@@ -1,0 +1,70 @@
+import test from "node:test"
+import assert from "node:assert/strict"
+
+// plugin.ts pulls @opencode-ai/plugin (peer dep, installed in devDeps); under
+// node --test with type stripping this import is fine.
+import { v2Setup } from "../plugin.ts"
+
+function makeCtx() {
+  const agents = new Map()
+  const skills = []
+  return {
+    agents,
+    skills,
+    ctx: {
+      agent: {
+        transform: async (cb) => {
+          await cb({
+            list: () => [...agents.keys()].map((id) => ({ id })),
+            get: (id) => agents.get(id),
+            update: (id, fn) => {
+              const a = agents.get(id) ?? {}
+              fn(a)
+              agents.set(id, a)
+            },
+            remove: (id) => agents.delete(id),
+          })
+        },
+      },
+      skill: {
+        transform: async (cb) => {
+          await cb({ source: (s) => skills.push(s), list: () => skills })
+        },
+      },
+    },
+  }
+}
+
+test("v2 setup：正常注册 forge agent 与 skill 目录源", async () => {
+  const { ctx, agents, skills } = makeCtx()
+  await v2Setup(ctx)
+  assert.ok(agents.has("forge"))
+  assert.equal(agents.get("forge").mode, "primary")
+  assert.equal(skills.length, 1)
+  assert.equal(skills[0].type, "directory")
+})
+
+test("v2 setup：forge 已存在时不覆盖（只创建不覆盖）", async () => {
+  const { ctx, agents } = makeCtx()
+  // simulate a pre-existing user-owned entry
+  await ctx.agent.transform(async (draft) => {
+    draft.update("forge", (a) => {
+      a.system = "USER OWNED"
+      a.mode = "subagent"
+    })
+  })
+  await v2Setup(ctx)
+  assert.equal(agents.get("forge").system, "USER OWNED")
+  assert.equal(agents.get("forge").mode, "subagent")
+})
+
+test("v2 setup：宿主形状漂移时静默跳过不抛错", async () => {
+  await assert.doesNotReject(v2Setup({}))
+  await assert.doesNotReject(v2Setup({ agent: {}, skill: {} }))
+  await assert.doesNotReject(
+    v2Setup({
+      agent: { transform: async (cb) => cb({ get: 5, update: null }) },
+      skill: { transform: async (cb) => cb({ source: undefined }) },
+    }),
+  )
+})

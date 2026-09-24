@@ -542,7 +542,7 @@ type V2PluginContext = {
   }
 }
 
-async function v2Setup(ctx: V2PluginContext): Promise<void> {
+export async function v2Setup(ctx: V2PluginContext): Promise<void> {
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform(async (draft) => {
       if (typeof draft.get !== "function" || typeof draft.update !== "function") return

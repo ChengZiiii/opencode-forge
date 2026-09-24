@@ -41,17 +41,24 @@
 - 内存：`Map<sessionID, planPath>` 记录"该会话的 active draft"，权限禁写与两门只对本会话生效。进程重启即失忆——禁写软降级（spec 已声明该行为），skill 纪律兜底。
 - 备选「纯内存状态机」被否：崩溃即丢，resume 无从谈起；备选「纯磁盘轮询」被否：权限钩子每工具调用读文件，浪费且慢。
 
-### D4. 禁写实现：`permission.ask` 钩子内按工具名单 deny
+### D4. draft 禁写：`tool.execute.before` 抛错为主，`permission.ask` 为带子
 
-draft 期对 `edit` / `write` / `bash` / 补丁类工具直接返回 deny（含说明文字指引 `plan_approve` / discard 出口），读类与 `plan_*` 放行。此 deny 高于用户 config 的 allow——阶段纪律由插件定义，逃生门只有批准与放弃两条。
-工具名字段按避坑文档 §4 的优先级链取（`metadata.tool` → `permission` → `id` → `type`），只影响 draft 期，不做全局改写。
-备选「skill 软约束」被否：这正是原生 plan 模式"看模型自觉"的老问题；备选「注册一个只读临时 agent」被否：引入主体切换，违背单主体原则。
+沙箱实测（1.18.32）推翻了最初的"纯 permission.ask 钉 deny"设计，三个事实：
+1. **permission.ask 钩子在 `opencode run` 模式从不触发**（文件级探针证实），只在 TUI 会话生效；
+2. **宿主存在 `"*": allow` 兜底规则**，allow 调用不产生 permission 请求 → 钩子无从被咨询；
+3. 全局收紧 edit/bash/task 为 ask 会废掉 run 模式的正常编辑（ask 一律 auto-reject）。
 
-### D5. 批准/完成门 = 把 `plan_approve` / `plan_close` 钉死为 ask
+因此主 enforcement 是 `tool.execute.before` 钩子：对写类工具（edit/write/bash/task/patch 族）检查会话 active plan，draft 状态即抛错中止调用（错误信息带 plan_approve / /plan discard 指引）。相位感知、TUI/run 通吃、不动全局 permission。`permission.ask` 里的 deny 分支保留为带子（覆盖用户自配 ask 的宿主）。
+会话状态缺失的兜底：`-c`/`--session` 续会话在新进程**不会**重发 `session.created`，故插件加载时记录 `PluginInput.worktree` 作为播种目录（tool context 每次再绑定权威 worktree）。
+备选「skill 软约束」被否（原生 plan 老问题）；备选「config 全局收紧」被否（破坏 run 模式可用性）。
 
-`permission.ask` 对这两个工具：任何来源的 allow 都改写为 ask（用户显式 deny 保持 deny）。效果：TUI 必弹确认框，用户的"允许"就是批准/关闭动作——门不需要额外命令、不依赖模型诚实。
-`plan_tick` / `plan_write` 不钉（draft 期本来就要频繁使用），普通权限即可。
-备选「专门 `/plan approve` 命令」被否：多一次交互且模型仍需先停下；备选「模型自行翻状态」被否：不可审计。
+### D5. 批准/完成门 = config ask 规则 + 工具内 `ToolContext.ask()`
+
+同批实测发现：**插件注册的工具完全绕过 permission 求值**（config 里对 plan_* 的规则不产生请求），但**工具内 `context.ask()` 发起的确认请求会按 config 规则求值**——无规则时命中 `"*": allow` 兜底直接放行。配方：
+1. config hook 注入 `permission.plan_approve/plan_close = "ask"`（尊重用户显式 deny）；
+2. `plan_approve` / `plan_close` 的 execute 顶部调 `context.ask()`。
+
+效果：TUI 弹确认框（用户的"允许"就是批准/关闭动作）；`opencode run` 无交互 → ask 一律 auto-reject（headless 无法静默过门）；`--auto` 是用户明示的自动批准（同 Claude Code 的 danger 口径，README 声明）。`permission.ask` 钩子对两门的钉 ask 保留为带子（防未来版本开始对插件工具求值）。
 
 ### D6. plan 文件格式：frontmatter 状态机 + 固定章节 + 行内时间戳注释
 
