@@ -28,7 +28,7 @@
 
 - [x] 6.1 `bun run bundle` 产出自包含 dist（无 --packages external）并提交，验证：dist/index.js 存在且 grep 无 external 残留、`npm pack --dry-run` 含 dist
 - [x] 6.2 中环验证：`git add -A && git commit` 后 `opencode plugin "git+file:///<仓库绝对路径>" --global` 安装，agent list + /plan 冒烟通过，随后四步卸载还原
-- [ ] 6.3 终验（合并前门槛）：push 后 `opencode plugin github:<owner>/opencode-forge --global` 安装 → 注册验证 → 全链冒烟（draft 禁写、批准门、tick、完成门、discard、session 提示）→ 四步卸载 + 重装确认环境还原
+- [x] 6.3 终验（合并前门槛）：push 后 `opencode plugin github:<owner>/opencode-forge --global` 安装 → 注册验证 → 全链冒烟（draft 禁写、批准门、tick、完成门、discard、session 提示）→ 四步卸载 + 重装确认环境还原
 
 ## 7. 文档
 
