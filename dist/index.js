@@ -12334,9 +12334,10 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // plugin.ts
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
+import { tmpdir } from "node:os";
 
 // src/plan-file.ts
 class PlanError extends Error {
@@ -12771,9 +12772,7 @@ var planTickTool = tool({
     n: tool.schema.number().int().positive().describe("Task number exactly as it appears in the plan's 任务清单")
   },
   execute: async (args, context) => {
-    const state = sessions.get(context.sessionID);
-    if (!state)
-      throw new PlanError("会话尚未绑定 plan。请用户执行 /plan resume 后重试。");
+    const state = ensureSession(context.sessionID, context.worktree);
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("工作区没有可用的 plan（.opencode/plan/ 无非终态 plan）。");
@@ -12791,6 +12790,9 @@ var planTickTool = tool({
     };
   }
 });
+async function gate(ask, permission, title) {
+  await ask({ permission, patterns: ["*"], always: [], metadata: { title } });
+}
 var planApproveTool = tool({
   description: "Ask the user to approve the session's draft plan (draft -> approved). The permission layer pins this call to a confirmation dialog — the user's Allow IS the approval. After approval the draft-phase write ban is lifted. Optionally pass a one-line summary of what changed since the last revision.",
   args: {
@@ -12804,6 +12806,7 @@ var planApproveTool = tool({
     if (active.doc.status !== "draft") {
       throw new PlanError(`plan 当前状态为 ${active.doc.status}，只有 draft 状态可以批准。`);
     }
+    await gate(context.ask, "plan_approve", `批准 plan：${active.doc.goal}`);
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
@@ -12836,6 +12839,7 @@ var planCloseTool = tool({
 - `)}
 请修正实现后重试，或先修订 plan。`);
     }
+    await gate(context.ask, "plan_close", `关闭 plan：${active.doc.goal}`);
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "done", nowIso()));
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
@@ -12850,9 +12854,7 @@ var planDiscardTool = tool({
     reason: tool.schema.string().optional().describe("Short reason recorded in the reply")
   },
   execute: async (_args, context) => {
-    const state = sessions.get(context.sessionID);
-    if (!state)
-      throw new PlanError("会话尚未绑定 plan；无 plan 可放弃。");
+    const state = ensureSession(context.sessionID, context.worktree);
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("工作区没有可放弃的 plan。");
@@ -12871,7 +12873,19 @@ function forgeTools() {
     plan_discard: planDiscardTool
   };
 }
-var server = async () => {
+var hostWorktree = "";
+function stateForBan(sessionID) {
+  if (!sessionID)
+    return null;
+  const existing = sessions.get(sessionID);
+  if (existing)
+    return existing;
+  if (!hostWorktree)
+    return null;
+  return ensureSession(sessionID, hostWorktree);
+}
+var server = async (input) => {
+  hostWorktree = input.worktree || input.directory || "";
   return {
     dispose: async () => {
       sessions.clear();
@@ -12903,27 +12917,49 @@ var server = async () => {
         template: PLAN_COMMAND_TEMPLATE,
         description: "forge plan harness：无参列出进行中 plan；resume 恢复；discard 放弃；带目标进入规划纪律"
       };
+      const perm = cfg.permission;
+      const permSection = perm ?? (cfg.permission = {});
+      for (const gateKey of ["plan_approve", "plan_close"]) {
+        if (permSection[gateKey] !== "deny")
+          permSection[gateKey] = "ask";
+      }
     },
     get tool() {
       return forgeDisabled ? {} : forgeTools();
     },
-    "permission.ask": async (input, output) => {
-      const meta = input.metadata ?? {};
-      const permissionField = input.permission;
-      const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input.id ?? input.type;
+    "tool.execute.before": async (input2) => {
+      if (process.env.FORGE_PERM_PROBE) {
+        try {
+          appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
+`);
+        } catch {}
+      }
+      if (typeof input2.tool === "string" && isWriteTool(input2.tool)) {
+        const state = stateForBan(input2.sessionID);
+        const active = state ? resolveActivePlan(state) : null;
+        if (active && active.doc.status === "draft") {
+          throw new Error(`[forge] plan 处于 draft 状态，写操作被禁止（${input2.tool}）。请呈报 plan 要点并调用 plan_approve 请求用户批准，或 /plan discard 放弃计划。`);
+        }
+      }
+    },
+    "permission.ask": async (input2, output) => {
+      const meta = input2.metadata ?? {};
+      const permissionField = input2.permission;
+      const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
+      if (process.env.FORGE_PERM_PROBE) {
+        try {
+          appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
+`);
+        } catch {}
+      }
       if (name === "plan_approve" || name === "plan_close") {
         if (output.status !== "deny")
           output.status = "ask";
         return;
       }
-      if (name === "plan_write" || name === "plan_tick" || name === "plan_discard") {
-        if (output.status === "ask")
-          output.status = "allow";
-        return;
-      }
-      const state = sessions.get(input.sessionID);
-      if (state && typeof name === "string" && isWriteTool(name)) {
-        const active = resolveActivePlan(state);
+      if (typeof name === "string" && isWriteTool(name)) {
+        const state = stateForBan(input2.sessionID);
+        const active = state ? resolveActivePlan(state) : null;
         if (active && active.doc.status === "draft") {
           output.status = "deny";
         }
@@ -12938,10 +12974,10 @@ var server = async () => {
         }
       }
     },
-    "experimental.chat.system.transform": async (input, output) => {
-      if (!input.sessionID)
+    "experimental.chat.system.transform": async (input2, output) => {
+      if (!input2.sessionID)
         return;
-      const state = sessions.get(input.sessionID);
+      const state = sessions.get(input2.sessionID);
       if (!state)
         return;
       const active = resolveActivePlan(state);

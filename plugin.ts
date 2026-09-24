@@ -1,8 +1,9 @@
 import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import { dirname, join, relative } from "node:path"
+import { tmpdir } from "node:os"
 import {
   PlanError,
   closeCheckFailures,
@@ -198,8 +199,7 @@ const planTickTool = tool({
     n: tool.schema.number().int().positive().describe("Task number exactly as it appears in the plan's 任务清单"),
   },
   execute: async (args, context) => {
-    const state = sessions.get(context.sessionID)
-    if (!state) throw new PlanError("会话尚未绑定 plan。请用户执行 /plan resume 后重试。")
+    const state = ensureSession(context.sessionID, context.worktree)
     const active = resolveActivePlan(state)
     if (!active) throw new PlanError("工作区没有可用的 plan（.opencode/plan/ 无非终态 plan）。")
     if (active.doc.status !== "approved") {
@@ -220,6 +220,22 @@ const planTickTool = tool({
   },
 })
 
+// Gates are implemented with ToolContext.ask(), NOT the permission config:
+// on opencode 1.18.32 plugin-registered tools bypass permission evaluation
+// entirely (verified: config "ask" rules on plan_* never produce a request),
+// while context.ask() creates a real user confirmation (TUI dialog; run mode
+// auto-rejects; --auto approves). The user's answer IS the gate.
+type AskFn = (input: {
+  permission: string
+  patterns: string[]
+  always: string[]
+  metadata: Record<string, unknown>
+}) => Promise<void>
+
+async function gate(ask: AskFn, permission: string, title: string): Promise<void> {
+  await ask({ permission, patterns: ["*"], always: [], metadata: { title } })
+}
+
 const planApproveTool = tool({
   description:
     "Ask the user to approve the session's draft plan (draft -> approved). The permission layer pins this call to a confirmation dialog — the user's Allow IS the approval. After approval the draft-phase write ban is lifted. Optionally pass a one-line summary of what changed since the last revision.",
@@ -233,6 +249,9 @@ const planApproveTool = tool({
     if (active.doc.status !== "draft") {
       throw new PlanError(`plan 当前状态为 ${active.doc.status}，只有 draft 状态可以批准。`)
     }
+    // The approval gate: user confirms in the dialog this creates. A rejected
+    // or auto-rejected ask throws and the plan stays in draft.
+    await gate(context.ask, "plan_approve", `批准 plan：${active.doc.goal}`)
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "approved", nowIso()))
     context.metadata({ title: `Plan approved: ${active.doc.goal}` })
     return {
@@ -267,6 +286,8 @@ const planCloseTool = tool({
     if (failures.length > 0) {
       throw new PlanError(`完成门校验未通过：\n- ${failures.join("\n- ")}\n请修正实现后重试，或先修订 plan。`)
     }
+    // The completion gate: user confirms closure in the dialog this creates.
+    await gate(context.ask, "plan_close", `关闭 plan：${active.doc.goal}`)
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "done", nowIso()))
     context.metadata({ title: `Plan done: ${active.doc.goal}` })
     return {
@@ -283,8 +304,7 @@ const planDiscardTool = tool({
     reason: tool.schema.string().optional().describe("Short reason recorded in the reply"),
   },
   execute: async (_args, context) => {
-    const state = sessions.get(context.sessionID)
-    if (!state) throw new PlanError("会话尚未绑定 plan；无 plan 可放弃。")
+    const state = ensureSession(context.sessionID, context.worktree)
     const active = resolveActivePlan(state)
     if (!active) throw new PlanError("工作区没有可放弃的 plan。")
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "abandoned", nowIso()))
@@ -304,11 +324,30 @@ function forgeTools(): Record<string, ToolDefinition> {
   }
 }
 
+// Launch-directory seed from PluginInput: continued sessions (-c / --session)
+// do NOT re-fire session.created in a new process, so a fresh process would
+// start with an empty session map and the draft write-ban would miss. The
+// plugin's launch worktree covers the single-project case (opencode run /
+// TUI); tool contexts re-bind the authoritative worktree on every plan_*
+// call. Empty when the host provides neither field (harmless: belt only).
+let hostWorktree = ""
+
+// Bind a session for ban lookups: known state, or seeded from the launch
+// worktree. Returns null only when nothing is known about the session.
+function stateForBan(sessionID: string | undefined): SessionState | null {
+  if (!sessionID) return null
+  const existing = sessions.get(sessionID)
+  if (existing) return existing
+  if (!hostWorktree) return null
+  return ensureSession(sessionID, hostWorktree)
+}
+
 // ---------------------------------------------------------------------------
 // v1 server entry (the loader used by `opencode plugin` installs reads this)
 // ---------------------------------------------------------------------------
 
-export const server: Plugin = async () => {
+export const server: Plugin = async (input) => {
+  hostWorktree = input.worktree || input.directory || ""
   return {
     dispose: async () => {
       sessions.clear()
@@ -357,6 +396,21 @@ export const server: Plugin = async () => {
         template: PLAN_COMMAND_TEMPLATE,
         description: "forge plan harness：无参列出进行中 plan；resume 恢复；discard 放弃；带目标进入规划纪律",
       }
+
+      // Gate permission rules: plugin-registered tools bypass automatic
+      // permission evaluation (verified 1.18.32), but the context.ask()
+      // requests the gate tools create ARE resolved against these rules —
+      // with no explicit rule a broad "*": allow default would resolve the
+      // gate ask to allow. "ask" makes the gate a real user confirmation
+      // (TUI dialog / run-mode reject / --auto approve). An explicit user
+      // "deny" is respected. No other permission key is touched: the draft
+      // write-ban lives in tool.execute.before (phase-aware, no global
+      // tightening), so stock behavior outside planning is unchanged.
+      const perm = (cfg as { permission?: Record<string, unknown> }).permission
+      const permSection = perm ?? ((cfg as { permission?: Record<string, unknown> }).permission = {})
+      for (const gateKey of ["plan_approve", "plan_close"]) {
+        if (permSection[gateKey] !== "deny") permSection[gateKey] = "ask"
+      }
     },
 
     // Registry getter keeps the disable knob honest: forge disabled -> no
@@ -365,10 +419,34 @@ export const server: Plugin = async () => {
       return forgeDisabled ? {} : forgeTools()
     },
 
-    // Draft write-ban + ask-pinned gates. Tool-name resolution follows the
-    // cross-version priority chain (metadata.tool -> permission -> id ->
-    // type); unknown sessions or fields resolve conservative (no ban) — the
-    // skill's soft discipline covers the gap.
+    // Draft write-ban, primary enforcement: tool.execute.before fires for
+    // every tool call (run mode included — unlike permission.ask, which never
+    // fires headless, verified 1.18.32). Throwing here aborts the call with
+    // the guidance message. Phase-aware, so no global permission tightening
+    // is needed and stock behavior is untouched outside the draft phase.
+    "tool.execute.before": async (input) => {
+      if (process.env.FORGE_PERM_PROBE) {
+        try {
+          appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input.tool)} session=${input.sessionID}\n`)
+        } catch {}
+      }
+      if (typeof input.tool === "string" && isWriteTool(input.tool)) {
+        const state = stateForBan(input.sessionID)
+        const active = state ? resolveActivePlan(state) : null
+        if (active && active.doc.status === "draft") {
+          throw new Error(
+            `[forge] plan 处于 draft 状态，写操作被禁止（${input.tool}）。请呈报 plan 要点并调用 plan_approve 请求用户批准，或 /plan discard 放弃计划。`,
+          )
+        }
+      }
+    },
+
+    // permission.ask belt: on hosts/sessions where permission requests ARE
+    // created for write tools (e.g. the user configured edit:"ask"), deny
+    // them during draft. The permission.ask hook itself never fires in
+    // `opencode run` mode (verified 1.18.32) — tool.execute.before above is
+    // the primary enforcement. Tool-name resolution follows the cross-version
+    // priority chain (metadata.tool -> permission -> id -> type).
     "permission.ask": async (input, output) => {
       const meta = (input.metadata ?? {}) as Record<string, unknown>
       const permissionField = (input as unknown as { permission?: unknown }).permission
@@ -377,21 +455,24 @@ export const server: Plugin = async () => {
         (typeof permissionField === "string" ? permissionField : undefined) ??
         input.id ??
         input.type
+      if (process.env.FORGE_PERM_PROBE) {
+        try {
+          appendFileSync(
+            join(tmpdir(), "forge-perm-probe.log"),
+            `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input.id)} type=${JSON.stringify(input.type)} meta=${JSON.stringify(input.metadata)}\n`,
+          )
+        } catch {}
+      }
       if (name === "plan_approve" || name === "plan_close") {
-        // The gates: never auto-allowed, immune to allow config; an explicit
-        // user deny stays denied.
+        // Belt for the gates: if a permission request ever surfaces for them
+        // (host starts evaluating plugin tools), keep it a real ask unless
+        // explicitly denied.
         if (output.status !== "deny") output.status = "ask"
         return
       }
-      if (name === "plan_write" || name === "plan_tick" || name === "plan_discard") {
-        // Harness-internal tools (the sanctioned writes while planning):
-        // upgrade ask -> allow, never overriding an explicit user deny.
-        if (output.status === "ask") output.status = "allow"
-        return
-      }
-      const state = sessions.get(input.sessionID)
-      if (state && typeof name === "string" && isWriteTool(name)) {
-        const active = resolveActivePlan(state)
+      if (typeof name === "string" && isWriteTool(name)) {
+        const state = stateForBan(input.sessionID)
+        const active = state ? resolveActivePlan(state) : null
         if (active && active.doc.status === "draft") {
           output.status = "deny"
         }
