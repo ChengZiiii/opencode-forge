@@ -1,0 +1,55 @@
+{
+  "name": "opencode-forge",
+  "version": "0.1.0",
+  "description": "Single general-purpose forge agent with a plan harness for opencode: file-backed plans in .opencode/plan/, tool-enforced plan structure, hard write-ban while planning (permission layer), ask-pinned approve/close gates the user confirms, and tick-as-you-go task tracking.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js"
+    },
+    "./server": {
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "SKILL.md",
+    "README.md"
+  ],
+  "scripts": {
+    "bundle": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && bun build ./plugin.ts --outfile ./dist/index.js --target node --format esm",
+    "test": "node --test tests/*.test.mjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "plan",
+    "planning",
+    "workflow",
+    "single-agent",
+    "skill"
+  ],
+  "license": "MIT",
+  "author": "chengsongren",
+  "homepage": "https://github.com/ChengZiiii/opencode-forge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ChengZiiii/opencode-forge.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ChengZiiii/opencode-forge/issues"
+  },
+  "peerDependencies": {
+    "@opencode-ai/plugin": "^1.18.0"
+  },
+  "devDependencies": {
+    "@opencode-ai/plugin": "^1.18.0",
+    "@types/node": "^22.13.9",
+    "typescript": "^5.8.2"
+  },
+  "engines": {
+    "opencode": "^1.18.0"
+  }
+}
