@@ -12,10 +12,15 @@
 //   updated: <ISO>
 //   goal: <one line>
 //   ---
-//   ## 目标 / ## 非目标 / ## 上下文发现 / ## 方案与备选 / ## 任务清单 / ## 风险 / ## 验收标准
+//   ## Goal / ## Non-Goals / ## Context Findings / ## Approach and
+//   Alternatives / ## Task List / ## Risks / ## Acceptance Criteria
 //
 // Task lines:    "- [ ] 1. describe..."  ->  "- [x] 1. describe... <!-- ticked: ISO -->"
-// Acceptance:    numbered "1. criterion" lines under 验收标准.
+// Acceptance:    numbered "1. criterion" lines under Acceptance Criteria.
+//
+// Section headers match bilingually: English is canonical (renderPlan
+// emits it); Chinese headers from plans written by earlier plugin
+// versions still parse through SECTION_ALIASES.
 
 export type PlanStatus = "draft" | "approved" | "done" | "abandoned"
 
@@ -71,25 +76,25 @@ const LEGAL_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
 }
 
 const SECTION_ORDER = [
-  "目标",
-  "非目标",
-  "上下文发现",
-  "方案与备选",
-  "任务清单",
-  "风险",
-  "验收标准",
+  "Goal",
+  "Non-Goals",
+  "Context Findings",
+  "Approach and Alternatives",
+  "Task List",
+  "Risks",
+  "Acceptance Criteria",
 ] as const
 
-// Header matching tolerates English synonyms so an English-writing model
-// still passes structure validation (design.md open question: dual matching).
+// Canonical English headers; Chinese aliases keep plans written by earlier
+// plugin versions (which rendered Chinese headers) loadable.
 const SECTION_ALIASES: Record<string, RegExp> = {
-  目标: /^(#*)\s*(目标|goal)\s*$/i,
-  非目标: /^(#*)\s*(非目标|non-goals?|out of scope)\s*$/i,
-  上下文发现: /^(#*)\s*(上下文发现|上下文|context findings?|findings)\s*$/i,
-  方案与备选: /^(#*)\s*(方案与备选|方案|approach( and alternatives)?)\s*$/i,
-  任务清单: /^(#*)\s*(任务清单|任务|tasks?)\s*$/i,
-  风险: /^(#*)\s*(风险|risks?)\s*$/i,
-  验收标准: /^(#*)\s*(验收标准|验收|acceptance criteria)\s*$/i,
+  Goal: /^(#*)\s*(goal|目标)\s*$/i,
+  "Non-Goals": /^(#*)\s*(non-goals?|out of scope|非目标)\s*$/i,
+  "Context Findings": /^(#*)\s*(context( findings?)?|findings|上下文发现|上下文)\s*$/i,
+  "Approach and Alternatives": /^(#*)\s*(approach( and alternatives)?|方案与备选|方案)\s*$/i,
+  "Task List": /^(#*)\s*(tasks?|task list|任务清单|任务)\s*$/i,
+  Risks: /^(#*)\s*(risks?|风险)\s*$/i,
+  "Acceptance Criteria": /^(#*)\s*(acceptance criteria|验收标准|验收)\s*$/i,
 }
 
 export function isTerminal(status: string): boolean {
@@ -138,15 +143,15 @@ export function planFileName(date: string, slug: string, existingNames: string[]
 export function validatePlanInput(input: Partial<PlanInput>): string[] {
   const missing: string[] = []
   const reqStr = (v: unknown): v is string => typeof v === "string" && v.trim().length > 0
-  if (!reqStr(input.goal)) missing.push("goal（目标）")
-  if (!reqStr(input.context)) missing.push("context（上下文发现）")
-  if (!reqStr(input.approach)) missing.push("approach（方案与备选）")
+  if (!reqStr(input.goal)) missing.push("goal")
+  if (!reqStr(input.context)) missing.push("context")
+  if (!reqStr(input.approach)) missing.push("approach")
   if (!Array.isArray(input.tasks) || input.tasks.length === 0 || !input.tasks.every(reqStr)) {
-    missing.push("tasks（任务清单，至少一条非空任务）")
+    missing.push("tasks (at least one non-empty task)")
   }
-  if (!reqStr(input.risks)) missing.push("risks（风险）")
+  if (!reqStr(input.risks)) missing.push("risks")
   if (!Array.isArray(input.acceptance) || input.acceptance.length === 0 || !input.acceptance.every(reqStr)) {
-    missing.push("acceptance（验收标准，至少一条）")
+    missing.push("acceptance (at least one criterion)")
   }
   return missing
 }
@@ -167,37 +172,37 @@ function frontmatterBlock(status: PlanStatus, created: string, updated: string, 
 export function renderPlan(input: PlanInput, now: string, createdOverride?: string): string {
   const missing = validatePlanInput(input)
   if (missing.length > 0) {
-    throw new PlanError(`plan 内容不完整，缺少：${missing.join("、")}`)
+    throw new PlanError(`Plan content incomplete; missing: ${missing.join(", ")}`)
   }
   const goal = input.goal.trim()
   const nonGoals = (input.nonGoals ?? []).filter((s) => s.trim().length > 0)
   const parts: string[] = [
     frontmatterBlock("draft", createdOverride ?? now, now, goal),
-    "## 目标",
+    "## Goal",
     "",
     goal,
     "",
-    "## 非目标",
+    "## Non-Goals",
     "",
-    nonGoals.length > 0 ? nonGoals.map((s) => `- ${s.trim()}`).join("\n") : "（本次任务未声明非目标）",
+    nonGoals.length > 0 ? nonGoals.map((s) => `- ${s.trim()}`).join("\n") : "(no non-goals declared for this task)",
     "",
-    "## 上下文发现",
+    "## Context Findings",
     "",
     input.context.trim(),
     "",
-    "## 方案与备选",
+    "## Approach and Alternatives",
     "",
     input.approach.trim(),
     "",
-    "## 任务清单",
+    "## Task List",
     "",
     input.tasks.map((t, i) => `- [ ] ${i + 1}. ${t.trim()}`).join("\n"),
     "",
-    "## 风险",
+    "## Risks",
     "",
     input.risks.trim(),
     "",
-    "## 验收标准",
+    "## Acceptance Criteria",
     "",
     input.acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join("\n"),
     "",
@@ -207,7 +212,7 @@ export function renderPlan(input: PlanInput, now: string, createdOverride?: stri
 
 function parseFrontmatter(text: string): { fm: Record<string, string>; body: string } {
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
-  if (!m) throw new PlanError("plan 文件缺少 frontmatter")
+  if (!m) throw new PlanError("plan file is missing frontmatter")
   const fm: Record<string, string> = {}
   for (const line of m[1].split(/\r?\n/)) {
     const kv = line.match(/^([A-Za-z_][\w-]*):\s*(.*)$/)
@@ -254,21 +259,21 @@ export function parsePlan(text: string): PlanDoc {
   const { fm, body } = parseFrontmatter(text)
   const status = (fm.status ?? "draft") as PlanStatus
   if (!["draft", "approved", "done", "abandoned"].includes(status)) {
-    throw new PlanError(`未知 plan 状态：${fm.status}`)
+    throw new PlanError(`Unknown plan status: ${fm.status}`)
   }
   const sections = splitSections(body)
   for (const key of SECTION_ORDER) {
     if (!sections.has(key)) {
-      throw new PlanError(`plan 缺少章节：${key}`)
+      throw new PlanError(`Plan is missing section: ${key}`)
     }
   }
   const tasks: PlanTask[] = []
   const seen = new Set<number>()
-  for (const line of (sections.get("任务清单") ?? "").split(/\r?\n/)) {
+  for (const line of (sections.get("Task List") ?? "").split(/\r?\n/)) {
     const m = line.match(TASK_RE)
     if (!m) continue
     const n = Number(m[2])
-    if (seen.has(n)) throw new PlanError(`任务编号重复：${n}`)
+    if (seen.has(n)) throw new PlanError(`Duplicate task number: ${n}`)
     seen.add(n)
     const ticked = m[3].match(TICKED_RE)
     tasks.push({
@@ -278,9 +283,9 @@ export function parsePlan(text: string): PlanDoc {
       ...(ticked ? { tickedAt: ticked[1] } : {}),
     })
   }
-  if (tasks.length === 0) throw new PlanError("任务清单为空或格式不合规")
+  if (tasks.length === 0) throw new PlanError("Task list is empty or malformed")
   const acceptance: string[] = []
-  for (const line of (sections.get("验收标准") ?? "").split(/\r?\n/)) {
+  for (const line of (sections.get("Acceptance Criteria") ?? "").split(/\r?\n/)) {
     const m = line.match(ACCEPT_RE)
     if (m) acceptance.push(m[2].trim())
   }
@@ -320,22 +325,24 @@ export function tickTask(text: string, n: number, now: string): string {
     const m = line.match(TASK_RE)
     if (!m || Number(m[2]) !== n) return line
     if (m[1].toLowerCase() === "x") {
-      throw new PlanError(`任务 ${n} 已处于勾选状态，拒绝重复打勾`)
+      throw new PlanError(`Task ${n} is already ticked; refusing duplicate tick`)
     }
     found = true
     const body = m[3].replace(TICKED_RE, "").trim()
     return `- [x] ${n}. ${body} <!-- ticked: ${now} -->`
   })
-  if (!found) throw new PlanError(`任务编号 ${n} 不存在`)
+  if (!found) throw new PlanError(`Task number ${n} does not exist`)
   return setUpdated(out.join("\n"), now)
 }
 
 export function transitionStatus(text: string, to: PlanStatus, now: string): string {
   const { fm } = parseFrontmatter(text)
   const from = (fm.status ?? "draft") as PlanStatus
-  if (from === to) throw new PlanError(`plan 已处于 ${to} 状态`)
+  if (from === to) throw new PlanError(`Plan is already ${to}`)
   if (!canTransition(from, to)) {
-    throw new PlanError(`非法状态迁移：${from} -> ${to}（合法路径：draft -> approved -> done；draft/approved -> abandoned）`)
+    throw new PlanError(
+      `Illegal status transition: ${from} -> ${to} (legal path: draft -> approved -> done; draft/approved -> abandoned)`,
+    )
   }
   const next = text.replace(/^status:.*$/m, `status: ${to}`)
   return setUpdated(next, now)
@@ -352,16 +359,16 @@ export function closeCheckFailures(doc: PlanDoc, checks: CloseCheck[]): string[]
   const failures: string[] = []
   const unticked = doc.tasks.filter((t) => !t.done).map((t) => t.n)
   if (unticked.length > 0) {
-    failures.push(`存在未勾选任务：${unticked.join("、")}`)
+    failures.push(`Unticked tasks remain: ${unticked.join(", ")}`)
   }
   const norm = (s: string) => s.toLowerCase().replace(/\s+/g, " ").trim()
   const byCriterion = new Map(checks.map((c) => [norm(c.criterion), c]))
   doc.acceptance.forEach((criterion, i) => {
     const check = byCriterion.get(norm(criterion))
     if (!check) {
-      failures.push(`验收标准 ${i + 1} 缺少自检项：${criterion}`)
+      failures.push(`Acceptance criterion ${i + 1} has no self-check: ${criterion}`)
     } else if (!check.pass) {
-      failures.push(`验收标准 ${i + 1} 自检未通过：${criterion}（证据：${check.evidence || "无"}）`)
+      failures.push(`Acceptance criterion ${i + 1} self-check failed: ${criterion} (evidence: ${check.evidence || "none"})`)
     }
   })
   return failures

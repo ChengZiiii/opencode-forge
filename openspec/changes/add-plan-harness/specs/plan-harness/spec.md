@@ -1,160 +1,160 @@
 ## Purpose
 
-把单任务计划变成磁盘上的一等公民：plan 文件落盘与结构由工具校验保证、draft 期禁写与批准/完成双权限门把关阶段切换、编号任务打勾追踪完成度、会话级提示与恢复，形成"短期单任务版 spec 工作流"。
+Make single-task plans first-class citizens on disk: plan-file persistence and structure are guaranteed by tool validation, the draft-phase write ban and the approve/completion permission gates guard phase transitions, numbered tasks track completion by ticking, and session notices and resume form a "short-horizon, single-task spec workflow".
 
 ## ADDED Requirements
 
-### Requirement: plan 文件落盘布局
+### Requirement: Plan file persistence layout
 
-plan 文件 SHALL 创建于工作区 `.opencode/plan/` 目录（插件在包外的唯一写入位置），文件名形如 `YYYY-MM-DD-<slug>.md`，slug 由任务目标派生（kebab-case，长度截断）。frontmatter SHALL 至少包含 `status`（取值 draft / approved / done / abandoned）、`created`、`updated`。同日 slug 冲突时 SHALL 追加数字后缀。
+Plan files SHALL be created under the workspace's `.opencode/plan/` directory (the plugin's only write location outside its package), named `YYYY-MM-DD-<slug>.md`, with the slug derived from the task goal (kebab-case, length-truncated). The frontmatter SHALL contain at least `status` (draft / approved / done / abandoned), `created`, and `updated`. Same-day slug collisions SHALL get a numeric suffix.
 
-#### Scenario: 生成合规 plan 文件
+#### Scenario: A compliant plan file is generated
 
-- **WHEN** `plan_write` 以目标"修复登录超时"成功落盘
-- **THEN** `.opencode/plan/` 下生成形如 `2026-09-25-fix-login-timeout.md` 的文件，frontmatter 含 `status: draft` 与时间戳字段
+- **WHEN** `plan_write` successfully persists a plan with the goal "fix the login timeout"
+- **THEN** a file like `2026-09-25-fix-login-timeout.md` appears under `.opencode/plan/`, with frontmatter containing `status: draft` and timestamp fields
 
-#### Scenario: 同日同 slug 冲突
+#### Scenario: Same-day slug collision
 
-- **WHEN** 同日已有同名 plan 文件且再次 `plan_write` 产生相同 slug
-- **THEN** 新文件名追加 `-2` 后缀，不覆盖既有文件
+- **WHEN** a plan file with the same name already exists today and another `plan_write` produces the same slug
+- **THEN** the new filename gets a `-2` suffix; the existing file is not overwritten
 
-### Requirement: 结构化模板校验
+### Requirement: Structured template validation
 
-`plan_write` SHALL 校验写入内容并生成固定章节：目标、非目标、上下文发现（含 `file:line` 证据引用）、方案与备选（含被否方案及原因）、编号任务清单（`- [ ]` checkbox，全局唯一编号）、风险、验收标准。任一必备章节缺失或为空时，工具 SHALL 报错并拒绝落盘。
+`plan_write` SHALL validate the content and render fixed sections: Goal, Non-Goals, Context Findings (with `file:line` evidence references), Approach and Alternatives (with rejected alternatives and reasons), a numbered Task List (`- [ ]` checkboxes, globally unique numbers), Risks, and Acceptance Criteria. When any required section is missing or empty, the tool SHALL error and refuse to write.
 
-#### Scenario: 完整内容成功落盘
+#### Scenario: Complete content persists
 
-- **WHEN** 规划内容包含全部必备章节
-- **THEN** 落盘成功，工具返回文件路径与任务数量
+- **WHEN** the planning content contains every required section
+- **THEN** persistence succeeds and the tool returns the file path and task count
 
-#### Scenario: 缺验收标准被拒
+#### Scenario: Missing acceptance criteria rejected
 
-- **WHEN** 规划内容缺少验收标准章节
-- **THEN** 工具报错指明缺失章节，不创建文件
+- **WHEN** the planning content lacks the acceptance criteria section
+- **THEN** the tool errors naming the missing section; no file is created
 
-### Requirement: draft 期写操作硬禁
+### Requirement: Hard write ban during draft
 
-当前会话存在 active draft（经 `/plan` 新建或 `/plan resume` 绑定且 status 为 draft）期间，权限钩子 SHALL 对写类工具（edit、write、bash 及其他变更类）无条件 deny，用户配置中的 allow SHALL NOT 放行；读类工具与 harness 工具（`plan_*`）SHALL 放行。`plan_approve` 批准或 discard 放弃后禁写 SHALL 即时解除。
+While the current session has an active draft (created via `/plan` or bound via `/plan resume`, with status draft), the permission hook SHALL unconditionally deny write-class tools (edit, write, bash, and other mutating tools); an `allow` in the user's config SHALL NOT override it. Read-class tools and the harness tools (`plan_*`) SHALL be allowed. After `plan_approve` approves or discard abandons the plan, the ban SHALL lift immediately.
 
-#### Scenario: draft 期写文件被拒
+#### Scenario: Writing a file during draft is denied
 
-- **WHEN** 会话存在 active draft 且模型调用 write/edit 类工具
-- **THEN** 调用被权限层拒绝，拒绝信息指引先经 `plan_approve` 或放弃
+- **WHEN** the session has an active draft and the model calls a write/edit-class tool
+- **THEN** the call is denied by the permission layer, with a message pointing to `plan_approve` or discard
 
-#### Scenario: draft 期 bash 被拒
+#### Scenario: bash during draft is denied
 
-- **WHEN** 会话存在 active draft 且模型调用 bash
-- **THEN** 调用被拒绝，理由同上
+- **WHEN** the session has an active draft and the model calls bash
+- **THEN** the call is denied for the same reason
 
-#### Scenario: 批准后禁写解除
+#### Scenario: The ban lifts after approval
 
-- **WHEN** `plan_approve` 经用户确认执行成功后模型再次调用写类工具
-- **THEN** 写操作按正常权限流程放行
+- **WHEN** `plan_approve` succeeds with user confirmation and the model calls a write-class tool again
+- **THEN** the write goes through the normal permission flow
 
-#### Scenario: 进程重启后软降级
+#### Scenario: Graceful degradation after process restart
 
-- **WHEN** opencode 进程重启且磁盘上仍存在 status 为 draft 的 plan
-- **THEN** 权限禁写不再自动生效（会话绑定状态已丢失），skill 纪律仍引导先批准或恢复；session_start 提示该未完成 plan
+- **WHEN** the opencode process restarts with a status-draft plan still on disk
+- **THEN** the write ban no longer applies automatically (session binding state is lost); skill discipline still guides approval or resume first, and the session-start notice surfaces the unfinished plan
 
-### Requirement: 批准门权限确认
+### Requirement: Approval gate permission confirmation
 
-`plan_approve` SHALL 将 active plan 的 status 由 draft 迁移到 approved；该工具调用 SHALL 被钉死为 ask 级确认（不自动放行、不受用户 allow 配置豁免），用户的确认框操作即批准动作。status 非 draft 时调用 SHALL 报错。
+`plan_approve` SHALL transition the active plan's status from draft to approved; the call SHALL be pinned to an ask-level confirmation (never auto-allowed, not exempted by user allow config), and the user's confirmation-dialog action IS the approval. Calling it with a non-draft status SHALL error.
 
-#### Scenario: 用户确认后进入执行
+#### Scenario: Entering execution after user confirmation
 
-- **WHEN** 模型呈报 plan 要点后调用 `plan_approve` 且用户在确认框选择允许
-- **THEN** status 变为 approved，draft 期禁写解除
+- **WHEN** the model presents the plan summary, calls `plan_approve`, and the user allows it in the confirmation dialog
+- **THEN** status becomes approved and the draft-phase write ban lifts
 
-#### Scenario: 重复批准被拒
+#### Scenario: Duplicate approval rejected
 
-- **WHEN** status 已为 approved 时模型调用 `plan_approve`
-- **THEN** 工具报错说明当前状态不可批准
+- **WHEN** status is already approved and the model calls `plan_approve`
+- **THEN** the tool errors explaining the current state cannot be approved
 
-### Requirement: 编号任务打勾
+### Requirement: Numbered task ticking
 
-`plan_tick` 接收任务编号 n，SHALL 校验该编号任务存在且未勾选，然后原子地置为 `- [x]` 并在同一行追加完成时间戳的 HTML 注释；编号不存在或已勾选时 SHALL 报错且不修改文件。bundled skill SHALL 规定每个编号任务完成后立即打勾，禁止批量事后补勾。
+`plan_tick` takes a task number n, SHALL verify that task exists and is unticked, then atomically set it to `- [x]` with a completion-timestamp HTML comment on the same line; a missing number or an already-ticked task SHALL error without modifying the file. The bundled skill SHALL mandate ticking immediately after each numbered task completes, banning batch after-the-fact ticking.
 
-#### Scenario: 勾掉已完成任务
+#### Scenario: Ticking a completed task
 
-- **WHEN** 任务 3 已实际完成且未勾选，模型调用 `plan_tick(3)`
-- **THEN** 文件中任务 3 变为勾选态并追加完成时间戳注释，工具返回剩余未勾数
+- **WHEN** task 3 is actually complete and unticked, and the model calls `plan_tick(3)`
+- **THEN** task 3 becomes ticked with a completion-timestamp comment, and the tool reports the remaining unticked count
 
-#### Scenario: 勾不存在的编号被拒
+#### Scenario: Ticking a nonexistent number rejected
 
-- **WHEN** plan 中不存在编号 7 的任务，模型调用 `plan_tick(7)`
-- **THEN** 工具报错，文件无任何改动
+- **WHEN** no task number 7 exists in the plan and the model calls `plan_tick(7)`
+- **THEN** the tool errors and the file is unchanged
 
-#### Scenario: 重复打勾被拒
+#### Scenario: Duplicate tick rejected
 
-- **WHEN** 任务 2 已处于勾选态，模型再次调用 `plan_tick(2)`
-- **THEN** 工具报错且文件不变
+- **WHEN** task 2 is already ticked and the model calls `plan_tick(2)` again
+- **THEN** the tool errors and the file is unchanged
 
-### Requirement: 完成门验收自检
+### Requirement: Completion gate acceptance self-check
 
-`plan_close` SHALL 仅在全部编号任务已勾选且调用参数携带逐条验收自检（每条验收标准给出 ✓/✗ 及证据引用）时，将 status 由 approved 迁移到 done；存在未勾任务或自检含 ✗ 项时 SHALL 报错拒绝。该工具调用 SHALL 被钉死为 ask 级确认。
+`plan_close` SHALL transition status from approved to done only when every numbered task is ticked and the call carries a per-criterion self-check (each acceptance criterion with ✓/✗ and an evidence reference); with unticked tasks or any ✗ it SHALL error and refuse. The call SHALL be pinned to an ask-level confirmation.
 
-#### Scenario: 全勾全过后关闭
+#### Scenario: Closing after all ticked and all passing
 
-- **WHEN** 全部任务已勾、自检每条验收标准均为 ✓ 且附证据，用户确认 `plan_close`
-- **THEN** status 变为 done，工具返回最终摘要
+- **WHEN** every task is ticked, every self-check is ✓ with evidence, and the user confirms `plan_close`
+- **THEN** status becomes done and the tool returns the final summary
 
-#### Scenario: 存在未勾任务被拒
+#### Scenario: Rejected with unticked tasks
 
-- **WHEN** 尚有任务未勾选时模型调用 `plan_close`
-- **THEN** 工具报错并列出未勾任务编号
+- **WHEN** tasks remain unticked and the model calls `plan_close`
+- **THEN** the tool errors listing the unticked task numbers
 
-#### Scenario: 验收不通过被拒
+#### Scenario: Rejected when acceptance fails
 
-- **WHEN** 自检中某条验收标准为 ✗
-- **THEN** 工具报错拒绝关闭，指引修正实现或先修订 plan
+- **WHEN** a self-check marks some acceptance criterion ✗
+- **THEN** the tool refuses to close, directing a fix or a plan revision first
 
-### Requirement: 放弃出口
+### Requirement: Discard exit
 
-`/plan discard` SHALL 将当前会话绑定的 active draft 置为 abandoned 并解除禁写；终态（done/abandoned）plan 文件 SHALL 保留在 `.opencode/plan/` 作为历史记录。
+`/plan discard` SHALL set the session-bound active draft to abandoned and lift the write ban; terminal (done/abandoned) plan files SHALL remain under `.opencode/plan/` as history.
 
-#### Scenario: 放弃后恢复自由
+#### Scenario: Freedom restored after discard
 
-- **WHEN** 用户执行 `/plan discard`
-- **THEN** 该 plan 的 status 变为 abandoned，写操作恢复正常
+- **WHEN** the user runs `/plan discard`
+- **THEN** the plan's status becomes abandoned and write operations return to normal
 
-### Requirement: 阶段命令不切主体
+### Requirement: Phase commands without switching subjects
 
-插件 SHALL 注册 `/plan <目标>`、`/plan resume`、`/plan discard` 命令：`/plan` 进入规划纪律（只读侦察 → 澄清 → `plan_write` → 呈批等待 `plan_approve`），`/plan resume` 绑定最近一个非终态 plan 继续执行，无参数的 `/plan` SHALL 列出非终态 plan 及进度。命令 SHALL NOT 触发 agent 切换（单主体原则）。
+The plugin SHALL register `/plan <goal>`, `/plan resume`, and `/plan discard` commands: `/plan` enters planning discipline (read-only recon → clarification → `plan_write` → present and await `plan_approve`), `/plan resume` binds the most recent non-terminal plan and continues it, and argument-less `/plan` SHALL list non-terminal plans with progress. Commands SHALL NOT trigger agent switching (single-subject principle).
 
-#### Scenario: 进入规划阶段
+#### Scenario: Entering the planning phase
 
-- **WHEN** 用户执行 `/plan 修复登录超时`
-- **THEN** forge 在当前会话进入规划纪律，最终产出落盘 plan 并等待批准，期间未发生 agent 切换
+- **WHEN** the user runs `/plan fix the login timeout`
+- **THEN** forge enters planning discipline in the current session, ultimately persisting a plan and awaiting approval, with no agent switching at any point
 
-#### Scenario: 恢复未完成 plan
+#### Scenario: Resuming an unfinished plan
 
-- **WHEN** 存在 status 为 approved 的半程 plan 且用户执行 `/plan resume`
-- **THEN** 会话绑定该 plan，从剩余任务继续
+- **WHEN** a half-done plan with status approved exists and the user runs `/plan resume`
+- **THEN** the session binds that plan and continues from the remaining tasks
 
-#### Scenario: 列出进行中 plan
+#### Scenario: Listing in-progress plans
 
-- **WHEN** 用户执行无参数 `/plan`
-- **THEN** 列出所有非终态 plan 的路径、状态与勾选进度
+- **WHEN** the user runs argument-less `/plan`
+- **THEN** every non-terminal plan is listed with path, status, and tick progress
 
-### Requirement: 会话启动提示
+### Requirement: Session-start notice
 
-session_start 钩子 SHALL 检测工作区非终态 plan，存在时在会话开头以一条提示给出路径与勾选进度，供用户决定是否 resume。
+The session_start hook SHALL detect non-terminal plans in the workspace; when one exists, it SHALL emit a notice at session start with the path and tick progress so the user can decide whether to resume.
 
-#### Scenario: 存在未完成 plan 时提示
+#### Scenario: Notice when an unfinished plan exists
 
-- **WHEN** `.opencode/plan/` 下存在 status 为 approved 的 plan（3/7 已勾）且用户开启新会话
-- **THEN** 会话开头出现提示：该 plan 路径与 `3/7` 进度
+- **WHEN** a plan with status approved (3/7 ticked) exists under `.opencode/plan/` and the user opens a new session
+- **THEN** a notice appears at session start with that plan's path and `3/7` progress
 
-### Requirement: bundled skill 单通道分发与规划纪律
+### Requirement: Bundled skill single-channel distribution and planning discipline
 
-SKILL.md SHALL 经 `config.skills.paths` 指向包目录的方式被 opencode 发现（SHALL NOT 复制到用户配置目录），内容 SHALL 覆盖：规划纪律（先只读侦察与澄清问题再落盘、呈批后执行）、完成即打勾纪律、以及分层边界——预估跨会话、多文件长期改动或需多轮需求评审的任务，SHALL 建议转用 OpenSpec spec 工作流而非 plan。
+SKILL.md SHALL be discovered by opencode via `config.skills.paths` pointing at the package directory (SHALL NOT be copied into the user's config directory). Its content SHALL cover: planning discipline (read-only reconnaissance and clarifying questions before persisting; execute only after approval), the tick-immediately discipline, and the tiering boundary — work expected to span sessions, involve long multi-file change, or need multi-round requirement review SHALL be recommended to an OpenSpec spec workflow instead of a plan.
 
-#### Scenario: skill 单通道被发现
+#### Scenario: Skill discovered through the single channel
 
-- **WHEN** 插件经官方安装模式安装后查看 skill 发现来源
-- **THEN** SKILL.md 由包目录经 skills.paths 扫描发现，用户配置目录无镜像副本
+- **WHEN** the plugin is installed via an official install mode and the skill discovery source is inspected
+- **THEN** SKILL.md is found by scanning the package directory via skills.paths, with no mirror copy in the user's config directory
 
-#### Scenario: 长任务被引导至 spec 流程
+#### Scenario: Long-horizon work is guided to the spec workflow
 
-- **WHEN** 用户以 `/plan` 提交一个预估跨多个会话的大型改造任务
-- **THEN** forge 依据 skill 的分层边界向用户说明该任务更适合 OpenSpec spec 工作流，由用户决定是否继续 plan
+- **WHEN** the user submits a large refactor expected to span multiple sessions via `/plan`
+- **THEN** forge, following the skill's tiering boundary, explains that the task fits an OpenSpec spec workflow better and lets the user decide whether to continue with a plan

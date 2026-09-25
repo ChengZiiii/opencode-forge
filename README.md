@@ -6,17 +6,18 @@ disk with tool-enforced structure, a hard write-ban while planning, user
 confirmation gates for approve/close, and tick-as-you-go task tracking.
 
 ```
-/plan 修复登录超时     → 只读侦察 → plan_write 落盘（draft，写操作被禁）
-                       → 呈报 → plan_approve（用户确认框 = 批准门）
-                       → 逐任务执行，完成即 plan_tick（时间戳审计）
-                       → 全勾后逐条验收自检 → plan_close（用户确认框 = 完成门）→ done
-/plan                 → 列出进行中的 plan 与进度
-/plan resume          → 恢复最近未完成的 plan
-/plan discard         → 放弃当前 plan（abandoned，写操作恢复）
+/plan fix login timeout   → read-only recon → plan_write (draft, writes denied)
+                           → present → plan_approve (user dialog = approval gate)
+                           → execute task by task, plan_tick on each (timestamped audit)
+                           → all ticked → per-criterion self-check → plan_close
+                             (user dialog = completion gate) → done
+/plan                     → list in-progress plans with progress
+/plan resume              → continue the most recent unfinished plan
+/plan discard             → abandon the current plan (abandoned, writes restored)
 ```
 
 - Plan files: `.opencode/plan/<date>-<slug>.md` in your project, frontmatter
-  state machine `draft → approved → done`（exit: `abandoned`）.
+  state machine `draft → approved → done` (exit: `abandoned`).
 - While a plan is in draft, `write` / `edit` / `bash` / `task` are **denied
   at the permission layer** — including your own `allow` config. The only
   exits are approval and discard. This is deliberate; see Design stance.
@@ -40,7 +41,7 @@ opencode plugin opencode-forge --global
 Local development: add `"file:///<repo abs path>"` to the `plugin` array in
 your opencode config. Single-file install: copy `dist/index.js` to
 `~/.config/opencode/plugin/forge.js` **and manually copy `SKILL.md`** to
-`~/.config/opencode/skills/forge-plan/SKILL.md` (the package has no installer
+`~/.config/opencode/skills/plan/SKILL.md` (the package has no installer
 script; that mode has no bundled skill otherwise).
 
 Note: do not enable opencode's experimental plan mode
@@ -72,9 +73,9 @@ If you already have a `command.plan` of your own, it wins and the plugin's
 1. Remove the plugin entry from the `plugin` array in
    `~/.config/opencode/opencode.json` (global installs).
 2. Delete the package store dir:
-   `~/.cache/opencode/packages/github_ChengZiiii_opencode-forge/` (exact name
-   is the sanitized install spec; for npm installs it is
-   `opencode-forge/`).
+   `~/.cache/opencode/packages/github_ChengZiiii/opencode-forge/` (github
+   installs, owner/repo layout; for npm installs it is
+   `~/.cache/opencode/packages/opencode-forge/`).
 3. Delete the `agent["forge"]` block from your config if you added one
    (otherwise the name lingers in the agent list).
 4. Done — the hidden native `build`/`plan` agents come back automatically

@@ -1,9 +1,9 @@
 ---
-name: forge-plan
+name: plan
 description: >-
   The plan discipline for the forge agent. You **MUST** load this skill when
   the /plan command routes a task goal to you, OR the user asks to "plan
-  first", "make a plan", "先规划", "做个计划" before implementation. It
+  first", "make a plan", "think before coding" before implementation. It
   governs the whole plan lifecycle: read-only reconnaissance, clarifying
   questions, plan_write (structured, tool-rendered), user-approval via
   plan_approve, tick-as-you-go execution via plan_tick, per-criterion
@@ -11,7 +11,7 @@ description: >-
   Do NOT load it for direct implementation requests with no planning intent.
 ---
 
-# Forge Plan Discipline
+# Plan Discipline (forge)
 
 Plans are short-horizon, single-task-goal documents on disk
 (`.opencode/plan/<date>-<slug>.md`). The harness (tools + permission layer)
@@ -22,8 +22,8 @@ enforces the hard parts; you supply the engineering judgment.
 - Explore with read/grep/glob only. **All write tools, bash, and task
   (subagents) are denied while a draft exists** — do not attempt them, do not
   ask the user to bypass.
-- Gather concrete evidence with `file:line` references; the plan's 上下文发现
-  section must contain findings you actually verified, not guesses.
+- Gather concrete evidence with `file:line` references; the plan's Context
+  Findings section must contain findings you actually verified, not guesses.
 - If the goal is ambiguous on scope, behavior, or acceptance — ask the user
   1-3 focused questions FIRST. Do not plan against assumptions the user could
   settle in one line.
@@ -31,8 +31,9 @@ enforces the hard parts; you supply the engineering judgment.
 ## Phase 2 — Write the plan (plan_write)
 
 Call `plan_write` with structured fields; the tool renders and validates the
-fixed sections (目标 / 非目标 / 上下文发现 / 方案与备选 / 任务清单 / 风险 /
-验收标准), so a malformed plan cannot exist.
+fixed sections (Goal / Non-Goals / Context Findings / Approach and
+Alternatives / Task List / Risks / Acceptance Criteria), so a malformed plan
+cannot exist.
 
 Quality bar for each field:
 
@@ -84,7 +85,7 @@ confirms closure in a dialog.
   file kept as history, writes restored.
 - **Resume**: new session with unfinished plan → the system notice carries
   the path; `/plan resume` continues from the remaining tasks.
-- **OpenSpec boundary**: work expected to span multiple sessions, days of
-  multi-file change, or multi-round requirement review is spec work, not plan
-  work. Say so once ("这更适合 OpenSpec/spec 流程"), let the user choose, and
-  proceed with a plan only if they insist.
+- **Spec-workflow boundary**: work expected to span multiple sessions, days
+  of multi-file change, or multi-round requirement review is spec work, not
+  plan work. Say so once (e.g. "this fits a spec workflow like OpenSpec
+  better"), let the user choose, and proceed with a plan only if they insist.

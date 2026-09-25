@@ -35,7 +35,7 @@ function makeCtx() {
   }
 }
 
-test("v2 setup：正常注册 forge agent 与 skill 目录源", async () => {
+test("v2 setup: registers the forge agent and the skill directory source", async () => {
   const { ctx, agents, skills } = makeCtx()
   await v2Setup(ctx)
   assert.ok(agents.has("forge"))
@@ -44,7 +44,7 @@ test("v2 setup：正常注册 forge agent 与 skill 目录源", async () => {
   assert.equal(skills[0].type, "directory")
 })
 
-test("v2 setup：forge 已存在时不覆盖（只创建不覆盖）", async () => {
+test("v2 setup: does not clobber an existing forge entry (create-only)", async () => {
   const { ctx, agents } = makeCtx()
   // simulate a pre-existing user-owned entry
   await ctx.agent.transform(async (draft) => {
@@ -58,7 +58,7 @@ test("v2 setup：forge 已存在时不覆盖（只创建不覆盖）", async () 
   assert.equal(agents.get("forge").mode, "subagent")
 })
 
-test("v2 setup：宿主形状漂移时静默跳过不抛错", async () => {
+test("v2 setup: silently skips on host shape drift without throwing", async () => {
   await assert.doesNotReject(v2Setup({}))
   await assert.doesNotReject(v2Setup({ agent: {}, skill: {} }))
   await assert.doesNotReject(

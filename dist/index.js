@@ -12354,22 +12354,22 @@ var LEGAL_TRANSITIONS = {
   abandoned: []
 };
 var SECTION_ORDER = [
-  "目标",
-  "非目标",
-  "上下文发现",
-  "方案与备选",
-  "任务清单",
-  "风险",
-  "验收标准"
+  "Goal",
+  "Non-Goals",
+  "Context Findings",
+  "Approach and Alternatives",
+  "Task List",
+  "Risks",
+  "Acceptance Criteria"
 ];
 var SECTION_ALIASES = {
-  目标: /^(#*)\s*(目标|goal)\s*$/i,
-  非目标: /^(#*)\s*(非目标|non-goals?|out of scope)\s*$/i,
-  上下文发现: /^(#*)\s*(上下文发现|上下文|context findings?|findings)\s*$/i,
-  方案与备选: /^(#*)\s*(方案与备选|方案|approach( and alternatives)?)\s*$/i,
-  任务清单: /^(#*)\s*(任务清单|任务|tasks?)\s*$/i,
-  风险: /^(#*)\s*(风险|risks?)\s*$/i,
-  验收标准: /^(#*)\s*(验收标准|验收|acceptance criteria)\s*$/i
+  Goal: /^(#*)\s*(goal|目标)\s*$/i,
+  "Non-Goals": /^(#*)\s*(non-goals?|out of scope|非目标)\s*$/i,
+  "Context Findings": /^(#*)\s*(context( findings?)?|findings|上下文发现|上下文)\s*$/i,
+  "Approach and Alternatives": /^(#*)\s*(approach( and alternatives)?|方案与备选|方案)\s*$/i,
+  "Task List": /^(#*)\s*(tasks?|task list|任务清单|任务)\s*$/i,
+  Risks: /^(#*)\s*(risks?|风险)\s*$/i,
+  "Acceptance Criteria": /^(#*)\s*(acceptance criteria|验收标准|验收)\s*$/i
 };
 function isTerminal(status) {
   return TERMINAL.includes(status);
@@ -12403,18 +12403,18 @@ function validatePlanInput(input) {
   const missing = [];
   const reqStr = (v) => typeof v === "string" && v.trim().length > 0;
   if (!reqStr(input.goal))
-    missing.push("goal（目标）");
+    missing.push("goal");
   if (!reqStr(input.context))
-    missing.push("context（上下文发现）");
+    missing.push("context");
   if (!reqStr(input.approach))
-    missing.push("approach（方案与备选）");
+    missing.push("approach");
   if (!Array.isArray(input.tasks) || input.tasks.length === 0 || !input.tasks.every(reqStr)) {
-    missing.push("tasks（任务清单，至少一条非空任务）");
+    missing.push("tasks (at least one non-empty task)");
   }
   if (!reqStr(input.risks))
-    missing.push("risks（风险）");
+    missing.push("risks");
   if (!Array.isArray(input.acceptance) || input.acceptance.length === 0 || !input.acceptance.every(reqStr)) {
-    missing.push("acceptance（验收标准，至少一条）");
+    missing.push("acceptance (at least one criterion)");
   }
   return missing;
 }
@@ -12434,39 +12434,39 @@ function frontmatterBlock(status, created, updated, goal) {
 function renderPlan(input, now, createdOverride) {
   const missing = validatePlanInput(input);
   if (missing.length > 0) {
-    throw new PlanError(`plan 内容不完整，缺少：${missing.join("、")}`);
+    throw new PlanError(`Plan content incomplete; missing: ${missing.join(", ")}`);
   }
   const goal = input.goal.trim();
   const nonGoals = (input.nonGoals ?? []).filter((s) => s.trim().length > 0);
   const parts = [
     frontmatterBlock("draft", createdOverride ?? now, now, goal),
-    "## 目标",
+    "## Goal",
     "",
     goal,
     "",
-    "## 非目标",
+    "## Non-Goals",
     "",
     nonGoals.length > 0 ? nonGoals.map((s) => `- ${s.trim()}`).join(`
-`) : "（本次任务未声明非目标）",
+`) : "(no non-goals declared for this task)",
     "",
-    "## 上下文发现",
+    "## Context Findings",
     "",
     input.context.trim(),
     "",
-    "## 方案与备选",
+    "## Approach and Alternatives",
     "",
     input.approach.trim(),
     "",
-    "## 任务清单",
+    "## Task List",
     "",
     input.tasks.map((t, i) => `- [ ] ${i + 1}. ${t.trim()}`).join(`
 `),
     "",
-    "## 风险",
+    "## Risks",
     "",
     input.risks.trim(),
     "",
-    "## 验收标准",
+    "## Acceptance Criteria",
     "",
     input.acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join(`
 `),
@@ -12478,7 +12478,7 @@ function renderPlan(input, now, createdOverride) {
 function parseFrontmatter(text) {
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
   if (!m)
-    throw new PlanError("plan 文件缺少 frontmatter");
+    throw new PlanError("plan file is missing frontmatter");
   const fm = {};
   for (const line of m[1].split(/\r?\n/)) {
     const kv = line.match(/^([A-Za-z_][\w-]*):\s*(.*)$/);
@@ -12526,23 +12526,23 @@ function parsePlan(text) {
   const { fm, body } = parseFrontmatter(text);
   const status = fm.status ?? "draft";
   if (!["draft", "approved", "done", "abandoned"].includes(status)) {
-    throw new PlanError(`未知 plan 状态：${fm.status}`);
+    throw new PlanError(`Unknown plan status: ${fm.status}`);
   }
   const sections = splitSections(body);
   for (const key of SECTION_ORDER) {
     if (!sections.has(key)) {
-      throw new PlanError(`plan 缺少章节：${key}`);
+      throw new PlanError(`Plan is missing section: ${key}`);
     }
   }
   const tasks = [];
   const seen = new Set;
-  for (const line of (sections.get("任务清单") ?? "").split(/\r?\n/)) {
+  for (const line of (sections.get("Task List") ?? "").split(/\r?\n/)) {
     const m = line.match(TASK_RE);
     if (!m)
       continue;
     const n = Number(m[2]);
     if (seen.has(n))
-      throw new PlanError(`任务编号重复：${n}`);
+      throw new PlanError(`Duplicate task number: ${n}`);
     seen.add(n);
     const ticked = m[3].match(TICKED_RE);
     tasks.push({
@@ -12553,9 +12553,9 @@ function parsePlan(text) {
     });
   }
   if (tasks.length === 0)
-    throw new PlanError("任务清单为空或格式不合规");
+    throw new PlanError("Task list is empty or malformed");
   const acceptance = [];
-  for (const line of (sections.get("验收标准") ?? "").split(/\r?\n/)) {
+  for (const line of (sections.get("Acceptance Criteria") ?? "").split(/\r?\n/)) {
     const m = line.match(ACCEPT_RE);
     if (m)
       acceptance.push(m[2].trim());
@@ -12595,14 +12595,14 @@ function tickTask(text, n, now) {
     if (!m || Number(m[2]) !== n)
       return line;
     if (m[1].toLowerCase() === "x") {
-      throw new PlanError(`任务 ${n} 已处于勾选状态，拒绝重复打勾`);
+      throw new PlanError(`Task ${n} is already ticked; refusing duplicate tick`);
     }
     found = true;
     const body = m[3].replace(TICKED_RE, "").trim();
     return `- [x] ${n}. ${body} <!-- ticked: ${now} -->`;
   });
   if (!found)
-    throw new PlanError(`任务编号 ${n} 不存在`);
+    throw new PlanError(`Task number ${n} does not exist`);
   return setUpdated(out.join(`
 `), now);
 }
@@ -12610,9 +12610,9 @@ function transitionStatus(text, to, now) {
   const { fm } = parseFrontmatter(text);
   const from = fm.status ?? "draft";
   if (from === to)
-    throw new PlanError(`plan 已处于 ${to} 状态`);
+    throw new PlanError(`Plan is already ${to}`);
   if (!canTransition(from, to)) {
-    throw new PlanError(`非法状态迁移：${from} -> ${to}（合法路径：draft -> approved -> done；draft/approved -> abandoned）`);
+    throw new PlanError(`Illegal status transition: ${from} -> ${to} (legal path: draft -> approved -> done; draft/approved -> abandoned)`);
   }
   const next = text.replace(/^status:.*$/m, `status: ${to}`);
   return setUpdated(next, now);
@@ -12624,16 +12624,16 @@ function closeCheckFailures(doc2, checks3) {
   const failures = [];
   const unticked = doc2.tasks.filter((t) => !t.done).map((t) => t.n);
   if (unticked.length > 0) {
-    failures.push(`存在未勾选任务：${unticked.join("、")}`);
+    failures.push(`Unticked tasks remain: ${unticked.join(", ")}`);
   }
   const norm = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
   const byCriterion = new Map(checks3.map((c) => [norm(c.criterion), c]));
   doc2.acceptance.forEach((criterion, i) => {
     const check2 = byCriterion.get(norm(criterion));
     if (!check2) {
-      failures.push(`验收标准 ${i + 1} 缺少自检项：${criterion}`);
+      failures.push(`Acceptance criterion ${i + 1} has no self-check: ${criterion}`);
     } else if (!check2.pass) {
-      failures.push(`验收标准 ${i + 1} 自检未通过：${criterion}（证据：${check2.evidence || "无"}）`);
+      failures.push(`Acceptance criterion ${i + 1} self-check failed: ${criterion} (evidence: ${check2.evidence || "none"})`);
     }
   });
   return failures;
@@ -12650,7 +12650,7 @@ var FORGE_AGENT = "forge";
 var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching; phases change through commands (/plan) and tools.
 
 Plan discipline (the tooling enforces the hard parts; you supply the judgment):
-- When the user invokes /plan with a goal, or asks to plan first, load the forge-plan skill and follow it: read-only reconnaissance, clarifying questions when the goal is ambiguous, then plan_write. It creates .opencode/plan/<date>-<slug>.md with status draft.
+- When the user invokes /plan with a goal, or asks to plan first, load the plan skill and follow it: read-only reconnaissance, clarifying questions when the goal is ambiguous, then plan_write. It creates .opencode/plan/<date>-<slug>.md with status draft.
 - While the session's plan is in draft, every write tool is denied at the permission layer. Do not attempt write/edit/bash/task during planning; do not ask the user to bypass it. The only exits are plan_approve and /plan discard.
 - After plan_write, present the goal, chosen approach, and numbered task list briefly, then call plan_approve. The user approves it in a confirmation dialog — that dialog is the approval gate.
 - After approval, execute tasks one by one and call plan_tick with the task number immediately after each completion. Never batch ticks at the end; never tick before the work is actually done.
@@ -12669,7 +12669,7 @@ var PLAN_COMMAND_TEMPLATE = [
   "- Argument empty: for every non-terminal plan (status draft or approved) in the directory above, read its frontmatter and task checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.",
   '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked tasks to the user in one short list, then continue executing it — tick each task the moment it is done (plan_tick). If none exists, say so.',
   '- Argument "discard": call the plan_discard tool, then tell the user the plan was abandoned and writes are restored.',
-  "- Any other argument: treat it as the task goal. Load the forge-plan skill (skill tool), then follow its planning discipline for this goal.",
+  "- Any other argument: treat it as the task goal. Load the plan skill (skill tool), then follow its planning discipline for this goal.",
   ""
 ].join(`
 `);
@@ -12723,13 +12723,13 @@ function relFrom(worktree, path) {
 var planWriteTool = tool({
   description: "Create or revise the session's plan (structured planning document, written to .opencode/plan/<date>-<slug>.md, status draft). The only sanctioned write while planning. Takes structured fields; the tool renders and validates the fixed sections — you cannot produce a malformed plan file.",
   args: {
-    goal: tool.schema.string().describe("One-line task goal (used for the filename slug and the 目标 section)"),
-    context: tool.schema.string().describe("上下文发现: what the reconnaissance actually found, with file:line evidence references"),
-    approach: tool.schema.string().describe("方案与备选: chosen approach AND rejected alternatives with reasons"),
+    goal: tool.schema.string().describe("One-line task goal (used for the filename slug and the Goal section)"),
+    context: tool.schema.string().describe("Context Findings: what the reconnaissance actually found, with file:line evidence references"),
+    approach: tool.schema.string().describe("Approach and Alternatives: chosen approach AND rejected alternatives with reasons"),
     tasks: tool.schema.array(tool.schema.string()).describe("Ordered task list; the tool numbers them 1..N as checkboxes"),
-    risks: tool.schema.string().describe("风险: known risks and mitigations"),
-    acceptance: tool.schema.array(tool.schema.string()).describe("验收标准: verifiable acceptance criteria, checked one by one at plan_close"),
-    nonGoals: tool.schema.array(tool.schema.string()).optional().describe("非目标: explicit out-of-scope items")
+    risks: tool.schema.string().describe("Risks: known risks and mitigations"),
+    acceptance: tool.schema.array(tool.schema.string()).describe("Acceptance Criteria: verifiable criteria, checked one by one at plan_close"),
+    nonGoals: tool.schema.array(tool.schema.string()).optional().describe("Non-Goals: explicit out-of-scope items")
   },
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, context.worktree);
@@ -12743,7 +12743,7 @@ var planWriteTool = tool({
       created = active.doc.created || undefined;
       mode = "revised";
     } else if (active) {
-      throw new PlanError(`已有 ${active.doc.status} 状态的 plan 在执行中（${relFrom(state.worktree, active.path)}）。请先完成并 plan_close，或 /plan discard 放弃后再重新规划。`);
+      throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
       const dir = planDirOf(context.worktree);
       mkdirSync(dir, { recursive: true });
@@ -12758,9 +12758,9 @@ var planWriteTool = tool({
     return {
       title: `plan ${mode}: ${doc2.goal}`,
       output: [
-        `plan 已${mode === "created" ? "创建" : "修订"}：${relFrom(state.worktree, path)}`,
-        `状态：draft（${doc2.tasks.length} 项任务，${doc2.acceptance.length} 条验收标准）。`,
-        "下一步：向用户简要呈报目标、选定方案与任务清单，然后调用 plan_approve 请求批准（将弹出用户确认框）。批准前所有写操作处于禁用状态。"
+        `Plan ${mode === "created" ? "created" : "revised"}: ${relFrom(state.worktree, path)}`,
+        `Status: draft (${doc2.tasks.length} tasks, ${doc2.acceptance.length} acceptance criteria).`,
+        "Next: briefly present the goal, chosen approach, and task list to the user, then call plan_approve to request approval (a user confirmation dialog appears). Until approval, all write operations are denied."
       ].join(`
 `)
     };
@@ -12769,15 +12769,15 @@ var planWriteTool = tool({
 var planTickTool = tool({
   description: "Mark plan task number n as done: sets its checkbox to [x] and stamps a completion timestamp. Call it IMMEDIATELY after finishing each numbered task — never batch ticks, never tick before the work is done. Only valid while the plan is approved.",
   args: {
-    n: tool.schema.number().int().positive().describe("Task number exactly as it appears in the plan's 任务清单")
+    n: tool.schema.number().int().positive().describe("Task number exactly as it appears in the plan's Task List")
   },
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, context.worktree);
     const active = resolveActivePlan(state);
     if (!active)
-      throw new PlanError("工作区没有可用的 plan（.opencode/plan/ 无非终态 plan）。");
+      throw new PlanError("No usable plan in this workspace (.opencode/plan/ has no non-terminal plan).");
     if (active.doc.status !== "approved") {
-      throw new PlanError(`plan 当前状态为 ${active.doc.status}，只有 approved 状态的 plan 才能打勾。先经 plan_approve 批准。`);
+      throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
     const next = tickTask(readFileSync(active.path, "utf8"), args.n, nowIso());
     writeFileSync(active.path, next);
@@ -12786,7 +12786,7 @@ var planTickTool = tool({
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` });
     return {
       title: `task ${args.n} done (${p.done}/${p.total})`,
-      output: p.done === p.total ? `任务 ${args.n} 已完成（${p.done}/${p.total}，全部完成）。请逐条对照验收标准自检并给出证据，然后调用 plan_close（将弹出用户确认框）。` : `任务 ${args.n} 已完成并打勾（${p.done}/${p.total}）。继续下一项任务。`
+      output: p.done === p.total ? `Task ${args.n} done (${p.done}/${p.total}, all complete). Self-check every acceptance criterion with concrete evidence, then call plan_close (a user confirmation dialog appears).` : `Task ${args.n} done and ticked (${p.done}/${p.total}). Continue with the next task.`
     };
   }
 });
@@ -12802,16 +12802,16 @@ var planApproveTool = tool({
     const state = ensureSession(context.sessionID, context.worktree);
     const active = resolveActivePlan(state);
     if (!active)
-      throw new PlanError("没有待批准的 plan。先调用 plan_write 创建。");
+      throw new PlanError("No plan awaiting approval. Create one with plan_write first.");
     if (active.doc.status !== "draft") {
-      throw new PlanError(`plan 当前状态为 ${active.doc.status}，只有 draft 状态可以批准。`);
+      throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
-    await gate(context.ask, "plan_approve", `批准 plan：${active.doc.goal}`);
+    await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
-      output: `plan 已获用户批准（approved）：${relFrom(state.worktree, active.path)}。草稿期写禁已解除。逐任务执行，每完成一项立即 plan_tick；全部完成后自检并 plan_close。`
+      output: `Plan approved by the user (approved): ${relFrom(state.worktree, active.path)}. The draft-phase write ban is lifted. Execute tasks one by one, calling plan_tick immediately after each; when all are done, self-check and plan_close.`
     };
   }
 });
@@ -12828,23 +12828,23 @@ var planCloseTool = tool({
     const state = ensureSession(context.sessionID, context.worktree);
     const active = resolveActivePlan(state);
     if (!active)
-      throw new PlanError("没有可关闭的 plan。");
+      throw new PlanError("No plan to close.");
     if (active.doc.status !== "approved") {
-      throw new PlanError(`plan 当前状态为 ${active.doc.status}，只有 approved 状态（全部任务完成后）可以关闭。`);
+      throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan (all tasks complete) can be closed.`);
     }
     const failures = closeCheckFailures(active.doc, args.checks);
     if (failures.length > 0) {
-      throw new PlanError(`完成门校验未通过：
+      throw new PlanError(`Completion gate check failed:
 - ${failures.join(`
 - `)}
-请修正实现后重试，或先修订 plan。`);
+Fix the implementation and retry, or revise the plan first.`);
     }
-    await gate(context.ask, "plan_close", `关闭 plan：${active.doc.goal}`);
+    await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`);
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "done", nowIso()));
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
       title: "plan done",
-      output: `plan 已完成并关闭（done）：${relFrom(state.worktree, active.path)}。自检 ${args.checks.length} 条全部通过。`
+      output: `Plan completed and closed (done): ${relFrom(state.worktree, active.path)}. All ${args.checks.length} self-checks passed.`
     };
   }
 });
@@ -12857,11 +12857,11 @@ var planDiscardTool = tool({
     const state = ensureSession(context.sessionID, context.worktree);
     const active = resolveActivePlan(state);
     if (!active)
-      throw new PlanError("工作区没有可放弃的 plan。");
+      throw new PlanError("No plan to abandon in this workspace.");
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "abandoned", nowIso()));
     state.planPath = undefined;
     context.metadata({ title: `Plan abandoned: ${active.doc.goal}` });
-    return { title: "plan abandoned", output: `plan 已放弃（abandoned）：${relFrom(state.worktree, active.path)}。写操作已恢复。` };
+    return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` };
   }
 });
 function forgeTools() {
@@ -12902,7 +12902,7 @@ var server = async (input) => {
       const existing = agentSection[FORGE_AGENT];
       agentSection[FORGE_AGENT] = {
         ...existing ?? {},
-        description: existing?.description ?? "forge — 单一通用编码主体：直接承接实现任务；规划经 /plan 进入 plan harness（.opencode/plan/ 落盘，批准/完成双确认门与打勾纪律由工具与权限层强制）。",
+        description: existing?.description ?? "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).",
         mode: existing?.mode ?? "primary",
         prompt: existing?.prompt ?? FORGE_PROMPT
       };
@@ -12915,7 +12915,7 @@ var server = async (input) => {
       cfg.command ??= {};
       cfg.command["plan"] ??= {
         template: PLAN_COMMAND_TEMPLATE,
-        description: "forge plan harness：无参列出进行中 plan；resume 恢复；discard 放弃；带目标进入规划纪律"
+        description: "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline"
       };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
@@ -12938,7 +12938,7 @@ var server = async (input) => {
         const state = stateForBan(input2.sessionID);
         const active = state ? resolveActivePlan(state) : null;
         if (active && active.doc.status === "draft") {
-          throw new Error(`[forge] plan 处于 draft 状态，写操作被禁止（${input2.tool}）。请呈报 plan 要点并调用 plan_approve 请求用户批准，或 /plan discard 放弃计划。`);
+          throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Present the plan summary and call plan_approve for user approval, or /plan discard to abandon it.`);
         }
       }
     },
@@ -12985,8 +12985,8 @@ var server = async (input) => {
         return;
       const p = progressOf(active.doc);
       const rel = relFrom(state.worktree, active.path);
-      const rule = active.doc.status === "draft" ? "draft 期间写操作被工具层拒绝；呈报要点后调用 plan_approve 请求批准，或 /plan discard 放弃" : "完成一项任务立即 plan_tick；全部完成后逐条对照验收标准自检并调用 plan_close";
-      output.system.push(`[forge:plan-notice] 当前会话绑定 plan：${rel}（status: ${active.doc.status}，${p.done}/${p.total} 已完成）。规则：${rule}。若用户尚未提及此 plan，请在回复开头用一句话向用户转达其路径与进度。`);
+      const rule = active.doc.status === "draft" ? "while in draft, write operations are denied at the tool layer; present the summary then call plan_approve for approval, or /plan discard to abandon" : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close";
+      output.system.push(`[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`);
     }
   };
 };
@@ -12998,7 +12998,7 @@ async function v2Setup(ctx) {
       if (draft.get(FORGE_AGENT) !== undefined)
         return;
       draft.update(FORGE_AGENT, (agent) => {
-        agent.description = "forge — 单一通用编码主体：直接承接实现任务；规划经 /plan 进入 plan harness（.opencode/plan/ 落盘，批准/完成双确认门与打勾纪律由工具与权限层强制）。";
+        agent.description = "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).";
         agent.system = FORGE_PROMPT;
         agent.mode = "primary";
       });
@@ -13014,6 +13014,7 @@ async function v2Setup(ctx) {
 }
 var plugin_default = { id: "forge", server, setup: v2Setup };
 export {
+  v2Setup,
   server,
   plugin_default as default
 };

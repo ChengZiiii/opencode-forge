@@ -36,7 +36,7 @@ const FORGE_AGENT = "forge"
 const FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching; phases change through commands (/plan) and tools.
 
 Plan discipline (the tooling enforces the hard parts; you supply the judgment):
-- When the user invokes /plan with a goal, or asks to plan first, load the forge-plan skill and follow it: read-only reconnaissance, clarifying questions when the goal is ambiguous, then plan_write. It creates .opencode/plan/<date>-<slug>.md with status draft.
+- When the user invokes /plan with a goal, or asks to plan first, load the plan skill and follow it: read-only reconnaissance, clarifying questions when the goal is ambiguous, then plan_write. It creates .opencode/plan/<date>-<slug>.md with status draft.
 - While the session's plan is in draft, every write tool is denied at the permission layer. Do not attempt write/edit/bash/task during planning; do not ask the user to bypass it. The only exits are plan_approve and /plan discard.
 - After plan_write, present the goal, chosen approach, and numbered task list briefly, then call plan_approve. The user approves it in a confirmation dialog — that dialog is the approval gate.
 - After approval, execute tasks one by one and call plan_tick with the task number immediately after each completion. Never batch ticks at the end; never tick before the work is actually done.
@@ -61,7 +61,7 @@ const PLAN_COMMAND_TEMPLATE = [
   '- Argument empty: for every non-terminal plan (status draft or approved) in the directory above, read its frontmatter and task checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.',
   '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked tasks to the user in one short list, then continue executing it — tick each task the moment it is done (plan_tick). If none exists, say so.',
   '- Argument "discard": call the plan_discard tool, then tell the user the plan was abandoned and writes are restored.',
-  "- Any other argument: treat it as the task goal. Load the forge-plan skill (skill tool), then follow its planning discipline for this goal.",
+  "- Any other argument: treat it as the task goal. Load the plan skill (skill tool), then follow its planning discipline for this goal.",
   "",
 ].join("\n")
 
@@ -73,7 +73,8 @@ type SessionState = {
 // sessionID -> state. Seeded by the session.created event and refined by
 // every tool call (worktree from ToolContext). In-memory only: a process
 // restart forgets bindings, which soft-disables the draft write-ban by
-// design (specs/plan-harness: "进程重启后软降级"); /plan resume re-binds
+// design (specs/plan-harness: graceful degradation after process restart);
+// /plan resume re-binds
 // implicitly on the next plan_* tool call via the directory fallback.
 const sessions = new Map<string, SessionState>()
 
@@ -147,13 +148,13 @@ const planWriteTool = tool({
   description:
     "Create or revise the session's plan (structured planning document, written to .opencode/plan/<date>-<slug>.md, status draft). The only sanctioned write while planning. Takes structured fields; the tool renders and validates the fixed sections — you cannot produce a malformed plan file.",
   args: {
-    goal: tool.schema.string().describe("One-line task goal (used for the filename slug and the 目标 section)"),
-    context: tool.schema.string().describe("上下文发现: what the reconnaissance actually found, with file:line evidence references"),
-    approach: tool.schema.string().describe("方案与备选: chosen approach AND rejected alternatives with reasons"),
+    goal: tool.schema.string().describe("One-line task goal (used for the filename slug and the Goal section)"),
+    context: tool.schema.string().describe("Context Findings: what the reconnaissance actually found, with file:line evidence references"),
+    approach: tool.schema.string().describe("Approach and Alternatives: chosen approach AND rejected alternatives with reasons"),
     tasks: tool.schema.array(tool.schema.string()).describe("Ordered task list; the tool numbers them 1..N as checkboxes"),
-    risks: tool.schema.string().describe("风险: known risks and mitigations"),
-    acceptance: tool.schema.array(tool.schema.string()).describe("验收标准: verifiable acceptance criteria, checked one by one at plan_close"),
-    nonGoals: tool.schema.array(tool.schema.string()).optional().describe("非目标: explicit out-of-scope items"),
+    risks: tool.schema.string().describe("Risks: known risks and mitigations"),
+    acceptance: tool.schema.array(tool.schema.string()).describe("Acceptance Criteria: verifiable criteria, checked one by one at plan_close"),
+    nonGoals: tool.schema.array(tool.schema.string()).optional().describe("Non-Goals: explicit out-of-scope items"),
   },
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, context.worktree)
@@ -168,7 +169,7 @@ const planWriteTool = tool({
       mode = "revised"
     } else if (active) {
       throw new PlanError(
-        `已有 ${active.doc.status} 状态的 plan 在执行中（${relFrom(state.worktree, active.path)}）。请先完成并 plan_close，或 /plan discard 放弃后再重新规划。`,
+        `A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`,
       )
     } else {
       const dir = planDirOf(context.worktree)
@@ -184,9 +185,9 @@ const planWriteTool = tool({
     return {
       title: `plan ${mode}: ${doc.goal}`,
       output: [
-        `plan 已${mode === "created" ? "创建" : "修订"}：${relFrom(state.worktree, path)}`,
-        `状态：draft（${doc.tasks.length} 项任务，${doc.acceptance.length} 条验收标准）。`,
-        "下一步：向用户简要呈报目标、选定方案与任务清单，然后调用 plan_approve 请求批准（将弹出用户确认框）。批准前所有写操作处于禁用状态。",
+        `Plan ${mode === "created" ? "created" : "revised"}: ${relFrom(state.worktree, path)}`,
+        `Status: draft (${doc.tasks.length} tasks, ${doc.acceptance.length} acceptance criteria).`,
+        "Next: briefly present the goal, chosen approach, and task list to the user, then call plan_approve to request approval (a user confirmation dialog appears). Until approval, all write operations are denied.",
       ].join("\n"),
     }
   },
@@ -196,14 +197,14 @@ const planTickTool = tool({
   description:
     "Mark plan task number n as done: sets its checkbox to [x] and stamps a completion timestamp. Call it IMMEDIATELY after finishing each numbered task — never batch ticks, never tick before the work is done. Only valid while the plan is approved.",
   args: {
-    n: tool.schema.number().int().positive().describe("Task number exactly as it appears in the plan's 任务清单"),
+    n: tool.schema.number().int().positive().describe("Task number exactly as it appears in the plan's Task List"),
   },
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, context.worktree)
     const active = resolveActivePlan(state)
-    if (!active) throw new PlanError("工作区没有可用的 plan（.opencode/plan/ 无非终态 plan）。")
+    if (!active) throw new PlanError("No usable plan in this workspace (.opencode/plan/ has no non-terminal plan).")
     if (active.doc.status !== "approved") {
-      throw new PlanError(`plan 当前状态为 ${active.doc.status}，只有 approved 状态的 plan 才能打勾。先经 plan_approve 批准。`)
+      throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`)
     }
     const next = tickTask(readFileSync(active.path, "utf8"), args.n, nowIso())
     writeFileSync(active.path, next)
@@ -214,8 +215,8 @@ const planTickTool = tool({
       title: `task ${args.n} done (${p.done}/${p.total})`,
       output:
         p.done === p.total
-          ? `任务 ${args.n} 已完成（${p.done}/${p.total}，全部完成）。请逐条对照验收标准自检并给出证据，然后调用 plan_close（将弹出用户确认框）。`
-          : `任务 ${args.n} 已完成并打勾（${p.done}/${p.total}）。继续下一项任务。`,
+          ? `Task ${args.n} done (${p.done}/${p.total}, all complete). Self-check every acceptance criterion with concrete evidence, then call plan_close (a user confirmation dialog appears).`
+          : `Task ${args.n} done and ticked (${p.done}/${p.total}). Continue with the next task.`,
     }
   },
 })
@@ -245,18 +246,18 @@ const planApproveTool = tool({
   execute: async (_args, context) => {
     const state = ensureSession(context.sessionID, context.worktree)
     const active = resolveActivePlan(state)
-    if (!active) throw new PlanError("没有待批准的 plan。先调用 plan_write 创建。")
+    if (!active) throw new PlanError("No plan awaiting approval. Create one with plan_write first.")
     if (active.doc.status !== "draft") {
-      throw new PlanError(`plan 当前状态为 ${active.doc.status}，只有 draft 状态可以批准。`)
+      throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`)
     }
     // The approval gate: user confirms in the dialog this creates. A rejected
     // or auto-rejected ask throws and the plan stays in draft.
-    await gate(context.ask, "plan_approve", `批准 plan：${active.doc.goal}`)
+    await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`)
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "approved", nowIso()))
     context.metadata({ title: `Plan approved: ${active.doc.goal}` })
     return {
       title: "plan approved",
-      output: `plan 已获用户批准（approved）：${relFrom(state.worktree, active.path)}。草稿期写禁已解除。逐任务执行，每完成一项立即 plan_tick；全部完成后自检并 plan_close。`,
+      output: `Plan approved by the user (approved): ${relFrom(state.worktree, active.path)}. The draft-phase write ban is lifted. Execute tasks one by one, calling plan_tick immediately after each; when all are done, self-check and plan_close.`,
     }
   },
 })
@@ -278,21 +279,21 @@ const planCloseTool = tool({
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, context.worktree)
     const active = resolveActivePlan(state)
-    if (!active) throw new PlanError("没有可关闭的 plan。")
+    if (!active) throw new PlanError("No plan to close.")
     if (active.doc.status !== "approved") {
-      throw new PlanError(`plan 当前状态为 ${active.doc.status}，只有 approved 状态（全部任务完成后）可以关闭。`)
+      throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan (all tasks complete) can be closed.`)
     }
     const failures = closeCheckFailures(active.doc, args.checks as CloseCheck[])
     if (failures.length > 0) {
-      throw new PlanError(`完成门校验未通过：\n- ${failures.join("\n- ")}\n请修正实现后重试，或先修订 plan。`)
+      throw new PlanError(`Completion gate check failed:\n- ${failures.join("\n- ")}\nFix the implementation and retry, or revise the plan first.`)
     }
     // The completion gate: user confirms closure in the dialog this creates.
-    await gate(context.ask, "plan_close", `关闭 plan：${active.doc.goal}`)
+    await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`)
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "done", nowIso()))
     context.metadata({ title: `Plan done: ${active.doc.goal}` })
     return {
       title: "plan done",
-      output: `plan 已完成并关闭（done）：${relFrom(state.worktree, active.path)}。自检 ${args.checks.length} 条全部通过。`,
+      output: `Plan completed and closed (done): ${relFrom(state.worktree, active.path)}. All ${args.checks.length} self-checks passed.`,
     }
   },
 })
@@ -306,11 +307,11 @@ const planDiscardTool = tool({
   execute: async (_args, context) => {
     const state = ensureSession(context.sessionID, context.worktree)
     const active = resolveActivePlan(state)
-    if (!active) throw new PlanError("工作区没有可放弃的 plan。")
+    if (!active) throw new PlanError("No plan to abandon in this workspace.")
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "abandoned", nowIso()))
     state.planPath = undefined
     context.metadata({ title: `Plan abandoned: ${active.doc.goal}` })
-    return { title: "plan abandoned", output: `plan 已放弃（abandoned）：${relFrom(state.worktree, active.path)}。写操作已恢复。` }
+    return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` }
   },
 })
 
@@ -375,7 +376,7 @@ export const server: Plugin = async (input) => {
         ...(existing ?? {}),
         description:
           (existing?.description as string | undefined) ??
-          "forge — 单一通用编码主体：直接承接实现任务；规划经 /plan 进入 plan harness（.opencode/plan/ 落盘，批准/完成双确认门与打勾纪律由工具与权限层强制）。",
+          "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).",
         mode: (existing?.mode as "primary" | "subagent" | "all" | undefined) ?? "primary",
         prompt: (existing?.prompt as string | undefined) ?? FORGE_PROMPT,
       }
@@ -394,7 +395,7 @@ export const server: Plugin = async (input) => {
       cfg.command ??= {}
       cfg.command["plan"] ??= {
         template: PLAN_COMMAND_TEMPLATE,
-        description: "forge plan harness：无参列出进行中 plan；resume 恢复；discard 放弃；带目标进入规划纪律",
+        description: "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline",
       }
 
       // Gate permission rules: plugin-registered tools bypass automatic
@@ -435,7 +436,7 @@ export const server: Plugin = async (input) => {
         const active = state ? resolveActivePlan(state) : null
         if (active && active.doc.status === "draft") {
           throw new Error(
-            `[forge] plan 处于 draft 状态，写操作被禁止（${input.tool}）。请呈报 plan 要点并调用 plan_approve 请求用户批准，或 /plan discard 放弃计划。`,
+            `[forge] A plan is in draft; write operations are denied (${input.tool}). Present the plan summary and call plan_approve for user approval, or /plan discard to abandon it.`,
           )
         }
       }
@@ -494,8 +495,8 @@ export const server: Plugin = async (input) => {
 
     // Session-start notice + standing reminder: injected into the system
     // prompt whenever the session has a non-terminal plan. The relay clause
-    // makes the first reply surface it to the user (the "会话启动提示"
-    // requirement — no native banner API exists for plugins).
+    // makes the first reply surface it to the user (the session-start
+    // notice requirement — no native banner API exists for plugins).
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return
       const state = sessions.get(input.sessionID)
@@ -506,10 +507,10 @@ export const server: Plugin = async (input) => {
       const rel = relFrom(state.worktree, active.path)
       const rule =
         active.doc.status === "draft"
-          ? "draft 期间写操作被工具层拒绝；呈报要点后调用 plan_approve 请求批准，或 /plan discard 放弃"
-          : "完成一项任务立即 plan_tick；全部完成后逐条对照验收标准自检并调用 plan_close"
+          ? "while in draft, write operations are denied at the tool layer; present the summary then call plan_approve for approval, or /plan discard to abandon"
+          : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close"
       output.system.push(
-        `[forge:plan-notice] 当前会话绑定 plan：${rel}（status: ${active.doc.status}，${p.done}/${p.total} 已完成）。规则：${rule}。若用户尚未提及此 plan，请在回复开头用一句话向用户转达其路径与进度。`,
+        `[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`,
       )
     },
   }
@@ -549,7 +550,7 @@ export async function v2Setup(ctx: V2PluginContext): Promise<void> {
       if (draft.get(FORGE_AGENT) !== undefined) return
       draft.update(FORGE_AGENT, (agent) => {
         agent.description =
-          "forge — 单一通用编码主体：直接承接实现任务；规划经 /plan 进入 plan harness（.opencode/plan/ 落盘，批准/完成双确认门与打勾纪律由工具与权限层强制）。"
+          "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer)."
         agent.system = FORGE_PROMPT
         agent.mode = "primary"
       })

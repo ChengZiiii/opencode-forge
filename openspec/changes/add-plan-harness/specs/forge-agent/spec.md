@@ -1,65 +1,65 @@
 ## Purpose
 
-管理 opencode 会话的单一通用 agent 身份：注册 forge、在插件存活期间运行时隐藏原生 build/plan、提供一键回原生的用户旋钮与卸载自愈，以此替代"多 agent 人格切换"的编排形态。
+Govern the single general-purpose agent identity for opencode sessions: register forge, hide the native build/plan agents at runtime for the plugin's lifetime, provide a one-knob return-to-native and uninstall self-healing — replacing "multi-agent persona switching" as the orchestration shape.
 
 ## ADDED Requirements
 
-### Requirement: 注册单一 forge 通用 agent
+### Requirement: Register the single general-purpose forge agent
 
-插件加载后，系统 SHALL 在 opencode 中注册 id 为 `forge` 的 primary 通用 agent（完整读写执行工具面），作为 Tab 循环中的唯一主主体。用户不经任何规划流程直接下达的实现类任务，forge SHALL 直接承接执行。
+Once the plugin loads, the system SHALL register a primary general-purpose agent with id `forge` (full read/write/execute tool surface) as the only primary subject in the Tab cycle. Implementation-type tasks the user issues directly, without any planning flow, SHALL be executed by forge directly.
 
-#### Scenario: 官方安装后 forge 出现在 agent 列表
+#### Scenario: forge appears in the agent list after an official install
 
-- **WHEN** 插件经 `opencode plugin` 官方安装模式安装并加载，用户执行 agent 列表查看
-- **THEN** 列表中出现 `forge`，且其为 primary 属性的通用 agent
+- **WHEN** the plugin is installed via an official `opencode plugin` install mode and loaded, and the user views the agent list
+- **THEN** the list contains `forge` as a primary general-purpose agent
 
-#### Scenario: 未经规划的直接任务由 forge 执行
+#### Scenario: A direct unplanned task is executed by forge
 
-- **WHEN** 用户在 forge 会话中直接下达一个实现类任务（未使用 `/plan`）
-- **THEN** forge 直接执行该任务，全程无需切换到其他 agent
+- **WHEN** the user issues an implementation-type task directly in a forge session (without `/plan`)
+- **THEN** forge executes the task directly, with no agent switching at any point
 
-### Requirement: 插件存活期间隐藏原生 build/plan
+### Requirement: Hide the native build/plan agents while the plugin is loaded
 
-插件加载期间，系统 SHALL 将原生 `build` 与 `plan` 两个 agent 置于禁用状态，Tab agent 循环 SHALL 不再提供二者。该隐藏 SHALL 以运行时配置注入方式实现（不写入用户配置文件）。
+While the plugin is loaded, the system SHALL disable the native `build` and `plan` agents, and the Tab agent cycle SHALL no longer offer them. The hiding SHALL be implemented as runtime config injection (nothing written to the user's config file).
 
-#### Scenario: Tab 循环只剩 forge
+#### Scenario: Only forge remains in the Tab cycle
 
-- **WHEN** 插件加载成功后用户循环切换 agent
-- **THEN** 循环中仅有 `forge`，不出现原生 `build` 与 `plan`
+- **WHEN** the plugin has loaded and the user cycles agents
+- **THEN** the cycle contains only `forge`; the native `build` and `plan` do not appear
 
-#### Scenario: 隐藏不落盘
+#### Scenario: The hide never touches disk
 
-- **WHEN** 插件注入禁用后用户查看其 opencode 配置文件
-- **THEN** 配置文件中不存在由插件写入的任何 agent 禁用条目
+- **WHEN** the user inspects their opencode config file after the plugin injected the disables
+- **THEN** the config file contains no agent-disable entries written by the plugin
 
-### Requirement: 一键回原生旋钮
+### Requirement: One-knob return to native
 
-用户配置 `agent["forge"].disable: true` 时，插件 SHALL 整体静默：不注册 forge agent、撤回对原生 build/plan 的隐藏注入、不注册 harness 工具、命令与 skill，系统回到原生形态。
+When the user sets `agent["forge"].disable: true`, the plugin SHALL go wholly silent: no forge agent registered, the native build/plan hide injection withdrawn, no harness tools, command, or skill registered — the system returns to its native shape.
 
-#### Scenario: 设旋钮后恢复原生
+#### Scenario: Native restored after the knob is set
 
-- **WHEN** 用户在配置中设置 `agent["forge"].disable: true` 并重启 opencode
-- **THEN** agent 列表中无 `forge`，原生 `build` 与 `plan` 恢复可用，无 harness 工具与命令注册
+- **WHEN** the user sets `agent["forge"].disable: true` in their config and restarts opencode
+- **THEN** the agent list has no `forge`, the native `build` and `plan` are available again, and no harness tools or commands are registered
 
-### Requirement: 卸载自愈
+### Requirement: Uninstall self-healing
 
-完成 README 记载的卸载步骤后，系统 SHALL 无插件残留：forge 消失、原生 build/plan 恢复。已生成的 `.opencode/plan/` 下的 plan 文件属于用户数据，卸载 SHALL NOT 删除。
+After the user completes the uninstall steps documented in the README, the system SHALL carry no plugin residue: forge is gone, native build/plan are restored. Plan files already generated under `.opencode/plan/` are user data, and uninstall SHALL NOT delete them.
 
-#### Scenario: 卸载后恢复原生
+#### Scenario: Native restored after uninstall
 
-- **WHEN** 用户按 README 四步卸载插件并重启 opencode
-- **THEN** agent 列表恢复为原生 `build`/`plan`，无 `forge`
+- **WHEN** the user uninstalls the plugin following the README's four steps and restarts opencode
+- **THEN** the agent list shows the native `build`/`plan` again, with no `forge`
 
-#### Scenario: 卸载保留 plan 数据
+#### Scenario: Uninstall keeps plan data
 
-- **WHEN** 工作区存在历史 plan 文件且用户卸载插件
-- **THEN** `.opencode/plan/` 目录及其文件保持原样
+- **WHEN** the workspace contains historical plan files and the user uninstalls the plugin
+- **THEN** the `.opencode/plan/` directory and its files remain untouched
 
-### Requirement: v2 前向兼容注册
+### Requirement: v2 forward-compatible registration
 
-在 v2 loader 下，插件 SHALL 经 `setup` 以"只创建不覆盖"方式注册 forge agent 与 skill（目标条目已存在即跳过，字段使用 v2 形状）；v2 侧 SHALL NOT 尝试注册工具、权限钩子或命令（v2 @1.18 无对应域能力）。宿主 API 形状漂移时注册 SHALL 静默跳过而非抛错。
+Under a v2 loader, the plugin SHALL register the forge agent and the skill via `setup` on a create-only basis (an existing target entry is skipped; fields use the v2 shape); the v2 side SHALL NOT attempt to register tools, permission hooks, or commands (v2 has no domain for them at 1.18). On host API shape drift, registration SHALL skip silently instead of throwing.
 
-#### Scenario: v2 下已存在同名条目不覆盖
+#### Scenario: An existing same-name entry is not clobbered under v2
 
-- **WHEN** v2 loader 调用 `setup` 且 agent 草稿中已存在 `forge` 条目
-- **THEN** 插件跳过创建，既有条目内容保持不变
+- **WHEN** a v2 loader calls `setup` and the agent draft already contains a `forge` entry
+- **THEN** the plugin skips creation and the existing entry's content is unchanged

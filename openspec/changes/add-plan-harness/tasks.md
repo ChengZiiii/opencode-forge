@@ -34,3 +34,10 @@
 
 - [x] 7.1 README：安装三模式、四步卸载（含 agent 配置块、store 目录）、文件账本（包外仅 `.opencode/plan/`，用户数据卸载不删）、与 experimental plan mode 互斥说明、禁写高于 allow 的设计立场，验证：按 README 在干净沙盒从零走通安装与卸载
 - [x] 7.2 AGENTS.md：照 vision-bridge 体例（架构表、v1/v2 分工、开发循环、openspec 工作流、提交规范），验证：新人按文档可在 15 分钟内完成改码→重建→沙盒冒烟循环
+
+## 8. 发布语言与命名修订（用户验收反馈）
+
+- [x] 8.1 skill 更名为 `plan`（frontmatter name、FORGE_PROMPT 与命令模板引用、README 手工拷贝路径），验证：实机 `opencode run` 免费模型加载 skill 名 `plan` 成功（LOADED plan 5）
+- [x] 8.2 插件全部面向用户文案英文化：工具参数描述、五工具全部输出与报错、draft 禁写错误、system notice、agent description、命令 description、README 流程图；plan 文档模板改为英文固定章节
+- [x] 8.3 向后兼容：SECTION_ALIASES 保留中文页别匹配，早期中文章节 plan 仍可 parse/tick/transition（新增单测覆盖 legacy 文档）；16/16 测试通过、typecheck 通过、dist 自检（自有文案无中文残留，仅 zod locale 与解析别名）
+- [x] 8.4 openspec 两个 spec delta 同步英文化（归档前修订，validate 复验通过）
