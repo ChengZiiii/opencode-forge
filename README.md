@@ -32,10 +32,10 @@ confirmation gates for approve/close, and tick-as-you-go task tracking.
 Requires opencode ≥ 1.18.
 
 ```bash
-# GitHub source
+# npm (recommended)
+opencode plugin @sorenllm/opencode-forge --global
+# or GitHub source
 opencode plugin github:ChengZiiii/opencode-forge --global
-# or npm after publishing
-opencode plugin opencode-forge --global
 ```
 
 Local development: add `"file:///<repo abs path>"` to the `plugin` array in

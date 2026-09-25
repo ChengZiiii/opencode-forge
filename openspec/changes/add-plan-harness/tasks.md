@@ -42,3 +42,4 @@
 - [x] 8.3 向后兼容：SECTION_ALIASES 保留中文页别匹配，早期中文章节 plan 仍可 parse/tick/transition（新增单测覆盖 legacy 文档）；16/16 测试通过、typecheck 通过、dist 自检（自有文案无中文残留，仅 zod locale 与解析别名）
 - [x] 8.4 openspec 两个 spec delta 同步英文化（归档前修订，validate 复验通过）
 - [x] 8.5 修复 global-project worktree 陷阱：非 git 目录会话被 opencode 归入 worktree="/" 的 global 项目，plan_write 曾把文件写到盘符根 `C:\.opencode\plan\`（用户实测发现）。修复：`effectiveWorktree`（rootish 检测 + 回退 PluginInput.directory），所有 plan_* 工具、session.created 种子与 PluginInput 捕获统一走它；新增单测；实机复现验证文件落在工作区 `.opencode/plan/`；用户被困 plan 已迁回工作区并复验可解析（status done, 3/3）
+- [x] 8.6 npm 发布（用户验收反馈：优先 npm plugin 安装模式）：`opencode-forge` 裸名已被第三方占用（Chris Scott，活跃更新中），改用作用域名 `@sorenllm/opencode-forge`（用户选定）；publishConfig access=public，pack 校验 4 文件白名单；2FA 由用户本机完成发布；README 安装章节改为 npm 优先

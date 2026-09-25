@@ -1,5 +1,5 @@
 {
-  "name": "opencode-forge",
+  "name": "@sorenllm/opencode-forge",
   "version": "0.1.0",
   "description": "Single general-purpose forge agent with a plan harness for opencode: file-backed plans in .opencode/plan/, tool-enforced plan structure, hard write-ban while planning (permission layer), ask-pinned approve/close gates the user confirms, and tick-as-you-go task tracking.",
   "type": "module",
@@ -51,5 +51,9 @@
   },
   "engines": {
     "opencode": "^1.18.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
   }
 }
