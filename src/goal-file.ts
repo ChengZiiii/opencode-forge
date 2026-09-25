@@ -261,6 +261,7 @@ export function renderGoal(
     revision?: number
     session?: string
     turnsUsed?: number
+    stopReason?: StopReason
   },
 ): string {
   const missing = validateGoalInput(input)
@@ -279,6 +280,7 @@ export function renderGoal(
       maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS,
       turnsUsed: meta.turnsUsed ?? 0,
       maxMinutes: input.maxMinutes ?? DEFAULT_MAX_MINUTES,
+      ...(meta.status === "paused" && meta.stopReason ? { stopReason: meta.stopReason } : {}),
     }),
     "## Goal",
     "",
@@ -570,6 +572,22 @@ export function appendLedger(text: string, entry: LedgerEntry, now: string): str
     lines.splice(at, 0, line)
   }
   return setUpdated(lines.join("\n"), now)
+}
+
+// Revision history carry-over: a revision re-renders the document, but the
+// Check Log and Turn Ledger are an audit trail and MUST survive (spec:
+// entries remain visible, stamped with the revision they were produced
+// under). Replaces the fresh placeholders with the carried lines.
+export function carryHistory(newText: string, oldDoc: GoalDoc): string {
+  let out = newText
+  if (oldDoc.log.length > 0) {
+    out = out.replace("(no checks recorded yet)", oldDoc.log.join("\n"))
+  }
+  if (oldDoc.ledger.length > 0) {
+    const lines = oldDoc.ledger.map((e) => `- turn ${e.turn} rev${e.revision} ${e.at} activity=${e.activity ? "yes" : "no"} (writes=${e.writes} checks=${e.checks})`)
+    out = out.replace("(no continuation turns yet)", lines.join("\n"))
+  }
+  return out
 }
 
 // Live-goal discovery (active/paused), newest `updated` first — crash

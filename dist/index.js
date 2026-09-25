@@ -12797,7 +12797,8 @@ function renderGoal(input, meta) {
       session: meta.session,
       maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS,
       turnsUsed: meta.turnsUsed ?? 0,
-      maxMinutes: input.maxMinutes ?? DEFAULT_MAX_MINUTES
+      maxMinutes: input.maxMinutes ?? DEFAULT_MAX_MINUTES,
+      ...meta.status === "paused" && meta.stopReason ? { stopReason: meta.stopReason } : {}
     }),
     "## Goal",
     "",
@@ -13072,6 +13073,19 @@ function appendLedger(text, entry, now) {
   return setUpdated2(lines.join(`
 `), now);
 }
+function carryHistory(newText, oldDoc) {
+  let out = newText;
+  if (oldDoc.log.length > 0) {
+    out = out.replace("(no checks recorded yet)", oldDoc.log.join(`
+`));
+  }
+  if (oldDoc.ledger.length > 0) {
+    const lines = oldDoc.ledger.map((e) => `- turn ${e.turn} rev${e.revision} ${e.at} activity=${e.activity ? "yes" : "no"} (writes=${e.writes} checks=${e.checks})`);
+    out = out.replace("(no continuation turns yet)", lines.join(`
+`));
+  }
+  return out;
+}
 function rankLiveGoals(entries) {
   return entries.map((e) => ({ name: e.name, doc: parseGoalLoose(e.text) })).filter((e) => e.doc !== null && isGoalLive(e.doc.status)).sort((a, b) => a.doc.updated < b.doc.updated ? 1 : a.doc.updated > b.doc.updated ? -1 : a.name.localeCompare(b.name));
 }
@@ -13279,7 +13293,7 @@ var GOAL_COMMAND_TEMPLATE = [
   `- Argument "resume": call the goal_resume tool for the session's paused goal (optionally with addTurns if the user asked for more budget). If no live goal exists but queued goals do, promote the oldest via goal_resume instead. The user confirms in a dialog.`,
   '- Argument "next": promote the oldest queued goal via the goal_resume tool (no live goal must remain). The user confirms in a dialog.',
   '- Argument "discard" (also "stop"/"cancel"/"off"): call the goal_discard tool. The user confirms in a dialog.',
-  '- Argument starting with "add " (or the user clearly wants to queue without arming): draft the contract from the rest of the argument and call goal_write with arm=false — it becomes a queued, inert goal (no dialog).',
+  '- Argument starting with "add " (or the user clearly wants to queue without arming): create a NEW contract from the rest of the argument and call goal_write with arm=false — never revise an existing goal for an add, never omit arm. It becomes a queued, inert goal (no dialog).',
   '- Any other argument: treat it as a goal statement. Extract contract markers into the structured goal_write fields: --check "cmd" becomes a shell verification item, --contains "file::text" a file-contract item, --success "..." an extra success criterion, --constraint "..." goes into constraints, --non-goal "..." into nonGoals, --max-turns N and --max-minutes N set budgets. Draft a complete contract (goal, criteria, checks, constraints, non-goals), SHOW the verification items verbatim to the user, then call goal_write with arm=true — a confirmation dialog arms the autonomous loop. If this session already has a live goal, say so and offer revise/queue/discard instead.',
   ""
 ].join(`
@@ -13498,14 +13512,14 @@ function readGoalDir(worktree) {
     return [];
   return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync2(join2(dir, name), "utf8") }));
 }
-function resolveSessionGoal(state, opts = {}) {
+function resolveSessionGoal(state) {
   if (state.goalPath && existsSync(state.goalPath)) {
     const doc2 = parseGoalLoose(readFileSync2(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
   }
-  const live = rankLiveGoals(readGoalDir(state.worktree)).find((e) => opts.anyOwner || !e.doc.session || e.doc.session === state.sessionID);
+  const live = rankLiveGoals(readGoalDir(state.worktree))[0];
   if (live) {
     const path = join2(goalDirOf(state.worktree), live.name);
     state.goalPath = path;
@@ -13566,7 +13580,7 @@ var goalWriteTool = tool({
       throw new GoalError(`This session already has a goal: ${relFrom(state.worktree, existing.path)} (status: ${existing.doc.status}). Re-run goal_write with revise=true to edit its contract, /goal add to queue a new one, or goal_discard to abandon it first.`);
     }
     if (existing) {
-      const text2 = renderGoal({
+      const text2 = carryHistory(renderGoal({
         ...input,
         ...input.maxTurns === undefined ? { maxTurns: existing.doc.maxTurns } : {},
         ...input.maxMinutes === undefined ? { maxMinutes: existing.doc.maxMinutes } : {}
@@ -13576,8 +13590,9 @@ var goalWriteTool = tool({
         created: existing.doc.created,
         revision: existing.doc.revision + 1,
         ...existing.doc.session ? { session: existing.doc.session } : {},
-        turnsUsed: existing.doc.turnsUsed
-      });
+        turnsUsed: existing.doc.turnsUsed,
+        ...existing.doc.status === "paused" && existing.doc.stopReason ? { stopReason: existing.doc.stopReason } : {}
+      }), existing.doc);
       atomicWrite(existing.path, text2);
       const doc3 = parseGoal(text2);
       context.metadata({ title: `Revise goal (rev ${doc3.revision}): ${doc3.goal}` });
@@ -13726,7 +13741,7 @@ var goalResumeTool = tool({
   },
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, worktreeFor(context));
-    let goal = resolveSessionGoal(state, { anyOwner: true });
+    let goal = resolveSessionGoal(state);
     if (!goal || goal.doc.status === "queued") {
       const oldest = rankQueuedGoals(readGoalDir(state.worktree))[0];
       if (oldest) {
@@ -13879,8 +13894,10 @@ async function continueIfEligible(client, sessionID) {
     try {
       const info = await client.session.get({ path: { id: sessionID } });
       const wt = effectiveWorktree(info?.worktree, info?.directory);
-      if (!wt)
+      if (!wt) {
+        goalProbe(`skip: no worktree for lazy seed session=${sessionID}`);
         return;
+      }
       state = ensureSession(sessionID, wt);
       goalProbe(`lazy-seeded session=${sessionID} worktree=${wt}`);
     } catch (err) {
@@ -13889,10 +13906,14 @@ async function continueIfEligible(client, sessionID) {
     }
   }
   const goal = resolveLiveGoal(state);
-  if (!goal || goal.doc.status !== "active")
+  if (!goal || goal.doc.status !== "active") {
+    goalProbe(`skip: no live active goal session=${sessionID}`);
     return;
-  if (goal.doc.session && goal.doc.session !== sessionID)
+  }
+  if (goal.doc.session && goal.doc.session !== sessionID) {
+    goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session}`);
     return;
+  }
   continuationInFlight.add(sessionID);
   try {
     if (pendingContinuationTurn.has(sessionID)) {
@@ -13938,7 +13959,8 @@ async function continueIfEligible(client, sessionID) {
           goalProbe(`skip: session busy again session=${sessionID} status=${t}`);
           return;
         }
-      } catch {
+      } catch (err) {
+        goalProbe(`skip: status check failed session=${sessionID} err=${String(err)}`);
         return;
       }
     }

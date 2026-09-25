@@ -7,7 +7,7 @@ import { join } from "node:path"
 // Debounce must be tiny BEFORE plugin.ts is imported (module-level const).
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 const { server } = await import("../plugin.ts")
-import { parseGoal } from "../src/goal-file.ts"
+import { appendLedger, parseGoal } from "../src/goal-file.ts"
 import { setShellRunnerForTests } from "../src/run-check.ts"
 
 const NOW_PREFIX = "goal-mode-test"
@@ -234,6 +234,52 @@ test("goal_write revise bumps the revision and keeps status/owner/budget", async
     assert.equal(doc.session, sid)
     assert.equal(doc.maxTurns, 5)
     assert.equal(doc.criteria.length, 2)
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("goal_write revise carries the Check Log and Turn Ledger audit trail", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "goal-revise-hist-"))
+  try {
+    setShellRunnerForTests(fakeRunnerPass)
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = await armGoal(hooks, wt)
+    // Produce a Check Log (goal_check) and a Turn Ledger entry (one
+    // continuation turn with activity), then revise the contract.
+    await hooks.tool.goal_check.execute({}, toolCtx(sid, wt))
+    const file = goalFiles(wt)[0]
+    writeFileSync(join(wt, ".opencode", "goal", file.name), appendLedger(file.text, { turn: 1, revision: 1, at: "2026-09-25T10:00:00+08:00", activity: true, writes: 2, checks: 1 }, "2026-09-25T10:00:00+08:00"))
+    await hooks.tool.goal_write.execute({ ...goalArgs({ goal: "make the suite greener" }), revise: true }, toolCtx(sid, wt, denyAsk))
+    const after = goalFiles(wt)[0]
+    const doc = parseGoal(after.text)
+    assert.equal(doc.revision, 2, "revision bumped")
+    assert.equal(doc.log.length, 2, "both rev1 Check Log lines survive the revision")
+    assert.match(doc.log[0], /rev1 #1 OK .*`npm test`/)
+    assert.equal(doc.ledger.length, 1, "the rev1 Turn Ledger entry survives the revision")
+    assert.match(after.text, /- turn 1 rev1 .*activity=yes \(writes=2 checks=1\)/)
+    await hooks.dispose?.()
+  } finally {
+    setShellRunnerForTests(null)
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("goal_write revise keeps stop_reason of a paused goal", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "goal-revise-pause-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = await armGoal(hooks, wt)
+    await hooks.tool.goal_pause.execute({ blocker: "waiting on an external API key" }, toolCtx(sid, wt))
+    assert.equal(liveDoc(wt).doc.status, "paused")
+    await hooks.tool.goal_write.execute({ ...goalArgs({ goal: "make the suite green once unblocked" }), revise: true }, toolCtx(sid, wt, denyAsk))
+    const { doc, name } = liveDoc(wt)
+    assert.equal(doc.status, "paused", "status stays paused across the revision")
+    assert.equal(doc.stopReason, "blocker", "stop_reason survives the revision")
+    assert.match(readFileSync(join(wt, ".opencode", "goal", name), "utf8"), /^stop_reason: blocker$/m)
     await hooks.dispose?.()
   } finally {
     rmSync(wt, { recursive: true, force: true })

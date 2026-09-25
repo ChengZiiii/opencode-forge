@@ -30,6 +30,7 @@ import {
   atomicWrite,
   budgetState,
   bumpBudget,
+  carryHistory,
   completeCheckFailures,
   goalFileName,
   incTurns,
@@ -115,7 +116,7 @@ const GOAL_COMMAND_TEMPLATE = [
   '- Argument "resume": call the goal_resume tool for the session\'s paused goal (optionally with addTurns if the user asked for more budget). If no live goal exists but queued goals do, promote the oldest via goal_resume instead. The user confirms in a dialog.',
   '- Argument "next": promote the oldest queued goal via the goal_resume tool (no live goal must remain). The user confirms in a dialog.',
   '- Argument "discard" (also "stop"/"cancel"/"off"): call the goal_discard tool. The user confirms in a dialog.',
-  '- Argument starting with "add " (or the user clearly wants to queue without arming): draft the contract from the rest of the argument and call goal_write with arm=false — it becomes a queued, inert goal (no dialog).',
+  '- Argument starting with "add " (or the user clearly wants to queue without arming): create a NEW contract from the rest of the argument and call goal_write with arm=false — never revise an existing goal for an add, never omit arm. It becomes a queued, inert goal (no dialog).',
   "- Any other argument: treat it as a goal statement. Extract contract markers into the structured goal_write fields: --check \"cmd\" becomes a shell verification item, --contains \"file::text\" a file-contract item, --success \"...\" an extra success criterion, --constraint \"...\" goes into constraints, --non-goal \"...\" into nonGoals, --max-turns N and --max-minutes N set budgets. Draft a complete contract (goal, criteria, checks, constraints, non-goals), SHOW the verification items verbatim to the user, then call goal_write with arm=true — a confirmation dialog arms the autonomous loop. If this session already has a live goal, say so and offer revise/queue/discard instead.",
   "",
 ].join("\n")
@@ -419,19 +420,20 @@ function readGoalDir(worktree: string): Array<{ name: string; text: string }> {
 
 type ActiveGoal = { path: string; doc: GoalDoc }
 
-// The session's goal: the bound file if non-terminal, else the freshest live
-// goal owned by this session (crash recovery). Queued goals are workspace
-// queue entries — they bind only via the explicit path set at creation or
-// promotion; creating another queued goal never trips over an unrelated one.
-// `anyOwner` widens the live fallback to goals owned by other (e.g. dead)
-// sessions — used only by the explicit rebind path goal_resume.
-function resolveSessionGoal(state: SessionState, opts: { anyOwner?: boolean } = {}): ActiveGoal | null {
+// The session's goal: the bound file if non-terminal, else the freshest
+// live goal in the workspace (goals are workspace-visible like plans — a
+// fresh session sees, checks, and can gate the active goal; the CONTINUATION
+// engine alone is owner-restricted, enforced separately in the idle guard).
+// Queued goals are workspace queue entries — they bind only via the explicit
+// path set at creation or promotion; creating another queued goal never
+// trips over an unrelated one.
+function resolveSessionGoal(state: SessionState): ActiveGoal | null {
   if (state.goalPath && existsSync(state.goalPath)) {
     const doc = parseGoalLoose(readFileSync(state.goalPath, "utf8"))
     if (doc && !isGoalTerminal(doc.status)) return { path: state.goalPath, doc }
     state.goalPath = undefined
   }
-  const live = rankLiveGoals(readGoalDir(state.worktree)).find((e) => opts.anyOwner || !e.doc.session || e.doc.session === state.sessionID)
+  const live = rankLiveGoals(readGoalDir(state.worktree))[0]
   if (live) {
     const path = join(goalDirOf(state.worktree), live.name)
     state.goalPath = path
@@ -504,23 +506,30 @@ const goalWriteTool = tool({
       )
     }
     if (existing) {
-      const text = renderGoal(
-        {
-          ...input,
-          // A revision must not silently change the budgets: keep the old
-          // ones unless the caller passes new values (budget laundering via
-          // edit would defeat the hard ceilings).
-          ...(input.maxTurns === undefined ? { maxTurns: existing.doc.maxTurns } : {}),
-          ...(input.maxMinutes === undefined ? { maxMinutes: existing.doc.maxMinutes } : {}),
-        },
-        {
-          now,
-          status: existing.doc.status,
-          created: existing.doc.created,
-          revision: existing.doc.revision + 1,
-          ...(existing.doc.session ? { session: existing.doc.session } : {}),
-          turnsUsed: existing.doc.turnsUsed,
-        },
+      const text = carryHistory(
+        renderGoal(
+          {
+            ...input,
+            // A revision must not silently change the budgets: keep the old
+            // ones unless the caller passes new values (budget laundering via
+            // edit would defeat the hard ceilings).
+            ...(input.maxTurns === undefined ? { maxTurns: existing.doc.maxTurns } : {}),
+            ...(input.maxMinutes === undefined ? { maxMinutes: existing.doc.maxMinutes } : {}),
+          },
+          {
+            now,
+            status: existing.doc.status,
+            created: existing.doc.created,
+            revision: existing.doc.revision + 1,
+            ...(existing.doc.session ? { session: existing.doc.session } : {}),
+            turnsUsed: existing.doc.turnsUsed,
+            // A paused goal keeps its stop_reason across a revision: the
+            // pause reason is why the loop stopped, not part of the contract
+            // being edited.
+            ...(existing.doc.status === "paused" && existing.doc.stopReason ? { stopReason: existing.doc.stopReason } : {}),
+          },
+        ),
+        existing.doc,
       )
       atomicWrite(existing.path, text)
       const doc = parseGoal(text)
@@ -683,7 +692,7 @@ const goalResumeTool = tool({
   },
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, worktreeFor(context))
-    let goal = resolveSessionGoal(state, { anyOwner: true })
+    let goal = resolveSessionGoal(state)
     // Promotion (/goal next) takes the OLDEST queued goal in the workspace,
     // not whichever the generic resolver happened to bind.
     if (!goal || goal.doc.status === "queued") {
@@ -870,7 +879,10 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
     try {
       const info = (await client.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined
       const wt = effectiveWorktree(info?.worktree, info?.directory)
-      if (!wt) return
+      if (!wt) {
+        goalProbe(`skip: no worktree for lazy seed session=${sessionID}`)
+        return
+      }
       state = ensureSession(sessionID, wt)
       goalProbe(`lazy-seeded session=${sessionID} worktree=${wt}`)
     } catch (err) {
@@ -879,8 +891,14 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
     }
   }
   const goal = resolveLiveGoal(state)
-  if (!goal || goal.doc.status !== "active") return
-  if (goal.doc.session && goal.doc.session !== sessionID) return
+  if (!goal || goal.doc.status !== "active") {
+    goalProbe(`skip: no live active goal session=${sessionID}`)
+    return
+  }
+  if (goal.doc.session && goal.doc.session !== sessionID) {
+    goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session}`)
+    return
+  }
   continuationInFlight.add(sessionID)
   try {
     // No-progress accounting, only for turns the engine itself started. The
@@ -939,7 +957,8 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
           goalProbe(`skip: session busy again session=${sessionID} status=${t}`)
           return
         }
-      } catch {
+      } catch (err) {
+        goalProbe(`skip: status check failed session=${sessionID} err=${String(err)}`)
         return
       }
     }
