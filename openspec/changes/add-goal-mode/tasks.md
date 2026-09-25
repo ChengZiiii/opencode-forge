@@ -30,7 +30,7 @@
 
 - [x] 5.1 `bun run bundle` 产出自包含 dist（grep 无 external 残留、npm pack 白名单仍为 dist/SKILL.md/README.md）、typecheck、全量 node:test 通过
 - [x] 5.2 中环验证：commit 后本地 `file://` 装载冒烟（沿用 add-plan-harness 6.2 流程），goal 全链：武装门 → 排队/提升 → 续跑两轮 → goal_check 两类验证项 → 完成门 fail-closed 与通过（含自证缺条拒绝）→ pause/resume 显式续跑语 → 无进展自停 → 投递失败自停 → draft 抢占 → 解耦回归（plan 五工具行为逐字一致）
-- [ ] 5.3 终验（合并前门槛）：npm 发布 0.2.0 后实机 `--force` 升级，重复 5.2 全链 + plan 回归（禁写/两门/tick 零行为变化）
+- [x] 5.3 终验（合并前门槛）：npm 发布 0.2.0 后实机 `--force` 升级，重复 5.2 全链 + plan 回归（禁写/两门/tick 零行为变化）
 
 ## 6. 文档
 
