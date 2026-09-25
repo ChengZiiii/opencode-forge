@@ -26,10 +26,8 @@ test("worktree resolution: global-project root falls back to the launch director
 
 function makeCtx() {
   const agents = new Map()
-  const skills = []
   return {
     agents,
-    skills,
     ctx: {
       agent: {
         transform: async (cb) => {
@@ -45,22 +43,15 @@ function makeCtx() {
           })
         },
       },
-      skill: {
-        transform: async (cb) => {
-          await cb({ source: (s) => skills.push(s), list: () => skills })
-        },
-      },
     },
   }
 }
 
-test("v2 setup: registers the forge agent and the skill directory source", async () => {
-  const { ctx, agents, skills } = makeCtx()
+test("v2 setup: registers the forge agent", async () => {
+  const { ctx, agents } = makeCtx()
   await v2Setup(ctx)
   assert.ok(agents.has("forge"))
   assert.equal(agents.get("forge").mode, "primary")
-  assert.equal(skills.length, 1)
-  assert.equal(skills[0].type, "directory")
 })
 
 test("v2 setup: does not clobber an existing forge entry (create-only)", async () => {
@@ -83,7 +74,6 @@ test("v2 setup: silently skips on host shape drift without throwing", async () =
   await assert.doesNotReject(
     v2Setup({
       agent: { transform: async (cb) => cb({ get: 5, update: null }) },
-      skill: { transform: async (cb) => cb({ source: undefined }) },
     }),
   )
 })

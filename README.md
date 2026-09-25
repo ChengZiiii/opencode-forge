@@ -58,9 +58,9 @@ opencode plugin github:ChengZiiii/opencode-forge --global
 
 Local development: add `"file:///<repo abs path>"` to the `plugin` array in
 your opencode config. Single-file install: copy `dist/index.js` to
-`~/.config/opencode/plugin/forge.js` **and manually copy `SKILL.md`** to
-`~/.config/opencode/skills/forge-plan/SKILL.md` (the package has no installer
-script; that mode has no bundled skill otherwise).
+`~/.config/opencode/plugin/forge.js` — it is fully self-contained (the plan
+discipline rides inside the /plan command template; there is no separate
+skill file).
 
 Note: do not enable opencode's experimental plan mode
 (`OPENCODE_EXPERIMENTAL_PLAN_MODE`) together with forge — two plan mechanisms
@@ -77,7 +77,7 @@ the plugin never writes them):
     "forge": {
       "model": "provider/model",   // pick any model for forge
       "disable": true              // one-knob return to native: no forge,
-                                   // build/plan restored, no tools/commands/skill
+                                   // build/plan restored, no tools/commands
     }
   }
 }
@@ -108,7 +108,7 @@ What this plugin touches, exhaustively:
 | --- | --- | --- |
 | `<project>/.opencode/plan/*.md` | plan files | user data — kept forever, uninstall never deletes |
 | `<project>/.opencode/goal/*.md` | goal files (contract, Check Log, Turn Ledger) | user data — kept forever, uninstall never deletes |
-| merged config object (RAM only) | forge agent, native build/plan `disable`, `skills.paths` entry, `command.plan`, `command.goal`, goal permission keys | vanishes when the plugin is removed; nothing is written to disk |
+| merged config object (RAM only) | forge agent, native build/plan `disable`, `command.plan`, `command.goal`, goal permission keys | vanishes when the plugin is removed; nothing is written to disk |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
 
@@ -208,11 +208,12 @@ bun run bundle        # rebuild self-contained dist/index.js (committed)
 ```
 
 Architecture: `plugin.ts` (dual entry — v1 `server` full-featured + v2
-`setup` defensive forward-compat) + `src/plan-file.ts` / `src/goal-file.ts`
+`setup` defensive forward-compat; the /plan and /goal command templates each
+carry their own full discipline, hermes-style: the entry turn is the
+rulebook) + `src/plan-file.ts` / `src/goal-file.ts`
 (pure document cores, unit-tested, no opencode imports) + `src/run-check.ts`
 (shell/file-contract runner with tree-kill timeouts and a workspace path
-guard) + `SKILL.md` (planning discipline, discovered via
-`config.skills.paths`). Behavioral changes go through the
+guard). Behavioral changes go through the
 OpenSpec workflow in `openspec/` — see AGENTS.md. Common pitfalls live in
 `../opencode-plugin-dev-pitfalls.md`.
 

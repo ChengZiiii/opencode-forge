@@ -12335,8 +12335,7 @@ function tool(input) {
 tool.schema = exports_external;
 // plugin.ts
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { fileURLToPath } from "node:url";
-import { dirname, join as join2, relative } from "node:path";
+import { join as join2, relative } from "node:path";
 import { tmpdir } from "node:os";
 
 // src/plan-file.ts
@@ -13251,9 +13250,6 @@ function formatOutcomes(outcomes) {
 }
 
 // plugin.ts
-var bundleDir = dirname(fileURLToPath(import.meta.url));
-var candidateDirs = [bundleDir, join2(bundleDir, "..")];
-var dataDir = candidateDirs.find((d) => existsSync(join2(d, "SKILL.md"))) ?? bundleDir;
 var FORGE_AGENT = "forge";
 var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
@@ -13268,7 +13264,19 @@ var PLAN_COMMAND_TEMPLATE = [
   "- Argument empty: for every non-terminal plan (status draft or approved) in the directory above, read its frontmatter and task checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.",
   '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked tasks to the user in one short list, then continue executing it — tick each task the moment it is done (plan_tick). If none exists, say so.',
   '- Argument "discard": call the plan_discard tool, then tell the user the plan was abandoned and writes are restored.',
-  "- Any other argument: treat it as the task goal — you are now in planning mode for this goal: read-only reconnaissance first (write tools are denied while drafting). Load the forge-plan skill (skill tool), then follow its discipline end to end: clarify ambiguities, plan_write the structured draft, present it briefly, plan_approve (a user dialog is the gate), then execute task by task with plan_tick immediately after each completion, and plan_close with per-criterion self-checks when all are ticked. Work expected to span sessions or many files belongs in a spec workflow (e.g. OpenSpec) — say so once and let the user choose.",
+  "- Any other argument: treat it as the task goal — you are now in planning mode for this goal. Follow the plan discipline below end to end.",
+  "",
+  "## Plan discipline",
+  "",
+  "Plans are short-horizon, single-task-goal documents (.opencode/plan/<date>-<slug>.md). The harness enforces the hard parts (draft write-ban, approval/close dialogs); you supply the engineering judgment. Never edit or create plan files by hand — every change goes through the plan_* tools.",
+  "",
+  "1. Reconnaissance (read-only): explore with read/grep/glob only — all write tools, bash, and subagents are DENIED while a draft exists; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous on scope, behavior, or acceptance, ask the user 1-3 focused questions FIRST — do not plan against assumptions the user could settle in one line.",
+  "2. Draft (plan_write): call plan_write with structured fields; the tool renders and validates the fixed sections, so a malformed plan cannot exist. Quality bar: goal = one line, the outcome not the activity; context = verified findings with file:line evidence, including what you ruled out and why; approach = the chosen approach AND at least one rejected alternative with the reason (a plan with no considered alternative is a guess); tasks = 3-8 concrete, independently verifiable steps, each doable in one sitting ('improve the code' is invalid; 'extract the timeout constant into config.ts and default it to 3000' is valid); risks = what could break, blast radius, rollback path; acceptance = criteria verifiable by a command, a file, or an observable behavior (vague criteria will fail the close); nonGoals = explicit out-of-scope items. To revise after feedback, call plan_write again — while in draft it overwrites the same file.",
+  "3. Approval (plan_approve): present briefly — goal, chosen approach with one line why, the numbered task list, the acceptance criteria — then call plan_approve. The user's confirmation in the dialog IS the approval; if they object, revise with plan_write and present again. Never implement before approval succeeds.",
+  "4. Execution (tick as you go): work tasks in order; call plan_tick with the task number immediately after EACH task's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected task or ask about revising (/plan with the same goal re-enters planning).",
+  "5. Completion (plan_close): when all tasks are ticked, self-check EVERY acceptance criterion with concrete evidence (file:line, command output, test result), then call plan_close with one check per criterion, pass/fail honest — a failing check refuses the close, and that is the design working, not an inconvenience. The user confirms closure in a dialog.",
+  "",
+  "Boundaries: /plan discard abandons the plan (terminal, file kept as history, writes restored); /plan resume continues an unfinished plan from its remaining tasks. Work expected to span multiple sessions or days of multi-file change is spec work (e.g. OpenSpec), not plan work — say so once and let the user choose.",
   ""
 ].join(`
 `);
@@ -14033,12 +14041,6 @@ var server = async (input) => {
         mode: existing?.mode ?? "primary",
         prompt: existing?.prompt ?? FORGE_PROMPT
       };
-      const cfgAny = cfg;
-      cfgAny.skills ??= {};
-      cfgAny.skills.paths ??= [];
-      if (!cfgAny.skills.paths.includes(dataDir)) {
-        cfgAny.skills.paths.push(dataDir);
-      }
       cfg.command ??= {};
       cfg.command["plan"] ??= {
         template: PLAN_COMMAND_TEMPLATE,
@@ -14189,13 +14191,6 @@ async function v2Setup(ctx) {
         agent.system = FORGE_PROMPT;
         agent.mode = "primary";
       });
-    });
-  }
-  if (typeof ctx.skill?.transform === "function") {
-    await ctx.skill.transform(async (draft) => {
-      if (typeof draft.source !== "function")
-        return;
-      draft.source({ type: "directory", path: dataDir });
     });
   }
 }

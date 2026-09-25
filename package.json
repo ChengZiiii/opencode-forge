@@ -14,7 +14,6 @@
   },
   "files": [
     "dist",
-    "SKILL.md",
     "README.md"
   ],
   "scripts": {
@@ -29,7 +28,7 @@
     "planning",
     "workflow",
     "single-agent",
-    "skill"
+    "goal"
   ],
   "license": "MIT",
   "author": "chengsongren",

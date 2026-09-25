@@ -18,11 +18,10 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
 
 | 文件 | 职责 |
 | ---- | ---- |
-| `plugin.ts` | 双入口：`server`（v1 hooks 全功能：config 注册 agent/命令/skill、tool 注册 5 个 plan_* + 6 个 goal_* 工具、permission.ask 禁写+钉门、event 播种会话与 idle 续跑调度、tool.execute.after 活动标记、system transform 注入 plan+goal 提醒、compaction 钩子）+ `setup`（v2 防御式只注册 agent/skill） |
+| `plugin.ts` | 双入口：`server`（v1 hooks 全功能：config 注册 agent/命令、tool 注册 5 个 plan_* + 6 个 goal_* 工具、permission.ask 禁写+钉门、event 播种会话与 idle 续跑调度、tool.execute.after 活动标记、system transform 注入 plan+goal 提醒、compaction 钩子）+ `setup`（v2 防御式只注册 agent）。纪律载体：`/plan`、`/goal` 命令模板各自自含全量纪律（hermes 式：进入轮即规则书，系统提示词零纪律），无捆绑 skill |
 | `src/plan-file.ts` | plan 纯函数核心：slug/文件名、渲染/解析、结构校验、打勾变换、状态机、close 校验、active 发现排序。**无 @opencode-ai 依赖、无副作用** |
 | `src/goal-file.ts` | goal 纯函数核心：契约渲染/解析（frontmatter+7 章节）、Check Log（runId 幂等追加）/Turn Ledger、预算状态、迁移状态机（paused 必带 stop_reason）、`carryHistory`（修订保留审计轨迹）、live/queued 发现排序。**无 @opencode-ai 依赖、无副作用、不 import plan-file（解耦红线）** |
 | `src/run-check.ts` | 宿主验证执行器：shell（tree-kill 超时：win32 taskkill /T、POSIX 进程组）、file-contract（工作区内路径逃逸拒绝）、可注入 runner 测试缝 |
-| `SKILL.md` | 规划纪律（侦察→澄清→落盘→呈批→打勾→自检→关闭 + OpenSpec 分层边界），经 `config.skills.paths` 单通道分发 |
 | `tests/*.test.mjs` | node:test 单测四件套：`plan-file`（纯函数）/ `goal-file`（纯函数）/ `goal-mode`（stub client + 可注入 runner 覆盖全部工具与续跑引擎；`FORGE_GOAL_DEBOUNCE_MS=10` 须在 import plugin.ts 前设置）/ `v2-setup`（v2 形态守卫） |
 | `dist/index.js` | 自包含构建产物（含 @opencode-ai/plugin + zod），**入库** |
 
@@ -53,7 +52,7 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
 ## v1 / v2 双入口
 
 - npm/github 安装（`opencode plugin`）→ v1 loader 只读 `server`，全功能。
-- v2 loader 只调 `setup`：仅注册 agent + skill（结构化类型 + `?.` 守卫，
+- v2 loader 只调 `setup`：仅注册 agent（结构化类型 + `?.` 守卫，
   只创建不覆盖；字段用 v2 的 `system`）。**v2 @1.18 无 tool/permission 域**，
   禁写与双门只能 v1 实现。上游补齐后按 vision-bridge 既定路线迁移。
 
@@ -66,7 +65,7 @@ bun run bundle        # dist 自包含重建（严禁 --packages external）
 # 常驻：bun build ./plugin.ts --outfile ./dist/index.js --target node --format esm --watch
 ```
 
-- SKILL.md 改动零手动：skills.paths 直扫包目录，重启 opencode 即生效。
+- 纪律改动（/plan、/goal 模板文本）零手动：模板随 dist 打包，重启 opencode 即生效。
 - 沙盒隔离测试：`OPENCODE_CONFIG_DIR=<临时目录>` 后跑 opencode，不污染真实配置。
 - goal 全链 E2E：`scripts/sandbox-e2e-setup.mjs` 写沙盒配置；
   `scripts/live-loop-e2e.mjs <baseUrl> <absWorkspace>` 对 `opencode serve`
@@ -85,12 +84,12 @@ bun run bundle        # dist 自包含重建（严禁 --packages external）
 - `scripts` 只允许 `bundle` / `test` / `typecheck`（七个 git 准备触发器
   名单外的安全名）；**严禁** `workspaces` 字段。
 - dist 入库（.gitignore 不含 dist），构建自包含。
-- `files` 白名单 = dist + SKILL.md + README.md；发布前 `npm pack --dry-run`
+- `files` 白名单 = dist + README.md；发布前 `npm pack --dry-run`
   核对。
 
 ## 提交规范
 
-conventional 风格：`plugin:` / `skill:` / `src:` / `tests:` / `docs:` / `chore:`。
+conventional 风格：`plugin:` / `src:` / `tests:` / `docs:` / `chore:`。
 
 ## OpenSpec 规格工作流（libretto）
 
