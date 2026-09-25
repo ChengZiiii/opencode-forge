@@ -76,10 +76,20 @@ export const defaultShellRunner: ShellRunner = (cmd, opts) =>
       timedOut = true
       killTree()
     }, opts.timeoutMs)
+    // Safety net: never hold the gate longer than timeout + 30s even if the
+    // tree kill raced (orphaned grand-child still streaming). Unref'd and
+    // cleared on settle so a completed check leaves no timer delaying
+    // process exit.
+    const failsafe = setTimeout(
+      () => settle({ code: null, output, timedOut: true, spawnError: "timeout settle fallback" }),
+      opts.timeoutMs + 30_000,
+    )
+    failsafe.unref?.()
     const settle = (r: { code: number | null; output: string; timedOut: boolean; spawnError?: string }) => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      clearTimeout(failsafe)
       resolveRun(r)
     }
     child.stdout?.on("data", (d: Buffer) => {
@@ -90,9 +100,6 @@ export const defaultShellRunner: ShellRunner = (cmd, opts) =>
     })
     child.on("error", (err) => settle({ code: null, output, timedOut, spawnError: err.message }))
     child.on("close", (code) => settle({ code, output, timedOut }))
-    // Safety net: never hold the gate longer than timeout + 30s even if the
-    // tree kill raced (orphaned grand-child still streaming).
-    setTimeout(() => settle({ code: null, output, timedOut: true, spawnError: "timeout settle fallback" }), opts.timeoutMs + 30_000)
   })
 
 // Test seam: swap the shell runner (goal-mode tests inject fakes).

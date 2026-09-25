@@ -73,6 +73,9 @@ export type LedgerEntry = { turn: number; revision: number; at: string; activity
 export type GoalDoc = {
   status: GoalStatus
   created: string
+  /** Wall-clock budget anchor: when this goal last became active. Empty for
+   *  queued goals and legacy files (budget falls back to `created`). */
+  armedAt: string
   updated: string
   revision: number
   session: string
@@ -181,9 +184,11 @@ export function goalFileName(date: string, slug: string, existingNames: string[]
 
 // Atomic file replace: a crash mid-write leaves either the old or the new
 // complete document, never a hybrid (goal files are rewritten every
-// continuation turn, so the crash window matters more than for plans).
+// continuation turn, so the crash window matters more than for plans). The
+// tmp name carries pid+random so concurrent writers (workspace-visible goal
+// tools + the continuation engine) never share a tmp file.
 export function atomicWrite(file: string, text: string): void {
-  const tmp = `${file}.tmp`
+  const tmp = `${file}.${process.pid}-${Math.random().toString(36).slice(2, 6)}.tmp`
   writeFileSync(tmp, text)
   renameSync(tmp, file)
 }
@@ -236,6 +241,7 @@ function frontmatterBlock(meta: {
   maxTurns: number
   turnsUsed: number
   maxMinutes: number
+  armedAt?: string
   stopReason?: StopReason
 }): string {
   const lines = [
@@ -245,6 +251,7 @@ function frontmatterBlock(meta: {
     `updated: ${meta.updated}`,
     `revision: ${meta.revision}`,
   ]
+  if (meta.armedAt) lines.push(`armed_at: ${meta.armedAt}`)
   if (meta.session) lines.push(`session: ${meta.session}`)
   lines.push(`max_turns: ${meta.maxTurns}`, `turns_used: ${meta.turnsUsed}`, `max_minutes: ${meta.maxMinutes}`)
   if (meta.status === "paused" && meta.stopReason) lines.push(`stop_reason: ${meta.stopReason}`)
@@ -261,6 +268,7 @@ export function renderGoal(
     revision?: number
     session?: string
     turnsUsed?: number
+    armedAt?: string
     stopReason?: StopReason
   },
 ): string {
@@ -280,6 +288,7 @@ export function renderGoal(
       maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS,
       turnsUsed: meta.turnsUsed ?? 0,
       maxMinutes: input.maxMinutes ?? DEFAULT_MAX_MINUTES,
+      ...(meta.armedAt ? { armedAt: meta.armedAt } : {}),
       ...(meta.status === "paused" && meta.stopReason ? { stopReason: meta.stopReason } : {}),
     }),
     "## Goal",
@@ -416,6 +425,7 @@ export function parseGoal(text: string): GoalDoc {
   return {
     status,
     created: fm.created ?? "",
+    armedAt: fm.armed_at ?? "",
     updated: fm.updated ?? "",
     revision: Math.max(1, num(fm.revision, 1)),
     session: fm.session ?? "",
@@ -478,6 +488,11 @@ export function transitionGoal(
   if (to === "active") {
     if (!opts.session) throw new GoalError("Arming/resuming requires the owning session id")
     next = setFm(next, "session", opts.session)
+    // Re-arming restarts the wall-clock budget window (spec: budget minutes
+    // count "since arming", not since the queued file was created). Resume
+    // passes an ask gate, so a user re-arming a budget-time goal is
+    // explicitly granting a fresh window.
+    next = setFm(next, "armed_at", now)
     next = next.replace(/^stop_reason:.*$\r?\n?/m, "")
   }
   return setUpdated(next, now)
@@ -497,9 +512,13 @@ export function bumpBudget(text: string, addTurns: number, now: string): string 
 }
 
 // "ok" while both budget tracks have room; the first exhausted track wins.
+// The wall-clock track anchors on armed_at (the last time this goal became
+// active — arming, promotion, or resume), falling back to created only for
+// legacy files written before armed_at existed. A queued-then-promoted goal
+// therefore gets a full window, not one silently consumed while inert.
 export function budgetState(doc: GoalDoc): "ok" | "budget-turns" | "budget-time" {
   if (doc.turnsUsed >= doc.maxTurns) return "budget-turns"
-  const start = Date.parse(doc.created)
+  const start = Date.parse(doc.armedAt || doc.created)
   if (Number.isFinite(start) && Date.now() - start > doc.maxMinutes * 60_000) return "budget-time"
   return "ok"
 }
@@ -581,11 +600,13 @@ export function appendLedger(text: string, entry: LedgerEntry, now: string): str
 export function carryHistory(newText: string, oldDoc: GoalDoc): string {
   let out = newText
   if (oldDoc.log.length > 0) {
-    out = out.replace("(no checks recorded yet)", oldDoc.log.join("\n"))
+    // Function replacement: the carried lines are arbitrary command output
+    // and would be mangled as a string replacement ($&, $', $$ expand).
+    out = out.replace("(no checks recorded yet)", () => oldDoc.log.join("\n"))
   }
   if (oldDoc.ledger.length > 0) {
     const lines = oldDoc.ledger.map((e) => `- turn ${e.turn} rev${e.revision} ${e.at} activity=${e.activity ? "yes" : "no"} (writes=${e.writes} checks=${e.checks})`)
-    out = out.replace("(no continuation turns yet)", lines.join("\n"))
+    out = out.replace("(no continuation turns yet)", () => lines.join("\n"))
   }
   return out
 }

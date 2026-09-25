@@ -837,3 +837,86 @@ test("decoupling: goal core modules import nothing from plan-file; gate tools re
   const seg = pluginSrc.slice(pluginSrc.indexOf("const goalCheckTool"), pluginSrc.indexOf("const goalPauseTool"))
   assert.ok(!seg.includes("resolveActivePlan") && !seg.includes("planPath"), "goal_check/goal_complete read no plan state")
 })
+
+// ---------------------------------------------------------------------------
+// Review regression tests (post-0.2.0 findings)
+// ---------------------------------------------------------------------------
+
+test("promotion of an old queued goal re-arms the wall-clock budget (armed_at)", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "goal-promo-clock-"))
+  try {
+    setShellRunnerForTests(fakeRunnerPass)
+    const { serverPromise, prompts } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    // Queue a goal whose created timestamp is long past its 5-minute window.
+    const sidA = nextSid()
+    await hooks.tool.goal_write.execute({ ...goalArgs({ maxMinutes: 5 }), arm: false }, toolCtx(sidA, wt))
+    const file = goalFiles(wt)[0]
+    const goalPath = join(wt, ".opencode", "goal", file.name)
+    const old = new Date(Date.now() - 30 * 60_000).toISOString()
+    writeFileSync(goalPath, readFileSync(goalPath, "utf8").replace(/^created:.*$/m, `created: ${old}`))
+    // A second session promotes it through the resume gate and idles.
+    const sidB = nextSid()
+    await hooks.tool.goal_resume.execute({}, toolCtx(sidB, wt, allowAsk))
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sidB } } })
+    await sleep(60)
+    assert.equal(prompts.length, 1, "fresh armed_at must let the promoted goal continue instead of budget-pausing on stale created")
+    assert.match(goalFiles(wt)[0].text, /^turns_used: 1$/m)
+    await hooks.dispose?.()
+  } finally {
+    setShellRunnerForTests(null)
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("disable knob: the continuation engine must not inject briefs", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "goal-disable-idle-"))
+  try {
+    const { serverPromise, prompts } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = await armGoal(hooks, wt)
+    await hooks.config({ agent: { forge: { disable: true } } })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(60)
+    assert.equal(prompts.length, 0, "a disabled plugin must not continue goals (the user cannot discard one either)")
+    // Re-enable and confirm the loop runs again (the knob is live).
+    await hooks.config({ agent: {} })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(60)
+    assert.equal(prompts.length, 1)
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("the completion turn gets its Turn Ledger line even after the goal is terminal", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "goal-gate-ledger-"))
+  try {
+    writeFileSync(join(wt, "done.txt"), "done\n")
+    setShellRunnerForTests(fakeRunnerPass)
+    const { serverPromise, prompts } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = await armGoal(hooks, wt)
+    // Turn 1: the engine continues; the turn has goal_check activity.
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(60)
+    assert.equal(prompts.length, 1)
+    await hooks["tool.execute.after"]({ tool: "goal_check", sessionID: sid, callID: "c", args: {} }, { title: "", output: "", metadata: {} })
+    // The model completes inside the continuation turn.
+    await hooks.tool.goal_complete.execute(
+      { attestations: [{ criterion: "npm test exits 0", pass: true, evidence: "exit=0 (fake runner)" }] },
+      toolCtx(sid, wt, allowAsk),
+    )
+    assert.equal(liveDoc(wt).doc.status, "completed")
+    // The next idle must still ledger turn 1 although the goal is terminal.
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(60)
+    assert.match(goalFiles(wt)[0].text, /- turn 1 rev1 \S+ activity=yes \(writes=0 checks=1\)/)
+    assert.equal(prompts.length, 1, "no further continuation for a terminal goal")
+    await hooks.dispose?.()
+  } finally {
+    setShellRunnerForTests(null)
+    rmSync(wt, { recursive: true, force: true })
+  }
+})

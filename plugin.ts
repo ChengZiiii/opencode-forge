@@ -452,8 +452,13 @@ function resolveLiveGoal(state: SessionState): ActiveGoal | null {
 function coerceChecks(rows: Array<{ shell?: string; containsFile?: string; containsText?: string; timeoutSec?: number }>): CheckItem[] {
   const items: CheckItem[] = []
   for (const c of rows) {
+    // Backticks would break the check-line round trip (the rendered
+    // document delimits commands/paths/text with them) — refuse at the door.
+    if ([c.shell, c.containsFile, c.containsText].some((v) => typeof v === "string" && v.includes("`"))) {
+      throw new GoalError("Verification items must not contain backticks (they break the goal file format)")
+    }
     if (typeof c.shell === "string" && c.shell.trim()) {
-      items.push({ kind: "shell", cmd: c.shell.trim(), ...(c.timeoutSec ? { timeoutSec: c.timeoutSec } : {}) })
+      items.push({ kind: "shell", cmd: c.shell.trim(), ...(c.timeoutSec ? { timeoutSec: Math.min(Math.max(1, c.timeoutSec), 600) } : {}) })
     } else if (typeof c.containsFile === "string" && c.containsFile.trim() && typeof c.containsText === "string" && c.containsText.trim()) {
       items.push({ kind: "contains", file: c.containsFile.trim(), text: c.containsText })
     } else {
@@ -523,6 +528,9 @@ const goalWriteTool = tool({
             revision: existing.doc.revision + 1,
             ...(existing.doc.session ? { session: existing.doc.session } : {}),
             turnsUsed: existing.doc.turnsUsed,
+            // The wall-clock window keeps running across a contract edit
+            // (revising is not re-arming; budgets carry over by contract).
+            ...(existing.doc.armedAt ? { armedAt: existing.doc.armedAt } : {}),
             // A paused goal keeps its stop_reason across a revision: the
             // pause reason is why the loop stopped, not part of the contract
             // being edited.
@@ -559,7 +567,7 @@ const goalWriteTool = tool({
     const text = renderGoal(input, {
       now,
       status: arm ? "active" : "queued",
-      ...(arm ? { session: context.sessionID } : {}),
+      ...(arm ? { session: context.sessionID, armedAt: now } : {}),
     })
     atomicWrite(path, text)
     state.goalPath = path
@@ -873,58 +881,84 @@ async function autoPauseGoal(client: GoalClient, state: SessionState, goal: Acti
 // Full guard chain, then send one continuation. Any unexpected error inside
 // degrades to "skip this round" — the loop never fights the host.
 async function continueIfEligible(client: GoalClient, sessionID: string): Promise<void> {
+  // The disable knob must gate the autonomous loop hardest of all: with the
+  // goal tools removed the user could not even discard a leftover goal, so
+  // the engine must never inject continuation prompts while disabled.
+  if (forgeDisabled) {
+    goalProbe(`skip: forge disabled session=${sessionID}`)
+    return
+  }
   if (continuationInFlight.has(sessionID)) return
-  let state = sessions.get(sessionID)
-  if (!state) {
-    try {
-      const info = (await client.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined
-      const wt = effectiveWorktree(info?.worktree, info?.directory)
-      if (!wt) {
-        goalProbe(`skip: no worktree for lazy seed session=${sessionID}`)
-        return
-      }
-      state = ensureSession(sessionID, wt)
-      goalProbe(`lazy-seeded session=${sessionID} worktree=${wt}`)
-    } catch (err) {
-      goalProbe(`lazy-seed failed session=${sessionID} err=${String(err)}`)
-      return
-    }
-  }
-  const goal = resolveLiveGoal(state)
-  if (!goal || goal.doc.status !== "active") {
-    goalProbe(`skip: no live active goal session=${sessionID}`)
-    return
-  }
-  if (goal.doc.session && goal.doc.session !== sessionID) {
-    goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session}`)
-    return
-  }
+  // Claim the in-flight slot BEFORE any await: two idles racing through the
+  // lazy-seed path must not both send a continuation (double-briefing and
+  // double turn accounting).
   continuationInFlight.add(sessionID)
   try {
+    let state = sessions.get(sessionID)
+    if (!state) {
+      try {
+        const info = (await client.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined
+        const wt = effectiveWorktree(info?.worktree, info?.directory)
+        if (!wt) {
+          goalProbe(`skip: no worktree for lazy seed session=${sessionID}`)
+          return
+        }
+        state = ensureSession(sessionID, wt)
+        goalProbe(`lazy-seeded session=${sessionID} worktree=${wt}`)
+      } catch (err) {
+        goalProbe(`lazy-seed failed session=${sessionID} err=${String(err)}`)
+        return
+      }
+    }
+    // Turn accounting FIRST, before the live-goal check: the previous
+    // continuation turn may have COMPLETED or paused the goal (that is the
+    // gate turn — exactly the one the ledger must not lose). The file is
+    // addressed directly via state.goalPath, which the engine sets when it
+    // sends a continuation, because a terminal goal is no longer discoverable
+    // through live-goal ranking.
+    let accountedContinuationTurn = false
+    let turnHadActivity = false
+    if (pendingContinuationTurn.has(sessionID)) {
+      accountedContinuationTurn = true
+      pendingContinuationTurn.delete(sessionID)
+      const act = turnActivity.get(sessionID)
+      turnHadActivity = !!act && (act.writes > 0 || act.checks > 0)
+      turnActivity.set(sessionID, { writes: 0, checks: 0 })
+      const ledgerPath = state.goalPath
+      if (ledgerPath && existsSync(ledgerPath)) {
+        try {
+          const fresh = parseGoalLoose(readFileSync(ledgerPath, "utf8"))
+          if (fresh && fresh.turnsUsed > 0) {
+            atomicWrite(
+              ledgerPath,
+              appendLedger(
+                readFileSync(ledgerPath, "utf8"),
+                { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 },
+                nowIso(),
+              ),
+            )
+          }
+        } catch (err) {
+          goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`)
+        }
+      }
+    }
+    const goal = resolveLiveGoal(state)
+    if (!goal || goal.doc.status !== "active") {
+      goalProbe(`skip: no live active goal session=${sessionID}`)
+      return
+    }
+    // An active goal without an owner session is anomalous (hand-edited or
+    // corrupted frontmatter): no session may claim its loop.
+    if (!goal.doc.session || goal.doc.session !== sessionID) {
+      goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session || "(none)"}`)
+      return
+    }
     // No-progress accounting, only for turns the engine itself started. The
     // finished turn's activity is also recorded in the goal's Turn Ledger
     // (auditable anti-batching evidence, visible at the completion gate).
-    if (pendingContinuationTurn.has(sessionID)) {
-      pendingContinuationTurn.delete(sessionID)
-      const act = turnActivity.get(sessionID)
-      const hadActivity = !!act && (act.writes > 0 || act.checks > 0)
-      turnActivity.set(sessionID, { writes: 0, checks: 0 })
-      try {
-        const fresh = parseGoalLoose(readFileSync(goal.path, "utf8"))
-        if (fresh && fresh.turnsUsed > 0) {
-          atomicWrite(
-            goal.path,
-            appendLedger(
-              readFileSync(goal.path, "utf8"),
-              { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: hadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 },
-              nowIso(),
-            ),
-          )
-        }
-      } catch (err) {
-        goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`)
-      }
-      if (hadActivity) {
+    if (accountedContinuationTurn) {
+      if (turnHadActivity) {
         noProgressStreak.delete(sessionID)
       } else {
         const n = (noProgressStreak.get(sessionID) ?? 0) + 1
@@ -970,6 +1004,9 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
       transportFails.delete(sessionID)
       pendingContinuationTurn.add(sessionID)
       turnActivity.set(sessionID, { writes: 0, checks: 0 })
+      // Remember which file this session's loop drives so the NEXT idle can
+      // ledger the turn even after the goal goes terminal.
+      state.goalPath = goal.path
       atomicWrite(goal.path, incTurns(readFileSync(goal.path, "utf8"), nowIso()))
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`)
     } catch (err) {
@@ -988,6 +1025,8 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
 }
 
 function scheduleIdleContinuation(client: GoalClient, sessionID: string): void {
+  // Belt for the engine guard: a disabled plugin must not even arm a timer.
+  if (forgeDisabled) return
   const existing = idleTimers.get(sessionID)
   if (existing) clearTimeout(existing)
   idleTimers.set(
@@ -1198,6 +1237,7 @@ export const server: Plugin = async (input) => {
           `[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`,
         )
       }
+      if (forgeDisabled) return
       const goal = resolveLiveGoal(state)
       if (goal) {
         const rel = relFrom(state.worktree, goal.path)
@@ -1215,6 +1255,7 @@ export const server: Plugin = async (input) => {
     // Goal facts survive compaction: the brief rides along in the compaction
     // prompt so post-compaction turns still follow the goal.
     "experimental.session.compacting": async (input, output) => {
+      if (forgeDisabled) return
       if (!input.sessionID) return
       const state = sessions.get(input.sessionID)
       if (!state) return
@@ -1230,12 +1271,16 @@ export const server: Plugin = async (input) => {
 
     // While the goal loop owns this session's continuation, suppress the
     // host's synthetic compaction auto-continue (no double continuation).
+    // Scoped to live goals (active OR paused): a paused goal's loop is merely
+    // parked, not resigned — a compaction must not hand the wheel back to the
+    // host's synthetic continue behind the resume gate.
     "experimental.compaction.autocontinue": async (input, output) => {
+      if (forgeDisabled) return
       if (!input.sessionID) return
       const state = sessions.get(input.sessionID)
       if (!state) return
       const goal = resolveLiveGoal(state)
-      if (goal && goal.doc.status === "active") output.enabled = false
+      if (goal) output.enabled = false
     },
   }
 }

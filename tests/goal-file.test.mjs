@@ -11,6 +11,7 @@ import {
   atomicWrite,
   budgetState,
   bumpBudget,
+  carryHistory,
   canTransitionGoal,
   completeCheckFailures,
   goalFileName,
@@ -255,4 +256,37 @@ test("atomic write: target always holds a complete document", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("budget wall-clock anchors on armed_at (since arming), not created", () => {
+  const base = parseGoal(renderActive())
+  const longAgo = new Date(Date.now() - 61 * 60_000).toISOString()
+  const fresh = new Date(Date.now() - 60_000).toISOString()
+  // armed_at wins over an old created: a queued-then-promoted goal keeps a
+  // full window instead of inheriting time consumed while inert.
+  assert.equal(budgetState({ ...base, created: longAgo, armedAt: fresh }), "ok")
+  assert.equal(budgetState({ ...base, created: fresh, armedAt: longAgo }), "budget-time")
+  // Legacy files without armed_at fall back to created.
+  assert.equal(budgetState({ ...base, created: longAgo, armedAt: "" }), "budget-time")
+})
+
+test("transitionGoal: entering active stamps armed_at; pause keeps it; resume re-arms it", () => {
+  const queued = renderGoal(sampleInput(), { now: NOW, status: "queued" })
+  const armed = transitionGoal(queued, "active", "2026-09-25T13:00:00.000Z", { session: "ses_a" })
+  assert.match(armed, /^armed_at: 2026-09-25T13:00:00\.000Z$/m)
+  const paused = transitionGoal(armed, "paused", "2026-09-25T13:05:00.000Z", { stopReason: "user" })
+  assert.match(paused, /^armed_at: 2026-09-25T13:00:00\.000Z$/m, "pausing keeps the original arming time")
+  const resumed = transitionGoal(paused, "active", "2026-09-25T14:00:00.000Z", { session: "ses_b" })
+  assert.match(resumed, /^armed_at: 2026-09-25T14:00:00\.000Z$/m, "resume re-arms the clock")
+})
+
+test("carryHistory: $-replacement patterns in audit lines survive literally", () => {
+  const withLog = renderActive().replace(
+    "(no checks recorded yet)",
+    () => "- 2026-09-25T12:00:00.000Z run=r1 rev1 #1 OK (1ms) `echo $& $' $$` :: exit=0",
+  )
+  const oldDoc = parseGoal(withLog)
+  const revised = carryHistory(renderGoal(sampleInput(), { now: NOW, status: "active", session: "ses_a", revision: 2 }), oldDoc)
+  assert.ok(revised.includes("`echo $& $' $$`"), "replacement patterns must not expand")
+  assert.equal(parseGoal(revised).log.length, 1)
 })

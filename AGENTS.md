@@ -23,7 +23,7 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
 | `src/goal-file.ts` | goal 纯函数核心：契约渲染/解析（frontmatter+7 章节）、Check Log（runId 幂等追加）/Turn Ledger、预算状态、迁移状态机（paused 必带 stop_reason）、`carryHistory`（修订保留审计轨迹）、live/queued 发现排序。**无 @opencode-ai 依赖、无副作用、不 import plan-file（解耦红线）** |
 | `src/run-check.ts` | 宿主验证执行器：shell（tree-kill 超时：win32 taskkill /T、POSIX 进程组）、file-contract（工作区内路径逃逸拒绝）、可注入 runner 测试缝 |
 | `SKILL.md` | 规划纪律（侦察→澄清→落盘→呈批→打勾→自检→关闭 + OpenSpec 分层边界），经 `config.skills.paths` 单通道分发 |
-| `tests/plan-file.test.mjs` / `tests/goal-file.test.mjs` / `tests/goal-mode.test.mjs` | node:test 单测（纯函数 + stub client 全引擎覆盖；`FORGE_GOAL_DEBOUNCE_MS=10` 须在 import plugin.ts 前设置） |
+| `tests/*.test.mjs` | node:test 单测四件套：`plan-file`（纯函数）/ `goal-file`（纯函数）/ `goal-mode`（stub client + 可注入 runner 覆盖全部工具与续跑引擎；`FORGE_GOAL_DEBOUNCE_MS=10` 须在 import plugin.ts 前设置）/ `v2-setup`（v2 形态守卫） |
 | `dist/index.js` | 自包含构建产物（含 @opencode-ai/plugin + zod），**入库** |
 
 ## 关键机制（改行为前必读）

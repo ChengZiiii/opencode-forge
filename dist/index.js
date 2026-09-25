@@ -12721,7 +12721,7 @@ function goalFileName(date5, slug, existingNames = []) {
   return name;
 }
 function atomicWrite(file2, text) {
-  const tmp = `${file2}.tmp`;
+  const tmp = `${file2}.${process.pid}-${Math.random().toString(36).slice(2, 6)}.tmp`;
   writeFileSync(tmp, text);
   renameSync(tmp, file2);
 }
@@ -12772,6 +12772,8 @@ function frontmatterBlock2(meta) {
     `updated: ${meta.updated}`,
     `revision: ${meta.revision}`
   ];
+  if (meta.armedAt)
+    lines.push(`armed_at: ${meta.armedAt}`);
   if (meta.session)
     lines.push(`session: ${meta.session}`);
   lines.push(`max_turns: ${meta.maxTurns}`, `turns_used: ${meta.turnsUsed}`, `max_minutes: ${meta.maxMinutes}`);
@@ -12798,6 +12800,7 @@ function renderGoal(input, meta) {
       maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS,
       turnsUsed: meta.turnsUsed ?? 0,
       maxMinutes: input.maxMinutes ?? DEFAULT_MAX_MINUTES,
+      ...meta.armedAt ? { armedAt: meta.armedAt } : {},
       ...meta.status === "paused" && meta.stopReason ? { stopReason: meta.stopReason } : {}
     }),
     "## Goal",
@@ -12940,6 +12943,7 @@ function parseGoal(text) {
   return {
     status,
     created: fm.created ?? "",
+    armedAt: fm.armed_at ?? "",
     updated: fm.updated ?? "",
     revision: Math.max(1, num(fm.revision, 1)),
     session: fm.session ?? "",
@@ -12992,6 +12996,7 @@ function transitionGoal(text, to, now, opts = {}) {
     if (!opts.session)
       throw new GoalError("Arming/resuming requires the owning session id");
     next = setFm(next, "session", opts.session);
+    next = setFm(next, "armed_at", now);
     next = next.replace(/^stop_reason:.*$\r?\n?/m, "");
   }
   return setUpdated2(next, now);
@@ -13010,7 +13015,7 @@ function bumpBudget(text, addTurns, now) {
 function budgetState(doc2) {
   if (doc2.turnsUsed >= doc2.maxTurns)
     return "budget-turns";
-  const start = Date.parse(doc2.created);
+  const start = Date.parse(doc2.armedAt || doc2.created);
   if (Number.isFinite(start) && Date.now() - start > doc2.maxMinutes * 60000)
     return "budget-time";
   return "ok";
@@ -13076,12 +13081,12 @@ function appendLedger(text, entry, now) {
 function carryHistory(newText, oldDoc) {
   let out = newText;
   if (oldDoc.log.length > 0) {
-    out = out.replace("(no checks recorded yet)", oldDoc.log.join(`
+    out = out.replace("(no checks recorded yet)", () => oldDoc.log.join(`
 `));
   }
   if (oldDoc.ledger.length > 0) {
     const lines = oldDoc.ledger.map((e) => `- turn ${e.turn} rev${e.revision} ${e.at} activity=${e.activity ? "yes" : "no"} (writes=${e.writes} checks=${e.checks})`);
-    out = out.replace("(no continuation turns yet)", lines.join(`
+    out = out.replace("(no continuation turns yet)", () => lines.join(`
 `));
   }
   return out;
@@ -13154,11 +13159,14 @@ var defaultShellRunner = (cmd, opts) => new Promise((resolveRun) => {
     timedOut = true;
     killTree();
   }, opts.timeoutMs);
+  const failsafe = setTimeout(() => settle({ code: null, output, timedOut: true, spawnError: "timeout settle fallback" }), opts.timeoutMs + 30000);
+  failsafe.unref?.();
   const settle = (r) => {
     if (settled)
       return;
     settled = true;
     clearTimeout(timer);
+    clearTimeout(failsafe);
     resolveRun(r);
   };
   child.stdout?.on("data", (d) => {
@@ -13171,7 +13179,6 @@ var defaultShellRunner = (cmd, opts) => new Promise((resolveRun) => {
   });
   child.on("error", (err) => settle({ code: null, output, timedOut, spawnError: err.message }));
   child.on("close", (code) => settle({ code, output, timedOut }));
-  setTimeout(() => settle({ code: null, output, timedOut: true, spawnError: "timeout settle fallback" }), opts.timeoutMs + 30000);
 });
 var shellRunner = defaultShellRunner;
 function truncateOutput(output) {
@@ -13534,8 +13541,11 @@ function resolveLiveGoal(state) {
 function coerceChecks(rows) {
   const items = [];
   for (const c of rows) {
+    if ([c.shell, c.containsFile, c.containsText].some((v) => typeof v === "string" && v.includes("`"))) {
+      throw new GoalError("Verification items must not contain backticks (they break the goal file format)");
+    }
     if (typeof c.shell === "string" && c.shell.trim()) {
-      items.push({ kind: "shell", cmd: c.shell.trim(), ...c.timeoutSec ? { timeoutSec: c.timeoutSec } : {} });
+      items.push({ kind: "shell", cmd: c.shell.trim(), ...c.timeoutSec ? { timeoutSec: Math.min(Math.max(1, c.timeoutSec), 600) } : {} });
     } else if (typeof c.containsFile === "string" && c.containsFile.trim() && typeof c.containsText === "string" && c.containsText.trim()) {
       items.push({ kind: "contains", file: c.containsFile.trim(), text: c.containsText });
     } else {
@@ -13591,6 +13601,7 @@ var goalWriteTool = tool({
         revision: existing.doc.revision + 1,
         ...existing.doc.session ? { session: existing.doc.session } : {},
         turnsUsed: existing.doc.turnsUsed,
+        ...existing.doc.armedAt ? { armedAt: existing.doc.armedAt } : {},
         ...existing.doc.status === "paused" && existing.doc.stopReason ? { stopReason: existing.doc.stopReason } : {}
       }), existing.doc);
       atomicWrite(existing.path, text2);
@@ -13620,7 +13631,7 @@ var goalWriteTool = tool({
     const text = renderGoal(input, {
       now,
       status: arm ? "active" : "queued",
-      ...arm ? { session: context.sessionID } : {}
+      ...arm ? { session: context.sessionID, armedAt: now } : {}
     });
     atomicWrite(path, text);
     state.goalPath = path;
@@ -13887,49 +13898,61 @@ async function autoPauseGoal(client, state, goal, reason, wrapup) {
   }
 }
 async function continueIfEligible(client, sessionID) {
+  if (forgeDisabled) {
+    goalProbe(`skip: forge disabled session=${sessionID}`);
+    return;
+  }
   if (continuationInFlight.has(sessionID))
     return;
-  let state = sessions.get(sessionID);
-  if (!state) {
-    try {
-      const info = await client.session.get({ path: { id: sessionID } });
-      const wt = effectiveWorktree(info?.worktree, info?.directory);
-      if (!wt) {
-        goalProbe(`skip: no worktree for lazy seed session=${sessionID}`);
-        return;
-      }
-      state = ensureSession(sessionID, wt);
-      goalProbe(`lazy-seeded session=${sessionID} worktree=${wt}`);
-    } catch (err) {
-      goalProbe(`lazy-seed failed session=${sessionID} err=${String(err)}`);
-      return;
-    }
-  }
-  const goal = resolveLiveGoal(state);
-  if (!goal || goal.doc.status !== "active") {
-    goalProbe(`skip: no live active goal session=${sessionID}`);
-    return;
-  }
-  if (goal.doc.session && goal.doc.session !== sessionID) {
-    goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session}`);
-    return;
-  }
   continuationInFlight.add(sessionID);
   try {
+    let state = sessions.get(sessionID);
+    if (!state) {
+      try {
+        const info = await client.session.get({ path: { id: sessionID } });
+        const wt = effectiveWorktree(info?.worktree, info?.directory);
+        if (!wt) {
+          goalProbe(`skip: no worktree for lazy seed session=${sessionID}`);
+          return;
+        }
+        state = ensureSession(sessionID, wt);
+        goalProbe(`lazy-seeded session=${sessionID} worktree=${wt}`);
+      } catch (err) {
+        goalProbe(`lazy-seed failed session=${sessionID} err=${String(err)}`);
+        return;
+      }
+    }
+    let accountedContinuationTurn = false;
+    let turnHadActivity = false;
     if (pendingContinuationTurn.has(sessionID)) {
+      accountedContinuationTurn = true;
       pendingContinuationTurn.delete(sessionID);
       const act = turnActivity.get(sessionID);
-      const hadActivity = !!act && (act.writes > 0 || act.checks > 0);
+      turnHadActivity = !!act && (act.writes > 0 || act.checks > 0);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
-      try {
-        const fresh = parseGoalLoose(readFileSync2(goal.path, "utf8"));
-        if (fresh && fresh.turnsUsed > 0) {
-          atomicWrite(goal.path, appendLedger(readFileSync2(goal.path, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: hadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+      const ledgerPath = state.goalPath;
+      if (ledgerPath && existsSync(ledgerPath)) {
+        try {
+          const fresh = parseGoalLoose(readFileSync2(ledgerPath, "utf8"));
+          if (fresh && fresh.turnsUsed > 0) {
+            atomicWrite(ledgerPath, appendLedger(readFileSync2(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+          }
+        } catch (err) {
+          goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
         }
-      } catch (err) {
-        goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
       }
-      if (hadActivity) {
+    }
+    const goal = resolveLiveGoal(state);
+    if (!goal || goal.doc.status !== "active") {
+      goalProbe(`skip: no live active goal session=${sessionID}`);
+      return;
+    }
+    if (!goal.doc.session || goal.doc.session !== sessionID) {
+      goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session || "(none)"}`);
+      return;
+    }
+    if (accountedContinuationTurn) {
+      if (turnHadActivity) {
         noProgressStreak.delete(sessionID);
       } else {
         const n = (noProgressStreak.get(sessionID) ?? 0) + 1;
@@ -13972,6 +13995,7 @@ async function continueIfEligible(client, sessionID) {
       transportFails.delete(sessionID);
       pendingContinuationTurn.add(sessionID);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
+      state.goalPath = goal.path;
       atomicWrite(goal.path, incTurns(readFileSync2(goal.path, "utf8"), nowIso()));
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
@@ -13989,6 +14013,8 @@ async function continueIfEligible(client, sessionID) {
   }
 }
 function scheduleIdleContinuation(client, sessionID) {
+  if (forgeDisabled)
+    return;
   const existing = idleTimers.get(sessionID);
   if (existing)
     clearTimeout(existing);
@@ -14124,6 +14150,8 @@ var server = async (input) => {
         const rule = active.doc.status === "draft" ? "while in draft, write operations are denied at the tool layer; present the summary then call plan_approve for approval, or /plan discard to abandon" : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close";
         output.system.push(`[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`);
       }
+      if (forgeDisabled)
+        return;
       const goal = resolveLiveGoal(state);
       if (goal) {
         const rel = relFrom(state.worktree, goal.path);
@@ -14133,6 +14161,8 @@ var server = async (input) => {
       }
     },
     "experimental.session.compacting": async (input2, output) => {
+      if (forgeDisabled)
+        return;
       if (!input2.sessionID)
         return;
       const state = sessions.get(input2.sessionID);
@@ -14148,13 +14178,15 @@ ${d.criteria.map((c, i) => `${i + 1}. ${c}`).join(`
 Post-compaction turns must keep following this goal and its constraints.`);
     },
     "experimental.compaction.autocontinue": async (input2, output) => {
+      if (forgeDisabled)
+        return;
       if (!input2.sessionID)
         return;
       const state = sessions.get(input2.sessionID);
       if (!state)
         return;
       const goal = resolveLiveGoal(state);
-      if (goal && goal.doc.status === "active")
+      if (goal)
         output.enabled = false;
     }
   };
