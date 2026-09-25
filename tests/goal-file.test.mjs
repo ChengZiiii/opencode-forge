@@ -145,7 +145,11 @@ test("transitionGoal: pause requires stop reason; resume rebinds owner and clear
 })
 
 test("budget: turns and wall-clock tracks, first exhausted wins", () => {
-  const base = parseGoal(renderActive())
+  // budgetState compares against the real clock, so the base doc must carry a
+  // fresh arm timestamp — the fixed NOW fixture would trip budget-time a day
+  // after it was written (pre-existing time bomb, fixed 2026-09-26).
+  const fresh = new Date().toISOString()
+  const base = parseGoal(renderGoal(sampleInput(), { now: fresh, status: "active", session: "ses_a" }))
   assert.equal(budgetState(base), "ok")
   assert.equal(budgetState({ ...base, turnsUsed: 25 }), "budget-turns")
   const longAgo = new Date(Date.now() - 61 * 60_000).toISOString()

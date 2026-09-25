@@ -1,7 +1,8 @@
 import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs"
-import { join, relative } from "node:path"
+import { execFileSync } from "node:child_process"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { isAbsolute, join, relative } from "node:path"
 import { tmpdir } from "node:os"
 import {
   PlanError,
@@ -48,6 +49,20 @@ import {
   type StopReason,
 } from "./src/goal-file.ts"
 import { formatOutcomes, outcomesAllOk, runChecks } from "./src/run-check.ts"
+import { killTree } from "./src/proc.ts"
+import { createJobManager, type Job } from "./src/job-manager.ts"
+import { HARD_MAX_WAIT_MS, POLL_WAIT_MAX_MS, jobsLogDir, pollJob, readJobLog, startJob } from "./src/job-runner.ts"
+import {
+  WATCHDOG_ENV_MARK,
+  clampStallMs,
+  createFileLedger,
+  createWatchdog,
+  parseMode,
+  watchdogLogDir,
+  type LedgerEntry,
+  type Watchdog,
+} from "./src/watchdog.ts"
+import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -151,6 +166,101 @@ const sessions = new Map<string, SessionState>()
 // injection when the user sets agent["forge"].disable = true (one-knob
 // return-to-native, forge-agent spec).
 let forgeDisabled = false
+
+// ---------------------------------------------------------------------------
+// Job supervisor (forge_shell / forge_jobs): non-blocking shell execution
+// with a four-condition completion race, session-owned jobs, and a
+// completion wake. See openspec job-supervisor spec + design.
+// ---------------------------------------------------------------------------
+
+// Plugin options (second server argument), captured at load.
+let jobsMode: "auto" | "forge" | "native" = "auto"
+let jobsKeepBuiltinShell = false
+
+// Capability probe: set when the native shell tool presents a
+// run_in_background parameter (tool.definition hook) or an experimental
+// background flag shows up in the host config.
+let nativeBackgroundSeen = false
+
+// Stage matrix (design D10): 0 = no native capability (full forge path,
+// builtin shell hidden on the plugin-created forge agent); 1 = native
+// run_in_background detected (stop hiding the builtin shell; forge_shell
+// remains the additive layer); 2 = manual-only confirmation that native
+// backgrounding is complete (forge_shell retires). Stage 2 is NEVER
+// auto-detected — "complete" is a semantic judgment only the user can make.
+function jobStage(): 0 | 1 | 2 {
+  if (jobsMode === "native") return 2
+  if (jobsMode === "forge") return 0
+  return nativeBackgroundSeen ? 1 : 0
+}
+
+const jobLogDir = jobsLogDir()
+const jobLedgerPath = join(jobLogDir, "ledger.jsonl")
+
+// Diagnostics ledger sink: bounded in memory by the manager; on disk a
+// JSONL file that resets once it passes 1MB.
+function jobLedgerSink(entry: Record<string, unknown>): void {
+  try {
+    mkdirSync(jobLogDir, { recursive: true })
+    if (existsSync(jobLedgerPath) && statSync(jobLedgerPath).size > 1_000_000) writeFileSync(jobLedgerPath, "")
+    appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}\n`)
+  } catch {
+    // A broken ledger write must never take the supervisor down.
+  }
+}
+
+const jobManager = createJobManager({ sink: jobLedgerSink })
+
+// Message-send client for completion wakes (promptAsync: fire-and-forget,
+// does not block the plugin fiber) and session lookups for handoff roots.
+type JobClient = {
+  session: {
+    promptAsync?: (opts: unknown) => Promise<unknown>
+    get?: (opts: unknown) => Promise<unknown>
+  }
+}
+let jobClient: JobClient | null = null
+
+function jobWakeText(job: Job): string {
+  return [
+    `[forge:job-complete] Background job ${job.id} finished (${job.state}${job.exitCode !== null ? `, exit ${job.exitCode}` : ""}).`,
+    `Command: ${job.cmd}`,
+    `Recent output:\n${job.tail.slice(-1500) || "(none)"}`,
+    "Details via forge_jobs (poll/log); the job stays in the registry until cleared.",
+  ].join("\n")
+}
+
+// Deliver queued completion wakes to a session that just went idle. A send
+// failure re-queues the wake (bounded by the manager's delivery window,
+// which abandons it to the ledger instead of looping forever).
+async function deliverJobWakes(sessionID: string): Promise<void> {
+  if (forgeDisabled || jobStage() >= 2) return
+  if (!jobClient || typeof jobClient.session.promptAsync !== "function") return
+  for (const job of jobManager.deliverWakesFor(sessionID)) {
+    try {
+      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: jobWakeText(job) }] } })
+    } catch {
+      job.wakeState = "queued"
+    }
+  }
+}
+
+// Root ancestor of a session for handoff rebinding, best-effort through the
+// host API; undefined when unresolvable (handoff then stays plugin-global).
+async function handoffTarget(sessionID: string): Promise<string | undefined> {
+  if (!jobClient || typeof jobClient.session.get !== "function") return undefined
+  let current = sessionID
+  for (let depth = 0; depth < 10; depth++) {
+    try {
+      const info = (await jobClient.session.get({ path: { id: current } })) as { parentID?: string } | undefined
+      if (!info?.parentID) return current === sessionID ? undefined : current
+      current = info.parentID
+    } catch {
+      return undefined
+    }
+  }
+  return current === sessionID ? undefined : current
+}
 
 const WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"])
 
@@ -743,8 +853,175 @@ const goalDiscardTool = tool({
   },
 })
 
+// ---------------------------------------------------------------------------
+// Job supervisor tools
+// ---------------------------------------------------------------------------
+
+const FORGE_SHELL_DESCRIPTION = [
+  "Run a shell command without ever blocking the session indefinitely. The call completes on the FIRST of: process exit (bound to the exit event — a detached grandchild holding the stdio pipes cannot suspend the call); success_pattern matching new output (opt-in regex); idle_ms with no new output (default 60000); max_wait_ms hard cap (default 120000, max 600000 — returns still-running, never kills).",
+  "Idle/max-wait return `still-running` with a jobId — the process stays alive; keep watching with forge_jobs poll / log, stop it with forge_jobs kill. run_in_background returns {jobId, logPath} immediately.",
+  "success_pattern semantics: a match completes the call as success; the process is kept alive by default (server semantics — the thing you just verified keeps running); pass keep_alive=false to kill its tree on match. Common patterns: dev servers `listening on|ready in|Local:`, builds `Compiled successfully|Done in`, test suites `passed|all tests`.",
+  "Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) MUST use this tool instead of the builtin shell.",
+].join("\n")
+
+// D10 stage-1 action: once the native run_in_background parameter exists,
+// forge_shell stays only as the supervision layer (idle/success/wake).
+const STAGE1_NOTE =
+  "Stage note: this host's builtin shell already offers a native run_in_background parameter — prefer that for plain backgrounding; keep using forge_shell when you need idle/success_pattern early return or exit wake messages."
+
+const forgeShellTool = tool({
+  description: FORGE_SHELL_DESCRIPTION,
+  args: {
+    command: tool.schema.string().describe("The shell command to run"),
+    workdir: tool.schema.string().optional().describe("Working directory (workspace-relative, or absolute)"),
+    run_in_background: tool.schema.boolean().optional().describe("Return {jobId, logPath} immediately, without waiting for any output or exit"),
+    idle_ms: tool.schema.number().int().nonnegative().optional().describe("No-new-output early-return threshold in ms (default 60000)"),
+    max_wait_ms: tool.schema.number().int().nonnegative().optional().describe("Hard cap on this call's wait in ms (default 120000, clamped to 600000); returns still-running, never kills"),
+    success_pattern: tool.schema.string().optional().describe("Regex; a match against new output completes the call as success immediately"),
+    keep_alive: tool.schema.boolean().optional().describe("After a success match: keep the process alive (default) or kill its tree (false)"),
+    notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)"),
+  },
+  execute: async (args, context) => {
+    if (jobStage() >= 2) {
+      throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.")
+    }
+    const state = ensureSession(context.sessionID, worktreeFor(context))
+    // Permission two-piece (pitfalls §4.5): plugin tools bypass permission
+    // evaluation, so context.ask() IS the posture; the config hook injects
+    // the matching "ask" rule so the request resolves to a real dialog. An
+    // explicit user deny always wins (the ask then rejects).
+    await gate(context.ask, "forge_shell", `forge_shell: ${args.command.slice(0, 100)}`)
+    let successPattern: RegExp | null = null
+    if (args.success_pattern) {
+      try {
+        successPattern = new RegExp(args.success_pattern)
+      } catch (err) {
+        throw new Error(`Invalid success_pattern: ${(err as Error).message}`)
+      }
+    }
+    const cwd = args.workdir ? (isAbsolute(args.workdir) ? args.workdir : join(state.worktree, args.workdir)) : state.worktree
+    const started = startJob(jobManager, {
+      cmd: args.command,
+      cwd,
+      ownerSession: context.sessionID,
+      worktree: state.worktree,
+      logDir: jobLogDir,
+      runInBackground: args.run_in_background === true,
+      ...(args.idle_ms !== undefined ? { idleMs: args.idle_ms } : {}),
+      ...(args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {}),
+      successPattern,
+      ...(args.keep_alive !== undefined ? { keepAlive: args.keep_alive } : {}),
+      ...(args.notify !== undefined ? { notify: args.notify } : {}),
+    })
+    context.metadata({ title: `forge_shell: ${args.command.slice(0, 60)}` })
+    if (args.run_in_background === true) {
+      return {
+        title: `job started: ${started.job.id}`,
+        output: [`[forge:job] Started in background.`, `jobId: ${started.job.id}`, `logPath: ${started.job.logPath}`, "Track with forge_jobs poll; a [forge:job-complete] message arrives on exit."].join("\n"),
+      }
+    }
+    const r = await started.settle
+    if (r.status === "exited") {
+      return {
+        title: `exit ${r.exitCode ?? "?"}`,
+        output: [
+          `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
+          ...(r.spawnError ? [`spawn error: ${r.spawnError}`] : []),
+          `output:\n${r.outputTail || "(none)"}`,
+        ].join("\n"),
+      }
+    }
+    if (r.status === "succeeded") {
+      return {
+        title: `success: ${r.matched}`,
+        output: [
+          `[forge:job] Success pattern matched: "${r.matched}".`,
+          r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : "The process tree was terminated (keep_alive=false).",
+          `output:\n${r.outputTail}`,
+        ].join("\n"),
+      }
+    }
+    return {
+      title: `still running (${Math.round(r.idleForMs / 1000)}s idle)`,
+      output: [
+        `[forge:job] Still running — ${Math.round(r.idleForMs / 1000)}s without new output (or the wait budget ran out). The process is alive as job ${started.job.id}.`,
+        `logPath: ${started.job.logPath}`,
+        `recent output:\n${r.outputTail || "(none yet)"}`,
+        "Next: forge_jobs poll to keep waiting, forge_jobs log for history, forge_jobs kill to stop.",
+      ].join("\n"),
+    }
+  },
+})
+
+const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"]
+
+const forgeJobsTool = tool({
+  description:
+    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it; log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry; handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+  args: {
+    action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
+    jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
+    waitMs: tool.schema.number().int().nonnegative().optional().describe("poll: bounded in-call wait (clamped to 30000)"),
+    offset: tool.schema.number().int().nonnegative().optional().describe("log: first line index; omitted = tail window"),
+    limit: tool.schema.number().int().positive().optional().describe("log: max lines (default 200)"),
+  },
+  execute: async (args, context) => {
+    if (jobStage() >= 2) throw new Error("[forge] The job supervisor is retired on this host.")
+    const action = String(args.action ?? "")
+    if (!FORGE_JOBS_ACTIONS.includes(action)) {
+      throw new Error(`Unknown action "${action}" — use one of: ${FORGE_JOBS_ACTIONS.join(", ")}.`)
+    }
+    if (action === "list") {
+      const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.scope}  ${j.cmd.slice(0, 60)}`)
+      return { title: `jobs (${rows.length})`, output: rows.length > 0 ? rows.join("\n") : "(no jobs)" }
+    }
+    if (!args.jobId) throw new Error(`Action "${action}" requires jobId.`)
+    const job = jobManager.get(args.jobId)
+    if (!job) throw new Error(`No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`)
+    if (action === "poll") {
+      const p = await pollJob(jobManager, args.jobId, args.waitMs ?? 0)
+      if (!p) throw new Error(`No job ${args.jobId}.`)
+      return {
+        title: `${job.id}: ${p.state}`,
+        output: [
+          `[forge:job] ${job.id}: ${p.state}${p.exitCode !== null ? ` exit=${p.exitCode}` : ""}${p.succeeded ? " (success pattern matched)" : ""}`,
+          `new output:\n${p.newOutput || "(none in this window)"}`,
+          `logPath: ${p.logPath}`,
+        ].join("\n"),
+      }
+    }
+    if (action === "log") {
+      const page = readJobLog(job.logPath, {
+        ...(args.offset !== undefined ? { offset: args.offset } : {}),
+        ...(args.limit !== undefined ? { limit: args.limit } : {}),
+      })
+      return {
+        title: `${job.id} log ${page.offset}-${page.offset + page.lines.length}/${page.total}`,
+        output: page.lines.length > 0 ? page.lines.join("\n") : "(empty)",
+      }
+    }
+    if (action === "kill") {
+      jobManager.kill(job)
+      return { title: `${job.id} killed`, output: `[forge:job] ${job.id}: tree kill issued (state: killed).` }
+    }
+    if (action === "clear") {
+      const ok = jobManager.clear(args.jobId)
+      return ok
+        ? { title: `${job.id} cleared`, output: `[forge:job] ${job.id} removed from the registry (log file untouched).` }
+        : { title: `${job.id} not cleared`, output: `[forge:job] ${job.id} is still running — kill it first.` }
+    }
+    // handoff
+    const target = await handoffTarget(context.sessionID)
+    jobManager.handoff(args.jobId, target)
+    return {
+      title: `${job.id} handed off`,
+      output: `[forge:job] ${job.id} promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`,
+    }
+  },
+})
+
 function forgeTools(): Record<string, ToolDefinition> {
-  return {
+  const tools: Record<string, ToolDefinition> = {
     plan_write: planWriteTool,
     plan_tick: planTickTool,
     plan_approve: planApproveTool,
@@ -757,6 +1034,11 @@ function forgeTools(): Record<string, ToolDefinition> {
     goal_resume: goalResumeTool,
     goal_discard: goalDiscardTool,
   }
+  if (jobStage() < 2) {
+    tools.forge_shell = forgeShellTool
+    tools.forge_jobs = forgeJobsTool
+  }
+  return tools
 }
 
 // Launch-directory seed from PluginInput: continued sessions (-c / --session)
@@ -1032,12 +1314,80 @@ function scheduleIdleContinuation(client: GoalClient, sessionID: string): void {
 // v1 server entry (the loader used by `opencode plugin` installs reads this)
 // ---------------------------------------------------------------------------
 
-export const server: Plugin = async (input) => {
+export const server: Plugin = async (input, options) => {
   hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || ""
   const client = input.client as unknown as GoalClient
+  jobClient = input.client as unknown as JobClient
+  const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown } } | undefined)?.jobs
+  if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
+  jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true
+
+  // hang-watchdog: invalid option values fall back to defaults and the
+  // fallback itself is ledgered (auditable misconfig, never a crash).
+  const wdOpts = (options as { watchdog?: { mode?: unknown; stallMs?: unknown } } | undefined)?.watchdog
+  const wdFallbacks: string[] = []
+  const wdMode = parseMode(wdOpts?.mode)
+  if (wdOpts?.mode !== undefined && wdOpts.mode !== wdMode) {
+    wdFallbacks.push(`invalid watchdog.mode ${JSON.stringify(String(wdOpts.mode))} — fell back to "${wdMode}"`)
+  }
+  const wdStallRaw = wdOpts?.stallMs
+  const wdStall = clampStallMs(typeof wdStallRaw === "number" ? wdStallRaw : undefined)
+  if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
+    wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`)
+  }
+  const watchdogLedger = createFileLedger(join(watchdogLogDir(), "log.jsonl"))
+  const rawLocator = createLocator()
+  const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1"
+  const probeLine = (text: string) => {
+    if (!probing()) return
+    try {
+      appendFileSync(join(tmpdir(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}\n`)
+    } catch {}
+  }
+  const diagnosticLocate = async (callID: string, t0: number, cmdNeedle?: string, phase2?: boolean) => {
+    const started = Date.now()
+    const hits = await rawLocator(callID, t0, cmdNeedle, phase2)
+    probeLine(`locate dur=${Date.now() - started}ms hits=${hits.length} phase2=${phase2 === true} needle=${JSON.stringify(cmdNeedle ?? null)}`)
+    if (hits.length === 0 && cmdNeedle) {
+      // Post-mortem aid: does the raw table even contain needle carriers,
+      // and where do they fall relative to the window?
+      try {
+        const raw = execFileSync("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress"], { encoding: "utf8", windowsHide: true, timeout: 15_000 })
+        const all = parseWindowsProcs(raw)
+        probeLine(`diag rawLen=${raw.length} procs=${all.length} windowStart=${new Date(t0 - 2000).toISOString()}`)
+        for (const p of all) {
+          if (p.cmd.includes(cmdNeedle)) probeLine(`diag needle-carrier pid=${p.pid} ppid=${p.ppid} created=${new Date(p.createdMs).toISOString()} cmd=${p.cmd.slice(0, 120)}`)
+        }
+      } catch (err) {
+        probeLine(`diag failed: ${String(err).slice(0, 150)}`)
+      }
+    }
+    return hits
+  }
+  const watchdog: Watchdog = createWatchdog({
+    mode: wdMode,
+    stallMs: wdStall,
+    sink: (entry) => watchdogLedger.append(entry),
+    locate: diagnosticLocate,
+    killTree: (pid) => killTree({ pid, kill: (sig) => process.kill(pid, sig as NodeJS.Signals) }),
+  })
+  for (const reason of wdFallbacks) {
+    const entry: LedgerEntry = {
+      ts: new Date().toISOString(),
+      event: "config-fallback",
+      callID: "-",
+      tool: "config",
+      t0: Date.now(),
+      mode: watchdog.mode,
+      reason,
+    }
+    watchdogLedger.append(entry)
+  }
   return {
     dispose: async () => {
       engineForgetAll()
+      jobManager.disposeAll()
+      watchdog.dispose()
       sessions.clear()
     },
 
@@ -1059,6 +1409,7 @@ export const server: Plugin = async (input) => {
       // permission overrides stay theirs; prompt/description/mode only when
       // absent).
       const existing = agentSection[FORGE_AGENT] as Record<string, unknown> | undefined
+      const userDefinedForge = existing !== undefined
       agentSection[FORGE_AGENT] = {
         ...(existing ?? {}),
         description:
@@ -1066,6 +1417,26 @@ export const server: Plugin = async (input) => {
           "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).",
         mode: (existing?.mode as "primary" | "subagent" | "all" | undefined) ?? "primary",
         prompt: (existing?.prompt as string | undefined) ?? FORGE_PROMPT,
+      }
+
+      // Capability probe source 1: an experimental background flag in the
+      // host config (the upstream PRs gate behind such flags).
+      try {
+        const exp = JSON.stringify((cfg as { experimental?: unknown }).experimental ?? "")
+        if (/background/i.test(exp)) nativeBackgroundSeen = true
+      } catch {
+        // Unreadable experimental section — probe source 2 still exists.
+      }
+
+      // Job supervisor stage 0 ONLY (D10): hide the builtin shell on the
+      // PLUGIN-CREATED forge entry (runtime injection, nothing written to the
+      // user's config file) — the exec surface becomes forge_shell. Stage 1
+      // (native run_in_background detected) withdraws the hide and keeps
+      // forge_shell as the additive layer; a user-defined forge entry,
+      // jobs.keepBuiltinShell, or stage 2 also keep the builtin shell.
+      if (!userDefinedForge && !jobsKeepBuiltinShell && jobStage() < 1) {
+        const entry = agentSection[FORGE_AGENT] as { tools?: Record<string, boolean> }
+        entry.tools = { ...(entry.tools ?? {}), shell: false, bash: false }
       }
 
       // /plan command — created only when the user has no command named
@@ -1095,7 +1466,7 @@ export const server: Plugin = async (input) => {
       // tightening), so stock behavior outside planning is unchanged.
       const perm = (cfg as { permission?: Record<string, unknown> }).permission
       const permSection = perm ?? ((cfg as { permission?: Record<string, unknown> }).permission = {})
-      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard"]) {
+      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell"]) {
         if (permSection[gateKey] !== "deny") permSection[gateKey] = "ask"
       }
     },
@@ -1111,11 +1482,24 @@ export const server: Plugin = async (input) => {
     // fires headless, verified 1.18.32). Throwing here aborts the call with
     // the guidance message. Phase-aware, so no global permission tightening
     // is needed and stock behavior is untouched outside the draft phase.
-    "tool.execute.before": async (input) => {
+    "tool.execute.before": async (input, output) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
           appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input.tool)} session=${input.sessionID}\n`)
         } catch {}
+      }
+      // hang-watchdog timing start (both builtin shell names count). The
+      // command text feeds the Windows locator's needle branch (CIM ppid is
+      // unreliable there — see src/proc-locate.ts).
+      if (watchdog.mode !== "off" && (input.tool === "shell" || input.tool === "bash")) {
+        const a = (output?.args ?? {}) as { command?: unknown; cmd?: unknown }
+        const cmdText = typeof a.command === "string" ? a.command : typeof a.cmd === "string" ? a.cmd : undefined
+        watchdog.track(input.callID, input.sessionID, input.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined)
+        if (process.env.FORGE_WATCHDOG_PROBE) {
+          try {
+            appendFileSync(join(tmpdir(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}\n`)
+          } catch {}
+        }
       }
       if (typeof input.tool === "string" && isWriteTool(input.tool)) {
         const state = stateForBan(input.sessionID)
@@ -1150,7 +1534,7 @@ export const server: Plugin = async (input) => {
           )
         } catch {}
       }
-      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
+      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard" || name === "forge_shell") {
         // Belt for the gates: if a permission request ever surfaces for them
         // (host starts evaluating plugin tools), keep it a real ask unless
         // explicitly denied.
@@ -1183,6 +1567,17 @@ export const server: Plugin = async (input) => {
         if (typeof sessionID === "string" && sessionID) {
           goalProbe(`idle event session=${sessionID}`)
           scheduleIdleContinuation(client, sessionID)
+          // Completion wakes ride the same idle signal: inject only while
+          // the owning session is free (never mid-turn).
+          void deliverJobWakes(sessionID)
+        }
+      }
+      if (event.type === "session.deleted") {
+        const info = (event as unknown as { properties: { info: { id?: string } } }).properties.info
+        if (typeof info?.id === "string" && info.id) {
+          // Owner session ended: live session-scoped jobs are killed,
+          // unread completions ledgered (job-supervisor spec).
+          jobManager.onSessionEnd(info.id)
         }
       }
     },
@@ -1191,12 +1586,52 @@ export const server: Plugin = async (input) => {
     // plan ticks, and goal_check count as activity; only continuation turns
     // are evaluated (turnActivity exists solely between a continuation send
     // and the following idle).
+    // hang-watchdog hooks — an independent backstop for the BUILTIN shell in
+    // any session (primary or delegated). forge_shell jobs carry no marker
+    // and are never governed here (their own idle/maxwait/kill system owns
+    // the lifecycle).
+    "shell.env": async (input, output) => {
+      if (watchdog.mode === "off") return
+      // No callID → no marker and no timing for this call (a table keyed on
+      // undefined would mis-track); the command runs, just ungoverned.
+      if (!input.callID) return
+      output.env[WATCHDOG_ENV_MARK] = markerValue(input.callID)
+      watchdog.markSeen(input.callID)
+      if (process.env.FORGE_WATCHDOG_PROBE) {
+        try {
+          appendFileSync(join(tmpdir(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input.callID} hostpid=${process.pid}\n`)
+        } catch {}
+      }
+    },
     "tool.execute.after": async (input) => {
+      if ((input.tool === "shell" || input.tool === "bash") && watchdog.has(input.callID)) {
+        watchdog.untrack(input.callID)
+        if (process.env.FORGE_WATCHDOG_PROBE) {
+          try {
+            appendFileSync(join(tmpdir(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input.callID}\n`)
+          } catch {}
+        }
+      }
       if (typeof input.tool !== "string") return
       const act = turnActivity.get(input.sessionID)
       if (!act) return
       if (isWriteTool(input.tool) || input.tool === "plan_tick") act.writes++
       if (input.tool === "goal_check") act.checks++
+    },
+
+    // Capability probe source 2 (read-only on the native tool): the native
+    // shell tool presenting a run_in_background parameter is stage-1
+    // evidence. On our own forge_shell, stage 1 prepends the native-first
+    // note (the probe has latched by the time this definition ships).
+    "tool.definition": async (input, output) => {
+      if (input.toolID === "shell" || input.toolID === "bash") {
+        const props = (output.parameters as { properties?: Record<string, unknown> } | undefined)?.properties
+        if (props && "run_in_background" in props) nativeBackgroundSeen = true
+      } else if (input.toolID === "forge_shell" && jobStage() === 1) {
+        if (!output.description.startsWith(STAGE1_NOTE)) {
+          output.description = `${STAGE1_NOTE}\n${output.description}`
+        }
+      }
     },
 
     // Session-start notices + standing reminders: injected into the system
@@ -1205,6 +1640,14 @@ export const server: Plugin = async (input) => {
     // the user (no native banner API exists for plugins).
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return
+      // Job-supervisor guidance reaches EVERY session including delegated
+      // ones (subagents are not in the `sessions` map — that is why this
+      // push happens before the state lookup).
+      if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
+        output.system.push(
+          "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.",
+        )
+      }
       const state = sessions.get(input.sessionID)
       if (!state) return
       const active = resolveActivePlan(state)

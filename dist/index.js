@@ -12334,9 +12334,10 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // plugin.ts
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { join as join2, relative } from "node:path";
-import { tmpdir } from "node:os";
+import { execFileSync as execFileSync2 } from "node:child_process";
+import { appendFileSync as appendFileSync2, existsSync as existsSync2, mkdirSync as mkdirSync3, readdirSync as readdirSync3, readFileSync as readFileSync5, statSync as statSync2, writeFileSync as writeFileSync3 } from "node:fs";
+import { isAbsolute, join as join3, relative } from "node:path";
+import { tmpdir as tmpdir2 } from "node:os";
 
 // src/plan-file.ts
 class PlanError extends Error {
@@ -13115,14 +13116,54 @@ function completeCheckFailures(doc2, attestations) {
 }
 
 // src/run-check.ts
-import { spawn } from "node:child_process";
+import { spawn as spawn2 } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
+
+// src/proc.ts
+import { spawn } from "node:child_process";
+function shellSpawn(spawnFn, cmd, opts = {}) {
+  return spawnFn(cmd, {
+    shell: true,
+    ...opts.cwd !== undefined ? { cwd: opts.cwd } : {},
+    env: opts.env ? { ...process.env, ...opts.env } : process.env,
+    windowsHide: opts.windowsHide ?? true,
+    detached: opts.detached ?? process.platform !== "win32"
+  });
+}
+function treeKillPlan(platform, pid) {
+  if (platform === "win32")
+    return { kind: "taskkill", args: ["/pid", String(pid), "/F", "/T"] };
+  return { kind: "group", signal: "SIGKILL" };
+}
+function killTree(child, opts = {}) {
+  const platform = opts.platform ?? process.platform;
+  if (!child.pid) {
+    child.kill();
+    return;
+  }
+  const plan = treeKillPlan(platform, child.pid);
+  if (plan.kind === "taskkill") {
+    try {
+      (opts.spawnFn ?? spawn)("taskkill", plan.args, { windowsHide: true, stdio: "ignore" });
+    } catch {
+      child.kill();
+    }
+  } else {
+    try {
+      process.kill(-child.pid, plan.signal);
+    } catch {
+      child.kill(plan.signal);
+    }
+  }
+}
+
+// src/run-check.ts
 var OUTPUT_LIMIT = 2048;
 var defaultShellRunner = (cmd, opts) => new Promise((resolveRun) => {
   let child;
   try {
-    child = spawn(cmd, {
+    child = spawn2(cmd, {
       shell: true,
       cwd: opts.cwd,
       windowsHide: true,
@@ -13135,28 +13176,9 @@ var defaultShellRunner = (cmd, opts) => new Promise((resolveRun) => {
   let output = "";
   let timedOut = false;
   let settled = false;
-  const killTree = () => {
-    if (!child.pid) {
-      child.kill();
-      return;
-    }
-    if (process.platform === "win32") {
-      try {
-        spawn("taskkill", ["/pid", String(child.pid), "/F", "/T"], { windowsHide: true, stdio: "ignore" });
-      } catch {
-        child.kill();
-      }
-    } else {
-      try {
-        process.kill(-child.pid, "SIGKILL");
-      } catch {
-        child.kill("SIGKILL");
-      }
-    }
-  };
   const timer = setTimeout(() => {
     timedOut = true;
-    killTree();
+    killTree(child);
   }, opts.timeoutMs);
   const failsafe = setTimeout(() => settle({ code: null, output, timedOut: true, spawnError: "timeout settle fallback" }), opts.timeoutMs + 30000);
   failsafe.unref?.();
@@ -13249,6 +13271,789 @@ function formatOutcomes(outcomes) {
 `);
 }
 
+// src/job-manager.ts
+var DEFAULT_MAX_FINISHED_JOBS = 50;
+var DEFAULT_MAX_TAIL_CHARS = 8192;
+var DEFAULT_MAX_REGISTRY_CHARS = 524288;
+var DEFAULT_WAKE_WINDOW_MS = 600000;
+var DEFAULT_MAX_LEDGER_ENTRIES = 200;
+function iso(now) {
+  return new Date(now()).toISOString();
+}
+function createJobManager(opts = {}) {
+  const now = opts.now ?? Date.now;
+  const maxFinishedJobs = opts.maxFinishedJobs ?? DEFAULT_MAX_FINISHED_JOBS;
+  const maxTailChars = opts.maxTailChars ?? DEFAULT_MAX_TAIL_CHARS;
+  const maxRegistryChars = opts.maxRegistryChars ?? DEFAULT_MAX_REGISTRY_CHARS;
+  const wakeWindowMs = opts.wakeWindowMs ?? DEFAULT_WAKE_WINDOW_MS;
+  const maxLedgerEntries = opts.maxLedgerEntries ?? DEFAULT_MAX_LEDGER_ENTRIES;
+  const jobs = new Map;
+  const ledger = [];
+  function emit(kind, job, detail) {
+    const entry = { at: iso(now), kind, jobId: job.id, session: job.ownerSession, detail };
+    ledger.push(entry);
+    if (ledger.length > maxLedgerEntries)
+      ledger.splice(0, ledger.length - maxLedgerEntries);
+    try {
+      opts.sink?.(entry);
+    } catch {}
+  }
+  function totalRegistryChars() {
+    let n = 0;
+    for (const j of jobs.values())
+      n += j.tail.length;
+    return n;
+  }
+  function isTerminal2(job) {
+    return job.state !== "running";
+  }
+  function enforceCaps() {
+    const finished = [...jobs.values()].filter(isTerminal2).sort((a, b) => (a.endedAt ?? a.startedAt) - (b.endedAt ?? b.startedAt));
+    let over = jobs.size - (maxFinishedJobs + countRunning());
+    let chars = totalRegistryChars();
+    for (const j of finished) {
+      if (over <= 0 && chars <= maxRegistryChars)
+        break;
+      emit("evicted", j, `evicted from registry (state ${j.state})`);
+      jobs.delete(j.id);
+      over--;
+      chars -= j.tail.length;
+    }
+  }
+  function countRunning() {
+    let n = 0;
+    for (const j of jobs.values())
+      if (!isTerminal2(j))
+        n++;
+    return n;
+  }
+  function create(input) {
+    const t = now();
+    const job = {
+      ...input,
+      scope: "session",
+      state: "running",
+      exitCode: null,
+      startedAt: t,
+      endedAt: null,
+      lastOutputAt: t,
+      tail: "",
+      outLen: 0,
+      pollCursor: 0,
+      readAfterEnd: false,
+      succeededAt: null,
+      wakeState: "none",
+      wakeQueuedAt: null
+    };
+    jobs.set(job.id, job);
+    enforceCaps();
+    return job;
+  }
+  function get(id) {
+    return jobs.get(id);
+  }
+  function list() {
+    return [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
+  }
+  function appendOutput(job, chunk) {
+    if (!chunk)
+      return;
+    job.outLen += chunk.length;
+    job.lastOutputAt = now();
+    const next = job.tail + chunk;
+    job.tail = next.length > maxTailChars ? next.slice(next.length - maxTailChars) : next;
+  }
+  function markTerminal(job, state, exitCode) {
+    if (isTerminal2(job))
+      return;
+    job.state = state;
+    job.exitCode = exitCode;
+    job.endedAt = now();
+    if (job.notify && job.wakeState === "none") {
+      job.wakeState = "queued";
+      job.wakeQueuedAt = now();
+    }
+    enforceCaps();
+  }
+  function kill(job) {
+    if (isTerminal2(job))
+      return;
+    try {
+      job.killTree();
+    } catch {}
+    markTerminal(job, "killed", null);
+  }
+  function poll(job) {
+    if (isTerminal2(job))
+      job.readAfterEnd = true;
+    const cursor = job.outLen;
+    const start = job.pollCursor;
+    const newOutput = sliceFromCursor(job, start);
+    job.pollCursor = cursor;
+    return {
+      state: job.state,
+      exitCode: job.exitCode,
+      newOutput,
+      cursor,
+      succeeded: job.succeededAt !== null,
+      logPath: job.logPath
+    };
+  }
+  function sliceFromCursor(job, cursor) {
+    const startOffset = Math.max(0, cursor - (job.outLen - job.tail.length));
+    return job.tail.slice(startOffset);
+  }
+  function clear(id) {
+    const job = jobs.get(id);
+    if (!job || !isTerminal2(job))
+      return false;
+    jobs.delete(id);
+    return true;
+  }
+  function handoff(id, toSession) {
+    const job = jobs.get(id);
+    if (!job)
+      return;
+    job.scope = "global";
+    if (toSession)
+      job.ownerSession = toSession;
+    return job;
+  }
+  function onSessionEnd(sessionID) {
+    for (const job of [...jobs.values()]) {
+      if (job.ownerSession !== sessionID)
+        continue;
+      if (!isTerminal2(job)) {
+        if (job.scope === "global")
+          continue;
+        kill(job);
+        emit("orphan-job", job, `owner session ended; tree killed (was: ${job.cmd.slice(0, 120)})`);
+      } else if (!job.readAfterEnd) {
+        emit("unread-completion", job, `owner session ended before the completion was read (state ${job.state}, exit ${job.exitCode})`);
+      }
+      jobs.delete(job.id);
+    }
+  }
+  function disposeAll() {
+    for (const job of [...jobs.values()]) {
+      if (!isTerminal2(job)) {
+        kill(job);
+        emit("orphan-job", job, "plugin dispose; tree killed");
+      }
+      jobs.delete(job.id);
+    }
+  }
+  function deliverWakesFor(sessionID) {
+    abandonStaleWakes();
+    const ready = [];
+    for (const job of jobs.values()) {
+      if (job.wakeState === "queued" && job.ownerSession === sessionID) {
+        job.wakeState = "delivered";
+        ready.push(job);
+      }
+    }
+    return ready;
+  }
+  function abandonStaleWakes() {
+    const t = now();
+    for (const job of jobs.values()) {
+      if (job.wakeState === "queued" && job.wakeQueuedAt !== null && t - job.wakeQueuedAt > wakeWindowMs) {
+        job.wakeState = "abandoned";
+        emit("wake-timeout", job, `session stayed busy past the ${wakeWindowMs}ms delivery window (state ${job.state}, exit ${job.exitCode})`);
+      }
+    }
+  }
+  function ledgerEntries() {
+    return [...ledger];
+  }
+  return {
+    create,
+    get,
+    list,
+    appendOutput,
+    markTerminal,
+    kill,
+    poll,
+    clear,
+    handoff,
+    onSessionEnd,
+    disposeAll,
+    deliverWakesFor,
+    abandonStaleWakes,
+    ledgerEntries,
+    size: () => jobs.size
+  };
+}
+function newJobId(now = Date.now) {
+  const d = new Date(now());
+  const p = (n, w = 2) => String(n).padStart(w, "0");
+  const rand = Math.random().toString(36).slice(2, 8);
+  return `j-${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}-${rand}`;
+}
+
+// src/job-runner.ts
+import { spawn as spawn3 } from "node:child_process";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync as readFileSync2, statSync, unlinkSync } from "node:fs";
+import { join as join2 } from "node:path";
+import { tmpdir } from "node:os";
+var DEFAULT_IDLE_MS = 60000;
+var DEFAULT_MAX_WAIT_MS = 120000;
+var HARD_MAX_WAIT_MS = 600000;
+var POLL_WAIT_MAX_MS = 30000;
+var DEFAULT_LOG_KEEP = 50;
+var JOB_ENV_MARKER = "FORGE_JOB_ID";
+function jobsLogDir(base) {
+  return join2(base ?? join2(tmpdir(), "opencode-forge"), "jobs");
+}
+function startJob(manager, opts) {
+  const idleMs = Math.max(0, opts.idleMs ?? DEFAULT_IDLE_MS);
+  const maxWaitMs = Math.min(Math.max(0, opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS), HARD_MAX_WAIT_MS);
+  mkdirSync(opts.logDir, { recursive: true });
+  const id = newJobId();
+  const logPath = join2(opts.logDir, `${id}.log`);
+  let child;
+  let settled = false;
+  let exiting = false;
+  let idleTimer = null;
+  const maxWaitTimer = setTimeout(() => {
+    resolveStillRunning();
+  }, maxWaitMs);
+  maxWaitTimer.unref?.();
+  let resolveSettle = () => {};
+  const settle = new Promise((res) => {
+    resolveSettle = res;
+  });
+  const armIdle = () => {
+    if (idleTimer)
+      clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => resolveStillRunning(), idleMs);
+    idleTimer.unref?.();
+  };
+  const stopTimers = () => {
+    if (idleTimer)
+      clearTimeout(idleTimer);
+    idleTimer = null;
+    clearTimeout(maxWaitTimer);
+  };
+  function resolveStillRunning() {
+    if (settled)
+      return;
+    settled = true;
+    stopTimers();
+    resolveSettle({ status: "still-running", idleForMs: Date.now() - job.lastOutputAt, outputTail: job.tail });
+  }
+  const job = manager.create({
+    id,
+    cmd: opts.cmd,
+    worktree: opts.worktree,
+    ownerSession: opts.ownerSession,
+    logPath,
+    notify: opts.notify ?? true,
+    killTree: () => killTree(child)
+  });
+  try {
+    child = shellSpawn(opts.spawnFn ?? spawn3, opts.cmd, {
+      cwd: opts.cwd,
+      env: { ...opts.env ?? {}, [JOB_ENV_MARKER]: id }
+    });
+  } catch (err) {
+    manager.markTerminal(job, "killed", null);
+    maxWaitTimer && clearTimeout(maxWaitTimer);
+    resolveSettle({ status: "exited", exitCode: null, outputTail: "", spawnError: String(err) });
+    return { job, settle };
+  }
+  const onChunk = (d) => {
+    const text = String(d);
+    manager.appendOutput(job, text);
+    try {
+      appendFileSync(logPath, text);
+    } catch {}
+    if (opts.successPattern && !settled && job.succeededAt === null) {
+      const m = opts.successPattern.exec(text) ?? opts.successPattern.exec(job.tail);
+      if (m) {
+        settled = true;
+        stopTimers();
+        job.succeededAt = Date.now();
+        const keptAlive = opts.keepAlive !== false;
+        if (!keptAlive) {
+          killTree(child);
+          manager.markTerminal(job, "succeeded", null);
+        }
+        resolveSettle({ status: "succeeded", matched: m[0], outputTail: job.tail, keptAlive });
+      }
+    }
+  };
+  child.stdout?.on("data", onChunk);
+  child.stderr?.on("data", onChunk);
+  child.on("exit", (code) => {
+    if (exiting)
+      return;
+    exiting = true;
+    stopTimers();
+    let finished = false;
+    const finish = () => {
+      if (finished)
+        return;
+      finished = true;
+      manager.markTerminal(job, "exited", code);
+      rotateLogs(opts.logDir);
+      if (!settled) {
+        settled = true;
+        resolveSettle({ status: "exited", exitCode: code, outputTail: job.tail });
+      }
+    };
+    const graceTimer = setTimeout(finish, opts.exitGraceMs ?? 500);
+    graceTimer.unref?.();
+    const streams = [];
+    if (child.stdout)
+      streams.push(child.stdout);
+    if (child.stderr)
+      streams.push(child.stderr);
+    let left = streams.length;
+    if (left === 0)
+      finish();
+    else
+      for (const s of streams)
+        s.once("close", () => {
+          if (--left === 0)
+            finish();
+        });
+  });
+  child.on("error", (err) => {
+    if (!settled) {
+      settled = true;
+      stopTimers();
+      manager.markTerminal(job, "killed", null);
+      resolveSettle({ status: "exited", exitCode: null, outputTail: job.tail, spawnError: err.message });
+    }
+  });
+  if (opts.runInBackground) {
+    stopTimers();
+  } else {
+    armIdle();
+  }
+  return { job, settle };
+}
+async function pollJob(manager, jobId, waitMs = 0) {
+  const job = manager.get(jobId);
+  if (!job)
+    return;
+  const deadline = Date.now() + Math.min(Math.max(0, waitMs), POLL_WAIT_MAX_MS);
+  while (job.outLen === job.pollCursor && job.state === "running" && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return manager.poll(job);
+}
+function readJobLog(logPath, opts = {}) {
+  const limit = Math.max(1, opts.limit ?? 200);
+  let raw = "";
+  try {
+    raw = existsSync(logPath) ? readFileSync2(logPath, "utf8") : "";
+  } catch {
+    raw = "";
+  }
+  const lines = raw.length === 0 ? [] : raw.split(/\r?\n/);
+  if (lines.length > 0 && lines[lines.length - 1] === "")
+    lines.pop();
+  const total = lines.length;
+  const offset = opts.offset !== undefined ? Math.max(0, Math.min(opts.offset, total)) : Math.max(0, total - limit);
+  return { lines: lines.slice(offset, offset + limit), total, offset };
+}
+function rotateLogs(logDir, keep = DEFAULT_LOG_KEEP) {
+  let entries = [];
+  try {
+    entries = readdirSync(logDir).filter((f) => f.endsWith(".log")).map((name) => {
+      try {
+        return { name, mtime: statSync(join2(logDir, name)).mtimeMs };
+      } catch {
+        return { name, mtime: 0 };
+      }
+    });
+  } catch {
+    return;
+  }
+  const excess = entries.length - keep;
+  if (excess <= 0)
+    return;
+  entries.sort((a, b) => a.mtime - b.mtime);
+  for (const e of entries.slice(0, excess)) {
+    try {
+      unlinkSync(join2(logDir, e.name));
+    } catch {}
+  }
+}
+
+// src/watchdog.ts
+import { mkdirSync as mkdirSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
+import { dirname } from "node:path";
+var WATCHDOG_ENV_MARK = "FORGE_WATCHDOG_MARK";
+var DEFAULT_STALL_MS = 600000;
+var MIN_STALL_MS = 60000;
+var DEFAULT_INTERVAL_MS = 30000;
+var DEFAULT_OBSERVE_MS = 60000;
+var WARN_RATIO = 0.8;
+function clampStallMs(raw, min = MIN_STALL_MS) {
+  const n = typeof raw === "number" && Number.isFinite(raw) ? raw : DEFAULT_STALL_MS;
+  return Math.max(min, Math.floor(n));
+}
+function parseMode(raw) {
+  return raw === "off" || raw === "dry-run" || raw === "kill" ? raw : "kill";
+}
+function createWatchdog(opts = {}) {
+  const mode = parseMode(opts.mode);
+  const stallMs = clampStallMs(opts.stallMs, opts.minStallMs ?? MIN_STALL_MS);
+  const intervalMs = Math.max(1, opts.intervalMs ?? DEFAULT_INTERVAL_MS);
+  const observeMs = opts.observeMs ?? DEFAULT_OBSERVE_MS;
+  const now = opts.now ?? Date.now;
+  const sink = opts.sink ?? (() => {});
+  const locate = opts.locate ?? (async () => []);
+  const killTree2 = opts.killTree ?? (() => {});
+  const isAlive = opts.isAlive ?? ((pid) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  });
+  const setIntervalFn = opts.setIntervalFn ?? setInterval;
+  const clearIntervalFn = opts.clearIntervalFn ?? clearInterval;
+  let currentMode = mode;
+  const table = new Map;
+  const markerSeenIDs = new Set;
+  let timer = null;
+  const write = (event, rec, extra = {}) => {
+    sink({
+      ts: new Date(now()).toISOString(),
+      event,
+      callID: rec.callID,
+      ...rec.sessionID !== undefined ? { sessionID: rec.sessionID } : {},
+      tool: rec.tool,
+      t0: rec.t0,
+      elapsedMs: now() - rec.t0,
+      mode: currentMode,
+      ...extra
+    });
+  };
+  const ensureTimer = () => {
+    if (currentMode === "off" || timer)
+      return;
+    timer = setIntervalFn(() => {
+      scan();
+    }, intervalMs);
+    timer.unref?.();
+  };
+  const maybeStopTimer = () => {
+    if (timer && table.size === 0) {
+      clearIntervalFn(timer);
+      timer = null;
+    }
+  };
+  const act = async (rec) => {
+    rec.acted = true;
+    try {
+      if (!rec.markerSeen) {
+        const pids2 = await locate(rec.callID, rec.t0, rec.cmdNeedle);
+        write("dry-run-candidate", rec, {
+          pids: pids2,
+          reason: "marker-missing (shell.env hook did not fire) — degraded to dry-run"
+        });
+        return;
+      }
+      const pidsA = await locate(rec.callID, rec.t0, rec.cmdNeedle, false);
+      let pids = pidsA;
+      if (pidsA.length === 0 && rec.cmdNeedle !== undefined) {
+        const pidsB = await locate(rec.callID, rec.t0, rec.cmdNeedle, true);
+        if (pidsB.length > 0) {
+          pids = pidsB;
+          rec.wave = 2;
+        }
+      }
+      if (pids.length === 0) {
+        write("unresolved", rec, { reason: "no matching process found" });
+        return;
+      }
+      if (currentMode === "dry-run") {
+        write("dry-run-candidate", rec, { pids, candidates: pidsA });
+        return;
+      }
+      const killed = [];
+      for (const p of pids) {
+        try {
+          killTree2(p.pid);
+          killed.push(p);
+        } catch {}
+      }
+      rec.killedAt = now();
+      if (rec.wave === 0)
+        rec.wave = 1;
+      write("kill", rec, {
+        pids: killed,
+        candidates: pids,
+        reason: pids === pidsA ? "wave 1 — host subtree / command match" : "workspace scope (call's own chain already exited)"
+      });
+    } catch (err) {
+      write("unresolved", rec, { reason: `intervention failed: ${String(err)}` });
+    }
+  };
+  const scan = async () => {
+    if (currentMode === "off")
+      return;
+    const nowMs = now();
+    for (const rec of table.values()) {
+      const elapsed = nowMs - rec.t0;
+      if (rec.acted && rec.killedAt !== undefined && !rec.unresolvedReported) {
+        if (nowMs - rec.killedAt >= observeMs) {
+          if (currentMode === "kill" && rec.wave === 1 && rec.cmdNeedle !== undefined) {
+            const wave2 = await locate(rec.callID, rec.t0, rec.cmdNeedle, true);
+            const stillAlive = wave2.filter((p) => isAlive(p.pid));
+            if (stillAlive.length > 0) {
+              const killed2 = [];
+              for (const p of stillAlive) {
+                try {
+                  killTree2(p.pid);
+                  killed2.push(p);
+                } catch {}
+              }
+              rec.killedAt = now();
+              rec.wave = 2;
+              write("kill", rec, { pids: killed2, reason: "wave 2 — workspace scope (wave 1 did not unblock the call)" });
+              return;
+            }
+          }
+          rec.unresolvedReported = true;
+          write("unresolved", rec, { reason: "no tool.execute.after within the observation window after kill" });
+        }
+        continue;
+      }
+      if (rec.acted)
+        continue;
+      if (elapsed >= stallMs) {
+        await act(rec);
+        continue;
+      }
+      if (elapsed >= WARN_RATIO * stallMs && !rec.warned) {
+        rec.warned = true;
+        write("warn", rec);
+      }
+    }
+    maybeStopTimer();
+  };
+  return {
+    get mode() {
+      return currentMode;
+    },
+    get stallMs() {
+      return stallMs;
+    },
+    track(callID, sessionID, tool3, t0 = now(), cmdNeedle) {
+      if (currentMode === "off")
+        return;
+      table.set(callID, {
+        callID,
+        sessionID,
+        tool: tool3,
+        t0,
+        markerSeen: markerSeenIDs.has(callID),
+        warned: false,
+        acted: false,
+        wave: 0,
+        ...cmdNeedle !== undefined && cmdNeedle.length > 0 ? { cmdNeedle } : {}
+      });
+      ensureTimer();
+    },
+    markSeen(callID) {
+      markerSeenIDs.add(callID);
+      const rec = table.get(callID);
+      if (rec)
+        rec.markerSeen = true;
+    },
+    untrack(callID) {
+      table.delete(callID);
+      maybeStopTimer();
+    },
+    has: (callID) => table.has(callID),
+    size: () => table.size,
+    scan,
+    setMode(next) {
+      currentMode = next;
+      if (next === "off") {
+        if (timer) {
+          clearIntervalFn(timer);
+          timer = null;
+        }
+        table.clear();
+      } else {
+        ensureTimer();
+      }
+    },
+    dispose() {
+      if (timer) {
+        clearIntervalFn(timer);
+        timer = null;
+      }
+      table.clear();
+    }
+  };
+}
+function watchdogLogDir(base) {
+  const tmp = base ?? (process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? "/tmp");
+  return `${tmp.replace(/[\\/]+$/, "")}/opencode-forge/watchdog`;
+}
+function createFileLedger(logPath, maxEntries = 200, maxBytes = 1e6) {
+  const append = (entry) => {
+    try {
+      mkdirSync2(dirname(logPath), { recursive: true });
+      let lines = [];
+      try {
+        lines = readFileSync3(logPath, "utf8").split(`
+`).filter((l) => l.trim().length > 0);
+      } catch {}
+      if (lines.length >= maxEntries)
+        lines = lines.slice(lines.length - maxEntries + 1);
+      lines.push(JSON.stringify(entry));
+      let text = lines.join(`
+`) + `
+`;
+      if (text.length > maxBytes) {
+        const keep = Math.max(1, Math.floor(maxEntries / 2));
+        text = lines.slice(-keep).join(`
+`) + `
+`;
+      }
+      writeFileSync2(logPath, text, "utf8");
+    } catch {}
+  };
+  const entries = () => {
+    try {
+      return readFileSync3(logPath, "utf8").split(`
+`).filter((l) => l.trim().length > 0).map((l) => JSON.parse(l));
+    } catch {
+      return [];
+    }
+  };
+  return { append, entries, path: logPath };
+}
+
+// src/proc-locate.ts
+import { execFileSync } from "node:child_process";
+import { readdirSync as readdirSync2, readFileSync as readFileSync4 } from "node:fs";
+function commandNeedle(command) {
+  const trimmed = command.trim().replace(/^["']|["']$/g, "");
+  if (trimmed.length === 0)
+    return "";
+  const tokens = trimmed.split(/\s+/);
+  const longest = tokens.reduce((a, b) => b.length > a.length ? b : a, "");
+  return longest.length >= 6 ? longest : trimmed;
+}
+function markerValue(callID) {
+  return `opencode-forge:${callID}`;
+}
+function createPosixLocator(deps = {}) {
+  const listPids = deps.listPids ?? (() => readdirSync2("/proc").map(Number).filter((n) => Number.isInteger(n) && n > 0));
+  const readEnv = deps.readEnv ?? ((pid) => {
+    try {
+      return readFileSync4(`/proc/${pid}/environ`);
+    } catch {
+      return null;
+    }
+  });
+  const readCmd = deps.readCmd ?? ((pid) => {
+    try {
+      return readFileSync4(`/proc/${pid}/cmdline`).toString("utf8").split("\x00").filter(Boolean).join(" ");
+    } catch {
+      return String(pid);
+    }
+  });
+  return async (callID, _t0) => {
+    const want = `${WATCHDOG_ENV_MARK}=${markerValue(callID)}`;
+    const hits = [];
+    for (const pid of listPids()) {
+      const env = readEnv(pid);
+      if (!env)
+        continue;
+      if (env.toString("utf8").split("\x00").includes(want))
+        hits.push({ pid, cmd: readCmd(pid) });
+    }
+    return hits;
+  };
+}
+var PS_LIST_PROCS = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate " + "| ConvertTo-Json -Compress";
+function parseWindowsProcs(raw) {
+  let parsed;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return [];
+  }
+  const arr = Array.isArray(parsed) ? parsed : [parsed];
+  const out = [];
+  for (const p of arr) {
+    const pid = Number(p?.ProcessId ?? p?.pid);
+    const ppid = Number(p?.ParentProcessId ?? p?.ppid);
+    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid))
+      continue;
+    const cmd = typeof p?.CommandLine === "string" ? p.CommandLine : "";
+    let createdMs = Number.NaN;
+    const cd = p?.CreationDate ?? p?.createdMs;
+    if (typeof cd === "number")
+      createdMs = cd;
+    else if (typeof cd === "string") {
+      const slash = /\/Date\((\d+)\)\//.exec(cd);
+      if (slash)
+        createdMs = Number(slash[1]);
+      else {
+        const t = Date.parse(cd);
+        if (!Number.isNaN(t))
+          createdMs = t;
+      }
+    }
+    if (Number.isNaN(createdMs))
+      continue;
+    out.push({ pid, ppid, cmd, createdMs });
+  }
+  return out;
+}
+var WINDOW_SLACK_MS = 2000;
+function createWindowsLocator(deps = {}) {
+  const hostPid = deps.hostPid ?? process.pid;
+  const execFn = deps.execFn ?? ((cmd) => execFileSync("powershell", ["-NoProfile", "-Command", cmd], { encoding: "utf8", windowsHide: true, timeout: 15000 }));
+  return async (callID, t0, cmdNeedle, phase2 = false) => {
+    let raw = "[]";
+    try {
+      raw = execFn(PS_LIST_PROCS);
+    } catch {
+      return [];
+    }
+    const procs = parseWindowsProcs(raw);
+    const children = new Map;
+    for (const p of procs) {
+      const list = children.get(p.ppid) ?? [];
+      list.push(p.pid);
+      children.set(p.ppid, list);
+    }
+    const descendants = new Set;
+    const queue = [hostPid];
+    while (queue.length > 0) {
+      const cur = queue.pop();
+      for (const child of children.get(cur) ?? []) {
+        if (!descendants.has(child)) {
+          descendants.add(child);
+          queue.push(child);
+        }
+      }
+    }
+    const windowStart = t0 - WINDOW_SLACK_MS;
+    const norm = (s) => s.replace(/\\/g, "/");
+    const slash = cmdNeedle !== undefined ? cmdNeedle.lastIndexOf("/") : -1;
+    const dirNeedle = phase2 && cmdNeedle !== undefined && slash > 0 ? norm(cmdNeedle.slice(0, slash)) : undefined;
+    return procs.filter((p) => p.createdMs >= windowStart && p.pid !== hostPid && !/Win32_Process/.test(p.cmd) && !/conhost\.exe/i.test(p.cmd) && (descendants.has(p.pid) || cmdNeedle !== undefined && cmdNeedle.length >= 6 && p.cmd.includes(cmdNeedle) || dirNeedle !== undefined && dirNeedle.length >= 6 && norm(p.cmd).includes(dirNeedle))).map((p) => ({ pid: p.pid, cmd: p.cmd, createdMs: p.createdMs }));
+  };
+}
+function createLocator(platform = process.platform, posix = {}, win = {}) {
+  return platform === "win32" ? createWindowsLocator(win) : createPosixLocator(posix);
+}
+
 // plugin.ts
 var FORGE_AGENT = "forge";
 var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
@@ -13312,6 +14117,68 @@ function effectiveWorktree(worktree, fallback) {
 }
 var sessions = new Map;
 var forgeDisabled = false;
+var jobsMode = "auto";
+var jobsKeepBuiltinShell = false;
+var nativeBackgroundSeen = false;
+function jobStage() {
+  if (jobsMode === "native")
+    return 2;
+  if (jobsMode === "forge")
+    return 0;
+  return nativeBackgroundSeen ? 1 : 0;
+}
+var jobLogDir = jobsLogDir();
+var jobLedgerPath = join3(jobLogDir, "ledger.jsonl");
+function jobLedgerSink(entry) {
+  try {
+    mkdirSync3(jobLogDir, { recursive: true });
+    if (existsSync2(jobLedgerPath) && statSync2(jobLedgerPath).size > 1e6)
+      writeFileSync3(jobLedgerPath, "");
+    appendFileSync2(jobLedgerPath, `${JSON.stringify(entry)}
+`);
+  } catch {}
+}
+var jobManager = createJobManager({ sink: jobLedgerSink });
+var jobClient = null;
+function jobWakeText(job) {
+  return [
+    `[forge:job-complete] Background job ${job.id} finished (${job.state}${job.exitCode !== null ? `, exit ${job.exitCode}` : ""}).`,
+    `Command: ${job.cmd}`,
+    `Recent output:
+${job.tail.slice(-1500) || "(none)"}`,
+    "Details via forge_jobs (poll/log); the job stays in the registry until cleared."
+  ].join(`
+`);
+}
+async function deliverJobWakes(sessionID) {
+  if (forgeDisabled || jobStage() >= 2)
+    return;
+  if (!jobClient || typeof jobClient.session.promptAsync !== "function")
+    return;
+  for (const job of jobManager.deliverWakesFor(sessionID)) {
+    try {
+      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: jobWakeText(job) }] } });
+    } catch {
+      job.wakeState = "queued";
+    }
+  }
+}
+async function handoffTarget(sessionID) {
+  if (!jobClient || typeof jobClient.session.get !== "function")
+    return;
+  let current = sessionID;
+  for (let depth = 0;depth < 10; depth++) {
+    try {
+      const info = await jobClient.session.get({ path: { id: current } });
+      if (!info?.parentID)
+        return current === sessionID ? undefined : current;
+      current = info.parentID;
+    } catch {
+      return;
+    }
+  }
+  return current === sessionID ? undefined : current;
+}
 var WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"]);
 function isWriteTool(name) {
   const n = name.toLowerCase();
@@ -13321,13 +14188,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 function planDirOf(worktree) {
-  return join2(worktree, ".opencode", "plan");
+  return join3(worktree, ".opencode", "plan");
 }
 function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
-  if (!existsSync(dir))
+  if (!existsSync2(dir))
     return [];
-  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync2(join2(dir, name), "utf8") }));
+  return readdirSync3(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync5(join3(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -13343,8 +14210,8 @@ function worktreeFor(context) {
   return effectiveWorktree(context.worktree, hostWorktree) || context.worktree;
 }
 function resolveActivePlan(state) {
-  if (state.planPath && existsSync(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync2(state.planPath, "utf8"));
+  if (state.planPath && existsSync2(state.planPath)) {
+    const doc2 = parsePlanLoose(readFileSync5(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -13352,7 +14219,7 @@ function resolveActivePlan(state) {
   const ranked = rankActivePlans(readPlanDir(state.worktree));
   if (ranked.length === 0)
     return null;
-  const path = join2(planDirOf(state.worktree), ranked[0].name);
+  const path = join3(planDirOf(state.worktree), ranked[0].name);
   state.planPath = path;
   return { path, doc: ranked[0].doc };
 }
@@ -13386,12 +14253,12 @@ var planWriteTool = tool({
       throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
       const dir = planDirOf(state.worktree);
-      mkdirSync(dir, { recursive: true });
-      path = join2(dir, planFileName(localDate(), slugify(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md"))));
+      mkdirSync3(dir, { recursive: true });
+      path = join3(dir, planFileName(localDate(), slugify(args.goal), readdirSync3(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
     const text = renderPlan(args, now, created);
-    writeFileSync2(path, text);
+    writeFileSync3(path, text);
     state.planPath = path;
     const doc2 = parsePlan(text);
     context.metadata({ title: `${mode === "created" ? "Create" : "Revise"} plan: ${doc2.goal}` });
@@ -13419,8 +14286,8 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync2(active.path, "utf8"), args.n, nowIso());
-    writeFileSync2(active.path, next);
+    const next = tickTask(readFileSync5(active.path, "utf8"), args.n, nowIso());
+    writeFileSync3(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` });
@@ -13447,7 +14314,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    writeFileSync2(active.path, transitionStatus(readFileSync2(active.path, "utf8"), "approved", nowIso()));
+    writeFileSync3(active.path, transitionStatus(readFileSync5(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -13480,7 +14347,7 @@ var planCloseTool = tool({
 Fix the implementation and retry, or revise the plan first.`);
     }
     await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`);
-    writeFileSync2(active.path, transitionStatus(readFileSync2(active.path, "utf8"), "done", nowIso()));
+    writeFileSync3(active.path, transitionStatus(readFileSync5(active.path, "utf8"), "done", nowIso()));
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
       title: "plan done",
@@ -13498,31 +14365,31 @@ var planDiscardTool = tool({
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan to abandon in this workspace.");
-    writeFileSync2(active.path, transitionStatus(readFileSync2(active.path, "utf8"), "abandoned", nowIso()));
+    writeFileSync3(active.path, transitionStatus(readFileSync5(active.path, "utf8"), "abandoned", nowIso()));
     state.planPath = undefined;
     context.metadata({ title: `Plan abandoned: ${active.doc.goal}` });
     return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` };
   }
 });
 function goalDirOf(worktree) {
-  return join2(worktree, ".opencode", "goal");
+  return join3(worktree, ".opencode", "goal");
 }
 function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
-  if (!existsSync(dir))
+  if (!existsSync2(dir))
     return [];
-  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync2(join2(dir, name), "utf8") }));
+  return readdirSync3(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync5(join3(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
-  if (state.goalPath && existsSync(state.goalPath)) {
-    const doc2 = parseGoalLoose(readFileSync2(state.goalPath, "utf8"));
+  if (state.goalPath && existsSync2(state.goalPath)) {
+    const doc2 = parseGoalLoose(readFileSync5(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
   }
   const live = rankLiveGoals(readGoalDir(state.worktree))[0];
   if (live) {
-    const path = join2(goalDirOf(state.worktree), live.name);
+    const path = join3(goalDirOf(state.worktree), live.name);
     state.goalPath = path;
     return { path, doc: live.doc };
   }
@@ -13619,9 +14486,9 @@ var goalWriteTool = tool({
       await gate(context.ask, "goal_write", `Arm goal: ${args.goal}`);
     }
     const dir = goalDirOf(state.worktree);
-    mkdirSync(dir, { recursive: true });
-    const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md")));
-    const path = join2(dir, name);
+    mkdirSync3(dir, { recursive: true });
+    const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync3(dir).filter((f) => f.endsWith(".md")));
+    const path = join3(dir, name);
     const text = renderGoal(input, {
       now,
       status: arm ? "active" : "queued",
@@ -13661,7 +14528,7 @@ var goalCheckTool = tool({
       o.index = selected[i].n;
     });
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = appendCheckLog(readFileSync2(goal.path, "utf8"), runId, outcomes, nowIso());
+    const next = appendCheckLog(readFileSync5(goal.path, "utf8"), runId, outcomes, nowIso());
     atomicWrite(goal.path, next);
     const ok = outcomesAllOk(outcomes);
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
@@ -13695,7 +14562,7 @@ var goalCompleteTool = tool({
     const failures = outcomes.filter((o) => !o.ok);
     if (failures.length > 0) {
       const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-      atomicWrite(goal.path, appendCheckLog(readFileSync2(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      atomicWrite(goal.path, appendCheckLog(readFileSync5(goal.path, "utf8"), runId2, outcomes, nowIso()));
       throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
 ${formatOutcomes(failures)}
 Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
@@ -13708,7 +14575,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
     }
     await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    let text = appendCheckLog(readFileSync2(goal.path, "utf8"), runId, outcomes, nowIso());
+    let text = appendCheckLog(readFileSync5(goal.path, "utf8"), runId, outcomes, nowIso());
     text = transitionGoal(text, "completed", nowIso());
     atomicWrite(goal.path, text);
     context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
@@ -13730,7 +14597,7 @@ var goalPauseTool = tool({
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
     }
     const stopReason = args.blocker ? "blocker" : "user";
-    atomicWrite(goal.path, transitionGoal(readFileSync2(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
+    atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` });
     return {
@@ -13750,7 +14617,7 @@ var goalResumeTool = tool({
     if (!goal || goal.doc.status === "queued") {
       const oldest = rankQueuedGoals(readGoalDir(state.worktree))[0];
       if (oldest) {
-        const path = join2(goalDirOf(state.worktree), oldest.name);
+        const path = join3(goalDirOf(state.worktree), oldest.name);
         state.goalPath = path;
         goal = { path, doc: oldest.doc };
       }
@@ -13760,7 +14627,7 @@ var goalResumeTool = tool({
     }
     const promoting = goal.doc.status === "queued";
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
-    let text = readFileSync2(goal.path, "utf8");
+    let text = readFileSync5(goal.path, "utf8");
     if (args.addTurns)
       text = bumpBudget(text, args.addTurns, nowIso());
     text = transitionGoal(text, "active", nowIso(), { session: context.sessionID });
@@ -13786,7 +14653,7 @@ var goalDiscardTool = tool({
     if (!goal)
       throw new GoalError("No goal to discard in this workspace.");
     await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
-    atomicWrite(goal.path, transitionGoal(readFileSync2(goal.path, "utf8"), "abandoned", nowIso()));
+    atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "abandoned", nowIso()));
     state.goalPath = undefined;
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
@@ -13796,8 +14663,171 @@ var goalDiscardTool = tool({
     };
   }
 });
+var FORGE_SHELL_DESCRIPTION = [
+  "Run a shell command without ever blocking the session indefinitely. The call completes on the FIRST of: process exit (bound to the exit event — a detached grandchild holding the stdio pipes cannot suspend the call); success_pattern matching new output (opt-in regex); idle_ms with no new output (default 60000); max_wait_ms hard cap (default 120000, max 600000 — returns still-running, never kills).",
+  "Idle/max-wait return `still-running` with a jobId — the process stays alive; keep watching with forge_jobs poll / log, stop it with forge_jobs kill. run_in_background returns {jobId, logPath} immediately.",
+  "success_pattern semantics: a match completes the call as success; the process is kept alive by default (server semantics — the thing you just verified keeps running); pass keep_alive=false to kill its tree on match. Common patterns: dev servers `listening on|ready in|Local:`, builds `Compiled successfully|Done in`, test suites `passed|all tests`.",
+  "Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) MUST use this tool instead of the builtin shell."
+].join(`
+`);
+var STAGE1_NOTE = "Stage note: this host's builtin shell already offers a native run_in_background parameter — prefer that for plain backgrounding; keep using forge_shell when you need idle/success_pattern early return or exit wake messages.";
+var forgeShellTool = tool({
+  description: FORGE_SHELL_DESCRIPTION,
+  args: {
+    command: tool.schema.string().describe("The shell command to run"),
+    workdir: tool.schema.string().optional().describe("Working directory (workspace-relative, or absolute)"),
+    run_in_background: tool.schema.boolean().optional().describe("Return {jobId, logPath} immediately, without waiting for any output or exit"),
+    idle_ms: tool.schema.number().int().nonnegative().optional().describe("No-new-output early-return threshold in ms (default 60000)"),
+    max_wait_ms: tool.schema.number().int().nonnegative().optional().describe("Hard cap on this call's wait in ms (default 120000, clamped to 600000); returns still-running, never kills"),
+    success_pattern: tool.schema.string().optional().describe("Regex; a match against new output completes the call as success immediately"),
+    keep_alive: tool.schema.boolean().optional().describe("After a success match: keep the process alive (default) or kill its tree (false)"),
+    notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)")
+  },
+  execute: async (args, context) => {
+    if (jobStage() >= 2) {
+      throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.");
+    }
+    const state = ensureSession(context.sessionID, worktreeFor(context));
+    await gate(context.ask, "forge_shell", `forge_shell: ${args.command.slice(0, 100)}`);
+    let successPattern = null;
+    if (args.success_pattern) {
+      try {
+        successPattern = new RegExp(args.success_pattern);
+      } catch (err) {
+        throw new Error(`Invalid success_pattern: ${err.message}`);
+      }
+    }
+    const cwd = args.workdir ? isAbsolute(args.workdir) ? args.workdir : join3(state.worktree, args.workdir) : state.worktree;
+    const started = startJob(jobManager, {
+      cmd: args.command,
+      cwd,
+      ownerSession: context.sessionID,
+      worktree: state.worktree,
+      logDir: jobLogDir,
+      runInBackground: args.run_in_background === true,
+      ...args.idle_ms !== undefined ? { idleMs: args.idle_ms } : {},
+      ...args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {},
+      successPattern,
+      ...args.keep_alive !== undefined ? { keepAlive: args.keep_alive } : {},
+      ...args.notify !== undefined ? { notify: args.notify } : {}
+    });
+    context.metadata({ title: `forge_shell: ${args.command.slice(0, 60)}` });
+    if (args.run_in_background === true) {
+      return {
+        title: `job started: ${started.job.id}`,
+        output: [`[forge:job] Started in background.`, `jobId: ${started.job.id}`, `logPath: ${started.job.logPath}`, "Track with forge_jobs poll; a [forge:job-complete] message arrives on exit."].join(`
+`)
+      };
+    }
+    const r = await started.settle;
+    if (r.status === "exited") {
+      return {
+        title: `exit ${r.exitCode ?? "?"}`,
+        output: [
+          `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
+          ...r.spawnError ? [`spawn error: ${r.spawnError}`] : [],
+          `output:
+${r.outputTail || "(none)"}`
+        ].join(`
+`)
+      };
+    }
+    if (r.status === "succeeded") {
+      return {
+        title: `success: ${r.matched}`,
+        output: [
+          `[forge:job] Success pattern matched: "${r.matched}".`,
+          r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : "The process tree was terminated (keep_alive=false).",
+          `output:
+${r.outputTail}`
+        ].join(`
+`)
+      };
+    }
+    return {
+      title: `still running (${Math.round(r.idleForMs / 1000)}s idle)`,
+      output: [
+        `[forge:job] Still running — ${Math.round(r.idleForMs / 1000)}s without new output (or the wait budget ran out). The process is alive as job ${started.job.id}.`,
+        `logPath: ${started.job.logPath}`,
+        `recent output:
+${r.outputTail || "(none yet)"}`,
+        "Next: forge_jobs poll to keep waiting, forge_jobs log for history, forge_jobs kill to stop."
+      ].join(`
+`)
+    };
+  }
+});
+var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"];
+var forgeJobsTool = tool({
+  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it; log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry; handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+  args: {
+    action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
+    jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
+    waitMs: tool.schema.number().int().nonnegative().optional().describe("poll: bounded in-call wait (clamped to 30000)"),
+    offset: tool.schema.number().int().nonnegative().optional().describe("log: first line index; omitted = tail window"),
+    limit: tool.schema.number().int().positive().optional().describe("log: max lines (default 200)")
+  },
+  execute: async (args, context) => {
+    if (jobStage() >= 2)
+      throw new Error("[forge] The job supervisor is retired on this host.");
+    const action = String(args.action ?? "");
+    if (!FORGE_JOBS_ACTIONS.includes(action)) {
+      throw new Error(`Unknown action "${action}" — use one of: ${FORGE_JOBS_ACTIONS.join(", ")}.`);
+    }
+    if (action === "list") {
+      const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.scope}  ${j.cmd.slice(0, 60)}`);
+      return { title: `jobs (${rows.length})`, output: rows.length > 0 ? rows.join(`
+`) : "(no jobs)" };
+    }
+    if (!args.jobId)
+      throw new Error(`Action "${action}" requires jobId.`);
+    const job = jobManager.get(args.jobId);
+    if (!job)
+      throw new Error(`No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`);
+    if (action === "poll") {
+      const p = await pollJob(jobManager, args.jobId, args.waitMs ?? 0);
+      if (!p)
+        throw new Error(`No job ${args.jobId}.`);
+      return {
+        title: `${job.id}: ${p.state}`,
+        output: [
+          `[forge:job] ${job.id}: ${p.state}${p.exitCode !== null ? ` exit=${p.exitCode}` : ""}${p.succeeded ? " (success pattern matched)" : ""}`,
+          `new output:
+${p.newOutput || "(none in this window)"}`,
+          `logPath: ${p.logPath}`
+        ].join(`
+`)
+      };
+    }
+    if (action === "log") {
+      const page = readJobLog(job.logPath, {
+        ...args.offset !== undefined ? { offset: args.offset } : {},
+        ...args.limit !== undefined ? { limit: args.limit } : {}
+      });
+      return {
+        title: `${job.id} log ${page.offset}-${page.offset + page.lines.length}/${page.total}`,
+        output: page.lines.length > 0 ? page.lines.join(`
+`) : "(empty)"
+      };
+    }
+    if (action === "kill") {
+      jobManager.kill(job);
+      return { title: `${job.id} killed`, output: `[forge:job] ${job.id}: tree kill issued (state: killed).` };
+    }
+    if (action === "clear") {
+      const ok = jobManager.clear(args.jobId);
+      return ok ? { title: `${job.id} cleared`, output: `[forge:job] ${job.id} removed from the registry (log file untouched).` } : { title: `${job.id} not cleared`, output: `[forge:job] ${job.id} is still running — kill it first.` };
+    }
+    const target = await handoffTarget(context.sessionID);
+    jobManager.handoff(args.jobId, target);
+    return {
+      title: `${job.id} handed off`,
+      output: `[forge:job] ${job.id} promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`
+    };
+  }
+});
 function forgeTools() {
-  return {
+  const tools = {
     plan_write: planWriteTool,
     plan_tick: planTickTool,
     plan_approve: planApproveTool,
@@ -13810,6 +14840,11 @@ function forgeTools() {
     goal_resume: goalResumeTool,
     goal_discard: goalDiscardTool
   };
+  if (jobStage() < 2) {
+    tools.forge_shell = forgeShellTool;
+    tools.forge_jobs = forgeJobsTool;
+  }
+  return tools;
 }
 var hostWorktree = "";
 function stateForBan(sessionID) {
@@ -13832,7 +14867,7 @@ var pendingContinuationTurn = new Set;
 function goalProbe(line) {
   if (process.env.FORGE_GOAL_PROBE) {
     try {
-      appendFileSync(join2(tmpdir(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
+      appendFileSync2(join3(tmpdir2(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
 `);
     } catch {}
   }
@@ -13878,7 +14913,7 @@ function wrapupBriefText(goal, reason) {
 }
 async function autoPauseGoal(client, state, goal, reason, wrapup) {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
-  atomicWrite(goal.path, transitionGoal(readFileSync2(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
   engineForgetSession(state.sessionID);
   if (wrapup && goal.doc.session) {
     try {
@@ -13925,11 +14960,11 @@ async function continueIfEligible(client, sessionID) {
       turnHadActivity = !!act && (act.writes > 0 || act.checks > 0);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
       const ledgerPath = state.goalPath;
-      if (ledgerPath && existsSync(ledgerPath)) {
+      if (ledgerPath && existsSync2(ledgerPath)) {
         try {
-          const fresh = parseGoalLoose(readFileSync2(ledgerPath, "utf8"));
+          const fresh = parseGoalLoose(readFileSync5(ledgerPath, "utf8"));
           if (fresh && fresh.turnsUsed > 0) {
-            atomicWrite(ledgerPath, appendLedger(readFileSync2(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+            atomicWrite(ledgerPath, appendLedger(readFileSync5(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
           }
         } catch (err) {
           goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
@@ -13990,7 +15025,7 @@ async function continueIfEligible(client, sessionID) {
       pendingContinuationTurn.add(sessionID);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
       state.goalPath = goal.path;
-      atomicWrite(goal.path, incTurns(readFileSync2(goal.path, "utf8"), nowIso()));
+      atomicWrite(goal.path, incTurns(readFileSync5(goal.path, "utf8"), nowIso()));
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
       const n = (transportFails.get(sessionID) ?? 0) + 1;
@@ -14017,12 +15052,79 @@ function scheduleIdleContinuation(client, sessionID) {
     continueIfEligible(client, sessionID);
   }, IDLE_DEBOUNCE_MS));
 }
-var server = async (input) => {
+var server = async (input, options) => {
   hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || "";
   const client = input.client;
+  jobClient = input.client;
+  const jobsOpts = options?.jobs;
+  if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native")
+    jobsMode = jobsOpts.mode;
+  jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true;
+  const wdOpts = options?.watchdog;
+  const wdFallbacks = [];
+  const wdMode = parseMode(wdOpts?.mode);
+  if (wdOpts?.mode !== undefined && wdOpts.mode !== wdMode) {
+    wdFallbacks.push(`invalid watchdog.mode ${JSON.stringify(String(wdOpts.mode))} — fell back to "${wdMode}"`);
+  }
+  const wdStallRaw = wdOpts?.stallMs;
+  const wdStall = clampStallMs(typeof wdStallRaw === "number" ? wdStallRaw : undefined);
+  if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
+    wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`);
+  }
+  const watchdogLedger = createFileLedger(join3(watchdogLogDir(), "log.jsonl"));
+  const rawLocator = createLocator();
+  const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1";
+  const probeLine = (text) => {
+    if (!probing())
+      return;
+    try {
+      appendFileSync2(join3(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
+`);
+    } catch {}
+  };
+  const diagnosticLocate = async (callID, t0, cmdNeedle, phase2) => {
+    const started = Date.now();
+    const hits = await rawLocator(callID, t0, cmdNeedle, phase2);
+    probeLine(`locate dur=${Date.now() - started}ms hits=${hits.length} phase2=${phase2 === true} needle=${JSON.stringify(cmdNeedle ?? null)}`);
+    if (hits.length === 0 && cmdNeedle) {
+      try {
+        const raw = execFileSync2("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress"], { encoding: "utf8", windowsHide: true, timeout: 15000 });
+        const all = parseWindowsProcs(raw);
+        probeLine(`diag rawLen=${raw.length} procs=${all.length} windowStart=${new Date(t0 - 2000).toISOString()}`);
+        for (const p of all) {
+          if (p.cmd.includes(cmdNeedle))
+            probeLine(`diag needle-carrier pid=${p.pid} ppid=${p.ppid} created=${new Date(p.createdMs).toISOString()} cmd=${p.cmd.slice(0, 120)}`);
+        }
+      } catch (err) {
+        probeLine(`diag failed: ${String(err).slice(0, 150)}`);
+      }
+    }
+    return hits;
+  };
+  const watchdog = createWatchdog({
+    mode: wdMode,
+    stallMs: wdStall,
+    sink: (entry) => watchdogLedger.append(entry),
+    locate: diagnosticLocate,
+    killTree: (pid) => killTree({ pid, kill: (sig) => process.kill(pid, sig) })
+  });
+  for (const reason of wdFallbacks) {
+    const entry = {
+      ts: new Date().toISOString(),
+      event: "config-fallback",
+      callID: "-",
+      tool: "config",
+      t0: Date.now(),
+      mode: watchdog.mode,
+      reason
+    };
+    watchdogLedger.append(entry);
+  }
   return {
     dispose: async () => {
       engineForgetAll();
+      jobManager.disposeAll();
+      watchdog.dispose();
       sessions.clear();
     },
     config: async (cfg) => {
@@ -14035,12 +15137,22 @@ var server = async (input) => {
         agentSection[native] = { ...agentSection[native] ?? {}, disable: true };
       }
       const existing = agentSection[FORGE_AGENT];
+      const userDefinedForge = existing !== undefined;
       agentSection[FORGE_AGENT] = {
         ...existing ?? {},
         description: existing?.description ?? "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).",
         mode: existing?.mode ?? "primary",
         prompt: existing?.prompt ?? FORGE_PROMPT
       };
+      try {
+        const exp = JSON.stringify(cfg.experimental ?? "");
+        if (/background/i.test(exp))
+          nativeBackgroundSeen = true;
+      } catch {}
+      if (!userDefinedForge && !jobsKeepBuiltinShell && jobStage() < 1) {
+        const entry = agentSection[FORGE_AGENT];
+        entry.tools = { ...entry.tools ?? {}, shell: false, bash: false };
+      }
       cfg.command ??= {};
       cfg.command["plan"] ??= {
         template: PLAN_COMMAND_TEMPLATE,
@@ -14052,7 +15164,7 @@ var server = async (input) => {
       };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
-      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard"]) {
+      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell"]) {
         if (permSection[gateKey] !== "deny")
           permSection[gateKey] = "ask";
       }
@@ -14060,12 +15172,23 @@ var server = async (input) => {
     get tool() {
       return forgeDisabled ? {} : forgeTools();
     },
-    "tool.execute.before": async (input2) => {
+    "tool.execute.before": async (input2, output) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join2(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
+          appendFileSync2(join3(tmpdir2(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
 `);
         } catch {}
+      }
+      if (watchdog.mode !== "off" && (input2.tool === "shell" || input2.tool === "bash")) {
+        const a = output?.args ?? {};
+        const cmdText = typeof a.command === "string" ? a.command : typeof a.cmd === "string" ? a.cmd : undefined;
+        watchdog.track(input2.callID, input2.sessionID, input2.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined);
+        if (process.env.FORGE_WATCHDOG_PROBE) {
+          try {
+            appendFileSync2(join3(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
+`);
+          } catch {}
+        }
       }
       if (typeof input2.tool === "string" && isWriteTool(input2.tool)) {
         const state = stateForBan(input2.sessionID);
@@ -14081,11 +15204,11 @@ var server = async (input) => {
       const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join2(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
+          appendFileSync2(join3(tmpdir2(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
 `);
         } catch {}
       }
-      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
+      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard" || name === "forge_shell") {
         if (output.status !== "deny")
           output.status = "ask";
         return;
@@ -14111,10 +15234,40 @@ var server = async (input) => {
         if (typeof sessionID === "string" && sessionID) {
           goalProbe(`idle event session=${sessionID}`);
           scheduleIdleContinuation(client, sessionID);
+          deliverJobWakes(sessionID);
+        }
+      }
+      if (event.type === "session.deleted") {
+        const info = event.properties.info;
+        if (typeof info?.id === "string" && info.id) {
+          jobManager.onSessionEnd(info.id);
         }
       }
     },
+    "shell.env": async (input2, output) => {
+      if (watchdog.mode === "off")
+        return;
+      if (!input2.callID)
+        return;
+      output.env[WATCHDOG_ENV_MARK] = markerValue(input2.callID);
+      watchdog.markSeen(input2.callID);
+      if (process.env.FORGE_WATCHDOG_PROBE) {
+        try {
+          appendFileSync2(join3(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
+`);
+        } catch {}
+      }
+    },
     "tool.execute.after": async (input2) => {
+      if ((input2.tool === "shell" || input2.tool === "bash") && watchdog.has(input2.callID)) {
+        watchdog.untrack(input2.callID);
+        if (process.env.FORGE_WATCHDOG_PROBE) {
+          try {
+            appendFileSync2(join3(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
+`);
+          } catch {}
+        }
+      }
       if (typeof input2.tool !== "string")
         return;
       const act = turnActivity.get(input2.sessionID);
@@ -14125,9 +15278,24 @@ var server = async (input) => {
       if (input2.tool === "goal_check")
         act.checks++;
     },
+    "tool.definition": async (input2, output) => {
+      if (input2.toolID === "shell" || input2.toolID === "bash") {
+        const props = output.parameters?.properties;
+        if (props && "run_in_background" in props)
+          nativeBackgroundSeen = true;
+      } else if (input2.toolID === "forge_shell" && jobStage() === 1) {
+        if (!output.description.startsWith(STAGE1_NOTE)) {
+          output.description = `${STAGE1_NOTE}
+${output.description}`;
+        }
+      }
+    },
     "experimental.chat.system.transform": async (input2, output) => {
       if (!input2.sessionID)
         return;
+      if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
+        output.system.push("[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.");
+      }
       const state = sessions.get(input2.sessionID);
       if (!state)
         return;

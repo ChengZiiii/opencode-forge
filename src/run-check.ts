@@ -9,6 +9,7 @@
 import { spawn } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { join, resolve, sep } from "node:path"
+import { killTree } from "./proc.ts"
 import {
   DEFAULT_TIMEOUT_SEC,
   MAX_TIMEOUT_SEC,
@@ -53,28 +54,9 @@ export const defaultShellRunner: ShellRunner = (cmd, opts) =>
     let output = ""
     let timedOut = false
     let settled = false
-    const killTree = () => {
-      if (!child.pid) {
-        child.kill()
-        return
-      }
-      if (process.platform === "win32") {
-        try {
-          spawn("taskkill", ["/pid", String(child.pid), "/F", "/T"], { windowsHide: true, stdio: "ignore" })
-        } catch {
-          child.kill()
-        }
-      } else {
-        try {
-          process.kill(-child.pid, "SIGKILL")
-        } catch {
-          child.kill("SIGKILL")
-        }
-      }
-    }
     const timer = setTimeout(() => {
       timedOut = true
-      killTree()
+      killTree(child)
     }, opts.timeoutMs)
     // Safety net: never hold the gate longer than timeout + 30s even if the
     // tree kill raced (orphaned grand-child still streaming). Unref'd and
