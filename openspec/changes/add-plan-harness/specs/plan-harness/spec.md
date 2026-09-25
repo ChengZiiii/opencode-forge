@@ -58,12 +58,17 @@ While the current session has an active draft (created via `/plan` or bound via 
 
 ### Requirement: Approval gate permission confirmation
 
-`plan_approve` SHALL transition the active plan's status from draft to approved; the call SHALL be pinned to an ask-level confirmation (never auto-allowed, not exempted by user allow config), and the user's confirmation-dialog action IS the approval. Calling it with a non-draft status SHALL error.
+`plan_approve` SHALL transition the active plan's status from draft to approved; the call SHALL be pinned to an ask-level confirmation (never auto-allowed, not exempted by user allow config). Approval SHALL be user-led: after a draft is written, the harness guidance SHALL direct the agent to present the plan and end its turn — the user reviews at their own pace (revision feedback triggers a `plan_write` revision and re-presentation; rejection leads to `/plan discard` or re-planning) — and `plan_approve` SHALL only be called after the user's explicit go-ahead in conversation, with the confirmation dialog acting as the final hard gate. Calling it with a non-draft status SHALL error.
 
 #### Scenario: Entering execution after user confirmation
 
-- **WHEN** the model presents the plan summary, calls `plan_approve`, and the user allows it in the confirmation dialog
+- **WHEN** the draft is presented, the user replies with an explicit go-ahead, the model calls `plan_approve`, and the user allows it in the confirmation dialog
 - **THEN** status becomes approved and the draft-phase write ban lifts
+
+#### Scenario: The user steers the review before any approval
+
+- **WHEN** the draft is presented and the user replies with change requests instead of a go-ahead
+- **THEN** the agent revises the draft via `plan_write`, re-presents it, and ends its turn again — no `plan_approve` call and no execution happen without the user's explicit approval
 
 #### Scenario: Duplicate approval rejected
 

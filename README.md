@@ -8,7 +8,8 @@ OpenSpec spec workflows remain a third, separate lane.
 
 ```
 /plan fix login timeout   → read-only recon → plan_write (draft, writes denied)
-                           → present → plan_approve (user dialog = approval gate)
+                           → present, end turn → USER REVIEW (revise / discard / go-ahead)
+                           → plan_approve (user dialog = final gate) on explicit go-ahead
                            → execute task by task, plan_tick on each (timestamped audit)
                            → all ticked → per-criterion self-check → plan_close
                              (user dialog = completion gate) → done
