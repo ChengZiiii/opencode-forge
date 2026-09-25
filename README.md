@@ -73,9 +73,9 @@ If you already have a `command.plan` of your own, it wins and the plugin's
 1. Remove the plugin entry from the `plugin` array in
    `~/.config/opencode/opencode.json` (global installs).
 2. Delete the package store dir:
-   `~/.cache/opencode/packages/github_ChengZiiii/opencode-forge/` (github
-   installs, owner/repo layout; for npm installs it is
-   `~/.cache/opencode/packages/opencode-forge/`).
+   `~/.cache/opencode/packages/@sorenllm/opencode-forge/` (npm installs,
+   scope-dir layout; for github installs it is
+   `~/.cache/opencode/packages/github_ChengZiiii/opencode-forge/`).
 3. Delete the `agent["forge"]` block from your config if you added one
    (otherwise the name lingers in the agent list).
 4. Done — the hidden native `build`/`plan` agents come back automatically
