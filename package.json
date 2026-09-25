@@ -1,6 +1,6 @@
 {
   "name": "@sorenllm/opencode-forge",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Single general-purpose forge agent for opencode with two orthogonal harnesses: a plan harness (file-backed plans in .opencode/plan/, approve/close confirmation gates, tick discipline, hard write-ban while planning) and a goal harness (autonomous, host-verified objectives in .opencode/goal/ — idle continuation under turn/minute budgets, shell + file-contract checks re-run by the plugin at the completion gate, no-progress/transport/budget auto-pause, queueing).",
   "type": "module",
   "main": "./dist/index.js",
