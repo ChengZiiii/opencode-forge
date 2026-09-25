@@ -65,6 +65,27 @@ const PLAN_COMMAND_TEMPLATE = [
   "",
 ].join("\n")
 
+// ---------------------------------------------------------------------------
+// Worktree resolution
+// ---------------------------------------------------------------------------
+// opencode assigns sessions in non-git directories to its built-in "global"
+// project, whose worktree is "/" — on Windows that resolves to the current
+// drive root, and join("/", ".opencode", "plan") would silently write plans
+// to C:\.opencode\plan\ (verified in the wild: a real user session landed
+// there). The launch directory (PluginInput.directory / session directory)
+// is always the real workspace, so whenever the reported worktree is a
+// degenerate root (or empty) we fall back to it.
+export function isRootish(p: string | undefined): boolean {
+  if (!p) return true
+  return p === "/" || p === "\\" || /^[A-Za-z]:[\\/]?$/.test(p)
+}
+
+export function effectiveWorktree(worktree: string | undefined, fallback: string | undefined): string {
+  const wt = (worktree ?? "").trim()
+  if (!isRootish(wt)) return wt
+  return (fallback ?? "").trim()
+}
+
 type SessionState = {
   worktree: string
   planPath?: string
@@ -117,6 +138,12 @@ function ensureSession(sessionID: string, worktree: string): SessionState {
   return state
 }
 
+// Where a plan_* tool call for this context should anchor: the session's real
+// worktree, with the launch directory as the global-project ("/") fallback.
+function worktreeFor(context: { sessionID: string; worktree: string }): string {
+  return effectiveWorktree(context.worktree, hostWorktree) || context.worktree
+}
+
 type ActivePlan = { path: string; doc: PlanDoc }
 
 // Session binding first; falls back to the newest non-terminal plan in the
@@ -157,7 +184,7 @@ const planWriteTool = tool({
     nonGoals: tool.schema.array(tool.schema.string()).optional().describe("Non-Goals: explicit out-of-scope items"),
   },
   execute: async (args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree)
+    const state = ensureSession(context.sessionID, worktreeFor(context))
     const active = resolveActivePlan(state)
     const now = nowIso()
     let path: string
@@ -172,7 +199,7 @@ const planWriteTool = tool({
         `A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`,
       )
     } else {
-      const dir = planDirOf(context.worktree)
+      const dir = planDirOf(state.worktree)
       mkdirSync(dir, { recursive: true })
       path = join(dir, planFileName(localDate(), slugify(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md"))))
       mode = "created"
@@ -200,7 +227,7 @@ const planTickTool = tool({
     n: tool.schema.number().int().positive().describe("Task number exactly as it appears in the plan's Task List"),
   },
   execute: async (args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree)
+    const state = ensureSession(context.sessionID, worktreeFor(context))
     const active = resolveActivePlan(state)
     if (!active) throw new PlanError("No usable plan in this workspace (.opencode/plan/ has no non-terminal plan).")
     if (active.doc.status !== "approved") {
@@ -244,7 +271,7 @@ const planApproveTool = tool({
     summary: tool.schema.string().optional().describe("One-line summary presented alongside the approval request"),
   },
   execute: async (_args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree)
+    const state = ensureSession(context.sessionID, worktreeFor(context))
     const active = resolveActivePlan(state)
     if (!active) throw new PlanError("No plan awaiting approval. Create one with plan_write first.")
     if (active.doc.status !== "draft") {
@@ -277,7 +304,7 @@ const planCloseTool = tool({
       .describe("One entry per acceptance criterion, in plan order"),
   },
   execute: async (args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree)
+    const state = ensureSession(context.sessionID, worktreeFor(context))
     const active = resolveActivePlan(state)
     if (!active) throw new PlanError("No plan to close.")
     if (active.doc.status !== "approved") {
@@ -305,7 +332,7 @@ const planDiscardTool = tool({
     reason: tool.schema.string().optional().describe("Short reason recorded in the reply"),
   },
   execute: async (_args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree)
+    const state = ensureSession(context.sessionID, worktreeFor(context))
     const active = resolveActivePlan(state)
     if (!active) throw new PlanError("No plan to abandon in this workspace.")
     writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "abandoned", nowIso()))
@@ -328,9 +355,10 @@ function forgeTools(): Record<string, ToolDefinition> {
 // Launch-directory seed from PluginInput: continued sessions (-c / --session)
 // do NOT re-fire session.created in a new process, so a fresh process would
 // start with an empty session map and the draft write-ban would miss. The
-// plugin's launch worktree covers the single-project case (opencode run /
-// TUI); tool contexts re-bind the authoritative worktree on every plan_*
-// call. Empty when the host provides neither field (harmless: belt only).
+// plugin's launch worktree (already global-project-corrected) covers the
+// single-project case (opencode run / TUI); tool contexts re-bind the
+// authoritative worktree on every plan_* call. Empty when the host provides
+// neither field (harmless: belt only).
 let hostWorktree = ""
 
 // Bind a session for ban lookups: known state, or seeded from the launch
@@ -348,7 +376,7 @@ function stateForBan(sessionID: string | undefined): SessionState | null {
 // ---------------------------------------------------------------------------
 
 export const server: Plugin = async (input) => {
-  hostWorktree = input.worktree || input.directory || ""
+  hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || ""
   return {
     dispose: async () => {
       sessions.clear()
@@ -486,7 +514,7 @@ export const server: Plugin = async (input) => {
         const info = (event as unknown as {
           properties: { info: { id: string; directory?: string; worktree?: string } }
         }).properties.info
-        const worktree = info.worktree ?? info.directory
+        const worktree = effectiveWorktree(info.worktree, info.directory)
         if (typeof worktree === "string" && worktree) {
           ensureSession(info.id, worktree)
         }

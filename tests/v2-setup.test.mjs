@@ -3,7 +3,26 @@ import assert from "node:assert/strict"
 
 // plugin.ts pulls @opencode-ai/plugin (peer dep, installed in devDeps); under
 // node --test with type stripping this import is fine.
-import { v2Setup } from "../plugin.ts"
+import { v2Setup, isRootish, effectiveWorktree } from "../plugin.ts"
+
+test("worktree resolution: global-project root falls back to the launch directory", () => {
+  // degenerate worktrees (opencode's global project uses "/")
+  assert.equal(isRootish("/"), true)
+  assert.equal(isRootish("\\"), true)
+  assert.equal(isRootish("C:"), true)
+  assert.equal(isRootish("C:\\"), true)
+  assert.equal(isRootish("C:/"), true)
+  assert.equal(isRootish(""), true)
+  assert.equal(isRootish(undefined), true)
+  // real worktrees are untouched
+  assert.equal(isRootish("C:/Users/Soren/Desktop/AgentWorkCommon"), false)
+  assert.equal(isRootish("/home/user/repo"), false)
+  // fallback chain: real worktree wins; rootish worktree defers to directory
+  assert.equal(effectiveWorktree("C:/repo", "C:/dir"), "C:/repo")
+  assert.equal(effectiveWorktree("/", "C:/Users/Soren/Desktop/AgentWorkCommon"), "C:/Users/Soren/Desktop/AgentWorkCommon")
+  assert.equal(effectiveWorktree(undefined, "C:/dir"), "C:/dir")
+  assert.equal(effectiveWorktree(undefined, undefined), "")
+})
 
 function makeCtx() {
   const agents = new Map()

@@ -12673,6 +12673,17 @@ var PLAN_COMMAND_TEMPLATE = [
   ""
 ].join(`
 `);
+function isRootish(p) {
+  if (!p)
+    return true;
+  return p === "/" || p === "\\" || /^[A-Za-z]:[\\/]?$/.test(p);
+}
+function effectiveWorktree(worktree, fallback) {
+  const wt = (worktree ?? "").trim();
+  if (!isRootish(wt))
+    return wt;
+  return (fallback ?? "").trim();
+}
 var sessions = new Map;
 var forgeDisabled = false;
 var WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"]);
@@ -12701,6 +12712,9 @@ function ensureSession(sessionID, worktree) {
   const state = { worktree };
   sessions.set(sessionID, state);
   return state;
+}
+function worktreeFor(context) {
+  return effectiveWorktree(context.worktree, hostWorktree) || context.worktree;
 }
 function resolveActivePlan(state) {
   if (state.planPath && existsSync(state.planPath)) {
@@ -12732,7 +12746,7 @@ var planWriteTool = tool({
     nonGoals: tool.schema.array(tool.schema.string()).optional().describe("Non-Goals: explicit out-of-scope items")
   },
   execute: async (args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree);
+    const state = ensureSession(context.sessionID, worktreeFor(context));
     const active = resolveActivePlan(state);
     const now = nowIso();
     let path;
@@ -12745,7 +12759,7 @@ var planWriteTool = tool({
     } else if (active) {
       throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
-      const dir = planDirOf(context.worktree);
+      const dir = planDirOf(state.worktree);
       mkdirSync(dir, { recursive: true });
       path = join(dir, planFileName(localDate(), slugify(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
@@ -12772,7 +12786,7 @@ var planTickTool = tool({
     n: tool.schema.number().int().positive().describe("Task number exactly as it appears in the plan's Task List")
   },
   execute: async (args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree);
+    const state = ensureSession(context.sessionID, worktreeFor(context));
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No usable plan in this workspace (.opencode/plan/ has no non-terminal plan).");
@@ -12799,7 +12813,7 @@ var planApproveTool = tool({
     summary: tool.schema.string().optional().describe("One-line summary presented alongside the approval request")
   },
   execute: async (_args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree);
+    const state = ensureSession(context.sessionID, worktreeFor(context));
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan awaiting approval. Create one with plan_write first.");
@@ -12825,7 +12839,7 @@ var planCloseTool = tool({
     })).describe("One entry per acceptance criterion, in plan order")
   },
   execute: async (args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree);
+    const state = ensureSession(context.sessionID, worktreeFor(context));
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan to close.");
@@ -12854,7 +12868,7 @@ var planDiscardTool = tool({
     reason: tool.schema.string().optional().describe("Short reason recorded in the reply")
   },
   execute: async (_args, context) => {
-    const state = ensureSession(context.sessionID, context.worktree);
+    const state = ensureSession(context.sessionID, worktreeFor(context));
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan to abandon in this workspace.");
@@ -12885,7 +12899,7 @@ function stateForBan(sessionID) {
   return ensureSession(sessionID, hostWorktree);
 }
 var server = async (input) => {
-  hostWorktree = input.worktree || input.directory || "";
+  hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || "";
   return {
     dispose: async () => {
       sessions.clear();
@@ -12968,7 +12982,7 @@ var server = async (input) => {
     event: async ({ event }) => {
       if (event.type === "session.created") {
         const info = event.properties.info;
-        const worktree = info.worktree ?? info.directory;
+        const worktree = effectiveWorktree(info.worktree, info.directory);
         if (typeof worktree === "string" && worktree) {
           ensureSession(info.id, worktree);
         }
@@ -13016,5 +13030,7 @@ var plugin_default = { id: "forge", server, setup: v2Setup };
 export {
   v2Setup,
   server,
+  isRootish,
+  effectiveWorktree,
   plugin_default as default
 };
