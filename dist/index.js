@@ -12334,9 +12334,9 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // plugin.ts
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { dirname, join, relative } from "node:path";
+import { dirname, join as join2, relative } from "node:path";
 import { tmpdir } from "node:os";
 
 // src/plan-file.ts
@@ -12642,12 +12642,599 @@ function rankActivePlans(entries) {
   return entries.map((e) => ({ name: e.name, doc: parsePlanLoose(e.text) })).filter((e) => e.doc !== null && !isTerminal(e.doc.status)).sort((a, b) => a.doc.updated < b.doc.updated ? 1 : a.doc.updated > b.doc.updated ? -1 : a.name.localeCompare(b.name));
 }
 
+// src/goal-file.ts
+import { renameSync, writeFileSync } from "node:fs";
+
+class GoalError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "GoalError";
+  }
+}
+var DEFAULT_MAX_TURNS = 25;
+var DEFAULT_MAX_MINUTES = 60;
+var HARD_MAX_TURNS = 200;
+var HARD_MAX_MINUTES = 480;
+var DEFAULT_TIMEOUT_SEC = 120;
+var MAX_TIMEOUT_SEC = 600;
+var TRANSPORT_FAILURE_LIMIT = 3;
+var NO_PROGRESS_LIMIT = 2;
+var TERMINAL2 = ["completed", "abandoned"];
+var LEGAL_TRANSITIONS2 = {
+  queued: ["active", "abandoned"],
+  active: ["paused", "completed", "abandoned"],
+  paused: ["active", "abandoned"],
+  completed: [],
+  abandoned: []
+};
+var SECTION_ORDER2 = [
+  "Goal",
+  "Success Criteria",
+  "Verification Checks",
+  "Constraints",
+  "Non-Goals",
+  "Check Log",
+  "Turn Ledger"
+];
+var SECTION_HEADERS = {
+  Goal: /^(#*)\s*goal\s*$/i,
+  "Success Criteria": /^(#*)\s*success criteria\s*$/i,
+  "Verification Checks": /^(#*)\s*verification checks\s*$/i,
+  Constraints: /^(#*)\s*constraints\s*$/i,
+  "Non-Goals": /^(#*)\s*non-goals?\s*$/i,
+  "Check Log": /^(#*)\s*check log\s*$/i,
+  "Turn Ledger": /^(#*)\s*turn ledger\s*$/i
+};
+var SHELL_LINE_RE = /^\s*(\d+)[.、)]\s*shell\s+`([^`]*)`(?:\s+\(timeout\s+(\d+)s?\))?$/i;
+var CONTAINS_LINE_RE = /^\s*(\d+)[.、)]\s*contains\s+`([^`]*)`\s*::\s*`([^`]*)`$/i;
+var NUMBERED_RE = /^\s*(\d+)[.、)]\s+(.+)$/;
+var LEDGER_RE = /^-\s*turn\s+(\d+)\s+rev(\d+)\s+(\S+)\s+activity=(yes|no)\s+\(writes=(\d+)\s+checks=(\d+)\)$/;
+function isGoalTerminal(status) {
+  return TERMINAL2.includes(status);
+}
+function isGoalLive(status) {
+  return status === "active" || status === "paused";
+}
+function canTransitionGoal(from, to) {
+  const legal = LEGAL_TRANSITIONS2[from];
+  return Array.isArray(legal) && legal.includes(to);
+}
+function slugifyGoal(goal) {
+  const slug = goal.toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "-").replace(/-+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32).replace(/-+$/g, "");
+  return slug || "goal";
+}
+function localDateNow(d = new Date) {
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, "0");
+  const day = String(d.getDate()).padStart(2, "0");
+  return `${y}-${m}-${day}`;
+}
+function goalFileName(date5, slug, existingNames = []) {
+  const taken = new Set(existingNames);
+  let base = `${date5}-${slug}`;
+  let name = `${base}.md`;
+  let i = 2;
+  while (taken.has(name)) {
+    name = `${base}-${i}.md`;
+    i++;
+  }
+  return name;
+}
+function atomicWrite(file2, text) {
+  const tmp = `${file2}.tmp`;
+  writeFileSync(tmp, text);
+  renameSync(tmp, file2);
+}
+function validateGoalInput(input) {
+  const missing = [];
+  const reqStr = (v) => typeof v === "string" && v.trim().length > 0;
+  if (!reqStr(input.goal))
+    missing.push("goal");
+  if (!Array.isArray(input.criteria) || input.criteria.length === 0 || !input.criteria.every(reqStr)) {
+    missing.push("criteria (at least one success criterion)");
+  }
+  if (!Array.isArray(input.checks) || input.checks.length === 0) {
+    missing.push("checks (at least one verification item)");
+  } else {
+    for (const c of input.checks) {
+      if (c.kind === "shell" && !reqStr(c.cmd)) {
+        missing.push("checks (a shell item has an empty command)");
+        break;
+      }
+      if (c.kind === "contains" && (!reqStr(c.file) || !reqStr(c.text))) {
+        missing.push("checks (a contains item has an empty file or text)");
+        break;
+      }
+    }
+  }
+  if (!reqStr(input.constraints))
+    missing.push("constraints");
+  if (input.maxTurns !== undefined && (!Number.isInteger(input.maxTurns) || input.maxTurns < 1 || input.maxTurns > HARD_MAX_TURNS)) {
+    missing.push(`maxTurns (integer 1-${HARD_MAX_TURNS})`);
+  }
+  if (input.maxMinutes !== undefined && (!Number.isInteger(input.maxMinutes) || input.maxMinutes < 1 || input.maxMinutes > HARD_MAX_MINUTES)) {
+    missing.push(`maxMinutes (integer 1-${HARD_MAX_MINUTES})`);
+  }
+  return missing;
+}
+function renderCheck(item) {
+  if (item.kind === "shell") {
+    const t = item.timeoutSec ?? DEFAULT_TIMEOUT_SEC;
+    return `shell \`${item.cmd}\` (timeout ${t}s)`;
+  }
+  return `contains \`${item.file}\` :: \`${item.text}\``;
+}
+function frontmatterBlock2(meta) {
+  const lines = [
+    "---",
+    `status: ${meta.status}`,
+    `created: ${meta.created}`,
+    `updated: ${meta.updated}`,
+    `revision: ${meta.revision}`
+  ];
+  if (meta.session)
+    lines.push(`session: ${meta.session}`);
+  lines.push(`max_turns: ${meta.maxTurns}`, `turns_used: ${meta.turnsUsed}`, `max_minutes: ${meta.maxMinutes}`);
+  if (meta.status === "paused" && meta.stopReason)
+    lines.push(`stop_reason: ${meta.stopReason}`);
+  lines.push("---", "");
+  return lines.join(`
+`);
+}
+function renderGoal(input, meta) {
+  const missing = validateGoalInput(input);
+  if (missing.length > 0) {
+    throw new GoalError(`Goal contract incomplete; missing: ${missing.join(", ")}`);
+  }
+  const goal = input.goal.trim();
+  const nonGoals = (input.nonGoals ?? []).filter((s) => s.trim().length > 0);
+  const parts = [
+    frontmatterBlock2({
+      status: meta.status,
+      created: meta.created ?? meta.now,
+      updated: meta.now,
+      revision: meta.revision ?? 1,
+      session: meta.session,
+      maxTurns: input.maxTurns ?? DEFAULT_MAX_TURNS,
+      turnsUsed: meta.turnsUsed ?? 0,
+      maxMinutes: input.maxMinutes ?? DEFAULT_MAX_MINUTES
+    }),
+    "## Goal",
+    "",
+    goal,
+    "",
+    "## Success Criteria",
+    "",
+    input.criteria.map((c, i) => `${i + 1}. ${c.trim()}`).join(`
+`),
+    "",
+    "## Verification Checks",
+    "",
+    input.checks.map((c, i) => `${i + 1}. ${renderCheck(c)}`).join(`
+`),
+    "",
+    "## Constraints",
+    "",
+    input.constraints.trim(),
+    "",
+    "## Non-Goals",
+    "",
+    nonGoals.length > 0 ? nonGoals.map((s) => `- ${s.trim()}`).join(`
+`) : "(no non-goals declared)",
+    "",
+    "## Check Log",
+    "",
+    "(no checks recorded yet)",
+    "",
+    "## Turn Ledger",
+    "",
+    "(no continuation turns yet)",
+    ""
+  ];
+  return parts.join(`
+`);
+}
+function parseFrontmatter2(text) {
+  const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/);
+  if (!m)
+    throw new GoalError("goal file is missing frontmatter");
+  const fm = {};
+  for (const line of m[1].split(/\r?\n/)) {
+    const kv = line.match(/^([A-Za-z_][\w-]*):\s*(.*)$/);
+    if (kv)
+      fm[kv[1]] = kv[2].trim();
+  }
+  return { fm, body: text.slice(m[0].length) };
+}
+function matchSectionHeader2(line) {
+  const trimmed = line.trim();
+  if (!trimmed.startsWith("#"))
+    return null;
+  for (const key of Object.keys(SECTION_HEADERS)) {
+    if (SECTION_HEADERS[key].test(trimmed))
+      return key;
+  }
+  return null;
+}
+function splitSections2(body) {
+  const sections = new Map;
+  let current = null;
+  const buf = [];
+  const flush = () => {
+    if (current !== null)
+      sections.set(current, buf.join(`
+`).trim());
+    buf.length = 0;
+  };
+  for (const line of body.split(/\r?\n/)) {
+    const header = matchSectionHeader2(line);
+    if (header !== null) {
+      flush();
+      current = header;
+    } else if (current !== null) {
+      buf.push(line);
+    }
+  }
+  flush();
+  return sections;
+}
+function parseGoal(text) {
+  const { fm, body } = parseFrontmatter2(text);
+  const status = fm.status ?? "queued";
+  if (!["queued", "active", "paused", "completed", "abandoned"].includes(status)) {
+    throw new GoalError(`Unknown goal status: ${fm.status}`);
+  }
+  const sections = splitSections2(body);
+  for (const key of SECTION_ORDER2) {
+    if (!sections.has(key)) {
+      throw new GoalError(`Goal is missing section: ${key}`);
+    }
+  }
+  const criteria = [];
+  const seenCriterion = new Set;
+  for (const line of (sections.get("Success Criteria") ?? "").split(/\r?\n/)) {
+    const m = line.match(NUMBERED_RE);
+    if (!m)
+      continue;
+    if (seenCriterion.has(Number(m[1])))
+      throw new GoalError(`Duplicate success criterion number: ${m[1]}`);
+    seenCriterion.add(Number(m[1]));
+    criteria.push(m[2].trim());
+  }
+  if (criteria.length === 0)
+    throw new GoalError("Success criteria are empty or malformed");
+  const checks3 = [];
+  const seenCheck = new Set;
+  for (const line of (sections.get("Verification Checks") ?? "").split(/\r?\n/)) {
+    const shell = line.match(SHELL_LINE_RE);
+    if (shell) {
+      if (seenCheck.has(Number(shell[1])))
+        throw new GoalError(`Duplicate verification item number: ${shell[1]}`);
+      seenCheck.add(Number(shell[1]));
+      checks3.push({ kind: "shell", cmd: shell[2], ...shell[3] ? { timeoutSec: Number(shell[3]) } : {} });
+      continue;
+    }
+    const contains = line.match(CONTAINS_LINE_RE);
+    if (contains) {
+      if (seenCheck.has(Number(contains[1])))
+        throw new GoalError(`Duplicate verification item number: ${contains[1]}`);
+      seenCheck.add(Number(contains[1]));
+      checks3.push({ kind: "contains", file: contains[2], text: contains[3] });
+    }
+  }
+  if (checks3.length === 0)
+    throw new GoalError("Verification checks are empty or malformed");
+  const log = (sections.get("Check Log") ?? "").split(/\r?\n/).filter((l) => l.startsWith("- "));
+  const ledger = [];
+  for (const line of (sections.get("Turn Ledger") ?? "").split(/\r?\n/)) {
+    const m = line.match(LEDGER_RE);
+    if (m) {
+      ledger.push({ turn: Number(m[1]), revision: Number(m[2]), at: m[3], activity: m[4] === "yes", writes: Number(m[5]), checks: Number(m[6]) });
+    }
+  }
+  const num = (v, dflt) => {
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt;
+  };
+  return {
+    status,
+    created: fm.created ?? "",
+    updated: fm.updated ?? "",
+    revision: Math.max(1, num(fm.revision, 1)),
+    session: fm.session ?? "",
+    maxTurns: Math.max(1, num(fm.max_turns, DEFAULT_MAX_TURNS)),
+    turnsUsed: num(fm.turns_used, 0),
+    maxMinutes: Math.max(1, num(fm.max_minutes, DEFAULT_MAX_MINUTES)),
+    ...status === "paused" && fm.stop_reason ? { stopReason: fm.stop_reason } : {},
+    goal: (sections.get("Goal") ?? "").split(/\r?\n/)[0]?.trim() ?? "",
+    criteria,
+    checks: checks3,
+    constraints: sections.get("Constraints") ?? "",
+    nonGoals: (sections.get("Non-Goals") ?? "").split(/\r?\n/).filter((l) => l.startsWith("- ")).map((l) => l.slice(1).trim()),
+    log,
+    ledger
+  };
+}
+function parseGoalLoose(text) {
+  try {
+    return parseGoal(text);
+  } catch {
+    return null;
+  }
+}
+function setFm(text, key, value) {
+  const re = new RegExp(`^${key}:.*$`, "m");
+  if (re.test(text))
+    return text.replace(re, `${key}: ${value}`);
+  return text.replace(/^---\r?\n/, `---
+${key}: ${value}
+`);
+}
+function setUpdated2(text, now) {
+  return setFm(text, "updated", now);
+}
+function transitionGoal(text, to, now, opts = {}) {
+  const { fm } = parseFrontmatter2(text);
+  const from = fm.status ?? "queued";
+  if (from === to)
+    throw new GoalError(`Goal is already ${to}`);
+  if (!canTransitionGoal(from, to)) {
+    throw new GoalError(`Illegal goal status transition: ${from} -> ${to} (legal paths: queued -> active; active <-> paused; active -> completed; queued/active/paused -> abandoned)`);
+  }
+  let next = text.replace(/^status:.*$/m, `status: ${to}`);
+  if (to === "paused") {
+    if (!opts.stopReason)
+      throw new GoalError("Pausing requires a stop reason (user/blocker/no-progress/budget-turns/budget-time/draft-conflict/transport-failures)");
+    next = setFm(next, "stop_reason", opts.stopReason);
+  }
+  if (to === "active") {
+    if (!opts.session)
+      throw new GoalError("Arming/resuming requires the owning session id");
+    next = setFm(next, "session", opts.session);
+    next = next.replace(/^stop_reason:.*$\r?\n?/m, "");
+  }
+  return setUpdated2(next, now);
+}
+function incTurns(text, now) {
+  const doc2 = parseGoal(text);
+  const next = setFm(text, "turns_used", String(doc2.turnsUsed + 1));
+  return setUpdated2(next, now);
+}
+function bumpBudget(text, addTurns, now) {
+  const doc2 = parseGoal(text);
+  const capped = Math.min(doc2.maxTurns + addTurns, HARD_MAX_TURNS);
+  const next = setFm(text, "max_turns", String(capped));
+  return setUpdated2(next, now);
+}
+function budgetState(doc2) {
+  if (doc2.turnsUsed >= doc2.maxTurns)
+    return "budget-turns";
+  const start = Date.parse(doc2.created);
+  if (Number.isFinite(start) && Date.now() - start > doc2.maxMinutes * 60000)
+    return "budget-time";
+  return "ok";
+}
+var LOG_SIG_RE = /^-\s*\S+\s+run=(\S+)\s+(rev\d+)\s+(#\d+)\s+/;
+function appendCheckLog(text, runId, outcomes, now) {
+  const doc2 = parseGoal(text);
+  const existing = new Set(doc2.log.map((l) => l.match(LOG_SIG_RE)).filter((m) => m !== null).map((m) => `${m[1]} ${m[2]} ${m[3]}`));
+  const add = outcomes.filter((o) => !existing.has(`${runId} rev${doc2.revision} #${o.index}`)).map((o) => {
+    const label = o.label.replace(/\r?\n/g, " ");
+    const flat = (o.detail || "(no output)").replace(/\r?\n/g, " ");
+    const detail = flat.length > 400 ? `${flat.slice(0, 400)}…` : flat;
+    return `- ${now} run=${runId} rev${doc2.revision} #${o.index} ${o.ok ? "OK" : "FAIL"} (${o.durationMs ?? 0}ms) \`${label}\` :: ${detail}`;
+  });
+  if (add.length === 0)
+    return setUpdated2(text, now);
+  const lines = text.split(/\r?\n/);
+  const logHeaderIdx = lines.findIndex((l) => SECTION_HEADERS["Check Log"].test(l.trim()));
+  if (logHeaderIdx === -1)
+    throw new GoalError("Goal is missing section: Check Log");
+  const placeholderIdx = lines.indexOf("(no checks recorded yet)", logHeaderIdx);
+  if (placeholderIdx !== -1)
+    lines.splice(placeholderIdx, 1);
+  let lastLog = -1;
+  for (let i = logHeaderIdx + 1;i < lines.length; i++) {
+    if (lines[i].startsWith("- "))
+      lastLog = i;
+    else if (lines[i].trim() !== "")
+      break;
+  }
+  const at = lastLog === -1 ? logHeaderIdx + 2 : lastLog + 1;
+  lines.splice(at, 0, ...add);
+  return setUpdated2(lines.join(`
+`), now);
+}
+function appendLedger(text, entry, now) {
+  const lines = text.split(/\r?\n/);
+  const line = `- turn ${entry.turn} rev${entry.revision} ${entry.at} activity=${entry.activity ? "yes" : "no"} (writes=${entry.writes} checks=${entry.checks})`;
+  const headerIdx = lines.findIndex((l) => SECTION_HEADERS["Turn Ledger"].test(l.trim()));
+  if (headerIdx === -1)
+    throw new GoalError("Goal is missing section: Turn Ledger");
+  const phIdx = lines.indexOf("(no continuation turns yet)", headerIdx);
+  if (phIdx !== -1)
+    lines.splice(phIdx, 1);
+  const re = new RegExp(`^-\\s*turn\\s+${entry.turn}\\s+rev\\d+\\s+`);
+  const existingIdx = lines.findIndex((l, i) => i > headerIdx && re.test(l));
+  if (existingIdx !== -1) {
+    lines[existingIdx] = line;
+  } else {
+    let lastLedger = -1;
+    for (let i = headerIdx + 1;i < lines.length; i++) {
+      if (lines[i].startsWith("- "))
+        lastLedger = i;
+      else if (lines[i].trim() !== "")
+        break;
+    }
+    const at = lastLedger === -1 ? headerIdx + 2 : lastLedger + 1;
+    lines.splice(at, 0, line);
+  }
+  return setUpdated2(lines.join(`
+`), now);
+}
+function rankLiveGoals(entries) {
+  return entries.map((e) => ({ name: e.name, doc: parseGoalLoose(e.text) })).filter((e) => e.doc !== null && isGoalLive(e.doc.status)).sort((a, b) => a.doc.updated < b.doc.updated ? 1 : a.doc.updated > b.doc.updated ? -1 : a.name.localeCompare(b.name));
+}
+function rankQueuedGoals(entries) {
+  return entries.map((e) => ({ name: e.name, doc: parseGoalLoose(e.text) })).filter((e) => e.doc !== null && e.doc.status === "queued").sort((a, b) => a.doc.created > b.doc.created ? 1 : a.doc.created < b.doc.created ? -1 : a.name.localeCompare(b.name));
+}
+function completeCheckFailures(doc2, attestations) {
+  const failures = [];
+  const norm = (s) => s.toLowerCase().replace(/\s+/g, " ").trim();
+  const byCriterion = new Map(attestations.map((a) => [norm(a.criterion), a]));
+  doc2.criteria.forEach((criterion, i) => {
+    const a = byCriterion.get(norm(criterion));
+    if (!a) {
+      failures.push(`Success criterion ${i + 1} has no self-attestation: ${criterion}`);
+    } else if (!a.pass) {
+      failures.push(`Success criterion ${i + 1} attested as unmet: ${criterion} (evidence: ${a.evidence || "none"})`);
+    }
+  });
+  if (attestations.length > doc2.criteria.length) {
+    failures.push(`${attestations.length - doc2.criteria.length} attestation(s) do not match any criterion of revision ${doc2.revision}`);
+  }
+  return failures;
+}
+
+// src/run-check.ts
+import { spawn } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { join, resolve, sep } from "node:path";
+var OUTPUT_LIMIT = 2048;
+var defaultShellRunner = (cmd, opts) => new Promise((resolveRun) => {
+  let child;
+  try {
+    child = spawn(cmd, {
+      shell: true,
+      cwd: opts.cwd,
+      windowsHide: true,
+      ...process.platform !== "win32" ? { detached: true } : {}
+    });
+  } catch (err) {
+    resolveRun({ code: null, output: "", timedOut: false, spawnError: String(err) });
+    return;
+  }
+  let output = "";
+  let timedOut = false;
+  let settled = false;
+  const killTree = () => {
+    if (!child.pid) {
+      child.kill();
+      return;
+    }
+    if (process.platform === "win32") {
+      try {
+        spawn("taskkill", ["/pid", String(child.pid), "/F", "/T"], { windowsHide: true, stdio: "ignore" });
+      } catch {
+        child.kill();
+      }
+    } else {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        child.kill("SIGKILL");
+      }
+    }
+  };
+  const timer = setTimeout(() => {
+    timedOut = true;
+    killTree();
+  }, opts.timeoutMs);
+  const settle = (r) => {
+    if (settled)
+      return;
+    settled = true;
+    clearTimeout(timer);
+    resolveRun(r);
+  };
+  child.stdout?.on("data", (d) => {
+    if (output.length < OUTPUT_LIMIT * 2)
+      output += d.toString();
+  });
+  child.stderr?.on("data", (d) => {
+    if (output.length < OUTPUT_LIMIT * 2)
+      output += d.toString();
+  });
+  child.on("error", (err) => settle({ code: null, output, timedOut, spawnError: err.message }));
+  child.on("close", (code) => settle({ code, output, timedOut }));
+  setTimeout(() => settle({ code: null, output, timedOut: true, spawnError: "timeout settle fallback" }), opts.timeoutMs + 30000);
+});
+var shellRunner = defaultShellRunner;
+function truncateOutput(output) {
+  const flat = output.replace(/\r?\n/g, " ⏎ ").trim();
+  return flat.length > OUTPUT_LIMIT ? `${flat.slice(0, OUTPUT_LIMIT)}…` : flat;
+}
+function insideWorktree(worktree, file2) {
+  const root = resolve(worktree);
+  const abs = resolve(root, file2);
+  return abs === root || abs.startsWith(root + sep);
+}
+async function runShellItem(item, index, worktree) {
+  const timeoutSec = Math.min(item.timeoutSec ?? DEFAULT_TIMEOUT_SEC, MAX_TIMEOUT_SEC);
+  const started = Date.now();
+  const r = await shellRunner(item.cmd, { cwd: worktree, timeoutMs: timeoutSec * 1000 });
+  const durationMs = Date.now() - started;
+  if (r.spawnError) {
+    return { index, kind: "shell", label: item.cmd, ok: false, detail: `spawn failed: ${r.spawnError}`, durationMs };
+  }
+  if (r.timedOut) {
+    return { index, kind: "shell", label: item.cmd, ok: false, detail: `timed out after ${timeoutSec}s (partial output: ${truncateOutput(r.output) || "none"})`, durationMs };
+  }
+  return {
+    index,
+    kind: "shell",
+    label: item.cmd,
+    ok: r.code === 0,
+    detail: `exit=${r.code} ${truncateOutput(r.output)}`.trim(),
+    durationMs
+  };
+}
+function runContainsItem(item, index, worktree) {
+  const started = Date.now();
+  const label = `${item.file} :: ${item.text}`;
+  if (!insideWorktree(worktree, item.file)) {
+    return { index, kind: "contains", label, ok: false, detail: "path escapes the workspace boundary", durationMs: Date.now() - started };
+  }
+  const abs = join(worktree, item.file);
+  let content;
+  try {
+    content = readFileSync(abs, "utf8");
+  } catch (err) {
+    return { index, kind: "contains", label, ok: false, detail: `cannot read file: ${err.message}`, durationMs: Date.now() - started };
+  }
+  const ok = content.includes(item.text);
+  return {
+    index,
+    kind: "contains",
+    label,
+    ok,
+    detail: ok ? `found in ${item.file} (${content.length} chars)` : `required text not found in ${item.file} (${content.length} chars)`,
+    durationMs: Date.now() - started
+  };
+}
+async function runChecks(checks3, worktree) {
+  const outcomes = [];
+  for (let i = 0;i < checks3.length; i++) {
+    const item = checks3[i];
+    outcomes.push(item.kind === "shell" ? await runShellItem(item, i + 1, worktree) : runContainsItem(item, i + 1, worktree));
+  }
+  return outcomes;
+}
+function outcomesAllOk(outcomes) {
+  return outcomes.every((o) => o.ok);
+}
+function formatOutcomes(outcomes) {
+  return outcomes.map((o) => `#${o.index} [${o.ok ? "PASS" : "FAIL"}] (${o.kind}) ${o.label}
+    ${o.detail}`).join(`
+`);
+}
+
 // plugin.ts
 var bundleDir = dirname(fileURLToPath(import.meta.url));
-var candidateDirs = [bundleDir, join(bundleDir, "..")];
-var dataDir = candidateDirs.find((d) => existsSync(join(d, "SKILL.md"))) ?? bundleDir;
+var candidateDirs = [bundleDir, join2(bundleDir, "..")];
+var dataDir = candidateDirs.find((d) => existsSync(join2(d, "SKILL.md"))) ?? bundleDir;
 var FORGE_AGENT = "forge";
-var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching; phases change through commands (/plan) and tools.
+var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching; phases change through commands (/plan, /goal) and tools.
 
 Plan discipline (the tooling enforces the hard parts; you supply the judgment):
 - When the user invokes /plan with a goal, or asks to plan first, load the plan skill and follow it: read-only reconnaissance, clarifying questions when the goal is ambiguous, then plan_write. It creates .opencode/plan/<date>-<slug>.md with status draft.
@@ -12657,6 +13244,13 @@ Plan discipline (the tooling enforces the hard parts; you supply the judgment):
 - When all tasks are ticked, self-check every acceptance criterion with concrete evidence, then call plan_close with a per-criterion pass/evidence array. The user confirms closure in a dialog.
 - If the system prompt carries a [forge:plan-notice] line and the user has not mentioned the plan, relay its path and progress in one short line at the start of your reply.
 - Work that is expected to span sessions, touch many files over days, or need multi-round requirement review belongs to a spec workflow (e.g. OpenSpec), not a plan. Say so once and let the user choose; if they still want a plan, plan it.
+
+Goal discipline (autonomous, host-verified execution; orthogonal to plans and spec workflows — a goal never reads plan state and plan state is never goal evidence):
+- /goal "<objective>" drafts a goal contract: goal, numbered success criteria, numbered verification items (shell commands the plugin runs itself, and file contracts file::text), constraints, non-goals, budgets. Show the verification items verbatim before arming. goal_write with arm=true presents a confirmation dialog — the user's Allow arms the autonomous loop. arm=false (/goal add) only queues an inert goal.
+- When a [forge:goal-continue] brief arrives, keep working the success criteria within the stated constraints. The plugin continues the session on idle until the goal completes, pauses, or hits its turn/minute budget.
+- goal_check runs the verification items on the host and appends results to the goal's Check Log — use it whenever you believe the criteria may hold. goal_complete re-runs EVERY item itself (fail-closed: any failing item refuses completion) and additionally requires a per-criterion attestation with concrete evidence, then a user confirmation dialog.
+- If you are genuinely blocked, call goal_pause with the blocker text — do not spin. When the goal is paused and the user clearly asks to continue (e.g. "continue", "resume"), call goal_resume; the dialog re-arms the loop. Ordinary chat never reactivates a goal.
+- Never claim the goal is complete without passing goal_complete. Never edit the goal file by hand; revise the contract through goal_write (which bumps the revision and invalidates earlier evidence).
 
 Outside planning you are a normal full-capability coding agent.`;
 var PLAN_COMMAND_TEMPLATE = [
@@ -12670,6 +13264,23 @@ var PLAN_COMMAND_TEMPLATE = [
   '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked tasks to the user in one short list, then continue executing it — tick each task the moment it is done (plan_tick). If none exists, say so.',
   '- Argument "discard": call the plan_discard tool, then tell the user the plan was abandoned and writes are restored.',
   "- Any other argument: treat it as the task goal. Load the plan skill (skill tool), then follow its planning discipline for this goal.",
+  ""
+].join(`
+`);
+var GOAL_COMMAND_TEMPLATE = [
+  '(forge goal harness routing. Argument: "$ARGUMENTS")',
+  "",
+  "Current .opencode/goal/ directory:",
+  "!`ls -1 .opencode/goal 2>/dev/null || echo '(empty)'`",
+  "",
+  "Route on the argument above (decide silently; do not recite this routing text to the user):",
+  "- Argument empty: for every non-terminal goal in the directory above, read its frontmatter and report to the user: path, status (queued/active/paused + stop_reason), revision, turns_used/max_turns budget. Mention queued goals and the /goal next promotion option. Ask whether to resume/promote one or arm something new.",
+  '- Argument "pause": call the goal_pause tool (with the blocker text as `blocker` when there is one), then tell the user the loop is stopped and how to resume.',
+  `- Argument "resume": call the goal_resume tool for the session's paused goal (optionally with addTurns if the user asked for more budget). If no live goal exists but queued goals do, promote the oldest via goal_resume instead. The user confirms in a dialog.`,
+  '- Argument "next": promote the oldest queued goal via the goal_resume tool (no live goal must remain). The user confirms in a dialog.',
+  '- Argument "discard" (also "stop"/"cancel"/"off"): call the goal_discard tool. The user confirms in a dialog.',
+  '- Argument starting with "add " (or the user clearly wants to queue without arming): draft the contract from the rest of the argument and call goal_write with arm=false — it becomes a queued, inert goal (no dialog).',
+  '- Any other argument: treat it as a goal statement. Extract contract markers into the structured goal_write fields: --check "cmd" becomes a shell verification item, --contains "file::text" a file-contract item, --success "..." an extra success criterion, --constraint "..." goes into constraints, --non-goal "..." into nonGoals, --max-turns N and --max-minutes N set budgets. Draft a complete contract (goal, criteria, checks, constraints, non-goals), SHOW the verification items verbatim to the user, then call goal_write with arm=true — a confirmation dialog arms the autonomous loop. If this session already has a live goal, say so and offer revise/queue/discard instead.',
   ""
 ].join(`
 `);
@@ -12695,13 +13306,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 function planDirOf(worktree) {
-  return join(worktree, ".opencode", "plan");
+  return join2(worktree, ".opencode", "plan");
 }
 function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
   if (!existsSync(dir))
     return [];
-  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync(join(dir, name), "utf8") }));
+  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync2(join2(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -12709,7 +13320,7 @@ function ensureSession(sessionID, worktree) {
     existing.worktree = worktree;
     return existing;
   }
-  const state = { worktree };
+  const state = { sessionID, worktree };
   sessions.set(sessionID, state);
   return state;
 }
@@ -12718,7 +13329,7 @@ function worktreeFor(context) {
 }
 function resolveActivePlan(state) {
   if (state.planPath && existsSync(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync(state.planPath, "utf8"));
+    const doc2 = parsePlanLoose(readFileSync2(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -12726,7 +13337,7 @@ function resolveActivePlan(state) {
   const ranked = rankActivePlans(readPlanDir(state.worktree));
   if (ranked.length === 0)
     return null;
-  const path = join(planDirOf(state.worktree), ranked[0].name);
+  const path = join2(planDirOf(state.worktree), ranked[0].name);
   state.planPath = path;
   return { path, doc: ranked[0].doc };
 }
@@ -12761,11 +13372,11 @@ var planWriteTool = tool({
     } else {
       const dir = planDirOf(state.worktree);
       mkdirSync(dir, { recursive: true });
-      path = join(dir, planFileName(localDate(), slugify(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md"))));
+      path = join2(dir, planFileName(localDate(), slugify(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
     const text = renderPlan(args, now, created);
-    writeFileSync(path, text);
+    writeFileSync2(path, text);
     state.planPath = path;
     const doc2 = parsePlan(text);
     context.metadata({ title: `${mode === "created" ? "Create" : "Revise"} plan: ${doc2.goal}` });
@@ -12793,8 +13404,8 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync(active.path, "utf8"), args.n, nowIso());
-    writeFileSync(active.path, next);
+    const next = tickTask(readFileSync2(active.path, "utf8"), args.n, nowIso());
+    writeFileSync2(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` });
@@ -12821,7 +13432,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "approved", nowIso()));
+    writeFileSync2(active.path, transitionStatus(readFileSync2(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -12854,7 +13465,7 @@ var planCloseTool = tool({
 Fix the implementation and retry, or revise the plan first.`);
     }
     await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`);
-    writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "done", nowIso()));
+    writeFileSync2(active.path, transitionStatus(readFileSync2(active.path, "utf8"), "done", nowIso()));
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
       title: "plan done",
@@ -12872,10 +13483,297 @@ var planDiscardTool = tool({
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan to abandon in this workspace.");
-    writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "abandoned", nowIso()));
+    writeFileSync2(active.path, transitionStatus(readFileSync2(active.path, "utf8"), "abandoned", nowIso()));
     state.planPath = undefined;
     context.metadata({ title: `Plan abandoned: ${active.doc.goal}` });
     return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` };
+  }
+});
+function goalDirOf(worktree) {
+  return join2(worktree, ".opencode", "goal");
+}
+function readGoalDir(worktree) {
+  const dir = goalDirOf(worktree);
+  if (!existsSync(dir))
+    return [];
+  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync2(join2(dir, name), "utf8") }));
+}
+function resolveSessionGoal(state, opts = {}) {
+  if (state.goalPath && existsSync(state.goalPath)) {
+    const doc2 = parseGoalLoose(readFileSync2(state.goalPath, "utf8"));
+    if (doc2 && !isGoalTerminal(doc2.status))
+      return { path: state.goalPath, doc: doc2 };
+    state.goalPath = undefined;
+  }
+  const live = rankLiveGoals(readGoalDir(state.worktree)).find((e) => opts.anyOwner || !e.doc.session || e.doc.session === state.sessionID);
+  if (live) {
+    const path = join2(goalDirOf(state.worktree), live.name);
+    state.goalPath = path;
+    return { path, doc: live.doc };
+  }
+  return null;
+}
+function resolveLiveGoal(state) {
+  const g = resolveSessionGoal(state);
+  return g && (g.doc.status === "active" || g.doc.status === "paused") ? g : null;
+}
+function coerceChecks(rows) {
+  const items = [];
+  for (const c of rows) {
+    if (typeof c.shell === "string" && c.shell.trim()) {
+      items.push({ kind: "shell", cmd: c.shell.trim(), ...c.timeoutSec ? { timeoutSec: c.timeoutSec } : {} });
+    } else if (typeof c.containsFile === "string" && c.containsFile.trim() && typeof c.containsText === "string" && c.containsText.trim()) {
+      items.push({ kind: "contains", file: c.containsFile.trim(), text: c.containsText });
+    } else {
+      throw new GoalError("Each verification item needs either `shell` or both `containsFile` and `containsText`");
+    }
+  }
+  return items;
+}
+var goalWriteTool = tool({
+  description: "Create or revise the session's goal contract (written to .opencode/goal/<date>-<slug>.md). Creating with arm=true arms the autonomous continuation loop — a user confirmation dialog IS the arm action; arm=false only queues an inert goal (/goal add). While this session already has a live goal, creating another is refused — pass revise=true to edit the current contract instead (bumps the revision; evidence from earlier revisions no longer counts; budgets carry over unless explicitly changed). Orthogonal to plans: never reads plan state.",
+  args: {
+    goal: tool.schema.string().describe("One-line goal statement (the semantic completion requirement)"),
+    criteria: tool.schema.array(tool.schema.string()).describe("Success Criteria: numbered, verifiable outcomes"),
+    checks: tool.schema.array(tool.schema.object({
+      shell: tool.schema.string().optional().describe("Shell command the plugin itself executes on the host"),
+      containsFile: tool.schema.string().optional().describe("File contract: workspace-relative file path"),
+      containsText: tool.schema.string().optional().describe("File contract: required literal text in that file"),
+      timeoutSec: tool.schema.number().int().positive().optional().describe("Shell timeout in seconds (default 120, max 600)")
+    })).describe("Verification Checks: at least one; each item is a shell command or a file::text contract"),
+    constraints: tool.schema.string().describe("Constraints: boundaries the work must respect"),
+    nonGoals: tool.schema.array(tool.schema.string()).optional().describe("Non-Goals: explicit out-of-scope items"),
+    maxTurns: tool.schema.number().int().positive().optional().describe("Turn budget (default 25, hard max 200)"),
+    maxMinutes: tool.schema.number().int().positive().optional().describe("Wall-clock budget in minutes (default 60, hard max 480)"),
+    arm: tool.schema.boolean().optional().describe("true = arm the loop now (user dialog); false = queue inert (/goal add)"),
+    revise: tool.schema.boolean().optional().describe("true = edit the existing goal's contract instead of refusing (revision bump)")
+  },
+  execute: async (args, context) => {
+    const state = ensureSession(context.sessionID, worktreeFor(context));
+    const now = nowIso();
+    const checks3 = coerceChecks(args.checks);
+    const input = {
+      goal: args.goal,
+      criteria: args.criteria,
+      checks: checks3,
+      constraints: args.constraints,
+      ...args.nonGoals ? { nonGoals: args.nonGoals } : {},
+      ...args.maxTurns ? { maxTurns: args.maxTurns } : {},
+      ...args.maxMinutes ? { maxMinutes: args.maxMinutes } : {}
+    };
+    const existing = resolveSessionGoal(state);
+    if (existing && args.revise !== true) {
+      throw new GoalError(`This session already has a goal: ${relFrom(state.worktree, existing.path)} (status: ${existing.doc.status}). Re-run goal_write with revise=true to edit its contract, /goal add to queue a new one, or goal_discard to abandon it first.`);
+    }
+    if (existing) {
+      const text2 = renderGoal({
+        ...input,
+        ...input.maxTurns === undefined ? { maxTurns: existing.doc.maxTurns } : {},
+        ...input.maxMinutes === undefined ? { maxMinutes: existing.doc.maxMinutes } : {}
+      }, {
+        now,
+        status: existing.doc.status,
+        created: existing.doc.created,
+        revision: existing.doc.revision + 1,
+        ...existing.doc.session ? { session: existing.doc.session } : {},
+        turnsUsed: existing.doc.turnsUsed
+      });
+      atomicWrite(existing.path, text2);
+      const doc3 = parseGoal(text2);
+      context.metadata({ title: `Revise goal (rev ${doc3.revision}): ${doc3.goal}` });
+      return {
+        title: `goal revised (rev ${doc3.revision})`,
+        output: [
+          `Goal contract revised: ${relFrom(state.worktree, existing.path)} (revision ${doc3.revision}).`,
+          `Evidence recorded under earlier revisions no longer counts. Status stays ${doc3.status}; budget stays ${doc3.turnsUsed}/${doc3.maxTurns} turns.`
+        ].join(`
+`)
+      };
+    }
+    const arm = args.arm !== false;
+    if (arm) {
+      const plan = resolveActivePlan(state);
+      if (plan && plan.doc.status === "draft") {
+        throw new GoalError(`This session has a plan in draft (${relFrom(state.worktree, plan.path)}); autonomous execution cannot arm against the planning-phase write ban. Approve the plan (plan_approve) or discard it (/plan discard) first.`);
+      }
+      await gate(context.ask, "goal_write", `Arm goal: ${args.goal}`);
+    }
+    const dir = goalDirOf(state.worktree);
+    mkdirSync(dir, { recursive: true });
+    const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md")));
+    const path = join2(dir, name);
+    const text = renderGoal(input, {
+      now,
+      status: arm ? "active" : "queued",
+      ...arm ? { session: context.sessionID } : {}
+    });
+    atomicWrite(path, text);
+    state.goalPath = path;
+    const doc2 = parseGoal(text);
+    context.metadata({ title: `${arm ? "Arm" : "Queue"} goal: ${doc2.goal}` });
+    return {
+      title: `goal ${arm ? "armed" : "queued"}: ${doc2.goal}`,
+      output: arm ? [
+        `Goal armed: ${relFrom(state.worktree, path)} (revision 1, ${doc2.criteria.length} criteria, ${doc2.checks.length} verification items, budget ${doc2.maxTurns} turns / ${doc2.maxMinutes} min).`,
+        "The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker."
+      ].join(`
+`) : `Goal queued (inert): ${relFrom(state.worktree, path)}. It never runs until promoted via /goal next or goal_resume (user dialog).`
+    };
+  }
+});
+var goalCheckTool = tool({
+  description: "Run the goal's verification items on the host (shell commands executed by the plugin in the workspace, file contracts re-read from disk) and append the dated, revision-stamped results to the goal's Check Log. Advisory feedback — only goal_complete has gating authority.",
+  args: {
+    items: tool.schema.array(tool.schema.number().int().positive()).optional().describe("Optional subset of verification item numbers; omit to run all")
+  },
+  execute: async (args, context) => {
+    const state = ensureSession(context.sessionID, worktreeFor(context));
+    const goal = resolveSessionGoal(state);
+    if (!goal || goal.doc.status !== "active" && goal.doc.status !== "paused") {
+      throw new GoalError("No live goal in this workspace (active or paused). Arm one with /goal <objective> first.");
+    }
+    const wanted = args.items ? new Set(args.items) : null;
+    const selected = goal.doc.checks.map((c, i) => ({ c, n: i + 1 })).filter((x) => !wanted || wanted.has(x.n));
+    if (selected.length === 0)
+      throw new GoalError("None of the given item numbers exist in this goal's Verification Checks.");
+    const outcomes = await runChecks(selected.map((x) => x.c), state.worktree);
+    outcomes.forEach((o, i) => {
+      o.index = selected[i].n;
+    });
+    const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
+    const next = appendCheckLog(readFileSync2(goal.path, "utf8"), runId, outcomes, nowIso());
+    atomicWrite(goal.path, next);
+    const ok = outcomesAllOk(outcomes);
+    context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
+    return {
+      title: `goal_check ${ok ? "all pass" : "failing"}`,
+      output: [
+        `Host verification run (revision ${goal.doc.revision}), recorded in the Check Log:`,
+        formatOutcomes(outcomes),
+        ok ? "All selected items pass. Proceed to goal_complete (it re-runs everything itself at the gate)." : "Failing items remain — fix the work, then re-run goal_check."
+      ].join(`
+`)
+    };
+  }
+});
+var goalCompleteTool = tool({
+  description: "Close the goal (active -> completed). Re-executes EVERY verification item itself on the host right now (fail-closed: any failing shell command, timeout, missing file, or absent contract text refuses completion) and requires a per-criterion attestation array (pass + concrete evidence). Only then does the user confirmation dialog appear — the user's Allow closes the goal.",
+  args: {
+    attestations: tool.schema.array(tool.schema.object({
+      criterion: tool.schema.string().describe("The success criterion text, copied verbatim from the goal"),
+      pass: tool.schema.boolean().describe("Whether the criterion is met"),
+      evidence: tool.schema.string().describe("Concrete evidence: file:line, command output, test result")
+    })).describe("One entry per success criterion of the current revision, in goal order")
+  },
+  execute: async (args, context) => {
+    const state = ensureSession(context.sessionID, worktreeFor(context));
+    const goal = resolveSessionGoal(state);
+    if (!goal || goal.doc.status !== "active") {
+      throw new GoalError(`No active goal to complete (status: ${goal?.doc.status ?? "none"}). goal_resume an active loop first.`);
+    }
+    const outcomes = await runChecks(goal.doc.checks, state.worktree);
+    const failures = outcomes.filter((o) => !o.ok);
+    if (failures.length > 0) {
+      const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
+      atomicWrite(goal.path, appendCheckLog(readFileSync2(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
+${formatOutcomes(failures)}
+Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
+    }
+    const attestationFailures = completeCheckFailures(goal.doc, args.attestations);
+    if (attestationFailures.length > 0) {
+      throw new GoalError(`Completion gate: self-attestation failed (revision ${goal.doc.revision}).
+- ${attestationFailures.join(`
+- `)}`);
+    }
+    await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
+    const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
+    let text = appendCheckLog(readFileSync2(goal.path, "utf8"), runId, outcomes, nowIso());
+    text = transitionGoal(text, "completed", nowIso());
+    atomicWrite(goal.path, text);
+    context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
+    return {
+      title: "goal completed",
+      output: `Goal completed and closed: ${relFrom(state.worktree, goal.path)}. All ${outcomes.length} verification items re-run passing at the gate; ${args.attestations.length} attestations recorded.`
+    };
+  }
+});
+var goalPauseTool = tool({
+  description: "Pause the session's live goal (active -> paused); the continuation loop stops immediately. Always safe, no confirmation needed. Pass the blocker text when pausing because you are stuck (stop_reason blocker); omit it for a user-requested pause.",
+  args: {
+    blocker: tool.schema.string().optional().describe("Specific blocker that prevents progress (recorded as stop_reason blocker)")
+  },
+  execute: async (args, context) => {
+    const state = ensureSession(context.sessionID, worktreeFor(context));
+    const goal = resolveSessionGoal(state);
+    if (!goal || goal.doc.status !== "active") {
+      throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
+    }
+    const stopReason = args.blocker ? "blocker" : "user";
+    atomicWrite(goal.path, transitionGoal(readFileSync2(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
+    engineForgetSession(context.sessionID);
+    context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` });
+    return {
+      title: `goal paused (${stopReason})`,
+      output: `Goal paused: ${relFrom(state.worktree, goal.path)} (stop_reason: ${stopReason}${args.blocker ? ` — ${args.blocker}` : ""}). Continuation is stopped; /goal resume or an explicit "continue" from the user re-arms it through a confirmation dialog.`
+    };
+  }
+});
+var goalResumeTool = tool({
+  description: "Re-arm a paused goal, or promote the oldest queued goal (/goal next). A user confirmation dialog IS the re-arm action. Optionally tops up the turn budget (hard-capped). Ownership rebinds to this session. When the goal is paused and the user explicitly says continue/resume, this is the tool to call; ordinary chat must never reactivate a goal.",
+  args: {
+    addTurns: tool.schema.number().int().positive().optional().describe("Extra turns to add to the budget (capped by the hard ceiling)")
+  },
+  execute: async (args, context) => {
+    const state = ensureSession(context.sessionID, worktreeFor(context));
+    let goal = resolveSessionGoal(state, { anyOwner: true });
+    if (!goal || goal.doc.status === "queued") {
+      const oldest = rankQueuedGoals(readGoalDir(state.worktree))[0];
+      if (oldest) {
+        const path = join2(goalDirOf(state.worktree), oldest.name);
+        state.goalPath = path;
+        goal = { path, doc: oldest.doc };
+      }
+    }
+    if (!goal || goal.doc.status !== "paused" && goal.doc.status !== "queued") {
+      throw new GoalError(`No paused or queued goal to resume (status: ${goal?.doc.status ?? "none"}).`);
+    }
+    const promoting = goal.doc.status === "queued";
+    await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
+    let text = readFileSync2(goal.path, "utf8");
+    if (args.addTurns)
+      text = bumpBudget(text, args.addTurns, nowIso());
+    text = transitionGoal(text, "active", nowIso(), { session: context.sessionID });
+    atomicWrite(goal.path, text);
+    state.goalPath = goal.path;
+    engineForgetSession(context.sessionID);
+    const doc2 = parseGoal(text);
+    context.metadata({ title: `${promoting ? "Goal promoted" : "Goal resumed"}: ${doc2.goal}` });
+    return {
+      title: promoting ? "goal promoted" : "goal resumed",
+      output: `Goal ${promoting ? "promoted from the queue and armed" : "resumed"}: ${relFrom(state.worktree, goal.path)} (budget ${doc2.turnsUsed}/${doc2.maxTurns} turns, owned by this session). The loop continues on the next idle.`
+    };
+  }
+});
+var goalDiscardTool = tool({
+  description: "Abandon the session's goal (live or queued -> abandoned) and stop the loop. A user confirmation dialog IS the discard action — abandoning the user's objective is the user's decision. The file stays in .opencode/goal/ as history.",
+  args: {
+    reason: tool.schema.string().optional().describe("Short reason recorded in the reply")
+  },
+  execute: async (_args, context) => {
+    const state = ensureSession(context.sessionID, worktreeFor(context));
+    const goal = resolveSessionGoal(state);
+    if (!goal)
+      throw new GoalError("No goal to discard in this workspace.");
+    await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
+    atomicWrite(goal.path, transitionGoal(readFileSync2(goal.path, "utf8"), "abandoned", nowIso()));
+    state.goalPath = undefined;
+    engineForgetSession(context.sessionID);
+    context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
+    return {
+      title: "goal abandoned",
+      output: `Goal abandoned: ${relFrom(state.worktree, goal.path)}${_args.reason ? ` (${_args.reason})` : ""}. The file remains as history; the loop is stopped.`
+    };
   }
 });
 function forgeTools() {
@@ -12884,7 +13782,13 @@ function forgeTools() {
     plan_tick: planTickTool,
     plan_approve: planApproveTool,
     plan_close: planCloseTool,
-    plan_discard: planDiscardTool
+    plan_discard: planDiscardTool,
+    goal_write: goalWriteTool,
+    goal_check: goalCheckTool,
+    goal_complete: goalCompleteTool,
+    goal_pause: goalPauseTool,
+    goal_resume: goalResumeTool,
+    goal_discard: goalDiscardTool
   };
 }
 var hostWorktree = "";
@@ -12898,10 +13802,185 @@ function stateForBan(sessionID) {
     return null;
   return ensureSession(sessionID, hostWorktree);
 }
+var IDLE_DEBOUNCE_MS = Number(process.env.FORGE_GOAL_DEBOUNCE_MS ?? 2000);
+var idleTimers = new Map;
+var continuationInFlight = new Set;
+var transportFails = new Map;
+var noProgressStreak = new Map;
+var turnActivity = new Map;
+var pendingContinuationTurn = new Set;
+function goalProbe(line) {
+  if (process.env.FORGE_GOAL_PROBE) {
+    try {
+      appendFileSync(join2(tmpdir(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
+`);
+    } catch {}
+  }
+}
+function engineForgetSession(sessionID) {
+  const t = idleTimers.get(sessionID);
+  if (t)
+    clearTimeout(t);
+  idleTimers.delete(sessionID);
+  continuationInFlight.delete(sessionID);
+  transportFails.delete(sessionID);
+  noProgressStreak.delete(sessionID);
+  turnActivity.delete(sessionID);
+  pendingContinuationTurn.delete(sessionID);
+}
+function engineForgetAll() {
+  for (const id of [...idleTimers.keys()])
+    engineForgetSession(id);
+}
+function goalBriefText(state, goal) {
+  const d = goal.doc;
+  return [
+    `[forge:goal-continue] Continue the active goal (revision ${d.revision}): ${d.goal}`,
+    `Success criteria:
+${d.criteria.map((c, i) => `${i + 1}. ${c}`).join(`
+`)}`,
+    `Verification items (the plugin runs these itself; never fake their output):
+${d.checks.map((c, i) => `${i + 1}. ${c.kind === "shell" ? `shell \`${c.cmd}\`` : `contains \`${c.file}\` :: \`${c.text}\``}`).join(`
+`)}`,
+    d.constraints.trim() ? `Constraints: ${d.constraints.trim()}` : "",
+    `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. Work the criteria now; call goal_check when you believe they hold, then goal_complete (it re-runs every check itself and asks the user). If genuinely blocked, call goal_pause with the blocker — do not spin.`,
+    `Goal file: ${relFrom(state.worktree, goal.path)}`
+  ].filter((s) => s.length > 0).join(`
+`);
+}
+function wrapupBriefText(goal, reason) {
+  return [
+    `[forge:goal-wrapup] The goal loop is stopping (stop_reason: ${reason}); the goal is now PAUSED.`,
+    `Goal (revision ${goal.doc.revision}): ${goal.doc.goal}`,
+    "Produce a concise handoff summary and nothing else: what is done, what remains, the single next concrete step. Do not continue working the goal in this turn."
+  ].join(`
+`);
+}
+async function autoPauseGoal(client, state, goal, reason, wrapup) {
+  goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
+  atomicWrite(goal.path, transitionGoal(readFileSync2(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  engineForgetSession(state.sessionID);
+  if (wrapup && goal.doc.session) {
+    try {
+      await client.session.prompt({
+        path: { id: goal.doc.session },
+        body: { parts: [{ type: "text", text: wrapupBriefText(goal, reason) }] }
+      });
+    } catch (err) {
+      goalProbe(`wrapup delivery failed session=${state.sessionID} err=${String(err)}`);
+    }
+  }
+}
+async function continueIfEligible(client, sessionID) {
+  if (continuationInFlight.has(sessionID))
+    return;
+  let state = sessions.get(sessionID);
+  if (!state) {
+    try {
+      const info = await client.session.get({ path: { id: sessionID } });
+      const wt = effectiveWorktree(info?.worktree, info?.directory);
+      if (!wt)
+        return;
+      state = ensureSession(sessionID, wt);
+      goalProbe(`lazy-seeded session=${sessionID} worktree=${wt}`);
+    } catch (err) {
+      goalProbe(`lazy-seed failed session=${sessionID} err=${String(err)}`);
+      return;
+    }
+  }
+  const goal = resolveLiveGoal(state);
+  if (!goal || goal.doc.status !== "active")
+    return;
+  if (goal.doc.session && goal.doc.session !== sessionID)
+    return;
+  continuationInFlight.add(sessionID);
+  try {
+    if (pendingContinuationTurn.has(sessionID)) {
+      pendingContinuationTurn.delete(sessionID);
+      const act = turnActivity.get(sessionID);
+      const hadActivity = !!act && (act.writes > 0 || act.checks > 0);
+      turnActivity.set(sessionID, { writes: 0, checks: 0 });
+      try {
+        const fresh = parseGoalLoose(readFileSync2(goal.path, "utf8"));
+        if (fresh && fresh.turnsUsed > 0) {
+          atomicWrite(goal.path, appendLedger(readFileSync2(goal.path, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: hadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+        }
+      } catch (err) {
+        goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
+      }
+      if (hadActivity) {
+        noProgressStreak.delete(sessionID);
+      } else {
+        const n = (noProgressStreak.get(sessionID) ?? 0) + 1;
+        noProgressStreak.set(sessionID, n);
+        goalProbe(`no-progress session=${sessionID} streak=${n}`);
+        if (n >= NO_PROGRESS_LIMIT) {
+          await autoPauseGoal(client, state, goal, "no-progress", true);
+          return;
+        }
+      }
+    }
+    const plan = resolveActivePlan(state);
+    if (plan && plan.doc.status === "draft") {
+      await autoPauseGoal(client, state, goal, "draft-conflict", false);
+      return;
+    }
+    const bs = budgetState(goal.doc);
+    if (bs !== "ok") {
+      await autoPauseGoal(client, state, goal, bs, true);
+      return;
+    }
+    if (typeof client.session.status === "function") {
+      try {
+        const st = await client.session.status({ path: { id: sessionID } });
+        const t = st?.[sessionID]?.type;
+        if (t && t !== "idle") {
+          goalProbe(`skip: session busy again session=${sessionID} status=${t}`);
+          return;
+        }
+      } catch {
+        return;
+      }
+    }
+    try {
+      await client.session.prompt({
+        path: { id: sessionID },
+        body: { parts: [{ type: "text", text: goalBriefText(state, goal) }] }
+      });
+      transportFails.delete(sessionID);
+      pendingContinuationTurn.add(sessionID);
+      turnActivity.set(sessionID, { writes: 0, checks: 0 });
+      atomicWrite(goal.path, incTurns(readFileSync2(goal.path, "utf8"), nowIso()));
+      goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
+    } catch (err) {
+      const n = (transportFails.get(sessionID) ?? 0) + 1;
+      transportFails.set(sessionID, n);
+      goalProbe(`transport failure session=${sessionID} count=${n} err=${String(err)}`);
+      if (n >= TRANSPORT_FAILURE_LIMIT) {
+        await autoPauseGoal(client, state, goal, "transport-failures", false);
+      }
+    }
+  } catch (err) {
+    goalProbe(`continuation aborted session=${sessionID} err=${String(err)}`);
+  } finally {
+    continuationInFlight.delete(sessionID);
+  }
+}
+function scheduleIdleContinuation(client, sessionID) {
+  const existing = idleTimers.get(sessionID);
+  if (existing)
+    clearTimeout(existing);
+  idleTimers.set(sessionID, setTimeout(() => {
+    idleTimers.delete(sessionID);
+    continueIfEligible(client, sessionID);
+  }, IDLE_DEBOUNCE_MS));
+}
 var server = async (input) => {
   hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || "";
+  const client = input.client;
   return {
     dispose: async () => {
+      engineForgetAll();
       sessions.clear();
     },
     config: async (cfg) => {
@@ -12931,9 +14010,13 @@ var server = async (input) => {
         template: PLAN_COMMAND_TEMPLATE,
         description: "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline"
       };
+      cfg.command["goal"] ??= {
+        template: GOAL_COMMAND_TEMPLATE,
+        description: "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)"
+      };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
-      for (const gateKey of ["plan_approve", "plan_close"]) {
+      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard"]) {
         if (permSection[gateKey] !== "deny")
           permSection[gateKey] = "ask";
       }
@@ -12944,7 +14027,7 @@ var server = async (input) => {
     "tool.execute.before": async (input2) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
+          appendFileSync(join2(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
 `);
         } catch {}
       }
@@ -12962,11 +14045,11 @@ var server = async (input) => {
       const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
+          appendFileSync(join2(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
 `);
         } catch {}
       }
-      if (name === "plan_approve" || name === "plan_close") {
+      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
         if (output.status !== "deny")
           output.status = "ask";
         return;
@@ -12987,6 +14070,24 @@ var server = async (input) => {
           ensureSession(info.id, worktree);
         }
       }
+      if (event.type === "session.idle") {
+        const sessionID = event.properties.sessionID;
+        if (typeof sessionID === "string" && sessionID) {
+          goalProbe(`idle event session=${sessionID}`);
+          scheduleIdleContinuation(client, sessionID);
+        }
+      }
+    },
+    "tool.execute.after": async (input2) => {
+      if (typeof input2.tool !== "string")
+        return;
+      const act = turnActivity.get(input2.sessionID);
+      if (!act)
+        return;
+      if (isWriteTool(input2.tool) || input2.tool === "plan_tick")
+        act.writes++;
+      if (input2.tool === "goal_check")
+        act.checks++;
     },
     "experimental.chat.system.transform": async (input2, output) => {
       if (!input2.sessionID)
@@ -12995,12 +14096,44 @@ var server = async (input) => {
       if (!state)
         return;
       const active = resolveActivePlan(state);
-      if (!active)
+      if (active) {
+        const p = progressOf(active.doc);
+        const rel = relFrom(state.worktree, active.path);
+        const rule = active.doc.status === "draft" ? "while in draft, write operations are denied at the tool layer; present the summary then call plan_approve for approval, or /plan discard to abandon" : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close";
+        output.system.push(`[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`);
+      }
+      const goal = resolveLiveGoal(state);
+      if (goal) {
+        const rel = relFrom(state.worktree, goal.path);
+        const d = goal.doc;
+        const rule = d.status === "active" ? "continue working the success criteria; call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself); if genuinely blocked call goal_pause with the blocker" : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it";
+        output.system.push(`[forge:goal-notice] This session is bound to a goal: ${rel} (status: ${d.status}${d.stopReason ? `, stopped: ${d.stopReason}` : ""}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Rule: ${rule}. If the user has not mentioned the goal yet, relay its path and status to them in one short line at the start of your reply.`);
+      }
+    },
+    "experimental.session.compacting": async (input2, output) => {
+      if (!input2.sessionID)
         return;
-      const p = progressOf(active.doc);
-      const rel = relFrom(state.worktree, active.path);
-      const rule = active.doc.status === "draft" ? "while in draft, write operations are denied at the tool layer; present the summary then call plan_approve for approval, or /plan discard to abandon" : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close";
-      output.system.push(`[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`);
+      const state = sessions.get(input2.sessionID);
+      if (!state)
+        return;
+      const goal = resolveLiveGoal(state);
+      if (!goal)
+        return;
+      const d = goal.doc;
+      output.context.push(`[forge:goal-brief] A live goal governs this session: ${relFrom(state.worktree, goal.path)} (status: ${d.status}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Goal: ${d.goal}. Success criteria:
+${d.criteria.map((c, i) => `${i + 1}. ${c}`).join(`
+`)}
+Post-compaction turns must keep following this goal and its constraints.`);
+    },
+    "experimental.compaction.autocontinue": async (input2, output) => {
+      if (!input2.sessionID)
+        return;
+      const state = sessions.get(input2.sessionID);
+      if (!state)
+        return;
+      const goal = resolveLiveGoal(state);
+      if (goal && goal.doc.status === "active")
+        output.enabled = false;
     }
   };
 };

@@ -1,7 +1,7 @@
 {
   "name": "@sorenllm/opencode-forge",
-  "version": "0.1.0",
-  "description": "Single general-purpose forge agent with a plan harness for opencode: file-backed plans in .opencode/plan/, tool-enforced plan structure, hard write-ban while planning (permission layer), ask-pinned approve/close gates the user confirms, and tick-as-you-go task tracking.",
+  "version": "0.2.0",
+  "description": "Single general-purpose forge agent for opencode with two orthogonal harnesses: a plan harness (file-backed plans in .opencode/plan/, approve/close confirmation gates, tick discipline, hard write-ban while planning) and a goal harness (autonomous, host-verified objectives in .opencode/goal/ — idle continuation under turn/minute budgets, shell + file-contract checks re-run by the plugin at the completion gate, no-progress/transport/budget auto-pause, queueing).",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
