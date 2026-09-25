@@ -1,9 +1,11 @@
 ---
-name: plan
+name: forge-plan
 description: >-
-  The plan discipline for the forge agent. You **MUST** load this skill when
-  the /plan command routes a task goal to you, OR the user asks to "plan
-  first", "make a plan", "think before coding" before implementation. It
+  The plan discipline for the forge agent (loaded as the "forge-plan" skill;
+  the /plan command is the entry point, this skill is the rulebook). You
+  **MUST** load this skill when the /plan command routes a task goal to you,
+  OR the user asks to "plan first", "make a plan", "think before coding"
+  before implementation. It
   governs the whole plan lifecycle: read-only reconnaissance, clarifying
   questions, plan_write (structured, tool-rendered), user-approval via
   plan_approve, tick-as-you-go execution via plan_tick, per-criterion

@@ -59,7 +59,7 @@ opencode plugin github:ChengZiiii/opencode-forge --global
 Local development: add `"file:///<repo abs path>"` to the `plugin` array in
 your opencode config. Single-file install: copy `dist/index.js` to
 `~/.config/opencode/plugin/forge.js` **and manually copy `SKILL.md`** to
-`~/.config/opencode/skills/plan/SKILL.md` (the package has no installer
+`~/.config/opencode/skills/forge-plan/SKILL.md` (the package has no installer
 script; that mode has no bundled skill otherwise).
 
 Note: do not enable opencode's experimental plan mode

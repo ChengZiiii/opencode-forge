@@ -13255,26 +13255,9 @@ var bundleDir = dirname(fileURLToPath(import.meta.url));
 var candidateDirs = [bundleDir, join2(bundleDir, "..")];
 var dataDir = candidateDirs.find((d) => existsSync(join2(d, "SKILL.md"))) ?? bundleDir;
 var FORGE_AGENT = "forge";
-var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching; phases change through commands (/plan, /goal) and tools.
+var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
-Plan discipline (the tooling enforces the hard parts; you supply the judgment):
-- When the user invokes /plan with a goal, or asks to plan first, load the plan skill and follow it: read-only reconnaissance, clarifying questions when the goal is ambiguous, then plan_write. It creates .opencode/plan/<date>-<slug>.md with status draft.
-- While the session's plan is in draft, every write tool is denied at the permission layer. Do not attempt write/edit/bash/task during planning; do not ask the user to bypass it. The only exits are plan_approve and /plan discard.
-- After plan_write, present the goal, chosen approach, and numbered task list briefly, then call plan_approve. The user approves it in a confirmation dialog — that dialog is the approval gate.
-- After approval, execute tasks one by one and call plan_tick with the task number immediately after each completion. Never batch ticks at the end; never tick before the work is actually done.
-- When all tasks are ticked, self-check every acceptance criterion with concrete evidence, then call plan_close with a per-criterion pass/evidence array. The user confirms closure in a dialog.
-- If the system prompt carries a [forge:plan-notice] line and the user has not mentioned the plan, relay its path and progress in one short line at the start of your reply.
-- Work that is expected to span sessions, touch many files over days, or need multi-round requirement review belongs to a spec workflow (e.g. OpenSpec), not a plan. Say so once and let the user choose; if they still want a plan, plan it.
-
-Goal discipline (autonomous, host-verified execution; orthogonal to plans and spec workflows — a goal never reads plan state and plan state is never goal evidence):
-- Goal mode is explicit opt-in. Enter it ONLY when the user runs /goal or unmistakably asks for a goal/autonomous loop (e.g. "set a goal for X", "keep working until it passes"). Never draft, queue, or arm a goal from an ordinary task request — ordinary tasks are normal work, or /plan planning when the user wants a reviewed approach first.
-- /goal "<objective>" drafts a goal contract: goal, numbered success criteria, numbered verification items (shell commands the plugin runs itself, and file contracts file::text), constraints, non-goals, budgets. Show the verification items verbatim before arming. goal_write with arm=true presents a confirmation dialog — the user's Allow arms the autonomous loop. arm=false (/goal add) only queues an inert goal.
-- When a [forge:goal-continue] brief arrives, keep working the success criteria within the stated constraints. The plugin continues the session on idle until the goal completes, pauses, or hits its turn/minute budget.
-- goal_check runs the verification items on the host and appends results to the goal's Check Log — use it whenever you believe the criteria may hold. goal_complete re-runs EVERY item itself (fail-closed: any failing item refuses completion) and additionally requires a per-criterion attestation with concrete evidence, then a user confirmation dialog.
-- If you are genuinely blocked, call goal_pause with the blocker text — do not spin. When the goal is paused and the user clearly asks to continue (e.g. "continue", "resume"), call goal_resume; the dialog re-arms the loop. Ordinary chat never reactivates a goal.
-- Never claim the goal is complete without passing goal_complete. Never edit the goal file by hand; revise the contract through goal_write (which bumps the revision and invalidates earlier evidence).
-
-Outside planning you are a normal full-capability coding agent.`;
+Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.`;
 var PLAN_COMMAND_TEMPLATE = [
   '(forge plan harness routing. Argument: "$ARGUMENTS")',
   "",
@@ -13285,7 +13268,7 @@ var PLAN_COMMAND_TEMPLATE = [
   "- Argument empty: for every non-terminal plan (status draft or approved) in the directory above, read its frontmatter and task checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.",
   '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked tasks to the user in one short list, then continue executing it — tick each task the moment it is done (plan_tick). If none exists, say so.',
   '- Argument "discard": call the plan_discard tool, then tell the user the plan was abandoned and writes are restored.',
-  "- Any other argument: treat it as the task goal. Load the plan skill (skill tool), then follow its planning discipline for this goal.",
+  "- Any other argument: treat it as the task goal — you are now in planning mode for this goal: read-only reconnaissance first (write tools are denied while drafting). Load the forge-plan skill (skill tool), then follow its discipline end to end: clarify ambiguities, plan_write the structured draft, present it briefly, plan_approve (a user dialog is the gate), then execute task by task with plan_tick immediately after each completion, and plan_close with per-criterion self-checks when all are ticked. Work expected to span sessions or many files belongs in a spec workflow (e.g. OpenSpec) — say so once and let the user choose.",
   ""
 ].join(`
 `);
@@ -13303,6 +13286,8 @@ var GOAL_COMMAND_TEMPLATE = [
   '- Argument "discard" (also "stop"/"cancel"/"off"): call the goal_discard tool. The user confirms in a dialog.',
   '- Argument starting with "add " (or the user clearly wants to queue without arming): create a NEW contract from the rest of the argument and call goal_write with arm=false — never revise an existing goal for an add, never omit arm. It becomes a queued, inert goal (no dialog).',
   '- Any other argument: treat it as a goal statement. Extract contract markers into the structured goal_write fields: --check "cmd" becomes a shell verification item, --contains "file::text" a file-contract item, --success "..." an extra success criterion, --constraint "..." goes into constraints, --non-goal "..." into nonGoals, --max-turns N and --max-minutes N set budgets. Draft a complete contract (goal, criteria, checks, constraints, non-goals), SHOW the verification items verbatim to the user, then call goal_write with arm=true — a confirmation dialog arms the autonomous loop. If this session already has a live goal, say so and offer revise/queue/discard instead.',
+  "",
+  "Goal files are host-managed: never edit or create anything under .opencode/goal/ by hand — contract changes go through goal_write (each revision bump invalidates evidence collected under earlier revisions), state changes through the goal_* tools. Likewise never enter the goal loop or call any goal_* tool unless the user ran /goal or explicitly asked for a goal loop.",
   ""
 ].join(`
 `);
@@ -13368,7 +13353,7 @@ function relFrom(worktree, path) {
   return rel && !rel.startsWith("..") ? rel.replaceAll("\\", "/") : path;
 }
 var planWriteTool = tool({
-  description: "Create or revise the session's plan (structured planning document, written to .opencode/plan/<date>-<slug>.md, status draft). The only sanctioned write while planning. Takes structured fields; the tool renders and validates the fixed sections — you cannot produce a malformed plan file.",
+  description: "Only used inside the /plan flow (the user ran /plan, asked to plan first, or a [forge:plan-notice] is present) — never self-initiate planning. Create or revise the session's plan (structured planning document, written to .opencode/plan/<date>-<slug>.md, status draft). The only sanctioned write while planning. Takes structured fields; the tool renders and validates the fixed sections — you cannot produce a malformed plan file.",
   args: {
     goal: tool.schema.string().describe("One-line task goal (used for the filename slug and the Goal section)"),
     context: tool.schema.string().describe("Context Findings: what the reconnaissance actually found, with file:line evidence references"),
@@ -13556,7 +13541,7 @@ function coerceChecks(rows) {
   return items;
 }
 var goalWriteTool = tool({
-  description: "Create or revise the session's goal contract (written to .opencode/goal/<date>-<slug>.md). Creating with arm=true arms the autonomous continuation loop — a user confirmation dialog IS the arm action; arm=false only queues an inert goal (/goal add). While this session already has a live goal, creating another is refused — pass revise=true to edit the current contract instead (bumps the revision; evidence from earlier revisions no longer counts; budgets carry over unless explicitly changed). Orthogonal to plans: never reads plan state.",
+  description: "Only used inside the /goal flow (the user ran /goal or explicitly asked for a goal loop) — never self-initiate. Create or revise the session's goal contract (written to .opencode/goal/<date>-<slug>.md). Creating with arm=true arms the autonomous continuation loop — a user confirmation dialog IS the arm action; arm=false only queues an inert goal (/goal add). While this session already has a live goal, creating another is refused — pass revise=true to edit the current contract instead (bumps the revision; evidence from earlier revisions no longer counts; budgets carry over unless explicitly changed). Orthogonal to plans: never reads plan state.",
   args: {
     goal: tool.schema.string().describe("One-line goal statement (the semantic completion requirement)"),
     criteria: tool.schema.array(tool.schema.string()).describe("Success Criteria: numbered, verifiable outcomes"),
