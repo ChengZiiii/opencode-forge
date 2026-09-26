@@ -1,0 +1,6 @@
+2.2 survive: hostExit=0 survivorAlive=true http=200 -> PASS (no broken-pipe zombie)
+3.2a normal-exit: hostExit=0 goneInMs=3 -> PASS (exit-event force kill)
+3.2b sigterm-terminate: signaled=true goneInMs=26 -> PASS (fence chain, 26ms)
+3.2c wmclose-kill: goneInMs=1 -> PASS
+3.3 hardkill(/F): jobDead=true inMs=2378 portDown=true -> PASS-SLOW (2378ms)
+5.3 relay: hostA=0 survivorAliveAfterA=true hostB=0 adopted=true polled=true killed=true inMs=1 registryLeft=0 cimLinger=0 -> PASS

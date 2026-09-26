@@ -46,6 +46,12 @@ export type Job = {
   wakeState: "none" | "queued" | "delivered" | "abandoned"
   wakeQueuedAt: number | null
   killTree: () => void
+  /** Spawned pid (0/undefined when unknown). Adopted registry survivors are addressed by pid. */
+  pid?: number
+  /** Opt-in: this job outlives the host process (persistent registry entry, no fence, never exit-killed). */
+  survive?: boolean
+  /** Adopted from a previous host run (registry scan). */
+  previousRun?: boolean
 }
 
 export type JobManagerOptions = {
@@ -136,6 +142,9 @@ export function createJobManager(opts: JobManagerOptions = {}) {
     logPath: string
     notify: boolean
     killTree: () => void
+    pid?: number
+    survive?: boolean
+    previousRun?: boolean
   }): Job {
     const t = now()
     const job: Job = {
@@ -157,6 +166,12 @@ export function createJobManager(opts: JobManagerOptions = {}) {
     jobs.set(job.id, job)
     enforceCaps()
     return job
+  }
+
+  // The runner learns the pid only after spawn returns; adopted jobs get it
+  // from the registry entry.
+  function setPid(job: Job, pid: number): void {
+    job.pid = pid
   }
 
   function get(id: string): Job | undefined {
@@ -246,10 +261,12 @@ export function createJobManager(opts: JobManagerOptions = {}) {
 
   // Owner session ended: live session-scoped jobs are terminated (orphans
   // ledgered), unread terminal completions are ledgered, everything the
-  // session owned leaves the registry.
+  // session owned leaves the registry. Surviving jobs opted out of death
+  // entirely — they stay running and in the table.
   function onSessionEnd(sessionID: string): void {
     for (const job of [...jobs.values()]) {
       if (job.ownerSession !== sessionID) continue
+      if (job.survive) continue
       if (!isTerminal(job)) {
         if (job.scope === "global") continue
         kill(job)
@@ -263,6 +280,7 @@ export function createJobManager(opts: JobManagerOptions = {}) {
 
   function disposeAll(): void {
     for (const job of [...jobs.values()]) {
+      if (job.survive) continue
       if (!isTerminal(job)) {
         kill(job)
         emit("orphan-job", job, "plugin dispose; tree killed")
@@ -302,6 +320,7 @@ export function createJobManager(opts: JobManagerOptions = {}) {
 
   return {
     create,
+    setPid,
     get,
     list,
     appendOutput,

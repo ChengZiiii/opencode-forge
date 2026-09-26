@@ -1,7 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 import { EventEmitter } from "node:events"
-import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -12,8 +12,6 @@ class FakeChild extends EventEmitter {
   constructor(pid = 4711) {
     super()
     this.pid = pid
-    this.stdout = new EventEmitter()
-    this.stderr = new EventEmitter()
     this.killSignals = []
   }
   kill(signal) {
@@ -38,15 +36,17 @@ function tmpLogDir() {
 
 const BASE = { cmd: "echo hi", cwd: "/w", ownerSession: "ses_a", worktree: "/w" }
 
-test("3.1 exit-bound completion: grandchild holding the pipes cannot suspend the call", async () => {
+// Output now lands in the log FILE (the child writes into an inherited fd);
+// tests simulate that by appending to the log and letting the tail flush.
+const emit = (job, text) => appendFileSync(job.logPath, text)
+
+test("3.1 exit-bound completion: no pipes exist, exit completes the call", async () => {
   const manager = createJobManager({ now: () => 0 })
   const dir = tmpLogDir()
   const fake = makeFakeSpawn()
   const { job, settle } = startJob(manager, { ...BASE, logDir: dir, idleMs: 10_000, maxWaitMs: 60_000, spawnFn: fake, exitGraceMs: 30 })
   const done = settle.then((r) => r)
-  // The direct child EXITS while its (fake) streams never emit close/EOF —
-  // the #47350 shape. Completion rides the exit event; the grace cap closes
-  // the job out despite the held pipes.
+  emit(job, "final-write\n")
   fake.spawned[0].child.emit("exit", 0)
   const r = await done
   assert.equal(r.status, "exited")
@@ -55,14 +55,32 @@ test("3.1 exit-bound completion: grandchild holding the pipes cannot suspend the
   rmSync(dir, { recursive: true, force: true })
 })
 
-test("3.1b real #47350 repro: launcher exits, detached holder keeps the pipes open", async () => {
+test("3.1 spawn stdio is file-backed: the child gets no host pipes", async () => {
+  const dir = tmpLogDir()
+  const fake = makeFakeSpawn()
+  const { job } = startJob(manager0(), { ...BASE, logDir: dir, runInBackground: true, spawnFn: fake })
+  const opts = fake.spawned[0].opts
+  assert.equal(opts.stdio[0], "ignore", "stdin ignored")
+  assert.ok(Number.isInteger(opts.stdio[1]) && opts.stdio[1] > 2, "stdout is a log-file fd, not a pipe")
+  assert.ok(Number.isInteger(opts.stdio[2]) && opts.stdio[2] === opts.stdio[1], "stderr shares the same fd")
+  fake.spawned[0].child.emit("exit", 0)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+function manager0() {
+  return createJobManager()
+}
+
+test("3.1b real #47350 repro: detached holder keeps the LOG fd, completion still rides exit", async () => {
   const manager = createJobManager()
   const dir = tmpLogDir()
-  // The holder outlives the completion (5s) but self-exits, so the test
-  // process is not held alive by the open pipe handle it keeps.
+  // The holder inherits fd 1 (= the job's log fd) and writes to it AFTER the
+  // launcher exits — the #47350 shape transposed to file-backed stdio: a
+  // grandchild holding output capacity can no longer suspend anything, and
+  // its late write stays durable in the log.
   writeFileSync(
     join(dir, "holder.js"),
-    "console.log('holder-alive')\nsetTimeout(() => process.exit(0), 5_000)\n",
+    "setTimeout(() => { require('node:fs').writeSync(1, 'holder-late-write\\n'); process.exit(0) }, 300)\n",
   )
   writeFileSync(
     join(dir, "launcher.js"),
@@ -89,22 +107,14 @@ test("3.1b real #47350 repro: launcher exits, detached holder keeps the pipes op
   assert.equal(r.exitCode, 0)
   assert.ok(elapsed < 5_000, `exit + grace resolves fast (took ${elapsed}ms)`)
   assert.match(r.outputTail, /launcher-done/, "final flush captured inside the grace window")
-  // The detached holder survives as debris — kill the (already exited) job's
-  // recorded child tree cleans nothing here, so kill the holder directly.
-  job.killTree()
-  // The holder's cwd IS this temp dir, so Windows refuses to delete it until
-  // the process self-exits (5s); retry the cleanup until then.
-  for (let i = 0; i < 30; i++) {
-    try {
-      rmSync(dir, { recursive: true, force: true })
-      break
-    } catch {
-      await new Promise((r) => setTimeout(r, 250))
-    }
-  }
+  // The holder writes 300ms after exit; the write lands in the log file even
+  // though the job is terminal (nothing was suspended).
+  await new Promise((res) => setTimeout(res, 800))
+  assert.match(readFileSync(job.logPath, "utf8"), /holder-late-write/, "late grandchild write is durable in the log")
+  rmSync(dir, { recursive: true, force: true })
 })
 
-test("3.2 idle early return: still-running, process alive, hint payload present", async () => {
+test("3.2 idle early return: still-running, process alive, no kill issued", async () => {
   const manager = createJobManager()
   const dir = tmpLogDir()
   const fake = makeFakeSpawn()
@@ -121,14 +131,13 @@ test("3.2 max-wait cap fires even with continuous output, without killing", asyn
   const manager = createJobManager()
   const dir = tmpLogDir()
   const fake = makeFakeSpawn()
-  const { job, settle } = startJob(manager, { ...BASE, logDir: dir, idleMs: 60_000, maxWaitMs: 40, spawnFn: fake })
-  const child = fake.spawned[0].child
-  const drip = setInterval(() => child.stdout.emit("data", "tick\n"), 5)
+  const { job, settle } = startJob(manager, { ...BASE, logDir: dir, idleMs: 60_000, maxWaitMs: 250, spawnFn: fake })
+  const drip = setInterval(() => emit(job, "tick\n"), 25)
   const r = await settle
   clearInterval(drip)
   assert.equal(r.status, "still-running")
   assert.equal(job.state, "running")
-  assert.deepEqual(child.killSignals, [])
+  assert.deepEqual(fake.spawned[0].child.killSignals, [])
   assert.ok(job.outLen > 0, "capture kept running under the drip")
   rmSync(dir, { recursive: true, force: true })
 })
@@ -145,8 +154,9 @@ test("3.3 success pattern: match short-circuits; default keeps the server alive"
     successPattern: /listening on :3000/,
     spawnFn: fake,
   })
-  fake.spawned[0].child.stdout.emit("data", "vite dev server\nlistening on :3000\n")
-  const r = await settle
+  emit(job, "vite dev server\nlistening on :3000\n")
+  const r = await Promise.race([settle, new Promise((res) => setTimeout(() => res("timeout"), 3_000))])
+  assert.notEqual(r, "timeout", "tail flush picks the write up within the poll cadence")
   assert.equal(r.status, "succeeded")
   assert.equal(r.matched, "listening on :3000")
   assert.equal(r.keptAlive, true)
@@ -169,30 +179,33 @@ test("3.3 success pattern with keep_alive=false kills the tree and closes the jo
     keepAlive: false,
     spawnFn: fake,
   })
-  const child = fake.spawned[0].child
-  child.stdout.emit("data", "building...\nDone in 1.2s\n")
-  const r = await settle
+  emit(job, "building...\nDone in 1.2s\n")
+  const r = await Promise.race([settle, new Promise((res) => setTimeout(() => res("timeout"), 3_000))])
+  assert.notEqual(r, "timeout")
   assert.equal(r.keptAlive, false)
   assert.equal(job.state, "succeeded")
-  child.emit("exit", null)
+  fake.spawned[0].child.emit("exit", null)
   assert.equal(job.state, "succeeded", "late exit must not override the terminal state")
   rmSync(dir, { recursive: true, force: true })
 })
 
-test("3.4 output is tee'd to the namespaced log file", async () => {
+test("3.4 output capture flows through the log file into the tail ring", async () => {
   const manager = createJobManager()
   const dir = tmpLogDir()
   const fake = makeFakeSpawn()
-  const { job, settle } = startJob(manager, { ...BASE, logDir: dir, idleMs: 30, spawnFn: fake })
-  fake.spawned[0].child.stdout.emit("data", "line-one\n")
-  fake.spawned[0].child.stderr.emit("data", "line-two-stderr\n")
-  await settle
+  const { job } = startJob(manager, { ...BASE, logDir: dir, runInBackground: true, spawnFn: fake })
+  emit(job, "line-one\n")
+  emit(job, "line-two-stderr\n")
+  const p = await pollJob(manager, job.id, 2_000)
+  assert.ok(p.newOutput.includes("line-one"))
+  assert.ok(p.newOutput.includes("line-two-stderr"))
   assert.ok(existsSync(job.logPath))
   const text = readFileSync(job.logPath, "utf8")
   assert.ok(text.includes("line-one"))
   assert.ok(text.includes("line-two-stderr"))
   const page = readJobLog(job.logPath)
   assert.equal(page.total, 2)
+  fake.spawned[0].child.emit("exit", 0)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -229,22 +242,20 @@ test("3.5 run_in_background returns an immediate handle; exit settles later", as
   const manager = createJobManager()
   const dir = tmpLogDir()
   const fake = makeFakeSpawn()
-  const { job, settle } = startJob(manager, { ...BASE, logDir: dir, runInBackground: true, spawnFn: fake })
+  const { job, settle } = startJob(manager, { ...BASE, logDir: dir, runInBackground: true, spawnFn: fake, exitGraceMs: 20 })
   assert.equal(job.state, "running")
   assert.ok(job.logPath.endsWith(".log"))
   assert.match(job.id, /^j-/)
   const opts = fake.spawned[0].opts
   assert.equal(opts.env[JOB_ENV_MARKER], job.id, "job marker env rides along")
-  fake.spawned[0].child.stdout.emit("data", "booting\n")
+  emit(job, "booting\n")
   fake.spawned[0].child.emit("exit", 3)
-  fake.spawned[0].child.stdout.emit("close")
-  fake.spawned[0].child.stderr.emit("close")
-  await Promise.resolve()
-  await new Promise((r) => setTimeout(r, 10))
+  await new Promise((r) => setTimeout(r, 60))
   assert.equal(job.state, "exited")
   assert.equal(job.exitCode, 3)
   const settled = await settle
   assert.equal(settled.status, "exited")
+  assert.ok(settled.outputTail.includes("booting"), "grace flush captured the final write")
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -253,15 +264,12 @@ test("pollJob waits for new output within the bounded window and drains once", a
   const dir = tmpLogDir()
   const fake = makeFakeSpawn()
   const { job } = startJob(manager, { ...BASE, logDir: dir, runInBackground: true, spawnFn: fake })
-  const child = fake.spawned[0].child
-  setTimeout(() => child.stdout.emit("data", "fresh\n"), 20)
+  setTimeout(() => emit(job, "fresh\n"), 20)
   const p = await pollJob(manager, job.id, 2_000)
   assert.equal(p.newOutput, "fresh\n")
   const p2 = await pollJob(manager, job.id, 0)
   assert.equal(p2.newOutput, "")
-  child.emit("exit", 0)
-  child.stdout.emit("close")
-  child.stderr.emit("close")
+  fake.spawned[0].child.emit("exit", 0)
   rmSync(dir, { recursive: true, force: true })
 })
 
@@ -276,5 +284,24 @@ test("spawn failure resolves as exited with spawnError, never hangs", async () =
   assert.equal(r.status, "exited")
   assert.match(r.spawnError, /ENOENT/)
   assert.equal(job.state, "killed")
+  rmSync(dir, { recursive: true, force: true })
+})
+
+// 2.3 poll/log semantics under the file tail: incremental cursor, same
+// logPath, and the tail ring keeps its bounded window.
+test("2.3 file tail: poll cursor advances incrementally and the ring stays bounded", async () => {
+  const manager = createJobManager({ maxTailChars: 100 })
+  const dir = tmpLogDir()
+  const fake = makeFakeSpawn()
+  const { job } = startJob(manager, { ...BASE, logDir: dir, runInBackground: true, spawnFn: fake })
+  emit(job, "x".repeat(60) + "\n")
+  const p1 = await pollJob(manager, job.id, 2_000)
+  assert.equal(p1.cursor, 61)
+  emit(job, "y".repeat(60) + "\n")
+  const p2 = await pollJob(manager, job.id, 2_000)
+  assert.equal(p2.cursor, 122)
+  assert.equal(p2.newOutput, "y".repeat(60) + "\n", "only the delta is returned")
+  assert.ok(job.tail.length <= 100, "ring is capped")
+  fake.spawned[0].child.emit("exit", 0)
   rmSync(dir, { recursive: true, force: true })
 })

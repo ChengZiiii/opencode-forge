@@ -128,6 +128,7 @@ What this plugin touches, exhaustively:
 | merged config object (RAM only) | forge agent, native build/plan `disable`, `command.plan`, `command.goal`, goal permission keys, `permission.forge_shell`, stage-0 builtin shell hide | vanishes when the plugin is removed; nothing is written to disk |
 | `<tmp>/opencode-forge/jobs/<jobId>.log` | job output tee (full output; oldest rotated out above 50 files) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
+| `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
@@ -246,6 +247,46 @@ deleted → its live session-scoped jobs are killed and the event is recorded
 in a bounded ledger (`handoff` beforehand survives). Plugin unload disposes
 everything it still owns.
 
+### Host exit cleans up on every path (0.3.1)
+
+Background jobs used to survive the opencode process as broken zombies (the
+host's stdout pipe died with it, so per-request writers broke on the next
+write). Jobs now die with the host on every exit path, layered:
+
+1. **stdio is file-backed.** Job stdout/stderr ARE the log file (inherited
+   fd) — the host holds no job pipes at all, so nothing can break, and a
+   `survive` job (below) stays genuinely healthy after the host is gone.
+2. **JS exit matrix.** `SIGINT` / `SIGTERM` / `process exit` /
+   `uncaughtException` / `unhandledRejection` / plugin dispose all force-kill
+   every live non-survive job (synchronous `taskkill /T /F` — fast enough to
+   finish before the OS terminates the host; dispose gets a graceful pass
+   with a 3s grace window first).
+3. **OS fence (Windows).** One lazily-started PowerShell watcher holds a Job
+   Object with `KILL_ON_JOB_CLOSE` around every spawned tree (periodic
+   process-table sweep adopts late-born grandchildren). Host dies ANY way —
+   including `taskkill /F`, where no JS handler can run — the watcher's stdin
+   pipe dies with it, the handle closes, and the kernel kills the whole tree
+   (~sub-second measured). POSIX has no kernel equivalent here (PDEATHSIG
+   was rejected for its parent-thread pitfalls): process groups + the exit
+   matrix carry it, and the next start's registry scan reports orphans.
+
+Known boundaries: a host killed within ~1s of a job's start can leak that
+job's grandchild (the fence watcher is still compiling); Chromium-family
+processes that explicitly break away from the job object escape the fence
+(deliberate: `BREAKAWAY_OK` is not set). Both are recorded in the ledger
+when observable.
+
+**Survive mode (explicit opt-out of death).** `forge_shell { survive: true }`
+starts a job that OUTLIVES the host: it is recorded in
+`<tmp>/opencode-forge/jobs/registry.json` (pid + command + log path), gets no
+fence and no exit kill, and the NEXT opencode run adopts it automatically —
+`forge_jobs list` shows it as `previous-run`, and poll/log/kill work on it
+as usual. Config `jobs.survive: "always"` flips the per-call default; config
+`jobs.survive: "deny"` disables survival entirely and a per-call
+`survive: true` against it is an error (the explicit deny wins). Survivors
+whose pid died are detected at next start, ledgered as orphans, and dropped
+from the registry. Stop survivors explicitly — nothing else will.
+
 ### Stage matrix (future compatibility, by design)
 
 OpenCode upstream is converging on native backgrounding (PRs #47231 /
@@ -262,11 +303,16 @@ true` keeps the builtin shell visible at any stage.
 
 ### Artifacts and uninstall additions
 
-Job output tees to `<tmp>/opencode-forge/jobs/<jobId>.log` (oldest rotated
-out above 50 files) and registry events append to
-`<tmp>/opencode-forge/jobs/ledger.jsonl` (bounded, 1 MB reset, 200 entries).
-These are runtime debris, not data: deleting the directory after uninstall
-is safe and complete.
+Job output lands in `<tmp>/opencode-forge/jobs/<jobId>.log` (the file IS the
+job's stdout/stderr; oldest rotated out above 50 files; reads are windowed to
+8 MB). Registry events append to
+`<tmp>/opencode-forge/jobs/ledger.jsonl` (bounded, 1 MB reset, 200 entries),
+and surviving jobs persist in `<tmp>/opencode-forge/jobs/registry.json`
+(bounded to 100 entries; a stale `registry.json.lock` breaks itself after 5s).
+These are runtime debris, not data — with ONE caveat: **if you uninstall with
+`survive` jobs still running, killing them is on you** (`taskkill /PID <pid>
+/F /T`, or just reboot); deleting the directory afterwards is safe and
+complete.
 
 ## Hang watchdog (a stuck builtin shell unblocks itself)
 

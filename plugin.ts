@@ -49,9 +49,12 @@ import {
   type StopReason,
 } from "./src/goal-file.ts"
 import { formatOutcomes, outcomesAllOk, runChecks } from "./src/run-check.ts"
-import { killTree } from "./src/proc.ts"
+import { killTree, pidAlive } from "./src/proc.ts"
 import { createJobManager, type Job } from "./src/job-manager.ts"
-import { HARD_MAX_WAIT_MS, POLL_WAIT_MAX_MS, jobsLogDir, pollJob, readJobLog, startJob } from "./src/job-runner.ts"
+import { HARD_MAX_WAIT_MS, POLL_WAIT_MAX_MS, adoptSurvivor, jobsLogDir, pollJob, readJobLog, startJob } from "./src/job-runner.ts"
+import { createJobFence, type JobFence } from "./src/job-fence.ts"
+import { createJobRegistry, registryPathFor, structuralRelocate, structuralRelocateAsync, type JobRegistry } from "./src/job-registry.ts"
+import { createExitCleanup, type ExitCleanup } from "./src/host-exit.ts"
 import {
   WATCHDOG_ENV_MARK,
   clampStallMs,
@@ -176,6 +179,61 @@ let forgeDisabled = false
 // Plugin options (second server argument), captured at load.
 let jobsMode: "auto" | "forge" | "native" = "auto"
 let jobsKeepBuiltinShell = false
+// jobs.survive: "never" (default — param may still opt a job in), "always"
+// (param may still opt a job out), "deny" (survive is off and cannot be
+// enabled per-call — the explicit user deny wins over everything).
+let jobsSurviveMode: "never" | "always" | "deny" = "never"
+
+// Resolve config + per-call flag. Throws on the one forbidden combination.
+export function effectiveSurvive(config: "never" | "always" | "deny", param: boolean | undefined): boolean {
+  if (config === "deny") {
+    if (param === true) throw new Error("[forge] jobs.survive is explicitly denied in config; a per-call survive=true cannot override it.")
+    return false
+  }
+  if (param !== undefined) return param
+  return config === "always"
+}
+
+// Lazy lifecycle wiring (started with the first job of this host process):
+// persistent survivor registry, the Windows job-object fence, the exit-matrix
+// cleanup, and adoption of survivors from PREVIOUS host runs. Lazy so merely
+// importing the plugin (tests, disabled installs) spawns nothing.
+let jobFence: JobFence | null = null
+let jobRegistry: JobRegistry | null = null
+let exitCleanup: ExitCleanup | null = null
+let jobsLifecycleStarted = false
+
+function ensureJobLifecycle(): { registry: JobRegistry | null; fence: JobFence | null } {
+  if (jobsLifecycleStarted) return { registry: jobRegistry, fence: jobFence }
+  jobsLifecycleStarted = true
+  const registry = createJobRegistry(registryPathFor(jobLogDir))
+  jobRegistry = registry
+  // Previous-run survivors: adopt the alive, ledger the dead (POSIX orphan
+  // detection rides the same scan — there is no kernel fence there).
+  const { adopted, dead } = registry.rescan(pidAlive, structuralRelocate)
+  for (const entry of adopted) {
+    adoptSurvivor(jobManager, entry, { registry, logDir: jobLogDir, relocate: structuralRelocate })
+  }
+  for (const entry of dead) {
+    jobLedgerSink({ at: new Date().toISOString(), kind: "orphan-job", jobId: entry.id, session: entry.ownerSession, detail: `previous-run survivor pid ${entry.pid} is dead (cmd: ${entry.cmd.slice(0, 120)})` })
+  }
+  jobFence = process.env.FORGE_TEST_NO_FENCE === "1"
+    ? null // wiring tests run without a real watcher (its stdin pipe would
+      // hold the test process's event loop open; fence behavior is covered
+      // by job-fence.test.mjs fakes + the live 4.1b check)
+    : createJobFence({
+        onDegrade: (reason) => {
+          jobLedgerSink({ at: new Date().toISOString(), kind: "fence-degraded", jobId: "-", session: "-", detail: reason })
+        },
+      })
+  exitCleanup = createExitCleanup(jobManager, {
+    graceMs: 3_000,
+    after: () => {
+      jobFence?.dispose()
+    },
+  })
+  return { registry, fence: jobFence }
+}
 
 // Capability probe: set when the native shell tool presents a
 // run_in_background parameter (tool.definition hook) or an experimental
@@ -880,6 +938,7 @@ const forgeShellTool = tool({
     success_pattern: tool.schema.string().optional().describe("Regex; a match against new output completes the call as success immediately"),
     keep_alive: tool.schema.boolean().optional().describe("After a success match: keep the process alive (default) or kill its tree (false)"),
     notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)"),
+    survive: tool.schema.boolean().optional().describe("Opt this job OUT of dying with the host: it keeps running after opencode exits, recorded in the persistent registry so the next run can poll/kill it (config jobs.survive sets the default; an explicit config deny cannot be overridden)"),
   },
   execute: async (args, context) => {
     if (jobStage() >= 2) {
@@ -891,6 +950,7 @@ const forgeShellTool = tool({
     // the matching "ask" rule so the request resolves to a real dialog. An
     // explicit user deny always wins (the ask then rejects).
     await gate(context.ask, "forge_shell", `forge_shell: ${args.command.slice(0, 100)}`)
+    const survive = effectiveSurvive(jobsSurviveMode, args.survive)
     let successPattern: RegExp | null = null
     if (args.success_pattern) {
       try {
@@ -899,6 +959,7 @@ const forgeShellTool = tool({
         throw new Error(`Invalid success_pattern: ${(err as Error).message}`)
       }
     }
+    const { registry, fence } = ensureJobLifecycle()
     const cwd = args.workdir ? (isAbsolute(args.workdir) ? args.workdir : join(state.worktree, args.workdir)) : state.worktree
     const started = startJob(jobManager, {
       cmd: args.command,
@@ -912,7 +973,19 @@ const forgeShellTool = tool({
       successPattern,
       ...(args.keep_alive !== undefined ? { keepAlive: args.keep_alive } : {}),
       ...(args.notify !== undefined ? { notify: args.notify } : {}),
+      ...(survive ? { survive: true, registry: registry ?? undefined } : { fence, relocate: structuralRelocate, relocateAsync: structuralRelocateAsync }),
     })
+    if (survive) {
+      return {
+        title: `job started (survives host exit): ${started.job.id}`,
+        output: [
+          `[forge:job] Started in background — SURVIVES host exit (no fence, no exit kill).`,
+          `jobId: ${started.job.id}`,
+          `logPath: ${started.job.logPath}`,
+          "Recorded in the persistent registry: the next opencode run can poll/log/kill it via forge_jobs. Stop it explicitly when done.",
+        ].join("\n"),
+      }
+    }
     context.metadata({ title: `forge_shell: ${args.command.slice(0, 60)}` })
     if (args.run_in_background === true) {
       return {
@@ -972,7 +1045,8 @@ const forgeJobsTool = tool({
       throw new Error(`Unknown action "${action}" — use one of: ${FORGE_JOBS_ACTIONS.join(", ")}.`)
     }
     if (action === "list") {
-      const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.scope}  ${j.cmd.slice(0, 60)}`)
+      ensureJobLifecycle()
+      const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.previousRun ? "previous-run" : j.survive ? "survive" : j.scope}  ${j.cmd.slice(0, 60)}`)
       return { title: `jobs (${rows.length})`, output: rows.length > 0 ? rows.join("\n") : "(no jobs)" }
     }
     if (!args.jobId) throw new Error(`Action "${action}" requires jobId.`)
@@ -997,7 +1071,10 @@ const forgeJobsTool = tool({
       })
       return {
         title: `${job.id} log ${page.offset}-${page.offset + page.lines.length}/${page.total}`,
-        output: page.lines.length > 0 ? page.lines.join("\n") : "(empty)",
+        output: [
+          ...(page.windowed ? [`(log exceeds ${8}MB — showing the most recent window; read the file directly for full history: ${job.logPath})`] : []),
+          page.lines.length > 0 ? page.lines.join("\n") : "(empty)",
+        ].join("\n"),
       }
     }
     if (action === "kill") {
@@ -1318,9 +1395,10 @@ export const server: Plugin = async (input, options) => {
   hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || ""
   const client = input.client as unknown as GoalClient
   jobClient = input.client as unknown as JobClient
-  const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown } } | undefined)?.jobs
+  const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
   jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true
+  if (jobsOpts?.survive === "never" || jobsOpts?.survive === "always" || jobsOpts?.survive === "deny") jobsSurviveMode = jobsOpts.survive
 
   // hang-watchdog: invalid option values fall back to defaults and the
   // fallback itself is ledgered (auditable misconfig, never a crash).
@@ -1386,6 +1464,10 @@ export const server: Plugin = async (input, options) => {
   return {
     dispose: async () => {
       engineForgetAll()
+      // Exit matrix trigger (idempotent): graceful-then-force every live
+      // non-survive job, then end the fence watcher. Survive jobs keep
+      // running by contract — their registry entries await the next host.
+      exitCleanup?.trigger("dispose")
       jobManager.disposeAll()
       watchdog.dispose()
       sessions.clear()

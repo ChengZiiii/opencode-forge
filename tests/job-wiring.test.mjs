@@ -6,6 +6,11 @@ import { join } from "node:path"
 
 import { server } from "../plugin.ts"
 
+// No real fence watcher inside wiring tests: its stdin pipe holds the event
+// loop open and the test process would never exit (fence semantics live in
+// job-fence.test.mjs and the live 4.1b check).
+process.env.FORGE_TEST_NO_FENCE = "1"
+
 // Module-level supervisor state is shared across server() calls; tests run
 // in file order and the capability-probe test (which latches stage 1) runs
 // LAST so earlier assertions see the pristine stage-0 state.

@@ -12334,9 +12334,9 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // plugin.ts
-import { execFileSync as execFileSync2 } from "node:child_process";
-import { appendFileSync as appendFileSync2, existsSync as existsSync2, mkdirSync as mkdirSync3, readdirSync as readdirSync3, readFileSync as readFileSync5, statSync as statSync2, writeFileSync as writeFileSync3 } from "node:fs";
-import { isAbsolute, join as join3, relative } from "node:path";
+import { execFileSync as execFileSync3 } from "node:child_process";
+import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync4, readdirSync as readdirSync4, readFileSync as readFileSync6, statSync as statSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { isAbsolute, join as join4, relative } from "node:path";
 import { tmpdir as tmpdir2 } from "node:os";
 
 // src/plan-file.ts
@@ -13121,20 +13121,21 @@ import { readFileSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 
 // src/proc.ts
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 function shellSpawn(spawnFn, cmd, opts = {}) {
   return spawnFn(cmd, {
     shell: true,
     ...opts.cwd !== undefined ? { cwd: opts.cwd } : {},
     env: opts.env ? { ...process.env, ...opts.env } : process.env,
     windowsHide: opts.windowsHide ?? true,
-    detached: opts.detached ?? process.platform !== "win32"
+    detached: opts.detached ?? process.platform !== "win32",
+    ...opts.stdio !== undefined ? { stdio: opts.stdio } : {}
   });
 }
-function treeKillPlan(platform, pid) {
+function treeKillPlan(platform, pid, force = true) {
   if (platform === "win32")
-    return { kind: "taskkill", args: ["/pid", String(pid), "/F", "/T"] };
-  return { kind: "group", signal: "SIGKILL" };
+    return { kind: "taskkill", args: force ? ["/pid", String(pid), "/F", "/T"] : ["/pid", String(pid), "/T"] };
+  return { kind: "group", signal: force ? "SIGKILL" : "SIGTERM" };
 }
 function killTree(child, opts = {}) {
   const platform = opts.platform ?? process.platform;
@@ -13156,6 +13157,49 @@ function killTree(child, opts = {}) {
       child.kill(plan.signal);
     }
   }
+}
+function pidAlive(pid) {
+  if (!pid || pid <= 0)
+    return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err.code === "EPERM";
+  }
+}
+function terminateTreeSync(pid, opts = {}) {
+  const graceMs = Math.max(0, opts.graceMs ?? 0);
+  const platform = opts.platform ?? process.platform;
+  const sync = opts.spawnSyncFn ?? spawnSync;
+  const wait = opts.wait ?? true;
+  const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+  const run = (force) => {
+    const plan = treeKillPlan(platform, pid, force);
+    if (plan.kind === "taskkill") {
+      try {
+        sync("taskkill", plan.args, { windowsHide: true, stdio: "ignore", timeout: 1e4 });
+      } catch {}
+    } else {
+      try {
+        process.kill(-pid, plan.signal);
+      } catch {
+        try {
+          process.kill(pid, plan.signal);
+        } catch {}
+      }
+    }
+  };
+  if (graceMs > 0) {
+    run(false);
+    if (wait) {
+      const deadline = Date.now() + graceMs;
+      while (Date.now() < deadline && pidAlive(pid))
+        sleep(Math.min(100, deadline - Date.now()));
+    }
+  }
+  run(true);
+  return { graceful: graceMs > 0, forced: true };
 }
 
 // src/run-check.ts
@@ -13349,6 +13393,9 @@ function createJobManager(opts = {}) {
     enforceCaps();
     return job;
   }
+  function setPid(job, pid) {
+    job.pid = pid;
+  }
   function get(id) {
     return jobs.get(id);
   }
@@ -13423,6 +13470,8 @@ function createJobManager(opts = {}) {
     for (const job of [...jobs.values()]) {
       if (job.ownerSession !== sessionID)
         continue;
+      if (job.survive)
+        continue;
       if (!isTerminal2(job)) {
         if (job.scope === "global")
           continue;
@@ -13436,6 +13485,8 @@ function createJobManager(opts = {}) {
   }
   function disposeAll() {
     for (const job of [...jobs.values()]) {
+      if (job.survive)
+        continue;
       if (!isTerminal2(job)) {
         kill(job);
         emit("orphan-job", job, "plugin dispose; tree killed");
@@ -13468,6 +13519,7 @@ function createJobManager(opts = {}) {
   }
   return {
     create,
+    setPid,
     get,
     list,
     appendOutput,
@@ -13493,7 +13545,7 @@ function newJobId(now = Date.now) {
 
 // src/job-runner.ts
 import { spawn as spawn3 } from "node:child_process";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync as readFileSync2, statSync, unlinkSync } from "node:fs";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, readFileSync as readFileSync2, statSync, unlinkSync } from "node:fs";
 import { join as join2 } from "node:path";
 import { tmpdir } from "node:os";
 var DEFAULT_IDLE_MS = 60000;
@@ -13502,8 +13554,60 @@ var HARD_MAX_WAIT_MS = 600000;
 var POLL_WAIT_MAX_MS = 30000;
 var DEFAULT_LOG_KEEP = 50;
 var JOB_ENV_MARKER = "FORGE_JOB_ID";
+var TAIL_POLL_MS = 200;
+var ADOPT_LIVENESS_MS = 1000;
 function jobsLogDir(base) {
   return join2(base ?? join2(tmpdir(), "opencode-forge"), "jobs");
+}
+var TAIL_CHUNK_BYTES = 4 * 1024 * 1024;
+function createFileTail(logPath, onText, pollMs = TAIL_POLL_MS) {
+  let pos = existsSync(logPath) ? statSync(logPath).size : 0;
+  let stopped = false;
+  const flush = () => {
+    if (stopped)
+      return;
+    try {
+      let size = existsSync(logPath) ? statSync(logPath).size : 0;
+      if (size < pos)
+        pos = size;
+      const fd = openSync(logPath, "r");
+      try {
+        const buf = Buffer.allocUnsafe(TAIL_CHUNK_BYTES);
+        while (pos < size) {
+          const want = Math.min(TAIL_CHUNK_BYTES, size - pos);
+          let read = 0;
+          while (read < want) {
+            const n = readSync(fd, buf, read, want - read, pos + read);
+            if (n <= 0)
+              break;
+            read += n;
+          }
+          if (read <= 0)
+            break;
+          pos += read;
+          onText(buf.toString("utf8", 0, read));
+          size = existsSync(logPath) ? statSync(logPath).size : size;
+          if (stopped)
+            break;
+        }
+      } finally {
+        closeSync(fd);
+      }
+    } catch {}
+  };
+  const timer = setInterval(flush, pollMs);
+  timer.unref?.();
+  return {
+    flush,
+    stop() {
+      stopped = true;
+      clearInterval(timer);
+    }
+  };
+}
+var liveTails = new Map;
+function flushJobOutput(job) {
+  liveTails.get(job.id)?.flush();
 }
 function startJob(manager, opts) {
   const idleMs = Math.max(0, opts.idleMs ?? DEFAULT_IDLE_MS);
@@ -13535,6 +13639,7 @@ function startJob(manager, opts) {
     idleTimer = null;
     clearTimeout(maxWaitTimer);
   };
+  const firstOutputHooks = [];
   function resolveStillRunning() {
     if (settled)
       return;
@@ -13549,25 +13654,67 @@ function startJob(manager, opts) {
     ownerSession: opts.ownerSession,
     logPath,
     notify: opts.notify ?? true,
-    killTree: () => killTree(child)
+    killTree: () => {
+      killTree(child);
+      if (opts.survive)
+        opts.registry?.remove(id);
+    },
+    ...opts.survive ? { survive: true } : {}
   });
+  let wfd;
   try {
+    wfd = openSync(logPath, "a");
     child = shellSpawn(opts.spawnFn ?? spawn3, opts.cmd, {
       cwd: opts.cwd,
-      env: { ...opts.env ?? {}, [JOB_ENV_MARKER]: id }
+      env: { ...opts.env ?? {}, [JOB_ENV_MARKER]: id },
+      stdio: ["ignore", wfd, wfd]
     });
   } catch (err) {
+    if (wfd !== undefined) {
+      try {
+        closeSync(wfd);
+      } catch {}
+    }
     manager.markTerminal(job, "killed", null);
     maxWaitTimer && clearTimeout(maxWaitTimer);
     resolveSettle({ status: "exited", exitCode: null, outputTail: "", spawnError: String(err) });
     return { job, settle };
   }
-  const onChunk = (d) => {
-    const text = String(d);
-    manager.appendOutput(job, text);
+  if (wfd !== undefined) {
     try {
-      appendFileSync(logPath, text);
+      closeSync(wfd);
     } catch {}
+  }
+  manager.setPid(job, child.pid ?? 0);
+  if (opts.survive) {
+    opts.registry?.add({ id, pid: child.pid ?? 0, cmd: opts.cmd, logPath, startedAt: job.startedAt, ownerSession: opts.ownerSession, hostPid: process.pid });
+  } else if (opts.fence) {
+    opts.fence.assign(child.pid ?? 0);
+    let reinforced = false;
+    const reinforce = () => {
+      if (reinforced)
+        return;
+      (async () => {
+        const kid = await opts.relocateAsync?.(child.pid ?? 0) ?? opts.relocate?.(child.pid ?? 0) ?? null;
+        if (kid !== null && kid > 0) {
+          reinforced = true;
+          opts.fence?.assign(kid);
+          manager.setPid(job, kid);
+        }
+      })();
+    };
+    for (const delay of [50, 400, 1500]) {
+      const t = setTimeout(reinforce, delay);
+      t.unref?.();
+    }
+    firstOutputHooks.push(reinforce);
+  }
+  const onChunk = (text) => {
+    if (firstOutputHooks.length > 0) {
+      for (const hook of firstOutputHooks.splice(0))
+        hook();
+    }
+    manager.appendOutput(job, text);
     if (opts.successPattern && !settled && job.succeededAt === null) {
       const m = opts.successPattern.exec(text) ?? opts.successPattern.exec(job.tail);
       if (m) {
@@ -13577,14 +13724,16 @@ function startJob(manager, opts) {
         const keptAlive = opts.keepAlive !== false;
         if (!keptAlive) {
           killTree(child);
+          if (opts.survive)
+            opts.registry?.remove(id);
           manager.markTerminal(job, "succeeded", null);
         }
         resolveSettle({ status: "succeeded", matched: m[0], outputTail: job.tail, keptAlive });
       }
     }
   };
-  child.stdout?.on("data", onChunk);
-  child.stderr?.on("data", onChunk);
+  const tail = createFileTail(logPath, onChunk);
+  liveTails.set(id, tail);
   child.on("exit", (code) => {
     if (exiting)
       return;
@@ -13595,7 +13744,12 @@ function startJob(manager, opts) {
       if (finished)
         return;
       finished = true;
+      tail.flush();
+      tail.stop();
+      liveTails.delete(id);
       manager.markTerminal(job, "exited", code);
+      if (opts.survive)
+        opts.registry?.remove(id);
       rotateLogs(opts.logDir);
       if (!settled) {
         settled = true;
@@ -13604,22 +13758,12 @@ function startJob(manager, opts) {
     };
     const graceTimer = setTimeout(finish, opts.exitGraceMs ?? 500);
     graceTimer.unref?.();
-    const streams = [];
-    if (child.stdout)
-      streams.push(child.stdout);
-    if (child.stderr)
-      streams.push(child.stderr);
-    let left = streams.length;
-    if (left === 0)
-      finish();
-    else
-      for (const s of streams)
-        s.once("close", () => {
-          if (--left === 0)
-            finish();
-        });
   });
   child.on("error", (err) => {
+    tail.stop();
+    liveTails.delete(id);
+    if (opts.survive)
+      opts.registry?.remove(id);
     if (!settled) {
       settled = true;
       stopTimers();
@@ -13641,14 +13785,81 @@ async function pollJob(manager, jobId, waitMs = 0) {
   const deadline = Date.now() + Math.min(Math.max(0, waitMs), POLL_WAIT_MAX_MS);
   while (job.outLen === job.pollCursor && job.state === "running" && Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 25));
+    flushJobOutput(job);
   }
+  flushJobOutput(job);
   return manager.poll(job);
 }
+function adoptSurvivor(manager, entry, opts) {
+  const kill = () => {
+    let pid = entry.pid;
+    for (let hop = 0;hop < 3 && !pidAlive(pid); hop++) {
+      const kid = opts.relocate?.(pid) ?? null;
+      if (kid === null || kid <= 0)
+        break;
+      pid = kid;
+    }
+    killTree({ pid, kill: (sig) => process.kill(pid, sig) });
+    opts.registry.remove(entry.id);
+  };
+  const job = manager.create({
+    id: entry.id,
+    cmd: entry.cmd,
+    worktree: opts.logDir,
+    ownerSession: entry.ownerSession,
+    logPath: entry.logPath,
+    notify: false,
+    killTree: kill,
+    survive: true,
+    previousRun: true
+  });
+  manager.setPid(job, entry.pid);
+  const tail = createFileTail(entry.logPath, (t) => manager.appendOutput(job, t));
+  liveTails.set(job.id, tail);
+  const watcher = setInterval(() => {
+    if (!pidAlive(entry.pid)) {
+      clearInterval(watcher);
+      tail.flush();
+      tail.stop();
+      liveTails.delete(job.id);
+      opts.registry.remove(entry.id);
+      manager.markTerminal(job, "exited", null);
+      rotateLogs(opts.logDir);
+    }
+  }, ADOPT_LIVENESS_MS);
+  watcher.unref?.();
+  return job;
+}
+var LOG_READ_MAX_BYTES = 8 * 1024 * 1024;
 function readJobLog(logPath, opts = {}) {
   const limit = Math.max(1, opts.limit ?? 200);
   let raw = "";
+  let windowed = false;
   try {
-    raw = existsSync(logPath) ? readFileSync2(logPath, "utf8") : "";
+    if (existsSync(logPath)) {
+      const size = statSync(logPath).size;
+      if (size > LOG_READ_MAX_BYTES) {
+        const fd = openSync(logPath, "r");
+        try {
+          const buf = Buffer.allocUnsafe(LOG_READ_MAX_BYTES);
+          let read = 0;
+          while (read < LOG_READ_MAX_BYTES) {
+            const n = readSync(fd, buf, read, LOG_READ_MAX_BYTES - read, size - LOG_READ_MAX_BYTES + read);
+            if (n <= 0)
+              break;
+            read += n;
+          }
+          const text = buf.toString("utf8", 0, read);
+          raw = text.slice(text.indexOf(`
+`) + 1);
+          windowed = true;
+        } finally {
+          closeSync(fd);
+        }
+      } else {
+        raw = readFileSync2(logPath, "utf8");
+      }
+    }
   } catch {
     raw = "";
   }
@@ -13657,7 +13868,7 @@ function readJobLog(logPath, opts = {}) {
     lines.pop();
   const total = lines.length;
   const offset = opts.offset !== undefined ? Math.max(0, Math.min(opts.offset, total)) : Math.max(0, total - limit);
-  return { lines: lines.slice(offset, offset + limit), total, offset };
+  return { lines: lines.slice(offset, offset + limit), total, offset, ...windowed ? { windowed: true } : {} };
 }
 function rotateLogs(logDir, keep = DEFAULT_LOG_KEEP) {
   let entries = [];
@@ -13683,9 +13894,467 @@ function rotateLogs(logDir, keep = DEFAULT_LOG_KEEP) {
   }
 }
 
+// src/job-fence.ts
+import { spawn as spawn4 } from "node:child_process";
+var FENCE_PS_SCRIPT = String.raw`
+Add-Type -TypeDefinition @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Threading;
+public static class ForgeJobFence {
+  [StructLayout(LayoutKind.Sequential)]
+  public struct BASIC_LIMITS {
+    public long PerProcessUserTimeLimit;
+    public long PerJobUserTimeLimit;
+    public uint LimitFlags;
+    public UIntPtr MinimumWorkingSetSize;
+    public UIntPtr MaximumWorkingSetSize;
+    public uint ActiveProcessLimit;
+    public UIntPtr Affinity;
+    public uint PriorityClass;
+    public uint SchedulingClass;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct IO_COUNTERS {
+    public ulong ReadOperationCount;
+    public ulong WriteOperationCount;
+    public ulong OtherOperationCount;
+    public ulong ReadTransferCount;
+    public ulong WriteTransferCount;
+    public ulong OtherTransferCount;
+  }
+  [StructLayout(LayoutKind.Sequential)]
+  public struct EXTENDED_LIMITS {
+    public BASIC_LIMITS Basic;
+    public IO_COUNTERS IoInfo;
+    public UIntPtr ProcessMemoryLimit;
+    public UIntPtr JobMemoryLimit;
+    public UIntPtr PeakProcessMemoryUsed;
+    public UIntPtr PeakJobMemoryUsed;
+  }
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public struct PE32 {
+    public uint dwSize;
+    public uint cntUsage;
+    public uint th32ProcessID;
+    public IntPtr th32DefaultHeapID;
+    public uint th32ModuleID;
+    public uint cntThreads;
+    public uint th32ParentProcessID;
+    public int pcPriClassBase;
+    public uint dwFlags;
+    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+    public string szExeFile;
+  }
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern IntPtr CreateJobObject(IntPtr a, string n);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool SetInformationJobObject(IntPtr hJob, int infoClass, IntPtr lpInfo, int cbInfo);
+  [DllImport("kernel32.dll", SetLastError = true)]
+  static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
+  [DllImport("kernel32.dll")]
+  static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
+  [DllImport("kernel32.dll")]
+  static extern bool CloseHandle(IntPtr h);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+  static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+  static extern bool Process32FirstW(IntPtr h, ref PE32 e);
+  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+  static extern bool Process32NextW(IntPtr h, ref PE32 e);
+
+  const int EXTENDED_LIMITS_CLASS = 9;
+  const uint KILL_ON_JOB_CLOSE = 0x2000;
+  const uint PROCESS_ALL_ACCESS = 0x1FFFFF;
+  const uint SNAP_PROCESS = 0x2;
+  // Descendant walk bound: deep enough for wrapper -> command -> children,
+  // shallow enough that a recycled ancestor pid cannot pull unrelated
+  // processes into the kill-on-close job.
+  const int MAX_DEPTH = 4;
+
+  static IntPtr _job = IntPtr.Zero;
+  static readonly HashSet<uint> _roots = new HashSet<uint>();
+  static readonly HashSet<uint> _fenced = new HashSet<uint>();
+  static readonly object _gate = new object();
+  static Timer _sweep;
+
+  static void Sweep(object state) {
+    try {
+      var parents = new Dictionary<uint, uint>();
+      var h = CreateToolhelp32Snapshot(SNAP_PROCESS, 0);
+      if (h != IntPtr.Zero && h != new IntPtr(-1)) {
+        var e = new PE32();
+        e.dwSize = (uint)Marshal.SizeOf(typeof(PE32));
+        if (Process32FirstW(h, ref e)) {
+          do { parents[e.th32ProcessID] = e.th32ParentProcessID; } while (Process32NextW(h, ref e));
+        }
+        CloseHandle(h);
+      }
+      lock (_gate) {
+        if (_job == IntPtr.Zero) return;
+        foreach (var kv in parents) {
+          if (_fenced.Contains(kv.Key)) continue;
+          uint p = kv.Key;
+          int depth = 0;
+          bool tracked = false;
+          while (p != 0 && depth <= MAX_DEPTH) {
+            if (_roots.Contains(p)) { tracked = true; break; }
+            uint up;
+            if (parents.TryGetValue(p, out up)) { p = up; } else { p = 0; }
+            depth++;
+          }
+          if (!tracked) continue;
+          var ph = OpenProcess(PROCESS_ALL_ACCESS, false, (int)kv.Key);
+          if (ph != IntPtr.Zero) {
+            if (AssignProcessToJobObject(_job, ph)) _fenced.Add(kv.Key);
+            CloseHandle(ph);
+          }
+        }
+      }
+    } catch { }
+  }
+
+  public static int Run() {
+    _job = CreateJobObject(IntPtr.Zero, null);
+    if (_job == IntPtr.Zero) return 2;
+    var info = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(EXTENDED_LIMITS)));
+    try {
+      Marshal.WriteInt32(info, 16, (int)KILL_ON_JOB_CLOSE);  // Basic.LimitFlags offset
+      if (!SetInformationJobObject(_job, EXTENDED_LIMITS_CLASS, info, Marshal.SizeOf(typeof(EXTENDED_LIMITS)))) return 3;
+    } finally {
+      Marshal.FreeHGlobal(info);
+    }
+    _sweep = new Timer(Sweep, null, 0, 400);
+    string line;
+    while ((line = Console.In.ReadLine()) != null) {
+      uint pid;
+      var t = line.Trim();
+      if (t.Length > 0 && uint.TryParse(t, out pid) && pid > 0) {
+        lock (_gate) { _roots.Add(pid); }
+        var ph = OpenProcess(PROCESS_ALL_ACCESS, false, (int)pid);
+        if (ph != IntPtr.Zero) {
+          if (AssignProcessToJobObject(_job, ph)) {
+            lock (_gate) { _fenced.Add(pid); }
+          }
+          CloseHandle(ph);
+        }
+      }
+    }
+    return 0;  // stdin EOF: the host is gone -> exit -> handle closes -> kernel kills
+  }
+}
+"@
+[ForgeJobFence]::Run()
+exit $LASTEXITCODE
+`;
+function createJobFence(opts = {}) {
+  const platform = opts.platform ?? process.platform;
+  if (platform !== "win32")
+    return null;
+  const spawnFn = opts.spawnFn ?? spawn4;
+  let child;
+  try {
+    child = spawnFn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", FENCE_PS_SCRIPT], {
+      windowsHide: true,
+      stdio: ["pipe", "ignore", "ignore"]
+    });
+  } catch (err) {
+    opts.onDegrade?.(`job fence not started: spawn failed (${String(err).slice(0, 120)})`);
+    return null;
+  }
+  const stdin = child.stdin;
+  if (!stdin) {
+    opts.onDegrade?.("job fence not started: watcher has no stdin");
+    return null;
+  }
+  let healthy = true;
+  child.on("exit", () => {
+    healthy = false;
+  });
+  child.on("error", () => {
+    healthy = false;
+  });
+  let reported = false;
+  const fail = (why) => {
+    healthy = false;
+    if (reported)
+      return;
+    reported = true;
+    opts.onDegrade?.(why);
+  };
+  return {
+    assign(pid) {
+      if (!healthy || !stdin.writable) {
+        fail("job fence watcher gone; job relies on the JS exit matrix only");
+        return;
+      }
+      try {
+        stdin.write(`${pid}
+`);
+      } catch (err) {
+        fail(`job fence write failed (${String(err).slice(0, 120)})`);
+      }
+    },
+    dispose() {
+      try {
+        stdin.end();
+      } catch {}
+    },
+    get healthy() {
+      return healthy;
+    }
+  };
+}
+
+// src/job-registry.ts
+import { closeSync as closeSync2, existsSync as existsSync2, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync3, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { execFileSync, spawn as spawn5 } from "node:child_process";
+import { dirname, join as join3 } from "node:path";
+var REGISTRY_KEEP = 100;
+function structuralRelocate(deadPid, platform = process.platform) {
+  if (deadPid <= 0)
+    return null;
+  if (platform === "win32") {
+    for (let attempt = 0;attempt < 2; attempt++) {
+      if (attempt > 0)
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
+      try {
+        const raw = execFileSync("powershell", ["-NoProfile", "-Command", `Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq ${deadPid} -and $_.Name -ne 'conhost.exe' } | Select-Object -First 1 -ExpandProperty ProcessId`], { encoding: "utf8", windowsHide: true, timeout: 1e4 });
+        const pid = Number(String(raw).trim());
+        if (Number.isInteger(pid) && pid > 0)
+          return pid;
+      } catch {}
+    }
+    return null;
+  }
+  try {
+    for (const ent of readdirSync2("/proc")) {
+      if (!/^\d+$/.test(ent))
+        continue;
+      try {
+        const m = /^(\d+) \((.*)\) (\w) (\d+)/.exec(readFileSync3(`/proc/${ent}/stat`, "utf8"));
+        if (m && Number(m[4]) === deadPid)
+          return Number(m[1]);
+      } catch {}
+    }
+  } catch {
+    return null;
+  }
+  return null;
+}
+function structuralRelocateAsync(deadPid, platform = process.platform) {
+  if (deadPid <= 0)
+    return Promise.resolve(null);
+  if (platform !== "win32")
+    return Promise.resolve(structuralRelocate(deadPid, platform));
+  return new Promise((resolve2) => {
+    let out = "";
+    let settled = false;
+    const done = (pid) => {
+      if (settled)
+        return;
+      settled = true;
+      clearTimeout(timer);
+      const n = Number(String(out).trim());
+      resolve2(Number.isInteger(n) && n > 0 ? n : pid);
+    };
+    const child = spawn5("powershell", ["-NoProfile", "-Command", `Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq ${deadPid} -and $_.Name -ne 'conhost.exe' } | Select-Object -First 1 -ExpandProperty ProcessId`], { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
+    const timer = setTimeout(() => {
+      try {
+        child.kill();
+      } catch {}
+      done(null);
+    }, 1e4);
+    child.stdout?.on("data", (d) => {
+      out += d;
+    });
+    child.on("error", () => done(null));
+    child.on("exit", () => done(null));
+  });
+}
+function acquireLock(lockPath, timeoutMs = 2000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;; ) {
+    try {
+      const fd = openSync2(lockPath, "wx");
+      return {
+        release: () => {
+          try {
+            closeSync2(fd);
+            unlinkSync2(lockPath);
+          } catch {}
+        }
+      };
+    } catch (err) {
+      if (err.code !== "EEXIST")
+        throw err;
+      try {
+        if (Date.now() - statSync2(lockPath).mtimeMs > 5000) {
+          unlinkSync2(lockPath);
+          continue;
+        }
+      } catch {}
+      if (Date.now() >= deadline)
+        return null;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
+    }
+  }
+}
+function readRaw(path) {
+  try {
+    const raw = existsSync2(path) ? readFileSync3(path, "utf8") : "";
+    if (!raw.trim())
+      return [];
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed.entries))
+      return [];
+    return parsed.entries.filter((e) => typeof e?.id === "string" && Number.isFinite(e?.pid) && e.pid > 0);
+  } catch {
+    return [];
+  }
+}
+function writeRaw(path, entries) {
+  mkdirSync2(dirname(path), { recursive: true });
+  writeFileSync2(path, `${JSON.stringify({ version: 1, entries: entries.slice(0, REGISTRY_KEEP) }, null, 2)}
+`);
+}
+function createJobRegistry(registryPath) {
+  const lockPath = `${registryPath}.lock`;
+  const mutate = (fn) => {
+    const lock = acquireLock(lockPath);
+    if (!lock)
+      return false;
+    try {
+      writeRaw(registryPath, fn(readRaw(registryPath)));
+      return true;
+    } finally {
+      lock.release();
+    }
+  };
+  return {
+    add(entry) {
+      mutate((entries) => [entry, ...entries.filter((e) => e.id !== entry.id)].slice(0, REGISTRY_KEEP));
+    },
+    remove(id) {
+      mutate((entries) => entries.filter((e) => e.id !== id));
+    },
+    list() {
+      return readRaw(registryPath);
+    },
+    rescan(isAlive, relocate) {
+      const entries = readRaw(registryPath);
+      const adopted = [];
+      const dead = [];
+      for (const e of entries) {
+        if (isAlive(e.pid)) {
+          adopted.push(e);
+          continue;
+        }
+        const relocated = relocate?.(e.pid) ?? null;
+        if (relocated !== null && relocated !== e.pid && isAlive(relocated)) {
+          adopted.push({ ...e, pid: relocated });
+        } else {
+          dead.push(e);
+        }
+      }
+      const lock = acquireLock(lockPath);
+      if (lock) {
+        try {
+          writeRaw(registryPath, adopted);
+        } finally {
+          lock.release();
+        }
+      }
+      return { adopted, dead };
+    }
+  };
+}
+function registryPathFor(jobsDir) {
+  return join3(jobsDir, "registry.json");
+}
+
+// src/host-exit.ts
+function createExitCleanup(manager, opts = {}) {
+  const graceMs = opts.graceMs ?? 3000;
+  let sequenced = false;
+  let forceIssued = false;
+  let afterRan = false;
+  const installed = [];
+  const liveTargets = () => {
+    const targets = [];
+    for (const job of manager.list()) {
+      if (job.state === "running" && !job.survive)
+        targets.push(job);
+    }
+    return targets;
+  };
+  const killOne = (job, graceful) => {
+    const pid = job.pid ?? 0;
+    if (pid > 0) {
+      terminateTreeSync(pid, {
+        graceMs: graceful ? graceMs : 0,
+        spawnSyncFn: opts.spawnSyncFn,
+        platform: opts.platform,
+        ...opts.noWait ? { wait: false } : {}
+      });
+    }
+    try {
+      job.killTree();
+    } catch {}
+    manager.markTerminal(job, "killed", null);
+  };
+  const forcePass = () => {
+    if (forceIssued)
+      return;
+    forceIssued = true;
+    for (const job of liveTargets())
+      killOne(job, false);
+  };
+  const trigger = (kind) => {
+    if (kind === "dispose") {
+      if (sequenced)
+        return;
+      sequenced = true;
+      for (const job of liveTargets())
+        killOne(job, true);
+      forcePass();
+      if (!afterRan) {
+        afterRan = true;
+        opts.after?.();
+      }
+      return;
+    }
+    forcePass();
+  };
+  const onSignal = (kind) => () => trigger(kind);
+  const wired = [
+    ["SIGINT", onSignal("SIGINT")],
+    ["SIGTERM", onSignal("SIGTERM")],
+    ["exit", onSignal("exit")],
+    ["uncaughtException", onSignal("uncaughtException")],
+    ["unhandledRejection", onSignal("unhandledRejection")]
+  ];
+  for (const [ev, fn] of wired) {
+    process.on(ev, fn);
+    installed.push([ev, fn]);
+  }
+  return {
+    trigger,
+    uninstall() {
+      for (const [ev, fn] of installed) {
+        try {
+          process.removeListener(ev, fn);
+        } catch {}
+      }
+    }
+  };
+}
+
 // src/watchdog.ts
-import { mkdirSync as mkdirSync2, readFileSync as readFileSync3, writeFileSync as writeFileSync2 } from "node:fs";
-import { dirname } from "node:path";
+import { mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
+import { dirname as dirname2 } from "node:path";
 var WATCHDOG_ENV_MARK = "FORGE_WATCHDOG_MARK";
 var DEFAULT_STALL_MS = 600000;
 var MIN_STALL_MS = 60000;
@@ -13903,10 +14572,10 @@ function watchdogLogDir(base) {
 function createFileLedger(logPath, maxEntries = 200, maxBytes = 1e6) {
   const append = (entry) => {
     try {
-      mkdirSync2(dirname(logPath), { recursive: true });
+      mkdirSync3(dirname2(logPath), { recursive: true });
       let lines = [];
       try {
-        lines = readFileSync3(logPath, "utf8").split(`
+        lines = readFileSync4(logPath, "utf8").split(`
 `).filter((l) => l.trim().length > 0);
       } catch {}
       if (lines.length >= maxEntries)
@@ -13921,12 +14590,12 @@ function createFileLedger(logPath, maxEntries = 200, maxBytes = 1e6) {
 `) + `
 `;
       }
-      writeFileSync2(logPath, text, "utf8");
+      writeFileSync3(logPath, text, "utf8");
     } catch {}
   };
   const entries = () => {
     try {
-      return readFileSync3(logPath, "utf8").split(`
+      return readFileSync4(logPath, "utf8").split(`
 `).filter((l) => l.trim().length > 0).map((l) => JSON.parse(l));
     } catch {
       return [];
@@ -13936,8 +14605,8 @@ function createFileLedger(logPath, maxEntries = 200, maxBytes = 1e6) {
 }
 
 // src/proc-locate.ts
-import { execFileSync } from "node:child_process";
-import { readdirSync as readdirSync2, readFileSync as readFileSync4 } from "node:fs";
+import { execFileSync as execFileSync2 } from "node:child_process";
+import { readdirSync as readdirSync3, readFileSync as readFileSync5 } from "node:fs";
 function commandNeedle(command) {
   const trimmed = command.trim().replace(/^["']|["']$/g, "");
   if (trimmed.length === 0)
@@ -13950,17 +14619,17 @@ function markerValue(callID) {
   return `opencode-forge:${callID}`;
 }
 function createPosixLocator(deps = {}) {
-  const listPids = deps.listPids ?? (() => readdirSync2("/proc").map(Number).filter((n) => Number.isInteger(n) && n > 0));
+  const listPids = deps.listPids ?? (() => readdirSync3("/proc").map(Number).filter((n) => Number.isInteger(n) && n > 0));
   const readEnv = deps.readEnv ?? ((pid) => {
     try {
-      return readFileSync4(`/proc/${pid}/environ`);
+      return readFileSync5(`/proc/${pid}/environ`);
     } catch {
       return null;
     }
   });
   const readCmd = deps.readCmd ?? ((pid) => {
     try {
-      return readFileSync4(`/proc/${pid}/cmdline`).toString("utf8").split("\x00").filter(Boolean).join(" ");
+      return readFileSync5(`/proc/${pid}/cmdline`).toString("utf8").split("\x00").filter(Boolean).join(" ");
     } catch {
       return String(pid);
     }
@@ -14017,7 +14686,7 @@ function parseWindowsProcs(raw) {
 var WINDOW_SLACK_MS = 2000;
 function createWindowsLocator(deps = {}) {
   const hostPid = deps.hostPid ?? process.pid;
-  const execFn = deps.execFn ?? ((cmd) => execFileSync("powershell", ["-NoProfile", "-Command", cmd], { encoding: "utf8", windowsHide: true, timeout: 15000 }));
+  const execFn = deps.execFn ?? ((cmd) => execFileSync2("powershell", ["-NoProfile", "-Command", cmd], { encoding: "utf8", windowsHide: true, timeout: 15000 }));
   return async (callID, t0, cmdNeedle, phase2 = false) => {
     let raw = "[]";
     try {
@@ -14119,6 +14788,47 @@ var sessions = new Map;
 var forgeDisabled = false;
 var jobsMode = "auto";
 var jobsKeepBuiltinShell = false;
+var jobsSurviveMode = "never";
+function effectiveSurvive(config2, param) {
+  if (config2 === "deny") {
+    if (param === true)
+      throw new Error("[forge] jobs.survive is explicitly denied in config; a per-call survive=true cannot override it.");
+    return false;
+  }
+  if (param !== undefined)
+    return param;
+  return config2 === "always";
+}
+var jobFence = null;
+var jobRegistry = null;
+var exitCleanup = null;
+var jobsLifecycleStarted = false;
+function ensureJobLifecycle() {
+  if (jobsLifecycleStarted)
+    return { registry: jobRegistry, fence: jobFence };
+  jobsLifecycleStarted = true;
+  const registry2 = createJobRegistry(registryPathFor(jobLogDir));
+  jobRegistry = registry2;
+  const { adopted, dead } = registry2.rescan(pidAlive, structuralRelocate);
+  for (const entry of adopted) {
+    adoptSurvivor(jobManager, entry, { registry: registry2, logDir: jobLogDir, relocate: structuralRelocate });
+  }
+  for (const entry of dead) {
+    jobLedgerSink({ at: new Date().toISOString(), kind: "orphan-job", jobId: entry.id, session: entry.ownerSession, detail: `previous-run survivor pid ${entry.pid} is dead (cmd: ${entry.cmd.slice(0, 120)})` });
+  }
+  jobFence = process.env.FORGE_TEST_NO_FENCE === "1" ? null : createJobFence({
+    onDegrade: (reason) => {
+      jobLedgerSink({ at: new Date().toISOString(), kind: "fence-degraded", jobId: "-", session: "-", detail: reason });
+    }
+  });
+  exitCleanup = createExitCleanup(jobManager, {
+    graceMs: 3000,
+    after: () => {
+      jobFence?.dispose();
+    }
+  });
+  return { registry: registry2, fence: jobFence };
+}
 var nativeBackgroundSeen = false;
 function jobStage() {
   if (jobsMode === "native")
@@ -14128,13 +14838,13 @@ function jobStage() {
   return nativeBackgroundSeen ? 1 : 0;
 }
 var jobLogDir = jobsLogDir();
-var jobLedgerPath = join3(jobLogDir, "ledger.jsonl");
+var jobLedgerPath = join4(jobLogDir, "ledger.jsonl");
 function jobLedgerSink(entry) {
   try {
-    mkdirSync3(jobLogDir, { recursive: true });
-    if (existsSync2(jobLedgerPath) && statSync2(jobLedgerPath).size > 1e6)
-      writeFileSync3(jobLedgerPath, "");
-    appendFileSync2(jobLedgerPath, `${JSON.stringify(entry)}
+    mkdirSync4(jobLogDir, { recursive: true });
+    if (existsSync3(jobLedgerPath) && statSync3(jobLedgerPath).size > 1e6)
+      writeFileSync4(jobLedgerPath, "");
+    appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}
 `);
   } catch {}
 }
@@ -14188,13 +14898,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 function planDirOf(worktree) {
-  return join3(worktree, ".opencode", "plan");
+  return join4(worktree, ".opencode", "plan");
 }
 function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
-  if (!existsSync2(dir))
+  if (!existsSync3(dir))
     return [];
-  return readdirSync3(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync5(join3(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync6(join4(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -14210,8 +14920,8 @@ function worktreeFor(context) {
   return effectiveWorktree(context.worktree, hostWorktree) || context.worktree;
 }
 function resolveActivePlan(state) {
-  if (state.planPath && existsSync2(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync5(state.planPath, "utf8"));
+  if (state.planPath && existsSync3(state.planPath)) {
+    const doc2 = parsePlanLoose(readFileSync6(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -14219,7 +14929,7 @@ function resolveActivePlan(state) {
   const ranked = rankActivePlans(readPlanDir(state.worktree));
   if (ranked.length === 0)
     return null;
-  const path = join3(planDirOf(state.worktree), ranked[0].name);
+  const path = join4(planDirOf(state.worktree), ranked[0].name);
   state.planPath = path;
   return { path, doc: ranked[0].doc };
 }
@@ -14253,12 +14963,12 @@ var planWriteTool = tool({
       throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
       const dir = planDirOf(state.worktree);
-      mkdirSync3(dir, { recursive: true });
-      path = join3(dir, planFileName(localDate(), slugify(args.goal), readdirSync3(dir).filter((f) => f.endsWith(".md"))));
+      mkdirSync4(dir, { recursive: true });
+      path = join4(dir, planFileName(localDate(), slugify(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
     const text = renderPlan(args, now, created);
-    writeFileSync3(path, text);
+    writeFileSync4(path, text);
     state.planPath = path;
     const doc2 = parsePlan(text);
     context.metadata({ title: `${mode === "created" ? "Create" : "Revise"} plan: ${doc2.goal}` });
@@ -14286,8 +14996,8 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync5(active.path, "utf8"), args.n, nowIso());
-    writeFileSync3(active.path, next);
+    const next = tickTask(readFileSync6(active.path, "utf8"), args.n, nowIso());
+    writeFileSync4(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` });
@@ -14314,7 +15024,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    writeFileSync3(active.path, transitionStatus(readFileSync5(active.path, "utf8"), "approved", nowIso()));
+    writeFileSync4(active.path, transitionStatus(readFileSync6(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -14347,7 +15057,7 @@ var planCloseTool = tool({
 Fix the implementation and retry, or revise the plan first.`);
     }
     await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`);
-    writeFileSync3(active.path, transitionStatus(readFileSync5(active.path, "utf8"), "done", nowIso()));
+    writeFileSync4(active.path, transitionStatus(readFileSync6(active.path, "utf8"), "done", nowIso()));
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
       title: "plan done",
@@ -14365,31 +15075,31 @@ var planDiscardTool = tool({
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan to abandon in this workspace.");
-    writeFileSync3(active.path, transitionStatus(readFileSync5(active.path, "utf8"), "abandoned", nowIso()));
+    writeFileSync4(active.path, transitionStatus(readFileSync6(active.path, "utf8"), "abandoned", nowIso()));
     state.planPath = undefined;
     context.metadata({ title: `Plan abandoned: ${active.doc.goal}` });
     return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` };
   }
 });
 function goalDirOf(worktree) {
-  return join3(worktree, ".opencode", "goal");
+  return join4(worktree, ".opencode", "goal");
 }
 function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
-  if (!existsSync2(dir))
+  if (!existsSync3(dir))
     return [];
-  return readdirSync3(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync5(join3(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync6(join4(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
-  if (state.goalPath && existsSync2(state.goalPath)) {
-    const doc2 = parseGoalLoose(readFileSync5(state.goalPath, "utf8"));
+  if (state.goalPath && existsSync3(state.goalPath)) {
+    const doc2 = parseGoalLoose(readFileSync6(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
   }
   const live = rankLiveGoals(readGoalDir(state.worktree))[0];
   if (live) {
-    const path = join3(goalDirOf(state.worktree), live.name);
+    const path = join4(goalDirOf(state.worktree), live.name);
     state.goalPath = path;
     return { path, doc: live.doc };
   }
@@ -14486,9 +15196,9 @@ var goalWriteTool = tool({
       await gate(context.ask, "goal_write", `Arm goal: ${args.goal}`);
     }
     const dir = goalDirOf(state.worktree);
-    mkdirSync3(dir, { recursive: true });
-    const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync3(dir).filter((f) => f.endsWith(".md")));
-    const path = join3(dir, name);
+    mkdirSync4(dir, { recursive: true });
+    const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md")));
+    const path = join4(dir, name);
     const text = renderGoal(input, {
       now,
       status: arm ? "active" : "queued",
@@ -14528,7 +15238,7 @@ var goalCheckTool = tool({
       o.index = selected[i].n;
     });
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = appendCheckLog(readFileSync5(goal.path, "utf8"), runId, outcomes, nowIso());
+    const next = appendCheckLog(readFileSync6(goal.path, "utf8"), runId, outcomes, nowIso());
     atomicWrite(goal.path, next);
     const ok = outcomesAllOk(outcomes);
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
@@ -14562,7 +15272,7 @@ var goalCompleteTool = tool({
     const failures = outcomes.filter((o) => !o.ok);
     if (failures.length > 0) {
       const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-      atomicWrite(goal.path, appendCheckLog(readFileSync5(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      atomicWrite(goal.path, appendCheckLog(readFileSync6(goal.path, "utf8"), runId2, outcomes, nowIso()));
       throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
 ${formatOutcomes(failures)}
 Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
@@ -14575,7 +15285,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
     }
     await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    let text = appendCheckLog(readFileSync5(goal.path, "utf8"), runId, outcomes, nowIso());
+    let text = appendCheckLog(readFileSync6(goal.path, "utf8"), runId, outcomes, nowIso());
     text = transitionGoal(text, "completed", nowIso());
     atomicWrite(goal.path, text);
     context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
@@ -14597,7 +15307,7 @@ var goalPauseTool = tool({
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
     }
     const stopReason = args.blocker ? "blocker" : "user";
-    atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
+    atomicWrite(goal.path, transitionGoal(readFileSync6(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` });
     return {
@@ -14617,7 +15327,7 @@ var goalResumeTool = tool({
     if (!goal || goal.doc.status === "queued") {
       const oldest = rankQueuedGoals(readGoalDir(state.worktree))[0];
       if (oldest) {
-        const path = join3(goalDirOf(state.worktree), oldest.name);
+        const path = join4(goalDirOf(state.worktree), oldest.name);
         state.goalPath = path;
         goal = { path, doc: oldest.doc };
       }
@@ -14627,7 +15337,7 @@ var goalResumeTool = tool({
     }
     const promoting = goal.doc.status === "queued";
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
-    let text = readFileSync5(goal.path, "utf8");
+    let text = readFileSync6(goal.path, "utf8");
     if (args.addTurns)
       text = bumpBudget(text, args.addTurns, nowIso());
     text = transitionGoal(text, "active", nowIso(), { session: context.sessionID });
@@ -14653,7 +15363,7 @@ var goalDiscardTool = tool({
     if (!goal)
       throw new GoalError("No goal to discard in this workspace.");
     await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
-    atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "abandoned", nowIso()));
+    atomicWrite(goal.path, transitionGoal(readFileSync6(goal.path, "utf8"), "abandoned", nowIso()));
     state.goalPath = undefined;
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
@@ -14681,7 +15391,8 @@ var forgeShellTool = tool({
     max_wait_ms: tool.schema.number().int().nonnegative().optional().describe("Hard cap on this call's wait in ms (default 120000, clamped to 600000); returns still-running, never kills"),
     success_pattern: tool.schema.string().optional().describe("Regex; a match against new output completes the call as success immediately"),
     keep_alive: tool.schema.boolean().optional().describe("After a success match: keep the process alive (default) or kill its tree (false)"),
-    notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)")
+    notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)"),
+    survive: tool.schema.boolean().optional().describe("Opt this job OUT of dying with the host: it keeps running after opencode exits, recorded in the persistent registry so the next run can poll/kill it (config jobs.survive sets the default; an explicit config deny cannot be overridden)")
   },
   execute: async (args, context) => {
     if (jobStage() >= 2) {
@@ -14689,6 +15400,7 @@ var forgeShellTool = tool({
     }
     const state = ensureSession(context.sessionID, worktreeFor(context));
     await gate(context.ask, "forge_shell", `forge_shell: ${args.command.slice(0, 100)}`);
+    const survive = effectiveSurvive(jobsSurviveMode, args.survive);
     let successPattern = null;
     if (args.success_pattern) {
       try {
@@ -14697,7 +15409,8 @@ var forgeShellTool = tool({
         throw new Error(`Invalid success_pattern: ${err.message}`);
       }
     }
-    const cwd = args.workdir ? isAbsolute(args.workdir) ? args.workdir : join3(state.worktree, args.workdir) : state.worktree;
+    const { registry: registry2, fence } = ensureJobLifecycle();
+    const cwd = args.workdir ? isAbsolute(args.workdir) ? args.workdir : join4(state.worktree, args.workdir) : state.worktree;
     const started = startJob(jobManager, {
       cmd: args.command,
       cwd,
@@ -14709,8 +15422,21 @@ var forgeShellTool = tool({
       ...args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {},
       successPattern,
       ...args.keep_alive !== undefined ? { keepAlive: args.keep_alive } : {},
-      ...args.notify !== undefined ? { notify: args.notify } : {}
+      ...args.notify !== undefined ? { notify: args.notify } : {},
+      ...survive ? { survive: true, registry: registry2 ?? undefined } : { fence, relocate: structuralRelocate, relocateAsync: structuralRelocateAsync }
     });
+    if (survive) {
+      return {
+        title: `job started (survives host exit): ${started.job.id}`,
+        output: [
+          `[forge:job] Started in background — SURVIVES host exit (no fence, no exit kill).`,
+          `jobId: ${started.job.id}`,
+          `logPath: ${started.job.logPath}`,
+          "Recorded in the persistent registry: the next opencode run can poll/log/kill it via forge_jobs. Stop it explicitly when done."
+        ].join(`
+`)
+      };
+    }
     context.metadata({ title: `forge_shell: ${args.command.slice(0, 60)}` });
     if (args.run_in_background === true) {
       return {
@@ -14775,7 +15501,8 @@ var forgeJobsTool = tool({
       throw new Error(`Unknown action "${action}" — use one of: ${FORGE_JOBS_ACTIONS.join(", ")}.`);
     }
     if (action === "list") {
-      const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.scope}  ${j.cmd.slice(0, 60)}`);
+      ensureJobLifecycle();
+      const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.previousRun ? "previous-run" : j.survive ? "survive" : j.scope}  ${j.cmd.slice(0, 60)}`);
       return { title: `jobs (${rows.length})`, output: rows.length > 0 ? rows.join(`
 `) : "(no jobs)" };
     }
@@ -14806,8 +15533,12 @@ ${p.newOutput || "(none in this window)"}`,
       });
       return {
         title: `${job.id} log ${page.offset}-${page.offset + page.lines.length}/${page.total}`,
-        output: page.lines.length > 0 ? page.lines.join(`
+        output: [
+          ...page.windowed ? [`(log exceeds ${8}MB — showing the most recent window; read the file directly for full history: ${job.logPath})`] : [],
+          page.lines.length > 0 ? page.lines.join(`
 `) : "(empty)"
+        ].join(`
+`)
       };
     }
     if (action === "kill") {
@@ -14867,7 +15598,7 @@ var pendingContinuationTurn = new Set;
 function goalProbe(line) {
   if (process.env.FORGE_GOAL_PROBE) {
     try {
-      appendFileSync2(join3(tmpdir2(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
+      appendFileSync(join4(tmpdir2(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
 `);
     } catch {}
   }
@@ -14913,7 +15644,7 @@ function wrapupBriefText(goal, reason) {
 }
 async function autoPauseGoal(client, state, goal, reason, wrapup) {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
-  atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  atomicWrite(goal.path, transitionGoal(readFileSync6(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
   engineForgetSession(state.sessionID);
   if (wrapup && goal.doc.session) {
     try {
@@ -14960,11 +15691,11 @@ async function continueIfEligible(client, sessionID) {
       turnHadActivity = !!act && (act.writes > 0 || act.checks > 0);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
       const ledgerPath = state.goalPath;
-      if (ledgerPath && existsSync2(ledgerPath)) {
+      if (ledgerPath && existsSync3(ledgerPath)) {
         try {
-          const fresh = parseGoalLoose(readFileSync5(ledgerPath, "utf8"));
+          const fresh = parseGoalLoose(readFileSync6(ledgerPath, "utf8"));
           if (fresh && fresh.turnsUsed > 0) {
-            atomicWrite(ledgerPath, appendLedger(readFileSync5(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+            atomicWrite(ledgerPath, appendLedger(readFileSync6(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
           }
         } catch (err) {
           goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
@@ -15025,7 +15756,7 @@ async function continueIfEligible(client, sessionID) {
       pendingContinuationTurn.add(sessionID);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
       state.goalPath = goal.path;
-      atomicWrite(goal.path, incTurns(readFileSync5(goal.path, "utf8"), nowIso()));
+      atomicWrite(goal.path, incTurns(readFileSync6(goal.path, "utf8"), nowIso()));
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
       const n = (transportFails.get(sessionID) ?? 0) + 1;
@@ -15060,6 +15791,8 @@ var server = async (input, options) => {
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native")
     jobsMode = jobsOpts.mode;
   jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true;
+  if (jobsOpts?.survive === "never" || jobsOpts?.survive === "always" || jobsOpts?.survive === "deny")
+    jobsSurviveMode = jobsOpts.survive;
   const wdOpts = options?.watchdog;
   const wdFallbacks = [];
   const wdMode = parseMode(wdOpts?.mode);
@@ -15071,14 +15804,14 @@ var server = async (input, options) => {
   if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
     wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`);
   }
-  const watchdogLedger = createFileLedger(join3(watchdogLogDir(), "log.jsonl"));
+  const watchdogLedger = createFileLedger(join4(watchdogLogDir(), "log.jsonl"));
   const rawLocator = createLocator();
   const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1";
   const probeLine = (text) => {
     if (!probing())
       return;
     try {
-      appendFileSync2(join3(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
+      appendFileSync(join4(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
 `);
     } catch {}
   };
@@ -15088,7 +15821,7 @@ var server = async (input, options) => {
     probeLine(`locate dur=${Date.now() - started}ms hits=${hits.length} phase2=${phase2 === true} needle=${JSON.stringify(cmdNeedle ?? null)}`);
     if (hits.length === 0 && cmdNeedle) {
       try {
-        const raw = execFileSync2("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress"], { encoding: "utf8", windowsHide: true, timeout: 15000 });
+        const raw = execFileSync3("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress"], { encoding: "utf8", windowsHide: true, timeout: 15000 });
         const all = parseWindowsProcs(raw);
         probeLine(`diag rawLen=${raw.length} procs=${all.length} windowStart=${new Date(t0 - 2000).toISOString()}`);
         for (const p of all) {
@@ -15123,6 +15856,7 @@ var server = async (input, options) => {
   return {
     dispose: async () => {
       engineForgetAll();
+      exitCleanup?.trigger("dispose");
       jobManager.disposeAll();
       watchdog.dispose();
       sessions.clear();
@@ -15175,7 +15909,7 @@ var server = async (input, options) => {
     "tool.execute.before": async (input2, output) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync2(join3(tmpdir2(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
+          appendFileSync(join4(tmpdir2(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
 `);
         } catch {}
       }
@@ -15185,7 +15919,7 @@ var server = async (input, options) => {
         watchdog.track(input2.callID, input2.sessionID, input2.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync2(join3(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
+            appendFileSync(join4(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
 `);
           } catch {}
         }
@@ -15204,7 +15938,7 @@ var server = async (input, options) => {
       const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync2(join3(tmpdir2(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
+          appendFileSync(join4(tmpdir2(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
 `);
         } catch {}
       }
@@ -15253,7 +15987,7 @@ var server = async (input, options) => {
       watchdog.markSeen(input2.callID);
       if (process.env.FORGE_WATCHDOG_PROBE) {
         try {
-          appendFileSync2(join3(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
+          appendFileSync(join4(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
 `);
         } catch {}
       }
@@ -15263,7 +15997,7 @@ var server = async (input, options) => {
         watchdog.untrack(input2.callID);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync2(join3(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
+            appendFileSync(join4(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
 `);
           } catch {}
         }
@@ -15368,5 +16102,6 @@ export {
   server,
   isRootish,
   effectiveWorktree,
+  effectiveSurvive,
   plugin_default as default
 };

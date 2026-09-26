@@ -1,0 +1,15 @@
+host exit code: 0
+job id: j-20260926-140111-gp7ygq
+python http.server processes still alive after host exit: 138728
+post-exit HTTP status: err:TypeError: fetch failed
+zombie verdict: SURVIVED-BROKEN (broken-pipe zombie: connection opens, handler dies writing stdout)
+
+host-events.log:
+host pid=79964 start
+host: job j-20260926-140111-gp7ygq logPath=C:\Users\Soren\AppData\Local\Temp\forge-lifecycle-probe\j-20260926-140111-gp7ygq.log
+host: sanity request status=200 (alive AND healthy while host lives)
+host: ready-file written; exiting NORMALLY (no dispose, no session.deleted simulation)
+host event: process exit fired
+
+job log tail:
+127.0.0.1 - - [26/Sep/2026 22:01:12] "GET / HTTP/1.1" 200 -
