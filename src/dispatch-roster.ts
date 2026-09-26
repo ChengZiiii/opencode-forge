@@ -183,7 +183,14 @@ export function buildDispatchConfig(opts: {
           message: `roster entry ${entry.model} exposes unknown level(s) ${illegal.map((d) => `"${d}"`).join(", ")}; legal ladder: ${ladder!.join(", ")}`,
         })
       }
-      roster.push({ model: entry.model, expose: [...expose], profiles: [...entry.profiles], verified: true })
+      // Fail-closed: illegal levels are stripped from the effective expose so
+      // a typo can never be dispatched; legal curation survives.
+      roster.push({
+        model: entry.model,
+        expose: expose.filter((d) => ladder!.includes(d)),
+        profiles: [...entry.profiles],
+        verified: true,
+      })
     } else {
       // Unknown to the catalog: accept verbatim + unverified notice (never
       // block self-hosted/custom models, but say plainly we cannot check).

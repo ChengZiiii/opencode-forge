@@ -66,6 +66,19 @@ import {
   type Watchdog,
 } from "./src/watchdog.ts"
 import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
+import {
+  buildDispatchConfig,
+  nativeLadder,
+  type BuiltRoster,
+  type CatalogSnapshot,
+  type ResolvedTier,
+  type ValidationFinding,
+} from "./src/dispatch-roster.ts"
+import { createDispatchEngine, DispatchError, type DispatchEngine } from "./src/dispatch-engine.ts"
+import { createDispatchLedger } from "./src/dispatch-ledger.ts"
+import { composeWorkerPrompt } from "./src/dispatch-prompt.ts"
+import { tierAgentDef } from "./src/dispatch-tiers.ts"
+import { loadModelsDevSnapshot } from "./src/models-dev.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -169,6 +182,83 @@ const sessions = new Map<string, SessionState>()
 // injection when the user sets agent["forge"].disable = true (one-knob
 // return-to-native, forge-agent spec).
 let forgeDisabled = false
+
+// ---------------------------------------------------------------------------
+// Dispatch suite (forge_dispatch / tiers / chat.params depth injection).
+// Spec: openspec/changes/add-dispatch-suite/specs/dispatch/spec.md; design
+// D1-D14. Module-level state mirrors the job supervisor's style: one host
+// process owns one engine + one injection table.
+// ---------------------------------------------------------------------------
+
+let dispatchDisabled = false
+let dispatchMaxConcurrent = 4
+let dispatchTimeoutMs = 600_000
+// Built once in the config hook (roster needs the user's provider config +
+// the models.dev snapshot).
+let dispatchBase: { cfg: BuiltRoster; catalog: CatalogSnapshot; findings: ValidationFinding[]; degraded: boolean } | null = null
+let activeDispatchEngine: DispatchEngine | null = null
+const dispatchLogDir = join(tmpdir(), "opencode-forge", "dispatch")
+const dispatchLedger = createDispatchLedger(join(dispatchLogDir, "ledger.jsonl"))
+
+// sessionID -> { level, family }: the chat.params injection table. "frozen"
+// means the level never changes after first registration (D2 stability).
+type DepthFamily = "openai" | "anthropic" | "zai" | "unknown"
+const dispatchDepths = new Map<string, { level: string; family: DepthFamily }>()
+
+// Provider option-shape families (D2). Explicit and conservative: an unknown
+// provider id injects NOTHING and is disclosed as such — never guessed.
+const OPENAI_FAMILY = new Set(["openai", "opencode", "openrouter", "groq", "xai", "azure", "github-copilot", "deepseek", "together", "vercel", "opus"])
+const ANTHROPIC_FAMILY = new Set(["anthropic"])
+const ZAI_FAMILY = new Set(["zai", "zai-coding-plan"])
+const ANTHROPIC_BUDGET: Record<string, number> = { off: 0, minimal: 1024, low: 4096, medium: 8192, high: 16384, xhigh: 24576, max: 32768 }
+
+function dispatchProviderFamily(providerID: string): "openai" | "anthropic" | "zai" | null {
+  if (OPENAI_FAMILY.has(providerID)) return "openai"
+  if (ANTHROPIC_FAMILY.has(providerID)) return "anthropic"
+  if (ZAI_FAMILY.has(providerID)) return "zai"
+  return null
+}
+
+// Register the resolved depth for a child session. Returns false when the
+// session already has a level (frozen — a re-registration attempt with a
+// different level is refused, never silently applied).
+function queueDispatchDepth(sessionID: string, level: string, providerID: string): boolean {
+  const existing = dispatchDepths.get(sessionID)
+  if (existing) return existing.level === level
+  dispatchDepths.set(sessionID, { level, family: dispatchProviderFamily(providerID) ?? "unknown" })
+  return true
+}
+
+function applyDepthToOptions(options: Record<string, unknown>, level: string, family: "openai" | "anthropic" | "zai"): void {
+  if (family === "openai") {
+    options.reasoningEffort = level
+  } else if (family === "anthropic") {
+    const budget = ANTHROPIC_BUDGET[level] ?? 8192
+    options.thinking = level === "off" ? { type: "disabled" } : { type: "enabled", budget_tokens: budget }
+  } else if (family === "zai") {
+    options.thinking = level === "off" ? { type: "disabled" } : { type: "enabled" }
+  }
+}
+
+// Configured provider/model identities from the user's opencode config:
+// explicit models keys enumerate; a provider without a models key falls back
+// to every catalog model of that provider (full catalog, keyless visible —
+// design D6).
+function configuredIdentitiesOf(cfg: Record<string, unknown>, catalog: CatalogSnapshot): string[] {
+  const providers = (cfg.provider ?? {}) as Record<string, { models?: Record<string, unknown> }>
+  const identities: string[] = []
+  for (const [providerID, provider] of Object.entries(providers)) {
+    const modelKeys = provider?.models ? Object.keys(provider.models) : null
+    if (modelKeys && modelKeys.length > 0) {
+      for (const m of modelKeys) identities.push(`${providerID}/${m}`)
+    } else {
+      const catModels = catalog.providers?.[providerID]?.models ?? {}
+      const ids = Object.keys(catModels)
+      if (ids.length > 0) for (const m of ids) identities.push(`${providerID}/${m}`)
+    }
+  }
+  return identities
+}
 
 // ---------------------------------------------------------------------------
 // Job supervisor (forge_shell / forge_jobs): non-blocking shell execution
@@ -1095,7 +1185,57 @@ const forgeJobsTool = tool({
     jobManager.handoff(args.jobId, target)
     return {
       title: `${job.id} handed off`,
-      output: `[forge:job] ${job.id} promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`,
+      output: `[forge:job] ${job.id}: promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`,
+    }
+  },
+})
+
+// forge_dispatch: scoped worker dispatch on a dynamically chosen model +
+// reasoning depth (spec: dispatch — forge_dispatch tool contract). The engine
+// (create -> message -> poll -> aggregate) lives in src/dispatch-engine.ts;
+// this tool validates params, guards the plan-draft phase (belt on top of the
+// tool.execute.before suspenders), and formats the honest report.
+const forgeDispatchTool = tool({
+  description:
+    "Dispatch a scoped task to a worker subagent running on a dynamically selected model and reasoning depth. Takes {prompt, profile, depth}: profile is a dispatch tier (scout=readonly recon, build=implementation, review=readonly review, quick=mechanical small change); depth is a reasoning level and must EXACTLY match one of the levels exposed for the resolved model — the vocabulary is listed below and in errors; there is no clamping, a mis-set depth is an error. Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
+  args: {
+    prompt: tool.schema.string().describe("Complete, self-contained task for the worker (it cannot see this conversation)"),
+    profile: tool.schema.string().describe("Dispatch tier: scout | build | review | quick (or a user-defined tier id)"),
+    depth: tool.schema.string().optional().describe("Reasoning depth, verbatim from the exposed vocabulary; omit to use the tier's default when it has one"),
+  },
+  execute: async (args, context) => {
+    const state = stateForBan(context.sessionID)
+    const active = state ? resolveActivePlan(state) : null
+    if (active && active.doc.status === "draft") {
+      throw new Error(
+        "[forge] A plan is in draft; dispatching workers is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.",
+      )
+    }
+    if (!args.prompt?.trim()) throw new Error("forge_dispatch requires a non-empty prompt.")
+    const engine = activeDispatchEngine
+    if (!engine) throw new Error("[forge] dispatch engine unavailable (disabled by dispatch.disable, or config still loading).")
+    try {
+      const r = await engine.dispatch({ prompt: args.prompt, profile: args.profile, ...(args.depth !== undefined ? { depth: args.depth } : {}) }, context.sessionID)
+      const tok = r.tokens
+      const costLine = r.costUsd !== null && r.costUsd !== undefined ? `$${r.costUsd.toFixed(6)}${r.priceSnapshot ? ` (${r.priceSnapshot})` : ""}` : `unpriced${r.costNote ? ` — ${r.costNote}` : ""}`
+      context.metadata({ title: `dispatch ${r.tier}: ${r.actual.model} @ ${r.actual.depth}` })
+      return {
+        title: `dispatch ${r.tier} → ${r.actual.model} @${r.actual.depth}`,
+        output: [
+          `[forge:dispatch] completed in ${r.durationMs}ms`,
+          `tier: ${r.tier}   model: ${r.actual.model}   depth: ${r.actual.depth}${r.requested.depth !== undefined && r.requested.depth !== r.actual.depth ? ` (requested ${r.requested.depth})` : ""}`,
+          `session: ${r.sessionID}`,
+          `tokens: input ${tok.input ?? 0}, output ${tok.output ?? 0}, reasoning ${tok.reasoning ?? 0}, cache r/w ${tok.cache?.read ?? 0}/${tok.cache?.write ?? 0}`,
+          `cost: ${costLine}`,
+          `depth injected: ${r.depthInjected}`,
+          "",
+          "Worker report:",
+          r.text || "(empty worker report)",
+        ].join("\n"),
+      }
+    } catch (err) {
+      if (err instanceof DispatchError) throw new Error(`[forge:dispatch:${err.code}] ${err.message}`)
+      throw err
     }
   },
 })
@@ -1117,6 +1257,9 @@ function forgeTools(): Record<string, ToolDefinition> {
   if (jobStage() < 2) {
     tools.forge_shell = forgeShellTool
     tools.forge_jobs = forgeJobsTool
+  }
+  if (!dispatchDisabled && !forgeDisabled) {
+    tools.forge_dispatch = forgeDispatchTool
   }
   return tools
 }
@@ -1416,6 +1559,21 @@ export const server: Plugin = async (input, options) => {
   if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
     wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`)
   }
+
+  // dispatch plugin options: invalid values fall back to defaults (auditable
+  // via the dispatch ledger, never a crash).
+  const dpOpts = (options as { dispatch?: { disable?: unknown; maxConcurrent?: unknown; timeoutMs?: unknown } } | undefined)?.dispatch
+  dispatchDisabled = dpOpts?.disable === true
+  if (Number.isInteger(dpOpts?.maxConcurrent) && (dpOpts!.maxConcurrent as number) >= 1 && (dpOpts!.maxConcurrent as number) <= 16) {
+    dispatchMaxConcurrent = dpOpts!.maxConcurrent as number
+  } else if (dpOpts?.maxConcurrent !== undefined) {
+    dispatchMaxConcurrent = 4
+  }
+  if (Number.isInteger(dpOpts?.timeoutMs) && (dpOpts!.timeoutMs as number) >= 1000 && (dpOpts!.timeoutMs as number) <= 600_000) {
+    dispatchTimeoutMs = dpOpts!.timeoutMs as number
+  } else if (dpOpts?.timeoutMs !== undefined) {
+    dispatchTimeoutMs = 600_000
+  }
   const watchdogLedger = createFileLedger(join(watchdogLogDir(), "log.jsonl"))
   const rawLocator = createLocator()
   const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1"
@@ -1473,6 +1631,9 @@ export const server: Plugin = async (input, options) => {
       exitCleanup?.trigger("dispose")
       jobManager.disposeAll()
       watchdog.dispose()
+      // Dispatch honesty: sessions are host memory objects — whatever is in
+      // flight is ledgered lost-on-exit (S19/spec).
+      activeDispatchEngine?.dispose()
       sessions.clear()
     },
 
@@ -1554,6 +1715,60 @@ export const server: Plugin = async (input, options) => {
       for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell"]) {
         if (permSection[gateKey] !== "deny") permSection[gateKey] = "ask"
       }
+
+      // Dispatch suite: build the roster (models.dev snapshot + the user's
+      // provider config + plugin options) and materialize tier agents. Nothing
+      // is written to disk except the bounded ledger; a user-defined
+      // forge-<tier> entry is never touched.
+      if (!dispatchDisabled) {
+        const snapshot = process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1"
+          ? { catalog: { providers: {} } as CatalogSnapshot, degraded: true, source: "test-off" }
+          : await loadModelsDevSnapshot()
+        const dispatchOpts = ((options as { dispatch?: { roster?: unknown; tiers?: unknown; maxConcurrent?: unknown; timeoutMs?: unknown } } | undefined)?.dispatch ?? {}) as {
+          roster?: Array<{ model: string; expose?: string[]; profiles: string[] }>
+          tiers?: Record<string, { shape?: "readonly" | "write"; defaultDepth?: string; model?: string; depth?: string }>
+        }
+        const built = buildDispatchConfig({
+          configuredIdentities: configuredIdentitiesOf(cfg as Record<string, unknown>, snapshot.catalog),
+          catalog: snapshot.catalog,
+          userRoster: dispatchOpts.roster ?? [],
+          userTiers: dispatchOpts.tiers,
+        })
+        dispatchBase = { cfg: built, catalog: snapshot.catalog, findings: built.findings, degraded: snapshot.degraded }
+        for (const finding of built.findings) {
+          dispatchLedger.append({ ts: new Date().toISOString(), event: "validation", level: finding.level, code: finding.code, note: finding.message })
+        }
+        if (snapshot.degraded) {
+          dispatchLedger.append({ ts: new Date().toISOString(), event: "models-dev-degraded", note: "models.dev snapshot unavailable — cost reporting degrades to null" })
+        }
+        for (const [tierId, tier] of Object.entries(built.tiers)) {
+          const id = `forge-${tierId}`
+          if (agentSection[id] !== undefined) continue // no-clobber (S10)
+          agentSection[id] = tierAgentDef(tierId, tier)
+        }
+        const roster = built
+        activeDispatchEngine?.dispose()
+        activeDispatchEngine = createDispatchEngine({
+          serverUrl: String(input.serverUrl ?? "").replace(/\/$/, ""),
+          workspace: hostWorktree,
+          fetcher: globalThis.fetch,
+          now: Date.now,
+          sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+          cfg: roster,
+          catalog: snapshot.catalog,
+          available: (identity) => {
+            // Availability = configured now; catalog presence is not required
+            // (custom providers stay dispatchable — D6). A dead roster key was
+            // already flagged at validation.
+            return roster.roster.some((e) => e.model === identity)
+          },
+          sink: (entry) => dispatchLedger.append(entry),
+          onDepth: queueDispatchDepth,
+          providerFamily: dispatchProviderFamily,
+          maxConcurrent: dispatchMaxConcurrent,
+          timeoutMs: dispatchTimeoutMs,
+        })
+      }
     },
 
     // Registry getter keeps the disable knob honest: forge disabled -> no
@@ -1595,6 +1810,40 @@ export const server: Plugin = async (input, options) => {
           )
         }
       }
+      // Draft-phase dispatch ban (S18): spawning workers while planning is
+      // the same protection class as the write ban.
+      if (input.tool === "forge_dispatch") {
+        const state = stateForBan(input.sessionID)
+        const active = state ? resolveActivePlan(state) : null
+        if (active && active.doc.status === "draft") {
+          throw new Error(
+            "[forge] A plan is in draft; dispatching workers is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.",
+          )
+        }
+      }
+    },
+
+    // Reasoning-depth injection for dispatched child sessions (D2): the host
+    // rebuilds options for EVERY LLM request, so the hook re-applies the SAME
+    // level each time (inject-once would drop the depth on turn 2). The level
+    // itself is frozen at registration; an unknown provider family injects
+    // nothing (disclosed honestly in the dispatch result).
+    "chat.params": async (input, output) => {
+      const entry = dispatchDepths.get(input.sessionID)
+      if (!entry || entry.family === "unknown") return
+      applyDepthToOptions(output.options ?? (output.options = {}), entry.level, entry.family)
+    },
+
+    // Test seam (wiring tests drive server() with stubs; same pragmatic
+    // module-state style as FORGE_TEST_NO_FENCE). Not part of the plugin API.
+    __forgeDispatchTest: {
+      queueDepth: queueDispatchDepth,
+      depthState: (sessionID: string) => dispatchDepths.get(sessionID) ?? null,
+      composePrompt: composeWorkerPrompt,
+      setEngine: (engine: DispatchEngine | null) => {
+        activeDispatchEngine?.dispose()
+        activeDispatchEngine = engine
+      },
     },
 
     // permission.ask belt: on hosts/sessions where permission requests ARE

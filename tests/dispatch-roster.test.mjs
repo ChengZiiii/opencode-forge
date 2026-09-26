@@ -126,6 +126,10 @@ test("S17: expose typo on a catalog-known identity errors fast listing the legal
   assert.equal(finding.level, "error")
   assert.match(finding.message, /hihg/)
   assert.match(finding.message, /low, high, max/) // legal values listed
+  // fail-closed: the illegal level is stripped from the effective expose so it
+  // can never be dispatched; legal levels survive
+  const entry = built.roster.find((e) => e.model === "zai-coding-plan/glm-5.3")
+  assert.deepEqual(entry.expose, ["low"])
 })
 
 test("dead roster key (identity not configured) warns by name", () => {
