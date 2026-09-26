@@ -52,3 +52,13 @@ id（1.18.32 的 before 钩子对子代理 bash 的 session 归属如此上报�
 5. 时间窗 2s 宽限（CIM 秒级取整 + before→spawn 延迟）。
 
 结论：spec 全部 requirement 的场景在实机成立；无阻塞项。
+
+## 7.1 / 7.2 — 发布与官方安装终验（2026-09-26）
+
+- **7.1 通过**：与 add-job-supervisor 同车 0.3.0 发布（同一 tarball，dist 含
+  两波定位与 needle 代码）；发布凭据链与 token 撤销见其 8.1 备注。
+- **7.2 通过（与 8.2 同一发布列车）**：npm spec 重装 0.3.0 后零干扰冒烟——
+  forge 会话常规命令与 build agent 内置 bash 命令（`BUILTIN-WATCHED-OK-030`）
+  均正常完成；`<tmp>/opencode-forge/watchdog/` 目录未出现：标记计时全部在
+  内存完成，零预警、零处置、零落账。内置 shell 路径的干预行为本体已在 6.1
+  kill/dry-run 实机验证；本轮验证的是"装上官方包后正常使用完全不感知"。

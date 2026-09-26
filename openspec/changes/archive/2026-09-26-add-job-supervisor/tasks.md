@@ -44,5 +44,5 @@
 
 ## 8. 发布门槛
 
-- [ ] 8.1 `bun build` 打包、dist 入库、版本 0.3.0、npm 发布（沿用 0.2.x 流程，脚本名避开七个触发词）；验证：`npm pack` 产物检查
-- [ ] 8.2 官方安装模式终验（发布后，npm spec 模式）：`opencode plugin @sorenllm/opencode-forge --global`（npm registry 名安装，不用 github/file 源）安装、注册、冒烟（forge_shell 执行 + forge_jobs poll/kill）全过；完整卸载四步 + 以同一 npm spec 重装回到干净可用状态（避坑 §TL;DR 6/§5）。**最终状态硬性要求：用户环境停留在 npm plugin 模式（registry 名安装）且全部冒烟通过**（用户 2026-09-26 明示）
+- [x] 8.1 `bun build` 打包、dist 入库、版本 0.3.0、npm 发布（沿用 0.2.x 流程，脚本名避开七个触发词）；验证：`npm pack` 产物检查（0.3.0，3 文件 105.7 kB；142/142 测试 + tsc 干净后发布；token 经 Edge 浏览器 passkey sudo-auth 现场签发，发布后已撤销）
+- [x] 8.2 官方安装模式终验（发布后，npm spec 模式）：`opencode plugin @sorenllm/opencode-forge --global`（npm registry 名安装，不用 github/file 源）安装、注册、冒烟（forge_shell 执行 + forge_jobs poll/kill）全过；完整卸载四步 + 以同一 npm spec 重装回到干净可用状态（避坑 §TL;DR 6/§5）。**最终状态硬性要求：用户环境停留在 npm plugin 模式（registry 名安装）且全部冒烟通过**（用户 2026-09-26 明示）（registry @latest→0.3.0；卸载后 NATIVE-OK 原生回归；重装后 forge_shell echo 出 `SMOKE-FORGE-SHELL-030` exit 0、后台 job `j-20260926-001948-u4wxnm` poll→kill→list=killed；用户 opencode.jsonc 注释与字节数保持不变）

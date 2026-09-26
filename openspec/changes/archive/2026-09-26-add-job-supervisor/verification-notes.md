@@ -29,3 +29,28 @@
   不构成阻塞。
 
 结论：D5/D6 预期全部满足；无 design 修订项。
+
+## 8.1 / 8.2 — 发布与官方安装终验（2026-09-26）
+
+- **8.1 通过**：版本 0.3.0（描述/关键词更新为四 harness 口径），`bun build`
+  dist 0.53 MB 入库，`npm pack --dry-run` 3 文件 105.7 kB、无七个触发词脚本、
+  双导出齐全；142/142 测试 + `tsc --noEmit` 干净后发布。发布凭据按 goal 要求
+  经 Edge 浏览器闭环取得：npmjs.com 会话验证（sorenllm 登录态、当前线上版
+  0.2.2、无版本冲突）→ granular token 页 sudo-auth（"Use security key" →
+  浏览器 Microsoft 密码管理器同步 passkey `chengsongren6522@outlook.com` 一键
+  通过，无需硬件密钥/密码）→ 30 天单包 `Read and write (publish and stage)`
+  + bypass-2FA token → `npm publish --access public` →
+  `+ @sorenllm/opencode-forge@0.3.0`。token 用后即删（npm Settings 页撤销，
+  本地临时文件先清）。注：`~/.npmrc` 旧 token 已失效（401），whoami 对
+  granular token 可用。
+- **8.2 通过（硬性最终态达成）**：registry `@latest`→0.3.0 后执行完整闭环——
+  卸载四步（config 条目手术式移除保留 JSONC 注释、删 `~/.cache/opencode/
+  packages/@sorenllm/`、无 agent.forge 残留、清 `<tmp>/opencode-forge/` 运行时
+  碎片）→ 无插件原生回归 `opencode run` 出 `NATIVE-OK`（build agent 复活）→
+  同一 npm spec `opencode plugin @sorenllm/opencode-forge --global` 重装 →
+  store `opencode-forge@latest` = **0.3.0**（dist 含两波定位代码）→ 冒烟：
+  `--auto --agent forge` 下 forge_shell echo 出 `SMOKE-FORGE-SHELL-030`
+  (exit 0)、后台 job `j-20260926-001948-u4wxnm` poll(running)→kill→list=
+  killed。用户 `opencode.jsonc` 重装前后字节数一致（3406）、注释保留。
+  **最终状态：用户环境为 npm plugin 模式（registry 名 `@sorenllm/opencode-forge`）
+  且全部冒烟通过。**

@@ -34,5 +34,5 @@
 
 ## 7. 发布门槛
 
-- [ ] 7.1 `bun build` 打包、dist 入库、版本（与 add-job-supervisor 同车 0.3.0，后到递增 patch）、npm 发布；验证：`npm pack` 产物检查
-- [ ] 7.2 官方安装模式终验（发布后，npm spec 模式）：`opencode plugin @sorenllm/opencode-forge --global`（npm registry 名安装）装上后冒烟（dry-run 模式跑一次正常命令零干扰）全过；与 add-job-supervisor 8.2 的同一发布列车共用"npm plugin 模式 + 测试通过"的最终状态硬性要求
+- [x] 7.1 `bun build` 打包、dist 入库、版本（与 add-job-supervisor 同车 0.3.0，后到递增 patch）、npm 发布；验证：`npm pack` 产物检查（0.3.0 同车发布，dist 含两波定位代码）
+- [x] 7.2 官方安装模式终验（发布后，npm spec 模式）：`opencode plugin @sorenllm/opencode-forge --global`（npm registry 名安装）装上后冒烟（dry-run 模式跑一次正常命令零干扰）全过；与 add-job-supervisor 8.2 的同一发布列车共用"npm plugin 模式 + 测试通过"的最终状态硬性要求（重装 0.3.0 后：forge 会话常规命令、build 会话内置 bash 命令均正常完成，`<tmp>/opencode-forge/watchdog/` 目录未出现——标记计时在内存中完成、零干预零落账）
