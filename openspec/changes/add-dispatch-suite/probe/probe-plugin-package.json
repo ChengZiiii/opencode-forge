@@ -1,0 +1,11 @@
+{
+  "name": "forge-dispatch-probe",
+  "version": "0.0.1",
+  "type": "module",
+  "main": "./index.js",
+  "exports": {
+    ".": { "import": "./index.js" },
+    "./server": { "import": "./index.js" }
+  },
+  "engines": { "opencode": "^1.18.0" }
+}

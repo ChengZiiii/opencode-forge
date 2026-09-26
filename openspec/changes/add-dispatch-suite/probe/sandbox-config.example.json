@@ -1,0 +1,4 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["file://C:/Users/Soren/AppData/Local/Temp/forge-dispatch-probe/plugin"]
+}
