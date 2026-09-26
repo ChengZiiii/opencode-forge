@@ -158,7 +158,19 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       const family = deps.providerFamily(providerID)
       const depthInjected = family === null ? "not injected (unknown provider shape)" : `${family} <- ${r.depth}`
 
-      await api(`/session/${childID}/message`, {
+      // The host's message POST is turn-synchronous (verified 1.18.32): it
+      // does not return until the child's whole first turn settles, so the
+      // per-dispatch deadline must govern this await too — race it, never
+      // await it bare. The elapsed re-check keeps fake-clock tests (instant
+      // sleep) honest: a raced deadline only declares timeout when the clock
+      // actually passed the deadline.
+      let deadlineHit = false
+      const deadlinePromise = deps
+        .sleep(Math.max(timeoutMs - (deps.now() - t0), 0))
+        .then(() => {
+          deadlineHit = true
+        })
+      const turnPost = api(`/session/${childID}/message`, {
         method: "POST",
         body: JSON.stringify({
           model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
@@ -166,6 +178,24 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
           parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, tier: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }],
         }),
       })
+      await Promise.race([turnPost, deadlinePromise])
+      if (deadlineHit && deps.now() - t0 >= timeoutMs) {
+        const elapsed = deps.now() - t0
+        deps.sink({
+          ts: new Date().toISOString(),
+          event: "timeout",
+          tier: req.profile,
+          identity: r.identity,
+          depth: r.depth,
+          sessionID: childID,
+          durationMs: elapsed,
+        })
+        throw new DispatchError(
+          `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
+          "timeout",
+        )
+      }
+      await turnPost
 
       // Poll for completion (stable-x2) under the per-dispatch deadline.
       let poll: PollState | null = null
