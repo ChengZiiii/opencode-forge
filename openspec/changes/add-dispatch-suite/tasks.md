@@ -8,12 +8,12 @@
 
 ## 2. 宿主接线（plugin.ts，派发核心）
 
-- [ ] 2.1 config hook：tier agent 物化（hidden、mode subagent、无 model 字段、deny 式 permission 含 task deny、no-clobber、`agent["forge"].disable` 与 `dispatch.disable` 时全部跳过）+ plugin options `dispatch` 块解析与回退记账。验证：`tests/dispatch-wiring.test.mjs` 断言注入形状/用户条目不覆盖/一键关
-- [ ] 2.2 `chat.params` 档位注入：sessionID→level 内存表、provider 形状映射（reasoningEffort/thinking 三族）、首回合写入后冻结、未知族不注入。验证：wiring 测试以 stub chat.params 输出对象断言写入与冻结
-- [ ] 2.3 `forge_dispatch` 工具注册（同步路径）：参数 schema、resolve→`input.client` 建会话（parentID best-effort）→消息体 model+agent→轮询→聚合→结果对象（requested/actual/tokens/costUsd|null/披露注入状态）；并发槽位（默认 4）拒绝与提示；结构化错误全部带菜单。验证：wiring 测试以 stub client 覆盖成功/菜单错误/钉扎错误/槽位拒绝
-- [ ] 2.4 plan draft 禁派：`tool.execute.before` 对 forge_dispatch 在活动 draft 期抛错（消息指向 plan_approve/discard），run 模式同样生效。验证：wiring 测试断言 draft 期拒绝与批准后放行
-- [ ] 2.5 账本与退出：`<tmp>/opencode-forge/dispatch/ledger.jsonl` 有界追加（事件/身份/档位/outcome/tokens/成本/timeout/lost-on-exit），dispose/host-exit 路径把 in-flight 记为 lost-on-exit。验证：单测注入 sink 断言轮转上限与退出标记
-- [ ] 2.6 worker 提示纪律模板：tier 形状差异化（readonly 报告式 vs 执行式），必含相对路径/拒绝原文上报/证据引用三条款。验证：模板单测断言三条款与形状差异
+- [x] 2.1 config hook：tier agent 物化（hidden、mode subagent、无 model 字段、deny 式 permission 含 task deny、no-clobber、`agent["forge"].disable` 与 `dispatch.disable` 时全部跳过）+ plugin options `dispatch` 块解析与回退记账。验证：`tests/dispatch-wiring.test.mjs` 断言注入形状/用户条目不覆盖/一键关
+- [x] 2.2 `chat.params` 档位注入：sessionID→level 内存表、provider 形状映射（reasoningEffort/thinking 三族）、首回合写入后冻结、未知族不注入。验证：wiring 测试以 stub chat.params 输出对象断言写入与冻结
+- [x] 2.3 `forge_dispatch` 工具注册（同步路径）：参数 schema、resolve→`input.client` 建会话（parentID best-effort）→消息体 model+agent→轮询→聚合→结果对象（requested/actual/tokens/costUsd|null/披露注入状态）；并发槽位（默认 4）拒绝与提示；结构化错误全部带菜单。验证：wiring 测试以 stub client 覆盖成功/菜单错误/钉扎错误/槽位拒绝
+- [x] 2.4 plan draft 禁派：`tool.execute.before` 对 forge_dispatch 在活动 draft 期抛错（消息指向 plan_approve/discard），run 模式同样生效。验证：wiring 测试断言 draft 期拒绝与批准后放行
+- [x] 2.5 账本与退出：`<tmp>/opencode-forge/dispatch/ledger.jsonl` 有界追加（事件/身份/档位/outcome/tokens/成本/timeout/lost-on-exit），dispose/host-exit 路径把 in-flight 记为 lost-on-exit。验证：单测注入 sink 断言轮转上限与退出标记
+- [x] 2.6 worker 提示纪律模板：tier 形状差异化（readonly 报告式 vs 执行式），必含相对路径/拒绝原文上报/证据引用三条款。验证：模板单测断言三条款与形状差异
 
 ## 3. waves：后台派发与唤醒
 
@@ -30,7 +30,7 @@
 
 ## 5. 数据源与文档
 
-- [ ] 5.1 models.dev 拉取与缓存：启动 GET（尊重 `OPENCODE_MODELS_URL`）、失败降级无价目、缓存目录命名空间。验证：单测注入 fetcher 覆盖成功/失败降级
+- [x] 5.1 models.dev 拉取与缓存：启动 GET（尊重 `OPENCODE_MODELS_URL`）、失败降级无价目、缓存目录命名空间。验证：单测注入 fetcher 覆盖成功/失败降级
 - [ ] 5.2 README：dispatch+waves+crew 章节（roster/曝光表/精确匹配语义/后台与唤醒/crew 工作流/已知坑：免钥×受限 tier、run 模式后台限制）、文件账本追加、卸载步骤核对。验证：人工审阅 + 文件账本表与实现一致
 
 ## 6. 验证闭环

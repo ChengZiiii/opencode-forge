@@ -13,21 +13,21 @@
 | S3 | 精确匹配 | 请求档位无人曝光 → 结构化错误带全菜单，零派发 | U | A | dispatch-resolver.test.mjs :: "S3: requested depth nobody exposes…" + "B12 regression: no clamping…" | PASS(A) |
 | S4 | 精确匹配 | 钉扎模型不可用 → 点名报错，绝不回退他人 | U | A | dispatch-resolver.test.mjs :: "S4: pinned tier with unavailable model errors naming the pin…" (+pin resolves/mismatch 两用例) | PASS(A) |
 | S5 | 精确匹配 | 中途失败 → 排除该身份重试一次，报告实际服务者 | U+S | A+B | U: dispatch-resolver.test.mjs :: "S5: exclude drops a failed identity…"；S 层待 B | PASS(A/S待B) |
-| S6 | 工具契约 | 成功派发诚实报告 actual（model/depth/tokens/cost/text） | S+E | B+C | | |
-| S7 | 工具契约 | 超时 → 超时报告（sessionID/elapsed/部分转录指针），会话留给宿主 | S+E | B+C | U 层：dispatch-client.test.mjs :: completion 稳定判定（deadline 由 B 层接线驱动，B/C 补） | U PASS |
-| S8 | 工具契约 | 第 5 个并发被拒 + 在飞数 + 重试提示 | S+E | B+C | | |
-| S9 | tier 物化 | forge-\<tier\>：hidden、mode subagent、无 model 字段、task deny | S | B | | |
-| S10 | tier 物化 | 用户自定义 forge-\<tier\> 条目不被覆盖 | S | B | | |
-| S11 | tier 物化 | agent forge disable 一键关：无 tier、无工具 | S | B | | |
-| S12 | 档位注入 | OpenAI 兼容族 → options.reasoningEffort 首回合恰好一次 | S+E | B+C | | |
-| S13 | 档位注入 | 未知 provider 形状 → 不注入 + 结果披露 | S | B | | |
+| S6 | 工具契约 | 成功派发诚实报告 actual（model/depth/tokens/cost/text） | S+E | B+C | S 层: wiring :: "forge_dispatch result object passes through…" + engine S6 用例；E 待 C | PASS(B/E待C) |
+| S7 | 工具契约 | 超时 → 超时报告（sessionID/elapsed/部分转录指针），会话留给宿主 | S+E | B+C | S 层: dispatch-engine.test.mjs :: "S7: timeout throws an honest report…"（含 ledger timeout 事件）；E 待 C | PASS(B/E待C) |
+| S8 | 工具契约 | 第 5 个并发被拒 + 在飞数 + 重试提示 | S+E | B+C | S 层: dispatch-engine.test.mjs :: "S8: the concurrency cap refuses…"；E 待 C | PASS(B/E待C) |
+| S9 | tier 物化 | forge-\<tier\>：hidden、mode subagent、无 model 字段、task deny | S | B | dispatch-wiring.test.mjs :: "S9: config hook materializes…" | PASS(B) |
+| S10 | tier 物化 | 用户自定义 forge-\<tier\> 条目不被覆盖 | S | B | dispatch-wiring.test.mjs :: "S10: a user-defined forge-<tier> entry is never clobbered" | PASS(B) |
+| S11 | tier 物化 | agent forge disable 一键关：无 tier、无工具 | S | B | dispatch-wiring.test.mjs :: "S11: agent.forge.disable removes tiers…" | PASS(B) |
+| S12 | 档位注入 | OpenAI 兼容族 → options.reasoningEffort 首回合恰好一次 | S+E | B+C | wiring :: "S12/S13: chat.params injects the same depth…"（每请求幂等注入+档位冻结） | PASS(B) |
+| S13 | 档位注入 | 未知 provider 形状 → 不注入 + 结果披露 | S | B | wiring :: S12/S13 用例 unknown-family 分支 + engine "unknown provider family is disclosed…" | PASS(B) |
 | S14 | 成本报告 | tokens 取宿主 info、成本快照自算带标签 | S+R | B+G | U: dispatch-client.test.mjs :: sumTokens/computeCost 计价（reasoning 计 output）；接线待 B/G | U PASS |
 | S15 | 成本报告 | 无价目身份 → costUsd null + 说明，绝不 0 | S | B | U: dispatch-client.test.mjs :: "S15: unpriced identity…" + cache 缺价两用例 | U PASS |
 | S16 | 启动校验 | 死 defaultDepth（quick→off 无人曝光 off）→ tier 降级 depth-required | U | A | dispatch-roster.test.mjs :: "S16: dead defaultDepth degrades…" + "S16 positive: quick keeps its default…" | PASS(A) |
 | S17 | 启动校验 | expose 拼错（catalog 已知身份）→ 快错列出合法梯 | U | A | dispatch-roster.test.mjs :: "S17: expose typo on a catalog-known identity errors fast…" | PASS(A) |
-| S18 | draft 互操作 | draft 活动期派发被拒 → 指向 plan_approve/discard | S+E | B+C | | |
-| S19 | 账本 | 宿主退出在飞派发 → lost-on-exit 记录、无孤儿进程 | E | C | | |
-| S20 | worker 纪律 | 组装提示含三条款；readonly 与执行形状有差异 | U | B | | |
+| S18 | draft 互操作 | draft 活动期派发被拒 → 指向 plan_approve/discard | S+E | B+C | S: wiring :: "S18: forge_dispatch is refused during a plan draft…"；E 层待 C | PASS(B/E待C) |
+| S19 | 账本 | 宿主退出在飞派发 → lost-on-exit 记录、无孤儿进程 | E | C | E 层待 C；S 雏形: engine :: "S19: dispose records in-flight…" | B部分 | |
+| S20 | worker 纪律 | 组装提示含三条款；readonly 与执行形状有差异 | U | B | wiring :: "S20: worker prompt template carries the three mandates…" | PASS(B) |
 
 ## waves（dispatch，S21–S28）
 
