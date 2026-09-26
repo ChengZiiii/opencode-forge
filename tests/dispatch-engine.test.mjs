@@ -213,6 +213,27 @@ test("unknown provider family is disclosed, not guessed", async () => {
   assert.equal(r.depthInjected, "not injected (unknown provider shape)")
 })
 
+test("B32: parentID is best-effort — a 400 on the parent-bearing create retries plain", async () => {
+  const bodies = []
+  const fetcher = fakeFetcher([
+    {
+      match: /\/session\?directory=/,
+      handle: (u, init) => {
+        const body = JSON.parse(init?.body ?? "{}")
+        bodies.push(body)
+        if (body.parentID !== undefined) return new Response("400 BadRequest: unknown field", { status: 400 })
+        return jsonRes({ id: CHILD })
+      },
+    },
+    { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "done" }] }])) },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { providerFamily: () => null }))
+  const r = await engine.dispatch({ prompt: "x", profile: "scout", depth: "low" }, "ses_parent")
+  assert.equal(r.text, "done")
+  assert.deepEqual(bodies[0], { parentID: "ses_parent" })
+  assert.deepEqual(bodies[1], {})
+})
+
 test("S19: dispose records in-flight dispatches as lost-on-exit", async () => {
   let resolveOuter
   const gate = new Promise((r) => (resolveOuter = r))
@@ -231,4 +252,69 @@ test("S19: dispose records in-flight dispatches as lost-on-exit", async () => {
   resolveOuter()
   await assert.rejects(() => running)
   assert.ok(sunk.some((e) => e.event === "lost-on-exit"), "lost-on-exit must be ledgered")
+})
+
+// Battle-I probe finding (live 1.18.32 serve): POST /session/<id>/message is
+// TURN-SYNCHRONOUS — it does not return until the child's whole first turn
+// settles. The old engine only checked the deadline inside the poll loop,
+// i.e. AFTER that await, so a child stuck in its first turn (long tool call,
+// unanswered permission ask) never reached the deadline check: the host's own
+// tool timeout killed the sync call instead and the honest timeout report +
+// ledger row were lost. The deadline must govern the message POST too.
+const REAL_CLOCK = {
+  now: Date.now,
+  sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+}
+
+const failAfter = (ms, tag) => new Promise((_, rej) => setTimeout(() => rej(new Error(`${tag}: engine hung past the fallback guard (${ms}ms)`)), ms))
+
+test("S7a: deadline fires while the child-turn message POST is still in flight", async () => {
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    {
+      match: new RegExp(`/session/${CHILD}/message$`),
+      handle: async (u, init) => {
+        if (init?.method !== "POST") return jsonRes([])
+        await new Promise((r) => setTimeout(r, 300)) // turn-synchronous host
+        return jsonRes([{ info: { role: "assistant" }, parts: [{ type: "text", text: "finally done" }] }])
+      },
+    },
+  ])
+  const sunk = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 80, pollIntervalMs: 10, sink: (e) => sunk.push(e) }))
+  const t0 = Date.now()
+  await assert.rejects(
+    () => Promise.race([engine.dispatch({ prompt: "slow turn", profile: "quick", depth: "low" }), failAfter(1500, "S7a")]),
+    (err) => {
+      assert.equal(err.code, "timeout")
+      assert.match(err.message, new RegExp(CHILD))
+      return true
+    },
+  )
+  const elapsed = Date.now() - t0
+  assert.ok(elapsed < 250, `timeout must fire near the 80ms deadline, took ${elapsed}ms`)
+  assert.ok(sunk.some((e) => e.event === "timeout" && e.sessionID === CHILD), "timeout must be ledgered with the childID")
+})
+
+test("S7b: deadline fires even when the child-turn message POST never returns", async () => {
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    {
+      match: new RegExp(`/session/${CHILD}/message$`),
+      handle: (u, init) => (init?.method !== "POST" ? jsonRes([]) : new Promise(() => {})),
+    },
+  ])
+  const sunk = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 80, pollIntervalMs: 10, sink: (e) => sunk.push(e) }))
+  const t0 = Date.now()
+  await assert.rejects(
+    () => Promise.race([engine.dispatch({ prompt: "hung turn", profile: "quick", depth: "low" }), failAfter(1500, "S7b")]),
+    (err) => {
+      assert.equal(err.code, "timeout")
+      return true
+    },
+  )
+  const elapsed = Date.now() - t0
+  assert.ok(elapsed < 250, `timeout must fire near the 80ms deadline, took ${elapsed}ms`)
+  assert.ok(sunk.some((e) => e.event === "timeout"), "timeout must be ledgered")
 })
