@@ -132,6 +132,23 @@ test("S17: expose typo on a catalog-known identity errors fast listing the legal
   assert.deepEqual(entry.expose, ["low"])
 })
 
+test("toggle/budget models have no cataloged named levels: user expose is accepted verbatim with a notice", () => {
+  const catalog = {
+    providers: { glm: { models: { "glm-4.7": { reasoningOptions: [] } } } }, // toggle-shaped after reduction
+  }
+  const built = buildDispatchConfig({
+    configuredIdentities: ["glm/glm-4.7"],
+    catalog,
+    userRoster: [{ model: "glm/glm-4.7", expose: ["thinking"], profiles: ["build"] }],
+  })
+  const finding = built.findings.find((f) => f.code === "unnamed-levels-accepted")
+  assert.ok(finding, "no cataloged named levels must be disclosed, not treated as a typo")
+  assert.equal(finding.level, "notice")
+  const entry = built.roster.find((e) => e.model === "glm/glm-4.7")
+  assert.deepEqual(entry.expose, ["thinking"]) // verbatim — the user names toggle levels
+  assert.equal(entry.verified, true)
+})
+
 test("dead roster key (identity not configured) warns by name", () => {
   const built = buildDispatchConfig({
     configuredIdentities: ["zai-coding-plan/glm-5.3"],

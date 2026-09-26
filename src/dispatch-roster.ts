@@ -173,24 +173,36 @@ export function buildDispatchConfig(opts: {
     const ladder = nativeLadder(catalog, entry.model)
     const verified = ladder !== null
     if (verified && catalogKnowsIdentity(catalog, entry.model)) {
-      // expose ⊆ native ladder — typos are config errors, fail fast.
-      const expose = entry.expose ?? ladder!
-      const illegal = expose.filter((d) => !ladder!.includes(d))
-      if (illegal.length > 0) {
+      const legal = ladder!
+      if (legal.length === 0) {
+        // Toggle/budget models: the catalog names no levels — the USER names
+        // them (wargame §2.2). Accept verbatim, disclose the basis.
         findings.push({
-          level: "error",
-          code: "expose-unknown-level",
-          message: `roster entry ${entry.model} exposes unknown level(s) ${illegal.map((d) => `"${d}"`).join(", ")}; legal ladder: ${ladder!.join(", ")}`,
+          level: "notice",
+          code: "unnamed-levels-accepted",
+          message: `roster entry ${entry.model} has no cataloged named reasoning levels (toggle/budget model); expose accepted verbatim without validation`,
+        })
+        roster.push({ model: entry.model, expose: [...(entry.expose ?? [])], profiles: [...entry.profiles], verified: true })
+      } else {
+        // expose ⊆ native ladder — typos are config errors, fail fast.
+        const expose = entry.expose ?? legal
+        const illegal = expose.filter((d) => !legal.includes(d))
+        if (illegal.length > 0) {
+          findings.push({
+            level: "error",
+            code: "expose-unknown-level",
+            message: `roster entry ${entry.model} exposes unknown level(s) ${illegal.map((d) => `"${d}"`).join(", ")}; legal ladder: ${legal.join(", ")}`,
+          })
+        }
+        // Fail-closed: illegal levels are stripped from the effective expose so
+        // a typo can never be dispatched; legal curation survives.
+        roster.push({
+          model: entry.model,
+          expose: expose.filter((d) => legal.includes(d)),
+          profiles: [...entry.profiles],
+          verified: true,
         })
       }
-      // Fail-closed: illegal levels are stripped from the effective expose so
-      // a typo can never be dispatched; legal curation survives.
-      roster.push({
-        model: entry.model,
-        expose: expose.filter((d) => ladder!.includes(d)),
-        profiles: [...entry.profiles],
-        verified: true,
-      })
     } else {
       // Unknown to the catalog: accept verbatim + unverified notice (never
       // block self-hosted/custom models, but say plainly we cannot check).

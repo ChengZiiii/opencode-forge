@@ -12335,9 +12335,9 @@ function tool(input) {
 tool.schema = exports_external;
 // plugin.ts
 import { execFileSync as execFileSync3 } from "node:child_process";
-import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync4, readdirSync as readdirSync4, readFileSync as readFileSync6, statSync as statSync3, writeFileSync as writeFileSync4 } from "node:fs";
-import { isAbsolute, join as join4, relative } from "node:path";
-import { tmpdir as tmpdir2 } from "node:os";
+import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync6, readdirSync as readdirSync4, readFileSync as readFileSync8, statSync as statSync3, writeFileSync as writeFileSync6 } from "node:fs";
+import { isAbsolute, join as join5, relative } from "node:path";
+import { tmpdir as tmpdir3 } from "node:os";
 
 // src/plan-file.ts
 class PlanError extends Error {
@@ -14723,6 +14723,664 @@ function createLocator(platform = process.platform, posix = {}, win = {}) {
   return platform === "win32" ? createWindowsLocator(win) : createPosixLocator(posix);
 }
 
+// src/dispatch-roster.ts
+var DEFAULT_TIERS = {
+  scout: { shape: "readonly", defaultDepth: "low" },
+  build: { shape: "write", defaultDepth: "high" },
+  review: { shape: "readonly", defaultDepth: "high" },
+  quick: { shape: "write", defaultDepth: "off" }
+};
+var TIER_ID_RE = /^[a-z0-9-]+$/;
+function nativeLadder(catalog, identity) {
+  const parsed = parseIdentity(identity);
+  if (!parsed)
+    return null;
+  const entry = catalog.providers?.[parsed.provider]?.models?.[parsed.model];
+  if (!entry)
+    return null;
+  const options = entry.reasoningOptions;
+  return Array.isArray(options) ? [...options] : null;
+}
+function identityCost(catalog, identity) {
+  const parsed = parseIdentity(identity);
+  if (!parsed)
+    return;
+  return catalog.providers?.[parsed.provider]?.models?.[parsed.model]?.cost;
+}
+function parseIdentity(identity) {
+  const slash = identity.indexOf("/");
+  if (slash <= 0 || slash === identity.length - 1)
+    return null;
+  return { provider: identity.slice(0, slash), model: identity.slice(slash + 1) };
+}
+function catalogKnowsIdentity(catalog, identity) {
+  const parsed = parseIdentity(identity);
+  if (!parsed)
+    return false;
+  return Boolean(catalog.providers?.[parsed.provider]?.models?.[parsed.model]);
+}
+function buildDispatchConfig(opts) {
+  const findings = [];
+  const catalog = opts.catalog ?? { providers: {} };
+  const tiers = {};
+  for (const [id, def] of Object.entries(DEFAULT_TIERS)) {
+    tiers[id] = { ...def, shape: def.shape ?? "readonly" };
+  }
+  for (const [id, def] of Object.entries(opts.userTiers ?? {})) {
+    if (!TIER_ID_RE.test(id)) {
+      findings.push({
+        level: "warn",
+        code: "tier-id-charset",
+        message: `tier id "${id}" violates [a-z0-9-] (it materializes as forge-<tier> agent ids)`
+      });
+    }
+    const shape = def.shape ?? "readonly";
+    if (def.shape === undefined) {
+      findings.push({
+        level: "warn",
+        code: "shape-defaulted",
+        message: `custom tier "${id}" has no shape; defaulting to readonly (write requires explicit "shape": "write")`
+      });
+    }
+    tiers[id] = { ...def, shape };
+  }
+  const roster = [];
+  const listed = new Set;
+  for (const entry of opts.userRoster ?? []) {
+    listed.add(entry.model);
+    const ladder = nativeLadder(catalog, entry.model);
+    const verified = ladder !== null;
+    if (verified && catalogKnowsIdentity(catalog, entry.model)) {
+      const legal = ladder;
+      if (legal.length === 0) {
+        findings.push({
+          level: "notice",
+          code: "unnamed-levels-accepted",
+          message: `roster entry ${entry.model} has no cataloged named reasoning levels (toggle/budget model); expose accepted verbatim without validation`
+        });
+        roster.push({ model: entry.model, expose: [...entry.expose ?? []], profiles: [...entry.profiles], verified: true });
+      } else {
+        const expose = entry.expose ?? legal;
+        const illegal = expose.filter((d) => !legal.includes(d));
+        if (illegal.length > 0) {
+          findings.push({
+            level: "error",
+            code: "expose-unknown-level",
+            message: `roster entry ${entry.model} exposes unknown level(s) ${illegal.map((d) => `"${d}"`).join(", ")}; legal ladder: ${legal.join(", ")}`
+          });
+        }
+        roster.push({
+          model: entry.model,
+          expose: expose.filter((d) => legal.includes(d)),
+          profiles: [...entry.profiles],
+          verified: true
+        });
+      }
+    } else {
+      findings.push({
+        level: "notice",
+        code: "unverified-identity",
+        message: `roster entry ${entry.model} is not in the models.dev snapshot; expose accepted verbatim without validation`
+      });
+      roster.push({ model: entry.model, expose: [...entry.expose ?? []], profiles: [...entry.profiles], verified: false });
+    }
+  }
+  for (const identity of opts.configuredIdentities) {
+    if (listed.has(identity))
+      continue;
+    const ladder = nativeLadder(catalog, identity);
+    roster.push({
+      model: identity,
+      expose: ladder ?? [],
+      profiles: ["scout", "quick"],
+      verified: ladder !== null
+    });
+  }
+  const tierIds = new Set(Object.keys(tiers));
+  for (const entry of roster) {
+    if (!opts.configuredIdentities.includes(entry.model)) {
+      findings.push({
+        level: "warn",
+        code: "dead-key",
+        message: `roster entry ${entry.model} is not a configured provider/model identity (dead key)`
+      });
+    }
+    const unknownTiers = entry.profiles.filter((p) => !tierIds.has(p));
+    if (unknownTiers.length > 0) {
+      findings.push({
+        level: "warn",
+        code: "unknown-tier-ref",
+        message: `roster entry ${entry.model} references nonexistent tier(s): ${unknownTiers.join(", ")}`
+      });
+    }
+  }
+  for (const [id, tier] of Object.entries(tiers)) {
+    if (tier.defaultDepth === undefined)
+      continue;
+    const served = roster.some((e) => e.profiles.includes(id) && e.expose.includes(tier.defaultDepth));
+    if (!served) {
+      findings.push({
+        level: "warn",
+        code: "dead-default-depth",
+        message: `tier "${id}" defaultDepth "${tier.defaultDepth}" is exposed by no candidate; tier degrades to depth-required (dispatches must pass depth explicitly)`
+      });
+      tiers[id] = { ...tier, defaultDepth: undefined, depthRequired: true };
+    }
+  }
+  return { roster, tiers, findings };
+}
+
+// src/dispatch-client.ts
+var CONSECUTIVE_STABLE_POLLS = 2;
+function completionVerdict(prev, cur) {
+  if (!prev) {
+    return { stablePolls: 0, verdict: "waiting", last: { ...cur } };
+  }
+  const unchanged = cur.count === prev.last.count && cur.text === prev.last.text;
+  const stablePolls = unchanged ? prev.stablePolls + 1 : 0;
+  if (stablePolls >= CONSECUTIVE_STABLE_POLLS && cur.count > 0) {
+    return { stablePolls, verdict: cur.text.trim() === "" ? "empty" : "complete", last: { ...cur } };
+  }
+  return { stablePolls, verdict: "waiting", last: { ...cur } };
+}
+function sumTokens(list) {
+  const total = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
+  for (const t of list) {
+    total.input += t.input ?? 0;
+    total.output += t.output ?? 0;
+    total.reasoning += t.reasoning ?? 0;
+    total.cache.read += t.cache?.read ?? 0;
+    total.cache.write += t.cache?.write ?? 0;
+  }
+  return total;
+}
+function computeCost(tokens, price) {
+  if (!price || typeof price.input !== "number" || typeof price.output !== "number") {
+    return { costUsd: null, note: "price unavailable for this identity (no snapshot price)" };
+  }
+  if (tokens.cache.read > 0 && typeof price.cacheRead !== "number") {
+    return { costUsd: null, note: "price unavailable: cache-read price missing from snapshot" };
+  }
+  if (tokens.cache.write > 0 && typeof price.cacheWrite !== "number") {
+    return { costUsd: null, note: "price unavailable: cache-write price missing from snapshot" };
+  }
+  const usd = (tokens.input * price.input + (tokens.output + tokens.reasoning) * price.output + tokens.cache.read * (price.cacheRead ?? 0) + tokens.cache.write * (price.cacheWrite ?? 0)) / 1e6;
+  return { costUsd: usd };
+}
+
+// src/dispatch-prompt.ts
+var COMMON_MANDATES = [
+  "Mandates (non-negotiable):",
+  "- Use workspace-relative paths ONLY. Never write to or read from absolute paths outside this workspace; the workspace root is where you were started, not the filesystem root.",
+  "- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial.",
+  "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."
+].join(`
+`);
+var READONLY_DISCIPLINE = `You are a readonly ${"{tier}"} worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`;
+var WRITE_DISCIPLINE = `You are a ${"{tier}"} worker executing one scoped task. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no starting side quests.`;
+function composeWorkerPrompt(input) {
+  const discipline = input.shape === "readonly" ? READONLY_DISCIPLINE.replaceAll("{tier}", input.tier) : WRITE_DISCIPLINE.replaceAll("{tier}", input.tier);
+  return [
+    "[forge:dispatch] You were dispatched by the forge main agent as a scoped worker.",
+    discipline,
+    "",
+    "Task:",
+    input.prompt.trim(),
+    "",
+    COMMON_MANDATES,
+    "",
+    "Finish with a single concluding report (the main agent will read only this): what you did, what you found/produced, and the evidence."
+  ].join(`
+`);
+}
+
+// src/dispatch-resolver.ts
+function exposedVocabulary(cfg) {
+  const set2 = new Set;
+  for (const entry of cfg.roster)
+    for (const d of entry.expose)
+      set2.add(d);
+  return [...set2];
+}
+function menuFor(cfg, tierId, depth, exclude, available) {
+  const lines = [];
+  for (const entry of cfg.roster) {
+    if (!entry.profiles.includes(tierId))
+      continue;
+    let reason;
+    if (exclude.includes(entry.model))
+      reason = "excluded after a failed attempt";
+    else if (!available(entry.model))
+      reason = "identity currently unavailable";
+    else if (depth !== undefined && !entry.expose.includes(depth))
+      reason = `depth "${depth}" not exposed`;
+    else
+      reason = "eligible";
+    lines.push({ identity: entry.model, expose: [...entry.expose], verified: entry.verified, reason });
+  }
+  return lines;
+}
+function costRank(catalog, identity) {
+  const cost = identityCost(catalog, identity);
+  if (!cost || typeof cost.input !== "number" || typeof cost.output !== "number")
+    return Number.POSITIVE_INFINITY;
+  return cost.input + cost.output;
+}
+function resolveDispatch(cfg, req, available, catalog = { providers: {} }) {
+  const tier = cfg.tiers[req.profile];
+  if (!tier) {
+    return {
+      ok: false,
+      error: {
+        code: "unknown-tier",
+        message: `unknown tier "${req.profile}"; known tiers: ${Object.keys(cfg.tiers).join(", ")}`,
+        menu: [],
+        vocabulary: exposedVocabulary(cfg)
+      }
+    };
+  }
+  const exclude = req.exclude ?? [];
+  if (tier.model) {
+    const pinnedIdentity = tier.model;
+    const entry = cfg.roster.find((e) => e.model === pinnedIdentity);
+    const expose = entry?.expose ?? [];
+    const menu = [
+      { identity: pinnedIdentity, expose, verified: entry?.verified ?? false, reason: "pinned tier target" }
+    ];
+    if (!available(pinnedIdentity)) {
+      return {
+        ok: false,
+        error: {
+          code: "pin-unavailable",
+          message: `tier "${req.profile}" is pinned to ${pinnedIdentity}, which is currently unavailable; fix or unpin the tier — no fallback model will be used`,
+          menu,
+          vocabulary: exposedVocabulary(cfg)
+        }
+      };
+    }
+    const depth2 = req.depth ?? tier.depth;
+    if (depth2 === undefined) {
+      return {
+        ok: false,
+        error: {
+          code: "depth-required",
+          message: `tier "${req.profile}" is pinned without a depth and none was requested; pass depth explicitly`,
+          menu,
+          vocabulary: exposedVocabulary(cfg)
+        }
+      };
+    }
+    if (!expose.includes(depth2)) {
+      return {
+        ok: false,
+        error: {
+          code: "pin-depth-mismatch",
+          message: `pinned model ${pinnedIdentity} does not expose depth "${depth2}" (expose: ${expose.join(", ") || "none"}); exact match only — no clamping`,
+          menu,
+          vocabulary: exposedVocabulary(cfg)
+        }
+      };
+    }
+    return { ok: true, identity: pinnedIdentity, depth: depth2, pinned: true };
+  }
+  const depth = req.depth ?? tier.defaultDepth;
+  if (depth === undefined) {
+    return {
+      ok: false,
+      error: {
+        code: "depth-required",
+        message: `tier "${req.profile}" has no usable default depth (its default was removed at validation); pass depth explicitly`,
+        menu: menuFor(cfg, req.profile, undefined, exclude, available),
+        vocabulary: exposedVocabulary(cfg)
+      }
+    };
+  }
+  const candidates = cfg.roster.map((entry, index) => ({ entry, index })).filter(({ entry }) => entry.profiles.includes(req.profile)).filter(({ entry }) => !exclude.includes(entry.model)).filter(({ entry }) => available(entry.model)).filter(({ entry }) => entry.expose.includes(depth)).sort((a, b) => a.index - b.index || costRank(catalog, a.entry.model) - costRank(catalog, b.entry.model));
+  if (candidates.length === 0) {
+    return {
+      ok: false,
+      error: {
+        code: "no-candidate",
+        message: `no candidate serves tier "${req.profile}" at depth "${depth}"; pick a depth from the menu's exposures (exact match — the plugin never clamps)`,
+        menu: menuFor(cfg, req.profile, depth, exclude, available),
+        vocabulary: exposedVocabulary(cfg)
+      }
+    };
+  }
+  return { ok: true, identity: candidates[0].entry.model, depth, pinned: false };
+}
+
+// src/dispatch-engine.ts
+var DEFAULT_DISPATCH_TIMEOUT_MS = 600000;
+var MAX_DISPATCH_TIMEOUT_MS = 600000;
+var DEFAULT_MAX_CONCURRENT = 4;
+var DEFAULT_POLL_INTERVAL_MS = 2000;
+
+class DispatchError extends Error {
+  code;
+  constructor(message, code) {
+    super(message);
+    this.name = "DispatchError";
+    this.code = code;
+  }
+}
+function textOf(messages) {
+  const assistant = [...messages].reverse().find((m) => (m.info?.role ?? m.role) === "assistant");
+  if (!assistant)
+    return "";
+  return (assistant.parts ?? []).filter((p) => p.type === "text" || typeof p.text === "string").map((p) => p.text ?? "").join(`
+`).trim();
+}
+function tokensOf(messages) {
+  return messages.filter((m) => (m.info?.role ?? m.role) === "assistant" && m.info?.tokens).map((m) => m.info.tokens);
+}
+function createDispatchEngine(deps) {
+  const maxConcurrent = deps.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
+  const timeoutMs = Math.min(deps.timeoutMs ?? DEFAULT_DISPATCH_TIMEOUT_MS, MAX_DISPATCH_TIMEOUT_MS);
+  const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const inFlight = new Set;
+  let seq = 0;
+  const api2 = async (path, init) => {
+    const res = await deps.fetcher(`${deps.serverUrl}${path}`, {
+      ...init,
+      headers: { "content-type": "application/json", ...init?.headers ?? {} }
+    });
+    const text = await res.text();
+    if (!res.ok)
+      throw new DispatchError(`${init?.method ?? "GET"} ${path} -> ${res.status}: ${text.slice(0, 300)}`, "host-error");
+    return text ? JSON.parse(text) : undefined;
+  };
+  const fetchMessages = async (sessionID) => {
+    const list = await api2(`/session/${sessionID}/message`);
+    return Array.isArray(list) ? list : [];
+  };
+  async function dispatch(req, parentSessionID) {
+    const t0 = deps.now();
+    const slot = `d${++seq}`;
+    if (inFlight.size >= maxConcurrent) {
+      deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.profile, note: `${inFlight.size} in flight` });
+      throw new DispatchError(`forge_dispatch refused: ${inFlight.size} dispatches already in flight (cap ${maxConcurrent}). Wait for a completion and retry.`, "cap-refused");
+    }
+    const r = resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth }, deps.available, deps.catalog);
+    if (!r.ok) {
+      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: req.profile, outcome: r.error.code, note: r.error.message });
+      throw new DispatchError(`${r.error.message}
+Menu:
+${r.error.menu.map((m) => `- ${m.identity} expose=[${m.expose.join(", ") || "none"}] ${m.reason}`).join(`
+`)}
+Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
+    }
+    const providerID = r.identity.slice(0, r.identity.indexOf("/"));
+    inFlight.add(slot);
+    let childID = "";
+    try {
+      const dir = encodeURIComponent(deps.workspace);
+      let created;
+      try {
+        created = await api2(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify(parentSessionID ? { parentID: parentSessionID } : {}) });
+      } catch {
+        created = await api2(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify({}) });
+      }
+      childID = created?.id ?? "";
+      if (!childID)
+        throw new DispatchError("host returned no session id for the child session", "host-error");
+      deps.onDepth(childID, r.depth, providerID);
+      const family = deps.providerFamily(providerID);
+      const depthInjected = family === null ? "not injected (unknown provider shape)" : `${family} <- ${r.depth}`;
+      await api2(`/session/${childID}/message`, {
+        method: "POST",
+        body: JSON.stringify({
+          model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
+          agent: `forge-${req.profile}`,
+          parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, tier: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }]
+        })
+      });
+      let poll = null;
+      let messages = [];
+      for (;; ) {
+        const elapsed = deps.now() - t0;
+        if (elapsed >= timeoutMs) {
+          deps.sink({
+            ts: new Date().toISOString(),
+            event: "timeout",
+            tier: req.profile,
+            identity: r.identity,
+            depth: r.depth,
+            sessionID: childID,
+            durationMs: elapsed
+          });
+          throw new DispatchError(`forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`, "timeout");
+        }
+        await deps.sleep(pollIntervalMs);
+        messages = await fetchMessages(childID);
+        poll = completionVerdict(poll, { count: messages.length, text: textOf(messages) });
+        if (poll.verdict === "complete" || poll.verdict === "empty")
+          break;
+      }
+      const durationMs = deps.now() - t0;
+      if (poll.verdict === "empty") {
+        deps.sink({
+          ts: new Date().toISOString(),
+          event: "empty-response",
+          tier: req.profile,
+          identity: r.identity,
+          depth: r.depth,
+          sessionID: childID,
+          durationMs
+        });
+        throw new DispatchError(`child session ${childID} returned an empty response (0-token assistant message). This is a known quirk of keyless endpoints combined with restricted tiers — see the README dispatch notes. The dispatch is NOT counted as success.`, "empty-response");
+      }
+      const tokens = sumTokens(tokensOf(messages));
+      const price = priceFor(deps.catalog, r.identity);
+      const cost = computeCost(tokens, price?.spec ?? null);
+      const result = {
+        tier: req.profile,
+        requested: { profile: req.profile, depth: req.depth },
+        actual: { model: r.identity, depth: r.depth },
+        sessionID: childID,
+        durationMs,
+        tokens,
+        costUsd: cost.costUsd,
+        ...cost.note ? { costNote: cost.note } : {},
+        ...price?.label ? { priceSnapshot: price.label } : {},
+        text: textOf(messages),
+        depthInjected
+      };
+      deps.sink({
+        ts: new Date().toISOString(),
+        event: "completed",
+        tier: req.profile,
+        identity: r.identity,
+        depth: r.depth,
+        sessionID: childID,
+        outcome: "completed",
+        tokens,
+        costUsd: cost.costUsd,
+        durationMs
+      });
+      return result;
+    } finally {
+      inFlight.delete(slot);
+    }
+  }
+  return {
+    dispatch,
+    inFlightCount: () => inFlight.size,
+    inFlightIDs: () => [...inFlight],
+    dispose: () => {
+      for (const slot of inFlight) {
+        deps.sink({ ts: new Date().toISOString(), event: "lost-on-exit", note: `dispatch ${slot} in flight at host exit` });
+      }
+      inFlight.clear();
+    }
+  };
+}
+function priceFor(catalog, identity) {
+  const slash = identity.indexOf("/");
+  if (slash <= 0)
+    return null;
+  const model = catalog.providers?.[identity.slice(0, slash)]?.models?.[identity.slice(slash + 1)];
+  const cost = model?.cost;
+  if (!cost)
+    return null;
+  return {
+    spec: {
+      input: cost.input,
+      output: cost.output,
+      cacheRead: cost.cache_read,
+      cacheWrite: cost.cache_write
+    },
+    label: "models.dev snapshot"
+  };
+}
+
+// src/dispatch-ledger.ts
+import { mkdirSync as mkdirSync4, readFileSync as readFileSync6, writeFileSync as writeFileSync4 } from "node:fs";
+import { dirname as dirname3 } from "node:path";
+var DISPATCH_LEDGER_MAX_ENTRIES = 200;
+var DISPATCH_LEDGER_MAX_BYTES = 1e6;
+function createDispatchLedger(logPath, maxEntries = DISPATCH_LEDGER_MAX_ENTRIES, maxBytes = DISPATCH_LEDGER_MAX_BYTES) {
+  const append = (entry) => {
+    try {
+      mkdirSync4(dirname3(logPath), { recursive: true });
+      let lines = [];
+      try {
+        lines = readFileSync6(logPath, "utf8").split(`
+`).filter((l) => l.trim().length > 0);
+      } catch {}
+      if (lines.length >= maxEntries)
+        lines = lines.slice(lines.length - maxEntries + 1);
+      lines.push(JSON.stringify(entry));
+      let text = lines.join(`
+`) + `
+`;
+      if (text.length > maxBytes) {
+        const keep = Math.max(1, Math.floor(maxEntries / 2));
+        text = lines.slice(-keep).join(`
+`) + `
+`;
+      }
+      writeFileSync4(logPath, text, "utf8");
+    } catch {}
+  };
+  const entries = () => {
+    try {
+      return readFileSync6(logPath, "utf8").split(`
+`).filter((l) => l.trim().length > 0).map((l) => JSON.parse(l));
+    } catch {
+      return [];
+    }
+  };
+  return { append, entries, path: logPath };
+}
+
+// src/dispatch-tiers.ts
+var MUTATING_TOOLS = ["write", "edit", "bash"];
+var TIER_PROMPTS = {
+  scout: "You are forge-scout, a readonly reconnaissance worker. Search, read, and run read-only commands; report findings with file:line evidence. You never modify anything — write tools are denied by design.",
+  build: "You are forge-build, an implementation worker. Execute the dispatched task exactly: minimal, focused changes with tests where the task implies them. Do not expand scope.",
+  review: "You are forge-review, a readonly review worker. Read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list with file:line evidence and a single-line verdict. Write tools are denied by design.",
+  quick: "You are forge-quick, a mechanical small-change worker. Make the smallest correct edit the task names (rename, constant, one-liner fix). No refactoring, no drive-by improvements."
+};
+function tierAgentPrompt(tierId) {
+  return TIER_PROMPTS[tierId] ?? `You are forge-${tierId}, a dispatched worker. Execute the dispatched task exactly as scoped.`;
+}
+function tierAgentDef(tierId, tier) {
+  const permission = { task: "deny" };
+  if (tier.shape === "readonly") {
+    for (const t of MUTATING_TOOLS)
+      permission[t] = "deny";
+  }
+  const shapeLine = tier.shape === "readonly" ? "Readonly tier: mutating tools are denied by design — report findings, never work around restrictions." : "Write tier: execute the scoped task with minimal, focused changes.";
+  const defaultLine = tier.defaultDepth ? ` Default reasoning depth: ${tier.defaultDepth}.` : "";
+  return {
+    description: `forge dispatch tier "${tierId}" (${tier.shape}) — spawned by forge_dispatch, not user-facing.${defaultLine}`,
+    mode: "subagent",
+    hidden: true,
+    prompt: `${tierAgentPrompt(tierId)}
+
+${shapeLine}`,
+    permission
+  };
+}
+
+// src/models-dev.ts
+import { mkdirSync as mkdirSync5, readFileSync as readFileSync7, writeFileSync as writeFileSync5 } from "node:fs";
+import { join as join4 } from "node:path";
+import { tmpdir as tmpdir2 } from "node:os";
+var DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json";
+function modelsDevCacheDir(base) {
+  return join4(base ?? join4(tmpdir2(), "opencode-forge"), "models-dev");
+}
+function namedLevels(rows) {
+  const out = [];
+  for (const r of rows) {
+    if (r && typeof r === "object" && r.type === "effort") {
+      const values = r.values;
+      if (Array.isArray(values)) {
+        for (const v of values)
+          if (typeof v === "string")
+            out.push(v);
+      }
+    }
+  }
+  return out;
+}
+function reduceModelsDev(raw) {
+  const catalog = { providers: {} };
+  const providers = raw?.constructor === Object ? raw : null;
+  if (!providers)
+    return catalog;
+  for (const [providerID, provider] of Object.entries(providers)) {
+    const models = provider.models;
+    if (!models || typeof models !== "object")
+      continue;
+    const out = { models: {} };
+    for (const [modelID, model] of Object.entries(models)) {
+      const m = model;
+      const options = Array.isArray(m.reasoning_options) ? namedLevels(m.reasoning_options) : undefined;
+      const cost = m.cost && typeof m.cost === "object" ? m.cost : undefined;
+      out.models[modelID] = {
+        ...options ? { reasoningOptions: options } : {},
+        ...cost ? { cost } : {}
+      };
+    }
+    catalog.providers[providerID] = out;
+  }
+  return catalog;
+}
+async function loadModelsDevSnapshot(opts = {}) {
+  const url2 = opts.url ?? process.env.OPENCODE_MODELS_URL ?? DEFAULT_MODELS_DEV_URL;
+  const cacheDir = modelsDevCacheDir(opts.cacheDir);
+  const cacheFile = join4(cacheDir, "snapshot.json");
+  const fetcher = opts.fetcher;
+  if (fetcher) {
+    try {
+      const res = await fetcher(url2, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8000) });
+      if (res.ok)
+        return { catalog: reduceModelsDev(JSON.parse(await res.text())), degraded: false, source: url2 };
+    } catch {}
+    return { catalog: { providers: {} }, degraded: true, source: "fetch-failed" };
+  }
+  try {
+    const res = await fetch(url2, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8000) });
+    if (res.ok) {
+      const catalog = reduceModelsDev(JSON.parse(await res.text()));
+      try {
+        mkdirSync5(cacheDir, { recursive: true });
+        writeFileSync5(cacheFile, JSON.stringify(catalog));
+      } catch {}
+      return { catalog, degraded: false, source: url2 };
+    }
+  } catch {}
+  try {
+    const cached2 = JSON.parse(readFileSync7(cacheFile, "utf8"));
+    if (cached2 && typeof cached2 === "object" && cached2.providers)
+      return { catalog: cached2, degraded: true, source: "cache" };
+  } catch {}
+  return { catalog: { providers: {} }, degraded: true, source: "unavailable" };
+}
+
 // plugin.ts
 var FORGE_AGENT = "forge";
 var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
@@ -14786,6 +15444,62 @@ function effectiveWorktree(worktree, fallback) {
 }
 var sessions = new Map;
 var forgeDisabled = false;
+var dispatchDisabled = false;
+var dispatchMaxConcurrent = 4;
+var dispatchTimeoutMs = 600000;
+var dispatchBase = null;
+var activeDispatchEngine = null;
+var dispatchLogDir = join5(tmpdir3(), "opencode-forge", "dispatch");
+var dispatchLedger = createDispatchLedger(join5(dispatchLogDir, "ledger.jsonl"));
+var dispatchDepths = new Map;
+var OPENAI_FAMILY = new Set(["openai", "opencode", "openrouter", "groq", "xai", "azure", "github-copilot", "deepseek", "together", "vercel", "opus"]);
+var ANTHROPIC_FAMILY = new Set(["anthropic"]);
+var ZAI_FAMILY = new Set(["zai", "zai-coding-plan"]);
+var ANTHROPIC_BUDGET = { off: 0, minimal: 1024, low: 4096, medium: 8192, high: 16384, xhigh: 24576, max: 32768 };
+function dispatchProviderFamily(providerID) {
+  if (OPENAI_FAMILY.has(providerID))
+    return "openai";
+  if (ANTHROPIC_FAMILY.has(providerID))
+    return "anthropic";
+  if (ZAI_FAMILY.has(providerID))
+    return "zai";
+  return null;
+}
+function queueDispatchDepth(sessionID, level, providerID) {
+  const existing = dispatchDepths.get(sessionID);
+  if (existing)
+    return existing.level === level;
+  dispatchDepths.set(sessionID, { level, family: dispatchProviderFamily(providerID) ?? "unknown" });
+  return true;
+}
+function applyDepthToOptions(options, level, family) {
+  if (family === "openai") {
+    options.reasoningEffort = level;
+  } else if (family === "anthropic") {
+    const budget = ANTHROPIC_BUDGET[level] ?? 8192;
+    options.thinking = level === "off" ? { type: "disabled" } : { type: "enabled", budget_tokens: budget };
+  } else if (family === "zai") {
+    options.thinking = level === "off" ? { type: "disabled" } : { type: "enabled" };
+  }
+}
+function configuredIdentitiesOf(cfg, catalog) {
+  const providers = cfg.provider ?? {};
+  const identities = [];
+  for (const [providerID, provider] of Object.entries(providers)) {
+    const modelKeys = provider?.models ? Object.keys(provider.models) : null;
+    if (modelKeys && modelKeys.length > 0) {
+      for (const m of modelKeys)
+        identities.push(`${providerID}/${m}`);
+    } else {
+      const catModels = catalog.providers?.[providerID]?.models ?? {};
+      const ids = Object.keys(catModels);
+      if (ids.length > 0)
+        for (const m of ids)
+          identities.push(`${providerID}/${m}`);
+    }
+  }
+  return identities;
+}
 var jobsMode = "auto";
 var jobsKeepBuiltinShell = false;
 var jobsSurviveMode = "never";
@@ -14838,12 +15552,12 @@ function jobStage() {
   return nativeBackgroundSeen ? 1 : 0;
 }
 var jobLogDir = jobsLogDir();
-var jobLedgerPath = join4(jobLogDir, "ledger.jsonl");
+var jobLedgerPath = join5(jobLogDir, "ledger.jsonl");
 function jobLedgerSink(entry) {
   try {
-    mkdirSync4(jobLogDir, { recursive: true });
+    mkdirSync6(jobLogDir, { recursive: true });
     if (existsSync3(jobLedgerPath) && statSync3(jobLedgerPath).size > 1e6)
-      writeFileSync4(jobLedgerPath, "");
+      writeFileSync6(jobLedgerPath, "");
     appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}
 `);
   } catch {}
@@ -14898,13 +15612,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 function planDirOf(worktree) {
-  return join4(worktree, ".opencode", "plan");
+  return join5(worktree, ".opencode", "plan");
 }
 function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync6(join4(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join5(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -14921,7 +15635,7 @@ function worktreeFor(context) {
 }
 function resolveActivePlan(state) {
   if (state.planPath && existsSync3(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync6(state.planPath, "utf8"));
+    const doc2 = parsePlanLoose(readFileSync8(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -14929,7 +15643,7 @@ function resolveActivePlan(state) {
   const ranked = rankActivePlans(readPlanDir(state.worktree));
   if (ranked.length === 0)
     return null;
-  const path = join4(planDirOf(state.worktree), ranked[0].name);
+  const path = join5(planDirOf(state.worktree), ranked[0].name);
   state.planPath = path;
   return { path, doc: ranked[0].doc };
 }
@@ -14963,12 +15677,12 @@ var planWriteTool = tool({
       throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
       const dir = planDirOf(state.worktree);
-      mkdirSync4(dir, { recursive: true });
-      path = join4(dir, planFileName(localDate(), slugify(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md"))));
+      mkdirSync6(dir, { recursive: true });
+      path = join5(dir, planFileName(localDate(), slugify(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
     const text = renderPlan(args, now, created);
-    writeFileSync4(path, text);
+    writeFileSync6(path, text);
     state.planPath = path;
     const doc2 = parsePlan(text);
     context.metadata({ title: `${mode === "created" ? "Create" : "Revise"} plan: ${doc2.goal}` });
@@ -14996,8 +15710,8 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync6(active.path, "utf8"), args.n, nowIso());
-    writeFileSync4(active.path, next);
+    const next = tickTask(readFileSync8(active.path, "utf8"), args.n, nowIso());
+    writeFileSync6(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` });
@@ -15024,7 +15738,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    writeFileSync4(active.path, transitionStatus(readFileSync6(active.path, "utf8"), "approved", nowIso()));
+    writeFileSync6(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -15057,7 +15771,7 @@ var planCloseTool = tool({
 Fix the implementation and retry, or revise the plan first.`);
     }
     await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`);
-    writeFileSync4(active.path, transitionStatus(readFileSync6(active.path, "utf8"), "done", nowIso()));
+    writeFileSync6(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "done", nowIso()));
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
       title: "plan done",
@@ -15075,31 +15789,31 @@ var planDiscardTool = tool({
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan to abandon in this workspace.");
-    writeFileSync4(active.path, transitionStatus(readFileSync6(active.path, "utf8"), "abandoned", nowIso()));
+    writeFileSync6(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "abandoned", nowIso()));
     state.planPath = undefined;
     context.metadata({ title: `Plan abandoned: ${active.doc.goal}` });
     return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` };
   }
 });
 function goalDirOf(worktree) {
-  return join4(worktree, ".opencode", "goal");
+  return join5(worktree, ".opencode", "goal");
 }
 function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync6(join4(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join5(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
   if (state.goalPath && existsSync3(state.goalPath)) {
-    const doc2 = parseGoalLoose(readFileSync6(state.goalPath, "utf8"));
+    const doc2 = parseGoalLoose(readFileSync8(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
   }
   const live = rankLiveGoals(readGoalDir(state.worktree))[0];
   if (live) {
-    const path = join4(goalDirOf(state.worktree), live.name);
+    const path = join5(goalDirOf(state.worktree), live.name);
     state.goalPath = path;
     return { path, doc: live.doc };
   }
@@ -15196,9 +15910,9 @@ var goalWriteTool = tool({
       await gate(context.ask, "goal_write", `Arm goal: ${args.goal}`);
     }
     const dir = goalDirOf(state.worktree);
-    mkdirSync4(dir, { recursive: true });
+    mkdirSync6(dir, { recursive: true });
     const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md")));
-    const path = join4(dir, name);
+    const path = join5(dir, name);
     const text = renderGoal(input, {
       now,
       status: arm ? "active" : "queued",
@@ -15238,7 +15952,7 @@ var goalCheckTool = tool({
       o.index = selected[i].n;
     });
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = appendCheckLog(readFileSync6(goal.path, "utf8"), runId, outcomes, nowIso());
+    const next = appendCheckLog(readFileSync8(goal.path, "utf8"), runId, outcomes, nowIso());
     atomicWrite(goal.path, next);
     const ok = outcomesAllOk(outcomes);
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
@@ -15272,7 +15986,7 @@ var goalCompleteTool = tool({
     const failures = outcomes.filter((o) => !o.ok);
     if (failures.length > 0) {
       const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-      atomicWrite(goal.path, appendCheckLog(readFileSync6(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      atomicWrite(goal.path, appendCheckLog(readFileSync8(goal.path, "utf8"), runId2, outcomes, nowIso()));
       throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
 ${formatOutcomes(failures)}
 Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
@@ -15285,7 +15999,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
     }
     await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    let text = appendCheckLog(readFileSync6(goal.path, "utf8"), runId, outcomes, nowIso());
+    let text = appendCheckLog(readFileSync8(goal.path, "utf8"), runId, outcomes, nowIso());
     text = transitionGoal(text, "completed", nowIso());
     atomicWrite(goal.path, text);
     context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
@@ -15307,7 +16021,7 @@ var goalPauseTool = tool({
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
     }
     const stopReason = args.blocker ? "blocker" : "user";
-    atomicWrite(goal.path, transitionGoal(readFileSync6(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
+    atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` });
     return {
@@ -15327,7 +16041,7 @@ var goalResumeTool = tool({
     if (!goal || goal.doc.status === "queued") {
       const oldest = rankQueuedGoals(readGoalDir(state.worktree))[0];
       if (oldest) {
-        const path = join4(goalDirOf(state.worktree), oldest.name);
+        const path = join5(goalDirOf(state.worktree), oldest.name);
         state.goalPath = path;
         goal = { path, doc: oldest.doc };
       }
@@ -15337,7 +16051,7 @@ var goalResumeTool = tool({
     }
     const promoting = goal.doc.status === "queued";
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
-    let text = readFileSync6(goal.path, "utf8");
+    let text = readFileSync8(goal.path, "utf8");
     if (args.addTurns)
       text = bumpBudget(text, args.addTurns, nowIso());
     text = transitionGoal(text, "active", nowIso(), { session: context.sessionID });
@@ -15363,7 +16077,7 @@ var goalDiscardTool = tool({
     if (!goal)
       throw new GoalError("No goal to discard in this workspace.");
     await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
-    atomicWrite(goal.path, transitionGoal(readFileSync6(goal.path, "utf8"), "abandoned", nowIso()));
+    atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "abandoned", nowIso()));
     state.goalPath = undefined;
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
@@ -15410,7 +16124,7 @@ var forgeShellTool = tool({
       }
     }
     const { registry: registry2, fence } = ensureJobLifecycle();
-    const cwd = args.workdir ? isAbsolute(args.workdir) ? args.workdir : join4(state.worktree, args.workdir) : state.worktree;
+    const cwd = args.workdir ? isAbsolute(args.workdir) ? args.workdir : join5(state.worktree, args.workdir) : state.worktree;
     const started = startJob(jobManager, {
       cmd: args.command,
       cwd,
@@ -15556,8 +16270,53 @@ ${p.newOutput || "(none in this window)"}`,
     jobManager.handoff(args.jobId, target);
     return {
       title: `${job.id} handed off`,
-      output: `[forge:job] ${job.id} promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`
+      output: `[forge:job] ${job.id}: promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`
     };
+  }
+});
+var forgeDispatchTool = tool({
+  description: "Dispatch a scoped task to a worker subagent running on a dynamically selected model and reasoning depth. Takes {prompt, profile, depth}: profile is a dispatch tier (scout=readonly recon, build=implementation, review=readonly review, quick=mechanical small change); depth is a reasoning level and must EXACTLY match one of the levels exposed for the resolved model — the vocabulary is listed below and in errors; there is no clamping, a mis-set depth is an error. Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
+  args: {
+    prompt: tool.schema.string().describe("Complete, self-contained task for the worker (it cannot see this conversation)"),
+    profile: tool.schema.string().describe("Dispatch tier: scout | build | review | quick (or a user-defined tier id)"),
+    depth: tool.schema.string().optional().describe("Reasoning depth, verbatim from the exposed vocabulary; omit to use the tier's default when it has one")
+  },
+  execute: async (args, context) => {
+    const state = stateForBan(context.sessionID);
+    const active = state ? resolveActivePlan(state) : null;
+    if (active && active.doc.status === "draft") {
+      throw new Error("[forge] A plan is in draft; dispatching workers is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.");
+    }
+    if (!args.prompt?.trim())
+      throw new Error("forge_dispatch requires a non-empty prompt.");
+    const engine = activeDispatchEngine;
+    if (!engine)
+      throw new Error("[forge] dispatch engine unavailable (disabled by dispatch.disable, or config still loading).");
+    try {
+      const r = await engine.dispatch({ prompt: args.prompt, profile: args.profile, ...args.depth !== undefined ? { depth: args.depth } : {} }, context.sessionID);
+      const tok = r.tokens;
+      const costLine = r.costUsd !== null && r.costUsd !== undefined ? `$${r.costUsd.toFixed(6)}${r.priceSnapshot ? ` (${r.priceSnapshot})` : ""}` : `unpriced${r.costNote ? ` — ${r.costNote}` : ""}`;
+      context.metadata({ title: `dispatch ${r.tier}: ${r.actual.model} @ ${r.actual.depth}` });
+      return {
+        title: `dispatch ${r.tier} → ${r.actual.model} @${r.actual.depth}`,
+        output: [
+          `[forge:dispatch] completed in ${r.durationMs}ms`,
+          `tier: ${r.tier}   model: ${r.actual.model}   depth: ${r.actual.depth}${r.requested.depth !== undefined && r.requested.depth !== r.actual.depth ? ` (requested ${r.requested.depth})` : ""}`,
+          `session: ${r.sessionID}`,
+          `tokens: input ${tok.input ?? 0}, output ${tok.output ?? 0}, reasoning ${tok.reasoning ?? 0}, cache r/w ${tok.cache?.read ?? 0}/${tok.cache?.write ?? 0}`,
+          `cost: ${costLine}`,
+          `depth injected: ${r.depthInjected}`,
+          "",
+          "Worker report:",
+          r.text || "(empty worker report)"
+        ].join(`
+`)
+      };
+    } catch (err) {
+      if (err instanceof DispatchError)
+        throw new Error(`[forge:dispatch:${err.code}] ${err.message}`);
+      throw err;
+    }
   }
 });
 function forgeTools() {
@@ -15577,6 +16336,9 @@ function forgeTools() {
   if (jobStage() < 2) {
     tools.forge_shell = forgeShellTool;
     tools.forge_jobs = forgeJobsTool;
+  }
+  if (!dispatchDisabled && !forgeDisabled) {
+    tools.forge_dispatch = forgeDispatchTool;
   }
   return tools;
 }
@@ -15601,7 +16363,7 @@ var pendingContinuationTurn = new Set;
 function goalProbe(line) {
   if (process.env.FORGE_GOAL_PROBE) {
     try {
-      appendFileSync(join4(tmpdir2(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
+      appendFileSync(join5(tmpdir3(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
 `);
     } catch {}
   }
@@ -15647,7 +16409,7 @@ function wrapupBriefText(goal, reason) {
 }
 async function autoPauseGoal(client, state, goal, reason, wrapup) {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
-  atomicWrite(goal.path, transitionGoal(readFileSync6(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
   engineForgetSession(state.sessionID);
   if (wrapup && goal.doc.session) {
     try {
@@ -15696,9 +16458,9 @@ async function continueIfEligible(client, sessionID) {
       const ledgerPath = state.goalPath;
       if (ledgerPath && existsSync3(ledgerPath)) {
         try {
-          const fresh = parseGoalLoose(readFileSync6(ledgerPath, "utf8"));
+          const fresh = parseGoalLoose(readFileSync8(ledgerPath, "utf8"));
           if (fresh && fresh.turnsUsed > 0) {
-            atomicWrite(ledgerPath, appendLedger(readFileSync6(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+            atomicWrite(ledgerPath, appendLedger(readFileSync8(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
           }
         } catch (err) {
           goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
@@ -15759,7 +16521,7 @@ async function continueIfEligible(client, sessionID) {
       pendingContinuationTurn.add(sessionID);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
       state.goalPath = goal.path;
-      atomicWrite(goal.path, incTurns(readFileSync6(goal.path, "utf8"), nowIso()));
+      atomicWrite(goal.path, incTurns(readFileSync8(goal.path, "utf8"), nowIso()));
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
       const n = (transportFails.get(sessionID) ?? 0) + 1;
@@ -15807,14 +16569,26 @@ var server = async (input, options) => {
   if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
     wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`);
   }
-  const watchdogLedger = createFileLedger(join4(watchdogLogDir(), "log.jsonl"));
+  const dpOpts = options?.dispatch;
+  dispatchDisabled = dpOpts?.disable === true;
+  if (Number.isInteger(dpOpts?.maxConcurrent) && dpOpts.maxConcurrent >= 1 && dpOpts.maxConcurrent <= 16) {
+    dispatchMaxConcurrent = dpOpts.maxConcurrent;
+  } else if (dpOpts?.maxConcurrent !== undefined) {
+    dispatchMaxConcurrent = 4;
+  }
+  if (Number.isInteger(dpOpts?.timeoutMs) && dpOpts.timeoutMs >= 1000 && dpOpts.timeoutMs <= 600000) {
+    dispatchTimeoutMs = dpOpts.timeoutMs;
+  } else if (dpOpts?.timeoutMs !== undefined) {
+    dispatchTimeoutMs = 600000;
+  }
+  const watchdogLedger = createFileLedger(join5(watchdogLogDir(), "log.jsonl"));
   const rawLocator = createLocator();
   const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1";
   const probeLine = (text) => {
     if (!probing())
       return;
     try {
-      appendFileSync(join4(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
+      appendFileSync(join5(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
 `);
     } catch {}
   };
@@ -15862,6 +16636,7 @@ var server = async (input, options) => {
       exitCleanup?.trigger("dispose");
       jobManager.disposeAll();
       watchdog.dispose();
+      activeDispatchEngine?.dispose();
       sessions.clear();
     },
     config: async (cfg) => {
@@ -15905,6 +16680,48 @@ var server = async (input, options) => {
         if (permSection[gateKey] !== "deny")
           permSection[gateKey] = "ask";
       }
+      if (!dispatchDisabled) {
+        const snapshot = process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1" ? { catalog: { providers: {} }, degraded: true, source: "test-off" } : await loadModelsDevSnapshot();
+        const dispatchOpts = options?.dispatch ?? {};
+        const built = buildDispatchConfig({
+          configuredIdentities: configuredIdentitiesOf(cfg, snapshot.catalog),
+          catalog: snapshot.catalog,
+          userRoster: dispatchOpts.roster ?? [],
+          userTiers: dispatchOpts.tiers
+        });
+        dispatchBase = { cfg: built, catalog: snapshot.catalog, findings: built.findings, degraded: snapshot.degraded };
+        for (const finding of built.findings) {
+          dispatchLedger.append({ ts: new Date().toISOString(), event: "validation", level: finding.level, code: finding.code, note: finding.message });
+        }
+        if (snapshot.degraded) {
+          dispatchLedger.append({ ts: new Date().toISOString(), event: "models-dev-degraded", note: "models.dev snapshot unavailable — cost reporting degrades to null" });
+        }
+        for (const [tierId, tier] of Object.entries(built.tiers)) {
+          const id = `forge-${tierId}`;
+          if (agentSection[id] !== undefined)
+            continue;
+          agentSection[id] = tierAgentDef(tierId, tier);
+        }
+        const roster = built;
+        activeDispatchEngine?.dispose();
+        activeDispatchEngine = createDispatchEngine({
+          serverUrl: String(input.serverUrl ?? "").replace(/\/$/, ""),
+          workspace: hostWorktree,
+          fetcher: globalThis.fetch,
+          now: Date.now,
+          sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
+          cfg: roster,
+          catalog: snapshot.catalog,
+          available: (identity) => {
+            return roster.roster.some((e) => e.model === identity);
+          },
+          sink: (entry) => dispatchLedger.append(entry),
+          onDepth: queueDispatchDepth,
+          providerFamily: dispatchProviderFamily,
+          maxConcurrent: dispatchMaxConcurrent,
+          timeoutMs: dispatchTimeoutMs
+        });
+      }
     },
     get tool() {
       return forgeDisabled ? {} : forgeTools();
@@ -15912,7 +16729,7 @@ var server = async (input, options) => {
     "tool.execute.before": async (input2, output) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join4(tmpdir2(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
+          appendFileSync(join5(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
 `);
         } catch {}
       }
@@ -15922,7 +16739,7 @@ var server = async (input, options) => {
         watchdog.track(input2.callID, input2.sessionID, input2.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync(join4(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
+            appendFileSync(join5(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
 `);
           } catch {}
         }
@@ -15934,6 +16751,28 @@ var server = async (input, options) => {
           throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Present the plan summary and call plan_approve for user approval, or /plan discard to abandon it.`);
         }
       }
+      if (input2.tool === "forge_dispatch") {
+        const state = stateForBan(input2.sessionID);
+        const active = state ? resolveActivePlan(state) : null;
+        if (active && active.doc.status === "draft") {
+          throw new Error("[forge] A plan is in draft; dispatching workers is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.");
+        }
+      }
+    },
+    "chat.params": async (input2, output) => {
+      const entry = dispatchDepths.get(input2.sessionID);
+      if (!entry || entry.family === "unknown")
+        return;
+      applyDepthToOptions(output.options ?? (output.options = {}), entry.level, entry.family);
+    },
+    __forgeDispatchTest: {
+      queueDepth: queueDispatchDepth,
+      depthState: (sessionID) => dispatchDepths.get(sessionID) ?? null,
+      composePrompt: composeWorkerPrompt,
+      setEngine: (engine) => {
+        activeDispatchEngine?.dispose();
+        activeDispatchEngine = engine;
+      }
     },
     "permission.ask": async (input2, output) => {
       const meta = input2.metadata ?? {};
@@ -15941,7 +16780,7 @@ var server = async (input, options) => {
       const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join4(tmpdir2(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
+          appendFileSync(join5(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
 `);
         } catch {}
       }
@@ -15990,7 +16829,7 @@ var server = async (input, options) => {
       watchdog.markSeen(input2.callID);
       if (process.env.FORGE_WATCHDOG_PROBE) {
         try {
-          appendFileSync(join4(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
+          appendFileSync(join5(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
 `);
         } catch {}
       }
@@ -16000,7 +16839,7 @@ var server = async (input, options) => {
         watchdog.untrack(input2.callID);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync(join4(tmpdir2(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
+            appendFileSync(join5(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
 `);
           } catch {}
         }

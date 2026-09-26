@@ -11,7 +11,10 @@ import { loadModelsDevSnapshot, reduceModelsDev } from "../src/models-dev.ts"
 const SAMPLE = {
   "zai-coding-plan": {
     models: {
-      "glm-5.3": { reasoning_options: ["low", "high", "max"], cost: { input: 0.6, output: 2.2, cache_read: 0.11 } },
+      // real models.dev shape: reasoning_options is a STRUCTURED array
+      "glm-5.3": { reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }], cost: { input: 0.6, output: 2.2, cache_read: 0.11 } },
+      "glm-4.7": { reasoning_options: [{ type: "toggle" }] },
+      "claude-x": { reasoning_options: [{ type: "budget_tokens", min: 1024 }] },
       weird: { cost: "not-an-object" },
     },
   },
@@ -19,8 +22,11 @@ const SAMPLE = {
 
 test("reduceModelsDev keeps reasoning_options + cost, skips malformed entries", () => {
   const c = reduceModelsDev(SAMPLE)
-  assert.deepEqual(c.providers["zai-coding-plan"].models["glm-5.3"].reasoningOptions, ["low", "high", "max"])
-  assert.equal(c.providers["zai-coding-plan"].models["glm-5.3"].cost.input, 0.6)
+  const glm = c.providers["zai-coding-plan"].models["glm-5.3"]
+  assert.deepEqual(glm.reasoningOptions, ["low", "high", "max"], "effort values are the named ladder")
+  assert.deepEqual(c.providers["zai-coding-plan"].models["glm-4.7"].reasoningOptions, [], "toggle models have no named levels")
+  assert.deepEqual(c.providers["zai-coding-plan"].models["claude-x"].reasoningOptions, [], "budget-only models have no named levels")
+  assert.equal(glm.cost.input, 0.6)
   assert.ok(c.providers["zai-coding-plan"].models.weird, "model kept even with a malformed cost")
   assert.equal(reduceModelsDev(null).providers && Object.keys(reduceModelsDev(null).providers).length, 0)
 })

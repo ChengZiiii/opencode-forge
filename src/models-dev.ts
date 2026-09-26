@@ -26,6 +26,23 @@ export function modelsDevCacheDir(base?: string): string {
 
 type FetchLike = (url: string, init?: { signal?: AbortSignal }) => Promise<{ ok: boolean; status?: number; text(): Promise<string> }>
 
+// models.dev reasoning_options is a STRUCTURED array, e.g.
+//   [{type:"effort", values:["low","high","max"]}]   — named effort ladder
+//   [{type:"toggle"}]                                — on/off, no named levels
+//   [{type:"budget_tokens", min|max}]                — budget range, no names
+// The named ladder is the union of effort "values"; toggle/budget models
+// reduce to [] (no cataloged names — expose must be user-curated).
+function namedLevels(rows: unknown[]): string[] {
+  const out: string[] = []
+  for (const r of rows) {
+    if (r && typeof r === "object" && (r as { type?: unknown }).type === "effort") {
+      const values = (r as { values?: unknown }).values
+      if (Array.isArray(values)) for (const v of values) if (typeof v === "string") out.push(v)
+    }
+  }
+  return out
+}
+
 // Shape reducer: models.dev api.json -> the minimal catalog slice. Never
 // throws on unexpected model shapes — a malformed entry is skipped.
 export function reduceModelsDev(raw: unknown): CatalogSnapshot {
@@ -38,7 +55,7 @@ export function reduceModelsDev(raw: unknown): CatalogSnapshot {
     const out: CatalogSnapshot["providers"][string] = { models: {} }
     for (const [modelID, model] of Object.entries(models as Record<string, unknown>)) {
       const m = model as { reasoning_options?: unknown; cost?: Record<string, unknown> }
-      const options = Array.isArray(m.reasoning_options) ? m.reasoning_options.filter((o): o is string => typeof o === "string") : undefined
+      const options = Array.isArray(m.reasoning_options) ? namedLevels(m.reasoning_options) : undefined
       const cost = m.cost && typeof m.cost === "object" ? m.cost : undefined
       out.models[modelID] = {
         ...(options ? { reasoningOptions: options } : {}),
