@@ -15441,7 +15441,7 @@ var forgeShellTool = tool({
     if (args.run_in_background === true) {
       return {
         title: `job started: ${started.job.id}`,
-        output: [`[forge:job] Started in background.`, `jobId: ${started.job.id}`, `logPath: ${started.job.logPath}`, "Track with forge_jobs poll; a [forge:job-complete] message arrives on exit."].join(`
+        output: [`[forge:job] Started in background.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `logPath: ${started.job.logPath}`, "Track with forge_jobs poll; a [forge:job-complete] message arrives on exit."].join(`
 `)
       };
     }
@@ -15451,6 +15451,7 @@ var forgeShellTool = tool({
         title: `exit ${r.exitCode ?? "?"}`,
         output: [
           `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
+          `cwd: ${cwd}`,
           ...r.spawnError ? [`spawn error: ${r.spawnError}`] : [],
           `output:
 ${r.outputTail || "(none)"}`
@@ -15463,6 +15464,7 @@ ${r.outputTail || "(none)"}`
         title: `success: ${r.matched}`,
         output: [
           `[forge:job] Success pattern matched: "${r.matched}".`,
+          `cwd: ${cwd}`,
           r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : "The process tree was terminated (keep_alive=false).",
           `output:
 ${r.outputTail}`
@@ -15474,6 +15476,7 @@ ${r.outputTail}`
       title: `still running (${Math.round(r.idleForMs / 1000)}s idle)`,
       output: [
         `[forge:job] Still running — ${Math.round(r.idleForMs / 1000)}s without new output (or the wait budget ran out). The process is alive as job ${started.job.id}.`,
+        `cwd: ${cwd}`,
         `logPath: ${started.job.logPath}`,
         `recent output:
 ${r.outputTail || "(none yet)"}`,

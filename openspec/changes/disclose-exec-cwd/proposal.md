@@ -32,3 +32,7 @@ succeeded / still-running / 后台句柄）只带 jobId、logPath 与输出尾�
 - 范围：`plugin.ts` 的 forgeShellTool execute 各返回点（cwd 变量已在函数
   内解析完成，直接带入返回）；单测断言四种返回形态均含 cwd 行。
 - 版本：0.3.2（补丁号）。
+
+## Capabilities
+
+- job-supervisor (MODIFIED)

@@ -229,6 +229,9 @@ the stdio-EOF bug):
 `run_in_background: true` skips all waiting and returns
 `{jobId, logPath}` immediately. Every run pops one permission dialog
 (`permission.forge_shell = "ask"`; an explicit `deny` in your config wins).
+Every result form carries `cwd:` — the absolute directory the command
+actually ran in. When the agent's narrative about the working directory
+disagrees with that line, the line wins.
 
 **`forge_jobs`** manages the registry: `list` / `poll {jobId, waitMs≤30s}`
 (bounded wait for new output or exit, drains it) / `log {jobId, offset?,
