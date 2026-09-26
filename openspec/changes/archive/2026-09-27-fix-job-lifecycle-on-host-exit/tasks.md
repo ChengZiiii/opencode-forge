@@ -33,4 +33,4 @@
 
 - [x] 6.1 全量回归：`node --test --test-timeout=20000 tests/*.test.mjs` + `tsc --noEmit` + bundle；wake/审批/stage 矩阵不回归；验证：全绿输出
 - [x] 6.2 实机冒烟（真实 opencode + 真驱动姿态同 7.x）：自然提示词起服务 → 宿主退出 → 端口死、无残留；survive 流程一轮；验证：实机记录
-- [ ] 6.3 发布车 0.3.1：pack 检查（同 forge 8.1 口径）→ 浏览器密钥 npm 发布 → npm spec 安装终验 + 冒烟（最终态 npm plugin 模式）；验证：forge 8.2 同款闭环
+- [x] 6.3 发布车 0.3.1：pack 检查 → npm 发布（偏差记录：浏览器密钥通道不可用，改用户提供的 granular token CLI 发布，token 用后即删）→ npm spec 安装终验 + 冒烟（registry 0.3.1 缓存拉取、宿主退出杀净 PASS）
