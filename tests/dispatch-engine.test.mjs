@@ -695,3 +695,164 @@ test("4.2 no-native-mapping on the agents path errors before spawn", async () =>
   )
   assert.equal(fetcher.calls.length, 0)
 })
+
+// ---------------------------------------------------------------------------
+// fix-dispatch-transport-timeout — transport interruption of the turn POST
+// (incident 2026-09-27): the POST is turn-synchronous, but the child session
+// is a host-side object. A transport-level rejection (fetch abort / network
+// failure — NOT an HTTP error response) must fall through to completion
+// polling under the same deadline; the child's real state decides the outcome.
+// ---------------------------------------------------------------------------
+
+const transportAbort = () => {
+  const e = new DOMException("The operation timed out.", "TimeoutError")
+  return Promise.reject(e)
+}
+
+test("TI-1: transport interruption of the turn POST recovers via polling (background)", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    {
+      match: new RegExp(`/session/${CHILD}/message$`),
+      handle: (u, init) => {
+        if (init?.method === "POST") return transportAbort()
+        return jsonRes([{ info: { role: "assistant", tokens: { input: 7, output: 3, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "recovered report" }] }])
+      },
+    },
+  ])
+  const sunk = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg, sink: (e) => sunk.push(e) }))
+  const handle = await engine.dispatch({ prompt: "review the repo", agent: "quick", depth: "low" }, "ses_parent", { background: true })
+  await settle()
+  const entry = reg.get(handle.dispatchId)
+  assert.equal(entry.state, "completed", `expected completed, got ${entry.state}: ${JSON.stringify(entry.result)}`)
+  assert.equal(entry.result.text, "recovered report")
+  assert.equal(entry.result.sessionID, CHILD)
+  const ti = sunk.find((e) => e.event === "transport-interrupted")
+  assert.ok(ti, "transport-interrupted must be ledgered")
+  assert.equal(ti.sessionID, CHILD)
+  assert.equal(ti.dispatchId, handle.dispatchId)
+  assert.equal(ti.parentSessionID, "ses_parent")
+  assert.match(String(ti.note), /timed out/)
+  assert.ok(sunk.some((e) => e.event === "completed"), "recovery ends in the normal completed event")
+  // recovery NEVER re-POSTs the message (the prompt may already be delivering)
+  assert.equal(fetcher.calls.filter((c) => c.init?.method === "POST" && c.url.endsWith("/message")).length, 1)
+})
+
+test("TI-2: undelivered message degrades to an honest timeout, not empty-response", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    {
+      match: new RegExp(`/session/${CHILD}/message$`),
+      handle: (u, init) => {
+        if (init?.method === "POST") return transportAbort()
+        return jsonRes([]) // the host never delivered the message: 0 assistant messages
+      },
+    },
+  ])
+  const sunk = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { tickMs: 10_000, timeoutMs: 30_000, cfg: CFG(), catalog: CATALOG, registry: reg, sink: (e) => sunk.push(e) }))
+  const handle = await engine.dispatch({ prompt: "x", agent: "quick", depth: "low" }, "ses_parent", { background: true })
+  await settle()
+  const entry = reg.get(handle.dispatchId)
+  assert.equal(entry.state, "timeout", `expected timeout, got ${entry.state}`)
+  assert.equal(entry.result.sessionID, CHILD, "the timeout report names the child session")
+  assert.match(String(entry.result.error), /left for the host to reclaim/)
+  assert.ok(sunk.some((e) => e.event === "timeout" && e.sessionID === CHILD))
+  assert.ok(!sunk.some((e) => e.event === "empty-response"), "an undelivered message must not be misreported as the keyless empty-response quirk")
+  assert.ok(sunk.some((e) => e.event === "transport-interrupted"))
+})
+
+test("TI-3: an HTTP error response is NOT recovered (agent path, no retry)", async () => {
+  const reg = createDispatchRegistry()
+  let creates = 0
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => { creates++; return jsonRes({ id: CHILD }) } },
+    {
+      match: new RegExp(`/session/${CHILD}/message$`),
+      handle: (u, init) => (init?.method === "POST" ? jsonRes({ boom: true }, 500) : jsonRes([])),
+    },
+  ])
+  const sunk = []
+  const engine = createDispatchEngine(agentsDeps(fetcher, { registry: reg, sink: (e) => sunk.push(e) }))
+  const handle = await engine.dispatch({ prompt: "x", agent: "research", depth: "low" }, "ses_parent", { background: true })
+  await settle()
+  const entry = reg.get(handle.dispatchId)
+  assert.equal(entry.state, "error")
+  assert.match(String(entry.result.error), /500/)
+  assert.ok(!sunk.some((e) => e.event === "transport-interrupted"), "HTTP-level refusals keep the existing host-error semantics")
+  assert.equal(creates, 1, "agents path never retries")
+  // TI-6 (ledger identity): the terminal error row is self-describing
+  const errRow = sunk.find((e) => e.event === "error")
+  assert.ok(errRow, "terminal error row exists")
+  assert.equal(errRow.dispatchId, handle.dispatchId)
+  assert.equal(errRow.parentSessionID, "ses_parent")
+  assert.equal(errRow.sessionID, CHILD)
+  assert.equal(typeof errRow.durationMs, "number")
+  assert.equal(entry.result.sessionID, CHILD, "the registry result carries the child sessionID, not \"\"")
+})
+
+test("TI-4: kill during recovery polling still lands (killed terminal, no wake)", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    {
+      match: new RegExp(`/session/${CHILD}/message$`),
+      handle: (u, init) => {
+        if (init?.method === "POST") return transportAbort()
+        return new Promise(() => {}) // hanging poll GET — kill must unwind it via the abort race
+      },
+    },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 3_000, pollIntervalMs: 10, cfg: CFG(), catalog: CATALOG, registry: reg }))
+  const handle = await engine.dispatch({ prompt: "x", agent: "quick", depth: "low" }, undefined, { background: true })
+  await new Promise((r) => setTimeout(r, 30))
+  engine.kill(handle.dispatchId)
+  for (let i = 0; i < 100 && reg.get(handle.dispatchId).state !== "killed"; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.equal(reg.get(handle.dispatchId).state, "killed")
+  assert.equal(reg.takeUndelivered().length, 0, "killed never wakes the parent")
+})
+
+test("TI-5: sync dispatch recovers identically (result returned, no throw)", async () => {
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    {
+      match: new RegExp(`/session/${CHILD}/message$`),
+      handle: (u, init) => {
+        if (init?.method === "POST") return transportAbort()
+        return jsonRes([{ info: { role: "assistant", tokens: { input: 4, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "sync recovered" }] }])
+      },
+    },
+  ])
+  const sunk = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { sink: (e) => sunk.push(e) }))
+  const r = await engine.dispatch({ prompt: "x", agent: "quick", depth: "low" })
+  assert.equal(r.text, "sync recovered")
+  assert.equal(r.sessionID, CHILD)
+  assert.ok(sunk.some((e) => e.event === "transport-interrupted"))
+  assert.ok(sunk.some((e) => e.event === "completed"))
+  assert.equal(fetcher.calls.filter((c) => c.init?.method === "POST" && c.url.endsWith("/message")).length, 1)
+})
+
+test("TI-6: empty-response terminal report carries the child sessionID (agents path)", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    {
+      match: new RegExp(`/session/${CHILD}/message$`),
+      handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [] }])),
+    },
+  ])
+  const sunk = []
+  const engine = createDispatchEngine(agentsDeps(fetcher, { registry: reg, sink: (e) => sunk.push(e) }))
+  const handle = await engine.dispatch({ prompt: "x", agent: "research", depth: "low" }, "ses_parent", { background: true })
+  await settle()
+  const entry = reg.get(handle.dispatchId)
+  assert.equal(entry.state, "error")
+  assert.equal(entry.result.sessionID, CHILD, "the incident's \"sessionID\": \"\" bug — terminal reports carry the child id")
+  const errRow = sunk.find((e) => e.event === "error")
+  assert.equal(errRow.sessionID, CHILD)
+  assert.equal(errRow.dispatchId, handle.dispatchId)
+})

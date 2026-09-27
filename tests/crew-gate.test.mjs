@@ -94,3 +94,15 @@ test("4.2: duplicate evidence across subtasks refuses (each dispatch one verdict
   assert.equal(r.ok, false)
   assert.ok(r.gaps.some((g) => g.includes("exactly one verdict")))
 })
+
+// fix-dispatch-transport-timeout: transport-interrupted is a non-outcome
+// event (recovery follows it; a terminal row lands separately) — it must
+// never demand a verdict or manufacture a gap.
+test("TI: a transport-interrupted row is not an outcome — no gap, no verdict required", () => {
+  const rows = [
+    row("bg-1", "transport-interrupted", "2026-09-27T00:00:30.000Z"),
+    row("bg-1", "completed", "2026-09-27T00:01:00.000Z"),
+  ]
+  const r = validateCrewReport([{ title: "a", verdict: "PASS", evidence: "bg-1" }], rows, CREW)
+  assert.equal(r.ok, true, JSON.stringify(r.gaps))
+})
