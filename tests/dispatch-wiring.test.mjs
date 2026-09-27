@@ -222,3 +222,143 @@ test("forge_dispatch result object passes through the engine report with a title
   assert.match(r.output, /worker concluded/)
   assert.match(r.output, /sessionID|ses_child/)
 })
+
+// ---------------------------------------------------------------------------
+// 3.3/3.4 waves wiring: background tool branch, list/kill tools, coalesced
+// completion wake briefs (single brief, exactly-once, parent-scoped).
+// ---------------------------------------------------------------------------
+import { DispatchError } from "../src/dispatch-engine.ts"
+
+const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms))
+
+const wakeInput = (calls) => ({
+  client: {
+    session: {
+      promptAsync: async (o) => calls.push({ kind: "promptAsync", o }),
+      prompt: async (o) => calls.push({ kind: "prompt", o }),
+      get: async () => undefined,
+      status: async () => ({}),
+    },
+  },
+  project: { id: "p" },
+  directory: worktree,
+  worktree,
+  serverUrl: new URL("http://127.0.0.1:1"),
+  $: () => {},
+})
+
+test("3.4: forge_dispatch background:true returns the handle; the engine gets background:true", async (t) => {
+  process.env.FORGE_DISPATCH_WAKE_DEBOUNCE_MS = "20"
+  const h = await server(wakeInput([]), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  let seenOpts
+  h.__forgeDispatchTest?.setEngine({
+    dispatch: async (req, parent, opts) => {
+      seenOpts = opts
+      return { dispatchId: "bg-77", tier: req.profile, requested: { profile: req.profile, depth: req.depth }, resolved: "zai/glm", depth: req.depth ?? "low", queuedAt: "2026-09-27T00:00:00.000Z" }
+    },
+    kill: () => {},
+    dispose: async () => {},
+  })
+  const r = await h.tool.forge_dispatch.execute({ prompt: "go", profile: "quick", depth: "low", background: true }, allowCtx("ses_bg"))
+  assert.deepEqual(seenOpts, { background: true }, "the background flag must reach the engine")
+  assert.match(r.output, /bg-77/)
+  assert.match(r.output, /queuedAt/)
+  assert.match(r.output, /forge_dispatch_list/, "the handle points at the tracking tool")
+  assert.match(h.tool.forge_dispatch.description, /opencode run/, "run-mode disclosure in the tool description")
+  assert.match(h.tool.forge_dispatch.description, /TUI/, "TUI targeting disclosed")
+})
+
+test("3.4: forge_dispatch_list lists in-flight and terminal entries from the registry", async (t) => {
+  const h = await server(wakeInput([]), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const reg = h.__forgeDispatchTest?.registry()
+  assert.ok(reg, "registry seam must exist after the config hook")
+  const tag = `lst-${Math.random().toString(36).slice(2, 7)}`
+  const a = reg.submit({ sessionID: `ses_${tag}_c1`, identity: "zai/glm", depth: "low", tier: "quick", parentSessionID: `ses_${tag}` })
+  reg.markRunning(a.dispatchId)
+  const b = reg.submit({ sessionID: `ses_${tag}_c2`, identity: "zai/glm", depth: "low", tier: "scout", parentSessionID: `ses_${tag}` })
+  reg.markCompleted(b.dispatchId, { text: `done-${tag}`, tokens: { input: 1 } })
+  const r = await h.tool.forge_dispatch_list.execute({}, allowCtx(`ses_${tag}`))
+  assert.match(r.output, new RegExp(a.dispatchId))
+  assert.match(r.output, new RegExp(b.dispatchId))
+  assert.match(r.output, new RegExp(`done-${tag}`), "terminal entries carry the full result object")
+  assert.match(r.output, /In flight/)
+})
+
+test("3.4: forge_dispatch_kill routes to the engine; failures surface with their code", async (t) => {
+  const h = await server(wakeInput([]), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const killed = []
+  h.__forgeDispatchTest?.setEngine({
+    dispatch: async () => { throw new Error("unused") },
+    kill: (id) => {
+      if (id === "bg-broken") throw new DispatchError("forge_dispatch_kill refused: dispatch bg-broken already completed; use forge_dispatch_list for its result.", "kill-failed")
+      killed.push(id)
+    },
+    dispose: async () => {},
+  })
+  const ok = await h.tool.forge_dispatch_kill.execute({ dispatchId: "bg-9" }, allowCtx("ses_kill"))
+  assert.match(ok.output, /bg-9.*killed/)
+  assert.deepEqual(killed, ["bg-9"])
+  await assert.rejects(
+    () => h.tool.forge_dispatch_kill.execute({ dispatchId: "bg-broken" }, allowCtx("ses_kill")),
+    (err) => {
+      assert.match(err.message, /forge:dispatch:kill-failed/)
+      assert.match(err.message, /already completed/)
+      return true
+    },
+  )
+})
+
+test("3.3: one idle yields ONE coalesced [forge:dispatch-complete] brief, exactly once", async (t) => {
+  process.env.FORGE_DISPATCH_WAKE_DEBOUNCE_MS = "20"
+  const calls = []
+  const h = await server(wakeInput(calls), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const reg = h.__forgeDispatchTest?.registry()
+  const tag = `wk-${Math.random().toString(36).slice(2, 7)}`
+  const parent = `ses_${tag}`
+  const a = reg.submit({ sessionID: `${parent}_c1`, identity: "zai/glm", depth: "low", tier: "quick", parentSessionID: parent })
+  reg.markRunning(a.dispatchId)
+  reg.markCompleted(a.dispatchId, { text: `report-${tag}`, costUsd: 0 })
+  const b = reg.submit({ sessionID: `${parent}_c2`, identity: "zai/glm", depth: "high", tier: "build", parentSessionID: parent })
+  reg.markTimeout(b.dispatchId, { error: `timed out-${tag}` })
+
+  await h.event({ event: { type: "session.idle", properties: { sessionID: parent } } })
+  await sleepMs(150)
+  const briefs = calls.filter((c) => JSON.stringify(c.o).includes("[forge:dispatch-complete]"))
+  assert.equal(briefs.length, 1, "exactly one brief for the idle")
+  const text = JSON.stringify(briefs[0].o)
+  assert.match(text, new RegExp(a.dispatchId))
+  assert.match(text, new RegExp(b.dispatchId))
+  assert.match(text, new RegExp(`report-${tag}`), "full result object rides the brief")
+  assert.match(text, new RegExp(`timed out-${tag}`), "timeout reports ride the brief too")
+
+  // a second idle must not re-deliver (exactly-once)
+  await h.event({ event: { type: "session.idle", properties: { sessionID: parent } } })
+  await sleepMs(120)
+  assert.equal(calls.filter((c) => JSON.stringify(c.o).includes("[forge:dispatch-complete]")).length, 1, "no re-delivery on the next idle")
+})
+
+test("3.3: another parent's terminals are never delivered on this session's idle", async (t) => {
+  process.env.FORGE_DISPATCH_WAKE_DEBOUNCE_MS = "20"
+  const calls = []
+  const h = await server(wakeInput(calls), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const reg = h.__forgeDispatchTest?.registry()
+  const tag = `sc-${Math.random().toString(36).slice(2, 7)}`
+  const e = reg.submit({ sessionID: `${tag}_c`, identity: "zai/glm", depth: "low", tier: "quick", parentSessionID: `ses_other_${tag}` })
+  reg.markCompleted(e.dispatchId, { text: "x" })
+
+  await h.event({ event: { type: "session.idle", properties: { sessionID: `ses_unrelated_${tag}` } } })
+  await sleepMs(120)
+  assert.equal(calls.filter((c) => JSON.stringify(c.o).includes("[forge:dispatch-complete]")).length, 0, "no cross-parent delivery")
+  // cleanup so later drains are not polluted
+  reg.takeUndelivered(`ses_other_${tag}`)
+})
