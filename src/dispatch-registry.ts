@@ -51,7 +51,7 @@ export function createDispatchRegistry() {
 
     get(dispatchId: string): RegistryEntry {
       const e = entries.get(dispatchId)
-      if (!e) fail(`unknown dispatch id "${dispatchId}"`)
+      if (!e) throw new Error(`[forge:dispatch-registry] unknown dispatch id "${dispatchId}"`)
       return e
     },
 
@@ -92,10 +92,13 @@ export function createDispatchRegistry() {
     },
 
     // Atomic exactly-once delivery drain for the wake engine: every terminal
-    // not yet delivered is returned and marked delivered in one step.
-    takeUndelivered(): RegistryEntry[] {
+    // not yet delivered is returned and marked delivered in one step. The
+    // optional parentSessionID scopes the drain to one parent session's wakes
+    // (another session's idle must not consume them).
+    takeUndelivered(parentSessionID?: string): RegistryEntry[] {
       const out: RegistryEntry[] = []
       for (const e of entries.values()) {
+        if (parentSessionID !== undefined && e.parentSessionID !== parentSessionID) continue
         if (isTerminal(e.state) && !e.delivered && e.state !== "killed") {
           e.delivered = true
           out.push(e)

@@ -10,6 +10,7 @@
 
 import { completionVerdict, computeCost, sumTokens, type PollState, type TokenCount } from "./dispatch-client.ts"
 import type { DispatchRegistry } from "./dispatch-registry.ts"
+import type { ResolveOk } from "./dispatch-resolver.ts"
 import { composeWorkerPrompt } from "./dispatch-prompt.ts"
 import { resolveDispatch } from "./dispatch-resolver.ts"
 import type { BuiltRoster, CatalogSnapshot } from "./dispatch-roster.ts"
@@ -72,6 +73,9 @@ export type DispatchEngineDeps = {
   // injection table); providerFamily resolves the option shape for disclosure.
   onDepth: (sessionID: string, level: string, providerID: string) => void
   registry?: DispatchRegistry
+  // Wake-engine hook: fired after a background dispatch reaches any
+  // deliverable terminal state (killed never fires — its wake is suppressed).
+  onTerminal?: (parentSessionID: string) => void
   providerFamily: (providerID: string) => string | null
   maxConcurrent?: number
   timeoutMs?: number
@@ -126,7 +130,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
   type KillControl = { fired: boolean; promise: Promise<void>; fire: () => void }
   const killControls = new Map<string, KillControl>()
 
-  const resolveOrThrow = (profile: string, depth: string | null | undefined, exclude: string[] | undefined): { identity: string; depth: string | null } => {
+  const resolveOrThrow = (profile: string, depth: string | undefined, exclude: string[] | undefined): ResolveOk => {
     const r = resolveDispatch(deps.cfg, { profile, depth, exclude }, deps.available, deps.catalog)
     if (!r.ok) {
       deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: profile, outcome: r.error.code, note: r.error.message })
@@ -140,7 +144,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
   // the CALLER owns slot accounting, retries, and (for background) registry
   // terminal mapping. The per-dispatch deadline t0 is shared across attempts.
   async function runAttempt(
-    r: { identity: string; depth: string | null },
+    r: ResolveOk,
     req: DispatchRequest,
     parentSessionID: string | undefined,
     t0: number,
@@ -306,10 +310,12 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     if (e instanceof DispatchError && e.code === "timeout") {
       report.outcome = "timeout"
       reg.markTimeout(dispatchId, report)
+      deps.onTerminal?.(reg.get(dispatchId).parentSessionID)
       return
     }
     deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.profile, identity, outcome: "error", note: report.error })
     reg.markError(dispatchId, report)
+    deps.onTerminal?.(reg.get(dispatchId).parentSessionID)
   }
 
   async function dispatch(req: DispatchRequest, parentSessionID?: string, opts?: { background?: boolean }): Promise<DispatchResult | DispatchHandle> {
@@ -330,7 +336,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
 
     // Eager resolution for BOTH paths: menu/pin errors surface synchronously
     // before anything is spawned.
-    const first: { identity: string; depth: string | null } = resolveOrThrow(req.profile, req.depth, undefined)
+    const first: ResolveOk = resolveOrThrow(req.profile, req.depth, undefined)
 
     if (bg) {
       const reg = deps.registry!
@@ -363,6 +369,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
                 deps.sink({ ts: new Date().toISOString(), event: "kill-late-completion", tier: req.profile, identity: identity.identity, sessionID: result.sessionID, outcome: "kill-late-completion" })
               } else {
                 reg.markCompleted(dispatchId, result)
+                deps.onTerminal?.(reg.get(dispatchId).parentSessionID)
               }
               return
             } catch (e) {
@@ -400,7 +407,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     // Sync path: bounded one-retry loop (spec B11); deadline t0 spans attempts.
     let exclude: string[] | undefined = undefined
     for (let attemptNo = 0; ; attemptNo++) {
-      const r: { identity: string; depth: string | null } = attemptNo === 0 ? first : resolveOrThrow(req.profile, req.depth, exclude)
+      const r: ResolveOk = attemptNo === 0 ? first : resolveOrThrow(req.profile, req.depth, exclude)
       const slot = `d${++seq}`
       inFlight.add(slot)
       try {

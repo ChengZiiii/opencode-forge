@@ -76,6 +76,7 @@ import {
 } from "./src/dispatch-roster.ts"
 import { createDispatchEngine, DispatchError, type DispatchEngine } from "./src/dispatch-engine.ts"
 import { createDispatchLedger } from "./src/dispatch-ledger.ts"
+import { createDispatchRegistry, type DispatchRegistry, type RegistryEntry } from "./src/dispatch-registry.ts"
 import { composeWorkerPrompt } from "./src/dispatch-prompt.ts"
 import { tierAgentDef } from "./src/dispatch-tiers.ts"
 import { loadModelsDevSnapshot } from "./src/models-dev.ts"
@@ -199,6 +200,14 @@ let dispatchBase: { cfg: BuiltRoster; catalog: CatalogSnapshot; findings: Valida
 let activeDispatchEngine: DispatchEngine | null = null
 const dispatchLogDir = join(tmpdir(), "opencode-forge", "dispatch")
 const dispatchLedger = createDispatchLedger(join(dispatchLogDir, "ledger.jsonl"))
+// Background dispatch registry (3.1/3.3): owned by the plugin, shared with
+// the engine; survives engine recreation across config reloads.
+let activeDispatchRegistry: DispatchRegistry | null = null
+// Captured in server(): the wake engine injects briefs through it.
+let dispatchClient: { session: { promptAsync?: (opts: unknown) => Promise<unknown>; prompt?: (opts: unknown) => Promise<unknown>; get?: (opts: unknown) => Promise<unknown>; status?: (opts: unknown) => Promise<unknown> } } | null = null
+// Per-parent debounce timers for completion briefs (D11: a burst of
+// completions yields ONE brief).
+const dispatchWakeTimers = new Map<string, ReturnType<typeof setTimeout>>()
 
 // sessionID -> { level, family }: the chat.params injection table. "frozen"
 // means the level never changes after first registration (D2 stability).
@@ -1190,6 +1199,68 @@ const forgeJobsTool = tool({
   },
 })
 
+
+// ---------------------------------------------------------------------------
+// Completion wake engine (3.3, design D11): background dispatch terminals are
+// delivered to the parent session as ONE coalesced [forge:dispatch-complete]
+// brief, debounced, never interrupting an active turn (idle-only), each
+// terminal delivered exactly once (registry takeUndelivered), and coalesced
+// with the goal continuation brief when both target the same idle (dispatch
+// results first, goal brief after).
+// ---------------------------------------------------------------------------
+
+function dispatchWakeDelay(idleDriven: boolean): number {
+  const env = Number(process.env.FORGE_DISPATCH_WAKE_DEBOUNCE_MS)
+  if (Number.isFinite(env) && env >= 0) return env
+  // Idle-driven wakes fire just after the goal continuation timer (same idle
+  // deadline, registration order makes the goal timer win): if the goal brief
+  // went out it drains the registry first and this becomes a no-op — one
+  // re-prompt per idle, never two.
+  return idleDriven ? IDLE_DEBOUNCE_MS + 50 : 1500
+}
+
+function scheduleDispatchWake(sessionID: string, idleDriven: boolean): void {
+  if (dispatchDisabled || forgeDisabled) return
+  if (dispatchWakeTimers.has(sessionID)) return // already scheduled: coalesce
+  const t = setTimeout(() => {
+    dispatchWakeTimers.delete(sessionID)
+    void injectDispatchBrief(sessionID)
+  }, dispatchWakeDelay(idleDriven))
+  dispatchWakeTimers.set(sessionID, t)
+}
+
+function dispatchBriefText(entries: RegistryEntry[]): string {
+  const lines = [`[forge:dispatch-complete] ${entries.length} background dispatch(es) reached terminal state:`]
+  for (const e of entries) {
+    lines.push(
+      "",
+      `- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not yet started)"}`,
+    )
+    const r = e.result as Record<string, unknown> | undefined
+    if (r !== undefined) {
+      lines.push(`  result: ${JSON.stringify(r, null, 1).replace(/\n/g, "\n").slice(0, 2000)}`)
+    }
+  }
+  return lines.join("\n")
+}
+
+async function injectDispatchBrief(sessionID: string): Promise<void> {
+  const reg = activeDispatchRegistry
+  if (!reg) return
+  const entries = reg.takeUndelivered(sessionID)
+  if (entries.length === 0) return
+  const c = dispatchClient
+  const send = c?.session.promptAsync ?? c?.session.prompt
+  if (typeof send !== "function") return
+  try {
+    await send.call(c!.session, { path: { id: sessionID }, body: { parts: [{ type: "text", text: dispatchBriefText(entries) }] } })
+  } catch {
+    // Transport failed: roll the delivery marker back so the next idle
+    // retries — a terminal dispatch must never be silently dropped.
+    for (const e of entries) e.delivered = false
+  }
+}
+
 // forge_dispatch: scoped worker dispatch on a dynamically chosen model +
 // reasoning depth (spec: dispatch — forge_dispatch tool contract). The engine
 // (create -> message -> poll -> aggregate) lives in src/dispatch-engine.ts;
@@ -1202,6 +1273,9 @@ const forgeDispatchTool = tool({
     prompt: tool.schema.string().describe("Complete, self-contained task for the worker (it cannot see this conversation)"),
     profile: tool.schema.string().describe("Dispatch tier: scout | build | review | quick (or a user-defined tier id)"),
     depth: tool.schema.string().optional().describe("Reasoning depth, verbatim from the exposed vocabulary; omit to use the tier's default when it has one"),
+    background: tool.schema.boolean().optional().describe(
+      "Run in the background: returns {dispatchId, resolved, queuedAt} immediately; the full result arrives later as a coalesced [forge:dispatch-complete] brief when the session is idle. Background mode targets live TUI sessions — under `opencode run` the session ends before any brief, so completions are ledger-only (read them via forge_dispatch_list) and sync mode is preferred.",
+    ),
   },
   execute: async (args, context) => {
     const state = stateForBan(context.sessionID)
@@ -1215,7 +1289,21 @@ const forgeDispatchTool = tool({
     const engine = activeDispatchEngine
     if (!engine) throw new Error("[forge] dispatch engine unavailable (disabled by dispatch.disable, or config still loading).")
     try {
-      const r = await engine.dispatch({ prompt: args.prompt, profile: args.profile, ...(args.depth !== undefined ? { depth: args.depth } : {}) }, context.sessionID)
+      const r = await engine.dispatch({ prompt: args.prompt, profile: args.profile, ...(args.depth !== undefined ? { depth: args.depth } : {}) }, context.sessionID, args.background === true ? { background: true } : undefined)
+      if ("dispatchId" in r) {
+        // Background handle (spec: eager resolution, nothing awaited).
+        context.metadata({ title: `dispatch ${r.tier} queued (${r.dispatchId})` })
+        return {
+          title: `dispatch ${r.tier} queued → ${r.resolved}${r.depth ? ` @${r.depth}` : ""}`,
+          output: [
+            `[forge:dispatch] accepted in the background: ${r.dispatchId}`,
+            `tier: ${r.tier}   resolved: ${r.resolved}${r.depth ? `   depth: ${r.depth}` : ""}`,
+            `queuedAt: ${r.queuedAt}`,
+            "",
+            "The full result (tokens/cost/report — or the timeout/error report) arrives as a [forge:dispatch-complete] brief when this session is next idle. Track progress any time with forge_dispatch_list; cancel with forge_dispatch_kill.",
+          ].join("\n"),
+        }
+      }
       const tok = r.tokens
       const costLine = r.costUsd !== null && r.costUsd !== undefined ? `$${r.costUsd.toFixed(6)}${r.priceSnapshot ? ` (${r.priceSnapshot})` : ""}` : `unpriced${r.costNote ? ` — ${r.costNote}` : ""}`
       context.metadata({ title: `dispatch ${r.tier}: ${r.actual.model} @ ${r.actual.depth}` })
@@ -1240,6 +1328,66 @@ const forgeDispatchTool = tool({
   },
 })
 
+
+// forge_dispatch_list (3.4): in-flight + recent terminal background dispatches
+// with dispatchIds — the model's recovery path after context compaction.
+const forgeDispatchListTool = tool({
+  description:
+    "List background forge_dispatch activity: in-flight dispatches (with dispatchIds) and recent terminal results (completed/timeout/error, full report objects). Use it to recover dispatch state after context compaction or to check on a background dispatch instead of waiting.",
+  args: {},
+  execute: async () => {
+    const reg = activeDispatchRegistry
+    if (!reg) throw new Error("[forge] no background dispatches have been submitted.")
+    const l = reg.list()
+    if (l.inFlight.length === 0 && l.terminal.length === 0) {
+      return { title: "no background dispatches", output: "[forge:dispatch-list] no background dispatches recorded in this session." }
+    }
+    const lines: string[] = []
+    if (l.inFlight.length > 0) {
+      lines.push("In flight:")
+      for (const e of l.inFlight) {
+        lines.push(`- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state} · queued ${e.queuedAt} · session ${e.sessionID || "(starting)"}`)
+      }
+    }
+    if (l.terminal.length > 0) {
+      lines.push("", "Recent terminal results:")
+      for (const e of l.terminal.slice().reverse()) {
+        lines.push(`- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not started)"}`)
+        const r = e.result as Record<string, unknown> | undefined
+        if (r !== undefined) lines.push(`  result: ${JSON.stringify(r, null, 1).slice(0, 2000)}`)
+        if (e.lateCompletion !== undefined) lines.push(`  (killed; a late result arrived after the kill and was discarded: ${JSON.stringify(e.lateCompletion).slice(0, 300)})`)
+      }
+    }
+    return { title: `dispatches: ${l.inFlight.length} in flight, ${l.terminal.length} terminal`, output: lines.join("\n") }
+  },
+})
+
+// forge_dispatch_kill (3.4, D12): best-effort abort — stops polling, marks
+// killed, suppresses the completion brief, ledgers honestly. There is no host
+// session-abort API on 1.18.32; a child that finishes anyway has its result
+// discarded and noted (kill-late-completion), never delivered.
+const forgeDispatchKillTool = tool({
+  description:
+    "Cancel an in-flight background forge_dispatch by dispatchId: polling stops, the completion brief is suppressed, and the outcome is ledgered as killed. Refuses honestly if the dispatch already finished (use forge_dispatch_list). The child session itself cannot be aborted on this host version and is left for the host to reclaim.",
+  args: {
+    dispatchId: tool.schema.string().describe("The dispatchId returned by forge_dispatch (background) or shown by forge_dispatch_list"),
+  },
+  execute: async (args) => {
+    const engine = activeDispatchEngine
+    if (!engine) throw new Error("[forge] dispatch engine unavailable.")
+    try {
+      engine.kill(args.dispatchId)
+    } catch (err) {
+      if (err instanceof DispatchError) throw new Error(`[forge:dispatch:${err.code}] ${err.message}`)
+      throw err
+    }
+    return {
+      title: `${args.dispatchId} killed`,
+      output: `[forge:dispatch] ${args.dispatchId}: killed — polling stopped, the completion brief is suppressed, and the outcome is ledgered. The child session cannot be aborted on this host and is left for the host to reclaim.`,
+    }
+  },
+})
+
 function forgeTools(): Record<string, ToolDefinition> {
   const tools: Record<string, ToolDefinition> = {
     plan_write: planWriteTool,
@@ -1260,6 +1408,8 @@ function forgeTools(): Record<string, ToolDefinition> {
   }
   if (!dispatchDisabled && !forgeDisabled) {
     tools.forge_dispatch = forgeDispatchTool
+    tools.forge_dispatch_list = forgeDispatchListTool
+    tools.forge_dispatch_kill = forgeDispatchKillTool
   }
   return tools
 }
@@ -1492,9 +1642,13 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
       }
     }
     try {
+      // Coalesce (D11): dispatch-completion briefs riding the same idle merge
+      // into this single re-prompt — dispatch results first, goal brief after.
+      const wakeEntries = activeDispatchRegistry?.takeUndelivered(sessionID) ?? []
+      const briefText = wakeEntries.length > 0 ? `${dispatchBriefText(wakeEntries)}\n\n${goalBriefText(state, goal)}` : goalBriefText(state, goal)
       await client.session.prompt({
         path: { id: sessionID },
-        body: { parts: [{ type: "text", text: goalBriefText(state, goal) }] },
+        body: { parts: [{ type: "text", text: briefText }] },
       })
       transportFails.delete(sessionID)
       pendingContinuationTurn.add(sessionID)
@@ -1541,6 +1695,7 @@ export const server: Plugin = async (input, options) => {
   hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || ""
   const client = input.client as unknown as GoalClient
   jobClient = input.client as unknown as JobClient
+  dispatchClient = input.client as unknown as typeof dispatchClient
   const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
   jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true
@@ -1747,6 +1902,7 @@ export const server: Plugin = async (input, options) => {
           agentSection[id] = tierAgentDef(tierId, tier)
         }
         const roster = built
+        activeDispatchRegistry = activeDispatchRegistry ?? createDispatchRegistry()
         activeDispatchEngine?.dispose()
         activeDispatchEngine = createDispatchEngine({
           serverUrl: String(input.serverUrl ?? "").replace(/\/$/, ""),
@@ -1763,6 +1919,8 @@ export const server: Plugin = async (input, options) => {
             return roster.roster.some((e) => e.model === identity)
           },
           sink: (entry) => dispatchLedger.append(entry),
+          registry: activeDispatchRegistry,
+          onTerminal: (parentSessionID) => scheduleDispatchWake(parentSessionID, false),
           onDepth: queueDispatchDepth,
           providerFamily: dispatchProviderFamily,
           maxConcurrent: dispatchMaxConcurrent,
@@ -1840,6 +1998,8 @@ export const server: Plugin = async (input, options) => {
       queueDepth: queueDispatchDepth,
       depthState: (sessionID: string) => dispatchDepths.get(sessionID) ?? null,
       composePrompt: composeWorkerPrompt,
+      registry: () => activeDispatchRegistry,
+      dispatchBriefText,
       setEngine: (engine: DispatchEngine | null) => {
         activeDispatchEngine?.dispose()
         activeDispatchEngine = engine
@@ -1904,6 +2064,7 @@ export const server: Plugin = async (input, options) => {
           // Completion wakes ride the same idle signal: inject only while
           // the owning session is free (never mid-turn).
           void deliverJobWakes(sessionID)
+          scheduleDispatchWake(sessionID, true)
         }
       }
       if (event.type === "session.deleted") {
