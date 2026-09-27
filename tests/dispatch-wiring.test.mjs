@@ -120,6 +120,15 @@ test("S12/S13: chat.params injects the same depth on every request of the sessio
   // re-registering a different level mid-session is refused (stability)
   assert.equal(inject("ses_dp", "max", "openai"), false, "level is frozen after first registration")
 
+  // B23 (TUI-pollution regression): a DIFFERENT session on the same serve,
+  // same provider family, must not see another session's depth — injection
+  // is keyed strictly by the dispatch child's sessionID.
+  inject("ses_dp3", "low", "openai")
+  const outOther = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_unrelated", provider: { id: "openai" } }, outOther)
+  assert.equal(outOther.options.reasoningEffort, undefined, "no cross-session depth leak")
+  assert.equal(outOther.options.thinking, undefined, "no cross-session depth leak (thinking)")
+
   // unknown provider family: nothing injected for that session's shape
   inject("ses_dp2", "high", "mystery-provider")
   const out3 = { options: {} }
