@@ -9,6 +9,7 @@
 // ledgered; sync failures throw DispatchError with an honest message.
 
 import { completionVerdict, computeCost, sumTokens, type PollState, type TokenCount } from "./dispatch-client.ts"
+import type { DispatchRegistry } from "./dispatch-registry.ts"
 import { composeWorkerPrompt } from "./dispatch-prompt.ts"
 import { resolveDispatch } from "./dispatch-resolver.ts"
 import type { BuiltRoster, CatalogSnapshot } from "./dispatch-roster.ts"
@@ -70,6 +71,7 @@ export type DispatchEngineDeps = {
   // Registers the resolved depth for the child session (feeds the chat.params
   // injection table); providerFamily resolves the option shape for disclosure.
   onDepth: (sessionID: string, level: string, providerID: string) => void
+  registry?: DispatchRegistry
   providerFamily: (providerID: string) => string | null
   maxConcurrent?: number
   timeoutMs?: number
@@ -118,11 +120,203 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     return Array.isArray(list) ? (list as RawMessage[]) : []
   }
 
-  async function dispatch(req: DispatchRequest, parentSessionID?: string): Promise<DispatchResult> {
+  // Per-pipeline abort control: kill() flips `fired` and resolves `promise`;
+  // the poll loop races its message fetch against the promise so a kill lands
+  // even mid-fetch (a bare flag check would never run while an await hangs).
+  type KillControl = { fired: boolean; promise: Promise<void>; fire: () => void }
+  const killControls = new Map<string, KillControl>()
+
+  const resolveOrThrow = (profile: string, depth: string | null | undefined, exclude: string[] | undefined): { identity: string; depth: string | null } => {
+    const r = resolveDispatch(deps.cfg, { profile, depth, exclude }, deps.available, deps.catalog)
+    if (!r.ok) {
+      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: profile, outcome: r.error.code, note: r.error.message })
+      throw new DispatchError(`${r.error.message}\nMenu:\n${r.error.menu.map((m) => `- ${m.identity} expose=[${m.expose.join(", ") || "none"}] ${m.reason}`).join("\n")}\nVocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code)
+    }
+    return r
+  }
+
+  // One pipeline attempt: child session + depth hook + turn + completion poll.
+  // Throws DispatchError (timeout / empty-response / host-error / menu codes);
+  // the CALLER owns slot accounting, retries, and (for background) registry
+  // terminal mapping. The per-dispatch deadline t0 is shared across attempts.
+  async function runAttempt(
+    r: { identity: string; depth: string | null },
+    req: DispatchRequest,
+    parentSessionID: string | undefined,
+    t0: number,
+    ctl: KillControl | undefined,
+    onChild: ((sessionID: string) => void) | undefined,
+  ): Promise<DispatchResult> {
+    const providerID = r.identity.slice(0, r.identity.indexOf("/"))
+    let childID = ""
+    // Child session: parentID is best-effort (dev-branch semantics; 1.18.32
+    // rejects some unknown CreateInput fields with 400) — retry plain.
+    const dir = encodeURIComponent(deps.workspace)
+    let created: unknown
+    try {
+      created = await api(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify(parentSessionID ? { parentID: parentSessionID } : {}) })
+    } catch {
+      created = await api(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify({}) })
+    }
+    childID = (created as { id?: string })?.id ?? ""
+    if (!childID) throw new DispatchError("host returned no session id for the child session", "host-error")
+    onChild?.(childID)
+
+    deps.onDepth(childID, r.depth, providerID)
+    const family = deps.providerFamily(providerID)
+    const depthInjected = family === null ? "not injected (unknown provider shape)" : `${family} <- ${r.depth}`
+
+    // The host's message POST is turn-synchronous (verified 1.18.32): it
+    // does not return until the child's whole first turn settles, so the
+    // per-dispatch deadline must govern this await too — race it, never
+    // await it bare. The elapsed re-check keeps fake-clock tests (instant
+    // sleep) honest: a raced deadline only declares timeout when the clock
+    // actually passed the deadline.
+    let deadlineHit = false
+    const deadlinePromise = deps
+      .sleep(Math.max(timeoutMs - (deps.now() - t0), 0))
+      .then(() => {
+        deadlineHit = true
+      })
+    const turnPost = api(`/session/${childID}/message`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
+        agent: `forge-${req.profile}`,
+        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, tier: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }],
+      }),
+    })
+    await Promise.race([turnPost, deadlinePromise])
+    if (deadlineHit && deps.now() - t0 >= timeoutMs) {
+      const elapsed = deps.now() - t0
+      deps.sink({
+        ts: new Date().toISOString(),
+        event: "timeout",
+        tier: req.profile,
+        identity: r.identity,
+        depth: r.depth,
+        sessionID: childID,
+        durationMs: elapsed,
+      })
+      throw new DispatchError(
+        `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
+        "timeout",
+      )
+    }
+    await turnPost
+
+    // Poll for completion (stable-x2) under the per-dispatch deadline. With a
+    // kill control, the message fetch races the abort promise so a kill lands
+    // even while a fetch is hanging.
+    let poll: PollState | null = null
+    let messages: RawMessage[] = []
+    for (;;) {
+      if (ctl?.fired) throw new KillRequested()
+      const elapsed = deps.now() - t0
+      if (elapsed >= timeoutMs) {
+        deps.sink({
+          ts: new Date().toISOString(),
+          event: "timeout",
+          tier: req.profile,
+          identity: r.identity,
+          depth: r.depth,
+          sessionID: childID,
+          durationMs: elapsed,
+        })
+        throw new DispatchError(
+          `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
+          "timeout",
+        )
+      }
+      await deps.sleep(pollIntervalMs)
+      messages = await (ctl ? Promise.race([fetchMessages(childID), ctl.promise.then(() => [])]) : fetchMessages(childID))
+      if (ctl?.fired) throw new KillRequested()
+      poll = completionVerdict(poll, { count: messages.length, text: textOf(messages) })
+      if (poll.verdict === "complete" || poll.verdict === "empty") break
+    }
+
+    const durationMs = deps.now() - t0
+    if (poll.verdict === "empty") {
+      deps.sink({
+        ts: new Date().toISOString(),
+        event: "empty-response",
+        tier: req.profile,
+        identity: r.identity,
+        depth: r.depth,
+        sessionID: childID,
+        durationMs,
+      })
+      throw new DispatchError(
+        `child session ${childID} returned an empty response (0-token assistant message). This is a known quirk of keyless endpoints combined with restricted tiers — see the README dispatch notes. The dispatch is NOT counted as success.`,
+        "empty-response",
+      )
+    }
+
+    const tokens = sumTokens(tokensOf(messages))
+    const price = priceFor(deps.catalog, r.identity)
+    const cost = computeCost(tokens, price?.spec ?? null)
+    const result: DispatchResult = {
+      tier: req.profile,
+      requested: { profile: req.profile, depth: req.depth },
+      actual: { model: r.identity, depth: r.depth },
+      sessionID: childID,
+      durationMs,
+      tokens,
+      costUsd: cost.costUsd,
+      ...(cost.note ? { costNote: cost.note } : {}),
+      ...(price?.label ? { priceSnapshot: price.label } : {}),
+      text: textOf(messages),
+      depthInjected,
+    }
+    deps.sink({
+      ts: new Date().toISOString(),
+      event: "completed",
+      tier: req.profile,
+      identity: r.identity,
+      depth: r.depth,
+      sessionID: childID,
+      outcome: "completed",
+      tokens,
+      costUsd: cost.costUsd,
+      durationMs,
+    })
+    return result
+  }
+
+  // Map a background pipeline failure to the registry terminal state + ledger.
+  // Never throws: a background dispatch reports through the registry and the
+  // completion brief, never by rejecting a long-gone tool call.
+  function bgTerminal(
+    reg: NonNullable<typeof deps.registry>,
+    dispatchId: string,
+    identity: string,
+    req: DispatchRequest,
+    t0: number,
+    e: unknown,
+  ): void {
+    const report = {
+      tier: req.profile,
+      requested: { profile: req.profile, depth: req.depth },
+      actual: { model: identity, depth: null as string | null },
+      sessionID: "",
+      outcome: "error",
+      durationMs: deps.now() - t0,
+      error: e instanceof Error ? e.message : String(e),
+    }
+    if (e instanceof DispatchError && e.code === "timeout") {
+      report.outcome = "timeout"
+      reg.markTimeout(dispatchId, report)
+      return
+    }
+    deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.profile, identity, outcome: "error", note: report.error })
+    reg.markError(dispatchId, report)
+  }
+
+  async function dispatch(req: DispatchRequest, parentSessionID?: string, opts?: { background?: boolean }): Promise<DispatchResult | DispatchHandle> {
     const t0 = deps.now()
 
-    // Concurrency cap: one slot pool shared by sync and (later) background
-    // dispatches — refusals carry the in-flight count and a retry hint.
+    // Concurrency cap: ONE slot pool shared by sync and background dispatches
+    // (spec: over-cap submits are refused identically).
     if (inFlight.size >= maxConcurrent) {
       deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.profile, note: `${inFlight.size} in flight` })
       throw new DispatchError(
@@ -131,152 +325,86 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       )
     }
 
-    // Spec: one retry per dispatch excluding a failed identity. The loop runs
-    // at most twice; the per-dispatch deadline t0 spans both attempts (a retry
-    // is a second chance to serve, not a second budget). Only attempt-level
-    // failures where the identity did not get to serve are retried —
-    // host-error and empty-response; a timeout consumed the child's real
-    // serving time and is final.
+    const bg = opts?.background === true
+    if (bg && !deps.registry) throw new DispatchError("background dispatch requires the dispatch registry (internal error)", "host-error")
+
+    // Eager resolution for BOTH paths: menu/pin errors surface synchronously
+    // before anything is spawned.
+    const first: { identity: string; depth: string | null } = resolveOrThrow(req.profile, req.depth, undefined)
+
+    if (bg) {
+      const reg = deps.registry!
+      const { dispatchId } = reg.submit({ sessionID: "", identity: first.identity, depth: first.depth, tier: req.profile, parentSessionID: parentSessionID ?? "" })
+      let fire = () => {}
+      const promise = new Promise<void>((res) => {
+        fire = res
+      })
+      const ctl: KillControl = { fired: false, promise, fire: () => { ctl.fired = true; fire() } }
+      killControls.set(dispatchId, ctl)
+      const slot = `d${++seq}`
+      inFlight.add(slot) // the cap pool stays occupied while the pipeline runs
+      void (async () => {
+        try {
+          if (reg.get(dispatchId).state === "killed") return // killed before the pipeline could start
+          reg.markRunning(dispatchId)
+          let identity = first
+          let exclude: string[] | undefined = undefined
+          for (let attemptNo = 0; ; attemptNo++) {
+            try {
+              const result = await runAttempt(identity, req, parentSessionID, t0, ctl, (sid) => {
+                try {
+                  reg.get(dispatchId).sessionID = sid
+                } catch {}
+              })
+              if (reg.get(dispatchId).state === "killed") {
+                // The kill landed while the result was already in: discard and
+                // note it (spec: a result arriving after a kill is noted).
+                reg.noteLateCompletion(dispatchId, result)
+                deps.sink({ ts: new Date().toISOString(), event: "kill-late-completion", tier: req.profile, identity: identity.identity, sessionID: result.sessionID, outcome: "kill-late-completion" })
+              } else {
+                reg.markCompleted(dispatchId, result)
+              }
+              return
+            } catch (e) {
+              if (e instanceof KillRequested) return // kill() already ledgered and mapped it
+              if (reg.get(dispatchId).state === "killed") return
+              const retryable = e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response")
+              const alternative = retryable
+                ? resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth, exclude: [identity.identity] }, deps.available, deps.catalog)
+                : { ok: false as const }
+              if (!retryable || attemptNo > 0 || !alternative.ok) {
+                bgTerminal(reg, dispatchId, identity.identity, req, t0, e)
+                return
+              }
+              deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.profile, identity: identity.identity, note: `${identity.identity}: ${(e as DispatchError).code}` })
+              exclude = [identity.identity]
+              identity = alternative
+              reg.get(dispatchId).identity = identity.identity
+            }
+          }
+        } finally {
+          inFlight.delete(slot)
+          killControls.delete(dispatchId)
+        }
+      })()
+      return {
+        dispatchId,
+        tier: req.profile,
+        requested: { profile: req.profile, depth: req.depth },
+        resolved: first.identity,
+        depth: first.depth,
+        queuedAt: reg.get(dispatchId).queuedAt,
+      }
+    }
+
+    // Sync path: bounded one-retry loop (spec B11); deadline t0 spans attempts.
     let exclude: string[] | undefined = undefined
     for (let attemptNo = 0; ; attemptNo++) {
+      const r: { identity: string; depth: string | null } = attemptNo === 0 ? first : resolveOrThrow(req.profile, req.depth, exclude)
       const slot = `d${++seq}`
-      // Resolution: exact match only; menu errors name every candidate.
-      const r = resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth, exclude }, deps.available, deps.catalog)
-      if (!r.ok) {
-        deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: req.profile, outcome: r.error.code, note: r.error.message })
-        throw new DispatchError(`${r.error.message}\nMenu:\n${r.error.menu.map((m) => `- ${m.identity} expose=[${m.expose.join(", ") || "none"}] ${m.reason}`).join("\n")}\nVocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code)
-      }
-      const providerID = r.identity.slice(0, r.identity.indexOf("/"))
       inFlight.add(slot)
-      let childID = ""
       try {
-        // Child session: parentID is best-effort (dev-branch semantics; 1.18.32
-        // rejects some unknown CreateInput fields with 400) — retry plain.
-        const dir = encodeURIComponent(deps.workspace)
-        let created: unknown
-        try {
-          created = await api(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify(parentSessionID ? { parentID: parentSessionID } : {}) })
-        } catch {
-          created = await api(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify({}) })
-        }
-        childID = (created as { id?: string })?.id ?? ""
-        if (!childID) throw new DispatchError("host returned no session id for the child session", "host-error")
-
-        deps.onDepth(childID, r.depth, providerID)
-        const family = deps.providerFamily(providerID)
-        const depthInjected = family === null ? "not injected (unknown provider shape)" : `${family} <- ${r.depth}`
-
-        // The host's message POST is turn-synchronous (verified 1.18.32): it
-        // does not return until the child's whole first turn settles, so the
-        // per-dispatch deadline must govern this await too — race it, never
-        // await it bare. The elapsed re-check keeps fake-clock tests (instant
-        // sleep) honest: a raced deadline only declares timeout when the clock
-        // actually passed the deadline.
-        let deadlineHit = false
-        const deadlinePromise = deps
-          .sleep(Math.max(timeoutMs - (deps.now() - t0), 0))
-          .then(() => {
-            deadlineHit = true
-          })
-        const turnPost = api(`/session/${childID}/message`, {
-          method: "POST",
-          body: JSON.stringify({
-            model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
-            agent: `forge-${req.profile}`,
-            parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, tier: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }],
-          }),
-        })
-        await Promise.race([turnPost, deadlinePromise])
-        if (deadlineHit && deps.now() - t0 >= timeoutMs) {
-          const elapsed = deps.now() - t0
-          deps.sink({
-            ts: new Date().toISOString(),
-            event: "timeout",
-            tier: req.profile,
-            identity: r.identity,
-            depth: r.depth,
-            sessionID: childID,
-            durationMs: elapsed,
-          })
-          throw new DispatchError(
-            `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
-            "timeout",
-          )
-        }
-        await turnPost
-
-        // Poll for completion (stable-x2) under the per-dispatch deadline.
-        let poll: PollState | null = null
-        let messages: RawMessage[] = []
-        for (;;) {
-          const elapsed = deps.now() - t0
-          if (elapsed >= timeoutMs) {
-            deps.sink({
-              ts: new Date().toISOString(),
-              event: "timeout",
-              tier: req.profile,
-              identity: r.identity,
-              depth: r.depth,
-              sessionID: childID,
-              durationMs: elapsed,
-            })
-            throw new DispatchError(
-              `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
-              "timeout",
-            )
-          }
-          await deps.sleep(pollIntervalMs)
-          messages = await fetchMessages(childID)
-          poll = completionVerdict(poll, { count: messages.length, text: textOf(messages) })
-          if (poll.verdict === "complete" || poll.verdict === "empty") break
-        }
-
-        const durationMs = deps.now() - t0
-        if (poll.verdict === "empty") {
-          deps.sink({
-            ts: new Date().toISOString(),
-            event: "empty-response",
-            tier: req.profile,
-            identity: r.identity,
-            depth: r.depth,
-            sessionID: childID,
-            durationMs,
-          })
-          throw new DispatchError(
-            `child session ${childID} returned an empty response (0-token assistant message). This is a known quirk of keyless endpoints combined with restricted tiers — see the README dispatch notes. The dispatch is NOT counted as success.`,
-            "empty-response",
-          )
-        }
-
-        const tokens = sumTokens(tokensOf(messages))
-        const price = priceFor(deps.catalog, r.identity)
-        const cost = computeCost(tokens, price?.spec ?? null)
-        const result: DispatchResult = {
-          tier: req.profile,
-          requested: { profile: req.profile, depth: req.depth },
-          actual: { model: r.identity, depth: r.depth },
-          sessionID: childID,
-          durationMs,
-          tokens,
-          costUsd: cost.costUsd,
-          ...(cost.note ? { costNote: cost.note } : {}),
-          ...(price?.label ? { priceSnapshot: price.label } : {}),
-          text: textOf(messages),
-          depthInjected,
-        }
-        deps.sink({
-          ts: new Date().toISOString(),
-          event: "completed",
-          tier: req.profile,
-          identity: r.identity,
-          depth: r.depth,
-          sessionID: childID,
-          outcome: "completed",
-          tokens,
-          costUsd: cost.costUsd,
-          durationMs,
-        })
-        return result
+        return await runAttempt(r, req, parentSessionID, t0, undefined, undefined)
       } catch (e) {
         const identity = r.identity
         const retryable = e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response")
@@ -296,6 +424,22 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
 
   return {
     dispatch,
+    // Best-effort kill (design D12): mark killed FIRST (so the pipeline's
+    // catch sees it), then fire the abort so a hung fetch unwinds. There is
+    // no host session-abort API on 1.18.32 — the child may finish naturally
+    // and its result is discarded and noted, never delivered.
+    kill: (dispatchId: string): void => {
+      const reg = deps.registry
+      if (!reg) throw new DispatchError("forge_dispatch_kill unavailable: no dispatch registry (internal error)", "kill-failed")
+      const e = reg.get(dispatchId)
+      if (e.state === "completed" || e.state === "timeout" || e.state === "error") {
+        throw new DispatchError(`forge_dispatch_kill refused: dispatch ${dispatchId} already ${e.state}; use forge_dispatch_list for its result.`, "kill-failed")
+      }
+      if (e.state === "killed") throw new DispatchError(`dispatch ${dispatchId} is already killed.`, "kill-failed")
+      reg.markKilled(dispatchId)
+      deps.sink({ ts: new Date().toISOString(), event: "killed", tier: e.tier, identity: e.identity, depth: e.depth ?? undefined, sessionID: e.sessionID, outcome: "killed" })
+      killControls.get(dispatchId)?.fire()
+    },
     inFlightCount: () => inFlight.size,
     inFlightIDs: () => [...inFlight],
     // Host exit honesty: sessions are host memory objects — record whatever is
@@ -307,6 +451,25 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       inFlight.clear()
     },
   }
+}
+
+// Internal abort sentinel: kill() fires the pipeline's abort promise; the
+// poll loop unwinds with this instead of an error the caller would see.
+class KillRequested extends Error {
+  constructor() {
+    super("kill requested")
+  }
+}
+
+// Immediate return value of a background submit (spec: eager resolution,
+// nothing awaited — the pipeline continues detached).
+export type DispatchHandle = {
+  dispatchId: string
+  tier: string
+  requested: { profile: string; depth?: string | null }
+  resolved: string
+  depth: string | null
+  queuedAt: string
 }
 
 export type DispatchEngine = ReturnType<typeof createDispatchEngine>
