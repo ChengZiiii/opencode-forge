@@ -920,3 +920,66 @@ test("the completion turn gets its Turn Ledger line even after the goal is termi
     rmSync(wt, { recursive: true, force: true })
   }
 })
+
+// B36 (waves): a dispatch-completion brief riding the SAME idle as the goal
+// continuation coalesces into ONE re-prompt — dispatch results first, goal
+// brief after. The follow-up dispatch timer must then find nothing to send.
+test("B36: goal continuation and dispatch-complete brief coalesce into a single re-prompt", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "forge-b36-"))
+  try {
+    // Keep the default idle-driven wake delay (IDLE_DEBOUNCE_MS+50): the goal
+    // timer (10ms here) must fire FIRST so its drain-before-send picks up the
+    // dispatch entry — a shorter wake delay would deliver the brief alone.
+    const calls = []
+    const client = {
+      session: {
+        prompt: async (body) => calls.push(body),
+        promptAsync: async (body) => calls.push(body),
+        get: async () => undefined,
+        status: async (o) => ({ [o.path.id]: { type: "idle" } }),
+      },
+    }
+    const hooks = await server({
+      client,
+      project: { id: "p" },
+      directory: wt,
+      worktree: wt,
+      serverUrl: new URL("http://127.0.0.1:1"),
+      $: {},
+      experimental_workspace: { register() {} },
+    }, {})
+    // config hook creates the shared dispatch registry
+    await hooks.config({ agent: {}, command: {}, permission: {} })
+    const reg = hooks.__forgeDispatchTest?.registry()
+    assert.ok(reg, "registry must exist for the coalesce test")
+
+    // arm a live goal owned by this session (same harness recipe as above)
+    const sid = "ses_b36"
+    await hooks.tool.goal_write.execute(
+      {
+        goal: "b36 coalesce",
+        criteria: ["npm test exits 0"],
+        checks: [{ shell: "npm test" }],
+        constraints: "stay in the sandbox",
+        arm: true,
+      },
+      { sessionID: sid, worktree: wt, ask: async () => ({ status: "allow" }), metadata() {}, callID: "c", agent: "forge", messageID: "m" },
+    )
+    // a background dispatch terminal awaiting delivery
+    const e = reg.submit({ sessionID: `${sid}_c`, identity: "zai/glm", depth: "low", tier: "quick", parentSessionID: sid })
+    reg.markCompleted(e.dispatchId, { text: "b36 worker report" })
+
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(300) // goal debounce 10ms + default idle wake delay (60ms) both settle
+
+    const dispatchBriefs = calls.filter((c) => JSON.stringify(c.body ?? c).includes("[forge:dispatch-complete]"))
+    assert.equal(dispatchBriefs.length, 1, "exactly one delivered brief")
+    const text = JSON.stringify(dispatchBriefs[0].body ?? dispatchBriefs[0])
+    assert.match(text, /b36 worker report/, "dispatch result rides the combined prompt")
+    assert.match(text, /\[forge:goal-continue\]/, "the goal brief rides the SAME prompt (coalesced)")
+    assert.equal(calls.filter((c) => JSON.stringify(c.body ?? c).includes("[forge:goal-continue]")).length, 1, "single goal re-prompt — never two for one idle")
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})

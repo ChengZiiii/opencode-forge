@@ -145,5 +145,15 @@ test("5.2 relay: manager B adopts manager A's survivor — poll sees output, kil
   }
   assert.ok(terminated, "sleeper terminated (pid-addressed tree kill)")
   assert.equal(regB.list().length, 0, "registry entry dropped after kill")
-  rmSync(dir, { recursive: true, force: true })
+  // taskkill is async on Windows: the child's log fd can outlive the pid by a
+  // few hundred ms, so the cleanup rm races an OS file lock — retry briefly.
+  for (let i = 0; ; i++) {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+      break
+    } catch (err) {
+      if (i >= 20 || err.code !== "EPERM") throw err
+      await new Promise((r) => setTimeout(r, 100))
+    }
+  }
 })

@@ -231,13 +231,13 @@ import { DispatchError } from "../src/dispatch-engine.ts"
 
 const sleepMs = (ms) => new Promise((r) => setTimeout(r, ms))
 
-const wakeInput = (calls) => ({
+const wakeInput = (calls, status) => ({
   client: {
     session: {
       promptAsync: async (o) => calls.push({ kind: "promptAsync", o }),
       prompt: async (o) => calls.push({ kind: "prompt", o }),
       get: async () => undefined,
-      status: async () => ({}),
+      status: status ?? (async () => ({})),
     },
   },
   project: { id: "p" },
@@ -361,6 +361,39 @@ test("3.3: another parent's terminals are never delivered on this session's idle
   assert.equal(calls.filter((c) => JSON.stringify(c.o).includes("[forge:dispatch-complete]")).length, 0, "no cross-parent delivery")
   // cleanup so later drains are not polluted
   reg.takeUndelivered(`ses_other_${tag}`)
+})
+
+// B34: a completion landing while the parent's turn is still active must NOT
+// be delivered mid-turn — spec: briefs "SHALL never interrupt an active turn
+// (delivery waits for the next idle)". A wake firing during a busy window
+// must leave the entries undelivered so the NEXT idle delivers them once.
+test("B34: a brief never interrupts an active turn — busy status defers delivery to the next idle", async (t) => {
+  process.env.FORGE_DISPATCH_WAKE_DEBOUNCE_MS = "20"
+  const calls = []
+  let busy = true
+  const h = await server(wakeInput(calls, async (o) => ({ [o.path.id]: { type: busy ? "busy" : "idle" } })), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const reg = h.__forgeDispatchTest?.registry()
+  const tag = `b34-${Math.random().toString(36).slice(2, 7)}`
+  const parent = `ses_${tag}`
+  const e = reg.submit({ sessionID: `${parent}_c`, identity: "zai/glm", depth: "low", tier: "quick", parentSessionID: parent })
+  reg.markRunning(e.dispatchId)
+  reg.markCompleted(e.dispatchId, { text: `done-${tag}`, costUsd: 0 })
+
+  await h.event({ event: { type: "session.idle", properties: { sessionID: parent } } })
+  await sleepMs(150)
+  assert.equal(
+    calls.filter((c) => JSON.stringify(c.o).includes("[forge:dispatch-complete]")).length, 0,
+    "busy session: no mid-turn delivery, entries stay undelivered",
+  )
+
+  busy = false
+  await h.event({ event: { type: "session.idle", properties: { sessionID: parent } } })
+  await sleepMs(150)
+  const briefs = calls.filter((c) => JSON.stringify(c.o).includes("[forge:dispatch-complete]"))
+  assert.equal(briefs.length, 1, "delivered exactly once, at the idle that follows")
+  assert.match(JSON.stringify(briefs[0].o), new RegExp(`done-${tag}`), "the deferred result rides that brief")
 })
 
 // ---------------------------------------------------------------------------
@@ -487,4 +520,47 @@ test("4.2: crew_close with full evidence asks once, appends the summary, ends th
     () => h.tool.crew_close.execute({ report: [{ title: "only", verdict: "PASS", evidence: "bg-9" }] }, recordingCtx(crewSession, asks)),
     /No active crew/,
   )
+})
+
+// ---------------------------------------------------------------------------
+// Battle II spot probes: B43 run-mode disclosure, B47 crew restart honesty,
+// B48 wave pacing discipline.
+// ---------------------------------------------------------------------------
+test("B43: the tool description discloses run-mode background limits in full", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  const d = h.tool.forge_dispatch.description
+  assert.match(d, /Background mode targets live TUI sessions/, "background is a TUI feature")
+  assert.match(d, /prefer sync|sync mode is preferred/, "run mode is pointed at sync")
+  // the ledger-only facet is disclosed on the background arg (same tool surface)
+  const bgDesc = String(h.tool.forge_dispatch.args?.background?.description ?? "")
+  assert.match(bgDesc, /ledger-only/, "post-session completions are ledger-only")
+})
+
+test("B47: crew state dies with the process — a restart starts clean, the ledger keeps the history", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const crewSession = `ses_restart_${Math.random().toString(36).slice(2, 7)}`
+  await h.tool.crew_begin.execute({ objective: "pre-crash crew" }, allowCtx(crewSession))
+  assert.ok(h.__forgeDispatchTest.crews().has(crewSession))
+
+  // Simulate host death: crews are process memory and nothing else — clear it.
+  h.__forgeDispatchTest.crews().clear()
+
+  // New /crew on the same session starts clean, with no memory of the old one.
+  await h.tool.crew_begin.execute({ objective: "post-restart crew" }, allowCtx(crewSession))
+  const c = h.__forgeDispatchTest.crews().get(crewSession)
+  assert.equal(c.objective, "post-restart crew", "no residual crew state leaks across a restart")
+})
+
+test("B48: the crew discipline mandates wave pacing — never past the cap, next batch only on briefs", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  const tpl = cfg.command.crew.template
+  assert.match(tpl, /WAVES, NEVER FLOODS/, "the pacing rule is named")
+  assert.match(tpl, /no larger than the concurrency cap/, "batches are capped")
+  assert.match(tpl, /\[forge:dispatch-complete\]/, "the next batch keys on completion briefs")
 })

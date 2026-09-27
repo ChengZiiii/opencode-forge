@@ -499,3 +499,58 @@ test("3.2: killing an already-terminal dispatch fails honestly, result-after-kil
   assert.ok(e.state === "killed" || e.state === "completed")
   if (e.state === "killed") assert.equal(reg2.takeUndelivered().length, 0)
 })
+
+// B39 (reverse direction): background dispatches occupying the shared pool
+// refuse a SYNC dispatch too — one slot pool, both directions.
+test("B39: background dispatches filling the pool refuse sync dispatches as well", async () => {
+  const reg = createDispatchRegistry()
+  let release
+  const gate = new Promise((r) => (release = r))
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: /\/message$/, handle: async (u, init) => {
+      if (init?.method === "POST") { await gate; return jsonRes({}) }
+      return jsonRes([])
+    } },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg, maxConcurrent: 1 }))
+  const bg = await engine.dispatch({ prompt: "bg", profile: "quick", depth: "low" }, undefined, { background: true })
+  await settle()
+  assert.equal(reg.get(bg.dispatchId).state, "running", "the background dispatch owns the only slot")
+  await assert.rejects(
+    () => engine.dispatch({ prompt: "sync", profile: "quick", depth: "low" }),
+    (err) => { assert.equal(err.code, "cap-refused"); return true },
+  )
+  release()
+  await settle()
+})
+
+// B42: host exit with MULTIPLE background dispatches in flight — the ledger
+// records EACH as lost-on-exit (sessions are host memory objects; no orphans,
+// no survive semantics, and no silent batch collapse into one row).
+test("B42: dispose with several in-flight background dispatches ledger each as lost-on-exit", async () => {
+  const reg = createDispatchRegistry()
+  let release
+  const gate = new Promise((r) => (release = r))
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: /\/message$/, handle: async (u, init) => {
+      if (init?.method === "POST") { await gate; return jsonRes({}) }
+      return jsonRes([])
+    } },
+  ])
+  const sunk = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg, sink: (e) => sunk.push(e) }))
+  const h1 = await engine.dispatch({ prompt: "a", profile: "quick", depth: "low" }, undefined, { background: true })
+  const h2 = await engine.dispatch({ prompt: "b", profile: "quick", depth: "low" }, undefined, { background: true })
+  assert.notEqual(h1.dispatchId, h2.dispatchId)
+  await settle()
+  assert.equal(reg.list().inFlight.length, 2, "both sit in the registry as running")
+  engine.dispose()
+  const lost = sunk.filter((e) => e.event === "lost-on-exit")
+  assert.equal(lost.length, 2, "one honest ledger row per in-flight dispatch — no batch collapse")
+  assert.match(lost[0].note, /dispatch d\d+ in flight at host exit/)
+  assert.notEqual(lost[0].note, lost[1].note, "each row names its own slot")
+  release()
+  await settle()
+})
