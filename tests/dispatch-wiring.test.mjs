@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { server } from "../plugin.ts"
+import { translateDepth } from "../src/dispatch-depth.ts"
 
 // Spec: openspec/changes/add-dispatch-suite/specs/dispatch/spec.md
 //   S9  tier agents are hidden, subagent-mode, modelless, task-denied
@@ -98,44 +99,50 @@ test("S11: agent.forge.disable removes tiers, and dispatch.disable skips tier in
   assert.equal(h2.tool.forge_dispatch, undefined, "dispatch.disable removes the tool")
 })
 
-test("S12/S13: chat.params injects the same depth on every request of the session, level frozen", async (t) => {
+test("S12/S13: chat.params injects the same translation on every request of the session, frozen", async (t) => {
   const h = await server(input(), {})
   t.after(() => h.dispose?.())
   assert.ok(h["chat.params"], "chat.params hook must be registered")
 
   const inject = h.__forgeDispatchTest?.queueDepth
   assert.ok(inject, "test seam must exist")
-  inject("ses_dp", "low", "openai")
+  inject("ses_dp", translateDepth("low", "openai", ["low", "high", "max"]))
 
   // options are rebuilt by the host for EVERY LLM request; the hook must
-  // re-apply the SAME level each time (inject-once would lose the depth on
-  // turn 2) — "frozen" means the level never changes after registration.
+  // re-apply the SAME translation each time (inject-once would lose the depth
+  // on turn 2) — "frozen" means it never changes after registration.
   const out1 = { options: {} }
   await h["chat.params"]({ sessionID: "ses_dp", provider: { id: "openai" } }, out1)
-  assert.equal(out1.options.reasoningEffort, "low", "first turn writes the level")
+  assert.equal(out1.options.reasoningEffort, "low", "first turn writes the effort word")
   const out2 = { options: {} }
   await h["chat.params"]({ sessionID: "ses_dp", provider: { id: "openai" } }, out2)
-  assert.equal(out2.options.reasoningEffort, "low", "same level re-applied (stable across turns)")
+  assert.equal(out2.options.reasoningEffort, "low", "same translation re-applied (stable across turns)")
 
-  // re-registering a different level mid-session is refused (stability)
-  assert.equal(inject("ses_dp", "max", "openai"), false, "level is frozen after first registration")
+  // re-registering a different translation mid-session is refused (stability)
+  assert.equal(inject("ses_dp", translateDepth("max", "openai", ["low", "high", "max"])), false, "translation is frozen after first registration")
+
+  // budget family: the published tier lands as the thinking option
+  inject("ses_dp4", translateDepth("high", "anthropic", null))
+  const outBudget = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_dp4", provider: { id: "anthropic" } }, outBudget)
+  assert.deepEqual(outBudget.options.thinking, { type: "enabled", budget_tokens: 24576 })
 
   // B23 (TUI-pollution regression): a DIFFERENT session on the same serve,
   // same provider family, must not see another session's depth — injection
   // is keyed strictly by the dispatch child's sessionID.
-  inject("ses_dp3", "low", "openai")
+  inject("ses_dp3", translateDepth("low", "openai", ["low", "high", "max"]))
   const outOther = { options: {} }
   await h["chat.params"]({ sessionID: "ses_unrelated", provider: { id: "openai" } }, outOther)
   assert.equal(outOther.options.reasoningEffort, undefined, "no cross-session depth leak")
   assert.equal(outOther.options.thinking, undefined, "no cross-session depth leak (thinking)")
 
-  // unknown provider family: nothing injected for that session's shape
-  inject("ses_dp2", "high", "mystery-provider")
+  // unknown provider shape: nothing injected for that session (B21 semantics)
+  inject("ses_dp2", translateDepth("high", "unknown", null))
   const out3 = { options: {} }
   await h["chat.params"]({ sessionID: "ses_dp2", provider: { id: "mystery-provider" } }, out3)
   assert.equal(out3.options.reasoningEffort, undefined)
   assert.equal(out3.options.thinking, undefined)
-  assert.equal(h.__forgeDispatchTest.depthState("ses_dp2").family, "unknown", "unknown family recorded for honest disclosure")
+  assert.equal(h.__forgeDispatchTest.depthState("ses_dp2").kind, "not-injected", "unknown family recorded for honest disclosure")
 })
 
 test("S20: worker prompt template carries the three mandates and differentiates shapes", async (t) => {

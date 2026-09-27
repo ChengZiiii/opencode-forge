@@ -92,7 +92,7 @@ test("S6: a successful dispatch reports actuals honestly (exact match, tokens, c
   const depths = []
   const engine = createDispatchEngine(
     baseDeps(fetcher, {
-      onDepth: (sid, level, provider) => depths.push({ sid, level, provider }),
+      onDepth: (sid, translation) => depths.push({ sid, translation }),
     }),
   )
   const r = await engine.dispatch({ prompt: "check things", profile: "scout", depth: "low" }, "ses_parent")
@@ -105,8 +105,11 @@ test("S6: a successful dispatch reports actuals honestly (exact match, tokens, c
   assert.equal(typeof r.costUsd, "number")
   assert.ok(r.costUsd > 0)
   assert.match(r.text, /did it/)
-  assert.match(r.depthInjected, /openai/)
-  assert.deepEqual(depths, [{ sid: CHILD, level: "low", provider: "zai-coding-plan" }])
+  assert.equal(r.depthTranslation, "verbatim", "meta word natively valid — disclosed as verbatim")
+  assert.equal(depths.length, 1)
+  assert.equal(depths[0].sid, CHILD)
+  assert.equal(depths[0].translation.kind, "verbatim")
+  assert.equal(depths[0].translation.word, "low")
   // the message body bound the model + the tier agent
   const post = fetcher.calls.find((c) => c.init?.method === "POST" && c.url.endsWith("/message"))
   const body = JSON.parse(post.init.body)
@@ -210,7 +213,45 @@ test("unknown provider family is disclosed, not guessed", async () => {
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { providerFamily: () => null }))
   const r = await engine.dispatch({ prompt: "x", profile: "scout", depth: "low" })
-  assert.equal(r.depthInjected, "not injected (unknown provider shape)")
+  assert.equal(r.depthTranslation, "not injected (unknown provider shape)")
+})
+
+// 3.2 a toggle-shaped model (empty catalog ladder) on an effort-family
+// provider: the meta word passes through UNVERIFIED — provider is the judge
+// (owner ruling: configured depth is never clamped or replaced).
+test("3.2 empty catalog ladder passes the depth through unverified", async () => {
+  const catalog = { providers: { glm: { models: { "glm-4.7": { reasoningOptions: [] } } } } }
+  const cfg = buildDispatchConfig({
+    configuredIdentities: ["glm/glm-4.7"],
+    catalog,
+    userRoster: [{ model: "glm/glm-4.7", expose: ["low"], profiles: ["scout"] }],
+  })
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "done" }] }])) },
+  ])
+  const depths = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg, catalog, onDepth: (sid, t) => depths.push({ sid, t }) }))
+  const r = await engine.dispatch({ prompt: "x", profile: "scout", depth: "low" })
+  assert.match(r.depthTranslation, /unverified/)
+  assert.equal(depths[0].t.word, "low")
+})
+
+// 3.2 budget family: canonical high lands as the published budget tier and the
+// report discloses the translation.
+test("3.2 budget-family translation is injected and disclosed", async () => {
+  const cfg = buildDispatchConfig({
+    configuredIdentities: ["anthropic/claude-haiku-4-5"],
+    catalog: CATALOG,
+    userRoster: [{ model: "anthropic/claude-haiku-4-5", expose: ["medium", "high"], profiles: ["scout"] }],
+  })
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "done" }] }])) },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg, providerFamily: () => "anthropic" }))
+  const r = await engine.dispatch({ prompt: "x", profile: "scout", depth: "high" })
+  assert.equal(r.depthTranslation, "canonical high → native thinking budget:24576")
 })
 
 test("B32: parentID is best-effort — a 400 on the parent-bearing create retries plain", async () => {

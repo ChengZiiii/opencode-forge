@@ -41,6 +41,13 @@ test("3.1 escape hatch on an unknown ladder still passes through (provider judge
   assert.match(t.disclose, /unverified/)
 })
 
+test("3.1 an EMPTY catalog ladder (toggle-shaped model) passes meta words through unverified — the provider judges", () => {
+  const t = translateDepth("low", "openai", [])
+  assert.equal(t.kind, "verbatim")
+  assert.equal(t.word, "low")
+  assert.match(t.disclose, /unverified/)
+})
+
 test("3.1 no interpolation: canonical high on a none/low/medium/XHigh model errors listing both vocabularies", () => {
   const t = translateDepth("high", "openai", ["none", "low", "medium", "XHigh"])
   assert.equal(t.kind, "no-mapping")
