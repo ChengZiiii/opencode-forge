@@ -306,12 +306,12 @@ test("S18: forge_dispatch is refused during a plan draft and allowed after appro
     /plan_approve|discard/,
     "draft must refuse forge_dispatch",
   )
-  await assert.rejects(() => h.tool.forge_dispatch.execute({ prompt: "p", profile: "scout", depth: "low" }, allowCtx("ses_ban")))
+  await assert.rejects(() => h.tool.forge_dispatch.execute({ prompt: "p", agent: "scout", depth: "low" }, allowCtx("ses_ban")))
   assert.equal(engineCalls, 0, "engine must never be reached during draft")
 
   await h.tool.plan_approve.execute({}, allowCtx("ses_ban"))
   await h["tool.execute.before"]({ tool: "forge_dispatch", sessionID: "ses_ban" }, { args: {} })
-  await h.tool.forge_dispatch.execute({ prompt: "p", profile: "scout", depth: "low" }, allowCtx("ses_ban"))
+  await h.tool.forge_dispatch.execute({ prompt: "p", agent: "scout", depth: "low" }, allowCtx("ses_ban"))
   assert.equal(engineCalls, 1, "engine runs after approval")
 })
 
@@ -320,22 +320,24 @@ test("forge_dispatch result object passes through the engine report with a title
   t.after(() => h.dispose?.())
   h.__forgeDispatchTest?.setEngine({
     dispatch: async (req) => ({
-      tier: req.profile,
-      requested: { profile: req.profile, depth: req.depth },
+      agent: req.agent,
+      requested: { agent: req.agent, depth: req.depth },
       actual: { model: "zai/glm", depth: req.depth ?? "low" },
       sessionID: "ses_child",
       durationMs: 42,
       tokens: { input: 10, output: 5, reasoning: 0, cache: { read: 0, write: 0 } },
       costUsd: 0.01,
       text: "worker concluded",
+      depthTranslation: "verbatim",
     }),
     dispose: async () => {},
   })
-  const r = await h.tool.forge_dispatch.execute({ prompt: "go", profile: "scout", depth: "low" }, allowCtx("ses_wiring"))
+  const r = await h.tool.forge_dispatch.execute({ prompt: "go", agent: "scout", depth: "low" }, allowCtx("ses_wiring"))
   assert.match(r.title, /scout/)
   assert.match(r.output, /zai\/glm/)
   assert.match(r.output, /worker concluded/)
-  assert.match(r.output, /sessionID|ses_child/)
+  assert.match(r.output, /ses_child/)
+  assert.match(r.output, /depthTranslation: verbatim/)
 })
 
 // ---------------------------------------------------------------------------
