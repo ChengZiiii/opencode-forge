@@ -12335,9 +12335,9 @@ function tool(input) {
 tool.schema = exports_external;
 // plugin.ts
 import { execFileSync as execFileSync3 } from "node:child_process";
-import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync6, readdirSync as readdirSync4, readFileSync as readFileSync8, statSync as statSync3, writeFileSync as writeFileSync6 } from "node:fs";
+import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync6, readdirSync as readdirSync4, readFileSync as readFileSync9, statSync as statSync4, writeFileSync as writeFileSync6 } from "node:fs";
 import { isAbsolute, join as join5, relative } from "node:path";
-import { tmpdir as tmpdir3 } from "node:os";
+import { tmpdir as tmpdir3, homedir } from "node:os";
 
 // src/plan-file.ts
 class PlanError extends Error {
@@ -14785,9 +14785,7 @@ function buildDispatchConfig(opts) {
     tiers[id] = { ...def, shape };
   }
   const roster = [];
-  const listed = new Set;
   for (const entry of opts.userRoster ?? []) {
-    listed.add(entry.model);
     const ladder = nativeLadder(catalog, entry.model);
     const verified = ladder !== null;
     if (verified && catalogKnowsIdentity(catalog, entry.model)) {
@@ -14824,17 +14822,6 @@ function buildDispatchConfig(opts) {
       });
       roster.push({ model: entry.model, expose: [...entry.expose ?? []], profiles: [...entry.profiles], verified: false });
     }
-  }
-  for (const identity of opts.configuredIdentities) {
-    if (listed.has(identity))
-      continue;
-    const ladder = nativeLadder(catalog, identity);
-    roster.push({
-      model: identity,
-      expose: ladder ?? [],
-      profiles: ["scout", "quick"],
-      verified: ladder !== null
-    });
   }
   const tierIds = new Set(Object.keys(tiers));
   for (const entry of roster) {
@@ -14916,13 +14903,14 @@ var COMMON_MANDATES = [
   "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."
 ].join(`
 `);
-var READONLY_DISCIPLINE = `You are a readonly ${"{tier}"} worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`;
-var WRITE_DISCIPLINE = `You are a ${"{tier}"} worker executing one scoped task. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no starting side quests.`;
+var READONLY_DISCIPLINE = `You are a readonly {agent} worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`;
+var WRITE_DISCIPLINE = `You are an {agent} worker executing one scoped task. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no starting side quests.`;
 function composeWorkerPrompt(input) {
-  const discipline = input.shape === "readonly" ? READONLY_DISCIPLINE.replaceAll("{tier}", input.tier) : WRITE_DISCIPLINE.replaceAll("{tier}", input.tier);
+  const discipline = input.shape === "readonly" ? READONLY_DISCIPLINE.replaceAll("{agent}", input.agent) : WRITE_DISCIPLINE.replaceAll("{agent}", input.agent);
   return [
     "[forge:dispatch] You were dispatched by the forge main agent as a scoped worker.",
     discipline,
+    ...input.role ? ["", "Your role:", input.role.trim()] : [],
     "",
     "Task:",
     input.prompt.trim(),
@@ -15049,6 +15037,175 @@ function resolveDispatch(cfg, req, available, catalog = { providers: {} }) {
   }
   return { ok: true, identity: candidates[0].entry.model, depth, pinned: false };
 }
+function resolveAgent(agents, req, available) {
+  const def = agents[req.agent];
+  if (!def || typeof def !== "object") {
+    return {
+      ok: false,
+      error: {
+        code: "unknown-agent",
+        message: `unknown dispatch agent "${req.agent}"; defined agents: ${Object.keys(agents).join(", ") || "(none)"}`
+      }
+    };
+  }
+  if (!def.model || typeof def.model !== "string") {
+    return {
+      ok: false,
+      error: {
+        code: "pin-unavailable",
+        message: `agent "${req.agent}" has no usable model (model: ${JSON.stringify(def.model)}); fix its "model" in forge.json — no fallback model will be used`
+      }
+    };
+  }
+  if (!available(def.model)) {
+    return {
+      ok: false,
+      error: {
+        code: "pin-unavailable",
+        message: `agent "${req.agent}" is pinned to ${def.model}, which is not configured on this host; fix the agent's "model" in forge.json — no fallback model will be used`
+      }
+    };
+  }
+  const depths = Array.isArray(def.depths) ? def.depths : [];
+  if (depths.length === 0) {
+    return {
+      ok: false,
+      error: {
+        code: "depth-not-in-set",
+        message: `agent "${req.agent}" defines no depths; give it at least one depth in forge.json (canonical words: none, low, medium, high, max — or the model's native level names)`
+      }
+    };
+  }
+  const depth = req.depth ?? depths[0];
+  if (!depths.includes(depth)) {
+    return {
+      ok: false,
+      error: {
+        code: "depth-not-in-set",
+        message: `agent "${req.agent}" does not allow depth "${depth}" (allowed: ${depths.join(", ")}) — exact match only, the plugin never clamps`
+      }
+    };
+  }
+  return { ok: true, model: def.model, depth, def };
+}
+
+// src/dispatch-depth.ts
+var META_DEPTHS = ["none", "low", "medium", "high", "max"];
+var BUDGET_TIERS = {
+  low: 8192,
+  medium: 16384,
+  high: 24576,
+  max: 32768
+};
+function noMapping(depth, family, nativeVocabulary, metaAvailable) {
+  return {
+    kind: "no-mapping",
+    family,
+    message: `depth "${depth}" has no native counterpart on this model — the plugin never interpolates. Native levels: ${nativeVocabulary.join(", ") || "(none named)"}. Meta words this model accepts: ${metaAvailable.join(", ") || "(none)"}.`,
+    nativeVocabulary,
+    metaAvailable
+  };
+}
+function translateDepth(depth, family, ladder) {
+  if (family === "unknown") {
+    return { kind: "not-injected", family, disclose: "not injected (unknown provider shape)" };
+  }
+  if (family === "anthropic") {
+    if (depth === "none")
+      return { kind: "off", family, disclose: "canonical none → native thinking:off" };
+    const budget = BUDGET_TIERS[depth];
+    if (budget !== undefined) {
+      return { kind: "tiered", family, budgetTokens: budget, disclose: `canonical ${depth} → native thinking budget:${budget}` };
+    }
+    return noMapping(depth, family, [], [...META_DEPTHS]);
+  }
+  if (family === "zai") {
+    if (depth === "none")
+      return { kind: "off", family, disclose: "canonical none → native thinking:off" };
+    if (META_DEPTHS.includes(depth)) {
+      return { kind: "toggle-on", family, disclose: `canonical ${depth} → native thinking:on (this provider shape takes a toggle, not a level)` };
+    }
+    return noMapping(depth, family, ["thinking on/off"], [...META_DEPTHS]);
+  }
+  const native = ladder ?? null;
+  if (native !== null && native.includes(depth)) {
+    return { kind: "verbatim", family: "openai", word: depth, disclose: META_DEPTHS.includes(depth) ? "verbatim" : `verbatim (native word "${depth}")` };
+  }
+  if (native !== null && native.length > 0 && META_DEPTHS.includes(depth)) {
+    return noMapping(depth, family, native, META_DEPTHS.filter((w) => native.includes(w)));
+  }
+  return { kind: "verbatim", family: "openai", word: depth, disclose: `verbatim (unverified — ${native === null ? "catalog does not know this model" : `catalog ladder does not list "${depth}"`}; the provider judges)` };
+}
+function applyDepthTranslation(options, t) {
+  if (t.kind === "verbatim") {
+    options.reasoningEffort = t.word;
+  } else if (t.kind === "tiered") {
+    options.thinking = { type: "enabled", budget_tokens: t.budgetTokens };
+  } else if (t.kind === "off") {
+    options.thinking = { type: "disabled" };
+  } else if (t.kind === "toggle-on") {
+    options.thinking = { type: "enabled" };
+  }
+}
+
+// src/dispatch-tiers.ts
+var MUTATING_TOOLS = ["write", "edit", "bash"];
+var TIER_PROMPTS = {
+  scout: "You are forge-scout, a readonly reconnaissance worker. Search, read, and run read-only commands; report findings with file:line evidence. You never modify anything — write tools are denied by design.",
+  build: "You are forge-build, an implementation worker. Execute the dispatched task exactly: minimal, focused changes with tests where the task implies them. Do not expand scope.",
+  review: "You are forge-review, a readonly review worker. Read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list with file:line evidence and a single-line verdict. Write tools are denied by design.",
+  quick: "You are forge-quick, a mechanical small-change worker. Make the smallest correct edit the task names (rename, constant, one-liner fix). No refactoring, no drive-by improvements."
+};
+function tierAgentPrompt(tierId) {
+  return TIER_PROMPTS[tierId] ?? `You are forge-${tierId}, a dispatched worker. Execute the dispatched task exactly as scoped.`;
+}
+var ROLE_PROMPTS = {
+  research: "You are a research worker: search, read, and run read-only checks to answer the dispatched question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
+  review: "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict."
+};
+function rolePromptFor(agentId, def) {
+  if (def?.prompt && def.prompt.trim().length > 0)
+    return def.prompt;
+  return ROLE_PROMPTS[agentId] ?? `You are forge-${agentId}, a dispatched worker. Execute the dispatched task exactly as scoped.`;
+}
+function forgeAgentDef(agentId, def) {
+  const permission = { task: "deny" };
+  const shape = def.shape ?? "readonly";
+  if (shape === "readonly") {
+    for (const t of MUTATING_TOOLS)
+      permission[t] = "deny";
+  }
+  Object.assign(permission, def.permission ?? {});
+  permission.task = "deny";
+  const shapeLine = shape === "readonly" ? "Readonly agent: mutating tools are denied by design — report findings, never work around restrictions." : "Write agent: execute the scoped task with minimal, focused changes.";
+  return {
+    description: `forge dispatch agent "${agentId}" (${shape}) — spawned by forge_dispatch, not user-facing.`,
+    mode: "subagent",
+    hidden: true,
+    prompt: `${rolePromptFor(agentId, def)}
+
+${shapeLine}`,
+    permission
+  };
+}
+function tierAgentDef(tierId, tier) {
+  const permission = { task: "deny" };
+  if (tier.shape === "readonly") {
+    for (const t of MUTATING_TOOLS)
+      permission[t] = "deny";
+  }
+  const shapeLine = tier.shape === "readonly" ? "Readonly tier: mutating tools are denied by design — report findings, never work around restrictions." : "Write tier: execute the scoped task with minimal, focused changes.";
+  const defaultLine = tier.defaultDepth ? ` Default reasoning depth: ${tier.defaultDepth}.` : "";
+  return {
+    description: `forge dispatch tier "${tierId}" (${tier.shape}) — spawned by forge_dispatch, not user-facing.${defaultLine}`,
+    mode: "subagent",
+    hidden: true,
+    prompt: `${tierAgentPrompt(tierId)}
+
+${shapeLine}`,
+    permission
+  };
+}
 
 // src/dispatch-engine.ts
 var DEFAULT_DISPATCH_TIMEOUT_MS = 600000;
@@ -15107,8 +15264,47 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
     }
     return r;
   };
+  const resolveForThrow = (req, exclude) => {
+    if (deps.legacy && req.agent in deps.cfg.tiers) {
+      const r = resolveOrThrow(req.agent, req.depth, exclude);
+      return {
+        model: r.identity,
+        depth: r.depth,
+        agentPath: false,
+        shape: deps.cfg.tiers[req.agent]?.shape ?? "readonly",
+        role: tierAgentPrompt(req.agent)
+      };
+    }
+    const a = resolveAgent(deps.agents(), { agent: req.agent, depth: req.depth }, deps.available);
+    if (!a.ok) {
+      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: req.agent, agent: req.agent, outcome: a.error.code, note: a.error.message });
+      throw new DispatchError(a.error.message, a.error.code);
+    }
+    return {
+      model: a.model,
+      depth: a.depth,
+      agentPath: true,
+      shape: a.def?.shape === "write" ? "write" : "readonly",
+      role: rolePromptFor(req.agent, a.def)
+    };
+  };
+  const translationFor = (identity, depth) => {
+    const providerID = identity.slice(0, identity.indexOf("/"));
+    const family = deps.providerFamily(providerID) ?? "unknown";
+    const ladder = nativeLadder(deps.catalog, identity);
+    return translateDepth(depth, family, ladder);
+  };
+  const translationOrThrow = (identity, depth) => {
+    const translation = translationFor(identity, depth);
+    if (translation.kind === "no-mapping") {
+      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", agent: undefined, identity, depth, outcome: "no-native-mapping", note: translation.message });
+      throw new DispatchError(translation.message, "no-native-mapping");
+    }
+    return translation;
+  };
   async function runAttempt(r, req, parentSessionID, t0, ctl, onChild, dispatchId) {
-    const providerID = r.identity.slice(0, r.identity.indexOf("/"));
+    const providerID = r.model.slice(0, r.model.indexOf("/"));
+    const translation = translationOrThrow(r.model, r.depth);
     let childID = "";
     const dir = encodeURIComponent(deps.workspace);
     let created;
@@ -15121,9 +15317,8 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
     if (!childID)
       throw new DispatchError("host returned no session id for the child session", "host-error");
     onChild?.(childID);
-    deps.onDepth(childID, r.depth, providerID);
-    const family = deps.providerFamily(providerID);
-    const depthInjected = family === null ? "not injected (unknown provider shape)" : `${family} <- ${r.depth}`;
+    deps.onDepth(childID, translation);
+    const depthInjected = translation.disclose;
     let deadlineHit = false;
     const deadlinePromise = deps.sleep(Math.max(timeoutMs - (deps.now() - t0), 0)).then(() => {
       deadlineHit = true;
@@ -15131,9 +15326,9 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
     const turnPost = api2(`/session/${childID}/message`, {
       method: "POST",
       body: JSON.stringify({
-        model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
-        agent: `forge-${req.profile}`,
-        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, tier: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }]
+        model: { providerID, modelID: r.model.slice(r.model.indexOf("/") + 1) },
+        agent: `forge-${req.agent}`,
+        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, agent: req.agent, shape: r.shape, ...r.role ? { role: r.role } : {} }) }]
       })
     });
     await Promise.race([turnPost, deadlinePromise]);
@@ -15142,8 +15337,9 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
       deps.sink({
         ts: new Date().toISOString(),
         event: "timeout",
-        tier: req.profile,
-        identity: r.identity,
+        tier: req.agent,
+        agent: req.agent,
+        identity: r.model,
         depth: r.depth,
         sessionID: childID,
         durationMs: elapsed,
@@ -15162,8 +15358,9 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
         deps.sink({
           ts: new Date().toISOString(),
           event: "timeout",
-          tier: req.profile,
-          identity: r.identity,
+          tier: req.agent,
+          agent: req.agent,
+          identity: r.model,
           depth: r.depth,
           sessionID: childID,
           durationMs: elapsed,
@@ -15184,8 +15381,9 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
       deps.sink({
         ts: new Date().toISOString(),
         event: "empty-response",
-        tier: req.profile,
-        identity: r.identity,
+        tier: req.agent,
+        agent: req.agent,
+        identity: r.model,
         depth: r.depth,
         sessionID: childID,
         durationMs,
@@ -15194,12 +15392,12 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
       throw new DispatchError(`child session ${childID} returned an empty response (0-token assistant message). This is a known quirk of keyless endpoints combined with restricted tiers — see the README dispatch notes. The dispatch is NOT counted as success.`, "empty-response");
     }
     const tokens = sumTokens(tokensOf(messages));
-    const price = priceFor(deps.catalog, r.identity);
+    const price = priceFor(deps.catalog, r.model);
     const cost = computeCost(tokens, price?.spec ?? null);
     const result = {
-      tier: req.profile,
-      requested: { profile: req.profile, depth: req.depth },
-      actual: { model: r.identity, depth: r.depth },
+      agent: req.agent,
+      requested: { agent: req.agent, depth: req.depth },
+      actual: { model: r.model, depth: r.depth },
       sessionID: childID,
       durationMs,
       tokens,
@@ -15207,13 +15405,14 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
       ...cost.note ? { costNote: cost.note } : {},
       ...price?.label ? { priceSnapshot: price.label } : {},
       text: textOf(messages),
-      depthInjected
+      depthTranslation: depthInjected
     };
     deps.sink({
       ts: new Date().toISOString(),
       event: "completed",
-      tier: req.profile,
-      identity: r.identity,
+      tier: req.agent,
+      agent: req.agent,
+      identity: r.model,
       depth: r.depth,
       sessionID: childID,
       outcome: "completed",
@@ -15226,8 +15425,8 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
   }
   function bgTerminal(reg, dispatchId, identity, req, t0, e) {
     const report = {
-      tier: req.profile,
-      requested: { profile: req.profile, depth: req.depth },
+      agent: req.agent,
+      requested: { agent: req.agent, depth: req.depth },
       actual: { model: identity, depth: null },
       sessionID: "",
       outcome: "error",
@@ -15240,23 +15439,24 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
       deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
       return;
     }
-    deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.profile, identity, outcome: "error", note: report.error });
+    deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.agent, identity, outcome: "error", note: report.error });
     reg.markError(dispatchId, report);
     deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
   }
   async function dispatch(req, parentSessionID, opts) {
     const t0 = deps.now();
     if (inFlight.size >= maxConcurrent) {
-      deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.profile, note: `${inFlight.size} in flight` });
+      deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.agent, agent: req.agent, note: `${inFlight.size} in flight` });
       throw new DispatchError(`forge_dispatch refused: ${inFlight.size} dispatches already in flight (cap ${maxConcurrent}). Wait for a completion and retry.`, "cap-refused");
     }
     const bg = opts?.background === true;
     if (bg && !deps.registry)
       throw new DispatchError("background dispatch requires the dispatch registry (internal error)", "host-error");
-    const first = resolveOrThrow(req.profile, req.depth, undefined);
+    const first = resolveForThrow(req, undefined);
+    translationOrThrow(first.model, first.depth);
     if (bg) {
       const reg = deps.registry;
-      const { dispatchId } = reg.submit({ sessionID: "", identity: first.identity, depth: first.depth, tier: req.profile, parentSessionID: parentSessionID ?? "" });
+      const { dispatchId } = reg.submit({ sessionID: "", identity: first.model, depth: first.depth, tier: req.agent, parentSessionID: parentSessionID ?? "" });
       let fire = () => {};
       const promise2 = new Promise((res) => {
         fire = res;
@@ -15273,18 +15473,18 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
           if (reg.get(dispatchId).state === "killed")
             return;
           reg.markRunning(dispatchId);
-          let identity = first;
+          let current = first;
           let exclude2 = undefined;
           for (let attemptNo = 0;; attemptNo++) {
             try {
-              const result = await runAttempt(identity, req, parentSessionID, t0, ctl, (sid) => {
+              const result = await runAttempt(current, req, parentSessionID, t0, ctl, (sid) => {
                 try {
                   reg.get(dispatchId).sessionID = sid;
                 } catch {}
               }, dispatchId);
               if (reg.get(dispatchId).state === "killed") {
                 reg.noteLateCompletion(dispatchId, result);
-                deps.sink({ ts: new Date().toISOString(), event: "kill-late-completion", tier: req.profile, identity: identity.identity, sessionID: result.sessionID, outcome: "kill-late-completion" });
+                deps.sink({ ts: new Date().toISOString(), event: "kill-late-completion", tier: req.agent, agent: req.agent, identity: current.model, sessionID: result.sessionID, outcome: "kill-late-completion" });
               } else {
                 reg.markCompleted(dispatchId, result);
                 deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
@@ -15295,16 +15495,16 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
                 return;
               if (reg.get(dispatchId).state === "killed")
                 return;
-              const retryable = e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response");
-              const alternative = retryable ? resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth, exclude: [identity.identity] }, deps.available, deps.catalog) : { ok: false };
+              const retryable = !current.agentPath && e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response");
+              const alternative = retryable ? resolveDispatch(deps.cfg, { profile: req.agent, depth: req.depth, exclude: [current.model] }, deps.available, deps.catalog) : { ok: false };
               if (!retryable || attemptNo > 0 || !alternative.ok) {
-                bgTerminal(reg, dispatchId, identity.identity, req, t0, e);
+                bgTerminal(reg, dispatchId, current.model, req, t0, e);
                 return;
               }
-              deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.profile, identity: identity.identity, note: `${identity.identity}: ${e.code}` });
-              exclude2 = [identity.identity];
-              identity = alternative;
-              reg.get(dispatchId).identity = identity.identity;
+              deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.agent, agent: req.agent, identity: current.model, note: `${current.model}: ${e.code}` });
+              exclude2 = [current.model];
+              current = resolveForThrow(req, exclude2);
+              reg.get(dispatchId).identity = current.model;
             }
           }
         } finally {
@@ -15314,29 +15514,29 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
       })();
       return {
         dispatchId,
-        tier: req.profile,
-        requested: { profile: req.profile, depth: req.depth },
-        resolved: first.identity,
+        agent: req.agent,
+        requested: { agent: req.agent, depth: req.depth },
+        resolved: first.model,
         depth: first.depth,
         queuedAt: reg.get(dispatchId).queuedAt
       };
     }
     let exclude = undefined;
     for (let attemptNo = 0;; attemptNo++) {
-      const r = attemptNo === 0 ? first : resolveOrThrow(req.profile, req.depth, exclude);
+      const r = attemptNo === 0 ? first : resolveForThrow(req, exclude);
       const slot = `d${++seq}`;
       inFlight.add(slot);
       try {
         return await runAttempt(r, req, parentSessionID, t0, undefined, undefined);
       } catch (e) {
-        const identity = r.identity;
-        const retryable = e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response");
+        const identity = r.model;
+        const retryable = !r.agentPath && e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response");
         if (!retryable || attemptNo > 0)
           throw e;
-        const alternative = resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth, exclude: [identity] }, deps.available, deps.catalog);
+        const alternative = resolveDispatch(deps.cfg, { profile: req.agent, depth: req.depth, exclude: [identity] }, deps.available, deps.catalog);
         if (!alternative.ok)
           throw e;
-        deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.profile, identity, note: `${identity}: ${e.code}` });
+        deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.agent, agent: req.agent, identity, note: `${identity}: ${e.code}` });
         exclude = [identity];
       } finally {
         inFlight.delete(slot);
@@ -15576,38 +15776,371 @@ function validateCrewReport(report, ledgerRows, crew) {
   return { ok: gaps.length === 0, gaps, dispatchIds: [...rowById.keys()] };
 }
 
-// src/dispatch-tiers.ts
-var MUTATING_TOOLS = ["write", "edit", "bash"];
-var TIER_PROMPTS = {
-  scout: "You are forge-scout, a readonly reconnaissance worker. Search, read, and run read-only commands; report findings with file:line evidence. You never modify anything — write tools are denied by design.",
-  build: "You are forge-build, an implementation worker. Execute the dispatched task exactly: minimal, focused changes with tests where the task implies them. Do not expand scope.",
-  review: "You are forge-review, a readonly review worker. Read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list with file:line evidence and a single-line verdict. Write tools are denied by design.",
-  quick: "You are forge-quick, a mechanical small-change worker. Make the smallest correct edit the task names (rename, constant, one-liner fix). No refactoring, no drive-by improvements."
-};
-function tierAgentPrompt(tierId) {
-  return TIER_PROMPTS[tierId] ?? `You are forge-${tierId}, a dispatched worker. Execute the dispatched task exactly as scoped.`;
-}
-function tierAgentDef(tierId, tier) {
-  const permission = { task: "deny" };
-  if (tier.shape === "readonly") {
-    for (const t of MUTATING_TOOLS)
-      permission[t] = "deny";
+// src/forge-config.ts
+import { readFileSync as readFileSync7, statSync as statSync3 } from "node:fs";
+function sanitizeJsonc(text) {
+  const out = [];
+  let i = 0;
+  const n = text.length;
+  let pendingComma = false;
+  const flushComma = (nextChar) => {
+    if (pendingComma) {
+      if (nextChar !== "}" && nextChar !== "]")
+        out.push(",");
+      pendingComma = false;
+    }
+  };
+  while (i < n) {
+    const c = text[i];
+    const d = i + 1 < n ? text[i + 1] : "";
+    if (c === "/" && d === "/") {
+      while (i < n && text[i] !== `
+`) {
+        out.push(" ");
+        i++;
+      }
+      continue;
+    }
+    if (c === "/" && d === "*") {
+      out.push(" ", " ");
+      i += 2;
+      while (i < n && !(text[i] === "*" && i + 1 < n && text[i + 1] === "/")) {
+        out.push(text[i] === `
+` ? `
+` : " ");
+        i++;
+      }
+      if (i < n) {
+        out.push(" ", " ");
+        i += 2;
+      }
+      continue;
+    }
+    if (c === '"') {
+      flushComma(c);
+      out.push(c);
+      i++;
+      while (i < n && text[i] !== '"') {
+        out.push(text[i]);
+        if (text[i] === "\\") {
+          i++;
+          if (i < n)
+            out.push(text[i]);
+        }
+        i++;
+      }
+      if (i < n) {
+        out.push('"');
+        i++;
+      }
+      continue;
+    }
+    if (c === ",") {
+      pendingComma = true;
+      out.push(" ");
+      i++;
+      continue;
+    }
+    if (c === " " || c === "\t" || c === `
+` || c === "\r") {
+      out.push(c);
+      i++;
+      continue;
+    }
+    flushComma(c);
+    out.push(c);
+    i++;
   }
-  const shapeLine = tier.shape === "readonly" ? "Readonly tier: mutating tools are denied by design — report findings, never work around restrictions." : "Write tier: execute the scoped task with minimal, focused changes.";
-  const defaultLine = tier.defaultDepth ? ` Default reasoning depth: ${tier.defaultDepth}.` : "";
+  return out.join("");
+}
+function lineColumnAt(text, offset) {
+  let line = 1;
+  let lineStart = 0;
+  for (let i = 0;i < offset && i < text.length; i++) {
+    if (text[i] === `
+`) {
+      line++;
+      lineStart = i + 1;
+    }
+  }
+  return { line, column: offset - lineStart + 1 };
+}
+function locateJsonError(text) {
+  const n = text.length;
+  let i = 0;
+  const stack = [];
+  const ws = () => {
+    while (i < n && (text[i] === " " || text[i] === "\t" || text[i] === `
+` || text[i] === "\r"))
+      i++;
+  };
+  const fail = (why) => {
+    const { line, column } = lineColumnAt(text, Math.min(i, n));
+    return { message: `${why} (line ${line}, column ${column})`, line, column };
+  };
+  const skipString = () => {
+    if (text[i] !== '"')
+      return null;
+    i++;
+    while (i < n && text[i] !== '"') {
+      if (text[i] === "\\")
+        i++;
+      i++;
+    }
+    if (i >= n)
+      return "unterminated string";
+    i++;
+    return null;
+  };
+  let expectValue = true;
+  ws();
+  if (i >= n)
+    return { message: "empty document", line: 1, column: 1 };
+  for (;; ) {
+    ws();
+    if (i >= n)
+      return stack.length === 0 ? null : fail("unexpected end of document");
+    const top = stack[stack.length - 1];
+    const c = text[i];
+    if (expectValue) {
+      if (c === "{") {
+        stack.push("o");
+        i++;
+        expectValue = false;
+        continue;
+      }
+      if (c === "[") {
+        stack.push("a");
+        i++;
+        continue;
+      }
+      if (c === "}") {
+        return fail(`expected a value before '}'`);
+      }
+      if (c === "]") {
+        if (top === "a" || top === "av") {
+          stack.pop();
+          expectValue = false;
+          if (stack.length === 0) {
+            ws();
+            return i >= n ? null : fail(`unexpected token '${text[i]}' after top-level value`);
+          }
+          i++;
+          continue;
+        }
+        return fail(`unexpected ']'`);
+      }
+      if (c === '"') {
+        const err = skipString();
+        if (err)
+          return fail(err);
+        expectValue = false;
+        if (top === "o")
+          stack[stack.length - 1] = "ov";
+        if (top === "a")
+          stack[stack.length - 1] = "av";
+        continue;
+      }
+      if (c === "-" || c >= "0" && c <= "9" || c === "t" || c === "f" || c === "n") {
+        while (i < n && !`{}[],:" 	
+\r`.includes(text[i]))
+          i++;
+        expectValue = false;
+        if (top === "a")
+          stack[stack.length - 1] = "av";
+        continue;
+      }
+      return fail(`unexpected token '${c}'`);
+    }
+    if (top === "o") {
+      if (c === '"') {
+        const err = skipString();
+        if (err)
+          return fail(err);
+        ws();
+        if (text[i] !== ":")
+          return fail("expected ':' after object key");
+        i++;
+        expectValue = true;
+        continue;
+      }
+      return fail(`expected '"' or '}' in object, got '${c}'`);
+    }
+    if (top === "ov" || top === "av") {
+      if (c === ",") {
+        i++;
+        expectValue = true;
+        if (top === "ov")
+          stack[stack.length - 1] = "o";
+        else
+          stack[stack.length - 1] = "a";
+        continue;
+      }
+      if (top === "ov" && c === "}" || top === "av" && c === "]") {
+        stack.pop();
+        if (stack.length === 0) {
+          i++;
+          ws();
+          return i >= n ? null : fail(`unexpected token '${text[i]}' after top-level value`);
+        }
+        i++;
+        continue;
+      }
+      return fail(`expected ',' or closing bracket, got '${c}'`);
+    }
+    if (c === "]") {
+      stack.pop();
+      if (stack.length === 0) {
+        i++;
+        ws();
+        return i >= n ? null : fail(`unexpected token '${text[i]}' after top-level value`);
+      }
+      i++;
+      continue;
+    }
+    return fail(`unexpected token '${c}'`);
+  }
+}
+function parseForgeJsonc(text) {
+  const sanitized = sanitizeJsonc(text);
+  let parsed;
+  try {
+    parsed = JSON.parse(sanitized);
+  } catch {
+    const located = locateJsonError(sanitized);
+    return {
+      ok: false,
+      error: located ?? { message: "invalid JSON", line: 1, column: 1 }
+    };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { ok: false, error: { message: "forge.json top level must be an object", line: 1, column: 1 } };
+  }
+  const agents = parsed.agents;
+  if (agents === undefined)
+    return { ok: true, config: { agents: {} } };
+  if (typeof agents !== "object" || agents === null || Array.isArray(agents)) {
+    return { ok: false, error: { message: 'forge.json "agents" must be an object mapping agent ids to definitions', line: 1, column: 1 } };
+  }
+  return { ok: true, config: { agents } };
+}
+function forgeRecipe(input) {
+  const suggested = input.detectedIdentities[0] ?? "provider/model";
+  const identityLines = input.detectedIdentities.length > 0 ? input.detectedIdentities.map((id) => `   - ${id}`).join(`
+`) : "   (none detected — check the provider section of the host's opencode config)";
+  const template = `{
+  // forge dispatch agents — save the file; changes apply on the next dispatch, no restart
+  "agents": {
+    "research": {
+      "model": "${suggested}", // exact "provider/model" string, pick from the detected list above
+      "depths": ["low", "medium"], // first entry is the default; canonical words: none, low, medium, high, max — or the model's native level names, passed through verbatim
+      // "prompt": "optional role prompt riding inside the discipline wrapper",
+      // "shape": "write", // default readonly denies mutating tools; write agents need this
+      // "permission": { "bash": "deny" } // optional override of the shape-derived permission
+    }
+  }
+}`;
+  return [
+    "[forge dispatch onboarding recipe]",
+    'The dispatch agent you called is pinned to the placeholder model "Local/GPT Luna" — forge.json is not configured. Steps:',
+    "",
+    "1. Detected configured identities (use one as the exact model string):",
+    identityLines,
+    "",
+    "2. Create ONE of these files (project-level wins; a single file fully applies — never merged):",
+    `   - ${input.projectPath}  (project-level, versionable, team-shared)`,
+    `   - ${input.globalPath}  (global)`,
+    "",
+    "3. Copy-paste template (JSONC — comments allowed) and edit model/depths:",
+    "",
+    template,
+    "",
+    '4. Verify: call the forge_dispatch tool again with agent "research" and a depth from its depths — the report shows the actual model and the depth translation.',
+    "",
+    '5. Extending: more agents are more entries under "agents"; agents that edit files need "shape": "write"; an explicit "permission" map overrides the shape-derived defaults — "task" is always denied, recursive dispatch stays impossible.'
+  ].join(`
+`);
+}
+var PLACEHOLDER_IDENTITY = "Local/GPT Luna";
+var SEED_AGENTS = {
+  research: { model: PLACEHOLDER_IDENTITY, depths: ["low", "medium"], shape: "readonly" },
+  review: { model: PLACEHOLDER_IDENTITY, depths: ["medium", "high", "max"], shape: "readonly" }
+};
+function forgeConfigPaths(opts) {
+  const sep2 = opts.projectDir?.includes("\\") && !opts.projectDir?.includes("/") ? "\\" : "/";
+  const project = opts.projectDir ? `${opts.projectDir}${sep2}.opencode${sep2}forge.json` : "";
+  const global = opts.homeDir ? `${opts.homeDir}${sep2}.config${sep2}opencode${sep2}forge.json` : "";
+  return { project, global };
+}
+function createForgeConfigLoader(deps) {
+  const stat = deps.stat ?? ((path) => {
+    try {
+      const s = statSync3(path);
+      return { mtimeMs: s.mtimeMs, size: s.size };
+    } catch {
+      return null;
+    }
+  });
+  const readFile = deps.readFile ?? ((path) => readFileSync7(path, "utf8"));
+  const paths = forgeConfigPaths({ projectDir: deps.projectDir, homeDir: deps.homeDir });
+  const cache = new Map;
+  const readCandidate = (path, source) => {
+    const st = stat(path);
+    if (st === null) {
+      cache.delete(path);
+      return null;
+    }
+    const hit = cache.get(path);
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size)
+      return hit.result;
+    const text = readFile(path);
+    const parsed = parseForgeJsonc(text);
+    let result;
+    if (!parsed.ok) {
+      result = {
+        agents: { ...SEED_AGENTS },
+        source: "seed",
+        path: null,
+        findings: [
+          {
+            level: "error",
+            code: "config-parse-error",
+            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — fell back to the built-in seed`
+          }
+        ]
+      };
+    } else {
+      result = { agents: parsed.config.agents, source, path, findings: [] };
+    }
+    cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result });
+    return result;
+  };
   return {
-    description: `forge dispatch tier "${tierId}" (${tier.shape}) — spawned by forge_dispatch, not user-facing.${defaultLine}`,
-    mode: "subagent",
-    hidden: true,
-    prompt: `${tierAgentPrompt(tierId)}
-
-${shapeLine}`,
-    permission
+    load() {
+      const project = paths.project ? readCandidate(paths.project, "project") : null;
+      if (project)
+        return project;
+      const global = paths.global ? readCandidate(paths.global, "global") : null;
+      if (global)
+        return global;
+      return {
+        agents: { ...SEED_AGENTS },
+        source: "seed",
+        path: null,
+        findings: [
+          {
+            level: "notice",
+            code: "dispatch-unconfigured",
+            message: "forge dispatch is unconfigured (no forge.json found): every forge_dispatch call will fail with the configuration recipe. Create .opencode/forge.json (project) or ~/.config/opencode/forge.json (global), or ask your session AI to configure dispatch — the recipe in the dispatch error tells it exactly what to write."
+          }
+        ]
+      };
+    }
   };
 }
 
 // src/models-dev.ts
-import { mkdirSync as mkdirSync5, readFileSync as readFileSync7, writeFileSync as writeFileSync5 } from "node:fs";
+import { mkdirSync as mkdirSync5, readFileSync as readFileSync8, writeFileSync as writeFileSync5 } from "node:fs";
 import { join as join4 } from "node:path";
 import { tmpdir as tmpdir2 } from "node:os";
 var DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json";
@@ -15676,7 +16209,7 @@ async function loadModelsDevSnapshot(opts = {}) {
     }
   } catch {}
   try {
-    const cached2 = JSON.parse(readFileSync7(cacheFile, "utf8"));
+    const cached2 = JSON.parse(readFileSync8(cacheFile, "utf8"));
     if (cached2 && typeof cached2 === "object" && cached2.providers)
       return { catalog: cached2, degraded: true, source: "cache" };
   } catch {}
@@ -15750,6 +16283,10 @@ var dispatchDisabled = false;
 var dispatchMaxConcurrent = 4;
 var dispatchTimeoutMs = 600000;
 var dispatchBase = null;
+var forgeLoader = null;
+var forgeLoaderDir = null;
+var forgeConfigState = null;
+var lastDetectedIdentities = [];
 var activeDispatchEngine = null;
 var dispatchLogDir = join5(tmpdir3(), "opencode-forge", "dispatch");
 var dispatchLedger = createDispatchLedger(join5(dispatchLogDir, "ledger.jsonl"));
@@ -15761,7 +16298,6 @@ var dispatchDepths = new Map;
 var OPENAI_FAMILY = new Set(["openai", "opencode", "openrouter", "groq", "xai", "azure", "github-copilot", "deepseek", "together", "vercel", "opus"]);
 var ANTHROPIC_FAMILY = new Set(["anthropic"]);
 var ZAI_FAMILY = new Set(["zai", "zai-coding-plan"]);
-var ANTHROPIC_BUDGET = { off: 0, minimal: 1024, low: 4096, medium: 8192, high: 16384, xhigh: 24576, max: 32768 };
 function dispatchProviderFamily(providerID) {
   if (OPENAI_FAMILY.has(providerID))
     return "openai";
@@ -15771,22 +16307,13 @@ function dispatchProviderFamily(providerID) {
     return "zai";
   return null;
 }
-function queueDispatchDepth(sessionID, level, providerID) {
+function queueDispatchDepth(sessionID, translation) {
+  const key = (t) => t.kind === "verbatim" ? `verbatim:${t.word}` : t.kind === "tiered" ? `tiered:${t.budgetTokens}` : t.kind;
   const existing = dispatchDepths.get(sessionID);
   if (existing)
-    return existing.level === level;
-  dispatchDepths.set(sessionID, { level, family: dispatchProviderFamily(providerID) ?? "unknown" });
+    return key(existing) === key(translation);
+  dispatchDepths.set(sessionID, translation);
   return true;
-}
-function applyDepthToOptions(options, level, family) {
-  if (family === "openai") {
-    options.reasoningEffort = level;
-  } else if (family === "anthropic") {
-    const budget = ANTHROPIC_BUDGET[level] ?? 8192;
-    options.thinking = level === "off" ? { type: "disabled" } : { type: "enabled", budget_tokens: budget };
-  } else if (family === "zai") {
-    options.thinking = level === "off" ? { type: "disabled" } : { type: "enabled" };
-  }
 }
 function configuredIdentitiesOf(cfg, catalog) {
   const providers = cfg.provider ?? {};
@@ -15862,7 +16389,7 @@ var jobLedgerPath = join5(jobLogDir, "ledger.jsonl");
 function jobLedgerSink(entry) {
   try {
     mkdirSync6(jobLogDir, { recursive: true });
-    if (existsSync3(jobLedgerPath) && statSync3(jobLedgerPath).size > 1e6)
+    if (existsSync3(jobLedgerPath) && statSync4(jobLedgerPath).size > 1e6)
       writeFileSync6(jobLedgerPath, "");
     appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}
 `);
@@ -15924,7 +16451,7 @@ function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join5(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync9(join5(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -15941,7 +16468,7 @@ function worktreeFor(context) {
 }
 function resolveActivePlan(state) {
   if (state.planPath && existsSync3(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync8(state.planPath, "utf8"));
+    const doc2 = parsePlanLoose(readFileSync9(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -16016,7 +16543,7 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync8(active.path, "utf8"), args.n, nowIso());
+    const next = tickTask(readFileSync9(active.path, "utf8"), args.n, nowIso());
     writeFileSync6(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
@@ -16044,7 +16571,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    writeFileSync6(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "approved", nowIso()));
+    writeFileSync6(active.path, transitionStatus(readFileSync9(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -16077,7 +16604,7 @@ var planCloseTool = tool({
 Fix the implementation and retry, or revise the plan first.`);
     }
     await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`);
-    writeFileSync6(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "done", nowIso()));
+    writeFileSync6(active.path, transitionStatus(readFileSync9(active.path, "utf8"), "done", nowIso()));
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
       title: "plan done",
@@ -16095,7 +16622,7 @@ var planDiscardTool = tool({
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan to abandon in this workspace.");
-    writeFileSync6(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "abandoned", nowIso()));
+    writeFileSync6(active.path, transitionStatus(readFileSync9(active.path, "utf8"), "abandoned", nowIso()));
     state.planPath = undefined;
     context.metadata({ title: `Plan abandoned: ${active.doc.goal}` });
     return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` };
@@ -16108,11 +16635,11 @@ function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join5(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync9(join5(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
   if (state.goalPath && existsSync3(state.goalPath)) {
-    const doc2 = parseGoalLoose(readFileSync8(state.goalPath, "utf8"));
+    const doc2 = parseGoalLoose(readFileSync9(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
@@ -16258,7 +16785,7 @@ var goalCheckTool = tool({
       o.index = selected[i].n;
     });
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = appendCheckLog(readFileSync8(goal.path, "utf8"), runId, outcomes, nowIso());
+    const next = appendCheckLog(readFileSync9(goal.path, "utf8"), runId, outcomes, nowIso());
     atomicWrite(goal.path, next);
     const ok = outcomesAllOk(outcomes);
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
@@ -16292,7 +16819,7 @@ var goalCompleteTool = tool({
     const failures = outcomes.filter((o) => !o.ok);
     if (failures.length > 0) {
       const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-      atomicWrite(goal.path, appendCheckLog(readFileSync8(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      atomicWrite(goal.path, appendCheckLog(readFileSync9(goal.path, "utf8"), runId2, outcomes, nowIso()));
       throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
 ${formatOutcomes(failures)}
 Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
@@ -16305,7 +16832,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
     }
     await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    let text = appendCheckLog(readFileSync8(goal.path, "utf8"), runId, outcomes, nowIso());
+    let text = appendCheckLog(readFileSync9(goal.path, "utf8"), runId, outcomes, nowIso());
     text = transitionGoal(text, "completed", nowIso());
     atomicWrite(goal.path, text);
     context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
@@ -16327,7 +16854,7 @@ var goalPauseTool = tool({
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
     }
     const stopReason = args.blocker ? "blocker" : "user";
-    atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
+    atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` });
     return {
@@ -16357,7 +16884,7 @@ var goalResumeTool = tool({
     }
     const promoting = goal.doc.status === "queued";
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
-    let text = readFileSync8(goal.path, "utf8");
+    let text = readFileSync9(goal.path, "utf8");
     if (args.addTurns)
       text = bumpBudget(text, args.addTurns, nowIso());
     text = transitionGoal(text, "active", nowIso(), { session: context.sessionID });
@@ -16383,7 +16910,7 @@ var goalDiscardTool = tool({
     if (!goal)
       throw new GoalError("No goal to discard in this workspace.");
     await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
-    atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "abandoned", nowIso()));
+    atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "abandoned", nowIso()));
     state.goalPath = undefined;
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
@@ -16600,7 +17127,7 @@ function scheduleDispatchWake(sessionID, idleDriven) {
 function dispatchBriefText(entries) {
   const lines = [`[forge:dispatch-complete] ${entries.length} background dispatch(es) reached terminal state:`];
   for (const e of entries) {
-    lines.push("", `- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not yet started)"}`);
+    lines.push("", `- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not yet started)"}`);
     const r = e.result;
     if (r !== undefined) {
       lines.push(`  result: ${JSON.stringify(r, null, 1).replace(/\n/g, `
@@ -16640,11 +17167,11 @@ async function injectDispatchBrief(sessionID) {
   }
 }
 var forgeDispatchTool = tool({
-  description: "Dispatch a scoped task to a worker subagent running on a dynamically selected model and reasoning depth. Takes {prompt, profile, depth}: profile is a dispatch tier (scout=readonly recon, build=implementation, review=readonly review, quick=mechanical small change); depth is a reasoning level and must EXACTLY match one of the levels exposed for the resolved model — the vocabulary is listed below and in errors; there is no clamping, a mis-set depth is an error. Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
+  description: "Dispatch a scoped task to a worker subagent defined in forge.json. Takes {prompt, agent, depth}: agent names a dispatch agent (see forge_dispatch_config for the effective set); the agent's model is pinned by its definition — no fallback ever. depth comes from the canonical metalanguage (none, low, medium, high, max; default = the agent's first entry) or the model's native level names verbatim (escape hatch); the ONLY validation is membership in the agent's depths — the provider is the final judge and its raw errors flow back. The report discloses the depth translation (canonical -> native). Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
   args: {
     prompt: tool.schema.string().describe("Complete, self-contained task for the worker (it cannot see this conversation)"),
-    profile: tool.schema.string().describe("Dispatch tier: scout | build | review | quick (or a user-defined tier id)"),
-    depth: tool.schema.string().optional().describe("Reasoning depth, verbatim from the exposed vocabulary; omit to use the tier's default when it has one"),
+    agent: tool.schema.string().describe("Dispatch agent id from forge.json (e.g. research, review, or a custom id; legacy inline tier ids still work when configured)"),
+    depth: tool.schema.string().optional().describe("Reasoning depth: none | low | medium | high | max (canonical) or the model's native level name verbatim; omit to use the agent's first depths entry"),
     background: tool.schema.boolean().optional().describe("Run in the background: returns {dispatchId, resolved, queuedAt} immediately; the full result arrives later as a coalesced [forge:dispatch-complete] brief when the session is idle. Background mode targets live TUI sessions — under `opencode run` the session ends before any brief, so completions are ledger-only (read them via forge_dispatch_list) and sync mode is preferred.")
   },
   execute: async (args, context) => {
@@ -16659,14 +17186,14 @@ var forgeDispatchTool = tool({
     if (!engine)
       throw new Error("[forge] dispatch engine unavailable (disabled by dispatch.disable, or config still loading).");
     try {
-      const r = await engine.dispatch({ prompt: args.prompt, profile: args.profile, ...args.depth !== undefined ? { depth: args.depth } : {} }, context.sessionID, args.background === true ? { background: true } : undefined);
+      const r = await engine.dispatch({ prompt: args.prompt, agent: args.agent, ...args.depth !== undefined ? { depth: args.depth } : {} }, context.sessionID, args.background === true ? { background: true } : undefined);
       if ("dispatchId" in r) {
-        context.metadata({ title: `dispatch ${r.tier} queued (${r.dispatchId})` });
+        context.metadata({ title: `dispatch ${r.agent} queued (${r.dispatchId})` });
         return {
-          title: `dispatch ${r.tier} queued → ${r.resolved}${r.depth ? ` @${r.depth}` : ""}`,
+          title: `dispatch ${r.agent} queued → ${r.resolved}${r.depth ? ` @${r.depth}` : ""}`,
           output: [
             `[forge:dispatch] accepted in the background: ${r.dispatchId}`,
-            `tier: ${r.tier}   resolved: ${r.resolved}${r.depth ? `   depth: ${r.depth}` : ""}`,
+            `agent: ${r.agent}   resolved: ${r.resolved}${r.depth ? `   depth: ${r.depth}` : ""}`,
             `queuedAt: ${r.queuedAt}`,
             "",
             "The full result (tokens/cost/report — or the timeout/error report) arrives as a [forge:dispatch-complete] brief when this session is next idle. Track progress any time with forge_dispatch_list; cancel with forge_dispatch_kill."
@@ -16676,16 +17203,16 @@ var forgeDispatchTool = tool({
       }
       const tok = r.tokens;
       const costLine = r.costUsd !== null && r.costUsd !== undefined ? `$${r.costUsd.toFixed(6)}${r.priceSnapshot ? ` (${r.priceSnapshot})` : ""}` : `unpriced${r.costNote ? ` — ${r.costNote}` : ""}`;
-      context.metadata({ title: `dispatch ${r.tier}: ${r.actual.model} @ ${r.actual.depth}` });
+      context.metadata({ title: `dispatch ${r.agent}: ${r.actual.model} @ ${r.actual.depth}` });
       return {
-        title: `dispatch ${r.tier} → ${r.actual.model} @${r.actual.depth}`,
+        title: `dispatch ${r.agent} → ${r.actual.model} @${r.actual.depth}`,
         output: [
           `[forge:dispatch] completed in ${r.durationMs}ms`,
-          `tier: ${r.tier}   model: ${r.actual.model}   depth: ${r.actual.depth}${r.requested.depth !== undefined && r.requested.depth !== r.actual.depth ? ` (requested ${r.requested.depth})` : ""}`,
+          `agent: ${r.agent}   model: ${r.actual.model}   depth: ${r.actual.depth}${r.requested.depth !== undefined && r.requested.depth !== r.actual.depth ? ` (requested ${r.requested.depth})` : ""}`,
           `session: ${r.sessionID}`,
           `tokens: input ${tok.input ?? 0}, output ${tok.output ?? 0}, reasoning ${tok.reasoning ?? 0}, cache r/w ${tok.cache?.read ?? 0}/${tok.cache?.write ?? 0}`,
           `cost: ${costLine}`,
-          `depth injected: ${r.depthInjected}`,
+          `depthTranslation: ${r.depthTranslation}`,
           "",
           "Worker report:",
           r.text || "(empty worker report)"
@@ -16693,10 +17220,39 @@ var forgeDispatchTool = tool({
 `)
       };
     } catch (err) {
+      if (err instanceof DispatchError && err.code === "pin-unavailable") {
+        throw new Error(`[forge:dispatch:pin-unavailable] ${err.message}
+
+${dispatchRecipeText()}`);
+      }
       if (err instanceof DispatchError)
         throw new Error(`[forge:dispatch:${err.code}] ${err.message}`);
       throw err;
     }
+  }
+});
+function dispatchRecipeText() {
+  const paths = forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
+  return forgeRecipe({
+    detectedIdentities: lastDetectedIdentities,
+    projectPath: paths.project || "(project .opencode/forge.json)",
+    globalPath: paths.global
+  });
+}
+var forgeDispatchConfigTool = tool({
+  description: "Read the effective forge dispatch configuration: {agents, knobs, findings}. agents mirrors the winning forge.json (project .opencode/forge.json > global ~/.config/opencode/forge.json > built-in seed) exactly — same keys, same shapes, writable back as valid forge.json agents content. knobs are the inline dispatch options {timeoutMs, maxConcurrent}. findings carry config state (config-parse-error, dispatch-unconfigured notice). Re-reads the file (mtime-cached) on every call, so edits are reflected immediately.",
+  args: {},
+  execute: async (_args, context) => {
+    const loaded = forgeLoader?.load() ?? { agents: {}, source: "seed", path: null, findings: [] };
+    context.metadata({ title: `dispatch config (${loaded.source})` });
+    return {
+      title: `dispatch config (${loaded.source}${loaded.path ? `: ${loaded.path}` : ""})`,
+      output: JSON.stringify({
+        agents: loaded.agents,
+        knobs: { timeoutMs: dispatchTimeoutMs, maxConcurrent: dispatchMaxConcurrent },
+        findings: loaded.findings
+      }, null, 2)
+    };
   }
 });
 var forgeDispatchListTool = tool({
@@ -16714,13 +17270,13 @@ var forgeDispatchListTool = tool({
     if (l.inFlight.length > 0) {
       lines.push("In flight:");
       for (const e of l.inFlight) {
-        lines.push(`- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state} · queued ${e.queuedAt} · session ${e.sessionID || "(starting)"}`);
+        lines.push(`- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state} · queued ${e.queuedAt} · session ${e.sessionID || "(starting)"}`);
       }
     }
     if (l.terminal.length > 0) {
       lines.push("", "Recent terminal results:");
       for (const e of l.terminal.slice().reverse()) {
-        lines.push(`- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not started)"}`);
+        lines.push(`- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not started)"}`);
         const r = e.result;
         if (r !== undefined)
           lines.push(`  result: ${JSON.stringify(r, null, 1).slice(0, 2000)}`);
@@ -16807,7 +17363,7 @@ var crewCloseTool = tool({
       throw new Error("[forge:crew] No active crew in this session (crew state is in-memory and dies on host restart). Start one with /crew <objective>.");
     const rows = [];
     try {
-      const file2 = readFileSync8(join5(dispatchLogDir, "ledger.jsonl"), "utf8");
+      const file2 = readFileSync9(join5(dispatchLogDir, "ledger.jsonl"), "utf8");
       for (const line of file2.split(`
 `)) {
         const t = line.trim();
@@ -16887,6 +17443,7 @@ function forgeTools() {
   }
   if (!dispatchDisabled && !forgeDisabled) {
     tools.forge_dispatch = forgeDispatchTool;
+    tools.forge_dispatch_config = forgeDispatchConfigTool;
     tools.forge_dispatch_list = forgeDispatchListTool;
     tools.forge_dispatch_kill = forgeDispatchKillTool;
     tools.crew_begin = crewBeginTool;
@@ -16961,7 +17518,7 @@ function wrapupBriefText(goal, reason) {
 }
 async function autoPauseGoal(client, state, goal, reason, wrapup) {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
-  atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
   engineForgetSession(state.sessionID);
   if (wrapup && goal.doc.session) {
     try {
@@ -17010,9 +17567,9 @@ async function continueIfEligible(client, sessionID) {
       const ledgerPath = state.goalPath;
       if (ledgerPath && existsSync3(ledgerPath)) {
         try {
-          const fresh = parseGoalLoose(readFileSync8(ledgerPath, "utf8"));
+          const fresh = parseGoalLoose(readFileSync9(ledgerPath, "utf8"));
           if (fresh && fresh.turnsUsed > 0) {
-            atomicWrite(ledgerPath, appendLedger(readFileSync8(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+            atomicWrite(ledgerPath, appendLedger(readFileSync9(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
           }
         } catch (err) {
           goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
@@ -17077,7 +17634,7 @@ ${goalBriefText(state, goal)}` : goalBriefText(state, goal);
       pendingContinuationTurn.add(sessionID);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
       state.goalPath = goal.path;
-      atomicWrite(goal.path, incTurns(readFileSync8(goal.path, "utf8"), nowIso()));
+      atomicWrite(goal.path, incTurns(readFileSync9(goal.path, "utf8"), nowIso()));
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
       const n = (transportFails.get(sessionID) ?? 0) + 1;
@@ -17244,11 +17801,32 @@ var server = async (input, options) => {
       if (!dispatchDisabled) {
         const snapshot = process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1" ? { catalog: { providers: {} }, degraded: true, source: "test-off" } : await loadModelsDevSnapshot();
         const dispatchOpts = options?.dispatch ?? {};
+        const legacyInline = (dispatchOpts.roster?.length ?? 0) > 0 || dispatchOpts.tiers !== undefined;
+        if (!forgeLoader || forgeLoaderDir !== hostWorktree) {
+          forgeLoader = createForgeConfigLoader({
+            projectDir: hostWorktree,
+            homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir()
+          });
+          forgeLoaderDir = hostWorktree;
+        }
+        const loaded = forgeLoader.load();
+        forgeConfigState = loaded;
+        for (const finding of loaded.findings) {
+          dispatchLedger.append({ ts: new Date().toISOString(), event: "validation", level: finding.level, code: finding.code, note: finding.message });
+        }
+        for (const [agentId, def] of Object.entries(loaded.agents)) {
+          const id = `forge-${agentId}`;
+          if (agentSection[id] !== undefined)
+            continue;
+          agentSection[id] = forgeAgentDef(agentId, def);
+        }
+        const detected = configuredIdentitiesOf(cfg, snapshot.catalog);
+        lastDetectedIdentities = detected;
         const built = buildDispatchConfig({
-          configuredIdentities: configuredIdentitiesOf(cfg, snapshot.catalog),
+          configuredIdentities: detected,
           catalog: snapshot.catalog,
-          userRoster: dispatchOpts.roster ?? [],
-          userTiers: dispatchOpts.tiers
+          userRoster: legacyInline ? dispatchOpts.roster ?? [] : [],
+          userTiers: legacyInline ? dispatchOpts.tiers : undefined
         });
         dispatchBase = { cfg: built, catalog: snapshot.catalog, findings: built.findings, degraded: snapshot.degraded };
         for (const finding of built.findings) {
@@ -17257,11 +17835,13 @@ var server = async (input, options) => {
         if (snapshot.degraded) {
           dispatchLedger.append({ ts: new Date().toISOString(), event: "models-dev-degraded", note: "models.dev snapshot unavailable — cost reporting degrades to null" });
         }
-        for (const [tierId, tier] of Object.entries(built.tiers)) {
-          const id = `forge-${tierId}`;
-          if (agentSection[id] !== undefined)
-            continue;
-          agentSection[id] = tierAgentDef(tierId, tier);
+        if (legacyInline) {
+          for (const [tierId, tier] of Object.entries(built.tiers)) {
+            const id = `forge-${tierId}`;
+            if (agentSection[id] !== undefined)
+              continue;
+            agentSection[id] = tierAgentDef(tierId, tier);
+          }
         }
         const roster = built;
         activeDispatchRegistry = activeDispatchRegistry ?? createDispatchRegistry();
@@ -17275,8 +17855,10 @@ var server = async (input, options) => {
           cfg: roster,
           catalog: snapshot.catalog,
           available: (identity) => {
-            return roster.roster.some((e) => e.model === identity);
+            return roster.roster.some((e) => e.model === identity) || lastDetectedIdentities.includes(identity);
           },
+          agents: () => forgeLoader?.load().agents ?? {},
+          legacy: legacyInline,
           sink: (entry) => dispatchLedger.append(entry),
           registry: activeDispatchRegistry,
           onTerminal: (parentSessionID) => scheduleDispatchWake(parentSessionID, false),
@@ -17325,9 +17907,9 @@ var server = async (input, options) => {
     },
     "chat.params": async (input2, output) => {
       const entry = dispatchDepths.get(input2.sessionID);
-      if (!entry || entry.family === "unknown")
+      if (!entry || entry.kind === "not-injected")
         return;
-      applyDepthToOptions(output.options ?? (output.options = {}), entry.level, entry.family);
+      applyDepthTranslation(output.options ?? (output.options = {}), entry);
     },
     __forgeDispatchTest: {
       queueDepth: queueDispatchDepth,
