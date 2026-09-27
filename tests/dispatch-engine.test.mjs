@@ -318,3 +318,69 @@ test("S7b: deadline fires even when the child-turn message POST never returns", 
   assert.ok(elapsed < 250, `timeout must fire near the 80ms deadline, took ${elapsed}ms`)
   assert.ok(sunk.some((e) => e.event === "timeout"), "timeout must be ledgered")
 })
+
+// B11 — spec: "One retry after a mid-dispatch failure": WHEN the resolved
+// identity fails during the dispatch attempt THEN resolution retries once
+// excluding that identity and the result reports which identity served.
+const CATALOG2 = {
+  providers: {
+    "zai-coding-plan": { models: { "glm-5.3": { reasoningOptions: ["low"], cost: { input: 0.6, output: 2.2, cache_read: 0.11, cache_write: 0.22 } } } },
+    "other-plan": { models: { "glm-5.3": { reasoningOptions: ["low"], cost: { input: 0.5, output: 2.0, cache_read: 0.1, cache_write: 0.2 } } } },
+  },
+}
+const CFG2 = () =>
+  buildDispatchConfig({
+    configuredIdentities: ["zai-coding-plan/glm-5.3", "other-plan/glm-5.3"],
+    catalog: CATALOG2,
+    userRoster: [
+      { model: "zai-coding-plan/glm-5.3", expose: ["low"], profiles: ["quick"] },
+      { model: "other-plan/glm-5.3", expose: ["low"], profiles: ["quick"] },
+    ],
+  })
+const CHILD_A = "ses_child_first"
+const CHILD_B = "ses_child_second"
+
+const twoChildFetcher = (firstPostBehavior) =>
+  fakeFetcher([
+    { match: /\/session\?directory=/, handle: (u, init, calls) => jsonRes({ id: calls.filter((c) => c.url.includes("/session?directory=")).length === 1 ? CHILD_A : CHILD_B }) },
+    {
+      match: new RegExp(`/session/(${CHILD_A}|${CHILD_B})/message$`),
+      handle: async (u, init) => {
+        if (init?.method === "POST") return u.includes(CHILD_A) ? firstPostBehavior() : jsonRes({})
+        if (u.includes(CHILD_A)) return firstPostBehavior === undefined ? jsonRes([]) : jsonRes([{ info: { role: "assistant" }, parts: [] }])
+        return jsonRes([{ info: { role: "assistant", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "served by B" }] }])
+      },
+    },
+  ])
+
+test("B11: a mid-dispatch host failure retries once excluding the failed identity", async () => {
+  const fetcher = twoChildFetcher(() => jsonRes({ "boom": true }, 500))
+  const sunk = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG2(), catalog: CATALOG2, sink: (e) => sunk.push(e) }))
+  const result = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" })
+  assert.equal(result.actual.model, "other-plan/glm-5.3", "the retry's identity is the one that actually served")
+  assert.equal(result.sessionID, CHILD_B)
+  assert.ok(sunk.some((e) => e.event === "retry-excluded" && String(e.note).includes("zai-coding-plan/glm-5.3")), "the exclusion must be ledgered")
+})
+
+test("B11: an empty first attempt retries once excluding the failed identity", async () => {
+  const fetcher = twoChildFetcher(() => jsonRes({}))
+  const sunk = []
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG2(), catalog: CATALOG2, sink: (e) => sunk.push(e) }))
+  const result = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" })
+  assert.equal(result.actual.model, "other-plan/glm-5.3")
+  assert.equal(result.text, "served by B")
+  assert.ok(sunk.filter((e) => e.event === "empty-response").length === 1, "the empty first attempt is ledgered once")
+  assert.ok(sunk.some((e) => e.event === "retry-excluded"))
+})
+
+test("B11: a second consecutive failure is NOT retried again (one retry per dispatch)", async () => {
+  let createCalls = 0
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: `ses_c${++createCalls}` }) },
+    { match: /\/message$/, handle: () => jsonRes({ "boom": true }, 500) },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG2(), catalog: CATALOG2 }))
+  await assert.rejects(() => engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }), (err) => err.code === "host-error")
+  assert.equal(createCalls, 2, "exactly one retry: two attempts total")
+})
