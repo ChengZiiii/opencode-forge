@@ -25,18 +25,18 @@
 
 ## 4. crew：/crew 编排
 
-- [ ] 4.1 `/crew <objective>` 命令注册 + 纪律模板（分解→波次（prompt/tier/depth/验收证据）→按 brief 节奏推进不洪水→逐子任务证据验收→失败至多一次重试→完成报告；draft 期拒绝；每会话单 crew；无参 usage；重启诚实死说明）。验证：命令注册测试 + draft 拒绝 + 单 crew 拒绝路径
-- [ ] 4.2 `crew_close` 工具：ask 级确认；按账本交叉核对（每子任务 verdict+证据、账本里有而报告里无 → 拒关、失败两次必须标 FAIL）；通过后摘要（逐子任务 verdict/账本引用/tokens 成本合计）入账本并结束 crew。验证：stub 覆盖全证据关闭/缺证据拒关/漏子任务拒关/FAIL 可见允许关
+- [x] 4.1 `/crew <objective>` 命令注册 + 纪律模板（分解→波次（prompt/tier/depth/验收证据）→按 brief 节奏推进不洪水→逐子任务证据验收→失败至多一次重试→完成报告；draft 期拒绝；每会话单 crew；无参 usage；重启诚实死说明）。验证：命令注册测试 + draft 拒绝 + 单 crew 拒绝路径
+- [x] 4.2 `crew_close` 工具：ask 级确认；按账本交叉核对（每子任务 verdict+证据、账本里有而报告里无 → 拒关、失败两次必须标 FAIL）；通过后摘要（逐子任务 verdict/账本引用/tokens 成本合计）入账本并结束 crew。验证：stub 覆盖全证据关闭/缺证据拒关/漏子任务拒关/FAIL 可见允许关
 
 ## 5. 数据源与文档
 
 - [x] 5.1 models.dev 拉取与缓存：启动 GET（尊重 `OPENCODE_MODELS_URL`）、失败降级无价目、缓存目录命名空间。验证：单测注入 fetcher 覆盖成功/失败降级
-- [ ] 5.2 README：dispatch+waves+crew 章节（roster/曝光表/精确匹配语义/后台与唤醒/crew 工作流/已知坑：免钥×受限 tier、run 模式后台限制）、文件账本追加、卸载步骤核对。验证：人工审阅 + 文件账本表与实现一致
+- [x] 5.2 README：dispatch+waves+crew 章节（roster/曝光表/精确匹配语义/后台与唤醒/crew 工作流/已知坑：免钥×受限 tier、run 模式后台限制）、文件账本追加、卸载步骤核对。验证：人工审阅 + 文件账本表与实现一致
 
 ## 6. 验证闭环
 
-- [ ] 6.1 `bun run typecheck` + `node --test tests/*.test.mjs` 全绿
-- [ ] 6.2 `bun run bundle` 重建 dist（自包含，无 --packages external）
-- [ ] 6.3 沙盒 E2E 冒烟：复用 probe 模式（`OPENCODE_CONFIG_DIR` + serve + 驱动脚本）对免钥模型跑同步 forge_dispatch（scout/低档只读）与后台派发唤醒各一次，断言结果对象字段、唤醒 brief、账本落盘。验证：脚本与输出存档 verify/e2e-smoke.md
-- [ ] 6.4 官方安装终验：`opencode plugin "git+file:///<repo>" --global` 安装 → 注册/冒烟 → README 四步卸载回干净态（pitfalls 第 7 节梯度）。验证：过程存档 verify/install-verify.md
-- [ ] 6.5 一键验收脚本 `scripts/accept-dispatch-suite.mjs`：净室重跑 typecheck → 全量测试 → bundle → 全新沙盒冒烟，输出单一 PASS/FAIL 与各环节摘要。验证：以脚本自身跑通为准（G 阶段自验）
+- [x] 6.1 `bun run typecheck` + `node --test tests/*.test.mjs` 全绿
+- [x] 6.2 `bun run bundle` 重建 dist（自包含，无 --packages external）
+- [x] 6.3 沙盒 E2E 冒烟：复用 probe 模式（`OPENCODE_CONFIG_DIR` + serve + 驱动脚本）对免钥模型跑同步 forge_dispatch（scout/低档只读）与后台派发唤醒各一次，断言结果对象字段、唤醒 brief、账本落盘。验证：脚本与输出存档 verify/e2e-smoke.md
+- [x] 6.4 官方安装终验：`opencode plugin "git+file:///<repo>" --global` 安装 → 注册/冒烟 → README 四步卸载回干净态（pitfalls 第 7 节梯度）。验证：过程存档 verify/install-verify.md
+- [x] 6.5 一键验收脚本 `scripts/accept-dispatch-suite.mjs`：净室重跑 typecheck → 全量测试 → bundle → 全新沙盒冒烟，输出单一 PASS/FAIL 与各环节摘要。验证：以脚本自身跑通为准（G 阶段自验）

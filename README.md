@@ -114,8 +114,8 @@ and the plugin's command of that name is not registered.
    (the hide was runtime-only). Your `.opencode/plan/` and `.opencode/goal/`
    files are yours; delete them yourself if you want.
 5. Optional runtime debris: delete `<tmp>/opencode-forge/` (job logs, the
-   job registry ledger, and the watchdog ledger — the file ledger table
-   above lists everything).
+   job registry ledger, the watchdog ledger, and the dispatch ledger — the
+   file ledger table above lists everything).
 
 ## File ledger
 
@@ -130,6 +130,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
+| `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger: resolved identity/depth, outcomes, tokens/cost, timeouts, lost-on-exit, crew summaries (bounded, capped rotation) | runtime debris — delete freely, also after uninstall |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
 
@@ -316,6 +317,97 @@ These are runtime debris, not data — with ONE caveat: **if you uninstall with
 `survive` jobs still running, killing them is on you** (`taskkill /PID <pid>
 /F /T`, or just reboot); deleting the directory afterwards is safe and
 complete.
+
+## Worker dispatch (scoped subagents on a chosen model + depth)
+
+`forge_dispatch {prompt, profile, depth}` spawns a child session that runs one
+scoped task on a dynamically chosen model and reasoning depth. The result is
+an honest report: the actual model/depth used, real token counts, a
+self-computed cost (`null` when the model is unpriced), and the worker's
+concluding report.
+
+### Roster and the expose ladder
+
+Tiers pick candidates from a roster you configure (plugin options, your
+config — the plugin never writes it):
+
+```jsonc
+["<plugin>", {
+  "dispatch": {
+    "timeoutMs": 600000,        // per-dispatch deadline, 1000–600000, default 600000
+    "maxConcurrent": 4,         // 1–16, default 4 — one slot pool shared by sync and background
+    "roster": [
+      { "model": "zai-coding-plan/glm-5.3", "expose": ["low", "high"], "profiles": ["scout", "quick"] }
+    ]
+  }
+}]
+```
+
+- `profiles` lists which tiers the model serves; any model with no roster
+  entry is still dispatchable through its native reasoning ladder.
+- `expose` narrows the depth vocabulary the tier may request for that model.
+  Use it when the endpoint only honors a subset of its native ladder.
+- **Exact-match semantics**: `depth` must be verbatim from the exposed
+  vocabulary — there is no clamping and no silent fallback. A mis-set depth
+  is an error that names every candidate and its legal levels. Omit `depth`
+  to use the tier's default when it has one; a tier whose default is not
+  exposed degrades to depth-required (startup warns).
+- Built-in tiers: `scout` (readonly recon), `build` (implementation),
+  `review` (readonly review), `quick` (mechanical small change). Each is
+  materialized as a hidden `forge-<tier>` subagent that carries the tier's
+  permission shape — readonly tiers physically deny `write`/`edit`/`bash`,
+  and every tier denies `task` (no recursive spawning). Startup validation
+  surfaces roster mistakes by name (typos in `expose` error with the legal
+  ladder; dead keys warn).
+
+### Background dispatch and wake briefs
+
+`forge_dispatch` takes `background: true`: it returns
+`{dispatchId, tier, requested, resolved, depth, queuedAt}` immediately and
+the full result arrives later as a coalesced `[forge:dispatch-complete]`
+brief — debounced, never interrupting an active turn (delivery waits for an
+idle), each terminal delivered exactly once, and merged into a single
+combined re-prompt when a goal continuation fires on the same idle.
+`forge_dispatch_list` recovers in-flight and recent terminal state (with
+dispatchIds) after context compaction; `forge_dispatch_kill {dispatchId}`
+stops polling, suppresses the brief, and ledgers `killed`. On host exit,
+in-flight dispatches are ledgered `lost-on-exit` — sessions are host memory
+objects, there are no orphan processes and no survive semantics.
+
+### Crew workflow (`/crew`)
+
+`/crew <objective>` registers a crew: decompose the objective into
+evidence-checked subtasks, dispatch them as background waves paced on
+completion briefs (**never past the concurrency cap — launch the next batch
+only as briefs free capacity**), at most ONE retry per failed subtask, then
+`crew_close` with the full report. The close is a hard gate: every subtask
+needs a PASS/FAIL verdict with evidence, a FAIL needs both failure reports,
+and the report is cross-checked against the dispatch ledger — a dispatched
+subtask missing from the report refuses the close (refusals never bother you
+with a dialog). A valid close asks once, appends a crew summary to the
+ledger, and ends the crew. Crew state is in-memory by design: a host restart
+ends it honestly and the ledger keeps the history.
+
+### Known pitfalls
+
+- **Keyless endpoints × restricted tiers**: free/keyless providers can return
+  a deterministic EMPTY response for any toolset-reduced (readonly) tier —
+  0 tokens, no parts. The plugin detects this and fails the dispatch honestly
+  (`empty-response`, never counted as success); use a write tier or a keyed
+  provider for readonly tiers on such endpoints.
+- **`opencode run` and background**: a finished run-mode session cannot be
+  re-prompted, so completion briefs have nowhere to land — completions are
+  ledger-only (read them via `forge_dispatch_list`). Background mode targets
+  live TUI sessions; prefer sync under `opencode run`.
+- **Host tool ceiling (~262s observed on 1.18.32)**: the host may kill a
+  sync tool call that exceeds roughly 262 seconds even though the plugin's
+  own deadline is higher. Keep `timeoutMs` at or below ~240000 for
+  sync-heavy workflows; a killed call still leaves the child session
+  reclaimable via `forge_dispatch_list` / the host API.
+- **Child permission asks**: a worker that hits a permission ask surfaces the
+  ask on the CHILD's session in the TUI. An unanswered ask stalls the child
+  until the dispatch deadline — scope worker prompts to avoid permission
+  boundaries (readonly tiers and workspace-relative paths help).
 
 ## Hang watchdog (a stuck builtin shell unblocks itself)
 

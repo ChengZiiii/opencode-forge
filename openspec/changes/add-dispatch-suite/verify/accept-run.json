@@ -1,0 +1,26 @@
+{
+  "ok": 1,
+  "stages": [
+    {
+      "name": "typecheck (tsc --noEmit)",
+      "pass": true,
+      "detail": "0 errors"
+    },
+    {
+      "name": "full test suite",
+      "pass": true,
+      "detail": "266 pass / 0 fail"
+    },
+    {
+      "name": "bundle (bun run bundle)",
+      "pass": true,
+      "detail": "dist/index.js rebuilt"
+    },
+    {
+      "name": "sandbox E2E smoke (dispatch-probe-g)",
+      "pass": true,
+      "detail": "10/10 assertions"
+    }
+  ],
+  "at": "2026-09-27T02:07:04.707Z"
+}
