@@ -9,6 +9,8 @@
 // The plugin only ever READS forge.json. Onboarding happens through the error
 // recipe (see forgeRecipe below), never by generating the file.
 
+import { readFileSync, statSync } from "node:fs"
+
 export type AgentShape = "readonly" | "write"
 
 export type ForgeAgentDef = {
@@ -273,4 +275,96 @@ export function parseForgeJsonc(text: string): JsoncParseOk | JsoncParseErr {
     return { ok: false, error: { message: 'forge.json "agents" must be an object mapping agent ids to definitions', line: 1, column: 1 } }
   }
   return { ok: true, config: { agents: agents as Record<string, ForgeAgentDef> } }
+}
+
+// ---------------------------------------------------------------------------
+// Cascade + seed (task 1.2)
+// ---------------------------------------------------------------------------
+
+// Placeholder identity for the seed: a fictional provider ("Local") that can
+// never appear in a real host config, so any dispatch on the seed fails
+// deterministically with the onboarding recipe (design D5).
+export const PLACEHOLDER_IDENTITY = "Local/GPT Luna"
+
+export const SEED_AGENTS: Record<string, ForgeAgentDef> = {
+  research: { model: PLACEHOLDER_IDENTITY, depths: ["low", "medium"], shape: "readonly" },
+  review: { model: PLACEHOLDER_IDENTITY, depths: ["medium", "high", "max"], shape: "readonly" },
+}
+
+export type ForgeConfigSource = "project" | "global" | "seed"
+
+export type ForgeConfigFinding = {
+  level: "error" | "warn" | "notice"
+  code: string
+  message: string
+}
+
+export type LoadedForgeConfig = {
+  agents: Record<string, ForgeAgentDef>
+  source: ForgeConfigSource
+  // null for the seed (no file backs it).
+  path: string | null
+  findings: ForgeConfigFinding[]
+}
+
+export function forgeConfigPaths(opts: { projectDir?: string; homeDir?: string }): { project: string; global: string } {
+  const sep = opts.projectDir?.includes("\\") && !opts.projectDir?.includes("/") ? "\\" : "/"
+  const project = opts.projectDir ? `${opts.projectDir}${sep}.opencode${sep}forge.json` : ""
+  const global = opts.homeDir ? `${opts.homeDir}${sep}.config${sep}opencode${sep}forge.json` : ""
+  return { project, global }
+}
+
+export type ForgeConfigLoaderDeps = {
+  projectDir?: string
+  homeDir?: string
+  // Injectable for tests; null stat = file missing.
+  stat?: (path: string) => { mtimeMs: number; size: number } | null
+  readFile?: (path: string) => string
+}
+
+export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): LoadedForgeConfig } {
+  const stat =
+    deps.stat ??
+    ((path: string) => {
+      try {
+        const s = statSync(path)
+        return { mtimeMs: s.mtimeMs, size: s.size }
+      } catch {
+        return null
+      }
+    })
+  const readFile = deps.readFile ?? ((path: string) => readFileSync(path, "utf8"))
+  const paths = forgeConfigPaths({ projectDir: deps.projectDir, homeDir: deps.homeDir })
+
+  const readCandidate = (path: string, source: Exclude<ForgeConfigSource, "seed">): LoadedForgeConfig | null => {
+    if (stat(path) === null) return null
+    const parsed = parseForgeJsonc(readFile(path))
+    if (!parsed.ok) {
+      // Design D9: a broken winning file falls back to the SEED, never to the
+      // next cascade level — no half-configured hybrid states.
+      return {
+        agents: { ...SEED_AGENTS },
+        source: "seed",
+        path: null,
+        findings: [
+          {
+            level: "error",
+            code: "config-parse-error",
+            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — fell back to the built-in seed`,
+          },
+        ],
+      }
+    }
+    return { agents: parsed.config.agents, source, path, findings: [] }
+  }
+
+  return {
+    load(): LoadedForgeConfig {
+      const project = paths.project ? readCandidate(paths.project, "project") : null
+      if (project) return project
+      const global = paths.global ? readCandidate(paths.global, "global") : null
+      if (global) return global
+      return { agents: { ...SEED_AGENTS }, source: "seed", path: null, findings: [] }
+    },
+  }
 }
