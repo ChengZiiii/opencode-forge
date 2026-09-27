@@ -9,7 +9,7 @@ import assert from "node:assert/strict"
 // 1.1 parseForgeJsonc: comments / trailing commas / strings containing comment
 // markers / escaped quotes / bad JSON with a located error.
 
-import { parseForgeJsonc, forgeConfigPaths, createForgeConfigLoader, SEED_AGENTS, PLACEHOLDER_IDENTITY } from "../src/forge-config.ts"
+import { parseForgeJsonc, forgeConfigPaths, createForgeConfigLoader, SEED_AGENTS, PLACEHOLDER_IDENTITY, forgeRecipe } from "../src/forge-config.ts"
 
 test("1.1 line and block comments are stripped", () => {
   const r = parseForgeJsonc(`{
@@ -201,4 +201,45 @@ test("1.4 a broken file reports the parse error, not the unconfigured notice", (
   const codes = loaded.findings.map((f) => f.code)
   assert.ok(codes.includes("config-parse-error"))
   assert.ok(!codes.includes("dispatch-unconfigured"))
+})
+
+// ---------------------------------------------------------------------------
+// 2.2 the onboarding recipe (spec delta — ADDED "Seed placeholder onboarding"):
+// machine-actionable, four blocks — detected identities (strings only, no
+// ladders), file paths, copy-paste template with inline comments, verify
+// dispatch + extension hints.
+
+test("2.2 recipe carries the four blocks and uses the injected detection list", () => {
+  const recipe = forgeRecipe({
+    detectedIdentities: ["zai-coding-plan/glm-5.3", "anthropic/claude-haiku-4-5"],
+    projectPath: "/w/.opencode/forge.json",
+    globalPath: "/h/.config/opencode/forge.json",
+  })
+  // 1. detected identities, strings only
+  assert.ok(recipe.includes("zai-coding-plan/glm-5.3"))
+  assert.ok(recipe.includes("anthropic/claude-haiku-4-5"))
+  // 2. both file paths
+  assert.ok(recipe.includes("/w/.opencode/forge.json"))
+  assert.ok(recipe.includes("/h/.config/opencode/forge.json"))
+  // 3. copy-paste template block with inline comments
+  assert.ok(recipe.includes('"agents"'))
+  assert.ok(recipe.includes('"model"'))
+  assert.ok(recipe.includes('"depths"'))
+  assert.ok(recipe.includes("//"), "template carries inline comments")
+  // the template itself must round-trip through the JSONC parser
+  const block = recipe.slice(recipe.indexOf("{"), recipe.lastIndexOf("}") + 1)
+  const parsed = parseForgeJsonc(block)
+  assert.equal(parsed.ok, true, `template block parses (got ${!parsed.ok && parsed.error.message})`)
+  assert.ok(parsed.config.agents.research, "template defines research")
+  // 4. verification dispatch
+  assert.ok(recipe.includes("forge_dispatch"))
+  // 5. extension hints
+  assert.ok(recipe.includes("shape"))
+  assert.ok(recipe.toLowerCase().includes("write"))
+})
+
+test("2.2 recipe works with an empty detection list (keyless hosts)", () => {
+  const recipe = forgeRecipe({ detectedIdentities: [], projectPath: "/w/.opencode/forge.json", globalPath: "/h/.config/opencode/forge.json" })
+  assert.ok(recipe.includes("forge.json"))
+  assert.ok(recipe.includes("(none detected"), "empty list is stated plainly")
 })
