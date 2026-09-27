@@ -9,7 +9,7 @@ import assert from "node:assert/strict"
 // 1.1 parseForgeJsonc: comments / trailing commas / strings containing comment
 // markers / escaped quotes / bad JSON with a located error.
 
-import { parseForgeJsonc } from "../src/forge-config.ts"
+import { parseForgeJsonc, forgeConfigPaths, createForgeConfigLoader, SEED_AGENTS, PLACEHOLDER_IDENTITY } from "../src/forge-config.ts"
 
 test("1.1 line and block comments are stripped", () => {
   const r = parseForgeJsonc(`{
@@ -70,4 +70,57 @@ test("1.1 bad JSON errors with a located message", () => {
 test("1.1 non-object top level is a parse error", () => {
   const r = parseForgeJsonc(`[1, 2]`)
   assert.equal(r.ok, false)
+})
+
+// ---------------------------------------------------------------------------
+// 1.2 three-level cascade, single winning source, no merging.
+
+const GLOBAL_TEXT = `{
+  "agents": {
+    "reviewer": { "model": "anthropic/claude-haiku-4-5", "depths": ["medium", "high"] }
+  }
+}`
+const PROJECT_TEXT = `{
+  "agents": {
+    "research": { "model": "zai/glm-5.3", "depths": ["low", "high", "max"] }
+  }
+}`
+
+function loaderWith(files) {
+  return createForgeConfigLoader({
+    projectDir: "/w",
+    homeDir: "/h",
+    stat: (p) => (files[p] ? { mtimeMs: files[p].mtime ?? 1, size: files[p].text.length } : null),
+    readFile: (p) => files[p].text,
+  })
+}
+
+test("1.2 project file wins fully — global is not merged in", () => {
+  const paths = forgeConfigPaths({ projectDir: "/w", homeDir: "/h" })
+  assert.equal(paths.project, "/w/.opencode/forge.json")
+  assert.equal(paths.global, "/h/.config/opencode/forge.json")
+  const loader = loaderWith({ "/w/.opencode/forge.json": { text: PROJECT_TEXT }, "/h/.config/opencode/forge.json": { text: GLOBAL_TEXT } })
+  const loaded = loader.load()
+  assert.equal(loaded.source, "project")
+  assert.equal(loaded.path, "/w/.opencode/forge.json")
+  assert.deepEqual(Object.keys(loaded.agents), ["research"], "global-only agents must not leak in")
+})
+
+test("1.2 global file serves when no project file exists", () => {
+  const loader = loaderWith({ "/h/.config/opencode/forge.json": { text: GLOBAL_TEXT } })
+  const loaded = loader.load()
+  assert.equal(loaded.source, "global")
+  assert.deepEqual(Object.keys(loaded.agents), ["reviewer"])
+})
+
+test("1.2 seed serves when neither file exists — research/review pinned to the placeholder", () => {
+  const loader = loaderWith({})
+  const loaded = loader.load()
+  assert.equal(loaded.source, "seed")
+  assert.equal(loaded.path, null)
+  assert.deepEqual(Object.keys(loaded.agents).sort(), ["research", "review"])
+  assert.equal(loaded.agents.research.model, PLACEHOLDER_IDENTITY)
+  assert.equal(PLACEHOLDER_IDENTITY, "Local/GPT Luna")
+  assert.deepEqual(SEED_AGENTS.research.depths, ["low", "medium"])
+  assert.deepEqual(SEED_AGENTS.review.depths, ["medium", "high", "max"])
 })
