@@ -62,6 +62,8 @@ function baseDeps(fetcher, over = {}) {
     available: () => true,
     sink: over.sink ?? (() => {}),
     onDepth: over.onDepth ?? (() => {}),
+    legacy: over.legacy ?? true,
+    agents: over.agents ?? (() => ({})),
     providerFamily: over.providerFamily ?? (() => "openai"),
     pollIntervalMs: 0,
     ...over,
@@ -95,9 +97,9 @@ test("S6: a successful dispatch reports actuals honestly (exact match, tokens, c
       onDepth: (sid, translation) => depths.push({ sid, translation }),
     }),
   )
-  const r = await engine.dispatch({ prompt: "check things", profile: "scout", depth: "low" }, "ses_parent")
-  assert.equal(r.tier, "scout")
-  assert.deepEqual(r.requested, { profile: "scout", depth: "low" })
+  const r = await engine.dispatch({ prompt: "check things", agent: "scout", depth: "low" }, "ses_parent")
+  assert.equal(r.agent, "scout")
+  assert.deepEqual(r.requested, { agent: "scout", depth: "low" })
   assert.equal(r.actual.model, "zai-coding-plan/glm-5.3")
   assert.equal(r.actual.depth, "low") // exact match — identical to requested
   assert.equal(r.sessionID, CHILD)
@@ -132,7 +134,7 @@ test("S7: timeout throws an honest report with sessionID + elapsed; no success i
     }),
   )
   await assert.rejects(
-    () => engine.dispatch({ prompt: "slow", profile: "scout", depth: "low" }),
+    () => engine.dispatch({ prompt: "slow", agent: "scout", depth: "low" }),
     (err) => {
       assert.equal(err.code, "timeout")
       assert.match(err.message, new RegExp(CHILD))
@@ -154,12 +156,12 @@ test("S8: the concurrency cap refuses excess dispatches with the count and a ret
     } },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { maxConcurrent: 2 }))
-  const a = engine.dispatch({ prompt: "a", profile: "scout", depth: "low" })
-  const b = engine.dispatch({ prompt: "b", profile: "scout", depth: "low" })
+  const a = engine.dispatch({ prompt: "a", agent: "scout", depth: "low" })
+  const b = engine.dispatch({ prompt: "b", agent: "scout", depth: "low" })
   await new Promise((r) => setTimeout(r, 5))
   assert.equal(engine.inFlightCount(), 2)
   await assert.rejects(
-    () => engine.dispatch({ prompt: "c", profile: "scout", depth: "low" }),
+    () => engine.dispatch({ prompt: "c", agent: "scout", depth: "low" }),
     (err) => {
       assert.equal(err.code, "cap-refused")
       assert.match(err.message, /2 dispatches already in flight/)
@@ -177,7 +179,7 @@ test("S8: the concurrency cap refuses excess dispatches with the count and a ret
 test("menu errors are thrown with the full menu and vocabulary", async () => {
   const engine = createDispatchEngine(baseDeps(fakeFetcher([])))
   await assert.rejects(
-    () => engine.dispatch({ prompt: "x", profile: "build", depth: "medium" }),
+    () => engine.dispatch({ prompt: "x", agent: "build", depth: "medium" }),
     (err) => {
       assert.equal(err.code, "no-candidate")
       assert.match(err.message, /Menu:/)
@@ -195,7 +197,7 @@ test("B27: an empty response is an honest error, never a silent success", async 
   const sunk = []
   const engine = createDispatchEngine(baseDeps(fetcher, { sink: (e) => sunk.push(e) }))
   await assert.rejects(
-    () => engine.dispatch({ prompt: "x", profile: "scout", depth: "low" }),
+    () => engine.dispatch({ prompt: "x", agent: "scout", depth: "low" }),
     (err) => {
       assert.equal(err.code, "empty-response")
       assert.match(err.message, /empty response/)
@@ -212,7 +214,7 @@ test("unknown provider family is disclosed, not guessed", async () => {
     { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "done" }] }])) },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { providerFamily: () => null }))
-  const r = await engine.dispatch({ prompt: "x", profile: "scout", depth: "low" })
+  const r = await engine.dispatch({ prompt: "x", agent: "scout", depth: "low" })
   assert.equal(r.depthTranslation, "not injected (unknown provider shape)")
 })
 
@@ -232,7 +234,7 @@ test("3.2 empty catalog ladder passes the depth through unverified", async () =>
   ])
   const depths = []
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg, catalog, onDepth: (sid, t) => depths.push({ sid, t }) }))
-  const r = await engine.dispatch({ prompt: "x", profile: "scout", depth: "low" })
+  const r = await engine.dispatch({ prompt: "x", agent: "scout", depth: "low" })
   assert.match(r.depthTranslation, /unverified/)
   assert.equal(depths[0].t.word, "low")
 })
@@ -250,7 +252,7 @@ test("3.2 budget-family translation is injected and disclosed", async () => {
     { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "done" }] }])) },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg, providerFamily: () => "anthropic" }))
-  const r = await engine.dispatch({ prompt: "x", profile: "scout", depth: "high" })
+  const r = await engine.dispatch({ prompt: "x", agent: "scout", depth: "high" })
   assert.equal(r.depthTranslation, "canonical high → native thinking budget:24576")
 })
 
@@ -269,7 +271,7 @@ test("B32: parentID is best-effort — a 400 on the parent-bearing create retrie
     { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "done" }] }])) },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { providerFamily: () => null }))
-  const r = await engine.dispatch({ prompt: "x", profile: "scout", depth: "low" }, "ses_parent")
+  const r = await engine.dispatch({ prompt: "x", agent: "scout", depth: "low" }, "ses_parent")
   assert.equal(r.text, "done")
   assert.deepEqual(bodies[0], { parentID: "ses_parent" })
   assert.deepEqual(bodies[1], {})
@@ -287,7 +289,7 @@ test("S19: dispose records in-flight dispatches as lost-on-exit", async () => {
   ])
   const sunk = []
   const engine = createDispatchEngine(baseDeps(fetcher, { sink: (e) => sunk.push(e) }))
-  const running = engine.dispatch({ prompt: "x", profile: "scout", depth: "low" })
+  const running = engine.dispatch({ prompt: "x", agent: "scout", depth: "low" })
   await new Promise((r) => setTimeout(r, 5))
   engine.dispose()
   resolveOuter()
@@ -325,7 +327,7 @@ test("S7a: deadline fires while the child-turn message POST is still in flight",
   const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 80, pollIntervalMs: 10, sink: (e) => sunk.push(e) }))
   const t0 = Date.now()
   await assert.rejects(
-    () => Promise.race([engine.dispatch({ prompt: "slow turn", profile: "quick", depth: "low" }), failAfter(1500, "S7a")]),
+    () => Promise.race([engine.dispatch({ prompt: "slow turn", agent: "quick", depth: "low" }), failAfter(1500, "S7a")]),
     (err) => {
       assert.equal(err.code, "timeout")
       assert.match(err.message, new RegExp(CHILD))
@@ -349,7 +351,7 @@ test("S7b: deadline fires even when the child-turn message POST never returns", 
   const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 80, pollIntervalMs: 10, sink: (e) => sunk.push(e) }))
   const t0 = Date.now()
   await assert.rejects(
-    () => Promise.race([engine.dispatch({ prompt: "hung turn", profile: "quick", depth: "low" }), failAfter(1500, "S7b")]),
+    () => Promise.race([engine.dispatch({ prompt: "hung turn", agent: "quick", depth: "low" }), failAfter(1500, "S7b")]),
     (err) => {
       assert.equal(err.code, "timeout")
       return true
@@ -398,7 +400,7 @@ test("B11: a mid-dispatch host failure retries once excluding the failed identit
   const fetcher = twoChildFetcher(() => jsonRes({ "boom": true }, 500))
   const sunk = []
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG2(), catalog: CATALOG2, sink: (e) => sunk.push(e) }))
-  const result = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" })
+  const result = await engine.dispatch({ prompt: "x", agent: "quick", depth: "low" })
   assert.equal(result.actual.model, "other-plan/glm-5.3", "the retry's identity is the one that actually served")
   assert.equal(result.sessionID, CHILD_B)
   assert.ok(sunk.some((e) => e.event === "retry-excluded" && String(e.note).includes("zai-coding-plan/glm-5.3")), "the exclusion must be ledgered")
@@ -408,7 +410,7 @@ test("B11: an empty first attempt retries once excluding the failed identity", a
   const fetcher = twoChildFetcher(() => jsonRes({}))
   const sunk = []
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG2(), catalog: CATALOG2, sink: (e) => sunk.push(e) }))
-  const result = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" })
+  const result = await engine.dispatch({ prompt: "x", agent: "quick", depth: "low" })
   assert.equal(result.actual.model, "other-plan/glm-5.3")
   assert.equal(result.text, "served by B")
   assert.ok(sunk.filter((e) => e.event === "empty-response").length === 1, "the empty first attempt is ledgered once")
@@ -422,7 +424,7 @@ test("B11: a second consecutive failure is NOT retried again (one retry per disp
     { match: /\/message$/, handle: () => jsonRes({ "boom": true }, 500) },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG2(), catalog: CATALOG2 }))
-  await assert.rejects(() => engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }), (err) => err.code === "host-error")
+  await assert.rejects(() => engine.dispatch({ prompt: "x", agent: "quick", depth: "low" }), (err) => err.code === "host-error")
   assert.equal(createCalls, 2, "exactly one retry: two attempts total")
 })
 
@@ -442,9 +444,9 @@ test("3.2: background submit returns a handle immediately and completes asynchro
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg }))
   const before = new Date().toISOString()
-  const handle = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }, undefined, { background: true })
+  const handle = await engine.dispatch({ prompt: "x", agent: "quick", depth: "low" }, undefined, { background: true })
   assert.ok(handle.dispatchId, "handle carries dispatchId")
-  assert.equal(handle.tier, "quick")
+  assert.equal(handle.agent, "quick")
   assert.equal(handle.resolved, "zai-coding-plan/glm-5.3", "resolution happened eagerly")
   assert.ok(handle.queuedAt >= before, "queuedAt is stamped")
   assert.equal(handle.text, undefined, "no result text on the handle")
@@ -459,7 +461,7 @@ test("3.2: background resolution errors return synchronously before any session 
   const fetcher = fakeFetcher([])
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg }))
   await assert.rejects(
-    () => engine.dispatch({ prompt: "x", profile: "quick", depth: "medium" }, undefined, { background: true }),
+    () => engine.dispatch({ prompt: "x", agent: "quick", depth: "medium" }, undefined, { background: true }),
     (err) => err.code === "no-candidate",
   )
   assert.equal(fetcher.calls.filter((c) => c.url.includes("/session?directory=")).length, 0, "nothing spawned")
@@ -473,10 +475,10 @@ test("3.2: the concurrency cap is one pool — over-cap background submits are r
     { match: /\/message$/, handle: async () => { await gate; return jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "ok" }] }]) } },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg, maxConcurrent: 1 }))
-  const syncRunning = engine.dispatch({ prompt: "a", profile: "quick", depth: "low" })
+  const syncRunning = engine.dispatch({ prompt: "a", agent: "quick", depth: "low" })
   await new Promise((r) => setTimeout(r, 5))
   await assert.rejects(
-    () => engine.dispatch({ prompt: "b", profile: "quick", depth: "low" }, undefined, { background: true }),
+    () => engine.dispatch({ prompt: "b", agent: "quick", depth: "low" }, undefined, { background: true }),
     (err) => { assert.equal(err.code, "cap-refused"); assert.match(err.message, /already in flight/); assert.match(err.message, /cap 1/); return true },
   )
   await syncRunning
@@ -494,7 +496,7 @@ test("3.2: background timeout marks the registry entry and never throws to the c
   ])
   let pollCount = 0
   const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 60, pollIntervalMs: 10, cfg: CFG(), catalog: CATALOG, registry: reg }))
-  const handle = await engine.dispatch({ prompt: "slow", profile: "quick", depth: "low" }, undefined, { background: true })
+  const handle = await engine.dispatch({ prompt: "slow", agent: "quick", depth: "low" }, undefined, { background: true })
   for (let i = 0; i < 100 && reg.get(handle.dispatchId).state !== "timeout"; i++) await new Promise((r) => setTimeout(r, 10))
   const entry = reg.get(handle.dispatchId)
   assert.equal(entry.state, "timeout")
@@ -509,7 +511,7 @@ test("3.2: kill stops the poll loop, marks killed, and suppresses the wake", asy
     { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : new Promise(() => {})) },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 3_000, pollIntervalMs: 10, cfg: CFG(), catalog: CATALOG, registry: reg }))
-  const handle = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }, undefined, { background: true })
+  const handle = await engine.dispatch({ prompt: "x", agent: "quick", depth: "low" }, undefined, { background: true })
   await new Promise((r) => setTimeout(r, 30))
   engine.kill(handle.dispatchId)
   for (let i = 0; i < 100 && reg.get(handle.dispatchId).state !== "killed"; i++) await new Promise((r) => setTimeout(r, 10))
@@ -524,7 +526,7 @@ test("3.2: killing an already-terminal dispatch fails honestly, result-after-kil
     { match: new RegExp(`/session/${CHILD}/message$`), handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "done" }] }])) },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg }))
-  const handle = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }, undefined, { background: true })
+  const handle = await engine.dispatch({ prompt: "x", agent: "quick", depth: "low" }, undefined, { background: true })
   await settle()
   assert.throws(() => engine.kill(handle.dispatchId), (err) => { assert.match(err.message, /already completed/); return true })
   // and a kill that lands while the pipeline is settling gets the late note
@@ -533,7 +535,7 @@ test("3.2: killing an already-terminal dispatch fails honestly, result-after-kil
     { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
     { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "late" }] }])) },
   ]), { cfg: CFG(), catalog: CATALOG, registry: reg2 }))
-  const h2 = await engine2.dispatch({ prompt: "x", profile: "quick", depth: "low" }, undefined, { background: true })
+  const h2 = await engine2.dispatch({ prompt: "x", agent: "quick", depth: "low" }, undefined, { background: true })
   await settle()
   try { engine2.kill(h2.dispatchId) } catch { /* already terminal on this scheduler — acceptable race */ }
   const e = reg2.get(h2.dispatchId)
@@ -555,11 +557,11 @@ test("B39: background dispatches filling the pool refuse sync dispatches as well
     } },
   ])
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg, maxConcurrent: 1 }))
-  const bg = await engine.dispatch({ prompt: "bg", profile: "quick", depth: "low" }, undefined, { background: true })
+  const bg = await engine.dispatch({ prompt: "bg", agent: "quick", depth: "low" }, undefined, { background: true })
   await settle()
   assert.equal(reg.get(bg.dispatchId).state, "running", "the background dispatch owns the only slot")
   await assert.rejects(
-    () => engine.dispatch({ prompt: "sync", profile: "quick", depth: "low" }),
+    () => engine.dispatch({ prompt: "sync", agent: "quick", depth: "low" }),
     (err) => { assert.equal(err.code, "cap-refused"); return true },
   )
   release()
@@ -582,8 +584,8 @@ test("B42: dispose with several in-flight background dispatches ledger each as l
   ])
   const sunk = []
   const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg, sink: (e) => sunk.push(e) }))
-  const h1 = await engine.dispatch({ prompt: "a", profile: "quick", depth: "low" }, undefined, { background: true })
-  const h2 = await engine.dispatch({ prompt: "b", profile: "quick", depth: "low" }, undefined, { background: true })
+  const h1 = await engine.dispatch({ prompt: "a", agent: "quick", depth: "low" }, undefined, { background: true })
+  const h2 = await engine.dispatch({ prompt: "b", agent: "quick", depth: "low" }, undefined, { background: true })
   assert.notEqual(h1.dispatchId, h2.dispatchId)
   await settle()
   assert.equal(reg.list().inFlight.length, 2, "both sit in the registry as running")
