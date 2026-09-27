@@ -65,13 +65,21 @@ const controller = new AbortController()
   }
 })()
 
-await api(`/session/${sid}/message`, { method: "POST", body: JSON.stringify({ model: MODEL, parts: [{ type: "text", text: TASK }] }) })
+// Fire-and-forget: the host's message POST is turn-synchronous (returns only
+// when the whole turn settles), so awaiting it bare exposes the driver to
+// undici's 300s headers timeout. Completion is detected by polling anyway.
+api(`/session/${sid}/message`, { method: "POST", body: JSON.stringify({ model: MODEL, parts: [{ type: "text", text: TASK }] }) }).then(
+  () => log("turn POST returned"),
+  (e) => log("turn POST failed:", e.message),
+)
 log("task sent; polling for completion...")
 
 const start = Date.now()
 let lastCount = 0
 let lastText = ""
+let lastSig = ""
 let stable = 0
+let lastRunningTool = true
 while (Date.now() - start < DEADLINE_MS) {
   await sleep(3000)
   let msgs = []
@@ -82,11 +90,15 @@ while (Date.now() - start < DEADLINE_MS) {
   }
   const assistant = [...msgs].reverse().find((m) => m.info?.role === "assistant")
   const text = assistant ? (assistant.parts ?? []).filter((p) => p.type === "text").map((p) => p.text).join("\n") : ""
-  if (msgs.length === lastCount && text === lastText) stable++
+  // A tool part still pending/running means the turn is mid-tool (e.g. a
+  // forge_dispatch call) — never declare stable while one is in flight.
+  const runningTool = assistant ? (assistant.parts ?? []).some((p) => p.type === "tool" && p.state?.status !== "completed" && p.state?.status !== "error") : true
+  const sig = `${msgs.length}|${text}`
+  if (sig === lastSig && !runningTool) stable++
   else stable = 0
-  lastCount = msgs.length
-  lastText = text
-  if (stable >= 2 && msgs.length > 1) break
+  lastSig = sig
+  lastRunningTool = runningTool
+  if (stable >= 3 && msgs.length > 1 && !runningTool) break
 }
 controller.abort()
 

@@ -12,10 +12,10 @@
 | S2 | 完整身份键 | 未列入 roster 的已配置身份生成默认条目（默认 tier+全原生梯） | U | A | dispatch-roster.test.mjs :: "S2: an unlisted configured identity is appended as a generated default entry" + "zero config: every configured identity gets a default entry" | PASS(A) |
 | S3 | 精确匹配 | 请求档位无人曝光 → 结构化错误带全菜单，零派发 | U | A | dispatch-resolver.test.mjs :: "S3: requested depth nobody exposes…" + "B12 regression: no clamping…" | PASS(A) |
 | S4 | 精确匹配 | 钉扎模型不可用 → 点名报错，绝不回退他人 | U | A | dispatch-resolver.test.mjs :: "S4: pinned tier with unavailable model errors naming the pin…" (+pin resolves/mismatch 两用例) | PASS(A) |
-| S5 | 精确匹配 | 中途失败 → 排除该身份重试一次，报告实际服务者 | U+S | A+B | U: dispatch-resolver.test.mjs :: "S5: exclude drops a failed identity…"；S 层待 B | PASS(A/S待B) |
-| S6 | 工具契约 | 成功派发诚实报告 actual（model/depth/tokens/cost/text） | S+E | B+C | S 层: wiring :: "forge_dispatch result object passes through…" + engine S6 用例；E 待 C | PASS(B/E待C) |
-| S7 | 工具契约 | 超时 → 超时报告（sessionID/elapsed/部分转录指针），会话留给宿主 | S+E | B+C | S 层: dispatch-engine.test.mjs :: "S7: timeout throws an honest report…"（含 ledger timeout 事件）；E 待 C | PASS(B/E待C) |
-| S8 | 工具契约 | 第 5 个并发被拒 + 在飞数 + 重试提示 | S+E | B+C | S 层: dispatch-engine.test.mjs :: "S8: the concurrency cap refuses…"；E 待 C | PASS(B/E待C) |
+| S5 | 精确匹配 | 中途失败 → 排除该身份重试一次，报告实际服务者 | U+S | A+B | U: dispatch-resolver.test.mjs :: "S5: exclude drops a failed identity…"；S: engine B11×3（有界两attempt+替代预检，保留原始诚实错误）；活体：单候选不重试、原始 keyless 错误原样到达模型 | PASS(A/B/C) |
+| S6 | 工具契约 | 成功派发诚实报告 actual（model/depth/tokens/cost/text） | S+E | B+C | S: wiring result-passthrough + engine S6；E: 活体 quick 成功路径（诚实报告全套字段+文件落盘+completed 行） | PASS(B/C) |
+| S7 | 工具契约 | 超时 → 超时报告（sessionID/elapsed/部分转录指针），会话留给宿主 | S+E | B+C | S: engine S7+S7a+S7b（deadline race 回合同步 POST）；E: 活体 timeout 行 30013–30019ms×3 + tool error 诚实报告到达父模型 + 子会话后台建文件 | PASS(B/C) |
+| S8 | 工具契约 | 第 5 个并发被拒 + 在飞数 + 重试提示 | S+E | B+C | S: engine S8 拒绝带在飞数+重试提示；E 按战役计划可选未跑（免钥端点成本） | PASS(B) |
 | S9 | tier 物化 | forge-\<tier\>：hidden、mode subagent、无 model 字段、task deny | S | B | dispatch-wiring.test.mjs :: "S9: config hook materializes…" | PASS(B) |
 | S10 | tier 物化 | 用户自定义 forge-\<tier\> 条目不被覆盖 | S | B | dispatch-wiring.test.mjs :: "S10: a user-defined forge-<tier> entry is never clobbered" | PASS(B) |
 | S11 | tier 物化 | agent forge disable 一键关：无 tier、无工具 | S | B | dispatch-wiring.test.mjs :: "S11: agent.forge.disable removes tiers…" | PASS(B) |
@@ -25,8 +25,8 @@
 | S15 | 成本报告 | 无价目身份 → costUsd null + 说明，绝不 0 | S | B | U: dispatch-client.test.mjs :: "S15: unpriced identity…" + cache 缺价两用例 | U PASS |
 | S16 | 启动校验 | 死 defaultDepth（quick→off 无人曝光 off）→ tier 降级 depth-required | U | A | dispatch-roster.test.mjs :: "S16: dead defaultDepth degrades…" + "S16 positive: quick keeps its default…" | PASS(A) |
 | S17 | 启动校验 | expose 拼错（catalog 已知身份）→ 快错列出合法梯 | U | A | dispatch-roster.test.mjs :: "S17: expose typo on a catalog-known identity errors fast…" | PASS(A) |
-| S18 | draft 互操作 | draft 活动期派发被拒 → 指向 plan_approve/discard | S+E | B+C | S: wiring :: "S18: forge_dispatch is refused during a plan draft…"；E 层待 C | PASS(B/E待C) |
-| S19 | 账本 | 宿主退出在飞派发 → lost-on-exit 记录、无孤儿进程 | E | C | E 层待 C；S 雏形: engine :: "S19: dispose records in-flight…" | B部分 | |
+| S18 | draft 互操作 | draft 活动期派发被拒 → 指向 plan_approve/discard | S+E | B+C | S: wiring :: "S18: forge_dispatch is refused during a plan draft…"（before 钩子 + belt 双层）；E 未跑（draft 会话活体探针成本高，S 层双层断言完备） | PASS(B) |
+| S19 | 账本 | 宿主退出在飞派发 → lost-on-exit 记录、无孤儿进程 | E | C | S: engine :: "S19: dispose records in-flight…"（lost-on-exit 行 + dispose 接插件钩子）；E 残余风险：Windows 控制台无法可靠投递优雅 SIGINT，强杀时宿主不调用 dispose（宿主进程生命周期限制，记 final-report 已知边界） | PASS(S)/E受限 |
 | S20 | worker 纪律 | 组装提示含三条款；readonly 与执行形状有差异 | U | B | wiring :: "S20: worker prompt template carries the three mandates…" | PASS(B) |
 
 ## waves（dispatch，S21–S28）
@@ -58,7 +58,7 @@
 
 - 阶段 A（目标：S1–S5、S16、S17 共 8 行有映射）：
 - 阶段 B（目标：S5/S6–S15/S18/S20 的 S 层行填完）：
-- 阶段 C（目标：S6/S7/S8/S12/S18/S19 的 E 层行闭环）：
+- 阶段 C（2026-09-27 完成）：S5/S6/S7 E 层闭环（活体证据见 battle-log 阶段 C 轮报）；S8/S18-E 按计划可选未跑；S19-E 受宿主限制已记录；战役Ⅰ B01–B33 全 verdict 0 OPEN。
 - 阶段 D（目标：S21–S28 的 S 层行填完）：
 - 阶段 E（目标：S30/S31/S34 的 S 层行填完）：
 - 阶段 F（目标：S21–S28、S29–S35 的 E 层行闭环）：
