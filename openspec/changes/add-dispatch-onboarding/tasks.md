@@ -4,22 +4,22 @@
 
 ## 1. 配置加载层（forge-config）
 
-- [ ] 1.1 `src/forge-config.ts`：JSONC strip 注释解析（字符串状态机，字符串内 `//` `/* */` 不误伤）+ 类型 `ForgeConfig {agents: Record<string, {model, depths, prompt?, shape?, permission?}>}`。验证：单测覆盖注释/尾逗号容忍/字符串含注释符/坏 JSON 报错定位
-- [ ] 1.2 三级回退与单一来源：project `.opencode/forge.json` > global `~/.config/opencode/forge.json` > seed 常量（research/review 钉 `Local/GPT Luna`）。验证：单测三级各取胜出、不合并、双文件并存时项目全量生效
-- [ ] 1.3 热生效：mtime+size 缓存，`loadForgeConfig()` 变更才重读；解析失败回退 seed 并产出 `config-parse-error` finding（路径+定位）。验证：单测改文件后重读、未改走缓存、坏文件回退+finding
-- [ ] 1.4 seed 常量 + 未配置启动 notice（findings 一条，指向配方）。验证：wiring 单测未配置态 config hook 后 findings 含 notice
+- [x] 1.1 `src/forge-config.ts`：JSONC strip 注释解析（字符串状态机，字符串内 `//` `/* */` 不误伤）+ 类型 `ForgeConfig {agents: Record<string, {model, depths, prompt?, shape?, permission?}>}`。验证：单测覆盖注释/尾逗号容忍/字符串含注释符/坏 JSON 报错定位
+- [x] 1.2 三级回退与单一来源：project `.opencode/forge.json` > global `~/.config/opencode/forge.json` > seed 常量（research/review 钉 `Local/GPT Luna`）。验证：单测三级各取胜出、不合并、双文件并存时项目全量生效
+- [x] 1.3 热生效：mtime+size 缓存，`loadForgeConfig()` 变更才重读；解析失败回退 seed 并产出 `config-parse-error` finding（路径+定位）。验证：单测改文件后重读、未改走缓存、坏文件回退+finding
+- [x] 1.4 seed 常量 + 未配置启动 notice（findings 一条，指向配方）。验证：wiring 单测未配置态 config hook 后 findings 含 notice
 
 ## 2. 解析与错误语义
 
-- [ ] 2.1 agents 解析路径：`resolveAgent(cfg, {agent, depth})` —— depth 缺省取 depths[0]；集合成员判定；`unknown-agent`/`depth-not-in-set`/`pin-unavailable`（含占位）错误码与文本。验证：单测五错误场景 + 缺省取首元素
-- [ ] 2.2 配方（recipe）生成纯函数：检测身份字符串清单（宿主 configuredIdentities，无梯子）+ 双路径 + 模板块（带行内注释）+ 验证派发 + 扩展提示。验证：单测断言配方四块齐备、身份清单来自注入的检测函数
-- [ ] 2.3 移除 roster 自动生成段 + legacy 保留：未列身份不再生成条目；inline roster/tiers 解析路径回归全绿。验证：roster 套件删自动生成用例、legacy 用例（S 层既有测试改造）通过
+- [x] 2.1 agents 解析路径：`resolveAgent(cfg, {agent, depth})` —— depth 缺省取 depths[0]；集合成员判定；`unknown-agent`/`depth-not-in-set`/`pin-unavailable`（含占位）错误码与文本。验证：单测五错误场景 + 缺省取首元素
+- [x] 2.2 配方（recipe）生成纯函数：检测身份字符串清单（宿主 configuredIdentities，无梯子）+ 双路径 + 模板块（带行内注释）+ 验证派发 + 扩展提示。验证：单测断言配方四块齐备、身份清单来自注入的检测函数
+- [x] 2.3 移除 roster 自动生成段 + legacy 保留：未列身份不再生成条目；inline roster/tiers 解析路径回归全绿。验证：roster 套件删自动生成用例、legacy 用例（S 层既有测试改造）通过
 
 ## 3. 元语翻译层
 
-- [ ] 3.1 翻译核心纯函数：`translateDepth(depth, nativeLadder)` —— 逐字优先（depth∈ladder → verbatim）；原生词直传；元语家族映射表数据；无对应物 → `no-native-mapping`（列双方）。验证：单测直合/翻译/逃生舱/无映射四类
-- [ ] 3.2 注入层接线：chat.params 家族分支按翻译结果注入（effort/budget 表/toggle）；`depthTranslation` 披露字段（`canonical low → native XHigh` / `verbatim`）。验证：wiring 单测注入值+报告披露行
-- [ ] 3.3 未知家族维持 "not injected (unknown provider shape)" 披露（B21 语义回归）。验证：既有 wiring 测试改造后通过
+- [x] 3.1 翻译核心纯函数：`translateDepth(depth, nativeLadder)` —— 逐字优先（depth∈ladder → verbatim）；原生词直传；元语家族映射表数据；无对应物 → `no-native-mapping`（列双方）。验证：单测直合/翻译/逃生舱/无映射四类
+- [x] 3.2 注入层接线：chat.params 家族分支按翻译结果注入（effort/budget 表/toggle）；`depthTranslation` 披露字段（`canonical low → native XHigh` / `verbatim`）。验证：wiring 单测注入值+报告披露行
+- [x] 3.3 未知家族维持 "not injected (unknown provider shape)" 披露（B21 语义回归）。验证：既有 wiring 测试改造后通过
 
 ## 4. 物化与工具契约
 
