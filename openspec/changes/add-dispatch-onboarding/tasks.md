@@ -23,10 +23,10 @@
 
 ## 4. 物化与工具契约
 
-- [ ] 4.1 agent 物化：forge-<agent> 隐藏 subagent，prompt（显式/角色默认 research/review/通用兜底）、shape→deny 列表、permission 覆盖、`task: deny` 恒强制、create-only、无 model 字段。验证：wiring 单测四提示词来源 + 权限形状 + no-clobber
-- [ ] 4.2 forge_dispatch 参数 `profile` → `agent`：args/描述/错误码包装；结果对象 `{agent, requested, actual, depthTranslation, …}`；背景句柄 `{dispatchId, agent, …}`；wake brief 文案 tier→agent。验证：wiring 全套改造回归 + 引擎测试参数同步
-- [ ] 4.3 `forge_dispatch_config` 工具：`{agents, knobs, findings}` round-trip；无发现类字段。验证：wiring 单测已配置/未配置（seed）两态形状
-- [ ] 4.4 worker 提示组装：外层三铁律恒包裹 + 内层角色提示词（prompt 键 → 角色默认 → 通用兜底）。验证：单测三层来源 + 纪律条款不可剥离
+- [x] 4.1 agent 物化：forge-<agent> 隐藏 subagent，prompt（显式/角色默认 research/review/通用兜底）、shape→deny 列表、permission 覆盖、`task: deny` 恒强制、create-only、无 model 字段。验证：wiring 单测四提示词来源 + 权限形状 + no-clobber
+- [x] 4.2 forge_dispatch 参数 `profile` → `agent`：args/描述/错误码包装；结果对象 `{agent, requested, actual, depthTranslation, …}`；背景句柄 `{dispatchId, agent, …}`；wake brief 文案 tier→agent。验证：wiring 全套改造回归 + 引擎测试参数同步
+- [x] 4.3 `forge_dispatch_config` 工具：`{agents, knobs, findings}` round-trip；无发现类字段。验证：wiring 单测已配置/未配置（seed）两态形状
+- [x] 4.4 worker 提示组装：外层三铁律恒包裹 + 内层角色提示词（prompt 键 → 角色默认 → 通用兜底）。验证：单测三层来源 + 纪律条款不可剥离
 
 ## 5. 集成与交付
 
