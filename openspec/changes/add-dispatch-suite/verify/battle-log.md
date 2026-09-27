@@ -18,6 +18,13 @@ LIMITATION：B27（keyless×受限 tier 确定性空响应，外因；守卫与�
 
 ## 轮报
 
+### 阶段 E（2026-09-27，tasks 4.1–4.2 全绿，门 E 通过）
+
+- 范围：/crew 命令（no-clobber 注册 + 纪律模板：分解→波次随 brief 节奏→逐子任务证据验收→至多一次重试）；crew_begin/crew_close 工具（内存会话态、诚实重启死亡、系统态标记防第二 crew、draft 拒绝）；crew_close 硬门（纯函数 validateCrewReport：verdict/evidence/背景派发引用、账本对照零丢子任务、PASS-压-失败派发拒绝、FAIL 必须双报告；ask 级确认；摘要 crew-summary 入账本）。引擎账本行补 dispatchId+parentSessionID 归因。
+- 全量绿证据：npm test → 259/259；typecheck → 0 errors。提交：0ef5ae3→febbc59→cab51f7。
+- 设计落定：账本为唯一事实源（D13）——账本行按 parentSessionID+ts(≥crew.startedAt)+dispatchId 归属本 crew；重启后 registry 死、账本活、新 crew 新起点（旧行被 ts 过滤）。refuse 先于 ask（缺证据不打扰用户）。
+- E 层：/crew 端到端（真模型跑完一个 crew）属 G 阶段 6.3 E2E 的一部分；B44–B48 战役Ⅱ覆盖。
+
 ### 阶段 D（2026-09-27，tasks 3.1–3.5 全绿，门 D 通过）
 
 - 范围：dispatch-registry 纯状态机（3.1）；引擎后台路径（3.2：runAttempt 提取、急解析、fire-and-forget 管线、共享槽池、kill abort-race、后台终态→registry+账本映射、后台同享一次排除重试）；唤醒引擎（3.3：父会话作用域 takeUndelivered、idle 驱动+终态驱动双去抖、单条合并 brief、恰一次、传输失败回滚 delivered、goal brief 同 idle 合并=先 drain 后发）；forge_dispatch background 分支 + forge_dispatch_list（compaction 恢复，有界）+ forge_dispatch_kill（诚实 kill-failed 包装）（3.4）；run/TUI 披露进工具描述与 background 参数（3.5）。
