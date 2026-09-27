@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -15,21 +15,27 @@ import { translateDepth } from "../src/dispatch-depth.ts"
 //   S13 unknown provider shape => nothing injected
 //   S18 draft-plan interop => forge_dispatch refused while a draft is active
 //   S20 worker prompt discipline (three mandates, shape-differentiated)
+// add-dispatch-onboarding: agent materialization from forge.json (seed when
+// unconfigured; legacy tier agents only when inline options exist).
 
 process.env.FORGE_TEST_NO_FENCE = "1"
+// Redirect the forge.json global path away from the real user home.
+process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "forge-wiring-home-"))
 
 const worktree = mkdtempSync(join(tmpdir(), "forge-dispatch-wiring-"))
 process.on("exit", () => {
-  try {
-    rmSync(worktree, { recursive: true, force: true })
-  } catch {}
+  for (const d of [worktree, process.env.FORGE_TEST_FORGE_HOME]) {
+    try {
+      rmSync(d, { recursive: true, force: true })
+    } catch {}
+  }
 })
 
-const input = () => ({
+const input = (dir = worktree) => ({
   client: { session: {} },
   project: { id: "p" },
-  directory: worktree,
-  worktree,
+  directory: dir,
+  worktree: dir,
   serverUrl: new URL("http://127.0.0.1:1"),
   $: () => {},
 })
@@ -43,8 +49,109 @@ const allowCtx = (sessionID) => ({
 
 const emptyCfg = () => ({ agent: {}, command: {}, permission: {} })
 
-test("S9: config hook materializes forge-<tier> agents hidden, subagent, modelless, task-denied", async (t) => {
+// ---------------------------------------------------------------------------
+// 4.1 agent materialization from forge.json.
+
+const seedAgentShape = (a, label) => {
+  assert.ok(a, `${label} must be injected`)
+  assert.equal(a.hidden, true, `${label} must be hidden`)
+  assert.equal(a.mode, "subagent", `${label} must be a subagent`)
+  assert.equal("model" in a, false, `${label} must NEVER carry a model field`)
+  assert.equal(a.permission.task, "deny", `${label} must deny task (physical recursion ban)`)
+  assert.ok(a.description, `${label} carries a description`)
+  assert.ok(a.prompt, `${label} carries a role prompt`)
+}
+
+test("4.1 unconfigured: the seed materializes research/review, readonly + task-denied, and NO legacy tier agents", async (t) => {
   const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+
+  seedAgentShape(cfg.agent["forge-research"], "forge-research")
+  seedAgentShape(cfg.agent["forge-review"], "forge-review")
+  assert.match(cfg.agent["forge-research"].prompt, /research/i)
+  // seed is readonly: mutating tools denied
+  for (const tool of ["write", "edit", "bash"]) {
+    assert.equal(cfg.agent["forge-research"].permission[tool], "deny")
+    assert.equal(cfg.agent["forge-review"].permission[tool], "deny")
+  }
+  // zero inline config => no legacy tier agents in the Tab cycle
+  for (const tier of ["scout", "build", "review", "quick"]) {
+    assert.equal(cfg.agent[`forge-${tier}`], undefined, `no legacy forge-${tier} without inline options`)
+  }
+})
+
+test("4.1 a project forge.json materializes custom agents with prompt/shape/permission layers", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-wiring-proj-"))
+  t.after(() => {
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  })
+  mkdirSync(join(dir, ".opencode"), { recursive: true })
+  writeFileSync(
+    join(dir, ".opencode", "forge.json"),
+    `{
+  "agents": {
+    "auditor": {
+      "model": "zai/glm-5.3",
+      "depths": ["low", "medium"],
+      "prompt": "You are a dependency auditor; check licenses.",
+      "shape": "write",
+      "permission": { "bash": "deny" }
+    },
+    "plain": { "model": "x/y", "depths": ["low"] }
+  }
+}`,
+  )
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+
+  seedAgentShape(cfg.agent["forge-auditor"], "forge-auditor")
+  assert.match(cfg.agent["forge-auditor"].prompt, /dependency auditor/)
+  // write shape: mutating tools NOT denied by shape...
+  assert.equal(cfg.agent["forge-auditor"].permission.write, undefined)
+  // ...but the explicit permission override IS honored...
+  assert.equal(cfg.agent["forge-auditor"].permission.bash, "deny")
+  // ...and task stays denied regardless
+  assert.equal(cfg.agent["forge-auditor"].permission.task, "deny")
+
+  // a custom agent without prompt gets the generic worker prompt, defaults readonly
+  seedAgentShape(cfg.agent["forge-plain"], "forge-plain")
+  assert.match(cfg.agent["forge-plain"].prompt, /forge-plain/)
+  assert.equal(cfg.agent["forge-plain"].permission.bash, "deny")
+  // seed agents do NOT leak in when a project file exists
+  assert.equal(cfg.agent["forge-research"], undefined, "single source — no seed merge")
+})
+
+test("4.1 a user-defined forge-<agent> entry is never clobbered", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  cfg.agent["forge-research"] = { description: "mine", mode: "subagent", prompt: "keep me" }
+  await h.config(cfg)
+  assert.equal(cfg.agent["forge-research"].prompt, "keep me")
+  assert.equal(cfg.agent["forge-research"].description, "mine")
+  assert.equal(cfg.agent["forge-research"].permission, undefined)
+})
+
+test("4.1 a broken forge.json falls back to the seed agents", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-wiring-broken-"))
+  t.after(() => {
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  })
+  mkdirSync(join(dir, ".opencode"), { recursive: true })
+  writeFileSync(join(dir, ".opencode", "forge.json"), `{ broken`)
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  seedAgentShape(cfg.agent["forge-research"], "forge-research (seed fallback)")
+})
+
+test("S9 (legacy): inline dispatch options materialize tier agents hidden, subagent, modelless, task-denied", async (t) => {
+  const h = await server(input(), { dispatch: { roster: [{ model: "zai/glm-5.3", expose: ["low", "max"], profiles: ["scout", "build", "review", "quick"] }] } })
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -71,8 +178,8 @@ test("S9: config hook materializes forge-<tier> agents hidden, subagent, modelle
   assert.equal(cfg.agent["forge-build"].permission.task, "deny")
 })
 
-test("S10: a user-defined forge-<tier> entry is never clobbered", async (t) => {
-  const h = await server(input(), {})
+test("S10 (legacy): a user-defined forge-<tier> entry is never clobbered", async (t) => {
+  const h = await server(input(), { dispatch: { roster: [{ model: "zai/glm-5.3", expose: ["low", "max"], profiles: ["build"] }] } })
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   cfg.agent["forge-build"] = { description: "mine", mode: "subagent", prompt: "keep me" }
