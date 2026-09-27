@@ -77,6 +77,7 @@ import {
 import { createDispatchEngine, DispatchError, type DispatchEngine } from "./src/dispatch-engine.ts"
 import { createDispatchLedger } from "./src/dispatch-ledger.ts"
 import { createDispatchRegistry, type DispatchRegistry, type RegistryEntry } from "./src/dispatch-registry.ts"
+import { validateCrewReport, type CrewSubtaskReport } from "./src/crew-gate.ts"
 import { composeWorkerPrompt } from "./src/dispatch-prompt.ts"
 import { tierAgentDef } from "./src/dispatch-tiers.ts"
 import { loadModelsDevSnapshot } from "./src/models-dev.ts"
@@ -208,6 +209,10 @@ let dispatchClient: { session: { promptAsync?: (opts: unknown) => Promise<unknow
 // Per-parent debounce timers for completion briefs (D11: a burst of
 // completions yields ONE brief).
 const dispatchWakeTimers = new Map<string, ReturnType<typeof setTimeout>>()
+// Crew orchestration state (4.1, D13): in-memory and session-bound — a
+// host restart kills it honestly (the dispatch ledger survives) and a new
+// /crew starts fresh. No file persistence by design.
+const crews = new Map<string, { objective: string; startedAt: string }>()
 
 // sessionID -> { level, family }: the chat.params injection table. "frozen"
 // means the level never changes after first registration (D2 stability).
@@ -1388,6 +1393,122 @@ const forgeDispatchKillTool = tool({
   },
 })
 
+
+// /crew discipline (4.1, D13): a template rulebook + an in-memory registry.
+// The waves pace on completion briefs; crew_close is the only hard gate.
+const CREW_COMMAND_TEMPLATE = [
+  "Objective: {args}",
+  "",
+  "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). Follow it exactly:",
+  "",
+  "1. REGISTER: call `crew_begin` with the objective. If it refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew.",
+  "2. DECOMPOSE: break the objective into subtasks. Every subtask carries FOUR fields before dispatch: (a) a self-contained prompt, (b) a tier/profile (scout = readonly recon, build = implementation, review = readonly review, quick = mechanical change), (c) an exact reasoning depth from the exposed vocabulary, (d) an acceptance-evidence statement — what the result text must contain for you to call it PASS.",
+  "3. WAVES, NEVER FLOODS: dispatch subtasks with background forge_dispatch in batches no larger than the concurrency cap (default 4). Launch the next batch ONLY as [forge:dispatch-complete] briefs free capacity. Never fire more dispatches while the cap is full.",
+  "4. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the dispatch result text — cite the dispatchId (bg-N) as the evidence reference. A result that does not meet the statement is a failure even if the worker sounded confident.",
+  "5. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or depth. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
+  "6. CLOSE: when every subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks your report against the dispatch ledger — a dispatched subtask missing from the report refuses the close. The user confirms the closing dialog.",
+].join("\n")
+
+const crewBeginTool = tool({
+  description:
+    "Register this session's crew (from /crew). Refuses when a crew is already active in the session or while a plan draft is active. Crew state is in-memory: a host restart ends it honestly (the dispatch ledger keeps the history).",
+  args: {
+    objective: tool.schema.string().describe("One-line crew objective (from /crew)"),
+  },
+  execute: async (args, context) => {
+    const state = stateForBan(context.sessionID)
+    const active = state ? resolveActivePlan(state) : null
+    if (active && active.doc.status === "draft") {
+      throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.")
+    }
+    if (!args.objective?.trim()) throw new Error("crew_begin requires a non-empty objective (from /crew <objective>).")
+    const existing = crews.get(context.sessionID)
+    if (existing) {
+      throw new Error(`[forge:crew] This session already has an active crew: "${existing.objective}" (started ${existing.startedAt}). Finish and close it with crew_close before starting another.`)
+    }
+    crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso() })
+    return {
+      title: `crew registered: ${args.objective.trim().slice(0, 60)}`,
+      output: `[forge:crew] Crew registered for this session. Objective: ${args.objective.trim()}. Proceed with the discipline: decompose → waves paced on completion briefs (never past the cap) → per-subtask evidence verdicts → at most one retry → crew_close with the full report.`,
+    }
+  },
+})
+
+const crewCloseTool = tool({
+  description:
+    "Close this session's crew with the final report (ask-level user confirmation). The gate cross-checks the report against the dispatch ledger: every subtask needs a verdict (PASS/FAIL) and a bg-N evidence reference; every dispatch this crew submitted must appear in the report; FAIL requires both failure reports (attempt + the one retry). On success the summary (verdicts, ledger references, aggregate tokens/cost) is appended to the dispatch ledger and the crew ends.",
+  args: {
+    report: tool.schema.array(tool.schema.object({
+      title: tool.schema.string().describe("Subtask title"),
+      verdict: tool.schema.string().describe("PASS or FAIL"),
+      evidence: tool.schema.string().describe("Acceptance evidence with the bg-N dispatch id reference"),
+      attempts: tool.schema.array(tool.schema.string()).optional().describe("For FAIL: both failure reports (attempt and retry)"),
+    })).describe("The full crew report — one entry per subtask"),
+  },
+  execute: async (args, context) => {
+    const crew = crews.get(context.sessionID)
+    if (!crew) throw new Error("[forge:crew] No active crew in this session (crew state is in-memory and dies on host restart). Start one with /crew <objective>.")
+    const rows: unknown[] = []
+    try {
+      const file = readFileSync(join(dispatchLogDir, "ledger.jsonl"), "utf8")
+      for (const line of file.split("\n")) {
+        const t = line.trim()
+        if (!t) continue
+        try {
+          rows.push(JSON.parse(t))
+        } catch {}
+      }
+    } catch {}
+    const check = validateCrewReport(
+      (args.report ?? []) as CrewSubtaskReport[],
+      rows as Parameters<typeof validateCrewReport>[1],
+      { objective: crew.objective, startedAt: crew.startedAt, sessionID: context.sessionID },
+    )
+    if (!check.ok) {
+      throw new Error(`[forge:crew] crew_close refused — the report does not match the dispatch ledger:\n${check.gaps.map((g) => `- ${g}`).join("\n")}\nThe crew stays active; complete or correct the report and call crew_close again.`)
+    }
+    // Aggregate tokens/cost for the crew's dispatches from the ledger rows.
+    let tokensIn = 0
+    let tokensOut = 0
+    let costSum = 0
+    let costKnown = 0
+    for (const row of rows as Array<Record<string, unknown>>) {
+      if (typeof row.dispatchId !== "string" || !check.dispatchIds.includes(row.dispatchId)) continue
+      const tok = row.tokens as { input?: number; output?: number; reasoning?: number } | undefined
+      tokensIn += tok?.input ?? 0
+      tokensOut += (tok?.output ?? 0) + (tok?.reasoning ?? 0)
+      if (typeof row.costUsd === "number") {
+        costSum += row.costUsd
+        costKnown++
+      }
+    }
+    await gate(context.ask, "crew_close", `Close crew: ${crew.objective}`)
+    dispatchLedger.append({
+      ts: nowIso(),
+      event: "crew-summary",
+      tier: "crew",
+      outcome: "closed",
+      sessionID: context.sessionID,
+      note: crew.objective,
+      tokens: { input: tokensIn, output: tokensOut, reasoning: 0, cache: { read: 0, write: 0 } },
+      costUsd: costKnown > 0 ? costSum : null,
+      dispatchIds: check.dispatchIds,
+      subtasks: (args.report ?? []).map((r) => ({ title: r.title, verdict: String(r.verdict).toUpperCase(), evidence: r.evidence })),
+    })
+    crews.delete(context.sessionID)
+    const fails = (args.report ?? []).filter((r) => String(r.verdict).toUpperCase() === "FAIL").length
+    return {
+      title: `crew closed: ${crew.objective.slice(0, 60)}`,
+      output: [
+        `[forge:crew] Crew closed: ${crew.objective}`,
+        `subtasks: ${(args.report ?? []).length} (PASS ${(args.report ?? []).length - fails}, FAIL ${fails})`,
+        `dispatches: ${check.dispatchIds.length}   tokens: in ${tokensIn}, out ${tokensOut}   cost: ${costKnown > 0 ? `$${costSum.toFixed(6)}` : "unpriced"}`,
+        "The summary is appended to the dispatch ledger.",
+      ].join("\n"),
+    }
+  },
+})
+
 function forgeTools(): Record<string, ToolDefinition> {
   const tools: Record<string, ToolDefinition> = {
     plan_write: planWriteTool,
@@ -1410,6 +1531,8 @@ function forgeTools(): Record<string, ToolDefinition> {
     tools.forge_dispatch = forgeDispatchTool
     tools.forge_dispatch_list = forgeDispatchListTool
     tools.forge_dispatch_kill = forgeDispatchKillTool
+    tools.crew_begin = crewBeginTool
+    tools.crew_close = crewCloseTool
   }
   return tools
 }
@@ -1850,6 +1973,11 @@ export const server: Plugin = async (input, options) => {
       }
 
       // /goal command — same no-clobber rule.
+      // /crew command — no-clobber like /plan and /goal.
+      cfg.command["crew"] ??= {
+        template: CREW_COMMAND_TEMPLATE,
+        description: "forge crew orchestration: decompose an objective into evidence-checked subtasks dispatched as paced background waves; at most one retry per subtask; crew_close cross-checks the report against the dispatch ledger",
+      }
       cfg.command["goal"] ??= {
         template: GOAL_COMMAND_TEMPLATE,
         description:
@@ -1867,7 +1995,7 @@ export const server: Plugin = async (input, options) => {
       // tightening), so stock behavior outside planning is unchanged.
       const perm = (cfg as { permission?: Record<string, unknown> }).permission
       const permSection = perm ?? ((cfg as { permission?: Record<string, unknown> }).permission = {})
-      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell"]) {
+      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell", "crew_close"]) {
         if (permSection[gateKey] !== "deny") permSection[gateKey] = "ask"
       }
 
@@ -1999,6 +2127,8 @@ export const server: Plugin = async (input, options) => {
       depthState: (sessionID: string) => dispatchDepths.get(sessionID) ?? null,
       composePrompt: composeWorkerPrompt,
       registry: () => activeDispatchRegistry,
+      crews: () => crews,
+      dispatchLogDir: () => dispatchLogDir,
       dispatchBriefText,
       setEngine: (engine: DispatchEngine | null) => {
         activeDispatchEngine?.dispose()
@@ -2138,6 +2268,10 @@ export const server: Plugin = async (input, options) => {
       // Job-supervisor guidance reaches EVERY session including delegated
       // ones (subagents are not in the `sessions` map — that is why this
       // push happens before the state lookup).
+      const crewActive = crews.get(input.sessionID)
+      if (crewActive && !output.system.some((s) => s.startsWith("[forge:crew-active]"))) {
+        output.system.push(`[forge:crew-active] A crew is ACTIVE in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict.`)
+      }
       if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
         output.system.push(
           "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.",
