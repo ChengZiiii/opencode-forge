@@ -180,6 +180,7 @@ test("tier default depth is used when the caller omits depth", () => {
   const cfg = buildDispatchConfig({
     configuredIdentities: ["anthropic/claude-haiku-4-5"],
     catalog: CATALOG,
+    userRoster: [{ model: "anthropic/claude-haiku-4-5", profiles: ["scout"] }],
   })
   const r = resolveDispatch(cfg, { profile: "scout" }, ok)
   assert.equal(r.ok, true)

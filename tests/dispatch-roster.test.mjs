@@ -3,9 +3,13 @@ import assert from "node:assert/strict"
 
 // Spec: openspec/changes/add-dispatch-suite/specs/dispatch/spec.md
 //   S1  full provider/model identity keys (same name, two providers = two entries)
-//   S2  unlisted configured identity gets a generated default entry
 //   S16 dead defaultDepth degrades the tier to depth-required
 //   S17 expose typo on a catalog-known identity errors fast with the legal ladder
+//
+// add-dispatch-onboarding REMOVED "Roster keyed by full provider/model identity
+// with exposure tables": the zero-config auto-generation of roster entries is
+// gone (configured != usable, owner ruling) — dispatch configuration lives in
+// forge.json; the inline roster stays as the documented legacy path.
 
 import {
   DEFAULT_TIERS,
@@ -33,19 +37,12 @@ test("default tiers ship with the documented shapes and depths", () => {
   assert.deepEqual(DEFAULT_TIERS.quick, { shape: "write", defaultDepth: "off" })
 })
 
-test("zero config: every configured identity gets a default entry with the full native ladder", () => {
+test("2.3 zero-config legacy: configured identities generate NO roster entries anymore", () => {
   const built = buildDispatchConfig({
     configuredIdentities: ["zai-coding-plan/glm-5.3", "anthropic/claude-haiku-4-5"],
     catalog: CATALOG,
   })
-  const byId = new Map(built.roster.map((e) => [e.model, e]))
-  assert.equal(built.roster.length, 2)
-  const glm = byId.get("zai-coding-plan/glm-5.3")
-  assert.deepEqual(glm.expose, ["low", "high", "max"]) // full native ladder, verbatim
-  assert.equal(glm.verified, true)
-  assert.deepEqual(glm.profiles, ["scout", "quick"]) // generated default tiers
-  // default tier map present untouched
-  assert.equal(built.tiers.build.shape, "write")
+  assert.equal(built.roster.length, 0, "auto-generation is removed — configured != usable")
 })
 
 test("S1: same model name on two providers stays two independent roster entries", () => {
@@ -69,20 +66,15 @@ test("S1: same model name on two providers stays two independent roster entries"
   assert.equal(built.roster[1].model, "opencode-go/glm-5.3")
 })
 
-test("S2: an unlisted configured identity is appended as a generated default entry", () => {
+test("2.3 an unlisted configured identity generates nothing — explicit roster only", () => {
   const built = buildDispatchConfig({
     configuredIdentities: ["zai-coding-plan/glm-5.3", "anthropic/claude-haiku-4-5"],
     catalog: CATALOG,
     userRoster: [{ model: "zai-coding-plan/glm-5.3", profiles: ["build"] }],
   })
-  const generated = built.roster.find((e) => e.model === "anthropic/claude-haiku-4-5")
-  assert.ok(generated, "unlisted identity must still get an entry")
-  assert.deepEqual(generated.expose, ["off", "low", "medium", "high"]) // full ladder
-  assert.deepEqual(generated.profiles, ["scout", "quick"])
-  assert.equal(generated.verified, true)
-  // listed entry keeps the user's curation and is not regenerated
-  const listed = built.roster.find((e) => e.model === "zai-coding-plan/glm-5.3")
-  assert.deepEqual(listed.profiles, ["build"])
+  assert.equal(built.roster.length, 1)
+  assert.equal(built.roster.some((e) => e.model === "anthropic/claude-haiku-4-5"), false, "no generated entries")
+  assert.deepEqual(built.roster[0].profiles, ["build"])
 })
 
 test("S16: dead defaultDepth degrades the tier to depth-required with a warning", () => {
@@ -105,6 +97,7 @@ test("S16 positive: quick keeps its default when some quick candidate exposes of
   const built = buildDispatchConfig({
     configuredIdentities: ["anthropic/claude-haiku-4-5"], // ladder includes off
     catalog: CATALOG,
+    userRoster: [{ model: "anthropic/claude-haiku-4-5", profiles: ["quick"] }],
   })
   assert.equal(built.tiers.quick.defaultDepth, "off")
   // only tiers with no exposing candidate degrade (build/review will here);
