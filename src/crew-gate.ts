@@ -39,7 +39,7 @@ export function validateCrewReport(
   for (const row of ledgerRows) {
     if (row.parentSessionID !== crew.sessionID) continue
     if (row.ts < crew.startedAt) continue
-    if (row.event === "validation" || row.event === "resolve-error" || row.event === "refused-cap" || row.event === "models-dev-degraded" || row.event === "retry-excluded" || row.event === "lost-on-exit" || row.event === "kill-late-completion") continue
+    if (row.event === "validation" || row.event === "resolve-error" || row.event === "refused-cap" || row.event === "models-dev-degraded" || row.event === "retry-excluded" || row.event === "lost-on-exit" || row.event === "kill-late-completion" || row.event === "transport-interrupted") continue
     if (CREW_DISPATCH_EVENTS.has(row.event) && row.dispatchId) rowById.set(row.dispatchId, row)
   }
 

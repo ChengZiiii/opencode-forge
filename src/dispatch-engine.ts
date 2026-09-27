@@ -65,6 +65,11 @@ export type DispatchLedgerEvent = {
   costUsd?: number | null
   durationMs?: number
   note?: string
+  // Terminal/identity fields (fix-dispatch-transport-timeout: terminal rows
+  // must be self-describing): present on rows emitted for background
+  // dispatches.
+  dispatchId?: string
+  parentSessionID?: string
 }
 
 export class DispatchError extends Error {
@@ -263,25 +268,56 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
         parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, agent: req.agent, shape: r.shape, ...(r.role ? { role: r.role } : {}) }) }],
       }),
     })
-    await Promise.race([turnPost, deadlinePromise])
-    if (deadlineHit && deps.now() - t0 >= timeoutMs) {
-      const elapsed = deps.now() - t0
+    // Mark the turn POST handled no matter which path this attempt takes: a
+    // deadline or kill exit abandons the await, and a later rejection of the
+    // already-unawaited promise must not surface as an unhandled rejection.
+    void turnPost.catch(() => {})
+    // Transport-recovery safety (incident 2026-09-27, spec: dispatch —
+    // transport interruption of the turn POST): the POST is turn-synchronous,
+    // but the child session is a HOST-SIDE object — a transport-level
+    // rejection (fetch abort / network failure; anything that is not an HTTP
+    // error response, which api() wraps as DispatchError) does not mean the
+    // child died. Ledger the interruption, then fall through to completion
+    // polling under the same deadline and let the child's real state decide.
+    // NEVER re-POST: the prompt may already be delivering (a second POST
+    // would duplicate the task). A message that was never delivered shows up
+    // as zero assistant messages, which polls as waiting until the deadline
+    // produces the honest timeout.
+    try {
+      await Promise.race([turnPost, deadlinePromise])
+      if (deadlineHit && deps.now() - t0 >= timeoutMs) {
+        const elapsed = deps.now() - t0
+        deps.sink({
+          ts: new Date().toISOString(),
+          event: "timeout",
+          tier: req.agent, agent: req.agent,
+          identity: r.model,
+          depth: r.depth,
+          sessionID: childID,
+          durationMs: elapsed,
+          ...(dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}),
+        })
+        throw new DispatchError(
+          `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
+          "timeout",
+        )
+      }
+      await turnPost
+    } catch (e) {
+      if (e instanceof DispatchError) throw e
       deps.sink({
         ts: new Date().toISOString(),
-        event: "timeout",
+        event: "transport-interrupted",
         tier: req.agent, agent: req.agent,
         identity: r.model,
         depth: r.depth,
         sessionID: childID,
-        durationMs: elapsed,
+        durationMs: deps.now() - t0,
+        note: e instanceof Error ? e.message : String(e),
         ...(dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}),
       })
-      throw new DispatchError(
-        `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
-        "timeout",
-      )
+      // recover: continue into the completion poll below (same deadline)
     }
-    await turnPost
 
     // Poll for completion (stable-x2) under the per-dispatch deadline. With a
     // kill control, the message fetch races the abort promise so a kill lands
@@ -366,7 +402,12 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
 
   // Map a background pipeline failure to the registry terminal state + ledger.
   // Never throws: a background dispatch reports through the registry and the
-  // completion brief, never by rejecting a long-gone tool call.
+  // completion brief, never by rejecting a long-gone tool call. Terminal
+  // reports are self-describing: the child sessionID comes from the registry
+  // entry (set by the onChild callback), and the timeout/error message itself
+  // states that the child is left running host-side (incident 2026-09-27 —
+  // the report used to ship `sessionID: ""` and the ledger row carried none
+  // of the identity fields).
   function bgTerminal(
     reg: NonNullable<typeof deps.registry>,
     dispatchId: string,
@@ -375,24 +416,44 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     t0: number,
     e: unknown,
   ): void {
+    let entrySessionID = ""
+    let parentSessionID = ""
+    try {
+      const entry = reg.get(dispatchId)
+      entrySessionID = entry.sessionID
+      parentSessionID = entry.parentSessionID
+    } catch {}
+    const durationMs = deps.now() - t0
     const report = {
       agent: req.agent,
       requested: { agent: req.agent, depth: req.depth },
       actual: { model: identity, depth: null as string | null },
-      sessionID: "",
+      sessionID: entrySessionID,
       outcome: "error",
-      durationMs: deps.now() - t0,
+      durationMs,
       error: e instanceof Error ? e.message : String(e),
     }
     if (e instanceof DispatchError && e.code === "timeout") {
       report.outcome = "timeout"
       reg.markTimeout(dispatchId, report)
-      deps.onTerminal?.(reg.get(dispatchId).parentSessionID)
+      deps.onTerminal?.(parentSessionID)
       return
     }
-    deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.agent, identity, outcome: "error", note: report.error })
+    deps.sink({
+      ts: new Date().toISOString(),
+      event: "error",
+      tier: req.agent,
+      agent: req.agent,
+      identity,
+      outcome: "error",
+      sessionID: entrySessionID,
+      durationMs,
+      note: report.error,
+      dispatchId,
+      parentSessionID,
+    })
     reg.markError(dispatchId, report)
-    deps.onTerminal?.(reg.get(dispatchId).parentSessionID)
+    deps.onTerminal?.(parentSessionID)
   }
 
   async function dispatch(req: DispatchRequest, parentSessionID?: string, opts?: { background?: boolean }): Promise<DispatchResult | DispatchHandle> {
