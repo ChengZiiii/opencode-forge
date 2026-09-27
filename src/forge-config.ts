@@ -278,6 +278,53 @@ export function parseForgeJsonc(text: string): JsoncParseOk | JsoncParseErr {
 }
 
 // ---------------------------------------------------------------------------
+// Onboarding recipe (task 2.2, spec — ADDED "Seed placeholder onboarding").
+// Machine-actionable: the user's session AI can execute every step from this
+// text alone. The identity list is injected (no discovery here — pure data),
+// strings only, no ladders (the metalanguage makes ladder knowledge
+// unnecessary).
+// ---------------------------------------------------------------------------
+
+export function forgeRecipe(input: { detectedIdentities: string[]; projectPath: string; globalPath: string }): string {
+  const suggested = input.detectedIdentities[0] ?? "provider/model"
+  const identityLines =
+    input.detectedIdentities.length > 0
+      ? input.detectedIdentities.map((id) => `   - ${id}`).join("\n")
+      : "   (none detected — check the provider section of the host's opencode config)"
+  const template = `{
+  // forge dispatch agents — save the file; changes apply on the next dispatch, no restart
+  "agents": {
+    "research": {
+      "model": "${suggested}", // exact "provider/model" string, pick from the detected list above
+      "depths": ["low", "medium"], // first entry is the default; canonical words: none, low, medium, high, max — or the model's native level names, passed through verbatim
+      // "prompt": "optional role prompt riding inside the discipline wrapper",
+      // "shape": "write", // default readonly denies mutating tools; write agents need this
+      // "permission": { "bash": "deny" } // optional override of the shape-derived permission
+    }
+  }
+}`
+  return [
+    "[forge dispatch onboarding recipe]",
+    'The dispatch agent you called is pinned to the placeholder model "Local/GPT Luna" — forge.json is not configured. Steps:',
+    "",
+    "1. Detected configured identities (use one as the exact model string):",
+    identityLines,
+    "",
+    "2. Create ONE of these files (project-level wins; a single file fully applies — never merged):",
+    `   - ${input.projectPath}  (project-level, versionable, team-shared)`,
+    `   - ${input.globalPath}  (global)`,
+    "",
+    "3. Copy-paste template (JSONC — comments allowed) and edit model/depths:",
+    "",
+    template,
+    "",
+    '4. Verify: call the forge_dispatch tool again with agent "research" and a depth from its depths — the report shows the actual model and the depth translation.',
+    "",
+    '5. Extending: more agents are more entries under "agents"; agents that edit files need "shape": "write"; an explicit "permission" map overrides the shape-derived defaults — "task" is always denied, recursive dispatch stays impossible.',
+  ].join("\n")
+}
+
+// ---------------------------------------------------------------------------
 // Cascade + seed (task 1.2)
 // ---------------------------------------------------------------------------
 
