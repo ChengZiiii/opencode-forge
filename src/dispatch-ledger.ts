@@ -12,7 +12,7 @@ export const DISPATCH_LEDGER_MAX_BYTES = 1_000_000
 
 // Ledger rows are open-ended (validation findings, config fallbacks, engine
 // events) — DispatchLedgerEvent plus optional extras.
-export type DispatchLedgerRow = DispatchLedgerEvent & { level?: string; code?: string }
+export type DispatchLedgerRow = DispatchLedgerEvent & { level?: string; code?: string; dispatchId?: string; parentSessionID?: string; dispatchIds?: string[]; subtasks?: Array<{ title: string; verdict: string; evidence: string }> }
 
 export type DispatchFileLedger = {
   append: (entry: DispatchLedgerRow) => void

@@ -150,6 +150,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     t0: number,
     ctl: KillControl | undefined,
     onChild: ((sessionID: string) => void) | undefined,
+    dispatchId?: string,
   ): Promise<DispatchResult> {
     const providerID = r.identity.slice(0, r.identity.indexOf("/"))
     let childID = ""
@@ -201,6 +202,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
         depth: r.depth,
         sessionID: childID,
         durationMs: elapsed,
+        ...(dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}),
       })
       throw new DispatchError(
         `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
@@ -226,6 +228,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
           depth: r.depth,
           sessionID: childID,
           durationMs: elapsed,
+          ...(dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}),
         })
         throw new DispatchError(
           `forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`,
@@ -249,6 +252,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
         depth: r.depth,
         sessionID: childID,
         durationMs,
+        ...(dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}),
       })
       throw new DispatchError(
         `child session ${childID} returned an empty response (0-token assistant message). This is a known quirk of keyless endpoints combined with restricted tiers — see the README dispatch notes. The dispatch is NOT counted as success.`,
@@ -283,6 +287,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       tokens,
       costUsd: cost.costUsd,
       durationMs,
+      ...(dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}),
     })
     return result
   }
@@ -361,7 +366,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
                 try {
                   reg.get(dispatchId).sessionID = sid
                 } catch {}
-              })
+              }, dispatchId)
               if (reg.get(dispatchId).state === "killed") {
                 // The kill landed while the result was already in: discard and
                 // note it (spec: a result arriving after a kill is noted).

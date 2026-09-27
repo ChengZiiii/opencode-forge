@@ -362,3 +362,129 @@ test("3.3: another parent's terminals are never delivered on this session's idle
   // cleanup so later drains are not polluted
   reg.takeUndelivered(`ses_other_${tag}`)
 })
+
+// ---------------------------------------------------------------------------
+// 4.1/4.2 crew: /crew command registration (no-clobber), crew_begin refusals
+// (draft, singleton), crew_close gate (gaps refuse without asking; valid
+// report asks once, appends the summary, ends the crew).
+// ---------------------------------------------------------------------------
+import { appendFileSync } from "node:fs"
+
+const recordingCtx = (sessionID, asks) => ({
+  sessionID,
+  ask: async (o) => {
+    asks.push(o)
+    return { status: "allow" }
+  },
+  metadata: () => {},
+  message: async () => {},
+})
+
+test("4.1: /crew command registers with the discipline template; a user command is never clobbered", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  assert.ok(cfg.command.crew, "/crew must be registered")
+  assert.match(cfg.command.crew.template, /crew_begin/)
+  assert.match(cfg.command.crew.template, /waves/i)
+  assert.match(cfg.command.crew.template, /crew_close/)
+  assert.match(cfg.command.crew.template, /at most once|RETRY AT MOST ONCE/i)
+
+  const h2 = await server(input(), {})
+  t.after(() => h2.dispose?.())
+  const cfg2 = emptyCfg()
+  cfg2.command.crew = { template: "mine", description: "user's own" }
+  await h2.config(cfg2)
+  assert.equal(cfg2.command.crew.template, "mine", "user command is never clobbered")
+})
+
+test("4.1: crew_begin refuses a second crew and refuses during a draft plan", async (t) => {
+  // fresh worktree: plan state on disk is per-worktree, and S18 already
+  // leaves an APPROVED plan in the shared module worktree
+  const wt = mkdtempSync(join(tmpdir(), "forge-crew-"))
+  t.after(() => { try { rmSync(wt, { recursive: true, force: true }) } catch {} })
+  const crewInput = () => ({ client: { session: {} }, project: { id: "p" }, directory: wt, worktree: wt, serverUrl: new URL("http://127.0.0.1:1"), $: () => {} })
+  const h = await server(crewInput(), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+
+  await h.tool.crew_begin.execute({ objective: "first crew" }, allowCtx("ses_crew"))
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "second crew" }, allowCtx("ses_crew")),
+    (err) => {
+      assert.match(err.message, /already has an active crew/)
+      assert.match(err.message, /first crew/)
+      return true
+    },
+  )
+
+  // a DIFFERENT session is free (session-bound state)
+  await h.tool.crew_begin.execute({ objective: "other session crew" }, allowCtx("ses_crew2"))
+
+  // draft refusal: real draft via plan_write, then begin is denied
+  await h.tool.plan_write.execute(
+    { goal: "draft blocks crew", context: "found (src/a.ts:1)", approach: "do X; rejected Y because Z", tasks: ["s"], risks: "none", acceptance: ["file"] },
+    allowCtx("ses_crew3"),
+  )
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "during draft" }, allowCtx("ses_crew3")),
+    /plan_approve|discard/,
+  )
+})
+
+test("4.2: crew_close refuses gaps WITHOUT asking the user; the crew stays active", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const asks = []
+  await h.tool.crew_begin.execute({ objective: "gappy crew" }, recordingCtx("ses_gap", asks))
+
+  // missing verdict
+  await assert.rejects(
+    () => h.tool.crew_close.execute({ report: [{ title: "a", verdict: "", evidence: "bg-1" }] }, recordingCtx("ses_gap", asks)),
+    (err) => { assert.match(err.message, /refused/); assert.match(err.message, /PASS or FAIL/); return true },
+  )
+  // dispatched-but-dropped: ledger has bg-2, report does not
+  const ledgerPath = join(h.__forgeDispatchTest.dispatchLogDir(), "ledger.jsonl")
+  appendFileSync(ledgerPath, JSON.stringify({ ts: new Date().toISOString(), event: "completed", dispatchId: "bg-1", parentSessionID: "ses_gap", tokens: { input: 5, output: 2, reasoning: 0, cache: { read: 0, write: 0 } }, costUsd: 0.01 }) + "\n")
+  appendFileSync(ledgerPath, JSON.stringify({ ts: new Date().toISOString(), event: "completed", dispatchId: "bg-2", parentSessionID: "ses_gap", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }) + "\n")
+  await assert.rejects(
+    () => h.tool.crew_close.execute({ report: [{ title: "a", verdict: "PASS", evidence: "bg-1" }] }, recordingCtx("ses_gap", asks)),
+    (err) => { assert.match(err.message, /bg-2/); assert.match(err.message, /silently dropped/); return true },
+  )
+  assert.equal(asks.length, 0, "refusals must not bother the user with an ask dialog")
+  const crews = h.__forgeDispatchTest.crews()
+  assert.ok(crews.has("ses_gap"), "the crew stays active after a refused close")
+})
+
+test("4.2: crew_close with full evidence asks once, appends the summary, ends the crew", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const asks = []
+  const crewSession = `ses_close_${Math.random().toString(36).slice(2, 7)}`
+  await h.tool.crew_begin.execute({ objective: "clean close" }, recordingCtx(crewSession, asks))
+  const ledgerPath = join(h.__forgeDispatchTest.dispatchLogDir(), "ledger.jsonl")
+  appendFileSync(ledgerPath, JSON.stringify({ ts: new Date().toISOString(), event: "completed", dispatchId: "bg-9", parentSessionID: crewSession, tokens: { input: 10, output: 4, reasoning: 2, cache: { read: 0, write: 0 } }, costUsd: 0.02 }) + "\n")
+  const r = await h.tool.crew_close.execute(
+    { report: [{ title: "only", verdict: "PASS", evidence: "dispatch bg-9 verified the file" }] },
+    recordingCtx(crewSession, asks),
+  )
+  assert.equal(asks.length, 1, "exactly one ask-level confirmation")
+  assert.match(asks[0].permission, /crew_close/)
+  assert.match(r.output, /PASS 1, FAIL 0/)
+  assert.match(r.output, /dispatch ledger/)
+  assert.equal(h.__forgeDispatchTest.crews().has(crewSession), false, "the crew ends")
+  // the summary landed in the ledger
+  const { readFileSync: rf } = await import("node:fs")
+  const text = rf(ledgerPath, "utf8")
+  assert.match(text, /crew-summary/)
+  assert.match(text, /clean close/)
+  // a second close now refuses: no active crew
+  await assert.rejects(
+    () => h.tool.crew_close.execute({ report: [{ title: "only", verdict: "PASS", evidence: "bg-9" }] }, recordingCtx(crewSession, asks)),
+    /No active crew/,
+  )
+})
