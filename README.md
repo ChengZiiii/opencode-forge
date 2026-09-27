@@ -130,7 +130,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
-| `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger: resolved identity/depth, outcomes, tokens/cost, timeouts, lost-on-exit, crew summaries (bounded, capped rotation) | runtime debris — delete freely, also after uninstall |
+| `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger: resolved identity/depth, outcomes, tokens/cost, timeouts, transport interruptions, lost-on-exit, crew summaries (bounded, capped rotation) | runtime debris — delete freely, also after uninstall |
 | `<project>/.opencode/forge.json`, `~/.config/opencode/forge.json` | your dispatch agent definitions (JSONC). **User data — the plugin only reads it, never writes or migrates it** | yours — version the project one, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
@@ -420,6 +420,18 @@ stops polling, suppresses the brief, and ledgers `killed`. On host exit,
 in-flight dispatches are ledgered `lost-on-exit` — sessions are host memory
 objects, there are no orphan processes and no survive semantics.
 
+**Transport-interruption recovery**: the child's prompt is delivered by a
+turn-synchronous HTTP POST that stays open for the whole first turn. If that
+POST dies at the transport layer (fetch abort / network failure — anything
+that is not an HTTP error response), the dispatch does **not** fail: the
+engine ledgers `transport-interrupted` (with the child sessionID) and falls
+back to completion polling under the same deadline — the child session is a
+host-side object and usually keeps running, so its result is still collected
+and delivered normally. The message is never re-POSTed (the prompt may
+already be delivering); a message that never arrived polls as waiting and
+ends in the honest deadline `timeout`. Terminal reports and terminal ledger
+rows carry the child sessionID, dispatchId, parentSessionID, and durationMs.
+
 ### Crew workflow (`/crew`)
 
 `/crew <objective>` registers a crew: decompose the objective into
@@ -447,9 +459,11 @@ ends it honestly and the ledger keeps the history.
   live TUI sessions; prefer sync under `opencode run`.
 - **Host tool ceiling (~262s observed on 1.18.32)**: the host may kill a
   sync tool call that exceeds roughly 262 seconds even though the plugin's
-  own deadline is higher. Keep `timeoutMs` at or below ~240000 for
-  sync-heavy workflows; a killed call still leaves the child session
-  reclaimable via `forge_dispatch_list` / the host API.
+  own deadline is higher. A same-family transport abort (~281s observed,
+  2026-09-27 incident) can also kill the background dispatch's turn POST.
+  Transport-interruption recovery (above) absorbs both: the dispatch falls
+  back to polling and still delivers the child's result; keep `timeoutMs`
+  modest anyway for sync-heavy workflows.
 - **Child permission asks**: a worker that hits a permission ask surfaces the
   ask on the CHILD's session in the TUI. An unanswered ask stalls the child
   until the dispatch deadline — scope worker prompts to avoid permission
