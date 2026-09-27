@@ -15094,117 +15094,271 @@ function createDispatchEngine(deps) {
     const list = await api2(`/session/${sessionID}/message`);
     return Array.isArray(list) ? list : [];
   };
-  async function dispatch(req, parentSessionID) {
-    const t0 = deps.now();
-    const slot = `d${++seq}`;
-    if (inFlight.size >= maxConcurrent) {
-      deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.profile, note: `${inFlight.size} in flight` });
-      throw new DispatchError(`forge_dispatch refused: ${inFlight.size} dispatches already in flight (cap ${maxConcurrent}). Wait for a completion and retry.`, "cap-refused");
-    }
-    const r = resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth }, deps.available, deps.catalog);
+  const killControls = new Map;
+  const resolveOrThrow = (profile, depth, exclude) => {
+    const r = resolveDispatch(deps.cfg, { profile, depth, exclude }, deps.available, deps.catalog);
     if (!r.ok) {
-      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: req.profile, outcome: r.error.code, note: r.error.message });
+      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: profile, outcome: r.error.code, note: r.error.message });
       throw new DispatchError(`${r.error.message}
 Menu:
 ${r.error.menu.map((m) => `- ${m.identity} expose=[${m.expose.join(", ") || "none"}] ${m.reason}`).join(`
 `)}
 Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
     }
+    return r;
+  };
+  async function runAttempt(r, req, parentSessionID, t0, ctl, onChild, dispatchId) {
     const providerID = r.identity.slice(0, r.identity.indexOf("/"));
-    inFlight.add(slot);
     let childID = "";
+    const dir = encodeURIComponent(deps.workspace);
+    let created;
     try {
-      const dir = encodeURIComponent(deps.workspace);
-      let created;
-      try {
-        created = await api2(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify(parentSessionID ? { parentID: parentSessionID } : {}) });
-      } catch {
-        created = await api2(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify({}) });
-      }
-      childID = created?.id ?? "";
-      if (!childID)
-        throw new DispatchError("host returned no session id for the child session", "host-error");
-      deps.onDepth(childID, r.depth, providerID);
-      const family = deps.providerFamily(providerID);
-      const depthInjected = family === null ? "not injected (unknown provider shape)" : `${family} <- ${r.depth}`;
-      await api2(`/session/${childID}/message`, {
-        method: "POST",
-        body: JSON.stringify({
-          model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
-          agent: `forge-${req.profile}`,
-          parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, tier: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }]
-        })
-      });
-      let poll = null;
-      let messages = [];
-      for (;; ) {
-        const elapsed = deps.now() - t0;
-        if (elapsed >= timeoutMs) {
-          deps.sink({
-            ts: new Date().toISOString(),
-            event: "timeout",
-            tier: req.profile,
-            identity: r.identity,
-            depth: r.depth,
-            sessionID: childID,
-            durationMs: elapsed
-          });
-          throw new DispatchError(`forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`, "timeout");
-        }
-        await deps.sleep(pollIntervalMs);
-        messages = await fetchMessages(childID);
-        poll = completionVerdict(poll, { count: messages.length, text: textOf(messages) });
-        if (poll.verdict === "complete" || poll.verdict === "empty")
-          break;
-      }
-      const durationMs = deps.now() - t0;
-      if (poll.verdict === "empty") {
-        deps.sink({
-          ts: new Date().toISOString(),
-          event: "empty-response",
-          tier: req.profile,
-          identity: r.identity,
-          depth: r.depth,
-          sessionID: childID,
-          durationMs
-        });
-        throw new DispatchError(`child session ${childID} returned an empty response (0-token assistant message). This is a known quirk of keyless endpoints combined with restricted tiers — see the README dispatch notes. The dispatch is NOT counted as success.`, "empty-response");
-      }
-      const tokens = sumTokens(tokensOf(messages));
-      const price = priceFor(deps.catalog, r.identity);
-      const cost = computeCost(tokens, price?.spec ?? null);
-      const result = {
-        tier: req.profile,
-        requested: { profile: req.profile, depth: req.depth },
-        actual: { model: r.identity, depth: r.depth },
-        sessionID: childID,
-        durationMs,
-        tokens,
-        costUsd: cost.costUsd,
-        ...cost.note ? { costNote: cost.note } : {},
-        ...price?.label ? { priceSnapshot: price.label } : {},
-        text: textOf(messages),
-        depthInjected
-      };
+      created = await api2(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify(parentSessionID ? { parentID: parentSessionID } : {}) });
+    } catch {
+      created = await api2(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify({}) });
+    }
+    childID = created?.id ?? "";
+    if (!childID)
+      throw new DispatchError("host returned no session id for the child session", "host-error");
+    onChild?.(childID);
+    deps.onDepth(childID, r.depth, providerID);
+    const family = deps.providerFamily(providerID);
+    const depthInjected = family === null ? "not injected (unknown provider shape)" : `${family} <- ${r.depth}`;
+    let deadlineHit = false;
+    const deadlinePromise = deps.sleep(Math.max(timeoutMs - (deps.now() - t0), 0)).then(() => {
+      deadlineHit = true;
+    });
+    const turnPost = api2(`/session/${childID}/message`, {
+      method: "POST",
+      body: JSON.stringify({
+        model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
+        agent: `forge-${req.profile}`,
+        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, tier: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }]
+      })
+    });
+    await Promise.race([turnPost, deadlinePromise]);
+    if (deadlineHit && deps.now() - t0 >= timeoutMs) {
+      const elapsed = deps.now() - t0;
       deps.sink({
         ts: new Date().toISOString(),
-        event: "completed",
+        event: "timeout",
         tier: req.profile,
         identity: r.identity,
         depth: r.depth,
         sessionID: childID,
-        outcome: "completed",
-        tokens,
-        costUsd: cost.costUsd,
-        durationMs
+        durationMs: elapsed,
+        ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
       });
-      return result;
-    } finally {
-      inFlight.delete(slot);
+      throw new DispatchError(`forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`, "timeout");
+    }
+    await turnPost;
+    let poll = null;
+    let messages = [];
+    for (;; ) {
+      if (ctl?.fired)
+        throw new KillRequested;
+      const elapsed = deps.now() - t0;
+      if (elapsed >= timeoutMs) {
+        deps.sink({
+          ts: new Date().toISOString(),
+          event: "timeout",
+          tier: req.profile,
+          identity: r.identity,
+          depth: r.depth,
+          sessionID: childID,
+          durationMs: elapsed,
+          ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
+        });
+        throw new DispatchError(`forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`, "timeout");
+      }
+      await deps.sleep(pollIntervalMs);
+      messages = await (ctl ? Promise.race([fetchMessages(childID), ctl.promise.then(() => [])]) : fetchMessages(childID));
+      if (ctl?.fired)
+        throw new KillRequested;
+      poll = completionVerdict(poll, { count: messages.length, text: textOf(messages) });
+      if (poll.verdict === "complete" || poll.verdict === "empty")
+        break;
+    }
+    const durationMs = deps.now() - t0;
+    if (poll.verdict === "empty") {
+      deps.sink({
+        ts: new Date().toISOString(),
+        event: "empty-response",
+        tier: req.profile,
+        identity: r.identity,
+        depth: r.depth,
+        sessionID: childID,
+        durationMs,
+        ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
+      });
+      throw new DispatchError(`child session ${childID} returned an empty response (0-token assistant message). This is a known quirk of keyless endpoints combined with restricted tiers — see the README dispatch notes. The dispatch is NOT counted as success.`, "empty-response");
+    }
+    const tokens = sumTokens(tokensOf(messages));
+    const price = priceFor(deps.catalog, r.identity);
+    const cost = computeCost(tokens, price?.spec ?? null);
+    const result = {
+      tier: req.profile,
+      requested: { profile: req.profile, depth: req.depth },
+      actual: { model: r.identity, depth: r.depth },
+      sessionID: childID,
+      durationMs,
+      tokens,
+      costUsd: cost.costUsd,
+      ...cost.note ? { costNote: cost.note } : {},
+      ...price?.label ? { priceSnapshot: price.label } : {},
+      text: textOf(messages),
+      depthInjected
+    };
+    deps.sink({
+      ts: new Date().toISOString(),
+      event: "completed",
+      tier: req.profile,
+      identity: r.identity,
+      depth: r.depth,
+      sessionID: childID,
+      outcome: "completed",
+      tokens,
+      costUsd: cost.costUsd,
+      durationMs,
+      ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
+    });
+    return result;
+  }
+  function bgTerminal(reg, dispatchId, identity, req, t0, e) {
+    const report = {
+      tier: req.profile,
+      requested: { profile: req.profile, depth: req.depth },
+      actual: { model: identity, depth: null },
+      sessionID: "",
+      outcome: "error",
+      durationMs: deps.now() - t0,
+      error: e instanceof Error ? e.message : String(e)
+    };
+    if (e instanceof DispatchError && e.code === "timeout") {
+      report.outcome = "timeout";
+      reg.markTimeout(dispatchId, report);
+      deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
+      return;
+    }
+    deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.profile, identity, outcome: "error", note: report.error });
+    reg.markError(dispatchId, report);
+    deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
+  }
+  async function dispatch(req, parentSessionID, opts) {
+    const t0 = deps.now();
+    if (inFlight.size >= maxConcurrent) {
+      deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.profile, note: `${inFlight.size} in flight` });
+      throw new DispatchError(`forge_dispatch refused: ${inFlight.size} dispatches already in flight (cap ${maxConcurrent}). Wait for a completion and retry.`, "cap-refused");
+    }
+    const bg = opts?.background === true;
+    if (bg && !deps.registry)
+      throw new DispatchError("background dispatch requires the dispatch registry (internal error)", "host-error");
+    const first = resolveOrThrow(req.profile, req.depth, undefined);
+    if (bg) {
+      const reg = deps.registry;
+      const { dispatchId } = reg.submit({ sessionID: "", identity: first.identity, depth: first.depth, tier: req.profile, parentSessionID: parentSessionID ?? "" });
+      let fire = () => {};
+      const promise2 = new Promise((res) => {
+        fire = res;
+      });
+      const ctl = { fired: false, promise: promise2, fire: () => {
+        ctl.fired = true;
+        fire();
+      } };
+      killControls.set(dispatchId, ctl);
+      const slot = `d${++seq}`;
+      inFlight.add(slot);
+      (async () => {
+        try {
+          if (reg.get(dispatchId).state === "killed")
+            return;
+          reg.markRunning(dispatchId);
+          let identity = first;
+          let exclude2 = undefined;
+          for (let attemptNo = 0;; attemptNo++) {
+            try {
+              const result = await runAttempt(identity, req, parentSessionID, t0, ctl, (sid) => {
+                try {
+                  reg.get(dispatchId).sessionID = sid;
+                } catch {}
+              }, dispatchId);
+              if (reg.get(dispatchId).state === "killed") {
+                reg.noteLateCompletion(dispatchId, result);
+                deps.sink({ ts: new Date().toISOString(), event: "kill-late-completion", tier: req.profile, identity: identity.identity, sessionID: result.sessionID, outcome: "kill-late-completion" });
+              } else {
+                reg.markCompleted(dispatchId, result);
+                deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
+              }
+              return;
+            } catch (e) {
+              if (e instanceof KillRequested)
+                return;
+              if (reg.get(dispatchId).state === "killed")
+                return;
+              const retryable = e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response");
+              const alternative = retryable ? resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth, exclude: [identity.identity] }, deps.available, deps.catalog) : { ok: false };
+              if (!retryable || attemptNo > 0 || !alternative.ok) {
+                bgTerminal(reg, dispatchId, identity.identity, req, t0, e);
+                return;
+              }
+              deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.profile, identity: identity.identity, note: `${identity.identity}: ${e.code}` });
+              exclude2 = [identity.identity];
+              identity = alternative;
+              reg.get(dispatchId).identity = identity.identity;
+            }
+          }
+        } finally {
+          inFlight.delete(slot);
+          killControls.delete(dispatchId);
+        }
+      })();
+      return {
+        dispatchId,
+        tier: req.profile,
+        requested: { profile: req.profile, depth: req.depth },
+        resolved: first.identity,
+        depth: first.depth,
+        queuedAt: reg.get(dispatchId).queuedAt
+      };
+    }
+    let exclude = undefined;
+    for (let attemptNo = 0;; attemptNo++) {
+      const r = attemptNo === 0 ? first : resolveOrThrow(req.profile, req.depth, exclude);
+      const slot = `d${++seq}`;
+      inFlight.add(slot);
+      try {
+        return await runAttempt(r, req, parentSessionID, t0, undefined, undefined);
+      } catch (e) {
+        const identity = r.identity;
+        const retryable = e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response");
+        if (!retryable || attemptNo > 0)
+          throw e;
+        const alternative = resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth, exclude: [identity] }, deps.available, deps.catalog);
+        if (!alternative.ok)
+          throw e;
+        deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.profile, identity, note: `${identity}: ${e.code}` });
+        exclude = [identity];
+      } finally {
+        inFlight.delete(slot);
+      }
     }
   }
   return {
     dispatch,
+    kill: (dispatchId) => {
+      const reg = deps.registry;
+      if (!reg)
+        throw new DispatchError("forge_dispatch_kill unavailable: no dispatch registry (internal error)", "kill-failed");
+      const e = reg.get(dispatchId);
+      if (e.state === "completed" || e.state === "timeout" || e.state === "error") {
+        throw new DispatchError(`forge_dispatch_kill refused: dispatch ${dispatchId} already ${e.state}; use forge_dispatch_list for its result.`, "kill-failed");
+      }
+      if (e.state === "killed")
+        throw new DispatchError(`dispatch ${dispatchId} is already killed.`, "kill-failed");
+      reg.markKilled(dispatchId);
+      deps.sink({ ts: new Date().toISOString(), event: "killed", tier: e.tier, identity: e.identity, depth: e.depth ?? undefined, sessionID: e.sessionID, outcome: "killed" });
+      killControls.get(dispatchId)?.fire();
+    },
     inFlightCount: () => inFlight.size,
     inFlightIDs: () => [...inFlight],
     dispose: () => {
@@ -15214,6 +15368,12 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
       inFlight.clear();
     }
   };
+}
+
+class KillRequested extends Error {
+  constructor() {
+    super("kill requested");
+  }
 }
 function priceFor(catalog, identity) {
   const slash = identity.indexOf("/");
@@ -15272,6 +15432,148 @@ function createDispatchLedger(logPath, maxEntries = DISPATCH_LEDGER_MAX_ENTRIES,
     }
   };
   return { append, entries, path: logPath };
+}
+
+// src/dispatch-registry.ts
+var TERMINAL_CAP = 50;
+function createDispatchRegistry() {
+  const entries = new Map;
+  let seq = 0;
+  const fail = (msg) => {
+    throw new Error(`[forge:dispatch-registry] ${msg}`);
+  };
+  const isTerminal2 = (st) => st === "completed" || st === "timeout" || st === "killed" || st === "error";
+  return {
+    submit(entry) {
+      const dispatchId = `bg-${++seq}`;
+      entries.set(dispatchId, {
+        ...entry,
+        dispatchId,
+        background: true,
+        queuedAt: entry.queuedAt ?? new Date().toISOString(),
+        state: "queued",
+        delivered: false
+      });
+      return { dispatchId };
+    },
+    get(dispatchId) {
+      const e = entries.get(dispatchId);
+      if (!e)
+        throw new Error(`[forge:dispatch-registry] unknown dispatch id "${dispatchId}"`);
+      return e;
+    },
+    markRunning(dispatchId) {
+      const e = this.get(dispatchId);
+      if (e.state !== "queued")
+        fail(`illegal transition ${e.state} → running for ${dispatchId}`);
+      e.state = "running";
+      return e;
+    },
+    markCompleted(dispatchId, result) {
+      return this.terminate(dispatchId, "completed", result);
+    },
+    markTimeout(dispatchId, report) {
+      return this.terminate(dispatchId, "timeout", report);
+    },
+    markError(dispatchId, report) {
+      return this.terminate(dispatchId, "error", report);
+    },
+    markKilled(dispatchId) {
+      return this.terminate(dispatchId, "killed");
+    },
+    noteLateCompletion(dispatchId, result) {
+      const e = this.get(dispatchId);
+      if (e.state !== "killed")
+        fail(`late completion only makes sense on a killed dispatch (${dispatchId} is ${e.state})`);
+      e.lateCompletion = result;
+    },
+    terminate(dispatchId, state, result) {
+      const e = this.get(dispatchId);
+      if (isTerminal2(e.state))
+        fail(`illegal transition ${e.state} → ${state} for ${dispatchId}`);
+      e.state = state;
+      if (result !== undefined)
+        e.result = result;
+      return e;
+    },
+    takeUndelivered(parentSessionID) {
+      const out = [];
+      for (const e of entries.values()) {
+        if (parentSessionID !== undefined && e.parentSessionID !== parentSessionID)
+          continue;
+        if (isTerminal2(e.state) && !e.delivered && e.state !== "killed") {
+          e.delivered = true;
+          out.push(e);
+        }
+      }
+      return out;
+    },
+    list() {
+      const inFlight = [];
+      const terminal = [];
+      for (const e of entries.values()) {
+        if (isTerminal2(e.state))
+          terminal.push(e);
+        else
+          inFlight.push(e);
+      }
+      return { inFlight, terminal: terminal.slice(-TERMINAL_CAP) };
+    }
+  };
+}
+
+// src/crew-gate.ts
+var CREW_DISPATCH_EVENTS = new Set(["completed", "timeout", "error", "killed", "empty-response"]);
+var DISPATCH_ID = /bg-\d+/g;
+function validateCrewReport(report, ledgerRows, crew) {
+  const gaps = [];
+  if (!Array.isArray(report) || report.length === 0) {
+    return { ok: false, gaps: ["the report lists no subtasks — a crew completion report must cover every subtask"], dispatchIds: [] };
+  }
+  const rowById = new Map;
+  for (const row of ledgerRows) {
+    if (row.parentSessionID !== crew.sessionID)
+      continue;
+    if (row.ts < crew.startedAt)
+      continue;
+    if (row.event === "validation" || row.event === "resolve-error" || row.event === "refused-cap" || row.event === "models-dev-degraded" || row.event === "retry-excluded" || row.event === "lost-on-exit" || row.event === "kill-late-completion")
+      continue;
+    if (CREW_DISPATCH_EVENTS.has(row.event) && row.dispatchId)
+      rowById.set(row.dispatchId, row);
+  }
+  const referenced = new Set;
+  report.forEach((sub, i) => {
+    const label = sub?.title?.trim() || `subtask #${i + 1}`;
+    const verdict = String(sub?.verdict ?? "").toUpperCase();
+    if (!sub?.title?.trim())
+      gaps.push(`${label}: missing title`);
+    if (verdict !== "PASS" && verdict !== "FAIL")
+      gaps.push(`${label}: verdict must be PASS or FAIL (got "${sub?.verdict ?? ""}")`);
+    const ids = [...String(sub?.evidence ?? "").matchAll(DISPATCH_ID)].map((m) => m[0]);
+    if (!String(sub?.evidence ?? "").trim())
+      gaps.push(`${label}: missing evidence reference`);
+    else if (ids.length === 0)
+      gaps.push(`${label}: evidence must reference a dispatch id (bg-N) that exists in the dispatch ledger`);
+    for (const id of ids) {
+      if (referenced.has(id))
+        gaps.push(`${label}: dispatch ${id} is already cited by another subtask — each dispatch belongs to exactly one verdict`);
+      referenced.add(id);
+      const row = rowById.get(id);
+      if (!row)
+        gaps.push(`${label}: dispatch ${id} has no ledger row for this crew (fabricated, stale, or pre-crew)`);
+      else if (verdict === "PASS" && row.event !== "completed") {
+        gaps.push(`${label}: marked PASS but dispatch ${id} ended ${row.event} — a subtask whose attempt and retry both failed must be marked FAIL with both reports visible`);
+      }
+    }
+    if (verdict === "FAIL" && (!Array.isArray(sub?.attempts) || sub.attempts.length < 2)) {
+      gaps.push(`${label}: FAIL requires both failure reports (the attempt and the one retry) in attempts[]`);
+    }
+  });
+  for (const [id, row] of rowById) {
+    if (!referenced.has(id))
+      gaps.push(`dispatch ${id} (${row.event}, ${row.ts}) has no verdict in the report — a dispatched subtask was silently dropped`);
+  }
+  return { ok: gaps.length === 0, gaps, dispatchIds: [...rowById.keys()] };
 }
 
 // src/dispatch-tiers.ts
@@ -15451,6 +15753,10 @@ var dispatchBase = null;
 var activeDispatchEngine = null;
 var dispatchLogDir = join5(tmpdir3(), "opencode-forge", "dispatch");
 var dispatchLedger = createDispatchLedger(join5(dispatchLogDir, "ledger.jsonl"));
+var activeDispatchRegistry = null;
+var dispatchClient = null;
+var dispatchWakeTimers = new Map;
+var crews = new Map;
 var dispatchDepths = new Map;
 var OPENAI_FAMILY = new Set(["openai", "opencode", "openrouter", "groq", "xai", "azure", "github-copilot", "deepseek", "together", "vercel", "opus"]);
 var ANTHROPIC_FAMILY = new Set(["anthropic"]);
@@ -16274,12 +16580,72 @@ ${p.newOutput || "(none in this window)"}`,
     };
   }
 });
+function dispatchWakeDelay(idleDriven) {
+  const env = Number(process.env.FORGE_DISPATCH_WAKE_DEBOUNCE_MS);
+  if (Number.isFinite(env) && env >= 0)
+    return env;
+  return idleDriven ? IDLE_DEBOUNCE_MS + 50 : 1500;
+}
+function scheduleDispatchWake(sessionID, idleDriven) {
+  if (dispatchDisabled || forgeDisabled)
+    return;
+  if (dispatchWakeTimers.has(sessionID))
+    return;
+  const t = setTimeout(() => {
+    dispatchWakeTimers.delete(sessionID);
+    injectDispatchBrief(sessionID);
+  }, dispatchWakeDelay(idleDriven));
+  dispatchWakeTimers.set(sessionID, t);
+}
+function dispatchBriefText(entries) {
+  const lines = [`[forge:dispatch-complete] ${entries.length} background dispatch(es) reached terminal state:`];
+  for (const e of entries) {
+    lines.push("", `- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not yet started)"}`);
+    const r = e.result;
+    if (r !== undefined) {
+      lines.push(`  result: ${JSON.stringify(r, null, 1).replace(/\n/g, `
+`).slice(0, 2000)}`);
+    }
+  }
+  return lines.join(`
+`);
+}
+async function injectDispatchBrief(sessionID) {
+  const reg = activeDispatchRegistry;
+  if (!reg)
+    return;
+  const c0 = dispatchClient;
+  if (typeof c0?.session.status === "function") {
+    try {
+      const st = await c0.session.status({ path: { id: sessionID } });
+      const t = st?.[sessionID]?.type;
+      if (t && t !== "idle")
+        return;
+    } catch {
+      return;
+    }
+  }
+  const entries = reg.takeUndelivered(sessionID);
+  if (entries.length === 0)
+    return;
+  const c = dispatchClient;
+  const send = c?.session.promptAsync ?? c?.session.prompt;
+  if (typeof send !== "function")
+    return;
+  try {
+    await send.call(c.session, { path: { id: sessionID }, body: { parts: [{ type: "text", text: dispatchBriefText(entries) }] } });
+  } catch {
+    for (const e of entries)
+      e.delivered = false;
+  }
+}
 var forgeDispatchTool = tool({
   description: "Dispatch a scoped task to a worker subagent running on a dynamically selected model and reasoning depth. Takes {prompt, profile, depth}: profile is a dispatch tier (scout=readonly recon, build=implementation, review=readonly review, quick=mechanical small change); depth is a reasoning level and must EXACTLY match one of the levels exposed for the resolved model — the vocabulary is listed below and in errors; there is no clamping, a mis-set depth is an error. Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
   args: {
     prompt: tool.schema.string().describe("Complete, self-contained task for the worker (it cannot see this conversation)"),
     profile: tool.schema.string().describe("Dispatch tier: scout | build | review | quick (or a user-defined tier id)"),
-    depth: tool.schema.string().optional().describe("Reasoning depth, verbatim from the exposed vocabulary; omit to use the tier's default when it has one")
+    depth: tool.schema.string().optional().describe("Reasoning depth, verbatim from the exposed vocabulary; omit to use the tier's default when it has one"),
+    background: tool.schema.boolean().optional().describe("Run in the background: returns {dispatchId, resolved, queuedAt} immediately; the full result arrives later as a coalesced [forge:dispatch-complete] brief when the session is idle. Background mode targets live TUI sessions — under `opencode run` the session ends before any brief, so completions are ledger-only (read them via forge_dispatch_list) and sync mode is preferred.")
   },
   execute: async (args, context) => {
     const state = stateForBan(context.sessionID);
@@ -16293,7 +16659,21 @@ var forgeDispatchTool = tool({
     if (!engine)
       throw new Error("[forge] dispatch engine unavailable (disabled by dispatch.disable, or config still loading).");
     try {
-      const r = await engine.dispatch({ prompt: args.prompt, profile: args.profile, ...args.depth !== undefined ? { depth: args.depth } : {} }, context.sessionID);
+      const r = await engine.dispatch({ prompt: args.prompt, profile: args.profile, ...args.depth !== undefined ? { depth: args.depth } : {} }, context.sessionID, args.background === true ? { background: true } : undefined);
+      if ("dispatchId" in r) {
+        context.metadata({ title: `dispatch ${r.tier} queued (${r.dispatchId})` });
+        return {
+          title: `dispatch ${r.tier} queued → ${r.resolved}${r.depth ? ` @${r.depth}` : ""}`,
+          output: [
+            `[forge:dispatch] accepted in the background: ${r.dispatchId}`,
+            `tier: ${r.tier}   resolved: ${r.resolved}${r.depth ? `   depth: ${r.depth}` : ""}`,
+            `queuedAt: ${r.queuedAt}`,
+            "",
+            "The full result (tokens/cost/report — or the timeout/error report) arrives as a [forge:dispatch-complete] brief when this session is next idle. Track progress any time with forge_dispatch_list; cancel with forge_dispatch_kill."
+          ].join(`
+`)
+        };
+      }
       const tok = r.tokens;
       const costLine = r.costUsd !== null && r.costUsd !== undefined ? `$${r.costUsd.toFixed(6)}${r.priceSnapshot ? ` (${r.priceSnapshot})` : ""}` : `unpriced${r.costNote ? ` — ${r.costNote}` : ""}`;
       context.metadata({ title: `dispatch ${r.tier}: ${r.actual.model} @ ${r.actual.depth}` });
@@ -16319,6 +16699,174 @@ var forgeDispatchTool = tool({
     }
   }
 });
+var forgeDispatchListTool = tool({
+  description: "List background forge_dispatch activity: in-flight dispatches (with dispatchIds) and recent terminal results (completed/timeout/error, full report objects). Use it to recover dispatch state after context compaction or to check on a background dispatch instead of waiting.",
+  args: {},
+  execute: async () => {
+    const reg = activeDispatchRegistry;
+    if (!reg)
+      throw new Error("[forge] no background dispatches have been submitted.");
+    const l = reg.list();
+    if (l.inFlight.length === 0 && l.terminal.length === 0) {
+      return { title: "no background dispatches", output: "[forge:dispatch-list] no background dispatches recorded in this session." };
+    }
+    const lines = [];
+    if (l.inFlight.length > 0) {
+      lines.push("In flight:");
+      for (const e of l.inFlight) {
+        lines.push(`- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state} · queued ${e.queuedAt} · session ${e.sessionID || "(starting)"}`);
+      }
+    }
+    if (l.terminal.length > 0) {
+      lines.push("", "Recent terminal results:");
+      for (const e of l.terminal.slice().reverse()) {
+        lines.push(`- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not started)"}`);
+        const r = e.result;
+        if (r !== undefined)
+          lines.push(`  result: ${JSON.stringify(r, null, 1).slice(0, 2000)}`);
+        if (e.lateCompletion !== undefined)
+          lines.push(`  (killed; a late result arrived after the kill and was discarded: ${JSON.stringify(e.lateCompletion).slice(0, 300)})`);
+      }
+    }
+    return { title: `dispatches: ${l.inFlight.length} in flight, ${l.terminal.length} terminal`, output: lines.join(`
+`) };
+  }
+});
+var forgeDispatchKillTool = tool({
+  description: "Cancel an in-flight background forge_dispatch by dispatchId: polling stops, the completion brief is suppressed, and the outcome is ledgered as killed. Refuses honestly if the dispatch already finished (use forge_dispatch_list). The child session itself cannot be aborted on this host version and is left for the host to reclaim.",
+  args: {
+    dispatchId: tool.schema.string().describe("The dispatchId returned by forge_dispatch (background) or shown by forge_dispatch_list")
+  },
+  execute: async (args) => {
+    const engine = activeDispatchEngine;
+    if (!engine)
+      throw new Error("[forge] dispatch engine unavailable.");
+    try {
+      engine.kill(args.dispatchId);
+    } catch (err) {
+      if (err instanceof DispatchError)
+        throw new Error(`[forge:dispatch:${err.code}] ${err.message}`);
+      throw err;
+    }
+    return {
+      title: `${args.dispatchId} killed`,
+      output: `[forge:dispatch] ${args.dispatchId}: killed — polling stopped, the completion brief is suppressed, and the outcome is ledgered. The child session cannot be aborted on this host and is left for the host to reclaim.`
+    };
+  }
+});
+var CREW_COMMAND_TEMPLATE = [
+  "Objective: {args}",
+  "",
+  "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). Follow it exactly:",
+  "",
+  "1. REGISTER: call `crew_begin` with the objective. If it refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew.",
+  "2. DECOMPOSE: break the objective into subtasks. Every subtask carries FOUR fields before dispatch: (a) a self-contained prompt, (b) a tier/profile (scout = readonly recon, build = implementation, review = readonly review, quick = mechanical change), (c) an exact reasoning depth from the exposed vocabulary, (d) an acceptance-evidence statement — what the result text must contain for you to call it PASS.",
+  "3. WAVES, NEVER FLOODS: dispatch subtasks with background forge_dispatch in batches no larger than the concurrency cap (default 4). Launch the next batch ONLY as [forge:dispatch-complete] briefs free capacity. Never fire more dispatches while the cap is full.",
+  "4. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the dispatch result text — cite the dispatchId (bg-N) as the evidence reference. A result that does not meet the statement is a failure even if the worker sounded confident.",
+  "5. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or depth. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
+  "6. CLOSE: when every subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks your report against the dispatch ledger — a dispatched subtask missing from the report refuses the close. The user confirms the closing dialog."
+].join(`
+`);
+var crewBeginTool = tool({
+  description: "Register this session's crew (from /crew). Refuses when a crew is already active in the session or while a plan draft is active. Crew state is in-memory: a host restart ends it honestly (the dispatch ledger keeps the history).",
+  args: {
+    objective: tool.schema.string().describe("One-line crew objective (from /crew)")
+  },
+  execute: async (args, context) => {
+    const state = stateForBan(context.sessionID);
+    const active = state ? resolveActivePlan(state) : null;
+    if (active && active.doc.status === "draft") {
+      throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.");
+    }
+    if (!args.objective?.trim())
+      throw new Error("crew_begin requires a non-empty objective (from /crew <objective>).");
+    const existing = crews.get(context.sessionID);
+    if (existing) {
+      throw new Error(`[forge:crew] This session already has an active crew: "${existing.objective}" (started ${existing.startedAt}). Finish and close it with crew_close before starting another.`);
+    }
+    crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso() });
+    return {
+      title: `crew registered: ${args.objective.trim().slice(0, 60)}`,
+      output: `[forge:crew] Crew registered for this session. Objective: ${args.objective.trim()}. Proceed with the discipline: decompose → waves paced on completion briefs (never past the cap) → per-subtask evidence verdicts → at most one retry → crew_close with the full report.`
+    };
+  }
+});
+var crewCloseTool = tool({
+  description: "Close this session's crew with the final report (ask-level user confirmation). The gate cross-checks the report against the dispatch ledger: every subtask needs a verdict (PASS/FAIL) and a bg-N evidence reference; every dispatch this crew submitted must appear in the report; FAIL requires both failure reports (attempt + the one retry). On success the summary (verdicts, ledger references, aggregate tokens/cost) is appended to the dispatch ledger and the crew ends.",
+  args: {
+    report: tool.schema.array(tool.schema.object({
+      title: tool.schema.string().describe("Subtask title"),
+      verdict: tool.schema.string().describe("PASS or FAIL"),
+      evidence: tool.schema.string().describe("Acceptance evidence with the bg-N dispatch id reference"),
+      attempts: tool.schema.array(tool.schema.string()).optional().describe("For FAIL: both failure reports (attempt and retry)")
+    })).describe("The full crew report — one entry per subtask")
+  },
+  execute: async (args, context) => {
+    const crew = crews.get(context.sessionID);
+    if (!crew)
+      throw new Error("[forge:crew] No active crew in this session (crew state is in-memory and dies on host restart). Start one with /crew <objective>.");
+    const rows = [];
+    try {
+      const file2 = readFileSync8(join5(dispatchLogDir, "ledger.jsonl"), "utf8");
+      for (const line of file2.split(`
+`)) {
+        const t = line.trim();
+        if (!t)
+          continue;
+        try {
+          rows.push(JSON.parse(t));
+        } catch {}
+      }
+    } catch {}
+    const check2 = validateCrewReport(args.report ?? [], rows, { objective: crew.objective, startedAt: crew.startedAt, sessionID: context.sessionID });
+    if (!check2.ok) {
+      throw new Error(`[forge:crew] crew_close refused — the report does not match the dispatch ledger:
+${check2.gaps.map((g) => `- ${g}`).join(`
+`)}
+The crew stays active; complete or correct the report and call crew_close again.`);
+    }
+    let tokensIn = 0;
+    let tokensOut = 0;
+    let costSum = 0;
+    let costKnown = 0;
+    for (const row of rows) {
+      if (typeof row.dispatchId !== "string" || !check2.dispatchIds.includes(row.dispatchId))
+        continue;
+      const tok = row.tokens;
+      tokensIn += tok?.input ?? 0;
+      tokensOut += (tok?.output ?? 0) + (tok?.reasoning ?? 0);
+      if (typeof row.costUsd === "number") {
+        costSum += row.costUsd;
+        costKnown++;
+      }
+    }
+    await gate(context.ask, "crew_close", `Close crew: ${crew.objective}`);
+    dispatchLedger.append({
+      ts: nowIso(),
+      event: "crew-summary",
+      tier: "crew",
+      outcome: "closed",
+      sessionID: context.sessionID,
+      note: crew.objective,
+      tokens: { input: tokensIn, output: tokensOut, reasoning: 0, cache: { read: 0, write: 0 } },
+      costUsd: costKnown > 0 ? costSum : null,
+      dispatchIds: check2.dispatchIds,
+      subtasks: (args.report ?? []).map((r) => ({ title: r.title, verdict: String(r.verdict).toUpperCase(), evidence: r.evidence }))
+    });
+    crews.delete(context.sessionID);
+    const fails = (args.report ?? []).filter((r) => String(r.verdict).toUpperCase() === "FAIL").length;
+    return {
+      title: `crew closed: ${crew.objective.slice(0, 60)}`,
+      output: [
+        `[forge:crew] Crew closed: ${crew.objective}`,
+        `subtasks: ${(args.report ?? []).length} (PASS ${(args.report ?? []).length - fails}, FAIL ${fails})`,
+        `dispatches: ${check2.dispatchIds.length}   tokens: in ${tokensIn}, out ${tokensOut}   cost: ${costKnown > 0 ? `$${costSum.toFixed(6)}` : "unpriced"}`,
+        "The summary is appended to the dispatch ledger."
+      ].join(`
+`)
+    };
+  }
+});
 function forgeTools() {
   const tools = {
     plan_write: planWriteTool,
@@ -16339,6 +16887,10 @@ function forgeTools() {
   }
   if (!dispatchDisabled && !forgeDisabled) {
     tools.forge_dispatch = forgeDispatchTool;
+    tools.forge_dispatch_list = forgeDispatchListTool;
+    tools.forge_dispatch_kill = forgeDispatchKillTool;
+    tools.crew_begin = crewBeginTool;
+    tools.crew_close = crewCloseTool;
   }
   return tools;
 }
@@ -16513,9 +17065,13 @@ async function continueIfEligible(client, sessionID) {
       }
     }
     try {
+      const wakeEntries = activeDispatchRegistry?.takeUndelivered(sessionID) ?? [];
+      const briefText = wakeEntries.length > 0 ? `${dispatchBriefText(wakeEntries)}
+
+${goalBriefText(state, goal)}` : goalBriefText(state, goal);
       await client.session.prompt({
         path: { id: sessionID },
-        body: { parts: [{ type: "text", text: goalBriefText(state, goal) }] }
+        body: { parts: [{ type: "text", text: briefText }] }
       });
       transportFails.delete(sessionID);
       pendingContinuationTurn.add(sessionID);
@@ -16552,6 +17108,7 @@ var server = async (input, options) => {
   hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || "";
   const client = input.client;
   jobClient = input.client;
+  dispatchClient = input.client;
   const jobsOpts = options?.jobs;
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native")
     jobsMode = jobsOpts.mode;
@@ -16670,13 +17227,17 @@ var server = async (input, options) => {
         template: PLAN_COMMAND_TEMPLATE,
         description: "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline"
       };
+      cfg.command["crew"] ??= {
+        template: CREW_COMMAND_TEMPLATE,
+        description: "forge crew orchestration: decompose an objective into evidence-checked subtasks dispatched as paced background waves; at most one retry per subtask; crew_close cross-checks the report against the dispatch ledger"
+      };
       cfg.command["goal"] ??= {
         template: GOAL_COMMAND_TEMPLATE,
         description: "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)"
       };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
-      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell"]) {
+      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell", "crew_close"]) {
         if (permSection[gateKey] !== "deny")
           permSection[gateKey] = "ask";
       }
@@ -16703,6 +17264,7 @@ var server = async (input, options) => {
           agentSection[id] = tierAgentDef(tierId, tier);
         }
         const roster = built;
+        activeDispatchRegistry = activeDispatchRegistry ?? createDispatchRegistry();
         activeDispatchEngine?.dispose();
         activeDispatchEngine = createDispatchEngine({
           serverUrl: String(input.serverUrl ?? "").replace(/\/$/, ""),
@@ -16716,6 +17278,8 @@ var server = async (input, options) => {
             return roster.roster.some((e) => e.model === identity);
           },
           sink: (entry) => dispatchLedger.append(entry),
+          registry: activeDispatchRegistry,
+          onTerminal: (parentSessionID) => scheduleDispatchWake(parentSessionID, false),
           onDepth: queueDispatchDepth,
           providerFamily: dispatchProviderFamily,
           maxConcurrent: dispatchMaxConcurrent,
@@ -16769,6 +17333,10 @@ var server = async (input, options) => {
       queueDepth: queueDispatchDepth,
       depthState: (sessionID) => dispatchDepths.get(sessionID) ?? null,
       composePrompt: composeWorkerPrompt,
+      registry: () => activeDispatchRegistry,
+      crews: () => crews,
+      dispatchLogDir: () => dispatchLogDir,
+      dispatchBriefText,
       setEngine: (engine) => {
         activeDispatchEngine?.dispose();
         activeDispatchEngine = engine;
@@ -16811,6 +17379,7 @@ var server = async (input, options) => {
           goalProbe(`idle event session=${sessionID}`);
           scheduleIdleContinuation(client, sessionID);
           deliverJobWakes(sessionID);
+          scheduleDispatchWake(sessionID, true);
         }
       }
       if (event.type === "session.deleted") {
@@ -16869,6 +17438,10 @@ ${output.description}`;
     "experimental.chat.system.transform": async (input2, output) => {
       if (!input2.sessionID)
         return;
+      const crewActive = crews.get(input2.sessionID);
+      if (crewActive && !output.system.some((s) => s.startsWith("[forge:crew-active]"))) {
+        output.system.push(`[forge:crew-active] A crew is ACTIVE in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict.`);
+      }
       if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
         output.system.push("[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.");
       }

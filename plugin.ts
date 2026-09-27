@@ -1252,6 +1252,19 @@ function dispatchBriefText(entries: RegistryEntry[]): string {
 async function injectDispatchBrief(sessionID: string): Promise<void> {
   const reg = activeDispatchRegistry
   if (!reg) return
+  // Never interrupt an active turn (spec): check the session status BEFORE
+  // draining — a busy session leaves the entries undelivered and the next
+  // idle delivers them exactly once. On a failed status read, wait too.
+  const c0 = dispatchClient
+  if (typeof c0?.session.status === "function") {
+    try {
+      const st = (await c0.session.status({ path: { id: sessionID } })) as Record<string, { type?: string }> | undefined
+      const t = st?.[sessionID]?.type
+      if (t && t !== "idle") return
+    } catch {
+      return
+    }
+  }
   const entries = reg.takeUndelivered(sessionID)
   if (entries.length === 0) return
   const c = dispatchClient
