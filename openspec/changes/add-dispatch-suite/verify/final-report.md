@@ -22,6 +22,7 @@ git：c7aec49a0e1ad01f87c1d185d3fbb0f48211e94c（代码终态；本报告提交�
 | 2 | tasks 6.4 `opencode plugin --global` | 安装器不读 `OPENCODE_CONFIG_DIR`，"global" 根随 `XDG_CONFIG_HOME` 走；首次尝试落到用户真实配置（已逐项完整还原，见 install-verify.md 事件记录），合规重试以 XDG 重定向在沙盒内全链路通过 | 已按 spec 命令形态验证通过；README 已记录该坑 |
 | 3 | 战役Ⅱ e2e 驱动首轮 7/10 | 三处失败全为驱动自身缺陷（dispatchId 真实格式 `bg-N`；账本整文件重写+轮转使字节偏移增量失效；模型回复引用 brief 标记词造成假阳性）——非插件缺陷 | 驱动修正后 10/10（二轮），过程记录在 e2e-smoke.md |
 | 4 | tasks.md 记账 | 阶段 E 提交信息声称 "tick 4.1-4.2" 但文件实际漏勾（工作本身有完整测试证据且门 E 已过） | 阶段 G 补勾至 23/23 |
+| 5 | roster.ts 自动生成条目（零配置 scout/quick 自动服务） | **用户已裁决：自动选模不可行**——配置≠可用（available() 仅查在册，B27 活体实证 keyless 空响应）；静默选模违反本插件"绝不静默替换"原则；且工具无 model 参数、失败恢复弱 | 后续 change `add-explicit-dispatch-roster` 落地：废除自动服务，检测到的身份降级为 setup 错误内嵌模板的预填内容（报错即教程，配置说了算）；本 change 按冻结 spec 保留现状 |
 
 ## LIMITATION 清单（知情项，验收时逐条过目）
 
