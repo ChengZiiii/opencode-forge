@@ -341,6 +341,84 @@ test("forge_dispatch result object passes through the engine report with a title
 })
 
 // ---------------------------------------------------------------------------
+// 4.3 forge_dispatch_config: pure round-trip introspection.
+
+test("4.3 configured state: round-trip shape mirrors the winning forge.json exactly", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-wiring-cfg-"))
+  t.after(() => {
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  })
+  mkdirSync(join(dir, ".opencode"), { recursive: true })
+  writeFileSync(
+    join(dir, ".opencode", "forge.json"),
+    `{
+  "agents": {
+    "research": { "model": "zai/glm-5.3", "depths": ["low", "high", "max"], "prompt": "dig deep", "shape": "write" },
+    "review": { "model": "anthropic/claude-haiku-4-5", "depths": ["medium", "high"], "permission": { "bash": "deny" } }
+  }
+}`,
+  )
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+
+  const r = await h.tool.forge_dispatch_config.execute({}, allowCtx("ses_cfg"))
+  const parsed = JSON.parse(r.output)
+  // exact round-trip keys — nothing invented
+  assert.deepEqual(Object.keys(parsed).sort(), ["agents", "findings", "knobs"])
+  assert.deepEqual(Object.keys(parsed.agents).sort(), ["research", "review"])
+  assert.deepEqual(parsed.agents.research.depths, ["low", "high", "max"])
+  assert.equal(parsed.agents.research.model, "zai/glm-5.3")
+  assert.equal(parsed.agents.research.prompt, "dig deep")
+  assert.deepEqual(parsed.knobs, { timeoutMs: 600000, maxConcurrent: 4 })
+  assert.deepEqual(parsed.findings, [])
+  // NO discovery fields, anywhere
+  const raw = r.output.toLowerCase()
+  assert.ok(!raw.includes("vocabulary"), "no canonicalVocabulary vestige")
+  assert.ok(!raw.includes("detected"), "no detected identities field")
+  assert.ok(!raw.includes("inflight") && !raw.includes("in-flight"), "in-flight belongs to forge_dispatch_list")
+})
+
+test("4.3 unconfigured state: seed agents + the unconfigured finding", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  const r = await h.tool.forge_dispatch_config.execute({}, allowCtx("ses_cfg2"))
+  const parsed = JSON.parse(r.output)
+  assert.deepEqual(Object.keys(parsed.agents).sort(), ["research", "review"])
+  assert.equal(parsed.agents.research.model, "Local/GPT Luna")
+  assert.ok(parsed.findings.some((f) => f.code === "dispatch-unconfigured"))
+})
+
+test("4.3 hot-apply: an edited forge.json is reflected without a config reload", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-wiring-hot-"))
+  t.after(() => {
+    try { rmSync(dir, { recursive: true, force: true }) } catch {}
+  })
+  mkdirSync(join(dir, ".opencode"), { recursive: true })
+  const file = join(dir, ".opencode", "forge.json")
+  writeFileSync(file, `{"agents": {"research": {"model": "a/b", "depths": ["low"]}}}`)
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  let parsed = JSON.parse((await h.tool.forge_dispatch_config.execute({}, allowCtx("ses_cfg3"))).output)
+  assert.equal(parsed.agents.research.model, "a/b")
+  writeFileSync(file, `{"agents": {"research": {"model": "c/d", "depths": ["low"]}}}`)
+  parsed = JSON.parse((await h.tool.forge_dispatch_config.execute({}, allowCtx("ses_cfg3"))).output)
+  assert.equal(parsed.agents.research.model, "c/d", "mtime cache re-reads on change")
+})
+
+test("4.3 forge disabled removes forge_dispatch_config with the rest", async (t) => {
+  const h = await server(input(), { dispatch: { disable: true } })
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  assert.equal(h.tool.forge_dispatch_config, undefined, "dispatch.disable removes the introspection tool")
+})
+
+// ---------------------------------------------------------------------------
 // 3.3/3.4 waves wiring: background tool branch, list/kill tools, coalesced
 // completion wake briefs (single brief, exactly-once, parent-scoped).
 // ---------------------------------------------------------------------------
