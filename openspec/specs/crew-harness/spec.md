@@ -1,7 +1,7 @@
 # crew-harness Specification
 
 ## Purpose
-TBD - created by archiving change add-dispatch-suite. Update Purpose after archive.
+The /crew orchestration layer: decompose an objective into evidence-checked subtasks, dispatch them as concurrency-paced background waves, retry each failure at most once, and gate the close on per-subtask PASS/FAIL verdicts cross-checked against the dispatch ledger.
 
 ## Requirements
 

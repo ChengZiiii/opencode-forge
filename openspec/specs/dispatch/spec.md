@@ -1,7 +1,7 @@
 # dispatch Specification
 
 ## Purpose
-TBD - created by archiving change add-dispatch-suite. Update Purpose after archive.
+Scoped worker dispatch for the forge agent: forge.json-defined agents (model pinned, depth from a canonical metalanguage translated per provider family, permission shape materialized as hidden subagents) dispatched as child sessions with honest actuals-only reporting, background handles with wake briefs, and a dispatch ledger. The plugin reads user configuration and never writes it.
 
 ## Requirements
 
