@@ -1,58 +1,45 @@
-// Tier agent definition builder (spec: dispatch — "Tier materialization as
-// the permission vehicle", design D3). Tier agents are the ONLY permission
-// vehicle on 1.18.32 (POST /session rejects a permission field), so each
-// materialized forge-<tier> carries a deny-style permission with task: deny
-// (physical recursion ban) and NEVER a model field — the brain is bound per
-// dispatch by the request body.
+// forge subagent materialization source (spec: forge-subagents — "Static
+// agent definitions in a dedicated forge.json" + "Materialization as native
+// subagents with a pinned model"; change simplify-dispatch-to-static-agents).
+//
+// Each forge.json definition materializes as a subagent-mode agent
+// `forge-<id>` that IS visible to the host's native task tool (no hidden
+// flag — task-vocabulary discoverability is the point), carries the PINNED
+// `model` (the brain is bound at materialization; there is no per-call model
+// selection), a standing discipline prompt, and a deny-style permission with
+// `task: deny` ALWAYS forced (recursive spawning stays physically
+// impossible).
 
-import type { ResolvedTier } from "./dispatch-roster.ts"
 import type { ForgeAgentDef } from "./forge-config.ts"
+import { materializeAgentPrompt } from "./dispatch-prompt.ts"
 
 const MUTATING_TOOLS = ["write", "edit", "bash"] as const
 
-// Per-tier discipline prompts (short; the per-dispatch discipline template in
-// dispatch-prompt.ts carries the mandates — this prompt frames the agent).
-const TIER_PROMPTS: Record<string, string> = {
-  scout:
-    "You are forge-scout, a readonly reconnaissance worker. Search, read, and run read-only commands; report findings with file:line evidence. You never modify anything — write tools are denied by design.",
-  build:
-    "You are forge-build, an implementation worker. Execute the dispatched task exactly: minimal, focused changes with tests where the task implies them. Do not expand scope.",
-  review:
-    "You are forge-review, a readonly review worker. Read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list with file:line evidence and a single-line verdict. Write tools are denied by design.",
-  quick:
-    "You are forge-quick, a mechanical small-change worker. Make the smallest correct edit the task names (rename, constant, one-liner fix). No refactoring, no drive-by improvements.",
-}
-
-export function tierAgentPrompt(tierId: string): string {
-  return TIER_PROMPTS[tierId] ?? `You are forge-${tierId}, a dispatched worker. Execute the dispatched task exactly as scoped.`
-}
-
-// ---------------------------------------------------------------------------
-// forge.json agent materialization (add-dispatch-onboarding, spec delta —
-// ADDED "Agent materialization as the permission vehicle" + MODIFIED "Worker
-// prompt discipline"). Role prompt layering: an explicit def.prompt overrides
-// everything; built-in roles (research, review) carry curated defaults; a
-// custom agent without a prompt gets the generic worker prompt.
-// ---------------------------------------------------------------------------
-
+// Built-in role defaults: an explicit def.prompt overrides everything;
+// research/review carry curated defaults; a custom agent without a prompt
+// gets the generic worker role.
 const ROLE_PROMPTS: Record<string, string> = {
   research:
-    "You are a research worker: search, read, and run read-only checks to answer the dispatched question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
+    "You are a research worker: search, read, and run read-only checks to answer the assigned question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
   review:
     "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict.",
 }
 
 export function rolePromptFor(agentId: string, def?: { prompt?: string }): string {
   if (def?.prompt && def.prompt.trim().length > 0) return def.prompt
-  return ROLE_PROMPTS[agentId] ?? `You are forge-${agentId}, a dispatched worker. Execute the dispatched task exactly as scoped.`
+  return ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`
 }
 
-// Materialize a forge.json agent as a hidden subagent (spec — ADDED "Agent
-// materialization as the permission vehicle"): create-only, NEVER a model
-// field (the brain is bound by the agent definition's pinned model at
-// dispatch time), deny-style permission (shape-derived, def.permission
-// override, task: deny ALWAYS forced — recursive dispatch stays physically
-// impossible).
+// Short task-tool description: this is what the dispatching model sees in
+// the task tool vocabulary, so it names the role and the pinned brain.
+export function agentDescriptionFor(agentId: string, def: ForgeAgentDef): string {
+  const shape = def.shape === "write" ? "write" : "readonly"
+  return `forge subagent "${agentId}" (${shape}, pinned ${def.model}) — dispatch via the task tool with subagent_type "forge-${agentId}".`
+}
+
+// Materialize one forge.json agent as a config-agent entry. The `model`
+// field is the reversal of the old "agents never carry a model" rule: the
+// brain is pinned by the definition, resolved by the host at spawn time.
 export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<string, unknown> {
   const permission: Record<string, string> = { task: "deny" }
   const shape = def.shape ?? "readonly"
@@ -61,34 +48,15 @@ export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<strin
   }
   Object.assign(permission, def.permission ?? {})
   permission.task = "deny" // an override never lifts the recursion ban
-  const shapeLine =
-    shape === "readonly"
-      ? "Readonly agent: mutating tools are denied by design — report findings, never work around restrictions."
-      : "Write agent: execute the scoped task with minimal, focused changes."
   return {
-    description: `forge dispatch agent "${agentId}" (${shape}) — spawned by forge_dispatch, not user-facing.`,
+    description: agentDescriptionFor(agentId, def),
     mode: "subagent",
-    hidden: true,
-    prompt: `${rolePromptFor(agentId, def)}\n\n${shapeLine}`,
-    permission,
-  }
-}
-
-export function tierAgentDef(tierId: string, tier: ResolvedTier): Record<string, unknown> {
-  const permission: Record<string, string> = { task: "deny" }
-  if (tier.shape === "readonly") {
-    for (const t of MUTATING_TOOLS) permission[t] = "deny"
-  }
-  const shapeLine =
-    tier.shape === "readonly"
-      ? "Readonly tier: mutating tools are denied by design — report findings, never work around restrictions."
-      : "Write tier: execute the scoped task with minimal, focused changes."
-  const defaultLine = tier.defaultDepth ? ` Default reasoning depth: ${tier.defaultDepth}.` : ""
-  return {
-    description: `forge dispatch tier "${tierId}" (${tier.shape}) — spawned by forge_dispatch, not user-facing.${defaultLine}`,
-    mode: "subagent",
-    hidden: true,
-    prompt: `${tierAgentPrompt(tierId)}\n\n${shapeLine}`,
+    model: def.model,
+    prompt: materializeAgentPrompt({
+      agent: agentId,
+      shape,
+      role: rolePromptFor(agentId, def),
+    }),
     permission,
   }
 }

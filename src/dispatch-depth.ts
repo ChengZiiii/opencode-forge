@@ -106,3 +106,20 @@ export function applyDepthTranslation(options: Record<string, unknown>, t: Depth
   }
   // not-injected / no-mapping: intentionally write nothing.
 }
+
+// Resolve a materialized agent's pinned thoughtLevel (spec: forge-subagents —
+// "Pinned thoughtLevel injection keyed by agent name"). Thin wrapper over
+// translateDepth with forge-subagents semantics: an untranslatable word
+// NEVER fails a session — it injects nothing and yields a bounded finding
+// message naming both vocabularies. The host injects nothing for
+// `not-injected` (unknown provider shape) either.
+export function resolvePinnedDepth(
+  thoughtLevel: string,
+  family: DepthFamilyID,
+  ladder: string[] | null,
+): { translation: DepthTranslation | null; findingMessage?: string } {
+  const t = translateDepth(thoughtLevel, family, ladder)
+  if (t.kind === "no-mapping") return { translation: null, findingMessage: t.message }
+  if (t.kind === "not-injected") return { translation: null }
+  return { translation: t }
+}

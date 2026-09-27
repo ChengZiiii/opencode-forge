@@ -66,29 +66,19 @@ import {
   type Watchdog,
 } from "./src/watchdog.ts"
 import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
-import {
-  buildDispatchConfig,
-  nativeLadder,
-  type BuiltRoster,
-  type CatalogSnapshot,
-  type ResolvedTier,
-  type ValidationFinding,
-} from "./src/dispatch-roster.ts"
-import { createDispatchEngine, DispatchError, type DispatchEngine } from "./src/dispatch-engine.ts"
-import { createDispatchLedger } from "./src/dispatch-ledger.ts"
-import { createDispatchRegistry, type DispatchRegistry, type RegistryEntry } from "./src/dispatch-registry.ts"
-import { validateCrewReport, type CrewSubtaskReport } from "./src/crew-gate.ts"
-import { composeWorkerPrompt } from "./src/dispatch-prompt.ts"
-import { tierAgentDef, forgeAgentDef } from "./src/dispatch-tiers.ts"
-import { applyDepthTranslation, type DepthTranslation } from "./src/dispatch-depth.ts"
-import { createForgeConfigLoader, forgeConfigPaths, forgeRecipe, type LoadedForgeConfig } from "./src/forge-config.ts"
-import { loadModelsDevSnapshot } from "./src/models-dev.ts"
+import { nativeLadder, loadModelsDevSnapshot, type CatalogSnapshot } from "./src/models-dev.ts"
+import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
+import { forgeAgentDef } from "./src/dispatch-tiers.ts"
+import { applyDepthTranslation, resolvePinnedDepth, type DepthTranslation } from "./src/dispatch-depth.ts"
+import { createForgeConfigLoader, forgeConfigPaths, type ForgeAgentDef, type LoadedForgeConfig } from "./src/forge-config.ts"
 
 const FORGE_AGENT = "forge"
 
 const FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
-Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.`
+Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.
+
+Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch through the native task channel instead.`
 
 // The single /plan command routes on its argument: empty = list, resume =
 // continue latest non-terminal plan, discard = abandon, anything else = start
@@ -188,51 +178,40 @@ const sessions = new Map<string, SessionState>()
 let forgeDisabled = false
 
 // ---------------------------------------------------------------------------
-// Dispatch suite (forge_dispatch / tiers / chat.params depth injection).
-// Spec: openspec/changes/add-dispatch-suite/specs/dispatch/spec.md; design
-// D1-D14. Module-level state mirrors the job supervisor's style: one host
-// process owns one engine + one injection table.
+// Forge subagents + depth injection (spec: forge-subagents; change
+// simplify-dispatch-to-static-agents). Module-level state mirrors the job
+// supervisor's style.
 // ---------------------------------------------------------------------------
 
-let dispatchDisabled = false
-let dispatchMaxConcurrent = 4
-let dispatchTimeoutMs = 600_000
-// Built once in the config hook (roster needs the user's provider config +
-// the models.dev snapshot).
-let dispatchBase: { cfg: BuiltRoster; catalog: CatalogSnapshot; findings: ValidationFinding[]; degraded: boolean } | null = null
-// forge.json loader (add-dispatch-onboarding): recreated when the host
-// worktree changes, otherwise persistent — hot-applies via its mtime cache on
-// every load() (the engine re-loads before each dispatch).
+// forge.json loader (static subagents): recreated when the host worktree
+// changes, otherwise persistent — hot-applies via its mtime cache on every
+// load() (the config hook re-materializes; chat.params re-reads per request).
 let forgeLoader: ReturnType<typeof createForgeConfigLoader> | null = null
 let forgeLoaderDir: string | null = null
-// Last load() result: feeds materialization + forge_dispatch_config.
-let forgeConfigState: LoadedForgeConfig | null = null
-// Detected configured identities (recipe payload for pin-unavailable errors).
-let lastDetectedIdentities: string[] = []
-let activeDispatchEngine: DispatchEngine | null = null
-const dispatchLogDir = join(tmpdir(), "opencode-forge", "dispatch")
-const dispatchLedger = createDispatchLedger(join(dispatchLogDir, "ledger.jsonl"))
-// Background dispatch registry (3.1/3.3): owned by the plugin, shared with
-// the engine; survives engine recreation across config reloads.
-let activeDispatchRegistry: DispatchRegistry | null = null
-// Captured in server(): the wake engine injects briefs through it.
-let dispatchClient: { session: { promptAsync?: (opts: unknown) => Promise<unknown>; prompt?: (opts: unknown) => Promise<unknown>; get?: (opts: unknown) => Promise<unknown>; status?: (opts: unknown) => Promise<unknown> } } | null = null
-// Per-parent debounce timers for completion briefs (D11: a burst of
-// completions yields ONE brief).
-const dispatchWakeTimers = new Map<string, ReturnType<typeof setTimeout>>()
-// Crew orchestration state (4.1, D13): in-memory and session-bound — a
-// host restart kills it honestly (the dispatch ledger survives) and a new
-// /crew starts fresh. No file persistence by design.
-const crews = new Map<string, { objective: string; startedAt: string }>()
+// Crew orchestration state (spec: crew-harness): in-memory and session-bound —
+// a host restart kills it honestly and a new /crew starts fresh. The declared
+// subtask plan (registered at crew_begin) is the crew_close gate's source of
+// truth. No file persistence by design.
+const crews = new Map<string, { objective: string; startedAt: string; subtasks: CrewSubtask[] }>()
 
-// sessionID -> translation: the chat.params injection table. The translation
-// is computed once at dispatch time (engine) and re-applied verbatim by the
-// hook on every LLM request of that worker session — "frozen" means it never
-// changes after registration (D2 stability).
-const dispatchDepths = new Map<string, DepthTranslation>()
+// models.dev snapshot (optional ladder verification for depth injection):
+// loaded in the config hook, null when unavailable (verbatim pass-through).
+let modelsDevCatalog: CatalogSnapshot | null = null
+// Bounded once-per-agent diagnostics for untranslatable depth words
+// (spec: inject nothing + record a finding; never break the session).
+const depthFindingNotes = new Map<string, string>()
+// Last config-hook result snapshots (test seam only — no behavior reads them).
+let crewCommandSnapshot: { template: string; description: string } | null = null
+let materializedSnapshot: Record<string, Record<string, unknown>> = {}
 
-// Provider option-shape families (D2). Explicit and conservative: an unknown
-// provider id injects NOTHING and is disclosed as such — never guessed.
+// sessionID -> frozen translation: the chat.params injection table. The FIRST
+// request of a forge-agent session freezes the translation (D3 stability:
+// never rewritten mid-session even if forge.json changes under it); later
+// requests of the same session re-apply it verbatim.
+const sessionDepths = new Map<string, { translation: DepthTranslation }>()
+
+// Provider option-shape families (inherited from the dispatch era). Explicit
+// and conservative: an unknown provider id injects NOTHING — never guessed.
 const OPENAI_FAMILY = new Set(["openai", "opencode", "openrouter", "groq", "xai", "azure", "github-copilot", "deepseek", "together", "vercel", "opus"])
 const ANTHROPIC_FAMILY = new Set(["anthropic"])
 const ZAI_FAMILY = new Set(["zai", "zai-coding-plan"])
@@ -244,38 +223,6 @@ function dispatchProviderFamily(providerID: string): "openai" | "anthropic" | "z
   return null
 }
 
-// Register the resolved depth translation for a child session. Returns false
-// when the session already has a different one (frozen — never silently
-// replaced). Identity = what actually gets injected, not the disclosure label
-// (two different verbatim words share the label but not the payload).
-function queueDispatchDepth(sessionID: string, translation: DepthTranslation): boolean {
-  const key = (t: DepthTranslation): string =>
-    t.kind === "verbatim" ? `verbatim:${t.word}` : t.kind === "tiered" ? `tiered:${t.budgetTokens}` : t.kind
-  const existing = dispatchDepths.get(sessionID)
-  if (existing) return key(existing) === key(translation)
-  dispatchDepths.set(sessionID, translation)
-  return true
-}
-
-// Configured provider/model identities from the user's opencode config:
-// explicit models keys enumerate; a provider without a models key falls back
-// to every catalog model of that provider (full catalog, keyless visible —
-// design D6).
-function configuredIdentitiesOf(cfg: Record<string, unknown>, catalog: CatalogSnapshot): string[] {
-  const providers = (cfg.provider ?? {}) as Record<string, { models?: Record<string, unknown> }>
-  const identities: string[] = []
-  for (const [providerID, provider] of Object.entries(providers)) {
-    const modelKeys = provider?.models ? Object.keys(provider.models) : null
-    if (modelKeys && modelKeys.length > 0) {
-      for (const m of modelKeys) identities.push(`${providerID}/${m}`)
-    } else {
-      const catModels = catalog.providers?.[providerID]?.models ?? {}
-      const ids = Object.keys(catModels)
-      if (ids.length > 0) for (const m of ids) identities.push(`${providerID}/${m}`)
-    }
-  }
-  return identities
-}
 
 // ---------------------------------------------------------------------------
 // Job supervisor (forge_shell / forge_jobs): non-blocking shell execution
@@ -1208,273 +1155,58 @@ const forgeJobsTool = tool({
 })
 
 
-// ---------------------------------------------------------------------------
-// Completion wake engine (3.3, design D11): background dispatch terminals are
-// delivered to the parent session as ONE coalesced [forge:dispatch-complete]
-// brief, debounced, never interrupting an active turn (idle-only), each
-// terminal delivered exactly once (registry takeUndelivered), and coalesced
-// with the goal continuation brief when both target the same idle (dispatch
-// results first, goal brief after).
-// ---------------------------------------------------------------------------
-
-function dispatchWakeDelay(idleDriven: boolean): number {
-  const env = Number(process.env.FORGE_DISPATCH_WAKE_DEBOUNCE_MS)
-  if (Number.isFinite(env) && env >= 0) return env
-  // Idle-driven wakes fire just after the goal continuation timer (same idle
-  // deadline, registration order makes the goal timer win): if the goal brief
-  // went out it drains the registry first and this becomes a no-op — one
-  // re-prompt per idle, never two.
-  return idleDriven ? IDLE_DEBOUNCE_MS + 50 : 1500
-}
-
-function scheduleDispatchWake(sessionID: string, idleDriven: boolean): void {
-  if (dispatchDisabled || forgeDisabled) return
-  if (dispatchWakeTimers.has(sessionID)) return // already scheduled: coalesce
-  const t = setTimeout(() => {
-    dispatchWakeTimers.delete(sessionID)
-    void injectDispatchBrief(sessionID)
-  }, dispatchWakeDelay(idleDriven))
-  dispatchWakeTimers.set(sessionID, t)
-}
-
-function dispatchBriefText(entries: RegistryEntry[]): string {
-  const lines = [`[forge:dispatch-complete] ${entries.length} background dispatch(es) reached terminal state:`]
-  for (const e of entries) {
-    lines.push(
-      "",
-      `- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not yet started)"}`,
-    )
-    const r = e.result as Record<string, unknown> | undefined
-    if (r !== undefined) {
-      lines.push(`  result: ${JSON.stringify(r, null, 1).replace(/\n/g, "\n").slice(0, 2000)}`)
-    }
-  }
-  return lines.join("\n")
-}
-
-async function injectDispatchBrief(sessionID: string): Promise<void> {
-  const reg = activeDispatchRegistry
-  if (!reg) return
-  // Never interrupt an active turn (spec): check the session status BEFORE
-  // draining — a busy session leaves the entries undelivered and the next
-  // idle delivers them exactly once. On a failed status read, wait too.
-  const c0 = dispatchClient
-  if (typeof c0?.session.status === "function") {
-    try {
-      const st = (await c0.session.status({ path: { id: sessionID } })) as Record<string, { type?: string }> | undefined
-      const t = st?.[sessionID]?.type
-      if (t && t !== "idle") return
-    } catch {
-      return
-    }
-  }
-  const entries = reg.takeUndelivered(sessionID)
-  if (entries.length === 0) return
-  const c = dispatchClient
-  const send = c?.session.promptAsync ?? c?.session.prompt
-  if (typeof send !== "function") return
-  try {
-    await send.call(c!.session, { path: { id: sessionID }, body: { parts: [{ type: "text", text: dispatchBriefText(entries) }] } })
-  } catch {
-    // Transport failed: roll the delivery marker back so the next idle
-    // retries — a terminal dispatch must never be silently dropped.
-    for (const e of entries) e.delivered = false
-  }
-}
-
-// forge_dispatch: scoped worker dispatch on a forge.json agent (spec:
-// dispatch — "forge_dispatch tool contract"). The engine (create -> message
-// -> poll -> aggregate) lives in src/dispatch-engine.ts; this tool validates
-// params, guards the plan-draft phase (belt on top of the tool.execute.before
-// suspenders), enriches pin-unavailable errors with the onboarding recipe,
-// and formats the honest report.
-const forgeDispatchTool = tool({
-  description:
-    "Dispatch a scoped task to a worker subagent defined in forge.json. Takes {prompt, agent, depth}: agent names a dispatch agent (see forge_dispatch_config for the effective set); the agent's model is pinned by its definition — no fallback ever. depth comes from the canonical metalanguage (none, low, medium, high, max; default = the agent's first entry) or the model's native level names verbatim (escape hatch); the ONLY validation is membership in the agent's depths — the provider is the final judge and its raw errors flow back. The report discloses the depth translation (canonical -> native). Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
-  args: {
-    prompt: tool.schema.string().describe("Complete, self-contained task for the worker (it cannot see this conversation)"),
-    agent: tool.schema.string().describe("Dispatch agent id from forge.json (e.g. research, review, or a custom id; legacy inline tier ids still work when configured)"),
-    depth: tool.schema.string().optional().describe("Reasoning depth: none | low | medium | high | max (canonical) or the model's native level name verbatim; omit to use the agent's first depths entry"),
-    background: tool.schema.boolean().optional().describe(
-      "Run in the background: returns {dispatchId, resolved, queuedAt} immediately; the full result arrives later as a coalesced [forge:dispatch-complete] brief when the session is idle. Background mode targets live TUI sessions — under `opencode run` the session ends before any brief, so completions are ledger-only (read them via forge_dispatch_list) and sync mode is preferred.",
-    ),
-  },
-  execute: async (args, context) => {
-    const state = stateForBan(context.sessionID)
-    const active = state ? resolveActivePlan(state) : null
-    if (active && active.doc.status === "draft") {
-      throw new Error(
-        "[forge] A plan is in draft; dispatching workers is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.",
-      )
-    }
-    if (!args.prompt?.trim()) throw new Error("forge_dispatch requires a non-empty prompt.")
-    const engine = activeDispatchEngine
-    if (!engine) throw new Error("[forge] dispatch engine unavailable (disabled by dispatch.disable, or config still loading).")
-    try {
-      const r = await engine.dispatch({ prompt: args.prompt, agent: args.agent, ...(args.depth !== undefined ? { depth: args.depth } : {}) }, context.sessionID, args.background === true ? { background: true } : undefined)
-      if ("dispatchId" in r) {
-        // Background handle (spec: eager resolution, nothing awaited).
-        context.metadata({ title: `dispatch ${r.agent} queued (${r.dispatchId})` })
-        return {
-          title: `dispatch ${r.agent} queued → ${r.resolved}${r.depth ? ` @${r.depth}` : ""}`,
-          output: [
-            `[forge:dispatch] accepted in the background: ${r.dispatchId}`,
-            `agent: ${r.agent}   resolved: ${r.resolved}${r.depth ? `   depth: ${r.depth}` : ""}`,
-            `queuedAt: ${r.queuedAt}`,
-            "",
-            "The full result (tokens/cost/report — or the timeout/error report) arrives as a [forge:dispatch-complete] brief when this session is next idle. Track progress any time with forge_dispatch_list; cancel with forge_dispatch_kill.",
-          ].join("\n"),
-        }
-      }
-      const tok = r.tokens
-      const costLine = r.costUsd !== null && r.costUsd !== undefined ? `$${r.costUsd.toFixed(6)}${r.priceSnapshot ? ` (${r.priceSnapshot})` : ""}` : `unpriced${r.costNote ? ` — ${r.costNote}` : ""}`
-      context.metadata({ title: `dispatch ${r.agent}: ${r.actual.model} @ ${r.actual.depth}` })
-      return {
-        title: `dispatch ${r.agent} → ${r.actual.model} @${r.actual.depth}`,
-        output: [
-          `[forge:dispatch] completed in ${r.durationMs}ms`,
-          `agent: ${r.agent}   model: ${r.actual.model}   depth: ${r.actual.depth}${r.requested.depth !== undefined && r.requested.depth !== r.actual.depth ? ` (requested ${r.requested.depth})` : ""}`,
-          `session: ${r.sessionID}`,
-          `tokens: input ${tok.input ?? 0}, output ${tok.output ?? 0}, reasoning ${tok.reasoning ?? 0}, cache r/w ${tok.cache?.read ?? 0}/${tok.cache?.write ?? 0}`,
-          `cost: ${costLine}`,
-          `depthTranslation: ${r.depthTranslation}`,
-          "",
-          "Worker report:",
-          r.text || "(empty worker report)",
-        ].join("\n"),
-      }
-    } catch (err) {
-      // The recipe rides the pin-unavailable error: the unconfigured state is
-      // self-explanatory for the session AI reading it (spec — seed onboarding).
-      if (err instanceof DispatchError && err.code === "pin-unavailable") {
-        throw new Error(`[forge:dispatch:pin-unavailable] ${err.message}\n\n${dispatchRecipeText()}`)
-      }
-      if (err instanceof DispatchError) throw new Error(`[forge:dispatch:${err.code}] ${err.message}`)
-      throw err
-    }
-  },
-})
-
-// The onboarding recipe payload: detected identities + the two file paths.
-// Pure data from state captured at the config hook.
-function dispatchRecipeText(): string {
-  const paths = forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
-  return forgeRecipe({
-    detectedIdentities: lastDetectedIdentities,
-    projectPath: paths.project || "(project .opencode/forge.json)",
-    globalPath: paths.global,
-  })
-}
-
-// forge_dispatch_config (add-dispatch-onboarding): pure round-trip
-// introspection — the effective agents map exactly as the winning forge.json
-// defines it (writable back as valid agents content), the inline knobs, and
-// current findings. NO discovery fields: vocabulary constants live in the
-// tool descriptions/errors, detected identities only inside the unconfigured
-// recipe, in-flight state belongs to forge_dispatch_list.
-const forgeDispatchConfigTool = tool({
-  description:
-    "Read the effective forge dispatch configuration: {agents, knobs, findings}. agents mirrors the winning forge.json (project .opencode/forge.json > global ~/.config/opencode/forge.json > built-in seed) exactly — same keys, same shapes, writable back as valid forge.json agents content. knobs are the inline dispatch options {timeoutMs, maxConcurrent}. findings carry config state (config-parse-error, dispatch-unconfigured notice). Re-reads the file (mtime-cached) on every call, so edits are reflected immediately.",
-  args: {},
-  execute: async (_args, context) => {
-    const loaded = forgeLoader?.load() ?? { agents: {}, source: "seed", path: null, findings: [] }
-    context.metadata({ title: `dispatch config (${loaded.source})` })
-    return {
-      title: `dispatch config (${loaded.source}${loaded.path ? `: ${loaded.path}` : ""})`,
-      output: JSON.stringify(
-        {
-          agents: loaded.agents,
-          knobs: { timeoutMs: dispatchTimeoutMs, maxConcurrent: dispatchMaxConcurrent },
-          findings: loaded.findings,
-        },
-        null,
-        2,
-      ),
-    }
-  },
-})
 
 
-// forge_dispatch_list (3.4): in-flight + recent terminal background dispatches
-// with dispatchIds — the model's recovery path after context compaction.
-const forgeDispatchListTool = tool({
-  description:
-    "List background forge_dispatch activity: in-flight dispatches (with dispatchIds) and recent terminal results (completed/timeout/error, full report objects). Use it to recover dispatch state after context compaction or to check on a background dispatch instead of waiting.",
-  args: {},
-  execute: async () => {
-    const reg = activeDispatchRegistry
-    if (!reg) throw new Error("[forge] no background dispatches have been submitted.")
-    const l = reg.list()
-    if (l.inFlight.length === 0 && l.terminal.length === 0) {
-      return { title: "no background dispatches", output: "[forge:dispatch-list] no background dispatches recorded in this session." }
-    }
-    const lines: string[] = []
-    if (l.inFlight.length > 0) {
-      lines.push("In flight:")
-      for (const e of l.inFlight) {
-        lines.push(`- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state} · queued ${e.queuedAt} · session ${e.sessionID || "(starting)"}`)
-      }
-    }
-    if (l.terminal.length > 0) {
-      lines.push("", "Recent terminal results:")
-      for (const e of l.terminal.slice().reverse()) {
-        lines.push(`- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not started)"}`)
-        const r = e.result as Record<string, unknown> | undefined
-        if (r !== undefined) lines.push(`  result: ${JSON.stringify(r, null, 1).slice(0, 2000)}`)
-        if (e.lateCompletion !== undefined) lines.push(`  (killed; a late result arrived after the kill and was discarded: ${JSON.stringify(e.lateCompletion).slice(0, 300)})`)
-      }
-    }
-    return { title: `dispatches: ${l.inFlight.length} in flight, ${l.terminal.length} terminal`, output: lines.join("\n") }
-  },
-})
-
-// forge_dispatch_kill (3.4, D12): best-effort abort — stops polling, marks
-// killed, suppresses the completion brief, ledgers honestly. There is no host
-// session-abort API on 1.18.32; a child that finishes anyway has its result
-// discarded and noted (kill-late-completion), never delivered.
-const forgeDispatchKillTool = tool({
-  description:
-    "Cancel an in-flight background forge_dispatch by dispatchId: polling stops, the completion brief is suppressed, and the outcome is ledgered as killed. Refuses honestly if the dispatch already finished (use forge_dispatch_list). The child session itself cannot be aborted on this host version and is left for the host to reclaim.",
-  args: {
-    dispatchId: tool.schema.string().describe("The dispatchId returned by forge_dispatch (background) or shown by forge_dispatch_list"),
-  },
-  execute: async (args) => {
-    const engine = activeDispatchEngine
-    if (!engine) throw new Error("[forge] dispatch engine unavailable.")
-    try {
-      engine.kill(args.dispatchId)
-    } catch (err) {
-      if (err instanceof DispatchError) throw new Error(`[forge:dispatch:${err.code}] ${err.message}`)
-      throw err
-    }
-    return {
-      title: `${args.dispatchId} killed`,
-      output: `[forge:dispatch] ${args.dispatchId}: killed — polling stopped, the completion brief is suppressed, and the outcome is ledgered. The child session cannot be aborted on this host and is left for the host to reclaim.`,
-    }
-  },
-})
-
-
-// /crew discipline (4.1, D13): a template rulebook + an in-memory registry.
-// The waves pace on completion briefs; crew_close is the only hard gate.
-const CREW_COMMAND_TEMPLATE = [
-  "Objective: {args}",
+// /crew discipline (spec: crew-harness, change simplify-dispatch-to-static-agents):
+// a template rulebook + an in-memory registry. Waves are batches of parallel
+// native `task` calls (results return in-turn); the declared subtask plan
+// registered at crew_begin is the crew_close gate's source of truth. The
+// template is COMPOSED PER CONFIG at the config hook: with configured agents
+// it carries the orchestration rulebook plus the live agent roster; with an
+// empty agent set it becomes the initialization guidance (hard gate, D10) —
+// the only configuration invitation in the plugin.
+const CREW_INIT_TEMPLATE = [
+  "(forge crew orchestration. Argument: \"$ARGUMENTS\")",
   "",
-  "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). Follow it exactly:",
+  "CREW IS NOT INITIALIZED: no forge subagents are configured (no usable forge.json agents). Refuse to enter orchestration and tell the user this feature needs a one-time setup, offering BOTH options:",
   "",
-  "1. REGISTER: call `crew_begin` with the objective. If it refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew.",
-  "2. DECOMPOSE: break the objective into subtasks. Every subtask carries FOUR fields before dispatch: (a) a self-contained prompt, (b) a tier/profile (scout = readonly recon, build = implementation, review = readonly review, quick = mechanical change), (c) an exact reasoning depth from the exposed vocabulary, (d) an acceptance-evidence statement — what the result text must contain for you to call it PASS.",
-  "3. WAVES, NEVER FLOODS: dispatch subtasks with background forge_dispatch in batches no larger than the concurrency cap (default 4). Launch the next batch ONLY as [forge:dispatch-complete] briefs free capacity. Never fire more dispatches while the cap is full.",
-  "4. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the dispatch result text — cite the dispatchId (bg-N) as the evidence reference. A result that does not meet the statement is a failure even if the worker sounded confident.",
-  "5. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or depth. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
-  "6. CLOSE: when every subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks your report against the dispatch ledger — a dispatched subtask missing from the report refuses the close. The user confirms the closing dialog.",
+  "1. The user configures it themselves: create ONE of these files (project-level wins, never merged):",
+  "{paths}",
+  "",
+  "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead.",
+  "",
+  "Template (JSONC — comments allowed; `model` is the exact provider/model identity, `thoughtLevel` is optional: none/low/medium/high/max or a native level name):",
+  "{template}",
+  "",
+  "After the file is saved: NEW agents require a host restart to appear in the task tool; thoughtLevel edits on existing agents apply without restart. Until then, crew stays unavailable.",
 ].join("\n")
+
+function crewOrchestrationTemplate(agentIds: string[]): string {
+  return [
+    "(forge crew orchestration. Argument: \"$ARGUMENTS\")",
+    "",
+    `Configured forge subagents (task-tool vocabulary): ${agentIds.map((id) => `forge-${id}`).join(", ")}`,
+    "",
+    "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). Follow it exactly:",
+    "",
+    "1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. Reconnaissance first if you need it to decompose well; a wrong plan is fixed by discarding and re-crewing, never by improvising outside the declared plan.",
+    "2. WAVES, NEVER FLOODS: execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in.",
+    "3. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, run that subtask through a native task call anyway AND tell the user about the gap — suggest configuring the missing role in forge.json.",
+    "4. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the task result text. A result that does not meet the statement is a failure even if the worker sounded confident.",
+    "5. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or agent. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
+    "6. CLOSE: when every declared subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks your report against the declared plan — a declared subtask missing from the report refuses the close, and so does an undeclared one. The user confirms the closing dialog.",
+  ].join("\n")
+}
 
 const crewBeginTool = tool({
   description:
-    "Register this session's crew (from /crew). Refuses when a crew is already active in the session or while a plan draft is active. Crew state is in-memory: a host restart ends it honestly (the dispatch ledger keeps the history).",
+    "Register this session's crew (from /crew) with its DECLARED subtask plan. Refuses when a crew is already active in the session, while a plan draft is active, or when subtasks are missing/duplicated. Crew state is in-memory: a host restart ends it honestly.",
   args: {
     objective: tool.schema.string().describe("One-line crew objective (from /crew)"),
+    subtasks: tool.schema.array(tool.schema.object({
+      title: tool.schema.string().describe("Short unique subtask title — the crew_close report must use these exact titles"),
+      agent: tool.schema.string().optional().describe("Intended forge-* agent id for this subtask, when one matches"),
+    })).describe("The declared subtask plan — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list"),
   },
   execute: async (args, context) => {
     const state = stateForBan(context.sessionID)
@@ -1483,88 +1215,65 @@ const crewBeginTool = tool({
       throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.")
     }
     if (!args.objective?.trim()) throw new Error("crew_begin requires a non-empty objective (from /crew <objective>).")
+    const raw = Array.isArray(args.subtasks) ? args.subtasks : []
+    if (raw.length === 0) throw new Error("[forge:crew] crew_begin requires subtasks[] — declare the plan before executing (decompose the objective into titled subtasks).")
+    const seen = new Set<string>()
+    const subtasks: CrewSubtask[] = []
+    for (const s of raw) {
+      const title = String((s as { title?: unknown })?.title ?? "").trim()
+      if (!title) throw new Error("[forge:crew] every subtask needs a non-empty title.")
+      const key = title.toLowerCase()
+      if (seen.has(key)) throw new Error(`[forge:crew] duplicate subtask title "${title}" — titles must be unique (they are the crew_close matching key).`)
+      seen.add(key)
+      const agent = String((s as { agent?: unknown })?.agent ?? "").trim()
+      subtasks.push(agent ? { title, agent } : { title })
+    }
     const existing = crews.get(context.sessionID)
     if (existing) {
       throw new Error(`[forge:crew] This session already has an active crew: "${existing.objective}" (started ${existing.startedAt}). Finish and close it with crew_close before starting another.`)
     }
-    crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso() })
+    crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso(), subtasks })
     return {
       title: `crew registered: ${args.objective.trim().slice(0, 60)}`,
-      output: `[forge:crew] Crew registered for this session. Objective: ${args.objective.trim()}. Proceed with the discipline: decompose → waves paced on completion briefs (never past the cap) → per-subtask evidence verdicts → at most one retry → crew_close with the full report.`,
+      output: [
+        `[forge:crew] Crew registered for this session. Objective: ${args.objective.trim()}`,
+        `Declared plan (${subtasks.length}):`,
+        ...subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
+        "Proceed with the discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+      ].join("\n"),
     }
   },
 })
 
 const crewCloseTool = tool({
   description:
-    "Close this session's crew with the final report (ask-level user confirmation). The gate cross-checks the report against the dispatch ledger: every subtask needs a verdict (PASS/FAIL) and a bg-N evidence reference; every dispatch this crew submitted must appear in the report; FAIL requires both failure reports (attempt + the one retry). On success the summary (verdicts, ledger references, aggregate tokens/cost) is appended to the dispatch ledger and the crew ends.",
+    "Close this session's crew with the final report (ask-level user confirmation). The gate cross-checks the report against the declared subtask plan: every declared subtask needs a verdict (PASS/FAIL) and an evidence statement; an undeclared subtask in the report refuses the close; FAIL requires both failure reports (attempt + the one retry). On success the crew ends and the summary is the tool output (there is no persistent crew record).",
   args: {
     report: tool.schema.array(tool.schema.object({
-      title: tool.schema.string().describe("Subtask title"),
+      title: tool.schema.string().describe("Subtask title — must match a title declared at crew_begin"),
       verdict: tool.schema.string().describe("PASS or FAIL"),
-      evidence: tool.schema.string().describe("Acceptance evidence with the bg-N dispatch id reference"),
+      evidence: tool.schema.string().describe("Acceptance evidence: what the result contained that satisfies the acceptance statement"),
       attempts: tool.schema.array(tool.schema.string()).optional().describe("For FAIL: both failure reports (attempt and retry)"),
-    })).describe("The full crew report — one entry per subtask"),
+    })).describe("The full crew report — one entry per declared subtask"),
   },
   execute: async (args, context) => {
     const crew = crews.get(context.sessionID)
     if (!crew) throw new Error("[forge:crew] No active crew in this session (crew state is in-memory and dies on host restart). Start one with /crew <objective>.")
-    const rows: unknown[] = []
-    try {
-      const file = readFileSync(join(dispatchLogDir, "ledger.jsonl"), "utf8")
-      for (const line of file.split("\n")) {
-        const t = line.trim()
-        if (!t) continue
-        try {
-          rows.push(JSON.parse(t))
-        } catch {}
-      }
-    } catch {}
-    const check = validateCrewReport(
-      (args.report ?? []) as CrewSubtaskReport[],
-      rows as Parameters<typeof validateCrewReport>[1],
-      { objective: crew.objective, startedAt: crew.startedAt, sessionID: context.sessionID },
-    )
+    const report = (args.report ?? []) as CrewSubtaskReport[]
+    const check = validateCrewReport(report, crew.subtasks)
     if (!check.ok) {
-      throw new Error(`[forge:crew] crew_close refused — the report does not match the dispatch ledger:\n${check.gaps.map((g) => `- ${g}`).join("\n")}\nThe crew stays active; complete or correct the report and call crew_close again.`)
-    }
-    // Aggregate tokens/cost for the crew's dispatches from the ledger rows.
-    let tokensIn = 0
-    let tokensOut = 0
-    let costSum = 0
-    let costKnown = 0
-    for (const row of rows as Array<Record<string, unknown>>) {
-      if (typeof row.dispatchId !== "string" || !check.dispatchIds.includes(row.dispatchId)) continue
-      const tok = row.tokens as { input?: number; output?: number; reasoning?: number } | undefined
-      tokensIn += tok?.input ?? 0
-      tokensOut += (tok?.output ?? 0) + (tok?.reasoning ?? 0)
-      if (typeof row.costUsd === "number") {
-        costSum += row.costUsd
-        costKnown++
-      }
+      throw new Error(`[forge:crew] crew_close refused — the report does not match the declared plan:\n${check.gaps.map((g) => `- ${g}`).join("\n")}\nThe crew stays active; complete or correct the report and call crew_close again.`)
     }
     await gate(context.ask, "crew_close", `Close crew: ${crew.objective}`)
-    dispatchLedger.append({
-      ts: nowIso(),
-      event: "crew-summary",
-      tier: "crew",
-      outcome: "closed",
-      sessionID: context.sessionID,
-      note: crew.objective,
-      tokens: { input: tokensIn, output: tokensOut, reasoning: 0, cache: { read: 0, write: 0 } },
-      costUsd: costKnown > 0 ? costSum : null,
-      dispatchIds: check.dispatchIds,
-      subtasks: (args.report ?? []).map((r) => ({ title: r.title, verdict: String(r.verdict).toUpperCase(), evidence: r.evidence })),
-    })
     crews.delete(context.sessionID)
-    const fails = (args.report ?? []).filter((r) => String(r.verdict).toUpperCase() === "FAIL").length
+    const fails = report.filter((r) => String(r.verdict).toUpperCase() === "FAIL").length
     return {
       title: `crew closed: ${crew.objective.slice(0, 60)}`,
       output: [
         `[forge:crew] Crew closed: ${crew.objective}`,
-        `subtasks: ${(args.report ?? []).length} (PASS ${(args.report ?? []).length - fails}, FAIL ${fails})`,
-        `dispatches: ${check.dispatchIds.length}   tokens: in ${tokensIn}, out ${tokensOut}   cost: ${costKnown > 0 ? `$${costSum.toFixed(6)}` : "unpriced"}`,
-        "The summary is appended to the dispatch ledger.",
+        `subtasks: ${report.length} (PASS ${report.length - fails}, FAIL ${fails})`,
+        ...report.map((r) => `- ${r.title}: ${String(r.verdict).toUpperCase()} — ${String(r.evidence).slice(0, 200)}`),
+        "This output is the crew's record (crew state is in-memory; nothing persists).",
       ].join("\n"),
     }
   },
@@ -1588,11 +1297,7 @@ function forgeTools(): Record<string, ToolDefinition> {
     tools.forge_shell = forgeShellTool
     tools.forge_jobs = forgeJobsTool
   }
-  if (!dispatchDisabled && !forgeDisabled) {
-    tools.forge_dispatch = forgeDispatchTool
-    tools.forge_dispatch_config = forgeDispatchConfigTool
-    tools.forge_dispatch_list = forgeDispatchListTool
-    tools.forge_dispatch_kill = forgeDispatchKillTool
+  if (!forgeDisabled) {
     tools.crew_begin = crewBeginTool
     tools.crew_close = crewCloseTool
   }
@@ -1827,10 +1532,7 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
       }
     }
     try {
-      // Coalesce (D11): dispatch-completion briefs riding the same idle merge
-      // into this single re-prompt — dispatch results first, goal brief after.
-      const wakeEntries = activeDispatchRegistry?.takeUndelivered(sessionID) ?? []
-      const briefText = wakeEntries.length > 0 ? `${dispatchBriefText(wakeEntries)}\n\n${goalBriefText(state, goal)}` : goalBriefText(state, goal)
+      const briefText = goalBriefText(state, goal)
       await client.session.prompt({
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: briefText }] },
@@ -1880,7 +1582,6 @@ export const server: Plugin = async (input, options) => {
   hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || ""
   const client = input.client as unknown as GoalClient
   jobClient = input.client as unknown as JobClient
-  dispatchClient = input.client as unknown as typeof dispatchClient
   const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
   jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true
@@ -1900,20 +1601,6 @@ export const server: Plugin = async (input, options) => {
     wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`)
   }
 
-  // dispatch plugin options: invalid values fall back to defaults (auditable
-  // via the dispatch ledger, never a crash).
-  const dpOpts = (options as { dispatch?: { disable?: unknown; maxConcurrent?: unknown; timeoutMs?: unknown } } | undefined)?.dispatch
-  dispatchDisabled = dpOpts?.disable === true
-  if (Number.isInteger(dpOpts?.maxConcurrent) && (dpOpts!.maxConcurrent as number) >= 1 && (dpOpts!.maxConcurrent as number) <= 16) {
-    dispatchMaxConcurrent = dpOpts!.maxConcurrent as number
-  } else if (dpOpts?.maxConcurrent !== undefined) {
-    dispatchMaxConcurrent = 4
-  }
-  if (Number.isInteger(dpOpts?.timeoutMs) && (dpOpts!.timeoutMs as number) >= 1000 && (dpOpts!.timeoutMs as number) <= 600_000) {
-    dispatchTimeoutMs = dpOpts!.timeoutMs as number
-  } else if (dpOpts?.timeoutMs !== undefined) {
-    dispatchTimeoutMs = 600_000
-  }
   const watchdogLedger = createFileLedger(join(watchdogLogDir(), "log.jsonl"))
   const rawLocator = createLocator()
   const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1"
@@ -1971,9 +1658,6 @@ export const server: Plugin = async (input, options) => {
       exitCleanup?.trigger("dispose")
       jobManager.disposeAll()
       watchdog.dispose()
-      // Dispatch honesty: sessions are host memory objects — whatever is in
-      // flight is ledgered lost-on-exit (S19/spec).
-      activeDispatchEngine?.dispose()
       sessions.clear()
     },
 
@@ -2035,11 +1719,8 @@ export const server: Plugin = async (input, options) => {
       }
 
       // /goal command — same no-clobber rule.
-      // /crew command — no-clobber like /plan and /goal.
-      cfg.command["crew"] ??= {
-        template: CREW_COMMAND_TEMPLATE,
-        description: "forge crew orchestration: decompose an objective into evidence-checked subtasks dispatched as paced background waves; at most one retry per subtask; crew_close cross-checks the report against the dispatch ledger",
-      }
+      // /crew command is composed per config LATER in this hook (it needs the
+      // loaded agent set for the roster/init-gate templates).
       cfg.command["goal"] ??= {
         template: GOAL_COMMAND_TEMPLATE,
         description:
@@ -2061,93 +1742,64 @@ export const server: Plugin = async (input, options) => {
         if (permSection[gateKey] !== "deny") permSection[gateKey] = "ask"
       }
 
-      // Dispatch suite: load forge.json (dedicated config, hot-apply), build
-      // the legacy roster only when inline dispatch options exist, and
-      // materialize agents/tiers. Nothing is written to disk except the
-      // bounded ledger; user-defined forge-<id> entries are never touched.
-      if (!dispatchDisabled) {
-        const snapshot = process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1"
-          ? { catalog: { providers: {} } as CatalogSnapshot, degraded: true, source: "test-off" }
-          : await loadModelsDevSnapshot()
-        const dispatchOpts = ((options as { dispatch?: { roster?: unknown; tiers?: unknown; maxConcurrent?: unknown; timeoutMs?: unknown } } | undefined)?.dispatch ?? {}) as {
-          roster?: Array<{ model: string; expose?: string[]; profiles: string[] }>
-          tiers?: Record<string, { shape?: "readonly" | "write"; defaultDepth?: string; model?: string; depth?: string }>
-        }
-        const legacyInline = (dispatchOpts.roster?.length ?? 0) > 0 || dispatchOpts.tiers !== undefined
-
-        // forge.json: project file > global file > seed.
-        if (!forgeLoader || forgeLoaderDir !== hostWorktree) {
-          forgeLoader = createForgeConfigLoader({
-            projectDir: hostWorktree,
-            homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(),
-          })
-          forgeLoaderDir = hostWorktree
-        }
-        const loaded = forgeLoader.load()
-        forgeConfigState = loaded
-        for (const finding of loaded.findings) {
-          dispatchLedger.append({ ts: new Date().toISOString(), event: "validation", level: finding.level, code: finding.code, note: finding.message })
-        }
-        for (const [agentId, def] of Object.entries(loaded.agents)) {
-          const id = `forge-${agentId}`
-          if (agentSection[id] !== undefined) continue // no-clobber
-          agentSection[id] = forgeAgentDef(agentId, def)
-        }
-
-        const detected = configuredIdentitiesOf(cfg as Record<string, unknown>, snapshot.catalog)
-        lastDetectedIdentities = detected
-        const built = buildDispatchConfig({
-          configuredIdentities: detected,
-          catalog: snapshot.catalog,
-          userRoster: legacyInline ? dispatchOpts.roster ?? [] : [],
-          userTiers: legacyInline ? dispatchOpts.tiers : undefined,
+      // forge subagents: load forge.json (hot-apply), materialize the static
+      // subagents WITH their pinned models, and compose the /crew command for
+      // the current agent set. Findings surface through the diagnostics log —
+      // never silently swallowed, never an AI-facing configuration invitation.
+      if (!forgeLoader || forgeLoaderDir !== hostWorktree) {
+        forgeLoader = createForgeConfigLoader({
+          projectDir: hostWorktree,
+          homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(),
         })
-        dispatchBase = { cfg: built, catalog: snapshot.catalog, findings: built.findings, degraded: snapshot.degraded }
-        for (const finding of built.findings) {
-          dispatchLedger.append({ ts: new Date().toISOString(), event: "validation", level: finding.level, code: finding.code, note: finding.message })
+        forgeLoaderDir = hostWorktree
+      }
+      const loaded = forgeLoader.load()
+      for (const finding of loaded.findings) {
+        console.warn(`[forge:config] ${finding.level}: ${finding.message}`)
+      }
+      materializedSnapshot = {}
+      for (const [agentId, def] of Object.entries(loaded.agents)) {
+        const id = `forge-${agentId}`
+        if (agentSection[id] !== undefined) continue // no-clobber
+        const entry = forgeAgentDef(agentId, def)
+        agentSection[id] = entry
+        materializedSnapshot[id] = entry
+      }
+
+      // models.dev snapshot: optional ladder verification for depth injection.
+      // Unavailable -> null -> verbatim pass-through (the provider judges).
+      if (process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1") {
+        modelsDevCatalog = null
+      } else {
+        try {
+          const snapshot = await loadModelsDevSnapshot()
+          modelsDevCatalog = snapshot.catalog
+        } catch {
+          modelsDevCatalog = null
         }
-        if (snapshot.degraded) {
-          dispatchLedger.append({ ts: new Date().toISOString(), event: "models-dev-degraded", note: "models.dev snapshot unavailable — cost reporting degrades to null" })
-        }
-        // Legacy tier agents materialize ONLY when inline options exist —
-        // zero-config installs get the forge.json seed surface instead.
-        if (legacyInline) {
-          for (const [tierId, tier] of Object.entries(built.tiers)) {
-            const id = `forge-${tierId}`
-            if (agentSection[id] !== undefined) continue // no-clobber (S10)
-            agentSection[id] = tierAgentDef(tierId, tier)
-          }
-        }
-        const roster = built
-        activeDispatchRegistry = activeDispatchRegistry ?? createDispatchRegistry()
-        activeDispatchEngine?.dispose()
-        activeDispatchEngine = createDispatchEngine({
-          serverUrl: String(input.serverUrl ?? "").replace(/\/$/, ""),
-          workspace: hostWorktree,
-          fetcher: globalThis.fetch,
-          now: Date.now,
-          sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-          cfg: roster,
-          catalog: snapshot.catalog,
-          available: (identity) => {
-            // Availability = configured on the host OR present in the legacy
-            // roster (dead-key entries stay dispatchable, preserving legacy
-            // behavior). Custom providers stay dispatchable — D6.
-            return roster.roster.some((e) => e.model === identity) || lastDetectedIdentities.includes(identity)
-          },
-          agents: () => forgeLoader?.load().agents ?? {},
-          legacy: legacyInline,
-          sink: (entry) => dispatchLedger.append(entry),
-          registry: activeDispatchRegistry,
-          onTerminal: (parentSessionID) => scheduleDispatchWake(parentSessionID, false),
-          onDepth: queueDispatchDepth,
-          providerFamily: dispatchProviderFamily,
-          maxConcurrent: dispatchMaxConcurrent,
-          timeoutMs: dispatchTimeoutMs,
-        })
+      }
+
+      // /crew command — composed per config: orchestration rulebook with the
+      // live roster when agents exist; the initialization guidance (hard gate)
+      // when none do. Overwritten on every config hook while plugin-owned (a
+      // template marker prefixes our text), never while user-defined.
+      cfg.command ??= {}
+      const existingCrew = cfg.command["crew"] as { template?: string } | undefined
+      if (!existingCrew || String(existingCrew.template ?? "").startsWith("(forge crew")) {
+        const agentIds = Object.keys(loaded.agents)
+        const template =
+          agentIds.length > 0
+            ? crewOrchestrationTemplate(agentIds)
+            : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}\n   - ${forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`)
+              .replaceAll("{template}", JSON.stringify({ agents: { research: { model: "provider/model", thoughtLevel: "low" } } }, null, 2).split("\n").map((l) => "   " + l).join("\n"))
+        const description =
+          agentIds.length > 0
+            ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report"
+            : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance"
+        cfg.command["crew"] = { template, description }
+        crewCommandSnapshot = { template, description }
       }
     },
-
     // Registry getter keeps the disable knob honest: forge disabled -> no
     // harness tools at all.
     get tool(): Record<string, ToolDefinition> {
@@ -2187,44 +1839,65 @@ export const server: Plugin = async (input, options) => {
           )
         }
       }
-      // Draft-phase dispatch ban (S18): spawning workers while planning is
-      // the same protection class as the write ban.
-      if (input.tool === "forge_dispatch") {
-        const state = stateForBan(input.sessionID)
-        const active = state ? resolveActivePlan(state) : null
-        if (active && active.doc.status === "draft") {
-          throw new Error(
-            "[forge] A plan is in draft; dispatching workers is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.",
-          )
-        }
-      }
+      // Draft-phase subagent-spawn ban is INHERITED: the native task tool is
+      // in the write-ban class (isWriteTool covers "task"), so no plugin-side
+      // dispatch refusal exists to maintain (spec: forge-subagents —
+      // "Native-task dispatch surface").
     },
 
-    // Reasoning-depth injection for dispatched child sessions (D2): the host
-    // rebuilds options for EVERY LLM request, so the hook re-applies the SAME
-    // translation each time (inject-once would drop the depth on turn 2). The
-    // translation is frozen at registration; an unknown provider family
-    // injects nothing (disclosed honestly in the dispatch result).
+    // Reasoning-depth injection for forge subagent sessions (spec:
+    // forge-subagents — "Pinned thoughtLevel injection keyed by agent name").
+    // Keyed by the AGENT NAME (stable across sessions and spawn paths — any
+    // session running a forge-* agent gets its pinned depth), not a
+    // per-dispatch table. The FIRST request of a session freezes the
+    // translation (never rewritten mid-session); the config is re-read per
+    // lookup (mtime-cached hot-apply) for NEW sessions. An untranslatable
+    // word injects nothing and records a bounded once-per-agent finding; an
+    // unknown provider family injects nothing, silently (not this plugin's
+    // vocabulary to guess).
     "chat.params": async (input, output) => {
-      const entry = dispatchDepths.get(input.sessionID)
-      if (!entry || entry.kind === "not-injected") return
-      applyDepthTranslation(output.options ?? (output.options = {}), entry)
+      if (forgeDisabled) return
+      const raw = input as unknown as { sessionID?: string; agent?: unknown; model?: { providerID?: unknown; modelID?: unknown } }
+      const sessionID = raw.sessionID
+      if (!sessionID) return
+      const agentName = typeof raw.agent === "string" ? raw.agent : (raw.agent as { name?: unknown } | undefined)?.name
+      if (typeof agentName !== "string" || !agentName.startsWith("forge-")) return
+      const frozen = sessionDepths.get(sessionID)
+      if (frozen) {
+        applyDepthTranslation(output.options ?? (output.options = {}), frozen.translation)
+        return
+      }
+      const agentId = agentName.slice("forge-".length)
+      const def: ForgeAgentDef | undefined = forgeLoader?.load().agents[agentId]
+      if (!def?.thoughtLevel) return
+      const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : ""
+      const modelID = typeof raw.model?.modelID === "string" ? raw.model.modelID : ""
+      const family = dispatchProviderFamily(providerID)
+      if (!family) return // unknown provider shape: inject nothing, silently
+      const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, family, nativeLadder(modelsDevCatalog, `${providerID}/${modelID}`))
+      if (!translation) {
+        if (findingMessage && !depthFindingNotes.has(agentId)) {
+          depthFindingNotes.set(agentId, findingMessage)
+          console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`)
+        }
+        return
+      }
+      sessionDepths.set(sessionID, { translation })
+      applyDepthTranslation(output.options ?? (output.options = {}), translation)
     },
 
     // Test seam (wiring tests drive server() with stubs; same pragmatic
     // module-state style as FORGE_TEST_NO_FENCE). Not part of the plugin API.
-    __forgeDispatchTest: {
-      queueDepth: queueDispatchDepth,
-      depthState: (sessionID: string) => dispatchDepths.get(sessionID) ?? null,
-      composePrompt: composeWorkerPrompt,
-      registry: () => activeDispatchRegistry,
+    __forgeSubagentsTest: {
       crews: () => crews,
-      dispatchLogDir: () => dispatchLogDir,
-      dispatchBriefText,
-      setEngine: (engine: DispatchEngine | null) => {
-        activeDispatchEngine?.dispose()
-        activeDispatchEngine = engine
+      depthState: (sessionID: string) => sessionDepths.get(sessionID)?.translation ?? null,
+      depthFinding: (agentId: string) => depthFindingNotes.get(agentId) ?? null,
+      catalog: () => modelsDevCatalog,
+      setCatalog: (c: CatalogSnapshot | null) => {
+        modelsDevCatalog = c
       },
+      crewCommand: () => crewCommandSnapshot,
+      materialized: () => materializedSnapshot,
     },
 
     // permission.ask belt: on hosts/sessions where permission requests ARE
@@ -2282,10 +1955,7 @@ export const server: Plugin = async (input, options) => {
         if (typeof sessionID === "string" && sessionID) {
           goalProbe(`idle event session=${sessionID}`)
           scheduleIdleContinuation(client, sessionID)
-          // Completion wakes ride the same idle signal: inject only while
-          // the owning session is free (never mid-turn).
           void deliverJobWakes(sessionID)
-          scheduleDispatchWake(sessionID, true)
         }
       }
       if (event.type === "session.deleted") {
@@ -2294,6 +1964,8 @@ export const server: Plugin = async (input, options) => {
           // Owner session ended: live session-scoped jobs are killed,
           // unread completions ledgered (job-supervisor spec).
           jobManager.onSessionEnd(info.id)
+          // The frozen depth translation dies with its session (bounded table).
+          sessionDepths.delete(info.id)
         }
       }
     },
@@ -2454,13 +2126,36 @@ export async function v2Setup(ctx: V2PluginContext): Promise<void> {
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform(async (draft) => {
       if (typeof draft.get !== "function" || typeof draft.update !== "function") return
-      if (draft.get(FORGE_AGENT) !== undefined) return
-      draft.update(FORGE_AGENT, (agent) => {
-        agent.description =
-          "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer)."
-        agent.system = FORGE_PROMPT
-        agent.mode = "primary"
-      })
+      if (draft.get(FORGE_AGENT) === undefined) {
+        draft.update(FORGE_AGENT, (agent) => {
+          agent.description =
+            "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer)."
+          agent.system = FORGE_PROMPT
+          agent.mode = "primary"
+        })
+      }
+      // Static forge subagents (spec: forge-subagents — v2 parity): same
+      // create-only discipline as the forge entry. The loader reads the
+      // process cwd (v2 ctx exposes no launch directory); any failure degrades
+      // to no subagents, never a throw.
+      try {
+        const loader = createForgeConfigLoader({ projectDir: process.cwd(), homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+        const loaded = loader.load()
+        for (const [agentId, def] of Object.entries(loaded.agents)) {
+          const id = `forge-${agentId}`
+          if (draft.get(id) !== undefined) continue // create-only
+          const v1def = forgeAgentDef(agentId, def)
+          draft.update(id, (agent) => {
+            agent.description = v1def.description
+            agent.system = v1def.prompt
+            agent.mode = v1def.mode
+            agent.model = v1def.model
+            agent.permission = v1def.permission
+          })
+        }
+      } catch {
+        // Host-shape drift or unreadable config: skip silently (v2 contract).
+      }
     })
   }
 }

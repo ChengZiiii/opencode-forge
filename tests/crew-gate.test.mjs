@@ -1,108 +1,128 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 
-// Task 4.2 — crew_close gate cross-checks (pure logic, spec scenarios):
-// full evidence closes; missing verdicts / dropped dispatches refuse;
-// bounded retry then honest FAIL is allowed and enforced.
+// Task 4.2 — crew_close gate cross-checks against the DECLARED SUBTASK PLAN
+// (spec: crew-harness — "crew_close completion gate", change
+// simplify-dispatch-to-static-agents). Refusal classes:
+//   1. declared subtask missing a verdict or evidence,
+//   2. renegade undeclared subtask in the report,
+//   3. FAIL without both attempt reports.
+// Honest FAILs close; full evidence closes.
 
 import { validateCrewReport } from "../src/crew-gate.ts"
 
-const CREW = { objective: "ship it", startedAt: "2026-09-27T00:00:00.000Z", sessionID: "ses_parent" }
-const row = (dispatchId, event, ts = "2026-09-27T00:01:00.000Z") => ({ ts, event, dispatchId, parentSessionID: "ses_parent" })
+const PLAN = [
+  { title: "alpha", agent: "forge-research" },
+  { title: "beta" },
+]
 
-test("4.2: full evidence closes — every subtask verdict+evidence matches the ledger", () => {
-  const rows = [row("bg-1", "completed"), row("bg-2", "completed")]
+test("gate: full evidence against the declared plan closes", () => {
   const report = [
-    { title: "a", verdict: "PASS", evidence: "dispatch bg-1 output said ok" },
-    { title: "b", verdict: "PASS", evidence: "dispatch bg-2 output said ok" },
+    { title: "alpha", verdict: "PASS", evidence: "result text contained the auth flow summary" },
+    { title: "beta", verdict: "PASS", evidence: "diff applied and tests output green" },
   ]
-  const r = validateCrewReport(report, rows, CREW)
-  assert.equal(r.ok, true, JSON.stringify(r.gaps))
+  const check = validateCrewReport(report, PLAN)
+  assert.equal(check.ok, true)
+  assert.equal(check.gaps.length, 0)
 })
 
-test("4.2: missing verdict or evidence refuses, naming the gap", () => {
-  const rows = [row("bg-1", "completed")]
-  const noVerdict = validateCrewReport([{ title: "a", verdict: "", evidence: "bg-1" }], rows, CREW)
-  assert.equal(noVerdict.ok, false)
-  assert.ok(noVerdict.gaps.some((g) => g.includes("PASS or FAIL")))
-  const noEvidence = validateCrewReport([{ title: "a", verdict: "PASS", evidence: "" }], rows, CREW)
-  assert.equal(noEvidence.ok, false)
-  assert.ok(noEvidence.gaps.some((g) => g.includes("missing evidence")))
-  const empty = validateCrewReport([], rows, CREW)
-  assert.equal(empty.ok, false)
+test("gate: empty report refuses", () => {
+  const check = validateCrewReport([], PLAN)
+  assert.equal(check.ok, false)
+  assert.match(check.gaps[0], /no subtasks/)
 })
 
-test("4.2: a dispatched subtask with no verdict in the report refuses (nothing dropped)", () => {
-  const rows = [row("bg-1", "completed"), row("bg-2", "completed", "2026-09-27T00:02:00.000Z")]
-  const report = [{ title: "a", verdict: "PASS", evidence: "bg-1 only" }]
-  const r = validateCrewReport(report, rows, CREW)
-  assert.equal(r.ok, false)
-  assert.ok(r.gaps.some((g) => g.includes("bg-2") && g.includes("silently dropped")))
-})
-
-test("4.2: evidence referencing an unknown/stale dispatch refuses", () => {
-  const rows = [row("bg-1", "completed")]
-  const r = validateCrewReport([{ title: "a", verdict: "PASS", evidence: "bg-9" }], rows, CREW)
-  assert.equal(r.ok, false)
-  assert.ok(r.gaps.some((g) => g.includes("bg-9") && g.includes("no ledger row")))
-})
-
-test("4.2: bounded retry then honest FAIL closes (with both attempts), PASS over a failed dispatch refuses", () => {
-  const rows = [row("bg-1", "empty-response"), row("bg-2", "error", "2026-09-27T00:03:00.000Z")]
-  const goodFail = validateCrewReport(
-    [{ title: "a", verdict: "FAIL", evidence: "bg-1 then bg-2", attempts: ["bg-1: empty", "bg-2: error"] }],
-    rows,
-    CREW,
-  )
-  assert.equal(goodFail.ok, true, JSON.stringify(goodFail.gaps))
-  const passOverFailure = validateCrewReport(
-    [{ title: "a", verdict: "PASS", evidence: "bg-2" }],
-    rows,
-    CREW,
-  )
-  assert.equal(passOverFailure.ok, false)
-  assert.ok(passOverFailure.gaps.some((g) => g.includes("must be marked FAIL")))
-  const lazyFail = validateCrewReport(
-    [{ title: "a", verdict: "FAIL", evidence: "bg-1", attempts: ["bg-1: empty"] }],
-    rows,
-    CREW,
-  )
-  assert.equal(lazyFail.ok, false)
-  assert.ok(lazyFail.gaps.some((g) => g.includes("both failure reports")))
-})
-
-test("4.2: ledger rows from other sessions or before the crew are ignored", () => {
-  const rows = [
-    { ts: "2026-09-27T00:01:00.000Z", event: "completed", dispatchId: "bg-1", parentSessionID: "ses_OTHER" },
-    { ts: "2025-01-01T00:00:00.000Z", event: "completed", dispatchId: "bg-2", parentSessionID: "ses_parent" },
-    row("bg-3", "completed"),
+test("gate: declared subtask missing a verdict refuses", () => {
+  const report = [
+    { title: "alpha", verdict: "PASS", evidence: "ok" },
+    { title: "beta", verdict: "", evidence: "ok" },
   ]
-  const r = validateCrewReport([{ title: "a", verdict: "PASS", evidence: "bg-3" }], rows, CREW)
-  assert.equal(r.ok, true, JSON.stringify(r.gaps))
+  const check = validateCrewReport(report, PLAN)
+  assert.equal(check.ok, false)
+  assert.ok(check.gaps.some((g) => g.includes("beta") && g.includes("verdict must be PASS or FAIL")))
 })
 
-test("4.2: duplicate evidence across subtasks refuses (each dispatch one verdict)", () => {
-  const rows = [row("bg-1", "completed")]
-  const r = validateCrewReport(
+test("gate: declared subtask missing evidence refuses", () => {
+  const report = [
+    { title: "alpha", verdict: "PASS", evidence: "ok" },
+    { title: "beta", verdict: "PASS", evidence: "   " },
+  ]
+  const check = validateCrewReport(report, PLAN)
+  assert.equal(check.ok, false)
+  assert.ok(check.gaps.some((g) => g.includes("beta") && g.includes("missing evidence")))
+})
+
+test("gate: a declared subtask silently dropped refuses", () => {
+  const report = [{ title: "alpha", verdict: "PASS", evidence: "ok" }]
+  const check = validateCrewReport(report, PLAN)
+  assert.equal(check.ok, false)
+  assert.ok(check.gaps.some((g) => g.includes("beta") && g.includes("silently dropped")))
+})
+
+test("gate: renegade undeclared subtask refuses", () => {
+  const report = [
+    { title: "alpha", verdict: "PASS", evidence: "ok" },
+    { title: "beta", verdict: "PASS", evidence: "ok" },
+    { title: "gamma-improvised", verdict: "PASS", evidence: "looked useful" },
+  ]
+  const check = validateCrewReport(report, PLAN)
+  assert.equal(check.ok, false)
+  assert.ok(check.gaps.some((g) => g.includes("gamma-improvised") && g.includes("renegade")))
+})
+
+test("gate: FAIL requires both failure reports", () => {
+  const one = validateCrewReport(
     [
-      { title: "a", verdict: "PASS", evidence: "bg-1" },
-      { title: "b", verdict: "PASS", evidence: "bg-1" },
+      { title: "alpha", verdict: "PASS", evidence: "ok" },
+      { title: "beta", verdict: "FAIL", evidence: "still broken", attempts: ["first failure only"] },
     ],
-    rows,
-    CREW,
+    PLAN,
   )
-  assert.equal(r.ok, false)
-  assert.ok(r.gaps.some((g) => g.includes("exactly one verdict")))
+  assert.equal(one.ok, false)
+  assert.ok(one.gaps.some((g) => g.includes("beta") && g.includes("both failure reports")))
+
+  const two = validateCrewReport(
+    [
+      { title: "alpha", verdict: "PASS", evidence: "ok" },
+      { title: "beta", verdict: "FAIL", evidence: "still broken", attempts: ["attempt failed: x", "retry failed: y"] },
+    ],
+    PLAN,
+  )
+  assert.equal(two.ok, true, "honest FAIL with both reports closes")
 })
 
-// fix-dispatch-transport-timeout: transport-interrupted is a non-outcome
-// event (recovery follows it; a terminal row lands separately) — it must
-// never demand a verdict or manufacture a gap.
-test("TI: a transport-interrupted row is not an outcome — no gap, no verdict required", () => {
-  const rows = [
-    row("bg-1", "transport-interrupted", "2026-09-27T00:00:30.000Z"),
-    row("bg-1", "completed", "2026-09-27T00:01:00.000Z"),
-  ]
-  const r = validateCrewReport([{ title: "a", verdict: "PASS", evidence: "bg-1" }], rows, CREW)
-  assert.equal(r.ok, true, JSON.stringify(r.gaps))
+test("gate: title matching is case-insensitive trim", () => {
+  const check = validateCrewReport(
+    [
+      { title: "  Alpha ", verdict: "PASS", evidence: "ok" },
+      { title: "BETA", verdict: "PASS", evidence: "ok" },
+    ],
+    PLAN,
+  )
+  assert.equal(check.ok, true)
+})
+
+test("gate: duplicate report entries refuse", () => {
+  const check = validateCrewReport(
+    [
+      { title: "alpha", verdict: "PASS", evidence: "ok" },
+      { title: "alpha", verdict: "PASS", evidence: "ok again" },
+      { title: "beta", verdict: "PASS", evidence: "ok" },
+    ],
+    PLAN,
+  )
+  assert.equal(check.ok, false)
+  assert.ok(check.gaps.some((g) => g.includes("duplicate")))
+})
+
+test("gate: PASS/FAIL verdict vocabulary is enforced", () => {
+  const check = validateCrewReport(
+    [
+      { title: "alpha", verdict: "DONE", evidence: "ok" },
+      { title: "beta", verdict: "PASS", evidence: "ok" },
+    ],
+    PLAN,
+  )
+  assert.equal(check.ok, false)
+  assert.ok(check.gaps.some((g) => g.includes("DONE")))
 })

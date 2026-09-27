@@ -104,3 +104,30 @@ test("3.1 unknown provider shape injects nothing and says so (B21)", () => {
   applyDepthTranslation(options, t)
   assert.deepEqual(options, {})
 })
+
+import { resolvePinnedDepth } from "../src/dispatch-depth.ts"
+
+// Task 2.2 ¡ª resolvePinnedDepth (spec: forge-subagents ¡ª "Pinned thoughtLevel
+// injection keyed by agent name"): an untranslatable word degrades to a
+// finding + no translation (never breaks a session); unknown family and
+// verbatim paths pass through as null / translation.
+
+test("resolvePinnedDepth: a no-mapping word yields a finding naming both vocabularies", () => {
+  const r = resolvePinnedDepth("medium", "openai", ["low", "high", "max"])
+  assert.equal(r.translation, null)
+  assert.match(r.findingMessage ?? "", /medium/)
+  assert.match(r.findingMessage ?? "", /low, high, max/)
+})
+
+test("resolvePinnedDepth: a natively valid word passes as the translation", () => {
+  const r = resolvePinnedDepth("high", "openai", ["low", "high", "max"])
+  assert.equal(r.translation?.kind, "verbatim")
+  assert.equal(r.findingMessage, undefined)
+})
+
+test("resolvePinnedDepth: unknown family and empty-ladder toggle shapes never fail", () => {
+  assert.deepEqual(resolvePinnedDepth("low", "unknown", ["low"]), { translation: null })
+  const unverified = resolvePinnedDepth("custom-word", "openai", null)
+  assert.equal(unverified.translation?.kind, "verbatim", "catalog-unknown ladders pass through verbatim (provider judges)")
+  assert.equal(unverified.findingMessage, undefined)
+})

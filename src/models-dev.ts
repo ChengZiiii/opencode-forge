@@ -1,23 +1,49 @@
-// models.dev snapshot loader (spec: dispatch — cost reporting; design D5/D6).
+// models.dev snapshot loader (inherited from the dispatch era; retained for
+// reasoning-ladder verification in the forge-subagents depth injection).
 //
 // The plugin only needs a minimal slice of models.dev: per provider/model the
 // native reasoning ladder (reasoning_options) and structured prices (cost).
 // Fetch respects OPENCODE_MODELS_URL (same override opencode honors), caches
 // the parsed slice under <tmp>/opencode-forge/models-dev/, and degrades to
-// the last cache (then to an empty catalog) on failure — dispatch keeps
-// working, costs report null.
+// the last cache (then to an empty catalog) on failure — depth injection
+// falls back to verbatim pass-through (the provider is the final judge).
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import type { CatalogSnapshot } from "./dispatch-roster.ts"
 
 export const DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json"
+
+// Minimal slice of the models.dev snapshot (absorbed from the deleted
+// dispatch-roster module). Prices are USD per million tokens (models.dev
+// shape).
+export type CatalogCost = { input?: number; output?: number }
+export type CatalogModel = { reasoningOptions?: string[]; cost?: CatalogCost }
+export type CatalogSnapshot = { providers: Record<string, { models: Record<string, CatalogModel> }> }
 
 export type ModelsDevResult = {
   catalog: CatalogSnapshot
   degraded: boolean
   source: string
+}
+
+// "provider/model" — opencode's identity key. Bare model-name matching does
+// not exist: the same model name on two providers is two entries.
+export function parseIdentity(identity: string): { provider: string; model: string } | null {
+  const slash = identity.indexOf("/")
+  if (slash <= 0 || slash === identity.length - 1) return null
+  return { provider: identity.slice(0, slash), model: identity.slice(slash + 1) }
+}
+
+// The identity's native ladder, or null when the catalog does not know it.
+export function nativeLadder(catalog: CatalogSnapshot | null | undefined, identity: string): string[] | null {
+  if (!catalog) return null
+  const parsed = parseIdentity(identity)
+  if (!parsed) return null
+  const entry = catalog.providers?.[parsed.provider]?.models?.[parsed.model]
+  if (!entry) return null
+  const options = entry.reasoningOptions
+  return Array.isArray(options) ? [...options] : null
 }
 
 export function modelsDevCacheDir(base?: string): string {

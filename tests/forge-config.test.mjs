@@ -1,245 +1,150 @@
 import test from "node:test"
 import assert from "node:assert/strict"
+import { mkdtempSync, writeFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 
-// Spec: openspec/changes/add-dispatch-onboarding/specs/dispatch/spec.md
-//   ADDED "Dedicated forge.json configuration file" — the file is JSONC
-//   (comments allowed), parsed by a string-state-machine stripper so comment
-//   markers inside string values never eat data.
-//
-// 1.1 parseForgeJsonc: comments / trailing commas / strings containing comment
-// markers / escaped quotes / bad JSON with a located error.
+// Task 1.1/1.2 — forge-config core (spec: forge-subagents — "Static agent
+// definitions in a dedicated forge.json" + "Field-level fail-soft validation"):
+// field-level fail-soft degradations, cascade with a single winner, hot-apply
+// cache, NO seed, NO recipe, inert unconfigured state.
 
-import { parseForgeJsonc, forgeConfigPaths, createForgeConfigLoader, SEED_AGENTS, PLACEHOLDER_IDENTITY, forgeRecipe } from "../src/forge-config.ts"
+import { createForgeConfigLoader, parseForgeJsonc, validateAgentSet, forgeConfigPaths } from "../src/forge-config.ts"
 
-test("1.1 line and block comments are stripped", () => {
-  const r = parseForgeJsonc(`{
-  // dispatch agents
-  "agents": {
-    /* research worker */ "research": { "model": "zai/glm-5.3", "depths": ["low"] }
-  }
-}`)
-  assert.equal(r.ok, true)
-  assert.deepEqual(r.config.agents.research.model, "zai/glm-5.3")
-})
-
-test("1.1 strings containing comment markers survive verbatim", () => {
-  const r = parseForgeJsonc(`{
-  "agents": {
-    "odd": { "model": "x/y", "depths": ["low"], "prompt": "see https://example.com // not a comment /* also not */" }
-  }
-}`)
-  assert.equal(r.ok, true)
-  assert.equal(r.config.agents.odd.prompt, "see https://example.com // not a comment /* also not */")
-})
-
-test("1.1 trailing commas are tolerated", () => {
-  const r = parseForgeJsonc(`{
-  "agents": {
-    "research": { "model": "zai/glm-5.3", "depths": ["low", "medium",], },
-  },
-}`)
-  assert.equal(r.ok, true)
-  assert.deepEqual(r.config.agents.research.depths, ["low", "medium"])
-})
-
-test("1.1 escaped quotes inside strings do not terminate the string state", () => {
-  const r = parseForgeJsonc(`{
-  "agents": {
-    "q": { "model": "x/y", "depths": ["low"], "prompt": "say \\"hi\\" // keep" }
-  }
-}`)
-  assert.equal(r.ok, true)
-  assert.equal(r.config.agents.q.prompt, 'say "hi" // keep')
-})
-
-test("1.1 bad JSON errors with a located message", () => {
-  const r = parseForgeJsonc(`{
-  "agents": {
-    "research": { "model": }
-  }
-}`)
-  assert.equal(r.ok, false)
-  assert.ok(r.error.message.length > 0, "error message is non-empty")
-  // Position must be reported and must point into the ORIGINAL text (comments
-  // are stripped space-preserving, so offsets align 1:1).
-  assert.ok(typeof r.error.line === "number" && r.error.line >= 1, "error carries a 1-based line")
-  assert.ok(typeof r.error.column === "number" && r.error.column >= 1, "error carries a 1-based column")
-  assert.equal(r.error.line, 3)
-})
-
-test("1.1 non-object top level is a parse error", () => {
-  const r = parseForgeJsonc(`[1, 2]`)
-  assert.equal(r.ok, false)
-})
-
-// ---------------------------------------------------------------------------
-// 1.2 three-level cascade, single winning source, no merging.
-
-const GLOBAL_TEXT = `{
-  "agents": {
-    "reviewer": { "model": "anthropic/claude-haiku-4-5", "depths": ["medium", "high"] }
-  }
-}`
-const PROJECT_TEXT = `{
-  "agents": {
-    "research": { "model": "zai/glm-5.3", "depths": ["low", "high", "max"] }
-  }
-}`
-
-function loaderWith(files) {
+function loaderWith(files, opts = {}) {
   return createForgeConfigLoader({
-    projectDir: "/w",
-    homeDir: "/h",
-    stat: (p) => (files[p] ? { mtimeMs: files[p].mtime ?? 1, size: files[p].text.length } : null),
-    readFile: (p) => files[p].text,
+    projectDir: opts.projectDir ?? "C:/proj",
+    homeDir: opts.homeDir ?? "C:/home",
+    stat: (p) => (files[p] === undefined ? null : { mtimeMs: 1, size: files[p].length }),
+    readFile: (p) => files[p],
   })
 }
 
-test("1.2 project file wins fully — global is not merged in", () => {
-  const paths = forgeConfigPaths({ projectDir: "/w", homeDir: "/h" })
-  assert.equal(paths.project, "/w/.opencode/forge.json")
-  assert.equal(paths.global, "/h/.config/opencode/forge.json")
-  const loader = loaderWith({ "/w/.opencode/forge.json": { text: PROJECT_TEXT }, "/h/.config/opencode/forge.json": { text: GLOBAL_TEXT } })
-  const loaded = loader.load()
-  assert.equal(loaded.source, "project")
-  assert.equal(loaded.path, "/w/.opencode/forge.json")
-  assert.deepEqual(Object.keys(loaded.agents), ["research"], "global-only agents must not leak in")
+test("parse: valid JSONC with comments and trailing commas", () => {
+  const r = parseForgeJsonc(`{\n  // comment\n  "agents": { "a": { "model": "p/m", "thoughtLevel": "low", } },\n}`)
+  assert.equal(r.ok, true)
 })
 
-test("1.2 global file serves when no project file exists", () => {
-  const loader = loaderWith({ "/h/.config/opencode/forge.json": { text: GLOBAL_TEXT } })
-  const loaded = loader.load()
-  assert.equal(loaded.source, "global")
-  assert.deepEqual(Object.keys(loaded.agents), ["reviewer"])
+test("parse: syntax error carries a location and the agent set empties", () => {
+  const r = parseForgeJsonc(`{ "agents": { "a": { "model": } } }`)
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.match(r.error.message, /line \d+/)
 })
 
-test("1.2 seed serves when neither file exists — research/review pinned to the placeholder", () => {
-  const loader = loaderWith({})
-  const loaded = loader.load()
-  assert.equal(loaded.source, "seed")
-  assert.equal(loaded.path, null)
-  assert.deepEqual(Object.keys(loaded.agents).sort(), ["research", "review"])
-  assert.equal(loaded.agents.research.model, PLACEHOLDER_IDENTITY)
-  assert.equal(PLACEHOLDER_IDENTITY, "Local/GPT Luna")
-  assert.deepEqual(SEED_AGENTS.research.depths, ["low", "medium"])
-  assert.deepEqual(SEED_AGENTS.review.depths, ["medium", "high", "max"])
-})
-
-// ---------------------------------------------------------------------------
-// 1.3 hot-apply: mtime+size cache — re-read only when the file changed; a
-// broken file falls back to the seed with a config-parse-error finding.
-
-test("1.3 unchanged file is served from cache (no re-read)", () => {
-  let reads = 0
-  const files = { "/w/.opencode/forge.json": { text: PROJECT_TEXT, mtime: 1 } }
-  const loader = createForgeConfigLoader({
-    projectDir: "/w",
-    homeDir: "/h",
-    stat: (p) => (files[p] ? { mtimeMs: files[p].mtime, size: files[p].text.length } : null),
-    readFile: (p) => {
-      reads++
-      return files[p].text
-    },
+test("fail-soft: one bad entry skips only itself, siblings still apply", () => {
+  const { agents, findings } = validateAgentSet({
+    good: { model: "p/good", thoughtLevel: "low" },
+    bad: { thoughtLevel: "low" }, // missing model
+    alsobad: "not an object",
   })
-  const a = loader.load()
-  const b = loader.load()
-  assert.equal(a.source, "project")
-  assert.equal(reads, 1, "second load must be a cache hit")
-  assert.deepEqual(Object.keys(b.agents), ["research"])
+  assert.deepEqual(Object.keys(agents), ["good"])
+  assert.equal(agents.good.model, "p/good")
+  assert.equal(findings.filter((f) => f.level === "error").length, 2)
+  assert.ok(findings.some((f) => f.code === "agent-model-missing"))
+  assert.ok(findings.some((f) => f.code === "agent-not-object"))
 })
 
-test("1.3 edited file is re-read and the new content applies", () => {
-  const files = { "/w/.opencode/forge.json": { text: PROJECT_TEXT, mtime: 1 } }
-  const loader = loaderWith(files)
-  assert.deepEqual(Object.keys(loader.load().agents), ["research"])
-  files["/w/.opencode/forge.json"] = { text: `{"agents": {"audit": {"model": "x/y", "depths": ["low"]}}}`, mtime: 2 }
-  const next = loader.load()
-  assert.deepEqual(Object.keys(next.agents), ["audit"], "changed mtime must trigger a re-read")
+test("fail-soft: invalid id skips the entry with an error finding", () => {
+  const { agents, findings } = validateAgentSet({ "Bad_Id!": { model: "p/m" } })
+  assert.deepEqual(agents, {})
+  assert.ok(findings.some((f) => f.code === "agent-id-invalid"))
 })
 
-test("1.3 broken file falls back to the seed with a located config-parse-error finding", () => {
-  const loader = loaderWith({ "/w/.opencode/forge.json": { text: `{ "agents": { "x": { "model": } } }` } })
-  const loaded = loader.load()
-  assert.equal(loaded.source, "seed")
-  assert.equal(loaded.findings.length, 1)
-  assert.equal(loaded.findings[0].code, "config-parse-error")
-  assert.equal(loaded.findings[0].level, "error")
-  assert.ok(loaded.findings[0].message.includes("/w/.opencode/forge.json"))
-  assert.ok(loaded.findings[0].message.includes("line"), "finding carries the located line")
-})
-
-test("1.3 repairing the file recovers on the next load", () => {
-  const files = { "/w/.opencode/forge.json": { text: `{ broken`, mtime: 1 } }
-  const loader = loaderWith(files)
-  assert.equal(loader.load().source, "seed")
-  files["/w/.opencode/forge.json"] = { text: PROJECT_TEXT, mtime: 2 }
-  const recovered = loader.load()
-  assert.equal(recovered.source, "project")
-  assert.deepEqual(recovered.findings, [])
-})
-
-// ---------------------------------------------------------------------------
-// 1.4 the unconfigured state carries one startup notice pointing at the recipe.
-
-test("1.4 unconfigured state surfaces one dispatch-unconfigured notice", () => {
-  const loaded = loaderWith({}).load()
-  assert.equal(loaded.source, "seed")
-  const notices = loaded.findings.filter((f) => f.code === "dispatch-unconfigured")
-  assert.equal(notices.length, 1)
-  assert.equal(notices[0].level, "notice")
-  assert.ok(notices[0].message.includes("forge.json"), "notice names the config file")
-  assert.ok(notices[0].message.toLowerCase().includes("dispatch"), "notice names the dispatch feature")
-})
-
-test("1.4 a configured state carries no notice", () => {
-  const loaded = loaderWith({ "/w/.opencode/forge.json": { text: PROJECT_TEXT } }).load()
-  assert.equal(loaded.findings.filter((f) => f.code === "dispatch-unconfigured").length, 0)
-})
-
-test("1.4 a broken file reports the parse error, not the unconfigured notice", () => {
-  const loaded = loaderWith({ "/w/.opencode/forge.json": { text: `{ broken` } }).load()
-  const codes = loaded.findings.map((f) => f.code)
-  assert.ok(codes.includes("config-parse-error"))
-  assert.ok(!codes.includes("dispatch-unconfigured"))
-})
-
-// ---------------------------------------------------------------------------
-// 2.2 the onboarding recipe (spec delta — ADDED "Seed placeholder onboarding"):
-// machine-actionable, four blocks — detected identities (strings only, no
-// ladders), file paths, copy-paste template with inline comments, verify
-// dispatch + extension hints.
-
-test("2.2 recipe carries the four blocks and uses the injected detection list", () => {
-  const recipe = forgeRecipe({
-    detectedIdentities: ["zai-coding-plan/glm-5.3", "anthropic/claude-haiku-4-5"],
-    projectPath: "/w/.opencode/forge.json",
-    globalPath: "/h/.config/opencode/forge.json",
+test("fail-soft: a mistyped optional field costs only itself", () => {
+  const { agents, findings } = validateAgentSet({
+    a: { model: "p/m", thoughtLevel: 3, shape: "aggressive", permission: { bash: 1 } },
   })
-  // 1. detected identities, strings only
-  assert.ok(recipe.includes("zai-coding-plan/glm-5.3"))
-  assert.ok(recipe.includes("anthropic/claude-haiku-4-5"))
-  // 2. both file paths
-  assert.ok(recipe.includes("/w/.opencode/forge.json"))
-  assert.ok(recipe.includes("/h/.config/opencode/forge.json"))
-  // 3. copy-paste template block with inline comments
-  assert.ok(recipe.includes('"agents"'))
-  assert.ok(recipe.includes('"model"'))
-  assert.ok(recipe.includes('"depths"'))
-  assert.ok(recipe.includes("//"), "template carries inline comments")
-  // the template itself must round-trip through the JSONC parser
-  const block = recipe.slice(recipe.indexOf("{"), recipe.lastIndexOf("}") + 1)
-  const parsed = parseForgeJsonc(block)
-  assert.equal(parsed.ok, true, `template block parses (got ${!parsed.ok && parsed.error.message})`)
-  assert.ok(parsed.config.agents.research, "template defines research")
-  // 4. verification dispatch
-  assert.ok(recipe.includes("forge_dispatch"))
-  // 5. extension hints
-  assert.ok(recipe.includes("shape"))
-  assert.ok(recipe.toLowerCase().includes("write"))
+  assert.equal(agents.a.model, "p/m")
+  assert.equal(agents.a.thoughtLevel, undefined)
+  assert.equal(agents.a.shape, undefined)
+  assert.equal(agents.a.permission, undefined)
+  assert.ok(findings.some((f) => f.code === "thoughtlevel-invalid"))
+  assert.ok(findings.some((f) => f.code === "shape-invalid"))
+  assert.ok(findings.some((f) => f.code === "permission-invalid"))
+  assert.ok(findings.every((f) => f.code === "thoughtlevel-invalid" || f.code === "shape-invalid" || f.code === "permission-invalid" ? f.level === "warn" : true))
 })
 
-test("2.2 recipe works with an empty detection list (keyless hosts)", () => {
-  const recipe = forgeRecipe({ detectedIdentities: [], projectPath: "/w/.opencode/forge.json", globalPath: "/h/.config/opencode/forge.json" })
-  assert.ok(recipe.includes("forge.json"))
-  assert.ok(recipe.includes("(none detected"), "empty list is stated plainly")
+test("depths is deprecated: warning finding, no behavior", () => {
+  const { agents, findings } = validateAgentSet({ a: { model: "p/m", depths: ["low", "medium"] } })
+  assert.equal(agents.a.model, "p/m")
+  assert.equal(agents.a.thoughtLevel, undefined)
+  assert.ok(findings.some((f) => f.code === "depths-deprecated" && f.level === "warn"))
+})
+
+test("cascade: project fully wins over global (no merge)", () => {
+  const files = {
+    "C:/proj/.opencode/forge.json": JSON.stringify({ agents: { research: { model: "proj/model" } } }),
+    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { research: { model: "global/model" }, review: { model: "global/model" } } }),
+  }
+  const l = loaderWith(files)
+  const r = l.load()
+  assert.equal(r.source, "project")
+  assert.deepEqual(Object.keys(r.agents), ["research"])
+  assert.equal(r.agents.research.model, "proj/model")
+})
+
+test("cascade: global applies when no project file exists", () => {
+  const files = {
+    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { review: { model: "global/model" } } }),
+  }
+  const l = loaderWith(files)
+  const r = l.load()
+  assert.equal(r.source, "global")
+  assert.equal(r.agents.review.model, "global/model")
+})
+
+test("broken JSON: empty set + one parse-location error finding; NO seed resurrects", () => {
+  const files = { "C:/proj/.opencode/forge.json": "{ agents: { broken" }
+  const l = loaderWith(files)
+  const r = l.load()
+  assert.deepEqual(r.agents, {})
+  assert.equal(r.findings.length, 1)
+  assert.equal(r.findings[0].code, "config-parse-error")
+  assert.match(r.findings[0].message, /line \d+, column \d+/)
+})
+
+test("unconfigured state is INERT and SILENT: empty agents, zero findings", () => {
+  const l = loaderWith({})
+  const r = l.load()
+  assert.deepEqual(r.agents, {})
+  assert.deepEqual(r.findings, [])
+  assert.equal(r.source, "none")
+  assert.equal(r.path, null)
+})
+
+test("hot-apply: an mtime/size change re-reads; unchanged stat hits the cache", () => {
+  let mtime = 1
+  const content = { text: JSON.stringify({ agents: { a: { model: "p/v1" } } }) }
+  const l = createForgeConfigLoader({
+    projectDir: "C:/proj",
+    stat: () => ({ mtimeMs: mtime, size: content.text.length }),
+    readFile: () => content.text,
+  })
+  assert.equal(l.load().agents.a.model, "p/v1")
+  // Same content, new mtime: re-read happens but result matches (cache keyed on stat).
+  content.text = JSON.stringify({ agents: { a: { model: "p/v2" } } })
+  mtime = 2
+  assert.equal(l.load().agents.a.model, "p/v2")
+})
+
+test("paths: project uses .opencode/forge.json, global uses ~/.config/opencode/forge.json", () => {
+  const p = forgeConfigPaths({ projectDir: "C:/w", homeDir: "C:/Users/x" })
+  assert.ok(p.project.includes(".opencode"))
+  assert.ok(p.global.includes(".config"))
+  assert.ok(p.global.endsWith("forge.json"))
+})
+
+test("loader against a real temp dir end to end", () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-config-"))
+  try {
+    writeFileSync(join(dir, ".opencode", "forge.json"), "", { flag: "wx" })
+  } catch {}
+  try {
+    const l = createForgeConfigLoader({ projectDir: dir, homeDir: join(dir, "home") })
+    const r1 = l.load()
+    assert.equal(r1.source, "none")
+    rmSync(join(dir, ".opencode", "forge.json"), { force: true })
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
 })

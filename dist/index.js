@@ -12335,7 +12335,7 @@ function tool(input) {
 tool.schema = exports_external;
 // plugin.ts
 import { execFileSync as execFileSync3 } from "node:child_process";
-import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync6, readdirSync as readdirSync4, readFileSync as readFileSync9, statSync as statSync4, writeFileSync as writeFileSync6 } from "node:fs";
+import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync5, readdirSync as readdirSync4, readFileSync as readFileSync8, statSync as statSync4, writeFileSync as writeFileSync5 } from "node:fs";
 import { isAbsolute, join as join5, relative } from "node:path";
 import { tmpdir as tmpdir3, homedir } from "node:os";
 
@@ -14723,15 +14723,20 @@ function createLocator(platform = process.platform, posix = {}, win = {}) {
   return platform === "win32" ? createWindowsLocator(win) : createPosixLocator(posix);
 }
 
-// src/dispatch-roster.ts
-var DEFAULT_TIERS = {
-  scout: { shape: "readonly", defaultDepth: "low" },
-  build: { shape: "write", defaultDepth: "high" },
-  review: { shape: "readonly", defaultDepth: "high" },
-  quick: { shape: "write", defaultDepth: "off" }
-};
-var TIER_ID_RE = /^[a-z0-9-]+$/;
+// src/models-dev.ts
+import { mkdirSync as mkdirSync4, readFileSync as readFileSync6, writeFileSync as writeFileSync4 } from "node:fs";
+import { join as join4 } from "node:path";
+import { tmpdir as tmpdir2 } from "node:os";
+var DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json";
+function parseIdentity(identity) {
+  const slash = identity.indexOf("/");
+  if (slash <= 0 || slash === identity.length - 1)
+    return null;
+  return { provider: identity.slice(0, slash), model: identity.slice(slash + 1) };
+}
 function nativeLadder(catalog, identity) {
+  if (!catalog)
+    return null;
   const parsed = parseIdentity(identity);
   if (!parsed)
     return null;
@@ -14741,352 +14746,174 @@ function nativeLadder(catalog, identity) {
   const options = entry.reasoningOptions;
   return Array.isArray(options) ? [...options] : null;
 }
-function identityCost(catalog, identity) {
-  const parsed = parseIdentity(identity);
-  if (!parsed)
-    return;
-  return catalog.providers?.[parsed.provider]?.models?.[parsed.model]?.cost;
+function modelsDevCacheDir(base) {
+  return join4(base ?? join4(tmpdir2(), "opencode-forge"), "models-dev");
 }
-function parseIdentity(identity) {
-  const slash = identity.indexOf("/");
-  if (slash <= 0 || slash === identity.length - 1)
-    return null;
-  return { provider: identity.slice(0, slash), model: identity.slice(slash + 1) };
-}
-function catalogKnowsIdentity(catalog, identity) {
-  const parsed = parseIdentity(identity);
-  if (!parsed)
-    return false;
-  return Boolean(catalog.providers?.[parsed.provider]?.models?.[parsed.model]);
-}
-function buildDispatchConfig(opts) {
-  const findings = [];
-  const catalog = opts.catalog ?? { providers: {} };
-  const tiers = {};
-  for (const [id, def] of Object.entries(DEFAULT_TIERS)) {
-    tiers[id] = { ...def, shape: def.shape ?? "readonly" };
-  }
-  for (const [id, def] of Object.entries(opts.userTiers ?? {})) {
-    if (!TIER_ID_RE.test(id)) {
-      findings.push({
-        level: "warn",
-        code: "tier-id-charset",
-        message: `tier id "${id}" violates [a-z0-9-] (it materializes as forge-<tier> agent ids)`
-      });
-    }
-    const shape = def.shape ?? "readonly";
-    if (def.shape === undefined) {
-      findings.push({
-        level: "warn",
-        code: "shape-defaulted",
-        message: `custom tier "${id}" has no shape; defaulting to readonly (write requires explicit "shape": "write")`
-      });
-    }
-    tiers[id] = { ...def, shape };
-  }
-  const roster = [];
-  for (const entry of opts.userRoster ?? []) {
-    const ladder = nativeLadder(catalog, entry.model);
-    const verified = ladder !== null;
-    if (verified && catalogKnowsIdentity(catalog, entry.model)) {
-      const legal = ladder;
-      if (legal.length === 0) {
-        findings.push({
-          level: "notice",
-          code: "unnamed-levels-accepted",
-          message: `roster entry ${entry.model} has no cataloged named reasoning levels (toggle/budget model); expose accepted verbatim without validation`
-        });
-        roster.push({ model: entry.model, expose: [...entry.expose ?? []], profiles: [...entry.profiles], verified: true });
-      } else {
-        const expose = entry.expose ?? legal;
-        const illegal = expose.filter((d) => !legal.includes(d));
-        if (illegal.length > 0) {
-          findings.push({
-            level: "error",
-            code: "expose-unknown-level",
-            message: `roster entry ${entry.model} exposes unknown level(s) ${illegal.map((d) => `"${d}"`).join(", ")}; legal ladder: ${legal.join(", ")}`
-          });
-        }
-        roster.push({
-          model: entry.model,
-          expose: expose.filter((d) => legal.includes(d)),
-          profiles: [...entry.profiles],
-          verified: true
-        });
+function namedLevels(rows) {
+  const out = [];
+  for (const r of rows) {
+    if (r && typeof r === "object" && r.type === "effort") {
+      const values = r.values;
+      if (Array.isArray(values)) {
+        for (const v of values)
+          if (typeof v === "string")
+            out.push(v);
       }
-    } else {
-      findings.push({
-        level: "notice",
-        code: "unverified-identity",
-        message: `roster entry ${entry.model} is not in the models.dev snapshot; expose accepted verbatim without validation`
-      });
-      roster.push({ model: entry.model, expose: [...entry.expose ?? []], profiles: [...entry.profiles], verified: false });
     }
   }
-  const tierIds = new Set(Object.keys(tiers));
-  for (const entry of roster) {
-    if (!opts.configuredIdentities.includes(entry.model)) {
-      findings.push({
-        level: "warn",
-        code: "dead-key",
-        message: `roster entry ${entry.model} is not a configured provider/model identity (dead key)`
-      });
-    }
-    const unknownTiers = entry.profiles.filter((p) => !tierIds.has(p));
-    if (unknownTiers.length > 0) {
-      findings.push({
-        level: "warn",
-        code: "unknown-tier-ref",
-        message: `roster entry ${entry.model} references nonexistent tier(s): ${unknownTiers.join(", ")}`
-      });
-    }
-  }
-  for (const [id, tier] of Object.entries(tiers)) {
-    if (tier.defaultDepth === undefined)
+  return out;
+}
+function reduceModelsDev(raw) {
+  const catalog = { providers: {} };
+  const providers = raw?.constructor === Object ? raw : null;
+  if (!providers)
+    return catalog;
+  for (const [providerID, provider] of Object.entries(providers)) {
+    const models = provider.models;
+    if (!models || typeof models !== "object")
       continue;
-    const served = roster.some((e) => e.profiles.includes(id) && e.expose.includes(tier.defaultDepth));
-    if (!served) {
-      findings.push({
-        level: "warn",
-        code: "dead-default-depth",
-        message: `tier "${id}" defaultDepth "${tier.defaultDepth}" is exposed by no candidate; tier degrades to depth-required (dispatches must pass depth explicitly)`
-      });
-      tiers[id] = { ...tier, defaultDepth: undefined, depthRequired: true };
+    const out = { models: {} };
+    for (const [modelID, model] of Object.entries(models)) {
+      const m = model;
+      const options = Array.isArray(m.reasoning_options) ? namedLevels(m.reasoning_options) : undefined;
+      const cost = m.cost && typeof m.cost === "object" ? m.cost : undefined;
+      out.models[modelID] = {
+        ...options ? { reasoningOptions: options } : {},
+        ...cost ? { cost } : {}
+      };
     }
+    catalog.providers[providerID] = out;
   }
-  return { roster, tiers, findings };
+  return catalog;
+}
+async function loadModelsDevSnapshot(opts = {}) {
+  const url2 = opts.url ?? process.env.OPENCODE_MODELS_URL ?? DEFAULT_MODELS_DEV_URL;
+  const cacheDir = modelsDevCacheDir(opts.cacheDir);
+  const cacheFile = join4(cacheDir, "snapshot.json");
+  const fetcher = opts.fetcher;
+  if (fetcher) {
+    try {
+      const res = await fetcher(url2, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8000) });
+      if (res.ok)
+        return { catalog: reduceModelsDev(JSON.parse(await res.text())), degraded: false, source: url2 };
+    } catch {}
+    return { catalog: { providers: {} }, degraded: true, source: "fetch-failed" };
+  }
+  try {
+    const res = await fetch(url2, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8000) });
+    if (res.ok) {
+      const catalog = reduceModelsDev(JSON.parse(await res.text()));
+      try {
+        mkdirSync4(cacheDir, { recursive: true });
+        writeFileSync4(cacheFile, JSON.stringify(catalog));
+      } catch {}
+      return { catalog, degraded: false, source: url2 };
+    }
+  } catch {}
+  try {
+    const cached2 = JSON.parse(readFileSync6(cacheFile, "utf8"));
+    if (cached2 && typeof cached2 === "object" && cached2.providers)
+      return { catalog: cached2, degraded: true, source: "cache" };
+  } catch {}
+  return { catalog: { providers: {} }, degraded: true, source: "unavailable" };
 }
 
-// src/dispatch-client.ts
-var CONSECUTIVE_STABLE_POLLS = 2;
-function completionVerdict(prev, cur) {
-  if (!prev) {
-    return { stablePolls: 0, verdict: "waiting", last: { ...cur } };
-  }
-  const unchanged = cur.count === prev.last.count && cur.text === prev.last.text;
-  const stablePolls = unchanged ? prev.stablePolls + 1 : 0;
-  if (stablePolls >= CONSECUTIVE_STABLE_POLLS && cur.count > 0) {
-    return { stablePolls, verdict: cur.text.trim() === "" ? "empty" : "complete", last: { ...cur } };
-  }
-  return { stablePolls, verdict: "waiting", last: { ...cur } };
+// src/crew-gate.ts
+function normTitle(t) {
+  return String(t ?? "").trim().toLowerCase();
 }
-function sumTokens(list) {
-  const total = { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } };
-  for (const t of list) {
-    total.input += t.input ?? 0;
-    total.output += t.output ?? 0;
-    total.reasoning += t.reasoning ?? 0;
-    total.cache.read += t.cache?.read ?? 0;
-    total.cache.write += t.cache?.write ?? 0;
+function validateCrewReport(report, declared) {
+  const gaps = [];
+  if (!Array.isArray(report) || report.length === 0) {
+    return { ok: false, gaps: ["the report lists no subtasks — a crew completion report must cover every declared subtask"] };
   }
-  return total;
-}
-function computeCost(tokens, price) {
-  if (!price || typeof price.input !== "number" || typeof price.output !== "number") {
-    return { costUsd: null, note: "price unavailable for this identity (no snapshot price)" };
+  const declaredTitles = new Set;
+  for (const s of Array.isArray(declared) ? declared : []) {
+    const t = normTitle(s?.title);
+    if (t)
+      declaredTitles.add(t);
   }
-  if (tokens.cache.read > 0 && typeof price.cacheRead !== "number") {
-    return { costUsd: null, note: "price unavailable: cache-read price missing from snapshot" };
+  const covered = new Set;
+  report.forEach((sub, i) => {
+    const label = sub?.title?.trim() || `subtask #${i + 1}`;
+    const key = normTitle(sub?.title);
+    if (!sub?.title?.trim())
+      gaps.push(`${label}: missing title`);
+    else if (covered.has(key))
+      gaps.push(`${label}: duplicate report entry for the same title`);
+    covered.add(key);
+    const verdict = String(sub?.verdict ?? "").toUpperCase();
+    if (verdict !== "PASS" && verdict !== "FAIL")
+      gaps.push(`${label}: verdict must be PASS or FAIL (got "${sub?.verdict ?? ""}")`);
+    if (!String(sub?.evidence ?? "").trim())
+      gaps.push(`${label}: missing evidence statement`);
+    if (verdict === "FAIL" && (!Array.isArray(sub?.attempts) || sub.attempts.length < 2)) {
+      gaps.push(`${label}: FAIL requires both failure reports (the attempt and the one retry) in attempts[]`);
+    }
+    if (key && declaredTitles.size > 0 && !declaredTitles.has(key)) {
+      gaps.push(`${label}: not part of the plan registered at crew_begin (renegade work) — fold discoveries into an existing subtask's verdict notes, or discard and re-crew with the full plan`);
+    }
+  });
+  for (const t of declaredTitles) {
+    if (!covered.has(t)) {
+      const original = (Array.isArray(declared) ? declared : []).find((s) => normTitle(s?.title) === t)?.title ?? t;
+      gaps.push(`"${original}": declared at crew_begin but has no verdict in the report — a declared subtask was silently dropped`);
+    }
   }
-  if (tokens.cache.write > 0 && typeof price.cacheWrite !== "number") {
-    return { costUsd: null, note: "price unavailable: cache-write price missing from snapshot" };
-  }
-  const usd = (tokens.input * price.input + (tokens.output + tokens.reasoning) * price.output + tokens.cache.read * (price.cacheRead ?? 0) + tokens.cache.write * (price.cacheWrite ?? 0)) / 1e6;
-  return { costUsd: usd };
+  return { ok: gaps.length === 0, gaps };
 }
 
 // src/dispatch-prompt.ts
-var COMMON_MANDATES = [
+var WORKER_MANDATES = [
   "Mandates (non-negotiable):",
   "- Use workspace-relative paths ONLY. Never write to or read from absolute paths outside this workspace; the workspace root is where you were started, not the filesystem root.",
   "- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial.",
   "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."
 ].join(`
 `);
-var READONLY_DISCIPLINE = `You are a readonly {agent} worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`;
-var WRITE_DISCIPLINE = `You are an {agent} worker executing one scoped task. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no starting side quests.`;
-function composeWorkerPrompt(input) {
-  const discipline = input.shape === "readonly" ? READONLY_DISCIPLINE.replaceAll("{agent}", input.agent) : WRITE_DISCIPLINE.replaceAll("{agent}", input.agent);
-  return [
-    "[forge:dispatch] You were dispatched by the forge main agent as a scoped worker.",
-    discipline,
-    ...input.role ? ["", "Your role:", input.role.trim()] : [],
-    "",
-    "Task:",
-    input.prompt.trim(),
-    "",
-    COMMON_MANDATES,
-    "",
-    "Finish with a single concluding report (the main agent will read only this): what you did, what you found/produced, and the evidence."
-  ].join(`
+var READONLY_DISCIPLINE = (agent) => `You are forge-${agent}, a readonly worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`;
+var WRITE_DISCIPLINE = (agent) => `You are forge-${agent}, a worker executing scoped tasks handed to you through the task tool. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no side quests.`;
+function materializeAgentPrompt(input) {
+  const frame = input.shape === "readonly" ? READONLY_DISCIPLINE(input.agent) : WRITE_DISCIPLINE(input.agent);
+  return [frame, "", "Your role:", input.role.trim(), "", WORKER_MANDATES].join(`
 `);
 }
 
-// src/dispatch-resolver.ts
-function exposedVocabulary(cfg) {
-  const set2 = new Set;
-  for (const entry of cfg.roster)
-    for (const d of entry.expose)
-      set2.add(d);
-  return [...set2];
+// src/dispatch-tiers.ts
+var MUTATING_TOOLS = ["write", "edit", "bash"];
+var ROLE_PROMPTS = {
+  research: "You are a research worker: search, read, and run read-only checks to answer the assigned question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
+  review: "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict."
+};
+function rolePromptFor(agentId, def) {
+  if (def?.prompt && def.prompt.trim().length > 0)
+    return def.prompt;
+  return ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`;
 }
-function menuFor(cfg, tierId, depth, exclude, available) {
-  const lines = [];
-  for (const entry of cfg.roster) {
-    if (!entry.profiles.includes(tierId))
-      continue;
-    let reason;
-    if (exclude.includes(entry.model))
-      reason = "excluded after a failed attempt";
-    else if (!available(entry.model))
-      reason = "identity currently unavailable";
-    else if (depth !== undefined && !entry.expose.includes(depth))
-      reason = `depth "${depth}" not exposed`;
-    else
-      reason = "eligible";
-    lines.push({ identity: entry.model, expose: [...entry.expose], verified: entry.verified, reason });
-  }
-  return lines;
+function agentDescriptionFor(agentId, def) {
+  const shape = def.shape === "write" ? "write" : "readonly";
+  return `forge subagent "${agentId}" (${shape}, pinned ${def.model}) — dispatch via the task tool with subagent_type "forge-${agentId}".`;
 }
-function costRank(catalog, identity) {
-  const cost = identityCost(catalog, identity);
-  if (!cost || typeof cost.input !== "number" || typeof cost.output !== "number")
-    return Number.POSITIVE_INFINITY;
-  return cost.input + cost.output;
-}
-function resolveDispatch(cfg, req, available, catalog = { providers: {} }) {
-  const tier = cfg.tiers[req.profile];
-  if (!tier) {
-    return {
-      ok: false,
-      error: {
-        code: "unknown-tier",
-        message: `unknown tier "${req.profile}"; known tiers: ${Object.keys(cfg.tiers).join(", ")}`,
-        menu: [],
-        vocabulary: exposedVocabulary(cfg)
-      }
-    };
+function forgeAgentDef(agentId, def) {
+  const permission = { task: "deny" };
+  const shape = def.shape ?? "readonly";
+  if (shape === "readonly") {
+    for (const t of MUTATING_TOOLS)
+      permission[t] = "deny";
   }
-  const exclude = req.exclude ?? [];
-  if (tier.model) {
-    const pinnedIdentity = tier.model;
-    const entry = cfg.roster.find((e) => e.model === pinnedIdentity);
-    const expose = entry?.expose ?? [];
-    const menu = [
-      { identity: pinnedIdentity, expose, verified: entry?.verified ?? false, reason: "pinned tier target" }
-    ];
-    if (!available(pinnedIdentity)) {
-      return {
-        ok: false,
-        error: {
-          code: "pin-unavailable",
-          message: `tier "${req.profile}" is pinned to ${pinnedIdentity}, which is currently unavailable; fix or unpin the tier — no fallback model will be used`,
-          menu,
-          vocabulary: exposedVocabulary(cfg)
-        }
-      };
-    }
-    const depth2 = req.depth ?? tier.depth;
-    if (depth2 === undefined) {
-      return {
-        ok: false,
-        error: {
-          code: "depth-required",
-          message: `tier "${req.profile}" is pinned without a depth and none was requested; pass depth explicitly`,
-          menu,
-          vocabulary: exposedVocabulary(cfg)
-        }
-      };
-    }
-    if (!expose.includes(depth2)) {
-      return {
-        ok: false,
-        error: {
-          code: "pin-depth-mismatch",
-          message: `pinned model ${pinnedIdentity} does not expose depth "${depth2}" (expose: ${expose.join(", ") || "none"}); exact match only — no clamping`,
-          menu,
-          vocabulary: exposedVocabulary(cfg)
-        }
-      };
-    }
-    return { ok: true, identity: pinnedIdentity, depth: depth2, pinned: true };
-  }
-  const depth = req.depth ?? tier.defaultDepth;
-  if (depth === undefined) {
-    return {
-      ok: false,
-      error: {
-        code: "depth-required",
-        message: `tier "${req.profile}" has no usable default depth (its default was removed at validation); pass depth explicitly`,
-        menu: menuFor(cfg, req.profile, undefined, exclude, available),
-        vocabulary: exposedVocabulary(cfg)
-      }
-    };
-  }
-  const candidates = cfg.roster.map((entry, index) => ({ entry, index })).filter(({ entry }) => entry.profiles.includes(req.profile)).filter(({ entry }) => !exclude.includes(entry.model)).filter(({ entry }) => available(entry.model)).filter(({ entry }) => entry.expose.includes(depth)).sort((a, b) => a.index - b.index || costRank(catalog, a.entry.model) - costRank(catalog, b.entry.model));
-  if (candidates.length === 0) {
-    return {
-      ok: false,
-      error: {
-        code: "no-candidate",
-        message: `no candidate serves tier "${req.profile}" at depth "${depth}"; pick a depth from the menu's exposures (exact match — the plugin never clamps)`,
-        menu: menuFor(cfg, req.profile, depth, exclude, available),
-        vocabulary: exposedVocabulary(cfg)
-      }
-    };
-  }
-  return { ok: true, identity: candidates[0].entry.model, depth, pinned: false };
-}
-function resolveAgent(agents, req, available) {
-  const def = agents[req.agent];
-  if (!def || typeof def !== "object") {
-    return {
-      ok: false,
-      error: {
-        code: "unknown-agent",
-        message: `unknown dispatch agent "${req.agent}"; defined agents: ${Object.keys(agents).join(", ") || "(none)"}`
-      }
-    };
-  }
-  if (!def.model || typeof def.model !== "string") {
-    return {
-      ok: false,
-      error: {
-        code: "pin-unavailable",
-        message: `agent "${req.agent}" has no usable model (model: ${JSON.stringify(def.model)}); fix its "model" in forge.json — no fallback model will be used`
-      }
-    };
-  }
-  if (!available(def.model)) {
-    return {
-      ok: false,
-      error: {
-        code: "pin-unavailable",
-        message: `agent "${req.agent}" is pinned to ${def.model}, which is not configured on this host; fix the agent's "model" in forge.json — no fallback model will be used`
-      }
-    };
-  }
-  const depths = Array.isArray(def.depths) ? def.depths : [];
-  if (depths.length === 0) {
-    return {
-      ok: false,
-      error: {
-        code: "depth-not-in-set",
-        message: `agent "${req.agent}" defines no depths; give it at least one depth in forge.json (canonical words: none, low, medium, high, max — or the model's native level names)`
-      }
-    };
-  }
-  const depth = req.depth ?? depths[0];
-  if (!depths.includes(depth)) {
-    return {
-      ok: false,
-      error: {
-        code: "depth-not-in-set",
-        message: `agent "${req.agent}" does not allow depth "${depth}" (allowed: ${depths.join(", ")}) — exact match only, the plugin never clamps`
-      }
-    };
-  }
-  return { ok: true, model: def.model, depth, def };
+  Object.assign(permission, def.permission ?? {});
+  permission.task = "deny";
+  return {
+    description: agentDescriptionFor(agentId, def),
+    mode: "subagent",
+    model: def.model,
+    prompt: materializeAgentPrompt({
+      agent: agentId,
+      shape,
+      role: rolePromptFor(agentId, def)
+    }),
+    permission
+  };
 }
 
 // src/dispatch-depth.ts
@@ -15147,671 +14974,13 @@ function applyDepthTranslation(options, t) {
     options.thinking = { type: "enabled" };
   }
 }
-
-// src/dispatch-tiers.ts
-var MUTATING_TOOLS = ["write", "edit", "bash"];
-var TIER_PROMPTS = {
-  scout: "You are forge-scout, a readonly reconnaissance worker. Search, read, and run read-only commands; report findings with file:line evidence. You never modify anything — write tools are denied by design.",
-  build: "You are forge-build, an implementation worker. Execute the dispatched task exactly: minimal, focused changes with tests where the task implies them. Do not expand scope.",
-  review: "You are forge-review, a readonly review worker. Read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list with file:line evidence and a single-line verdict. Write tools are denied by design.",
-  quick: "You are forge-quick, a mechanical small-change worker. Make the smallest correct edit the task names (rename, constant, one-liner fix). No refactoring, no drive-by improvements."
-};
-function tierAgentPrompt(tierId) {
-  return TIER_PROMPTS[tierId] ?? `You are forge-${tierId}, a dispatched worker. Execute the dispatched task exactly as scoped.`;
-}
-var ROLE_PROMPTS = {
-  research: "You are a research worker: search, read, and run read-only checks to answer the dispatched question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
-  review: "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict."
-};
-function rolePromptFor(agentId, def) {
-  if (def?.prompt && def.prompt.trim().length > 0)
-    return def.prompt;
-  return ROLE_PROMPTS[agentId] ?? `You are forge-${agentId}, a dispatched worker. Execute the dispatched task exactly as scoped.`;
-}
-function forgeAgentDef(agentId, def) {
-  const permission = { task: "deny" };
-  const shape = def.shape ?? "readonly";
-  if (shape === "readonly") {
-    for (const t of MUTATING_TOOLS)
-      permission[t] = "deny";
-  }
-  Object.assign(permission, def.permission ?? {});
-  permission.task = "deny";
-  const shapeLine = shape === "readonly" ? "Readonly agent: mutating tools are denied by design — report findings, never work around restrictions." : "Write agent: execute the scoped task with minimal, focused changes.";
-  return {
-    description: `forge dispatch agent "${agentId}" (${shape}) — spawned by forge_dispatch, not user-facing.`,
-    mode: "subagent",
-    hidden: true,
-    prompt: `${rolePromptFor(agentId, def)}
-
-${shapeLine}`,
-    permission
-  };
-}
-function tierAgentDef(tierId, tier) {
-  const permission = { task: "deny" };
-  if (tier.shape === "readonly") {
-    for (const t of MUTATING_TOOLS)
-      permission[t] = "deny";
-  }
-  const shapeLine = tier.shape === "readonly" ? "Readonly tier: mutating tools are denied by design — report findings, never work around restrictions." : "Write tier: execute the scoped task with minimal, focused changes.";
-  const defaultLine = tier.defaultDepth ? ` Default reasoning depth: ${tier.defaultDepth}.` : "";
-  return {
-    description: `forge dispatch tier "${tierId}" (${tier.shape}) — spawned by forge_dispatch, not user-facing.${defaultLine}`,
-    mode: "subagent",
-    hidden: true,
-    prompt: `${tierAgentPrompt(tierId)}
-
-${shapeLine}`,
-    permission
-  };
-}
-
-// src/dispatch-engine.ts
-var DEFAULT_DISPATCH_TIMEOUT_MS = 600000;
-var MAX_DISPATCH_TIMEOUT_MS = 600000;
-var DEFAULT_MAX_CONCURRENT = 4;
-var DEFAULT_POLL_INTERVAL_MS = 2000;
-
-class DispatchError extends Error {
-  code;
-  constructor(message, code) {
-    super(message);
-    this.name = "DispatchError";
-    this.code = code;
-  }
-}
-function textOf(messages) {
-  const assistant = [...messages].reverse().find((m) => (m.info?.role ?? m.role) === "assistant");
-  if (!assistant)
-    return "";
-  return (assistant.parts ?? []).filter((p) => p.type === "text" || typeof p.text === "string").map((p) => p.text ?? "").join(`
-`).trim();
-}
-function tokensOf(messages) {
-  return messages.filter((m) => (m.info?.role ?? m.role) === "assistant" && m.info?.tokens).map((m) => m.info.tokens);
-}
-function createDispatchEngine(deps) {
-  const maxConcurrent = deps.maxConcurrent ?? DEFAULT_MAX_CONCURRENT;
-  const timeoutMs = Math.min(deps.timeoutMs ?? DEFAULT_DISPATCH_TIMEOUT_MS, MAX_DISPATCH_TIMEOUT_MS);
-  const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const inFlight = new Set;
-  let seq = 0;
-  const api2 = async (path, init) => {
-    const res = await deps.fetcher(`${deps.serverUrl}${path}`, {
-      ...init,
-      headers: { "content-type": "application/json", ...init?.headers ?? {} }
-    });
-    const text = await res.text();
-    if (!res.ok)
-      throw new DispatchError(`${init?.method ?? "GET"} ${path} -> ${res.status}: ${text.slice(0, 300)}`, "host-error");
-    return text ? JSON.parse(text) : undefined;
-  };
-  const fetchMessages = async (sessionID) => {
-    const list = await api2(`/session/${sessionID}/message`);
-    return Array.isArray(list) ? list : [];
-  };
-  const killControls = new Map;
-  const resolveOrThrow = (profile, depth, exclude) => {
-    const r = resolveDispatch(deps.cfg, { profile, depth, exclude }, deps.available, deps.catalog);
-    if (!r.ok) {
-      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: profile, outcome: r.error.code, note: r.error.message });
-      throw new DispatchError(`${r.error.message}
-Menu:
-${r.error.menu.map((m) => `- ${m.identity} expose=[${m.expose.join(", ") || "none"}] ${m.reason}`).join(`
-`)}
-Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
-    }
-    return r;
-  };
-  const resolveForThrow = (req, exclude) => {
-    if (deps.legacy && req.agent in deps.cfg.tiers) {
-      const r = resolveOrThrow(req.agent, req.depth, exclude);
-      return {
-        model: r.identity,
-        depth: r.depth,
-        agentPath: false,
-        shape: deps.cfg.tiers[req.agent]?.shape ?? "readonly",
-        role: tierAgentPrompt(req.agent)
-      };
-    }
-    const a = resolveAgent(deps.agents(), { agent: req.agent, depth: req.depth }, deps.available);
-    if (!a.ok) {
-      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: req.agent, agent: req.agent, outcome: a.error.code, note: a.error.message });
-      throw new DispatchError(a.error.message, a.error.code);
-    }
-    return {
-      model: a.model,
-      depth: a.depth,
-      agentPath: true,
-      shape: a.def?.shape === "write" ? "write" : "readonly",
-      role: rolePromptFor(req.agent, a.def)
-    };
-  };
-  const translationFor = (identity, depth) => {
-    const providerID = identity.slice(0, identity.indexOf("/"));
-    const family = deps.providerFamily(providerID) ?? "unknown";
-    const ladder = nativeLadder(deps.catalog, identity);
-    return translateDepth(depth, family, ladder);
-  };
-  const translationOrThrow = (identity, depth) => {
-    const translation = translationFor(identity, depth);
-    if (translation.kind === "no-mapping") {
-      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", agent: undefined, identity, depth, outcome: "no-native-mapping", note: translation.message });
-      throw new DispatchError(translation.message, "no-native-mapping");
-    }
-    return translation;
-  };
-  async function runAttempt(r, req, parentSessionID, t0, ctl, onChild, dispatchId) {
-    const providerID = r.model.slice(0, r.model.indexOf("/"));
-    const translation = translationOrThrow(r.model, r.depth);
-    let childID = "";
-    const dir = encodeURIComponent(deps.workspace);
-    let created;
-    try {
-      created = await api2(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify(parentSessionID ? { parentID: parentSessionID } : {}) });
-    } catch {
-      created = await api2(`/session?directory=${dir}`, { method: "POST", body: JSON.stringify({}) });
-    }
-    childID = created?.id ?? "";
-    if (!childID)
-      throw new DispatchError("host returned no session id for the child session", "host-error");
-    onChild?.(childID);
-    deps.onDepth(childID, translation);
-    const depthInjected = translation.disclose;
-    let deadlineHit = false;
-    const deadlinePromise = deps.sleep(Math.max(timeoutMs - (deps.now() - t0), 0)).then(() => {
-      deadlineHit = true;
-    });
-    const turnPost = api2(`/session/${childID}/message`, {
-      method: "POST",
-      body: JSON.stringify({
-        model: { providerID, modelID: r.model.slice(r.model.indexOf("/") + 1) },
-        agent: `forge-${req.agent}`,
-        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, agent: req.agent, shape: r.shape, ...r.role ? { role: r.role } : {} }) }]
-      })
-    });
-    turnPost.catch(() => {});
-    try {
-      await Promise.race([turnPost, deadlinePromise]);
-      if (deadlineHit && deps.now() - t0 >= timeoutMs) {
-        const elapsed = deps.now() - t0;
-        deps.sink({
-          ts: new Date().toISOString(),
-          event: "timeout",
-          tier: req.agent,
-          agent: req.agent,
-          identity: r.model,
-          depth: r.depth,
-          sessionID: childID,
-          durationMs: elapsed,
-          ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
-        });
-        throw new DispatchError(`forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`, "timeout");
-      }
-      await turnPost;
-    } catch (e) {
-      if (e instanceof DispatchError)
-        throw e;
-      deps.sink({
-        ts: new Date().toISOString(),
-        event: "transport-interrupted",
-        tier: req.agent,
-        agent: req.agent,
-        identity: r.model,
-        depth: r.depth,
-        sessionID: childID,
-        durationMs: deps.now() - t0,
-        note: e instanceof Error ? e.message : String(e),
-        ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
-      });
-    }
-    let poll = null;
-    let messages = [];
-    for (;; ) {
-      if (ctl?.fired)
-        throw new KillRequested;
-      const elapsed = deps.now() - t0;
-      if (elapsed >= timeoutMs) {
-        deps.sink({
-          ts: new Date().toISOString(),
-          event: "timeout",
-          tier: req.agent,
-          agent: req.agent,
-          identity: r.model,
-          depth: r.depth,
-          sessionID: childID,
-          durationMs: elapsed,
-          ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
-        });
-        throw new DispatchError(`forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`, "timeout");
-      }
-      await deps.sleep(pollIntervalMs);
-      messages = await (ctl ? Promise.race([fetchMessages(childID), ctl.promise.then(() => [])]) : fetchMessages(childID));
-      if (ctl?.fired)
-        throw new KillRequested;
-      poll = completionVerdict(poll, { count: messages.length, text: textOf(messages) });
-      if (poll.verdict === "complete" || poll.verdict === "empty")
-        break;
-    }
-    const durationMs = deps.now() - t0;
-    if (poll.verdict === "empty") {
-      deps.sink({
-        ts: new Date().toISOString(),
-        event: "empty-response",
-        tier: req.agent,
-        agent: req.agent,
-        identity: r.model,
-        depth: r.depth,
-        sessionID: childID,
-        durationMs,
-        ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
-      });
-      throw new DispatchError(`child session ${childID} returned an empty response (0-token assistant message). This is a known quirk of keyless endpoints combined with restricted tiers — see the README dispatch notes. The dispatch is NOT counted as success.`, "empty-response");
-    }
-    const tokens = sumTokens(tokensOf(messages));
-    const price = priceFor(deps.catalog, r.model);
-    const cost = computeCost(tokens, price?.spec ?? null);
-    const result = {
-      agent: req.agent,
-      requested: { agent: req.agent, depth: req.depth },
-      actual: { model: r.model, depth: r.depth },
-      sessionID: childID,
-      durationMs,
-      tokens,
-      costUsd: cost.costUsd,
-      ...cost.note ? { costNote: cost.note } : {},
-      ...price?.label ? { priceSnapshot: price.label } : {},
-      text: textOf(messages),
-      depthTranslation: depthInjected
-    };
-    deps.sink({
-      ts: new Date().toISOString(),
-      event: "completed",
-      tier: req.agent,
-      agent: req.agent,
-      identity: r.model,
-      depth: r.depth,
-      sessionID: childID,
-      outcome: "completed",
-      tokens,
-      costUsd: cost.costUsd,
-      durationMs,
-      ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
-    });
-    return result;
-  }
-  function bgTerminal(reg, dispatchId, identity, req, t0, e) {
-    let entrySessionID = "";
-    let parentSessionID = "";
-    try {
-      const entry = reg.get(dispatchId);
-      entrySessionID = entry.sessionID;
-      parentSessionID = entry.parentSessionID;
-    } catch {}
-    const durationMs = deps.now() - t0;
-    const report = {
-      agent: req.agent,
-      requested: { agent: req.agent, depth: req.depth },
-      actual: { model: identity, depth: null },
-      sessionID: entrySessionID,
-      outcome: "error",
-      durationMs,
-      error: e instanceof Error ? e.message : String(e)
-    };
-    if (e instanceof DispatchError && e.code === "timeout") {
-      report.outcome = "timeout";
-      reg.markTimeout(dispatchId, report);
-      deps.onTerminal?.(parentSessionID);
-      return;
-    }
-    deps.sink({
-      ts: new Date().toISOString(),
-      event: "error",
-      tier: req.agent,
-      agent: req.agent,
-      identity,
-      outcome: "error",
-      sessionID: entrySessionID,
-      durationMs,
-      note: report.error,
-      dispatchId,
-      parentSessionID
-    });
-    reg.markError(dispatchId, report);
-    deps.onTerminal?.(parentSessionID);
-  }
-  async function dispatch(req, parentSessionID, opts) {
-    const t0 = deps.now();
-    if (inFlight.size >= maxConcurrent) {
-      deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.agent, agent: req.agent, note: `${inFlight.size} in flight` });
-      throw new DispatchError(`forge_dispatch refused: ${inFlight.size} dispatches already in flight (cap ${maxConcurrent}). Wait for a completion and retry.`, "cap-refused");
-    }
-    const bg = opts?.background === true;
-    if (bg && !deps.registry)
-      throw new DispatchError("background dispatch requires the dispatch registry (internal error)", "host-error");
-    const first = resolveForThrow(req, undefined);
-    translationOrThrow(first.model, first.depth);
-    if (bg) {
-      const reg = deps.registry;
-      const { dispatchId } = reg.submit({ sessionID: "", identity: first.model, depth: first.depth, tier: req.agent, parentSessionID: parentSessionID ?? "" });
-      let fire = () => {};
-      const promise2 = new Promise((res) => {
-        fire = res;
-      });
-      const ctl = { fired: false, promise: promise2, fire: () => {
-        ctl.fired = true;
-        fire();
-      } };
-      killControls.set(dispatchId, ctl);
-      const slot = `d${++seq}`;
-      inFlight.add(slot);
-      (async () => {
-        try {
-          if (reg.get(dispatchId).state === "killed")
-            return;
-          reg.markRunning(dispatchId);
-          let current = first;
-          let exclude2 = undefined;
-          for (let attemptNo = 0;; attemptNo++) {
-            try {
-              const result = await runAttempt(current, req, parentSessionID, t0, ctl, (sid) => {
-                try {
-                  reg.get(dispatchId).sessionID = sid;
-                } catch {}
-              }, dispatchId);
-              if (reg.get(dispatchId).state === "killed") {
-                reg.noteLateCompletion(dispatchId, result);
-                deps.sink({ ts: new Date().toISOString(), event: "kill-late-completion", tier: req.agent, agent: req.agent, identity: current.model, sessionID: result.sessionID, outcome: "kill-late-completion" });
-              } else {
-                reg.markCompleted(dispatchId, result);
-                deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
-              }
-              return;
-            } catch (e) {
-              if (e instanceof KillRequested)
-                return;
-              if (reg.get(dispatchId).state === "killed")
-                return;
-              const retryable = !current.agentPath && e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response");
-              const alternative = retryable ? resolveDispatch(deps.cfg, { profile: req.agent, depth: req.depth, exclude: [current.model] }, deps.available, deps.catalog) : { ok: false };
-              if (!retryable || attemptNo > 0 || !alternative.ok) {
-                bgTerminal(reg, dispatchId, current.model, req, t0, e);
-                return;
-              }
-              deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.agent, agent: req.agent, identity: current.model, note: `${current.model}: ${e.code}` });
-              exclude2 = [current.model];
-              current = resolveForThrow(req, exclude2);
-              reg.get(dispatchId).identity = current.model;
-            }
-          }
-        } finally {
-          inFlight.delete(slot);
-          killControls.delete(dispatchId);
-        }
-      })();
-      return {
-        dispatchId,
-        agent: req.agent,
-        requested: { agent: req.agent, depth: req.depth },
-        resolved: first.model,
-        depth: first.depth,
-        queuedAt: reg.get(dispatchId).queuedAt
-      };
-    }
-    let exclude = undefined;
-    for (let attemptNo = 0;; attemptNo++) {
-      const r = attemptNo === 0 ? first : resolveForThrow(req, exclude);
-      const slot = `d${++seq}`;
-      inFlight.add(slot);
-      try {
-        return await runAttempt(r, req, parentSessionID, t0, undefined, undefined);
-      } catch (e) {
-        const identity = r.model;
-        const retryable = !r.agentPath && e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response");
-        if (!retryable || attemptNo > 0)
-          throw e;
-        const alternative = resolveDispatch(deps.cfg, { profile: req.agent, depth: req.depth, exclude: [identity] }, deps.available, deps.catalog);
-        if (!alternative.ok)
-          throw e;
-        deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.agent, agent: req.agent, identity, note: `${identity}: ${e.code}` });
-        exclude = [identity];
-      } finally {
-        inFlight.delete(slot);
-      }
-    }
-  }
-  return {
-    dispatch,
-    kill: (dispatchId) => {
-      const reg = deps.registry;
-      if (!reg)
-        throw new DispatchError("forge_dispatch_kill unavailable: no dispatch registry (internal error)", "kill-failed");
-      const e = reg.get(dispatchId);
-      if (e.state === "completed" || e.state === "timeout" || e.state === "error") {
-        throw new DispatchError(`forge_dispatch_kill refused: dispatch ${dispatchId} already ${e.state}; use forge_dispatch_list for its result.`, "kill-failed");
-      }
-      if (e.state === "killed")
-        throw new DispatchError(`dispatch ${dispatchId} is already killed.`, "kill-failed");
-      reg.markKilled(dispatchId);
-      deps.sink({ ts: new Date().toISOString(), event: "killed", tier: e.tier, identity: e.identity, depth: e.depth ?? undefined, sessionID: e.sessionID, outcome: "killed" });
-      killControls.get(dispatchId)?.fire();
-    },
-    inFlightCount: () => inFlight.size,
-    inFlightIDs: () => [...inFlight],
-    dispose: () => {
-      for (const slot of inFlight) {
-        deps.sink({ ts: new Date().toISOString(), event: "lost-on-exit", note: `dispatch ${slot} in flight at host exit` });
-      }
-      inFlight.clear();
-    }
-  };
-}
-
-class KillRequested extends Error {
-  constructor() {
-    super("kill requested");
-  }
-}
-function priceFor(catalog, identity) {
-  const slash = identity.indexOf("/");
-  if (slash <= 0)
-    return null;
-  const model = catalog.providers?.[identity.slice(0, slash)]?.models?.[identity.slice(slash + 1)];
-  const cost = model?.cost;
-  if (!cost)
-    return null;
-  return {
-    spec: {
-      input: cost.input,
-      output: cost.output,
-      cacheRead: cost.cache_read,
-      cacheWrite: cost.cache_write
-    },
-    label: "models.dev snapshot"
-  };
-}
-
-// src/dispatch-ledger.ts
-import { mkdirSync as mkdirSync4, readFileSync as readFileSync6, writeFileSync as writeFileSync4 } from "node:fs";
-import { dirname as dirname3 } from "node:path";
-var DISPATCH_LEDGER_MAX_ENTRIES = 200;
-var DISPATCH_LEDGER_MAX_BYTES = 1e6;
-function createDispatchLedger(logPath, maxEntries = DISPATCH_LEDGER_MAX_ENTRIES, maxBytes = DISPATCH_LEDGER_MAX_BYTES) {
-  const append = (entry) => {
-    try {
-      mkdirSync4(dirname3(logPath), { recursive: true });
-      let lines = [];
-      try {
-        lines = readFileSync6(logPath, "utf8").split(`
-`).filter((l) => l.trim().length > 0);
-      } catch {}
-      if (lines.length >= maxEntries)
-        lines = lines.slice(lines.length - maxEntries + 1);
-      lines.push(JSON.stringify(entry));
-      let text = lines.join(`
-`) + `
-`;
-      if (text.length > maxBytes) {
-        const keep = Math.max(1, Math.floor(maxEntries / 2));
-        text = lines.slice(-keep).join(`
-`) + `
-`;
-      }
-      writeFileSync4(logPath, text, "utf8");
-    } catch {}
-  };
-  const entries = () => {
-    try {
-      return readFileSync6(logPath, "utf8").split(`
-`).filter((l) => l.trim().length > 0).map((l) => JSON.parse(l));
-    } catch {
-      return [];
-    }
-  };
-  return { append, entries, path: logPath };
-}
-
-// src/dispatch-registry.ts
-var TERMINAL_CAP = 50;
-function createDispatchRegistry() {
-  const entries = new Map;
-  let seq = 0;
-  const fail = (msg) => {
-    throw new Error(`[forge:dispatch-registry] ${msg}`);
-  };
-  const isTerminal2 = (st) => st === "completed" || st === "timeout" || st === "killed" || st === "error";
-  return {
-    submit(entry) {
-      const dispatchId = `bg-${++seq}`;
-      entries.set(dispatchId, {
-        ...entry,
-        dispatchId,
-        background: true,
-        queuedAt: entry.queuedAt ?? new Date().toISOString(),
-        state: "queued",
-        delivered: false
-      });
-      return { dispatchId };
-    },
-    get(dispatchId) {
-      const e = entries.get(dispatchId);
-      if (!e)
-        throw new Error(`[forge:dispatch-registry] unknown dispatch id "${dispatchId}"`);
-      return e;
-    },
-    markRunning(dispatchId) {
-      const e = this.get(dispatchId);
-      if (e.state !== "queued")
-        fail(`illegal transition ${e.state} → running for ${dispatchId}`);
-      e.state = "running";
-      return e;
-    },
-    markCompleted(dispatchId, result) {
-      return this.terminate(dispatchId, "completed", result);
-    },
-    markTimeout(dispatchId, report) {
-      return this.terminate(dispatchId, "timeout", report);
-    },
-    markError(dispatchId, report) {
-      return this.terminate(dispatchId, "error", report);
-    },
-    markKilled(dispatchId) {
-      return this.terminate(dispatchId, "killed");
-    },
-    noteLateCompletion(dispatchId, result) {
-      const e = this.get(dispatchId);
-      if (e.state !== "killed")
-        fail(`late completion only makes sense on a killed dispatch (${dispatchId} is ${e.state})`);
-      e.lateCompletion = result;
-    },
-    terminate(dispatchId, state, result) {
-      const e = this.get(dispatchId);
-      if (isTerminal2(e.state))
-        fail(`illegal transition ${e.state} → ${state} for ${dispatchId}`);
-      e.state = state;
-      if (result !== undefined)
-        e.result = result;
-      return e;
-    },
-    takeUndelivered(parentSessionID) {
-      const out = [];
-      for (const e of entries.values()) {
-        if (parentSessionID !== undefined && e.parentSessionID !== parentSessionID)
-          continue;
-        if (isTerminal2(e.state) && !e.delivered && e.state !== "killed") {
-          e.delivered = true;
-          out.push(e);
-        }
-      }
-      return out;
-    },
-    list() {
-      const inFlight = [];
-      const terminal = [];
-      for (const e of entries.values()) {
-        if (isTerminal2(e.state))
-          terminal.push(e);
-        else
-          inFlight.push(e);
-      }
-      return { inFlight, terminal: terminal.slice(-TERMINAL_CAP) };
-    }
-  };
-}
-
-// src/crew-gate.ts
-var CREW_DISPATCH_EVENTS = new Set(["completed", "timeout", "error", "killed", "empty-response"]);
-var DISPATCH_ID = /bg-\d+/g;
-function validateCrewReport(report, ledgerRows, crew) {
-  const gaps = [];
-  if (!Array.isArray(report) || report.length === 0) {
-    return { ok: false, gaps: ["the report lists no subtasks — a crew completion report must cover every subtask"], dispatchIds: [] };
-  }
-  const rowById = new Map;
-  for (const row of ledgerRows) {
-    if (row.parentSessionID !== crew.sessionID)
-      continue;
-    if (row.ts < crew.startedAt)
-      continue;
-    if (row.event === "validation" || row.event === "resolve-error" || row.event === "refused-cap" || row.event === "models-dev-degraded" || row.event === "retry-excluded" || row.event === "lost-on-exit" || row.event === "kill-late-completion" || row.event === "transport-interrupted")
-      continue;
-    if (CREW_DISPATCH_EVENTS.has(row.event) && row.dispatchId)
-      rowById.set(row.dispatchId, row);
-  }
-  const referenced = new Set;
-  report.forEach((sub, i) => {
-    const label = sub?.title?.trim() || `subtask #${i + 1}`;
-    const verdict = String(sub?.verdict ?? "").toUpperCase();
-    if (!sub?.title?.trim())
-      gaps.push(`${label}: missing title`);
-    if (verdict !== "PASS" && verdict !== "FAIL")
-      gaps.push(`${label}: verdict must be PASS or FAIL (got "${sub?.verdict ?? ""}")`);
-    const ids = [...String(sub?.evidence ?? "").matchAll(DISPATCH_ID)].map((m) => m[0]);
-    if (!String(sub?.evidence ?? "").trim())
-      gaps.push(`${label}: missing evidence reference`);
-    else if (ids.length === 0)
-      gaps.push(`${label}: evidence must reference a dispatch id (bg-N) that exists in the dispatch ledger`);
-    for (const id of ids) {
-      if (referenced.has(id))
-        gaps.push(`${label}: dispatch ${id} is already cited by another subtask — each dispatch belongs to exactly one verdict`);
-      referenced.add(id);
-      const row = rowById.get(id);
-      if (!row)
-        gaps.push(`${label}: dispatch ${id} has no ledger row for this crew (fabricated, stale, or pre-crew)`);
-      else if (verdict === "PASS" && row.event !== "completed") {
-        gaps.push(`${label}: marked PASS but dispatch ${id} ended ${row.event} — a subtask whose attempt and retry both failed must be marked FAIL with both reports visible`);
-      }
-    }
-    if (verdict === "FAIL" && (!Array.isArray(sub?.attempts) || sub.attempts.length < 2)) {
-      gaps.push(`${label}: FAIL requires both failure reports (the attempt and the one retry) in attempts[]`);
-    }
-  });
-  for (const [id, row] of rowById) {
-    if (!referenced.has(id))
-      gaps.push(`dispatch ${id} (${row.event}, ${row.ts}) has no verdict in the report — a dispatched subtask was silently dropped`);
-  }
-  return { ok: gaps.length === 0, gaps, dispatchIds: [...rowById.keys()] };
+function resolvePinnedDepth(thoughtLevel, family, ladder) {
+  const t = translateDepth(thoughtLevel, family, ladder);
+  if (t.kind === "no-mapping")
+    return { translation: null, findingMessage: t.message };
+  if (t.kind === "not-injected")
+    return { translation: null };
+  return { translation: t };
 }
 
 // src/forge-config.ts
@@ -15842,7 +15011,7 @@ function sanitizeJsonc(text) {
     if (c === "/" && d === "*") {
       out.push(" ", " ");
       i += 2;
-      while (i < n && !(text[i] === "*" && i + 1 < n && text[i + 1] === "/")) {
+      while (i < n && !(text[i] === "*" && i + 1 < n)) {
         out.push(text[i] === `
 ` ? `
 ` : " ");
@@ -16051,59 +15220,74 @@ function parseForgeJsonc(text) {
       error: located ?? { message: "invalid JSON", line: 1, column: 1 }
     };
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return { ok: false, error: { message: "forge.json top level must be an object", line: 1, column: 1 } };
-  }
-  const agents = parsed.agents;
-  if (agents === undefined)
-    return { ok: true, config: { agents: {} } };
-  if (typeof agents !== "object" || agents === null || Array.isArray(agents)) {
-    return { ok: false, error: { message: 'forge.json "agents" must be an object mapping agent ids to definitions', line: 1, column: 1 } };
-  }
-  return { ok: true, config: { agents } };
+  return { ok: true, config: parsed };
 }
-function forgeRecipe(input) {
-  const suggested = input.detectedIdentities[0] ?? "provider/model";
-  const identityLines = input.detectedIdentities.length > 0 ? input.detectedIdentities.map((id) => `   - ${id}`).join(`
-`) : "   (none detected — check the provider section of the host's opencode config)";
-  const template = `{
-  // forge dispatch agents — save the file; changes apply on the next dispatch, no restart
-  "agents": {
-    "research": {
-      "model": "${suggested}", // exact "provider/model" string, pick from the detected list above
-      "depths": ["low", "medium"], // first entry is the default; canonical words: none, low, medium, high, max — or the model's native level names, passed through verbatim
-      // "prompt": "optional role prompt riding inside the discipline wrapper",
-      // "shape": "write", // default readonly denies mutating tools; write agents need this
-      // "permission": { "bash": "deny" } // optional override of the shape-derived permission
+var AGENT_ID_RE = /^[a-z0-9-]+$/;
+function isRecord(v) {
+  return typeof v === "object" && v !== null && !Array.isArray(v);
+}
+function nonEmptyString(v) {
+  return typeof v === "string" && v.trim().length > 0;
+}
+function validateAgentSet(raw) {
+  const findings = [];
+  const agents = {};
+  if (raw === undefined)
+    return { agents, findings };
+  if (!isRecord(raw)) {
+    findings.push({ level: "error", code: "agents-not-object", message: 'forge.json "agents" must be an object mapping agent ids to definitions — the agent set is empty' });
+    return { agents, findings };
+  }
+  for (const [id, entry] of Object.entries(raw)) {
+    const label = `agents.${id}`;
+    if (!AGENT_ID_RE.test(id)) {
+      findings.push({ level: "error", code: "agent-id-invalid", message: `${label}: agent id must match [a-z0-9-] — entry skipped` });
+      continue;
     }
+    if (!isRecord(entry)) {
+      findings.push({ level: "error", code: "agent-not-object", message: `${label}: definition must be an object — entry skipped` });
+      continue;
+    }
+    if (!nonEmptyString(entry.model)) {
+      findings.push({ level: "error", code: "agent-model-missing", message: `${label}.model: a non-empty "provider/model" string is required — entry skipped, siblings still apply` });
+      continue;
+    }
+    const def = { model: entry.model.trim() };
+    if (entry.depths !== undefined) {
+      findings.push({ level: "warn", code: "depths-deprecated", message: `${label}.depths is no longer used (static agents pin one thoughtLevel) — ignored; set "thoughtLevel" instead` });
+    }
+    if (entry.thoughtLevel !== undefined) {
+      if (nonEmptyString(entry.thoughtLevel)) {
+        def.thoughtLevel = entry.thoughtLevel.trim();
+      } else {
+        findings.push({ level: "warn", code: "thoughtlevel-invalid", message: `${label}.thoughtLevel must be a non-empty string — field ignored, the agent still materializes` });
+      }
+    }
+    if (entry.prompt !== undefined) {
+      if (nonEmptyString(entry.prompt)) {
+        def.prompt = entry.prompt;
+      } else {
+        findings.push({ level: "warn", code: "prompt-invalid", message: `${label}.prompt must be a non-empty string — field ignored` });
+      }
+    }
+    if (entry.shape !== undefined) {
+      if (entry.shape === "readonly" || entry.shape === "write") {
+        def.shape = entry.shape;
+      } else {
+        findings.push({ level: "warn", code: "shape-invalid", message: `${label}.shape must be "readonly" or "write" — defaulting to readonly` });
+      }
+    }
+    if (entry.permission !== undefined) {
+      if (isRecord(entry.permission) && Object.values(entry.permission).every((v) => typeof v === "string")) {
+        def.permission = entry.permission;
+      } else {
+        findings.push({ level: "warn", code: "permission-invalid", message: `${label}.permission must map tool names to string values — field ignored` });
+      }
+    }
+    agents[id] = def;
   }
-}`;
-  return [
-    "[forge dispatch onboarding recipe]",
-    'The dispatch agent you called is pinned to the placeholder model "Local/GPT Luna" — forge.json is not configured. Steps:',
-    "",
-    "1. Detected configured identities (use one as the exact model string):",
-    identityLines,
-    "",
-    "2. Create ONE of these files (project-level wins; a single file fully applies — never merged):",
-    `   - ${input.projectPath}  (project-level, versionable, team-shared)`,
-    `   - ${input.globalPath}  (global)`,
-    "",
-    "3. Copy-paste template (JSONC — comments allowed) and edit model/depths:",
-    "",
-    template,
-    "",
-    '4. Verify: call the forge_dispatch tool again with agent "research" and a depth from its depths — the report shows the actual model and the depth translation.',
-    "",
-    '5. Extending: more agents are more entries under "agents"; agents that edit files need "shape": "write"; an explicit "permission" map overrides the shape-derived defaults — "task" is always denied, recursive dispatch stays impossible.'
-  ].join(`
-`);
+  return { agents, findings };
 }
-var PLACEHOLDER_IDENTITY = "Local/GPT Luna";
-var SEED_AGENTS = {
-  research: { model: PLACEHOLDER_IDENTITY, depths: ["low", "medium"], shape: "readonly" },
-  review: { model: PLACEHOLDER_IDENTITY, depths: ["medium", "high", "max"], shape: "readonly" }
-};
 function forgeConfigPaths(opts) {
   const sep2 = opts.projectDir?.includes("\\") && !opts.projectDir?.includes("/") ? "\\" : "/";
   const project = opts.projectDir ? `${opts.projectDir}${sep2}.opencode${sep2}forge.json` : "";
@@ -16136,19 +15320,30 @@ function createForgeConfigLoader(deps) {
     let result;
     if (!parsed.ok) {
       result = {
-        agents: { ...SEED_AGENTS },
-        source: "seed",
-        path: null,
+        agents: {},
+        source,
+        path,
         findings: [
           {
             level: "error",
             code: "config-parse-error",
-            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — fell back to the built-in seed`
+            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — the agent set is empty until the file parses`
           }
         ]
       };
     } else {
-      result = { agents: parsed.config.agents, source, path, findings: [] };
+      const top = parsed.config;
+      if (top !== undefined && !isRecord(top)) {
+        result = {
+          agents: {},
+          source,
+          path,
+          findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — the agent set is empty` }]
+        };
+      } else {
+        const validated = validateAgentSet(top === undefined ? undefined : top.agents);
+        result = { agents: validated.agents, source, path, findings: validated.findings };
+      }
     }
     cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result });
     return result;
@@ -16161,104 +15356,18 @@ function createForgeConfigLoader(deps) {
       const global = paths.global ? readCandidate(paths.global, "global") : null;
       if (global)
         return global;
-      return {
-        agents: { ...SEED_AGENTS },
-        source: "seed",
-        path: null,
-        findings: [
-          {
-            level: "notice",
-            code: "dispatch-unconfigured",
-            message: "forge dispatch is unconfigured (no forge.json found): every forge_dispatch call will fail with the configuration recipe. Create .opencode/forge.json (project) or ~/.config/opencode/forge.json (global), or ask your session AI to configure dispatch — the recipe in the dispatch error tells it exactly what to write."
-          }
-        ]
-      };
+      return { agents: {}, source: "none", path: null, findings: [] };
     }
   };
-}
-
-// src/models-dev.ts
-import { mkdirSync as mkdirSync5, readFileSync as readFileSync8, writeFileSync as writeFileSync5 } from "node:fs";
-import { join as join4 } from "node:path";
-import { tmpdir as tmpdir2 } from "node:os";
-var DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json";
-function modelsDevCacheDir(base) {
-  return join4(base ?? join4(tmpdir2(), "opencode-forge"), "models-dev");
-}
-function namedLevels(rows) {
-  const out = [];
-  for (const r of rows) {
-    if (r && typeof r === "object" && r.type === "effort") {
-      const values = r.values;
-      if (Array.isArray(values)) {
-        for (const v of values)
-          if (typeof v === "string")
-            out.push(v);
-      }
-    }
-  }
-  return out;
-}
-function reduceModelsDev(raw) {
-  const catalog = { providers: {} };
-  const providers = raw?.constructor === Object ? raw : null;
-  if (!providers)
-    return catalog;
-  for (const [providerID, provider] of Object.entries(providers)) {
-    const models = provider.models;
-    if (!models || typeof models !== "object")
-      continue;
-    const out = { models: {} };
-    for (const [modelID, model] of Object.entries(models)) {
-      const m = model;
-      const options = Array.isArray(m.reasoning_options) ? namedLevels(m.reasoning_options) : undefined;
-      const cost = m.cost && typeof m.cost === "object" ? m.cost : undefined;
-      out.models[modelID] = {
-        ...options ? { reasoningOptions: options } : {},
-        ...cost ? { cost } : {}
-      };
-    }
-    catalog.providers[providerID] = out;
-  }
-  return catalog;
-}
-async function loadModelsDevSnapshot(opts = {}) {
-  const url2 = opts.url ?? process.env.OPENCODE_MODELS_URL ?? DEFAULT_MODELS_DEV_URL;
-  const cacheDir = modelsDevCacheDir(opts.cacheDir);
-  const cacheFile = join4(cacheDir, "snapshot.json");
-  const fetcher = opts.fetcher;
-  if (fetcher) {
-    try {
-      const res = await fetcher(url2, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8000) });
-      if (res.ok)
-        return { catalog: reduceModelsDev(JSON.parse(await res.text())), degraded: false, source: url2 };
-    } catch {}
-    return { catalog: { providers: {} }, degraded: true, source: "fetch-failed" };
-  }
-  try {
-    const res = await fetch(url2, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8000) });
-    if (res.ok) {
-      const catalog = reduceModelsDev(JSON.parse(await res.text()));
-      try {
-        mkdirSync5(cacheDir, { recursive: true });
-        writeFileSync5(cacheFile, JSON.stringify(catalog));
-      } catch {}
-      return { catalog, degraded: false, source: url2 };
-    }
-  } catch {}
-  try {
-    const cached2 = JSON.parse(readFileSync8(cacheFile, "utf8"));
-    if (cached2 && typeof cached2 === "object" && cached2.providers)
-      return { catalog: cached2, degraded: true, source: "cache" };
-  } catch {}
-  return { catalog: { providers: {} }, degraded: true, source: "unavailable" };
 }
 
 // plugin.ts
 var FORGE_AGENT = "forge";
 var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
-Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.`;
+Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.
+
+Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch through the native task channel instead.`;
 var PLAN_COMMAND_TEMPLATE = [
   '(forge plan harness routing. Argument: "$ARGUMENTS")',
   "",
@@ -16317,22 +15426,14 @@ function effectiveWorktree(worktree, fallback) {
 }
 var sessions = new Map;
 var forgeDisabled = false;
-var dispatchDisabled = false;
-var dispatchMaxConcurrent = 4;
-var dispatchTimeoutMs = 600000;
-var dispatchBase = null;
 var forgeLoader = null;
 var forgeLoaderDir = null;
-var forgeConfigState = null;
-var lastDetectedIdentities = [];
-var activeDispatchEngine = null;
-var dispatchLogDir = join5(tmpdir3(), "opencode-forge", "dispatch");
-var dispatchLedger = createDispatchLedger(join5(dispatchLogDir, "ledger.jsonl"));
-var activeDispatchRegistry = null;
-var dispatchClient = null;
-var dispatchWakeTimers = new Map;
 var crews = new Map;
-var dispatchDepths = new Map;
+var modelsDevCatalog = null;
+var depthFindingNotes = new Map;
+var crewCommandSnapshot = null;
+var materializedSnapshot = {};
+var sessionDepths = new Map;
 var OPENAI_FAMILY = new Set(["openai", "opencode", "openrouter", "groq", "xai", "azure", "github-copilot", "deepseek", "together", "vercel", "opus"]);
 var ANTHROPIC_FAMILY = new Set(["anthropic"]);
 var ZAI_FAMILY = new Set(["zai", "zai-coding-plan"]);
@@ -16344,32 +15445,6 @@ function dispatchProviderFamily(providerID) {
   if (ZAI_FAMILY.has(providerID))
     return "zai";
   return null;
-}
-function queueDispatchDepth(sessionID, translation) {
-  const key = (t) => t.kind === "verbatim" ? `verbatim:${t.word}` : t.kind === "tiered" ? `tiered:${t.budgetTokens}` : t.kind;
-  const existing = dispatchDepths.get(sessionID);
-  if (existing)
-    return key(existing) === key(translation);
-  dispatchDepths.set(sessionID, translation);
-  return true;
-}
-function configuredIdentitiesOf(cfg, catalog) {
-  const providers = cfg.provider ?? {};
-  const identities = [];
-  for (const [providerID, provider] of Object.entries(providers)) {
-    const modelKeys = provider?.models ? Object.keys(provider.models) : null;
-    if (modelKeys && modelKeys.length > 0) {
-      for (const m of modelKeys)
-        identities.push(`${providerID}/${m}`);
-    } else {
-      const catModels = catalog.providers?.[providerID]?.models ?? {};
-      const ids = Object.keys(catModels);
-      if (ids.length > 0)
-        for (const m of ids)
-          identities.push(`${providerID}/${m}`);
-    }
-  }
-  return identities;
 }
 var jobsMode = "auto";
 var jobsKeepBuiltinShell = false;
@@ -16426,9 +15501,9 @@ var jobLogDir = jobsLogDir();
 var jobLedgerPath = join5(jobLogDir, "ledger.jsonl");
 function jobLedgerSink(entry) {
   try {
-    mkdirSync6(jobLogDir, { recursive: true });
+    mkdirSync5(jobLogDir, { recursive: true });
     if (existsSync3(jobLedgerPath) && statSync4(jobLedgerPath).size > 1e6)
-      writeFileSync6(jobLedgerPath, "");
+      writeFileSync5(jobLedgerPath, "");
     appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}
 `);
   } catch {}
@@ -16489,7 +15564,7 @@ function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync9(join5(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join5(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -16506,7 +15581,7 @@ function worktreeFor(context) {
 }
 function resolveActivePlan(state) {
   if (state.planPath && existsSync3(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync9(state.planPath, "utf8"));
+    const doc2 = parsePlanLoose(readFileSync8(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -16548,12 +15623,12 @@ var planWriteTool = tool({
       throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
       const dir = planDirOf(state.worktree);
-      mkdirSync6(dir, { recursive: true });
+      mkdirSync5(dir, { recursive: true });
       path = join5(dir, planFileName(localDate(), slugify(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
     const text = renderPlan(args, now, created);
-    writeFileSync6(path, text);
+    writeFileSync5(path, text);
     state.planPath = path;
     const doc2 = parsePlan(text);
     context.metadata({ title: `${mode === "created" ? "Create" : "Revise"} plan: ${doc2.goal}` });
@@ -16581,8 +15656,8 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync9(active.path, "utf8"), args.n, nowIso());
-    writeFileSync6(active.path, next);
+    const next = tickTask(readFileSync8(active.path, "utf8"), args.n, nowIso());
+    writeFileSync5(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` });
@@ -16609,7 +15684,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    writeFileSync6(active.path, transitionStatus(readFileSync9(active.path, "utf8"), "approved", nowIso()));
+    writeFileSync5(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -16642,7 +15717,7 @@ var planCloseTool = tool({
 Fix the implementation and retry, or revise the plan first.`);
     }
     await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`);
-    writeFileSync6(active.path, transitionStatus(readFileSync9(active.path, "utf8"), "done", nowIso()));
+    writeFileSync5(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "done", nowIso()));
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
       title: "plan done",
@@ -16660,7 +15735,7 @@ var planDiscardTool = tool({
     const active = resolveActivePlan(state);
     if (!active)
       throw new PlanError("No plan to abandon in this workspace.");
-    writeFileSync6(active.path, transitionStatus(readFileSync9(active.path, "utf8"), "abandoned", nowIso()));
+    writeFileSync5(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "abandoned", nowIso()));
     state.planPath = undefined;
     context.metadata({ title: `Plan abandoned: ${active.doc.goal}` });
     return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` };
@@ -16673,11 +15748,11 @@ function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync9(join5(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join5(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
   if (state.goalPath && existsSync3(state.goalPath)) {
-    const doc2 = parseGoalLoose(readFileSync9(state.goalPath, "utf8"));
+    const doc2 = parseGoalLoose(readFileSync8(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
@@ -16781,7 +15856,7 @@ var goalWriteTool = tool({
       await gate(context.ask, "goal_write", `Arm goal: ${args.goal}`);
     }
     const dir = goalDirOf(state.worktree);
-    mkdirSync6(dir, { recursive: true });
+    mkdirSync5(dir, { recursive: true });
     const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md")));
     const path = join5(dir, name);
     const text = renderGoal(input, {
@@ -16823,7 +15898,7 @@ var goalCheckTool = tool({
       o.index = selected[i].n;
     });
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = appendCheckLog(readFileSync9(goal.path, "utf8"), runId, outcomes, nowIso());
+    const next = appendCheckLog(readFileSync8(goal.path, "utf8"), runId, outcomes, nowIso());
     atomicWrite(goal.path, next);
     const ok = outcomesAllOk(outcomes);
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
@@ -16857,7 +15932,7 @@ var goalCompleteTool = tool({
     const failures = outcomes.filter((o) => !o.ok);
     if (failures.length > 0) {
       const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-      atomicWrite(goal.path, appendCheckLog(readFileSync9(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      atomicWrite(goal.path, appendCheckLog(readFileSync8(goal.path, "utf8"), runId2, outcomes, nowIso()));
       throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
 ${formatOutcomes(failures)}
 Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
@@ -16870,7 +15945,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
     }
     await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    let text = appendCheckLog(readFileSync9(goal.path, "utf8"), runId, outcomes, nowIso());
+    let text = appendCheckLog(readFileSync8(goal.path, "utf8"), runId, outcomes, nowIso());
     text = transitionGoal(text, "completed", nowIso());
     atomicWrite(goal.path, text);
     context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
@@ -16892,7 +15967,7 @@ var goalPauseTool = tool({
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
     }
     const stopReason = args.blocker ? "blocker" : "user";
-    atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
+    atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` });
     return {
@@ -16922,7 +15997,7 @@ var goalResumeTool = tool({
     }
     const promoting = goal.doc.status === "queued";
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
-    let text = readFileSync9(goal.path, "utf8");
+    let text = readFileSync8(goal.path, "utf8");
     if (args.addTurns)
       text = bumpBudget(text, args.addTurns, nowIso());
     text = transitionGoal(text, "active", nowIso(), { session: context.sessionID });
@@ -16948,7 +16023,7 @@ var goalDiscardTool = tool({
     if (!goal)
       throw new GoalError("No goal to discard in this workspace.");
     await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
-    atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "abandoned", nowIso()));
+    atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "abandoned", nowIso()));
     state.goalPath = undefined;
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
@@ -17145,226 +16220,47 @@ ${p.newOutput || "(none in this window)"}`,
     };
   }
 });
-function dispatchWakeDelay(idleDriven) {
-  const env = Number(process.env.FORGE_DISPATCH_WAKE_DEBOUNCE_MS);
-  if (Number.isFinite(env) && env >= 0)
-    return env;
-  return idleDriven ? IDLE_DEBOUNCE_MS + 50 : 1500;
-}
-function scheduleDispatchWake(sessionID, idleDriven) {
-  if (dispatchDisabled || forgeDisabled)
-    return;
-  if (dispatchWakeTimers.has(sessionID))
-    return;
-  const t = setTimeout(() => {
-    dispatchWakeTimers.delete(sessionID);
-    injectDispatchBrief(sessionID);
-  }, dispatchWakeDelay(idleDriven));
-  dispatchWakeTimers.set(sessionID, t);
-}
-function dispatchBriefText(entries) {
-  const lines = [`[forge:dispatch-complete] ${entries.length} background dispatch(es) reached terminal state:`];
-  for (const e of entries) {
-    lines.push("", `- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not yet started)"}`);
-    const r = e.result;
-    if (r !== undefined) {
-      lines.push(`  result: ${JSON.stringify(r, null, 1).replace(/\n/g, `
-`).slice(0, 2000)}`);
-    }
-  }
-  return lines.join(`
-`);
-}
-async function injectDispatchBrief(sessionID) {
-  const reg = activeDispatchRegistry;
-  if (!reg)
-    return;
-  const c0 = dispatchClient;
-  if (typeof c0?.session.status === "function") {
-    try {
-      const st = await c0.session.status({ path: { id: sessionID } });
-      const t = st?.[sessionID]?.type;
-      if (t && t !== "idle")
-        return;
-    } catch {
-      return;
-    }
-  }
-  const entries = reg.takeUndelivered(sessionID);
-  if (entries.length === 0)
-    return;
-  const c = dispatchClient;
-  const send = c?.session.promptAsync ?? c?.session.prompt;
-  if (typeof send !== "function")
-    return;
-  try {
-    await send.call(c.session, { path: { id: sessionID }, body: { parts: [{ type: "text", text: dispatchBriefText(entries) }] } });
-  } catch {
-    for (const e of entries)
-      e.delivered = false;
-  }
-}
-var forgeDispatchTool = tool({
-  description: "Dispatch a scoped task to a worker subagent defined in forge.json. Takes {prompt, agent, depth}: agent names a dispatch agent (see forge_dispatch_config for the effective set); the agent's model is pinned by its definition — no fallback ever. depth comes from the canonical metalanguage (none, low, medium, high, max; default = the agent's first entry) or the model's native level names verbatim (escape hatch); the ONLY validation is membership in the agent's depths — the provider is the final judge and its raw errors flow back. The report discloses the depth translation (canonical -> native). Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
-  args: {
-    prompt: tool.schema.string().describe("Complete, self-contained task for the worker (it cannot see this conversation)"),
-    agent: tool.schema.string().describe("Dispatch agent id from forge.json (e.g. research, review, or a custom id; legacy inline tier ids still work when configured)"),
-    depth: tool.schema.string().optional().describe("Reasoning depth: none | low | medium | high | max (canonical) or the model's native level name verbatim; omit to use the agent's first depths entry"),
-    background: tool.schema.boolean().optional().describe("Run in the background: returns {dispatchId, resolved, queuedAt} immediately; the full result arrives later as a coalesced [forge:dispatch-complete] brief when the session is idle. Background mode targets live TUI sessions — under `opencode run` the session ends before any brief, so completions are ledger-only (read them via forge_dispatch_list) and sync mode is preferred.")
-  },
-  execute: async (args, context) => {
-    const state = stateForBan(context.sessionID);
-    const active = state ? resolveActivePlan(state) : null;
-    if (active && active.doc.status === "draft") {
-      throw new Error("[forge] A plan is in draft; dispatching workers is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.");
-    }
-    if (!args.prompt?.trim())
-      throw new Error("forge_dispatch requires a non-empty prompt.");
-    const engine = activeDispatchEngine;
-    if (!engine)
-      throw new Error("[forge] dispatch engine unavailable (disabled by dispatch.disable, or config still loading).");
-    try {
-      const r = await engine.dispatch({ prompt: args.prompt, agent: args.agent, ...args.depth !== undefined ? { depth: args.depth } : {} }, context.sessionID, args.background === true ? { background: true } : undefined);
-      if ("dispatchId" in r) {
-        context.metadata({ title: `dispatch ${r.agent} queued (${r.dispatchId})` });
-        return {
-          title: `dispatch ${r.agent} queued → ${r.resolved}${r.depth ? ` @${r.depth}` : ""}`,
-          output: [
-            `[forge:dispatch] accepted in the background: ${r.dispatchId}`,
-            `agent: ${r.agent}   resolved: ${r.resolved}${r.depth ? `   depth: ${r.depth}` : ""}`,
-            `queuedAt: ${r.queuedAt}`,
-            "",
-            "The full result (tokens/cost/report — or the timeout/error report) arrives as a [forge:dispatch-complete] brief when this session is next idle. Track progress any time with forge_dispatch_list; cancel with forge_dispatch_kill."
-          ].join(`
-`)
-        };
-      }
-      const tok = r.tokens;
-      const costLine = r.costUsd !== null && r.costUsd !== undefined ? `$${r.costUsd.toFixed(6)}${r.priceSnapshot ? ` (${r.priceSnapshot})` : ""}` : `unpriced${r.costNote ? ` — ${r.costNote}` : ""}`;
-      context.metadata({ title: `dispatch ${r.agent}: ${r.actual.model} @ ${r.actual.depth}` });
-      return {
-        title: `dispatch ${r.agent} → ${r.actual.model} @${r.actual.depth}`,
-        output: [
-          `[forge:dispatch] completed in ${r.durationMs}ms`,
-          `agent: ${r.agent}   model: ${r.actual.model}   depth: ${r.actual.depth}${r.requested.depth !== undefined && r.requested.depth !== r.actual.depth ? ` (requested ${r.requested.depth})` : ""}`,
-          `session: ${r.sessionID}`,
-          `tokens: input ${tok.input ?? 0}, output ${tok.output ?? 0}, reasoning ${tok.reasoning ?? 0}, cache r/w ${tok.cache?.read ?? 0}/${tok.cache?.write ?? 0}`,
-          `cost: ${costLine}`,
-          `depthTranslation: ${r.depthTranslation}`,
-          "",
-          "Worker report:",
-          r.text || "(empty worker report)"
-        ].join(`
-`)
-      };
-    } catch (err) {
-      if (err instanceof DispatchError && err.code === "pin-unavailable") {
-        throw new Error(`[forge:dispatch:pin-unavailable] ${err.message}
-
-${dispatchRecipeText()}`);
-      }
-      if (err instanceof DispatchError)
-        throw new Error(`[forge:dispatch:${err.code}] ${err.message}`);
-      throw err;
-    }
-  }
-});
-function dispatchRecipeText() {
-  const paths = forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
-  return forgeRecipe({
-    detectedIdentities: lastDetectedIdentities,
-    projectPath: paths.project || "(project .opencode/forge.json)",
-    globalPath: paths.global
-  });
-}
-var forgeDispatchConfigTool = tool({
-  description: "Read the effective forge dispatch configuration: {agents, knobs, findings}. agents mirrors the winning forge.json (project .opencode/forge.json > global ~/.config/opencode/forge.json > built-in seed) exactly — same keys, same shapes, writable back as valid forge.json agents content. knobs are the inline dispatch options {timeoutMs, maxConcurrent}. findings carry config state (config-parse-error, dispatch-unconfigured notice). Re-reads the file (mtime-cached) on every call, so edits are reflected immediately.",
-  args: {},
-  execute: async (_args, context) => {
-    const loaded = forgeLoader?.load() ?? { agents: {}, source: "seed", path: null, findings: [] };
-    context.metadata({ title: `dispatch config (${loaded.source})` });
-    return {
-      title: `dispatch config (${loaded.source}${loaded.path ? `: ${loaded.path}` : ""})`,
-      output: JSON.stringify({
-        agents: loaded.agents,
-        knobs: { timeoutMs: dispatchTimeoutMs, maxConcurrent: dispatchMaxConcurrent },
-        findings: loaded.findings
-      }, null, 2)
-    };
-  }
-});
-var forgeDispatchListTool = tool({
-  description: "List background forge_dispatch activity: in-flight dispatches (with dispatchIds) and recent terminal results (completed/timeout/error, full report objects). Use it to recover dispatch state after context compaction or to check on a background dispatch instead of waiting.",
-  args: {},
-  execute: async () => {
-    const reg = activeDispatchRegistry;
-    if (!reg)
-      throw new Error("[forge] no background dispatches have been submitted.");
-    const l = reg.list();
-    if (l.inFlight.length === 0 && l.terminal.length === 0) {
-      return { title: "no background dispatches", output: "[forge:dispatch-list] no background dispatches recorded in this session." };
-    }
-    const lines = [];
-    if (l.inFlight.length > 0) {
-      lines.push("In flight:");
-      for (const e of l.inFlight) {
-        lines.push(`- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state} · queued ${e.queuedAt} · session ${e.sessionID || "(starting)"}`);
-      }
-    }
-    if (l.terminal.length > 0) {
-      lines.push("", "Recent terminal results:");
-      for (const e of l.terminal.slice().reverse()) {
-        lines.push(`- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not started)"}`);
-        const r = e.result;
-        if (r !== undefined)
-          lines.push(`  result: ${JSON.stringify(r, null, 1).slice(0, 2000)}`);
-        if (e.lateCompletion !== undefined)
-          lines.push(`  (killed; a late result arrived after the kill and was discarded: ${JSON.stringify(e.lateCompletion).slice(0, 300)})`);
-      }
-    }
-    return { title: `dispatches: ${l.inFlight.length} in flight, ${l.terminal.length} terminal`, output: lines.join(`
-`) };
-  }
-});
-var forgeDispatchKillTool = tool({
-  description: "Cancel an in-flight background forge_dispatch by dispatchId: polling stops, the completion brief is suppressed, and the outcome is ledgered as killed. Refuses honestly if the dispatch already finished (use forge_dispatch_list). The child session itself cannot be aborted on this host version and is left for the host to reclaim.",
-  args: {
-    dispatchId: tool.schema.string().describe("The dispatchId returned by forge_dispatch (background) or shown by forge_dispatch_list")
-  },
-  execute: async (args) => {
-    const engine = activeDispatchEngine;
-    if (!engine)
-      throw new Error("[forge] dispatch engine unavailable.");
-    try {
-      engine.kill(args.dispatchId);
-    } catch (err) {
-      if (err instanceof DispatchError)
-        throw new Error(`[forge:dispatch:${err.code}] ${err.message}`);
-      throw err;
-    }
-    return {
-      title: `${args.dispatchId} killed`,
-      output: `[forge:dispatch] ${args.dispatchId}: killed — polling stopped, the completion brief is suppressed, and the outcome is ledgered. The child session cannot be aborted on this host and is left for the host to reclaim.`
-    };
-  }
-});
-var CREW_COMMAND_TEMPLATE = [
-  "Objective: {args}",
+var CREW_INIT_TEMPLATE = [
+  '(forge crew orchestration. Argument: "$ARGUMENTS")',
   "",
-  "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). Follow it exactly:",
+  "CREW IS NOT INITIALIZED: no forge subagents are configured (no usable forge.json agents). Refuse to enter orchestration and tell the user this feature needs a one-time setup, offering BOTH options:",
   "",
-  "1. REGISTER: call `crew_begin` with the objective. If it refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew.",
-  "2. DECOMPOSE: break the objective into subtasks. Every subtask carries FOUR fields before dispatch: (a) a self-contained prompt, (b) a tier/profile (scout = readonly recon, build = implementation, review = readonly review, quick = mechanical change), (c) an exact reasoning depth from the exposed vocabulary, (d) an acceptance-evidence statement — what the result text must contain for you to call it PASS.",
-  "3. WAVES, NEVER FLOODS: dispatch subtasks with background forge_dispatch in batches no larger than the concurrency cap (default 4). Launch the next batch ONLY as [forge:dispatch-complete] briefs free capacity. Never fire more dispatches while the cap is full.",
-  "4. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the dispatch result text — cite the dispatchId (bg-N) as the evidence reference. A result that does not meet the statement is a failure even if the worker sounded confident.",
-  "5. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or depth. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
-  "6. CLOSE: when every subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks your report against the dispatch ledger — a dispatched subtask missing from the report refuses the close. The user confirms the closing dialog."
+  "1. The user configures it themselves: create ONE of these files (project-level wins, never merged):",
+  "{paths}",
+  "",
+  "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead.",
+  "",
+  "Template (JSONC — comments allowed; `model` is the exact provider/model identity, `thoughtLevel` is optional: none/low/medium/high/max or a native level name):",
+  "{template}",
+  "",
+  "After the file is saved: NEW agents require a host restart to appear in the task tool; thoughtLevel edits on existing agents apply without restart. Until then, crew stays unavailable."
 ].join(`
 `);
+function crewOrchestrationTemplate(agentIds) {
+  return [
+    '(forge crew orchestration. Argument: "$ARGUMENTS")',
+    "",
+    `Configured forge subagents (task-tool vocabulary): ${agentIds.map((id) => `forge-${id}`).join(", ")}`,
+    "",
+    "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). Follow it exactly:",
+    "",
+    "1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. Reconnaissance first if you need it to decompose well; a wrong plan is fixed by discarding and re-crewing, never by improvising outside the declared plan.",
+    "2. WAVES, NEVER FLOODS: execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in.",
+    "3. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, run that subtask through a native task call anyway AND tell the user about the gap — suggest configuring the missing role in forge.json.",
+    "4. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the task result text. A result that does not meet the statement is a failure even if the worker sounded confident.",
+    "5. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or agent. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
+    "6. CLOSE: when every declared subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks your report against the declared plan — a declared subtask missing from the report refuses the close, and so does an undeclared one. The user confirms the closing dialog."
+  ].join(`
+`);
+}
 var crewBeginTool = tool({
-  description: "Register this session's crew (from /crew). Refuses when a crew is already active in the session or while a plan draft is active. Crew state is in-memory: a host restart ends it honestly (the dispatch ledger keeps the history).",
+  description: "Register this session's crew (from /crew) with its DECLARED subtask plan. Refuses when a crew is already active in the session, while a plan draft is active, or when subtasks are missing/duplicated. Crew state is in-memory: a host restart ends it honestly.",
   args: {
-    objective: tool.schema.string().describe("One-line crew objective (from /crew)")
+    objective: tool.schema.string().describe("One-line crew objective (from /crew)"),
+    subtasks: tool.schema.array(tool.schema.object({
+      title: tool.schema.string().describe("Short unique subtask title — the crew_close report must use these exact titles"),
+      agent: tool.schema.string().optional().describe("Intended forge-* agent id for this subtask, when one matches")
+    })).describe("The declared subtask plan — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list")
   },
   execute: async (args, context) => {
     const state = stateForBan(context.sessionID);
@@ -17374,88 +16270,71 @@ var crewBeginTool = tool({
     }
     if (!args.objective?.trim())
       throw new Error("crew_begin requires a non-empty objective (from /crew <objective>).");
+    const raw = Array.isArray(args.subtasks) ? args.subtasks : [];
+    if (raw.length === 0)
+      throw new Error("[forge:crew] crew_begin requires subtasks[] — declare the plan before executing (decompose the objective into titled subtasks).");
+    const seen = new Set;
+    const subtasks = [];
+    for (const s of raw) {
+      const title = String(s?.title ?? "").trim();
+      if (!title)
+        throw new Error("[forge:crew] every subtask needs a non-empty title.");
+      const key = title.toLowerCase();
+      if (seen.has(key))
+        throw new Error(`[forge:crew] duplicate subtask title "${title}" — titles must be unique (they are the crew_close matching key).`);
+      seen.add(key);
+      const agent = String(s?.agent ?? "").trim();
+      subtasks.push(agent ? { title, agent } : { title });
+    }
     const existing = crews.get(context.sessionID);
     if (existing) {
       throw new Error(`[forge:crew] This session already has an active crew: "${existing.objective}" (started ${existing.startedAt}). Finish and close it with crew_close before starting another.`);
     }
-    crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso() });
+    crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso(), subtasks });
     return {
       title: `crew registered: ${args.objective.trim().slice(0, 60)}`,
-      output: `[forge:crew] Crew registered for this session. Objective: ${args.objective.trim()}. Proceed with the discipline: decompose → waves paced on completion briefs (never past the cap) → per-subtask evidence verdicts → at most one retry → crew_close with the full report.`
+      output: [
+        `[forge:crew] Crew registered for this session. Objective: ${args.objective.trim()}`,
+        `Declared plan (${subtasks.length}):`,
+        ...subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
+        "Proceed with the discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask."
+      ].join(`
+`)
     };
   }
 });
 var crewCloseTool = tool({
-  description: "Close this session's crew with the final report (ask-level user confirmation). The gate cross-checks the report against the dispatch ledger: every subtask needs a verdict (PASS/FAIL) and a bg-N evidence reference; every dispatch this crew submitted must appear in the report; FAIL requires both failure reports (attempt + the one retry). On success the summary (verdicts, ledger references, aggregate tokens/cost) is appended to the dispatch ledger and the crew ends.",
+  description: "Close this session's crew with the final report (ask-level user confirmation). The gate cross-checks the report against the declared subtask plan: every declared subtask needs a verdict (PASS/FAIL) and an evidence statement; an undeclared subtask in the report refuses the close; FAIL requires both failure reports (attempt + the one retry). On success the crew ends and the summary is the tool output (there is no persistent crew record).",
   args: {
     report: tool.schema.array(tool.schema.object({
-      title: tool.schema.string().describe("Subtask title"),
+      title: tool.schema.string().describe("Subtask title — must match a title declared at crew_begin"),
       verdict: tool.schema.string().describe("PASS or FAIL"),
-      evidence: tool.schema.string().describe("Acceptance evidence with the bg-N dispatch id reference"),
+      evidence: tool.schema.string().describe("Acceptance evidence: what the result contained that satisfies the acceptance statement"),
       attempts: tool.schema.array(tool.schema.string()).optional().describe("For FAIL: both failure reports (attempt and retry)")
-    })).describe("The full crew report — one entry per subtask")
+    })).describe("The full crew report — one entry per declared subtask")
   },
   execute: async (args, context) => {
     const crew = crews.get(context.sessionID);
     if (!crew)
       throw new Error("[forge:crew] No active crew in this session (crew state is in-memory and dies on host restart). Start one with /crew <objective>.");
-    const rows = [];
-    try {
-      const file2 = readFileSync9(join5(dispatchLogDir, "ledger.jsonl"), "utf8");
-      for (const line of file2.split(`
-`)) {
-        const t = line.trim();
-        if (!t)
-          continue;
-        try {
-          rows.push(JSON.parse(t));
-        } catch {}
-      }
-    } catch {}
-    const check2 = validateCrewReport(args.report ?? [], rows, { objective: crew.objective, startedAt: crew.startedAt, sessionID: context.sessionID });
+    const report = args.report ?? [];
+    const check2 = validateCrewReport(report, crew.subtasks);
     if (!check2.ok) {
-      throw new Error(`[forge:crew] crew_close refused — the report does not match the dispatch ledger:
+      throw new Error(`[forge:crew] crew_close refused — the report does not match the declared plan:
 ${check2.gaps.map((g) => `- ${g}`).join(`
 `)}
 The crew stays active; complete or correct the report and call crew_close again.`);
     }
-    let tokensIn = 0;
-    let tokensOut = 0;
-    let costSum = 0;
-    let costKnown = 0;
-    for (const row of rows) {
-      if (typeof row.dispatchId !== "string" || !check2.dispatchIds.includes(row.dispatchId))
-        continue;
-      const tok = row.tokens;
-      tokensIn += tok?.input ?? 0;
-      tokensOut += (tok?.output ?? 0) + (tok?.reasoning ?? 0);
-      if (typeof row.costUsd === "number") {
-        costSum += row.costUsd;
-        costKnown++;
-      }
-    }
     await gate(context.ask, "crew_close", `Close crew: ${crew.objective}`);
-    dispatchLedger.append({
-      ts: nowIso(),
-      event: "crew-summary",
-      tier: "crew",
-      outcome: "closed",
-      sessionID: context.sessionID,
-      note: crew.objective,
-      tokens: { input: tokensIn, output: tokensOut, reasoning: 0, cache: { read: 0, write: 0 } },
-      costUsd: costKnown > 0 ? costSum : null,
-      dispatchIds: check2.dispatchIds,
-      subtasks: (args.report ?? []).map((r) => ({ title: r.title, verdict: String(r.verdict).toUpperCase(), evidence: r.evidence }))
-    });
     crews.delete(context.sessionID);
-    const fails = (args.report ?? []).filter((r) => String(r.verdict).toUpperCase() === "FAIL").length;
+    const fails = report.filter((r) => String(r.verdict).toUpperCase() === "FAIL").length;
     return {
       title: `crew closed: ${crew.objective.slice(0, 60)}`,
       output: [
         `[forge:crew] Crew closed: ${crew.objective}`,
-        `subtasks: ${(args.report ?? []).length} (PASS ${(args.report ?? []).length - fails}, FAIL ${fails})`,
-        `dispatches: ${check2.dispatchIds.length}   tokens: in ${tokensIn}, out ${tokensOut}   cost: ${costKnown > 0 ? `$${costSum.toFixed(6)}` : "unpriced"}`,
-        "The summary is appended to the dispatch ledger."
+        `subtasks: ${report.length} (PASS ${report.length - fails}, FAIL ${fails})`,
+        ...report.map((r) => `- ${r.title}: ${String(r.verdict).toUpperCase()} — ${String(r.evidence).slice(0, 200)}`),
+        "This output is the crew's record (crew state is in-memory; nothing persists)."
       ].join(`
 `)
     };
@@ -17479,11 +16358,7 @@ function forgeTools() {
     tools.forge_shell = forgeShellTool;
     tools.forge_jobs = forgeJobsTool;
   }
-  if (!dispatchDisabled && !forgeDisabled) {
-    tools.forge_dispatch = forgeDispatchTool;
-    tools.forge_dispatch_config = forgeDispatchConfigTool;
-    tools.forge_dispatch_list = forgeDispatchListTool;
-    tools.forge_dispatch_kill = forgeDispatchKillTool;
+  if (!forgeDisabled) {
     tools.crew_begin = crewBeginTool;
     tools.crew_close = crewCloseTool;
   }
@@ -17556,7 +16431,7 @@ function wrapupBriefText(goal, reason) {
 }
 async function autoPauseGoal(client, state, goal, reason, wrapup) {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
-  atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
   engineForgetSession(state.sessionID);
   if (wrapup && goal.doc.session) {
     try {
@@ -17605,9 +16480,9 @@ async function continueIfEligible(client, sessionID) {
       const ledgerPath = state.goalPath;
       if (ledgerPath && existsSync3(ledgerPath)) {
         try {
-          const fresh = parseGoalLoose(readFileSync9(ledgerPath, "utf8"));
+          const fresh = parseGoalLoose(readFileSync8(ledgerPath, "utf8"));
           if (fresh && fresh.turnsUsed > 0) {
-            atomicWrite(ledgerPath, appendLedger(readFileSync9(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+            atomicWrite(ledgerPath, appendLedger(readFileSync8(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
           }
         } catch (err) {
           goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
@@ -17660,10 +16535,7 @@ async function continueIfEligible(client, sessionID) {
       }
     }
     try {
-      const wakeEntries = activeDispatchRegistry?.takeUndelivered(sessionID) ?? [];
-      const briefText = wakeEntries.length > 0 ? `${dispatchBriefText(wakeEntries)}
-
-${goalBriefText(state, goal)}` : goalBriefText(state, goal);
+      const briefText = goalBriefText(state, goal);
       await client.session.prompt({
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: briefText }] }
@@ -17672,7 +16544,7 @@ ${goalBriefText(state, goal)}` : goalBriefText(state, goal);
       pendingContinuationTurn.add(sessionID);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
       state.goalPath = goal.path;
-      atomicWrite(goal.path, incTurns(readFileSync9(goal.path, "utf8"), nowIso()));
+      atomicWrite(goal.path, incTurns(readFileSync8(goal.path, "utf8"), nowIso()));
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
       const n = (transportFails.get(sessionID) ?? 0) + 1;
@@ -17703,7 +16575,6 @@ var server = async (input, options) => {
   hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || "";
   const client = input.client;
   jobClient = input.client;
-  dispatchClient = input.client;
   const jobsOpts = options?.jobs;
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native")
     jobsMode = jobsOpts.mode;
@@ -17720,18 +16591,6 @@ var server = async (input, options) => {
   const wdStall = clampStallMs(typeof wdStallRaw === "number" ? wdStallRaw : undefined);
   if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
     wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`);
-  }
-  const dpOpts = options?.dispatch;
-  dispatchDisabled = dpOpts?.disable === true;
-  if (Number.isInteger(dpOpts?.maxConcurrent) && dpOpts.maxConcurrent >= 1 && dpOpts.maxConcurrent <= 16) {
-    dispatchMaxConcurrent = dpOpts.maxConcurrent;
-  } else if (dpOpts?.maxConcurrent !== undefined) {
-    dispatchMaxConcurrent = 4;
-  }
-  if (Number.isInteger(dpOpts?.timeoutMs) && dpOpts.timeoutMs >= 1000 && dpOpts.timeoutMs <= 600000) {
-    dispatchTimeoutMs = dpOpts.timeoutMs;
-  } else if (dpOpts?.timeoutMs !== undefined) {
-    dispatchTimeoutMs = 600000;
   }
   const watchdogLedger = createFileLedger(join5(watchdogLogDir(), "log.jsonl"));
   const rawLocator = createLocator();
@@ -17788,7 +16647,6 @@ var server = async (input, options) => {
       exitCleanup?.trigger("dispose");
       jobManager.disposeAll();
       watchdog.dispose();
-      activeDispatchEngine?.dispose();
       sessions.clear();
     },
     config: async (cfg) => {
@@ -17822,10 +16680,6 @@ var server = async (input, options) => {
         template: PLAN_COMMAND_TEMPLATE,
         description: "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline"
       };
-      cfg.command["crew"] ??= {
-        template: CREW_COMMAND_TEMPLATE,
-        description: "forge crew orchestration: decompose an objective into evidence-checked subtasks dispatched as paced background waves; at most one retry per subtask; crew_close cross-checks the report against the dispatch ledger"
-      };
       cfg.command["goal"] ??= {
         template: GOAL_COMMAND_TEMPLATE,
         description: "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)"
@@ -17836,75 +16690,47 @@ var server = async (input, options) => {
         if (permSection[gateKey] !== "deny")
           permSection[gateKey] = "ask";
       }
-      if (!dispatchDisabled) {
-        const snapshot = process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1" ? { catalog: { providers: {} }, degraded: true, source: "test-off" } : await loadModelsDevSnapshot();
-        const dispatchOpts = options?.dispatch ?? {};
-        const legacyInline = (dispatchOpts.roster?.length ?? 0) > 0 || dispatchOpts.tiers !== undefined;
-        if (!forgeLoader || forgeLoaderDir !== hostWorktree) {
-          forgeLoader = createForgeConfigLoader({
-            projectDir: hostWorktree,
-            homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir()
-          });
-          forgeLoaderDir = hostWorktree;
-        }
-        const loaded = forgeLoader.load();
-        forgeConfigState = loaded;
-        for (const finding of loaded.findings) {
-          dispatchLedger.append({ ts: new Date().toISOString(), event: "validation", level: finding.level, code: finding.code, note: finding.message });
-        }
-        for (const [agentId, def] of Object.entries(loaded.agents)) {
-          const id = `forge-${agentId}`;
-          if (agentSection[id] !== undefined)
-            continue;
-          agentSection[id] = forgeAgentDef(agentId, def);
-        }
-        const detected = configuredIdentitiesOf(cfg, snapshot.catalog);
-        lastDetectedIdentities = detected;
-        const built = buildDispatchConfig({
-          configuredIdentities: detected,
-          catalog: snapshot.catalog,
-          userRoster: legacyInline ? dispatchOpts.roster ?? [] : [],
-          userTiers: legacyInline ? dispatchOpts.tiers : undefined
+      if (!forgeLoader || forgeLoaderDir !== hostWorktree) {
+        forgeLoader = createForgeConfigLoader({
+          projectDir: hostWorktree,
+          homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir()
         });
-        dispatchBase = { cfg: built, catalog: snapshot.catalog, findings: built.findings, degraded: snapshot.degraded };
-        for (const finding of built.findings) {
-          dispatchLedger.append({ ts: new Date().toISOString(), event: "validation", level: finding.level, code: finding.code, note: finding.message });
+        forgeLoaderDir = hostWorktree;
+      }
+      const loaded = forgeLoader.load();
+      for (const finding of loaded.findings) {
+        console.warn(`[forge:config] ${finding.level}: ${finding.message}`);
+      }
+      materializedSnapshot = {};
+      for (const [agentId, def] of Object.entries(loaded.agents)) {
+        const id = `forge-${agentId}`;
+        if (agentSection[id] !== undefined)
+          continue;
+        const entry = forgeAgentDef(agentId, def);
+        agentSection[id] = entry;
+        materializedSnapshot[id] = entry;
+      }
+      if (process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1") {
+        modelsDevCatalog = null;
+      } else {
+        try {
+          const snapshot = await loadModelsDevSnapshot();
+          modelsDevCatalog = snapshot.catalog;
+        } catch {
+          modelsDevCatalog = null;
         }
-        if (snapshot.degraded) {
-          dispatchLedger.append({ ts: new Date().toISOString(), event: "models-dev-degraded", note: "models.dev snapshot unavailable — cost reporting degrades to null" });
-        }
-        if (legacyInline) {
-          for (const [tierId, tier] of Object.entries(built.tiers)) {
-            const id = `forge-${tierId}`;
-            if (agentSection[id] !== undefined)
-              continue;
-            agentSection[id] = tierAgentDef(tierId, tier);
-          }
-        }
-        const roster = built;
-        activeDispatchRegistry = activeDispatchRegistry ?? createDispatchRegistry();
-        activeDispatchEngine?.dispose();
-        activeDispatchEngine = createDispatchEngine({
-          serverUrl: String(input.serverUrl ?? "").replace(/\/$/, ""),
-          workspace: hostWorktree,
-          fetcher: globalThis.fetch,
-          now: Date.now,
-          sleep: (ms) => new Promise((r) => setTimeout(r, ms)),
-          cfg: roster,
-          catalog: snapshot.catalog,
-          available: (identity) => {
-            return roster.roster.some((e) => e.model === identity) || lastDetectedIdentities.includes(identity);
-          },
-          agents: () => forgeLoader?.load().agents ?? {},
-          legacy: legacyInline,
-          sink: (entry) => dispatchLedger.append(entry),
-          registry: activeDispatchRegistry,
-          onTerminal: (parentSessionID) => scheduleDispatchWake(parentSessionID, false),
-          onDepth: queueDispatchDepth,
-          providerFamily: dispatchProviderFamily,
-          maxConcurrent: dispatchMaxConcurrent,
-          timeoutMs: dispatchTimeoutMs
-        });
+      }
+      cfg.command ??= {};
+      const existingCrew = cfg.command["crew"];
+      if (!existingCrew || String(existingCrew.template ?? "").startsWith("(forge crew")) {
+        const agentIds = Object.keys(loaded.agents);
+        const template = agentIds.length > 0 ? crewOrchestrationTemplate(agentIds) : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}
+   - ${forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`).replaceAll("{template}", JSON.stringify({ agents: { research: { model: "provider/model", thoughtLevel: "low" } } }, null, 2).split(`
+`).map((l) => "   " + l).join(`
+`));
+        const description = agentIds.length > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance";
+        cfg.command["crew"] = { template, description };
+        crewCommandSnapshot = { template, description };
       }
     },
     get tool() {
@@ -17935,32 +16761,52 @@ var server = async (input, options) => {
           throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Present the plan summary and call plan_approve for user approval, or /plan discard to abandon it.`);
         }
       }
-      if (input2.tool === "forge_dispatch") {
-        const state = stateForBan(input2.sessionID);
-        const active = state ? resolveActivePlan(state) : null;
-        if (active && active.doc.status === "draft") {
-          throw new Error("[forge] A plan is in draft; dispatching workers is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.");
-        }
-      }
     },
     "chat.params": async (input2, output) => {
-      const entry = dispatchDepths.get(input2.sessionID);
-      if (!entry || entry.kind === "not-injected")
+      if (forgeDisabled)
         return;
-      applyDepthTranslation(output.options ?? (output.options = {}), entry);
-    },
-    __forgeDispatchTest: {
-      queueDepth: queueDispatchDepth,
-      depthState: (sessionID) => dispatchDepths.get(sessionID) ?? null,
-      composePrompt: composeWorkerPrompt,
-      registry: () => activeDispatchRegistry,
-      crews: () => crews,
-      dispatchLogDir: () => dispatchLogDir,
-      dispatchBriefText,
-      setEngine: (engine) => {
-        activeDispatchEngine?.dispose();
-        activeDispatchEngine = engine;
+      const raw = input2;
+      const sessionID = raw.sessionID;
+      if (!sessionID)
+        return;
+      const agentName = typeof raw.agent === "string" ? raw.agent : raw.agent?.name;
+      if (typeof agentName !== "string" || !agentName.startsWith("forge-"))
+        return;
+      const frozen = sessionDepths.get(sessionID);
+      if (frozen) {
+        applyDepthTranslation(output.options ?? (output.options = {}), frozen.translation);
+        return;
       }
+      const agentId = agentName.slice("forge-".length);
+      const def = forgeLoader?.load().agents[agentId];
+      if (!def?.thoughtLevel)
+        return;
+      const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : "";
+      const modelID = typeof raw.model?.modelID === "string" ? raw.model.modelID : "";
+      const family = dispatchProviderFamily(providerID);
+      if (!family)
+        return;
+      const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, family, nativeLadder(modelsDevCatalog, `${providerID}/${modelID}`));
+      if (!translation) {
+        if (findingMessage && !depthFindingNotes.has(agentId)) {
+          depthFindingNotes.set(agentId, findingMessage);
+          console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`);
+        }
+        return;
+      }
+      sessionDepths.set(sessionID, { translation });
+      applyDepthTranslation(output.options ?? (output.options = {}), translation);
+    },
+    __forgeSubagentsTest: {
+      crews: () => crews,
+      depthState: (sessionID) => sessionDepths.get(sessionID)?.translation ?? null,
+      depthFinding: (agentId) => depthFindingNotes.get(agentId) ?? null,
+      catalog: () => modelsDevCatalog,
+      setCatalog: (c) => {
+        modelsDevCatalog = c;
+      },
+      crewCommand: () => crewCommandSnapshot,
+      materialized: () => materializedSnapshot
     },
     "permission.ask": async (input2, output) => {
       const meta = input2.metadata ?? {};
@@ -17999,13 +16845,13 @@ var server = async (input, options) => {
           goalProbe(`idle event session=${sessionID}`);
           scheduleIdleContinuation(client, sessionID);
           deliverJobWakes(sessionID);
-          scheduleDispatchWake(sessionID, true);
         }
       }
       if (event.type === "session.deleted") {
         const info = event.properties.info;
         if (typeof info?.id === "string" && info.id) {
           jobManager.onSessionEnd(info.id);
+          sessionDepths.delete(info.id);
         }
       }
     },
@@ -18121,13 +16967,30 @@ async function v2Setup(ctx) {
     await ctx.agent.transform(async (draft) => {
       if (typeof draft.get !== "function" || typeof draft.update !== "function")
         return;
-      if (draft.get(FORGE_AGENT) !== undefined)
-        return;
-      draft.update(FORGE_AGENT, (agent) => {
-        agent.description = "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).";
-        agent.system = FORGE_PROMPT;
-        agent.mode = "primary";
-      });
+      if (draft.get(FORGE_AGENT) === undefined) {
+        draft.update(FORGE_AGENT, (agent) => {
+          agent.description = "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).";
+          agent.system = FORGE_PROMPT;
+          agent.mode = "primary";
+        });
+      }
+      try {
+        const loader = createForgeConfigLoader({ projectDir: process.cwd(), homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
+        const loaded = loader.load();
+        for (const [agentId, def] of Object.entries(loaded.agents)) {
+          const id = `forge-${agentId}`;
+          if (draft.get(id) !== undefined)
+            continue;
+          const v1def = forgeAgentDef(agentId, def);
+          draft.update(id, (agent) => {
+            agent.description = v1def.description;
+            agent.system = v1def.prompt;
+            agent.mode = v1def.mode;
+            agent.model = v1def.model;
+            agent.permission = v1def.permission;
+          });
+        }
+      } catch {}
     });
   }
 }

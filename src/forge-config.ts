@@ -1,35 +1,45 @@
-// Dedicated forge.json configuration core (spec: dispatch — ADDED
-// "Dedicated forge.json configuration file", design D1/D2/D5).
+// Dedicated forge.json configuration core (spec: forge-subagents — "Static
+// agent definitions in a dedicated forge.json" + "Field-level fail-soft
+// validation"; change simplify-dispatch-to-static-agents).
 //
 // The file is JSONC: line/block comments allowed, trailing commas tolerated.
-// Everything here is data in, data out (same purity contract as
-// dispatch-roster.ts) — the loader in this module takes injected fs deps, so
+// Everything here is data in, data out — the loader takes injected fs deps so
 // tests drive the exact code the plugin runs.
 //
-// The plugin only ever READS forge.json. Onboarding happens through the error
-// recipe (see forgeRecipe below), never by generating the file.
+// Validation is FIELD-LEVEL FAIL-SOFT (ZCode subagentMarkdown pattern): a
+// semantically invalid agent entry is skipped with an error finding while its
+// siblings still apply; a mistyped optional field is ignored with a finding
+// while the agent still materializes. Only a syntactically broken document
+// disables the whole (empty) agent set. There is NO seed and NO fallback: an
+// unconfigured host is inert and silent, and the plugin only ever READS the
+// file — onboarding is human-facing documentation, never an AI invitation.
 
 import { readFileSync, statSync } from "node:fs"
 
 export type AgentShape = "readonly" | "write"
 
+// Validated agent definition. `model` is REQUIRED (an entry without it is
+// skipped with an error finding); everything else is optional and degrades
+// field-by-field.
 export type ForgeAgentDef = {
   model: string
-  depths: string[]
+  thoughtLevel?: string
   prompt?: string
   shape?: AgentShape
   permission?: Record<string, string>
 }
 
-export type ForgeConfig = {
-  agents: Record<string, ForgeAgentDef>
+export type ForgeConfigFinding = {
+  level: "error" | "warn"
+  code: string
+  message: string
 }
 
 // ---------------------------------------------------------------------------
-// JSONC parsing (task 1.1)
+// JSONC parsing (unchanged from the dispatch-suite era; battle-tested)
 // ---------------------------------------------------------------------------
 
-export type JsoncParseOk = { ok: true; config: ForgeConfig }
+export type JsoncParseOk = { ok: true; config: unknown }
 export type JsoncParseErr = { ok: false; error: { message: string; line?: number; column?: number } }
 
 // Strip comments and trailing commas SPACE-PRESERVING: every replaced char
@@ -63,7 +73,7 @@ function sanitizeJsonc(text: string): string {
     if (c === "/" && d === "*") {
       out.push(" ", " ")
       i += 2
-      while (i < n && !(text[i] === "*" && i + 1 < n && text[i + 1] === "/")) {
+      while (i < n && !(text[i] === "*" && i + 1 < n)) {
         out.push(text[i] === "\n" ? "\n" : " ")
         i++
       }
@@ -131,9 +141,6 @@ function lineColumnAt(text: string, offset: number): { line: number; column: num
 function locateJsonError(text: string): { message: string; line: number; column: number } | null {
   const n = text.length
   let i = 0
-  // Container stack: "o" object (expecting key or close), "ov" object after a
-  // key-value pair (expecting comma or close), "a" array expecting value or
-  // close, "av" array after a value.
   const stack: Array<"o" | "ov" | "a" | "av"> = []
   const ws = () => {
     while (i < n && (text[i] === " " || text[i] === "\t" || text[i] === "\n" || text[i] === "\r")) i++
@@ -165,17 +172,15 @@ function locateJsonError(text: string): { message: string; line: number; column:
       if (c === "{") {
         stack.push("o")
         i++
-        expectValue = false // next: key or close
+        expectValue = false
         continue
       }
       if (c === "[") {
         stack.push("a")
         i++
-        continue // arrays expect a value immediately (or close)
+        continue
       }
       if (c === "}") {
-        // An object never closes while a VALUE is expected ({"a": } is a
-        // syntax error) — only arrays may close empty (handled below).
         return fail(`expected a value before '}'`)
       }
       if (c === "]") {
@@ -195,7 +200,7 @@ function locateJsonError(text: string): { message: string; line: number; column:
         const err = skipString()
         if (err) return fail(err)
         expectValue = false
-        if (top === "o") stack[stack.length - 1] = "ov" // a bare string is not a valid key start; JSON.parse will say so
+        if (top === "o") stack[stack.length - 1] = "ov"
         if (top === "a") stack[stack.length - 1] = "av"
         continue
       }
@@ -207,7 +212,6 @@ function locateJsonError(text: string): { message: string; line: number; column:
       }
       return fail(`unexpected token '${c}'`)
     }
-    // Not expecting a value: object key, colon, comma, or close.
     if (top === "o") {
       if (c === '"') {
         const err = skipString()
@@ -246,7 +250,7 @@ function locateJsonError(text: string): { message: string; line: number; column:
         i++
         ws()
         return i >= n ? null : fail(`unexpected token '${text[i]}' after top-level value`)
-        }
+      }
       i++
       continue
     }
@@ -266,90 +270,93 @@ export function parseForgeJsonc(text: string): JsoncParseOk | JsoncParseErr {
       error: located ?? { message: "invalid JSON", line: 1, column: 1 },
     }
   }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return { ok: false, error: { message: "forge.json top level must be an object", line: 1, column: 1 } }
-  }
-  const agents = (parsed as { agents?: unknown }).agents
-  if (agents === undefined) return { ok: true, config: { agents: {} } }
-  if (typeof agents !== "object" || agents === null || Array.isArray(agents)) {
-    return { ok: false, error: { message: 'forge.json "agents" must be an object mapping agent ids to definitions', line: 1, column: 1 } }
-  }
-  return { ok: true, config: { agents: agents as Record<string, ForgeAgentDef> } }
+  return { ok: true, config: parsed }
 }
 
 // ---------------------------------------------------------------------------
-// Onboarding recipe (task 2.2, spec — ADDED "Seed placeholder onboarding").
-// Machine-actionable: the user's session AI can execute every step from this
-// text alone. The identity list is injected (no discovery here — pure data),
-// strings only, no ladders (the metalanguage makes ladder knowledge
-// unnecessary).
+// Field-level fail-soft semantic validation (spec: forge-subagents —
+// "Field-level fail-soft validation")
 // ---------------------------------------------------------------------------
 
-export function forgeRecipe(input: { detectedIdentities: string[]; projectPath: string; globalPath: string }): string {
-  const suggested = input.detectedIdentities[0] ?? "provider/model"
-  const identityLines =
-    input.detectedIdentities.length > 0
-      ? input.detectedIdentities.map((id) => `   - ${id}`).join("\n")
-      : "   (none detected — check the provider section of the host's opencode config)"
-  const template = `{
-  // forge dispatch agents — save the file; changes apply on the next dispatch, no restart
-  "agents": {
-    "research": {
-      "model": "${suggested}", // exact "provider/model" string, pick from the detected list above
-      "depths": ["low", "medium"], // first entry is the default; canonical words: none, low, medium, high, max — or the model's native level names, passed through verbatim
-      // "prompt": "optional role prompt riding inside the discipline wrapper",
-      // "shape": "write", // default readonly denies mutating tools; write agents need this
-      // "permission": { "bash": "deny" } // optional override of the shape-derived permission
+const AGENT_ID_RE = /^[a-z0-9-]+$/
+
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return typeof v === "object" && v !== null && !Array.isArray(v)
+}
+
+function nonEmptyString(v: unknown): v is string {
+  return typeof v === "string" && v.trim().length > 0
+}
+
+export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAgentDef>; findings: ForgeConfigFinding[] } {
+  const findings: ForgeConfigFinding[] = []
+  const agents: Record<string, ForgeAgentDef> = {}
+  if (raw === undefined) return { agents, findings }
+  if (!isRecord(raw)) {
+    findings.push({ level: "error", code: "agents-not-object", message: 'forge.json "agents" must be an object mapping agent ids to definitions — the agent set is empty' })
+    return { agents, findings }
+  }
+  for (const [id, entry] of Object.entries(raw)) {
+    const label = `agents.${id}`
+    if (!AGENT_ID_RE.test(id)) {
+      findings.push({ level: "error", code: "agent-id-invalid", message: `${label}: agent id must match [a-z0-9-] — entry skipped` })
+      continue
     }
+    if (!isRecord(entry)) {
+      findings.push({ level: "error", code: "agent-not-object", message: `${label}: definition must be an object — entry skipped` })
+      continue
+    }
+    if (!nonEmptyString(entry.model)) {
+      findings.push({ level: "error", code: "agent-model-missing", message: `${label}.model: a non-empty "provider/model" string is required — entry skipped, siblings still apply` })
+      continue
+    }
+    const def: ForgeAgentDef = { model: entry.model.trim() }
+    if (entry.depths !== undefined) {
+      findings.push({ level: "warn", code: "depths-deprecated", message: `${label}.depths is no longer used (static agents pin one thoughtLevel) — ignored; set "thoughtLevel" instead` })
+    }
+    if (entry.thoughtLevel !== undefined) {
+      if (nonEmptyString(entry.thoughtLevel)) {
+        def.thoughtLevel = entry.thoughtLevel.trim()
+      } else {
+        findings.push({ level: "warn", code: "thoughtlevel-invalid", message: `${label}.thoughtLevel must be a non-empty string — field ignored, the agent still materializes` })
+      }
+    }
+    if (entry.prompt !== undefined) {
+      if (nonEmptyString(entry.prompt)) {
+        def.prompt = entry.prompt
+      } else {
+        findings.push({ level: "warn", code: "prompt-invalid", message: `${label}.prompt must be a non-empty string — field ignored` })
+      }
+    }
+    if (entry.shape !== undefined) {
+      if (entry.shape === "readonly" || entry.shape === "write") {
+        def.shape = entry.shape
+      } else {
+        findings.push({ level: "warn", code: "shape-invalid", message: `${label}.shape must be "readonly" or "write" — defaulting to readonly` })
+      }
+    }
+    if (entry.permission !== undefined) {
+      if (isRecord(entry.permission) && Object.values(entry.permission).every((v) => typeof v === "string")) {
+        def.permission = entry.permission as Record<string, string>
+      } else {
+        findings.push({ level: "warn", code: "permission-invalid", message: `${label}.permission must map tool names to string values — field ignored` })
+      }
+    }
+    agents[id] = def
   }
-}`
-  return [
-    "[forge dispatch onboarding recipe]",
-    'The dispatch agent you called is pinned to the placeholder model "Local/GPT Luna" — forge.json is not configured. Steps:',
-    "",
-    "1. Detected configured identities (use one as the exact model string):",
-    identityLines,
-    "",
-    "2. Create ONE of these files (project-level wins; a single file fully applies — never merged):",
-    `   - ${input.projectPath}  (project-level, versionable, team-shared)`,
-    `   - ${input.globalPath}  (global)`,
-    "",
-    "3. Copy-paste template (JSONC — comments allowed) and edit model/depths:",
-    "",
-    template,
-    "",
-    '4. Verify: call the forge_dispatch tool again with agent "research" and a depth from its depths — the report shows the actual model and the depth translation.',
-    "",
-    '5. Extending: more agents are more entries under "agents"; agents that edit files need "shape": "write"; an explicit "permission" map overrides the shape-derived defaults — "task" is always denied, recursive dispatch stays impossible.',
-  ].join("\n")
+  return { agents, findings }
 }
 
 // ---------------------------------------------------------------------------
-// Cascade + seed (task 1.2)
+// Cascade loader (project > global; hot-apply mtime cache; NO seed)
 // ---------------------------------------------------------------------------
 
-// Placeholder identity for the seed: a fictional provider ("Local") that can
-// never appear in a real host config, so any dispatch on the seed fails
-// deterministically with the onboarding recipe (design D5).
-export const PLACEHOLDER_IDENTITY = "Local/GPT Luna"
-
-export const SEED_AGENTS: Record<string, ForgeAgentDef> = {
-  research: { model: PLACEHOLDER_IDENTITY, depths: ["low", "medium"], shape: "readonly" },
-  review: { model: PLACEHOLDER_IDENTITY, depths: ["medium", "high", "max"], shape: "readonly" },
-}
-
-export type ForgeConfigSource = "project" | "global" | "seed"
-
-export type ForgeConfigFinding = {
-  level: "error" | "warn" | "notice"
-  code: string
-  message: string
-}
+export type ForgeConfigSource = "project" | "global" | "none"
 
 export type LoadedForgeConfig = {
   agents: Record<string, ForgeAgentDef>
   source: ForgeConfigSource
-  // null for the seed (no file backs it).
+  // null when no file backs the result (unconfigured or unreadable).
   path: string | null
   findings: ForgeConfigFinding[]
 }
@@ -383,12 +390,12 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, "utf8"))
   const paths = forgeConfigPaths({ projectDir: deps.projectDir, homeDir: deps.homeDir })
 
-  // Hot-apply cache (design D2): stat before every load; only an mtime/size
-  // change triggers a re-read. Cached per path, INCLUDING parse failures, so
-  // a broken file does not re-parse on every dispatch.
+  // Hot-apply cache: stat before every load; only an mtime/size change
+  // triggers a re-read. Cached per path, INCLUDING parse failures, so a
+  // broken file does not re-parse on every lookup.
   const cache = new Map<string, { mtimeMs: number; size: number; result: LoadedForgeConfig }>()
 
-  const readCandidate = (path: string, source: Exclude<ForgeConfigSource, "seed">): LoadedForgeConfig | null => {
+  const readCandidate = (path: string, source: Exclude<ForgeConfigSource, "none">): LoadedForgeConfig | null => {
     const st = stat(path)
     if (st === null) {
       cache.delete(path)
@@ -400,22 +407,33 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
     const parsed = parseForgeJsonc(text)
     let result: LoadedForgeConfig
     if (!parsed.ok) {
-      // Design D9: a broken winning file falls back to the SEED, never to the
-      // next cascade level — no half-configured hybrid states.
+      // Broken document: the WHOLE set is empty with one error finding
+      // carrying the parse location. There is no seed to fall back to.
       result = {
-        agents: { ...SEED_AGENTS },
-        source: "seed",
-        path: null,
+        agents: {},
+        source,
+        path,
         findings: [
           {
             level: "error",
             code: "config-parse-error",
-            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — fell back to the built-in seed`,
+            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — the agent set is empty until the file parses`,
           },
         ],
       }
     } else {
-      result = { agents: parsed.config.agents, source, path, findings: [] }
+      const top = parsed.config
+      if (top !== undefined && !isRecord(top)) {
+        result = {
+          agents: {},
+          source,
+          path,
+          findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — the agent set is empty` }],
+        }
+      } else {
+        const validated = validateAgentSet(top === undefined ? undefined : (top as Record<string, unknown>).agents)
+        result = { agents: validated.agents, source, path, findings: validated.findings }
+      }
     }
     cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result })
     return result
@@ -427,20 +445,10 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
       if (project) return project
       const global = paths.global ? readCandidate(paths.global, "global") : null
       if (global) return global
-      // Truly unconfigured (no file anywhere): one notice pointing at the
-      // recipe. A broken file already reported its parse error above.
-      return {
-        agents: { ...SEED_AGENTS },
-        source: "seed",
-        path: null,
-        findings: [
-          {
-            level: "notice",
-            code: "dispatch-unconfigured",
-            message: "forge dispatch is unconfigured (no forge.json found): every forge_dispatch call will fail with the configuration recipe. Create .opencode/forge.json (project) or ~/.config/opencode/forge.json (global), or ask your session AI to configure dispatch — the recipe in the dispatch error tells it exactly what to write.",
-          },
-        ],
-      }
+      // Unconfigured: inert and silent (spec — "the unconfigured state SHALL
+      // be inert: no subagents registered, no errors raised, no AI-facing
+      // configuration recipe emitted").
+      return { agents: {}, source: "none", path: null, findings: [] }
     },
   }
 }

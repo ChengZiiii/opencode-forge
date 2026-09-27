@@ -113,9 +113,10 @@ and the plugin's command of that name is not registered.
 4. Done — the hidden native `build`/`plan` agents come back automatically
    (the hide was runtime-only). Your `.opencode/plan/` and `.opencode/goal/`
    files are yours; delete them yourself if you want.
-5. Optional runtime debris: delete `<tmp>/opencode-forge/` (job logs, the
-   job registry ledger, the watchdog ledger, and the dispatch ledger — the
-   file ledger table above lists everything).
+ 5. Optional runtime debris: delete `<tmp>/opencode-forge/` (job logs, the
+    job registry ledger, the watchdog ledger, and any leftover dispatch
+    ledger from older versions — the file ledger table above lists
+    everything).
 
 ## File ledger
 
@@ -125,13 +126,13 @@ What this plugin touches, exhaustively:
 | --- | --- | --- |
 | `<project>/.opencode/plan/*.md` | plan files | user data — kept forever, uninstall never deletes |
 | `<project>/.opencode/goal/*.md` | goal files (contract, Check Log, Turn Ledger) | user data — kept forever, uninstall never deletes |
-| merged config object (RAM only) | forge agent, native build/plan `disable`, `command.plan`, `command.goal`, goal permission keys, `permission.forge_shell`, stage-0 builtin shell hide | vanishes when the plugin is removed; nothing is written to disk |
+| merged config object (RAM only) | forge agent, static `forge-<id>` subagents, native build/plan `disable`, `command.plan`, `command.goal`, `command.crew`, goal permission keys, `permission.forge_shell`, `permission.crew_close`, stage-0 builtin shell hide | vanishes when the plugin is removed; nothing is written to disk |
 | `<tmp>/opencode-forge/jobs/<jobId>.log` | job output tee (full output; oldest rotated out above 50 files) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
-| `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger: resolved identity/depth, outcomes, tokens/cost, timeouts, transport interruptions, lost-on-exit, crew summaries (bounded, capped rotation) | runtime debris — delete freely, also after uninstall |
-| `<project>/.opencode/forge.json`, `~/.config/opencode/forge.json` | your dispatch agent definitions (JSONC). **User data — the plugin only reads it, never writes or migrates it** | yours — version the project one, keep the global one out of sync tools if it holds machine-specific models |
+| `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (the dispatch engine was removed); only present as inert debris from older versions | runtime debris — delete freely |
+| `<project>/.opencode/forge.json`, `~/.config/opencode/forge.json` | your static subagent definitions (JSONC). **User data — the plugin only reads it, never writes or migrates it** | yours — version the project one, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
 
@@ -319,155 +320,135 @@ These are runtime debris, not data — with ONE caveat: **if you uninstall with
 /F /T`, or just reboot); deleting the directory afterwards is safe and
 complete.
 
-## Worker dispatch (scoped subagents on a chosen model + depth)
+## Forge subagents (static worker agents in forge.json)
 
-`forge_dispatch {prompt, agent, depth}` spawns a child session that runs one
-scoped task on the agent's pinned model at the requested reasoning depth. The
-result is an honest report: the actual model/depth used, real token counts, a
-self-computed cost (`null` when the model is unpriced), the
-`depthTranslation` disclosure (`canonical high → native XHigh`, or
-`verbatim`), and the worker's concluding report.
+Forge subagents are **static, user-authored worker agents**: each forge.json
+entry pins a model and an optional reasoning depth, materializes as a native
+`forge-<id>` subagent, and is dispatched through the host's **native `task`
+tool** — which means every run is visible in the TUI, expandable and
+monitorable, exactly like any native subagent. There is no dispatch tool, no
+child-session engine, and no configuration invitation anywhere: the session
+AI never writes your config.
 
-### forge.json — the dispatch configuration
+No forge.json? Nothing happens — the plugin registers nothing and the native
+subagent behavior is untouched. Onboarding is this README, for you the human.
 
-Agents live in a dedicated `forge.json` (JSONC — comments allowed), resolved
-by a three-level cascade with a single winning source (never merged):
+### forge.json — the configuration
+
+A dedicated `forge.json` (JSONC — comments allowed), resolved by a two-level
+cascade with a single winning source (never merged):
 
 1. `<project>/.opencode/forge.json` — project-level, versionable, team-shared
 2. `~/.config/opencode/forge.json` — global
-3. the built-in seed — `research {depths: [low, medium]}` and
-   `review {depths: [medium, high, max]}`, both pinned to the placeholder
-   `Local/GPT Luna` (an identity that never resolves: an unconfigured install
-   fails every dispatch with the configuration recipe below)
 
 ```jsonc
 {
-  // forge dispatch agents — save the file; changes apply on the next dispatch, no restart
+  // forge subagents — definitions; see the restart table below for apply timing
   "agents": {
     "research": {
-      "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string
-      "depths": ["low", "medium"], // first entry is the default
-      // "prompt": "optional role prompt riding inside the discipline wrapper",
-      // "shape": "write", // default readonly denies mutating tools
-      // "permission": { "bash": "deny" } // optional override; "task" is always denied
+      "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string — REQUIRED
+      "thoughtLevel": "low",              // optional: none/low/medium/high/max or a native level name
+      // "prompt": "optional role prompt; built-in research/review defaults exist",
+      // "shape": "write",   // default readonly denies write/edit/bash
+      // "permission": { "bash": "deny" } // optional override; "task" is ALWAYS denied
     }
   }
 }
 ```
 
 - **The plugin only ever reads this file.** It never creates, writes, or
-  migrates it. Unconfigured? The first `forge_dispatch` error carries a
-  machine-actionable recipe (detected identities, both file paths, the
-  template, a verify dispatch) — or just ask your session AI to configure
-  dispatch; `forge_dispatch_config` shows the exact live state.
-- **Hot-apply**: the file is re-read (mtime-cached) before every dispatch and
-  on every `forge_dispatch_config` call — edits take effect on the next
-  dispatch, no host restart. One boundary: newly added agents materialize
-  their hidden `forge-<agent>` entry only on the next config reload; the
-  dispatch itself still works (the body names the agent), but a brand-new
-  agent's first dispatch may need a host reload if the host validates agent
-  names on session create.
-- Each agent materializes as a hidden `mode: subagent` agent `forge-<agent>`
-  carrying the role prompt (explicit `prompt` > built-in research/review
-  defaults > generic worker) and a deny-style permission: `shape: "readonly"`
-  (the default) denies `write`/`edit`/`bash`, `shape: "write"` allows them,
-  an explicit `permission` map overrides the shape default — and `task` is
-  ALWAYS denied (recursive dispatch stays physically impossible). Agents
-  never carry a `model` field; the brain is bound per dispatch.
+  migrates it. The old AI-authored onboarding path (seed placeholder +
+  error recipe) is gone: an unconfigured host is inert and silent, and the
+  session AI is never invited to touch config. The ONE exception is the
+  `/crew` initialization gate (below), where AI-assisted configuration is
+  offered to YOU and happens only on your explicit go-ahead.
+- **Parsing is field-level fail-soft** (ZCode-style): a semantically bad
+  agent entry is skipped with an error finding while its siblings apply; a
+  mistyped optional field is ignored with a warning; a syntactically broken
+  file empties the agent set with one parse-location error. There is no seed
+  in any failure path. Findings surface in the plugin diagnostics log.
+- **`depths` is deprecated**: the array is ignored with a warning finding.
+  Pin ONE `thoughtLevel` per agent instead.
+- Each agent materializes as `forge-<id>` — a subagent-mode agent visible in
+  the task tool's vocabulary (never hidden), carrying the pinned `model`,
+  the worker discipline (workspace-relative paths only, verbatim reporting
+  of tool refusals, evidence-bearing conclusions) around its role prompt,
+  and a deny-style permission: `shape: "readonly"` (the default) denies
+  `write`/`edit`/`bash`, `shape: "write"` allows them, an explicit
+  `permission` map overrides the shape default — and `task` is ALWAYS
+  denied (recursive spawning stays physically impossible).
 
-### The depth metalanguage
+**What applies when** — edits take hold per field:
 
-`depth` comes from the canonical five-word set `none | low | medium | high |
-max`, or the model's **native level names verbatim** (escape hatch — e.g.
-Qwen's `XHigh`). Translation to the provider's native parameter follows three
-hard rules:
+| change | needs a host restart? |
+| --- | --- |
+| `thoughtLevel` on an existing agent | no (applies to NEW sessions of that agent; running sessions keep their frozen depth) |
+| agent added / removed, or `model` / `prompt` / `permission` changed | yes (materialization runs on the config hook) |
 
-- **verbatim-first**: a meta word the model natively offers passes as-is
-- **no interpolation**: a meta word with no counterpart errors listing both
-  vocabularies — never a nearest guess
-- **full disclosure**: the report always shows `canonical → native`
+### Dispatching
 
-Per family: effort-style providers (OpenAI-compatible) receive
-`reasoningEffort = <word>`; budget-style (Anthropic-style) receive a
-published thinking tier — `low → 8192`, `medium → 16384`, `high → 24576`,
-`max → 32768` budget tokens, `none → thinking off`; toggle-style (zai/GLM)
-receive thinking on/off (that shape has no level slot — disclosed honestly).
-A provider whose option shape the plugin does not know gets nothing injected,
-disclosed as `not injected (unknown provider shape)`. The provider is the
-final judge of every depth word: its raw errors flow back unedited.
+Say "dispatch a subagent..." in a forge session and the model picks from the
+task tool vocabulary: a configured `forge-*` agent whose description matches
+runs on its pinned brain; if none matches, forge is instructed to say so
+plainly and fall back to the native task channel. During a plan draft the
+native `task` tool is already denied by the plan harness — no plugin-side
+rule needed.
 
-### Legacy inline roster (advanced)
+**Known pitfall — keyless endpoints × readonly agents**: free/keyless
+providers can return a deterministic EMPTY response for any toolset-reduced
+(readonly) agent. On the native task channel this now surfaces as a visible,
+attributable task failure; the mitigation is unchanged — use
+`shape: "write"` for such endpoints, or a keyed provider.
 
-The pre-forge.json inline form still works when configured (the plugin
-options `dispatch.roster` / `dispatch.tiers`): tier ids it defines keep their
-exact-match resolution, one-retry-excluding-a-failed-identity semantics, and
-startup dead-key warnings. Legacy tier ids win over forge.json agents of the
-same name while inline options exist. Zero-config auto-generation of roster
-entries was removed (configured ≠ usable) — dispatch without configuration is
-the seed + recipe path above.
+### The thoughtLevel word
 
-### Background dispatch and wake briefs
+One word per agent: the canonical `none | low | medium | high | max`, or the
+model's native level name verbatim (e.g. Qwen's `XHigh`). Injection rides the
+`chat.params` hook keyed by agent name, translated per provider family:
+effort-style (OpenAI-compatible) receives `reasoningEffort = <word>`;
+budget-style (Anthropic-style) receives a published thinking tier
+(`low → 8192`, `medium → 16384`, `high → 24576`, `max → 32768`,
+`none → off`); toggle-style (zai/GLM) receives thinking on/off. Rules:
+verbatim-first, no interpolation, unknown family injects nothing. A word the
+model does not natively offer injects NOTHING and records one finding naming
+both vocabularies — the session is never broken by a config word. A
+session's depth is frozen at its first request (editing forge.json
+mid-session never rewrites a running session).
 
-`forge_dispatch` takes `background: true`: it returns
-`{dispatchId, agent, requested, resolved, depth, queuedAt}` immediately and
-the full result arrives later as a coalesced `[forge:dispatch-complete]`
-brief — debounced, never interrupting an active turn (delivery waits for an
-idle), each terminal delivered exactly once, and merged into a single
-combined re-prompt when a goal continuation fires on the same idle.
-`forge_dispatch_list` recovers in-flight and recent terminal state (with
-dispatchIds) after context compaction; `forge_dispatch_kill {dispatchId}`
-stops polling, suppresses the brief, and ledgers `killed`. On host exit,
-in-flight dispatches are ledgered `lost-on-exit` — sessions are host memory
-objects, there are no orphan processes and no survive semantics.
+## Crew workflow (`/crew`)
 
-**Transport-interruption recovery**: the child's prompt is delivered by a
-turn-synchronous HTTP POST that stays open for the whole first turn. If that
-POST dies at the transport layer (fetch abort / network failure — anything
-that is not an HTTP error response), the dispatch does **not** fail: the
-engine ledgers `transport-interrupted` (with the child sessionID) and falls
-back to completion polling under the same deadline — the child session is a
-host-side object and usually keeps running, so its result is still collected
-and delivered normally. The message is never re-POSTed (the prompt may
-already be delivering); a message that never arrived polls as waiting and
-ends in the honest deadline `timeout`. Terminal reports and terminal ledger
-rows carry the child sessionID, dispatchId, parentSessionID, and durationMs.
+`/crew <objective>` is the third state-activation command next to `/plan` and
+`/goal`: it enters crew orchestration discipline for the session. The flow:
 
-### Crew workflow (`/crew`)
+1. **Register** the declared plan: `crew_begin {objective, subtasks}` — one
+   titled subtask each, optionally naming the intended `forge-*` agent.
+2. **Execute in waves** of parallel native `task` calls (results return
+   in-turn; the next wave launches only after the previous wave's results).
+3. **Missing role?** Run the subtask through a native task call anyway and
+   tell the user — suggest configuring the missing role.
+4. **Verify** each subtask against its acceptance-evidence statement;
+   retry a failure at most once.
+5. **Close** with `crew_close` — a hard, ask-gated gate cross-checking the
+   report against the DECLARED plan: every declared subtask needs a
+   PASS/FAIL verdict with evidence; an undeclared subtask in the report
+   refuses the close (fold discoveries into an existing verdict, or discard
+   and re-crew); a FAIL needs both failure reports. The close output is the
+   crew's record — crew state is in-memory and a host restart ends it
+   honestly.
 
-`/crew <objective>` registers a crew: decompose the objective into
-evidence-checked subtasks, dispatch them as background waves paced on
-completion briefs (**never past the concurrency cap — launch the next batch
-only as briefs free capacity**), at most ONE retry per failed subtask, then
-`crew_close` with the full report. The close is a hard gate: every subtask
-needs a PASS/FAIL verdict with evidence, a FAIL needs both failure reports,
-and the report is cross-checked against the dispatch ledger — a dispatched
-subtask missing from the report refuses the close (refusals never bother you
-with a dialog). A valid close asks once, appends a crew summary to the
-ledger, and ends the crew. Crew state is in-memory by design: a host restart
-ends it honestly and the ledger keeps the history.
+**Not initialized?** `/crew` on a host with zero usable forge agents refuses
+with one-time setup guidance: the two file paths, a copy-paste template, and
+the choice of configuring it yourself OR having the session AI do it — the
+latter only on your explicit go-ahead in that conversation, through the
+normal visible write path. This is the plugin's only configuration
+invitation. After saving the file, restart opencode to materialize the
+agents.
 
-### Known pitfalls
+### Debris note
 
-- **Keyless endpoints × readonly agents**: free/keyless providers can return
-  a deterministic EMPTY response for any toolset-reduced (readonly) agent —
-  0 tokens, no parts. The plugin detects this and fails the dispatch honestly
-  (`empty-response`, never counted as success); use a `shape: "write"` agent
-  or a keyed provider for readonly work on such endpoints.
-- **`opencode run` and background**: a finished run-mode session cannot be
-  re-prompted, so completion briefs have nowhere to land — completions are
-  ledger-only (read them via `forge_dispatch_list`). Background mode targets
-  live TUI sessions; prefer sync under `opencode run`.
-- **Host tool ceiling (~262s observed on 1.18.32)**: the host may kill a
-  sync tool call that exceeds roughly 262 seconds even though the plugin's
-  own deadline is higher. A same-family transport abort (~281s observed,
-  2026-09-27 incident) can also kill the background dispatch's turn POST.
-  Transport-interruption recovery (above) absorbs both: the dispatch falls
-  back to polling and still delivers the child's result; keep `timeoutMs`
-  modest anyway for sync-heavy workflows.
-- **Child permission asks**: a worker that hits a permission ask surfaces the
-  ask on the CHILD's session in the TUI. An unanswered ask stalls the child
-  until the dispatch deadline — scope worker prompts to avoid permission
-  boundaries (readonly tiers and workspace-relative paths help).
+The old dispatch suite's ledger at `<tmp>/opencode-forge/dispatch/` is no
+longer written. If it exists on your machine it is inert runtime debris —
+delete the directory freely, also after uninstalling.
 
 ## Hang watchdog (a stuck builtin shell unblocks itself)
 

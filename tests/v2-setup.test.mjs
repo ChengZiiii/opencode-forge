@@ -77,3 +77,71 @@ test("v2 setup: silently skips on host shape drift without throwing", async () =
     }),
   )
 })
+
+// Task 3.3 �� v2 parity (spec: forge-subagents): setup registers the static
+// subagents create-only from forge.json (process cwd), degrading silently on
+// any host-shape drift.
+
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+
+test("v2 setup: registers forge subagents from the cwd forge.json (create-only)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-v2-"))
+  const prevCwd = process.cwd()
+  try {
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+    process.chdir(dir)
+    const { ctx, agents } = makeCtx()
+    await v2Setup(ctx)
+    assert.ok(agents.has("forge"), "the primary agent still registers")
+    assert.ok(agents.has("forge-research"), "the subagent registers")
+    const sub = agents.get("forge-research")
+    assert.equal(sub.mode, "subagent")
+    assert.equal(sub.model, "zai/glm")
+    assert.equal(sub.permission.task, "deny")
+  } finally {
+    process.chdir(prevCwd)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("v2 setup: never clobbers a user-defined forge-* entry", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-v2-"))
+  const prevCwd = process.cwd()
+  try {
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm" } } }))
+    process.chdir(dir)
+    const { ctx, agents } = makeCtx()
+    await v2Setup(ctx)
+    agents.get("forge-research").system = "USER OWNED"
+    await v2Setup(ctx)
+    assert.equal(agents.get("forge-research").system, "USER OWNED")
+  } finally {
+    process.chdir(prevCwd)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("v2 setup: unreadable config degrades to forge-only registration, never throws", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-v2-empty-"))
+  const prevCwd = process.cwd()
+  const prevHome = process.env.FORGE_TEST_FORGE_HOME
+  try {
+    process.chdir(dir)
+    // Redirect the global cascade away from the real user home (which may
+    // legitimately carry a forge.json — that would be a config, not "none").
+    process.env.FORGE_TEST_FORGE_HOME = join(dir, "home")
+    const { ctx, agents } = makeCtx()
+    await assert.doesNotReject(v2Setup(ctx))
+    assert.ok(agents.has("forge"))
+    assert.equal(agents.has("forge-research"), false, "no subagents without config")
+  } finally {
+    if (prevHome === undefined) delete process.env.FORGE_TEST_FORGE_HOME
+    else process.env.FORGE_TEST_FORGE_HOME = prevHome
+    process.chdir(prevCwd)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
