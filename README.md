@@ -131,6 +131,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger: resolved identity/depth, outcomes, tokens/cost, timeouts, lost-on-exit, crew summaries (bounded, capped rotation) | runtime debris — delete freely, also after uninstall |
+| `<project>/.opencode/forge.json`, `~/.config/opencode/forge.json` | your dispatch agent definitions (JSONC). **User data — the plugin only reads it, never writes or migrates it** | yours — version the project one, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
 
@@ -320,50 +321,95 @@ complete.
 
 ## Worker dispatch (scoped subagents on a chosen model + depth)
 
-`forge_dispatch {prompt, profile, depth}` spawns a child session that runs one
-scoped task on a dynamically chosen model and reasoning depth. The result is
-an honest report: the actual model/depth used, real token counts, a
-self-computed cost (`null` when the model is unpriced), and the worker's
-concluding report.
+`forge_dispatch {prompt, agent, depth}` spawns a child session that runs one
+scoped task on the agent's pinned model at the requested reasoning depth. The
+result is an honest report: the actual model/depth used, real token counts, a
+self-computed cost (`null` when the model is unpriced), the
+`depthTranslation` disclosure (`canonical high → native XHigh`, or
+`verbatim`), and the worker's concluding report.
 
-### Roster and the expose ladder
+### forge.json — the dispatch configuration
 
-Tiers pick candidates from a roster you configure (plugin options, your
-config — the plugin never writes it):
+Agents live in a dedicated `forge.json` (JSONC — comments allowed), resolved
+by a three-level cascade with a single winning source (never merged):
+
+1. `<project>/.opencode/forge.json` — project-level, versionable, team-shared
+2. `~/.config/opencode/forge.json` — global
+3. the built-in seed — `research {depths: [low, medium]}` and
+   `review {depths: [medium, high, max]}`, both pinned to the placeholder
+   `Local/GPT Luna` (an identity that never resolves: an unconfigured install
+   fails every dispatch with the configuration recipe below)
 
 ```jsonc
-["<plugin>", {
-  "dispatch": {
-    "timeoutMs": 600000,        // per-dispatch deadline, 1000–600000, default 600000
-    "maxConcurrent": 4,         // 1–16, default 4 — one slot pool shared by sync and background
-    "roster": [
-      { "model": "zai-coding-plan/glm-5.3", "expose": ["low", "high"], "profiles": ["scout", "quick"] }
-    ]
+{
+  // forge dispatch agents — save the file; changes apply on the next dispatch, no restart
+  "agents": {
+    "research": {
+      "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string
+      "depths": ["low", "medium"], // first entry is the default
+      // "prompt": "optional role prompt riding inside the discipline wrapper",
+      // "shape": "write", // default readonly denies mutating tools
+      // "permission": { "bash": "deny" } // optional override; "task" is always denied
+    }
   }
-}]
+}
 ```
 
-- `profiles` lists which tiers the model serves; any model with no roster
-  entry is still dispatchable through its native reasoning ladder.
-- `expose` narrows the depth vocabulary the tier may request for that model.
-  Use it when the endpoint only honors a subset of its native ladder.
-- **Exact-match semantics**: `depth` must be verbatim from the exposed
-  vocabulary — there is no clamping and no silent fallback. A mis-set depth
-  is an error that names every candidate and its legal levels. Omit `depth`
-  to use the tier's default when it has one; a tier whose default is not
-  exposed degrades to depth-required (startup warns).
-- Built-in tiers: `scout` (readonly recon), `build` (implementation),
-  `review` (readonly review), `quick` (mechanical small change). Each is
-  materialized as a hidden `forge-<tier>` subagent that carries the tier's
-  permission shape — readonly tiers physically deny `write`/`edit`/`bash`,
-  and every tier denies `task` (no recursive spawning). Startup validation
-  surfaces roster mistakes by name (typos in `expose` error with the legal
-  ladder; dead keys warn).
+- **The plugin only ever reads this file.** It never creates, writes, or
+  migrates it. Unconfigured? The first `forge_dispatch` error carries a
+  machine-actionable recipe (detected identities, both file paths, the
+  template, a verify dispatch) — or just ask your session AI to configure
+  dispatch; `forge_dispatch_config` shows the exact live state.
+- **Hot-apply**: the file is re-read (mtime-cached) before every dispatch and
+  on every `forge_dispatch_config` call — edits take effect on the next
+  dispatch, no host restart. One boundary: newly added agents materialize
+  their hidden `forge-<agent>` entry only on the next config reload; the
+  dispatch itself still works (the body names the agent), but a brand-new
+  agent's first dispatch may need a host reload if the host validates agent
+  names on session create.
+- Each agent materializes as a hidden `mode: subagent` agent `forge-<agent>`
+  carrying the role prompt (explicit `prompt` > built-in research/review
+  defaults > generic worker) and a deny-style permission: `shape: "readonly"`
+  (the default) denies `write`/`edit`/`bash`, `shape: "write"` allows them,
+  an explicit `permission` map overrides the shape default — and `task` is
+  ALWAYS denied (recursive dispatch stays physically impossible). Agents
+  never carry a `model` field; the brain is bound per dispatch.
+
+### The depth metalanguage
+
+`depth` comes from the canonical five-word set `none | low | medium | high |
+max`, or the model's **native level names verbatim** (escape hatch — e.g.
+Qwen's `XHigh`). Translation to the provider's native parameter follows three
+hard rules:
+
+- **verbatim-first**: a meta word the model natively offers passes as-is
+- **no interpolation**: a meta word with no counterpart errors listing both
+  vocabularies — never a nearest guess
+- **full disclosure**: the report always shows `canonical → native`
+
+Per family: effort-style providers (OpenAI-compatible) receive
+`reasoningEffort = <word>`; budget-style (Anthropic-style) receive a
+published thinking tier — `low → 8192`, `medium → 16384`, `high → 24576`,
+`max → 32768` budget tokens, `none → thinking off`; toggle-style (zai/GLM)
+receive thinking on/off (that shape has no level slot — disclosed honestly).
+A provider whose option shape the plugin does not know gets nothing injected,
+disclosed as `not injected (unknown provider shape)`. The provider is the
+final judge of every depth word: its raw errors flow back unedited.
+
+### Legacy inline roster (advanced)
+
+The pre-forge.json inline form still works when configured (the plugin
+options `dispatch.roster` / `dispatch.tiers`): tier ids it defines keep their
+exact-match resolution, one-retry-excluding-a-failed-identity semantics, and
+startup dead-key warnings. Legacy tier ids win over forge.json agents of the
+same name while inline options exist. Zero-config auto-generation of roster
+entries was removed (configured ≠ usable) — dispatch without configuration is
+the seed + recipe path above.
 
 ### Background dispatch and wake briefs
 
 `forge_dispatch` takes `background: true`: it returns
-`{dispatchId, tier, requested, resolved, depth, queuedAt}` immediately and
+`{dispatchId, agent, requested, resolved, depth, queuedAt}` immediately and
 the full result arrives later as a coalesced `[forge:dispatch-complete]`
 brief — debounced, never interrupting an active turn (delivery waits for an
 idle), each terminal delivered exactly once, and merged into a single
@@ -390,11 +436,11 @@ ends it honestly and the ledger keeps the history.
 
 ### Known pitfalls
 
-- **Keyless endpoints × restricted tiers**: free/keyless providers can return
-  a deterministic EMPTY response for any toolset-reduced (readonly) tier —
+- **Keyless endpoints × readonly agents**: free/keyless providers can return
+  a deterministic EMPTY response for any toolset-reduced (readonly) agent —
   0 tokens, no parts. The plugin detects this and fails the dispatch honestly
-  (`empty-response`, never counted as success); use a write tier or a keyed
-  provider for readonly tiers on such endpoints.
+  (`empty-response`, never counted as success); use a `shape: "write"` agent
+  or a keyed provider for readonly work on such endpoints.
 - **`opencode run` and background**: a finished run-mode session cannot be
   re-prompted, so completion briefs have nowhere to land — completions are
   ledger-only (read them via `forge_dispatch_list`). Background mode targets
