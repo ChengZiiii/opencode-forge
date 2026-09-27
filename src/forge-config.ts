@@ -336,13 +336,26 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, "utf8"))
   const paths = forgeConfigPaths({ projectDir: deps.projectDir, homeDir: deps.homeDir })
 
+  // Hot-apply cache (design D2): stat before every load; only an mtime/size
+  // change triggers a re-read. Cached per path, INCLUDING parse failures, so
+  // a broken file does not re-parse on every dispatch.
+  const cache = new Map<string, { mtimeMs: number; size: number; result: LoadedForgeConfig }>()
+
   const readCandidate = (path: string, source: Exclude<ForgeConfigSource, "seed">): LoadedForgeConfig | null => {
-    if (stat(path) === null) return null
-    const parsed = parseForgeJsonc(readFile(path))
+    const st = stat(path)
+    if (st === null) {
+      cache.delete(path)
+      return null
+    }
+    const hit = cache.get(path)
+    if (hit && hit.mtimeMs === st.mtimeMs && hit.size === st.size) return hit.result
+    const text = readFile(path)
+    const parsed = parseForgeJsonc(text)
+    let result: LoadedForgeConfig
     if (!parsed.ok) {
       // Design D9: a broken winning file falls back to the SEED, never to the
       // next cascade level — no half-configured hybrid states.
-      return {
+      result = {
         agents: { ...SEED_AGENTS },
         source: "seed",
         path: null,
@@ -354,8 +367,11 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
           },
         ],
       }
+    } else {
+      result = { agents: parsed.config.agents, source, path, findings: [] }
     }
-    return { agents: parsed.config.agents, source, path, findings: [] }
+    cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result })
+    return result
   }
 
   return {
