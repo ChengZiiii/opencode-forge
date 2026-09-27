@@ -42,14 +42,29 @@
 - **WHEN** an agent pins a model that is not configured on the host (including the built-in placeholder `Local/GPT Luna`)
 - **THEN** dispatch errors naming the pinned model and the error carries the configuration recipe (see the seed onboarding requirement); no other model is used
 
+#### Scenario: Requested depth nobody exposes is a hard error
+
+- **WHEN** a dispatch names a legacy inline tier (agent id = tier name) at a depth that no candidate serving that tier exposes
+- **THEN** the dispatch call returns a structured error listing every candidate's exposure and the available depth vocabulary, and nothing is spawned
+
+#### Scenario: Pinned model unavailable errors without fallback
+
+- **WHEN** a legacy inline tier pins `model: "zai-coding-plan/glm-5.3"` with `depth: "max"` and that identity is not currently available
+- **THEN** dispatch errors naming the pinned identity and suggesting fixing or unpinning it; no other model is used
+
+#### Scenario: One retry after a mid-dispatch failure
+
+- **WHEN** a legacy inline tier's resolved identity fails during the dispatch attempt
+- **THEN** resolution retries once excluding that identity and the result reports which identity actually served the dispatch; an agents-path dispatch (model pinned per definition) never retries with another model — the honest error is reported
+
 ### Requirement: forge_dispatch tool contract
 
 The plugin SHALL register a `forge_dispatch` tool on the forge agent taking `{prompt, agent, depth?, background?}` (`agent` names a dispatch agent from `forge.json`; `depth` defaults to the agent's first depths entry and must be a member of that agent's set). The tool SHALL create a child session on the host instance via the plugin input's bundled client, attach the materialized agent via the message body's `agent` field and the pinned model via the body's `model` field, poll for completion with a per-dispatch deadline (`dispatch.timeoutMs`, default 600000, max 600000), and return an honest report: `{agent, requested:{agent,depth}, actual:{model,depth}, sessionID, durationMs, tokens{...}, costUsd|null, text, depthTranslation}` where `depthTranslation` discloses `canonical → native` (or "verbatim"). Concurrent dispatches beyond `dispatch.maxConcurrent` (default 4) SHALL be refused with a retry hint. When `agent["forge"].disable` is set the tool SHALL not be registered.
 
-#### Scenario: A successful dispatch reports actuals and the translation
+#### Scenario: A successful dispatch reports actuals honestly
 
 - **WHEN** forge_dispatch runs agent=research depth=low and the child session completes
-- **THEN** the result names the pinned model, the actual depth with its `canonical → native` disclosure, real token counts, a self-computed cost, and the worker's concluding text
+- **THEN** the result names the pinned model, the actual depth with its `canonical → native` disclosure (`depthTranslation`), real token counts, a self-computed cost, and the worker's concluding text
 
 #### Scenario: Timeout reports partial state
 
