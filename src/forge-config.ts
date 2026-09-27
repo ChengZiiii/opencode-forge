@@ -380,7 +380,20 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
       if (project) return project
       const global = paths.global ? readCandidate(paths.global, "global") : null
       if (global) return global
-      return { agents: { ...SEED_AGENTS }, source: "seed", path: null, findings: [] }
+      // Truly unconfigured (no file anywhere): one notice pointing at the
+      // recipe. A broken file already reported its parse error above.
+      return {
+        agents: { ...SEED_AGENTS },
+        source: "seed",
+        path: null,
+        findings: [
+          {
+            level: "notice",
+            code: "dispatch-unconfigured",
+            message: "forge dispatch is unconfigured (no forge.json found): every forge_dispatch call will fail with the configuration recipe. Create .opencode/forge.json (project) or ~/.config/opencode/forge.json (global), or ask your session AI to configure dispatch — the recipe in the dispatch error tells it exactly what to write.",
+          },
+        ],
+      }
     },
   }
 }
