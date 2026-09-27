@@ -81,7 +81,7 @@ import { validateCrewReport, type CrewSubtaskReport } from "./src/crew-gate.ts"
 import { composeWorkerPrompt } from "./src/dispatch-prompt.ts"
 import { tierAgentDef, forgeAgentDef } from "./src/dispatch-tiers.ts"
 import { applyDepthTranslation, type DepthTranslation } from "./src/dispatch-depth.ts"
-import { createForgeConfigLoader, type LoadedForgeConfig } from "./src/forge-config.ts"
+import { createForgeConfigLoader, forgeConfigPaths, forgeRecipe, type LoadedForgeConfig } from "./src/forge-config.ts"
 import { loadModelsDevSnapshot } from "./src/models-dev.ts"
 
 const FORGE_AGENT = "forge"
@@ -1242,7 +1242,7 @@ function dispatchBriefText(entries: RegistryEntry[]): string {
   for (const e of entries) {
     lines.push(
       "",
-      `- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not yet started)"}`,
+      `- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not yet started)"}`,
     )
     const r = e.result as Record<string, unknown> | undefined
     if (r !== undefined) {
@@ -1282,18 +1282,19 @@ async function injectDispatchBrief(sessionID: string): Promise<void> {
   }
 }
 
-// forge_dispatch: scoped worker dispatch on a dynamically chosen model +
-// reasoning depth (spec: dispatch — forge_dispatch tool contract). The engine
-// (create -> message -> poll -> aggregate) lives in src/dispatch-engine.ts;
-// this tool validates params, guards the plan-draft phase (belt on top of the
-// tool.execute.before suspenders), and formats the honest report.
+// forge_dispatch: scoped worker dispatch on a forge.json agent (spec:
+// dispatch — "forge_dispatch tool contract"). The engine (create -> message
+// -> poll -> aggregate) lives in src/dispatch-engine.ts; this tool validates
+// params, guards the plan-draft phase (belt on top of the tool.execute.before
+// suspenders), enriches pin-unavailable errors with the onboarding recipe,
+// and formats the honest report.
 const forgeDispatchTool = tool({
   description:
-    "Dispatch a scoped task to a worker subagent running on a dynamically selected model and reasoning depth. Takes {prompt, profile, depth}: profile is a dispatch tier (scout=readonly recon, build=implementation, review=readonly review, quick=mechanical small change); depth is a reasoning level and must EXACTLY match one of the levels exposed for the resolved model — the vocabulary is listed below and in errors; there is no clamping, a mis-set depth is an error. Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
+    "Dispatch a scoped task to a worker subagent defined in forge.json. Takes {prompt, agent, depth}: agent names a dispatch agent (see forge_dispatch_config for the effective set); the agent's model is pinned by its definition — no fallback ever. depth comes from the canonical metalanguage (none, low, medium, high, max; default = the agent's first entry) or the model's native level names verbatim (escape hatch); the ONLY validation is membership in the agent's depths — the provider is the final judge and its raw errors flow back. The report discloses the depth translation (canonical -> native). Background mode targets live TUI sessions; under `opencode run` prefer sync. The result reports the actual model/depth, real token counts, a self-computed cost (null when unpriced), and the worker's concluding report. Refuses while a plan draft is active.",
   args: {
     prompt: tool.schema.string().describe("Complete, self-contained task for the worker (it cannot see this conversation)"),
-    profile: tool.schema.string().describe("Dispatch tier: scout | build | review | quick (or a user-defined tier id)"),
-    depth: tool.schema.string().optional().describe("Reasoning depth, verbatim from the exposed vocabulary; omit to use the tier's default when it has one"),
+    agent: tool.schema.string().describe("Dispatch agent id from forge.json (e.g. research, review, or a custom id; legacy inline tier ids still work when configured)"),
+    depth: tool.schema.string().optional().describe("Reasoning depth: none | low | medium | high | max (canonical) or the model's native level name verbatim; omit to use the agent's first depths entry"),
     background: tool.schema.boolean().optional().describe(
       "Run in the background: returns {dispatchId, resolved, queuedAt} immediately; the full result arrives later as a coalesced [forge:dispatch-complete] brief when the session is idle. Background mode targets live TUI sessions — under `opencode run` the session ends before any brief, so completions are ledger-only (read them via forge_dispatch_list) and sync mode is preferred.",
     ),
@@ -1310,15 +1311,15 @@ const forgeDispatchTool = tool({
     const engine = activeDispatchEngine
     if (!engine) throw new Error("[forge] dispatch engine unavailable (disabled by dispatch.disable, or config still loading).")
     try {
-      const r = await engine.dispatch({ prompt: args.prompt, profile: args.profile, ...(args.depth !== undefined ? { depth: args.depth } : {}) }, context.sessionID, args.background === true ? { background: true } : undefined)
+      const r = await engine.dispatch({ prompt: args.prompt, agent: args.agent, ...(args.depth !== undefined ? { depth: args.depth } : {}) }, context.sessionID, args.background === true ? { background: true } : undefined)
       if ("dispatchId" in r) {
         // Background handle (spec: eager resolution, nothing awaited).
-        context.metadata({ title: `dispatch ${r.tier} queued (${r.dispatchId})` })
+        context.metadata({ title: `dispatch ${r.agent} queued (${r.dispatchId})` })
         return {
-          title: `dispatch ${r.tier} queued → ${r.resolved}${r.depth ? ` @${r.depth}` : ""}`,
+          title: `dispatch ${r.agent} queued → ${r.resolved}${r.depth ? ` @${r.depth}` : ""}`,
           output: [
             `[forge:dispatch] accepted in the background: ${r.dispatchId}`,
-            `tier: ${r.tier}   resolved: ${r.resolved}${r.depth ? `   depth: ${r.depth}` : ""}`,
+            `agent: ${r.agent}   resolved: ${r.resolved}${r.depth ? `   depth: ${r.depth}` : ""}`,
             `queuedAt: ${r.queuedAt}`,
             "",
             "The full result (tokens/cost/report — or the timeout/error report) arrives as a [forge:dispatch-complete] brief when this session is next idle. Track progress any time with forge_dispatch_list; cancel with forge_dispatch_kill.",
@@ -1327,12 +1328,12 @@ const forgeDispatchTool = tool({
       }
       const tok = r.tokens
       const costLine = r.costUsd !== null && r.costUsd !== undefined ? `$${r.costUsd.toFixed(6)}${r.priceSnapshot ? ` (${r.priceSnapshot})` : ""}` : `unpriced${r.costNote ? ` — ${r.costNote}` : ""}`
-      context.metadata({ title: `dispatch ${r.tier}: ${r.actual.model} @ ${r.actual.depth}` })
+      context.metadata({ title: `dispatch ${r.agent}: ${r.actual.model} @ ${r.actual.depth}` })
       return {
-        title: `dispatch ${r.tier} → ${r.actual.model} @${r.actual.depth}`,
+        title: `dispatch ${r.agent} → ${r.actual.model} @${r.actual.depth}`,
         output: [
           `[forge:dispatch] completed in ${r.durationMs}ms`,
-          `tier: ${r.tier}   model: ${r.actual.model}   depth: ${r.actual.depth}${r.requested.depth !== undefined && r.requested.depth !== r.actual.depth ? ` (requested ${r.requested.depth})` : ""}`,
+          `agent: ${r.agent}   model: ${r.actual.model}   depth: ${r.actual.depth}${r.requested.depth !== undefined && r.requested.depth !== r.actual.depth ? ` (requested ${r.requested.depth})` : ""}`,
           `session: ${r.sessionID}`,
           `tokens: input ${tok.input ?? 0}, output ${tok.output ?? 0}, reasoning ${tok.reasoning ?? 0}, cache r/w ${tok.cache?.read ?? 0}/${tok.cache?.write ?? 0}`,
           `cost: ${costLine}`,
@@ -1343,11 +1344,27 @@ const forgeDispatchTool = tool({
         ].join("\n"),
       }
     } catch (err) {
+      // The recipe rides the pin-unavailable error: the unconfigured state is
+      // self-explanatory for the session AI reading it (spec — seed onboarding).
+      if (err instanceof DispatchError && err.code === "pin-unavailable") {
+        throw new Error(`[forge:dispatch:pin-unavailable] ${err.message}\n\n${dispatchRecipeText()}`)
+      }
       if (err instanceof DispatchError) throw new Error(`[forge:dispatch:${err.code}] ${err.message}`)
       throw err
     }
   },
 })
+
+// The onboarding recipe payload: detected identities + the two file paths.
+// Pure data from state captured at the config hook.
+function dispatchRecipeText(): string {
+  const paths = forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+  return forgeRecipe({
+    detectedIdentities: lastDetectedIdentities,
+    projectPath: paths.project || "(project .opencode/forge.json)",
+    globalPath: paths.global,
+  })
+}
 
 
 // forge_dispatch_list (3.4): in-flight + recent terminal background dispatches
@@ -1367,13 +1384,13 @@ const forgeDispatchListTool = tool({
     if (l.inFlight.length > 0) {
       lines.push("In flight:")
       for (const e of l.inFlight) {
-        lines.push(`- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state} · queued ${e.queuedAt} · session ${e.sessionID || "(starting)"}`)
+        lines.push(`- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state} · queued ${e.queuedAt} · session ${e.sessionID || "(starting)"}`)
       }
     }
     if (l.terminal.length > 0) {
       lines.push("", "Recent terminal results:")
       for (const e of l.terminal.slice().reverse()) {
-        lines.push(`- ${e.dispatchId} · tier ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not started)"}`)
+        lines.push(`- ${e.dispatchId} · agent ${e.tier} · ${e.identity}${e.depth ? ` @${e.depth}` : ""} · ${e.state.toUpperCase()} · session ${e.sessionID || "(not started)"}`)
         const r = e.result as Record<string, unknown> | undefined
         if (r !== undefined) lines.push(`  result: ${JSON.stringify(r, null, 1).slice(0, 2000)}`)
         if (e.lateCompletion !== undefined) lines.push(`  (killed; a late result arrived after the kill and was discarded: ${JSON.stringify(e.lateCompletion).slice(0, 300)})`)
@@ -2084,11 +2101,13 @@ export const server: Plugin = async (input, options) => {
           cfg: roster,
           catalog: snapshot.catalog,
           available: (identity) => {
-            // Availability = configured now; catalog presence is not required
-            // (custom providers stay dispatchable — D6). A dead roster key was
-            // already flagged at validation.
-            return roster.roster.some((e) => e.model === identity)
+            // Availability = configured on the host OR present in the legacy
+            // roster (dead-key entries stay dispatchable, preserving legacy
+            // behavior). Custom providers stay dispatchable — D6.
+            return roster.roster.some((e) => e.model === identity) || lastDetectedIdentities.includes(identity)
           },
+          agents: () => forgeLoader?.load().agents ?? {},
+          legacy: legacyInline,
           sink: (entry) => dispatchLedger.append(entry),
           registry: activeDispatchRegistry,
           onTerminal: (parentSessionID) => scheduleDispatchWake(parentSessionID, false),

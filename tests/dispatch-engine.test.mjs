@@ -597,3 +597,101 @@ test("B42: dispose with several in-flight background dispatches ledger each as l
   release()
   await settle()
 })
+
+// ---------------------------------------------------------------------------
+// add-dispatch-onboarding — agents path (forge.json): pinned model, no retry.
+
+const AGENTS_MAP = {
+  research: { model: "zai-coding-plan/glm-5.3", depths: ["low", "high", "max"], shape: "readonly" },
+  auditor: { model: "opencode-go/glm-5.3", depths: ["low"], prompt: "You are a dependency auditor." },
+}
+
+function agentsDeps(fetcher, over = {}) {
+  return baseDeps(fetcher, { legacy: false, agents: () => AGENTS_MAP, ...over })
+}
+
+test("4.2 agents path: pinned model, forge-<agent> body, role prompt inside the wrapper", async () => {
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: /\/message$/, handle: (u, init, calls) => {
+      const postCount = calls.filter((c) => c.init?.method === "POST" && c.url.endsWith("/message")).length
+      if (postCount >= 1) return jsonRes([{ info: { role: "assistant", tokens: { input: 3, output: 2, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "ok" }] }])
+      return jsonRes([])
+    } },
+  ])
+  const engine = createDispatchEngine(agentsDeps(fetcher))
+  const r = await engine.dispatch({ prompt: "check deps", agent: "auditor", depth: "low" })
+  assert.equal(r.agent, "auditor")
+  assert.equal(r.actual.model, "opencode-go/glm-5.3")
+  const body = JSON.parse(fetcher.calls.find((c) => c.init?.method === "POST" && c.url.endsWith("/message")).init.body)
+  assert.deepEqual(body.model, { providerID: "opencode-go", modelID: "glm-5.3" })
+  assert.equal(body.agent, "forge-auditor")
+  assert.match(body.parts[0].text, /dependency auditor/)
+  assert.match(body.parts[0].text, /Mandates/)
+  // default depth = first entry (no explicit depth needed)
+  const r2 = await engine.dispatch({ prompt: "x", agent: "research" })
+  assert.equal(r2.actual.depth, "low")
+})
+
+test("4.2 unknown agent errors with the code and the defined names", async () => {
+  const engine = createDispatchEngine(agentsDeps(fakeFetcher([])))
+  await assert.rejects(
+    () => engine.dispatch({ prompt: "x", agent: "ghost" }),
+    (err) => {
+      assert.equal(err.code, "unknown-agent")
+      assert.match(err.message, /research/)
+      return true
+    },
+  )
+})
+
+test("4.2 out-of-set depth errors depth-not-in-set", async () => {
+  const engine = createDispatchEngine(agentsDeps(fakeFetcher([])))
+  await assert.rejects(
+    () => engine.dispatch({ prompt: "x", agent: "research", depth: "medium" }),
+    (err) => err.code === "depth-not-in-set",
+  )
+})
+
+test("4.2 unavailable pinned model errors pin-unavailable — never a fallback", async () => {
+  const engine = createDispatchEngine(agentsDeps(fakeFetcher([]), { available: () => false }))
+  await assert.rejects(
+    () => engine.dispatch({ prompt: "x", agent: "research" }),
+    (err) => {
+      assert.equal(err.code, "pin-unavailable")
+      assert.match(err.message, /no fallback/i)
+      return true
+    },
+  )
+})
+
+test("4.2 agents path NEVER retries on empty-response — one session, honest error", async () => {
+  let creates = 0
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => { creates++; return jsonRes({ id: CHILD }) } },
+    { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "user" }, parts: [] }])) },
+  ])
+  const engine = createDispatchEngine(agentsDeps(fetcher))
+  await assert.rejects(
+    () => engine.dispatch({ prompt: "x", agent: "research", depth: "low" }),
+    (err) => err.code === "empty-response",
+  )
+  assert.equal(creates, 1, "a pinned model that fails is reported, never retried on another model")
+})
+
+test("4.2 no-native-mapping on the agents path errors before spawn", async () => {
+  const catalog = { providers: { qwen: { models: { "qwen3-max": { reasoningOptions: ["none", "low", "medium", "XHigh"] } } } } }
+  const agents = { research: { model: "qwen/qwen3-max", depths: ["low", "medium", "high"] } }
+  const fetcher = fakeFetcher([]) // any fetch would fail the test differently
+  const engine = createDispatchEngine(agentsDeps(fetcher, { catalog, agents: () => agents }))
+  await assert.rejects(
+    () => engine.dispatch({ prompt: "x", agent: "research", depth: "high" }),
+    (err) => {
+      assert.equal(err.code, "no-native-mapping")
+      assert.match(err.message, /XHigh/)
+      assert.match(err.message, /never interpolates/i)
+      return true
+    },
+  )
+  assert.equal(fetcher.calls.length, 0)
+})

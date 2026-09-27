@@ -12,20 +12,33 @@ import { completionVerdict, computeCost, sumTokens, type PollState, type TokenCo
 import type { DispatchRegistry } from "./dispatch-registry.ts"
 import type { ResolveOk } from "./dispatch-resolver.ts"
 import { composeWorkerPrompt } from "./dispatch-prompt.ts"
-import { resolveDispatch } from "./dispatch-resolver.ts"
+import { resolveDispatch, resolveAgent } from "./dispatch-resolver.ts"
 import { translateDepth, type DepthFamilyID, type DepthTranslation } from "./dispatch-depth.ts"
 import { nativeLadder, type BuiltRoster, type CatalogSnapshot } from "./dispatch-roster.ts"
+import { rolePromptFor, tierAgentPrompt } from "./dispatch-tiers.ts"
+import type { ForgeAgentDef } from "./forge-config.ts"
 
 export const DEFAULT_DISPATCH_TIMEOUT_MS = 600_000
 export const MAX_DISPATCH_TIMEOUT_MS = 600_000
 export const DEFAULT_MAX_CONCURRENT = 4
 export const DEFAULT_POLL_INTERVAL_MS = 2_000
 
-export type DispatchRequest = { prompt: string; profile: string; depth?: string }
+export type DispatchRequest = { prompt: string; agent: string; depth?: string }
+
+// One resolved dispatch target, unified over the two paths:
+//   agents path  forge.json agent — model pinned by the definition, NO retry
+//   legacy path  inline roster/tier resolution — keeps the one-retry rule
+export type ResolvedDispatch = {
+  model: string
+  depth: string
+  agentPath: boolean
+  shape: "readonly" | "write"
+  role?: string
+}
 
 export type DispatchResult = {
-  tier: string
-  requested: { profile: string; depth?: string }
+  agent: string
+  requested: { agent: string; depth?: string }
   actual: { model: string; depth: string }
   sessionID: string
   durationMs: number
@@ -40,7 +53,10 @@ export type DispatchResult = {
 export type DispatchLedgerEvent = {
   ts: string
   event: string
+  // D8 compat: the ledger keeps the `tier` field NAME for old-row
+  // readability; new rows write the agent id into it (and mirror in `agent`).
   tier?: string
+  agent?: string
   identity?: string
   depth?: string
   sessionID?: string
@@ -69,6 +85,11 @@ export type DispatchEngineDeps = {
   cfg: BuiltRoster
   catalog: CatalogSnapshot
   available: (identity: string) => boolean
+  // forge.json agents (hot-apply: re-loaded before each dispatch).
+  agents: () => Record<string, ForgeAgentDef>
+  // true when inline dispatch.roster/tiers options are configured (legacy
+  // path active for tier ids it defines).
+  legacy?: boolean
   sink: (entry: DispatchLedgerEvent) => void
   // Registers the resolved depth translation for the child session (feeds
   // the chat.params injection table); providerFamily resolves the option
@@ -141,19 +162,48 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     return r
   }
 
+  // Unified resolution (add-dispatch-onboarding): legacy tiers win for ids
+  // they define (compat — existing inline configs keep their semantics);
+  // everything else resolves against forge.json agents. `exclude` is a
+  // legacy-only retry input; the agents path never retries.
+  const resolveForThrow = (req: DispatchRequest, exclude: string[] | undefined): ResolvedDispatch => {
+    if (deps.legacy && req.agent in deps.cfg.tiers) {
+      const r: ResolveOk = resolveOrThrow(req.agent, req.depth, exclude)
+      return {
+        model: r.identity,
+        depth: r.depth,
+        agentPath: false,
+        shape: deps.cfg.tiers[req.agent]?.shape ?? "readonly",
+        role: tierAgentPrompt(req.agent),
+      }
+    }
+    const a = resolveAgent(deps.agents(), { agent: req.agent, depth: req.depth }, deps.available)
+    if (!a.ok) {
+      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: req.agent, agent: req.agent, outcome: a.error.code, note: a.error.message })
+      throw new DispatchError(a.error.message, a.error.code)
+    }
+    return {
+      model: a.model,
+      depth: a.depth,
+      agentPath: true,
+      shape: a.def?.shape === "write" ? "write" : "readonly",
+      role: rolePromptFor(req.agent, a.def),
+    }
+  }
+
   // Translate a resolved depth to the provider's native option (design D4:
   // verbatim-first / no interpolation / full disclosure). A no-mapping result
   // is a hard error — nothing may be spawned on an untranslatable depth.
-  const translationFor = (r: ResolveOk): DepthTranslation => {
-    const providerID = r.identity.slice(0, r.identity.indexOf("/"))
+  const translationFor = (identity: string, depth: string): DepthTranslation => {
+    const providerID = identity.slice(0, identity.indexOf("/"))
     const family = (deps.providerFamily(providerID) ?? "unknown") as DepthFamilyID
-    const ladder = nativeLadder(deps.catalog, r.identity)
-    return translateDepth(r.depth, family, ladder)
+    const ladder = nativeLadder(deps.catalog, identity)
+    return translateDepth(depth, family, ladder)
   }
-  const translationOrThrow = (r: ResolveOk): Exclude<DepthTranslation, { kind: "no-mapping" }> => {
-    const translation = translationFor(r)
+  const translationOrThrow = (identity: string, depth: string): Exclude<DepthTranslation, { kind: "no-mapping" }> => {
+    const translation = translationFor(identity, depth)
     if (translation.kind === "no-mapping") {
-      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: undefined, identity: r.identity, depth: r.depth, outcome: "no-native-mapping", note: translation.message })
+      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", agent: undefined, identity, depth, outcome: "no-native-mapping", note: translation.message })
       throw new DispatchError(translation.message, "no-native-mapping")
     }
     return translation
@@ -164,7 +214,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
   // the CALLER owns slot accounting, retries, and (for background) registry
   // terminal mapping. The per-dispatch deadline t0 is shared across attempts.
   async function runAttempt(
-    r: ResolveOk,
+    r: ResolvedDispatch,
     req: DispatchRequest,
     parentSessionID: string | undefined,
     t0: number,
@@ -172,10 +222,10 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     onChild: ((sessionID: string) => void) | undefined,
     dispatchId?: string,
   ): Promise<DispatchResult> {
-    const providerID = r.identity.slice(0, r.identity.indexOf("/"))
+    const providerID = r.model.slice(0, r.model.indexOf("/"))
     // Translation errors throw BEFORE the child session is created (nothing is
     // spawned on an untranslatable depth).
-    const translation = translationOrThrow(r)
+    const translation = translationOrThrow(r.model, r.depth)
     let childID = ""
     // Child session: parentID is best-effort (dev-branch semantics; 1.18.32
     // rejects some unknown CreateInput fields with 400) — retry plain.
@@ -208,9 +258,9 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     const turnPost = api(`/session/${childID}/message`, {
       method: "POST",
       body: JSON.stringify({
-        model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
-        agent: `forge-${req.profile}`,
-        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, agent: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }],
+        model: { providerID, modelID: r.model.slice(r.model.indexOf("/") + 1) },
+        agent: `forge-${req.agent}`,
+        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, agent: req.agent, shape: r.shape, ...(r.role ? { role: r.role } : {}) }) }],
       }),
     })
     await Promise.race([turnPost, deadlinePromise])
@@ -219,8 +269,8 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       deps.sink({
         ts: new Date().toISOString(),
         event: "timeout",
-        tier: req.profile,
-        identity: r.identity,
+        tier: req.agent, agent: req.agent,
+        identity: r.model,
         depth: r.depth,
         sessionID: childID,
         durationMs: elapsed,
@@ -245,8 +295,8 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
         deps.sink({
           ts: new Date().toISOString(),
           event: "timeout",
-          tier: req.profile,
-          identity: r.identity,
+          tier: req.agent, agent: req.agent,
+          identity: r.model,
           depth: r.depth,
           sessionID: childID,
           durationMs: elapsed,
@@ -269,8 +319,8 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       deps.sink({
         ts: new Date().toISOString(),
         event: "empty-response",
-        tier: req.profile,
-        identity: r.identity,
+        tier: req.agent, agent: req.agent,
+        identity: r.model,
         depth: r.depth,
         sessionID: childID,
         durationMs,
@@ -283,12 +333,12 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     }
 
     const tokens = sumTokens(tokensOf(messages))
-    const price = priceFor(deps.catalog, r.identity)
+    const price = priceFor(deps.catalog, r.model)
     const cost = computeCost(tokens, price?.spec ?? null)
     const result: DispatchResult = {
-      tier: req.profile,
-      requested: { profile: req.profile, depth: req.depth },
-      actual: { model: r.identity, depth: r.depth },
+      agent: req.agent,
+      requested: { agent: req.agent, depth: req.depth },
+      actual: { model: r.model, depth: r.depth },
       sessionID: childID,
       durationMs,
       tokens,
@@ -301,8 +351,8 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     deps.sink({
       ts: new Date().toISOString(),
       event: "completed",
-      tier: req.profile,
-      identity: r.identity,
+      tier: req.agent, agent: req.agent,
+      identity: r.model,
       depth: r.depth,
       sessionID: childID,
       outcome: "completed",
@@ -326,8 +376,8 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     e: unknown,
   ): void {
     const report = {
-      tier: req.profile,
-      requested: { profile: req.profile, depth: req.depth },
+      agent: req.agent,
+      requested: { agent: req.agent, depth: req.depth },
       actual: { model: identity, depth: null as string | null },
       sessionID: "",
       outcome: "error",
@@ -340,7 +390,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       deps.onTerminal?.(reg.get(dispatchId).parentSessionID)
       return
     }
-    deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.profile, identity, outcome: "error", note: report.error })
+    deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.agent, identity, outcome: "error", note: report.error })
     reg.markError(dispatchId, report)
     deps.onTerminal?.(reg.get(dispatchId).parentSessionID)
   }
@@ -351,7 +401,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     // Concurrency cap: ONE slot pool shared by sync and background dispatches
     // (spec: over-cap submits are refused identically).
     if (inFlight.size >= maxConcurrent) {
-      deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.profile, note: `${inFlight.size} in flight` })
+      deps.sink({ ts: new Date().toISOString(), event: "refused-cap", tier: req.agent, agent: req.agent, note: `${inFlight.size} in flight` })
       throw new DispatchError(
         `forge_dispatch refused: ${inFlight.size} dispatches already in flight (cap ${maxConcurrent}). Wait for a completion and retry.`,
         "cap-refused",
@@ -361,15 +411,14 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     const bg = opts?.background === true
     if (bg && !deps.registry) throw new DispatchError("background dispatch requires the dispatch registry (internal error)", "host-error")
 
-    // Eager resolution for BOTH paths: menu/pin errors surface synchronously
-    // before anything is spawned — translation errors too (nothing may spawn
-    // on an untranslatable depth).
-    const first: ResolveOk = resolveOrThrow(req.profile, req.depth, undefined)
-    translationOrThrow(first)
+    // Eager resolution for BOTH paths: menu/pin/translation errors surface
+    // synchronously before anything is spawned.
+    const first: ResolvedDispatch = resolveForThrow(req, undefined)
+    translationOrThrow(first.model, first.depth)
 
     if (bg) {
       const reg = deps.registry!
-      const { dispatchId } = reg.submit({ sessionID: "", identity: first.identity, depth: first.depth, tier: req.profile, parentSessionID: parentSessionID ?? "" })
+      const { dispatchId } = reg.submit({ sessionID: "", identity: first.model, depth: first.depth, tier: req.agent, parentSessionID: parentSessionID ?? "" })
       let fire = () => {}
       const promise = new Promise<void>((res) => {
         fire = res
@@ -382,11 +431,11 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
         try {
           if (reg.get(dispatchId).state === "killed") return // killed before the pipeline could start
           reg.markRunning(dispatchId)
-          let identity = first
+          let current = first
           let exclude: string[] | undefined = undefined
           for (let attemptNo = 0; ; attemptNo++) {
             try {
-              const result = await runAttempt(identity, req, parentSessionID, t0, ctl, (sid) => {
+              const result = await runAttempt(current, req, parentSessionID, t0, ctl, (sid) => {
                 try {
                   reg.get(dispatchId).sessionID = sid
                 } catch {}
@@ -395,7 +444,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
                 // The kill landed while the result was already in: discard and
                 // note it (spec: a result arriving after a kill is noted).
                 reg.noteLateCompletion(dispatchId, result)
-                deps.sink({ ts: new Date().toISOString(), event: "kill-late-completion", tier: req.profile, identity: identity.identity, sessionID: result.sessionID, outcome: "kill-late-completion" })
+                deps.sink({ ts: new Date().toISOString(), event: "kill-late-completion", tier: req.agent, agent: req.agent, identity: current.model, sessionID: result.sessionID, outcome: "kill-late-completion" })
               } else {
                 reg.markCompleted(dispatchId, result)
                 deps.onTerminal?.(reg.get(dispatchId).parentSessionID)
@@ -404,18 +453,20 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
             } catch (e) {
               if (e instanceof KillRequested) return // kill() already ledgered and mapped it
               if (reg.get(dispatchId).state === "killed") return
-              const retryable = e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response")
+              // Agents path: NO alternative-candidate retry — a pinned model
+              // that fails reports the honest error (owner ruling).
+              const retryable = !current.agentPath && e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response")
               const alternative = retryable
-                ? resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth, exclude: [identity.identity] }, deps.available, deps.catalog)
+                ? resolveDispatch(deps.cfg, { profile: req.agent, depth: req.depth, exclude: [current.model] }, deps.available, deps.catalog)
                 : { ok: false as const }
               if (!retryable || attemptNo > 0 || !alternative.ok) {
-                bgTerminal(reg, dispatchId, identity.identity, req, t0, e)
+                bgTerminal(reg, dispatchId, current.model, req, t0, e)
                 return
               }
-              deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.profile, identity: identity.identity, note: `${identity.identity}: ${(e as DispatchError).code}` })
-              exclude = [identity.identity]
-              identity = alternative
-              reg.get(dispatchId).identity = identity.identity
+              deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.agent, agent: req.agent, identity: current.model, note: `${current.model}: ${(e as DispatchError).code}` })
+              exclude = [current.model]
+              current = resolveForThrow(req, exclude)
+              reg.get(dispatchId).identity = current.model
             }
           }
         } finally {
@@ -425,32 +476,33 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       })()
       return {
         dispatchId,
-        tier: req.profile,
-        requested: { profile: req.profile, depth: req.depth },
-        resolved: first.identity,
+        agent: req.agent,
+        requested: { agent: req.agent, depth: req.depth },
+        resolved: first.model,
         depth: first.depth,
         queuedAt: reg.get(dispatchId).queuedAt,
       }
     }
 
-    // Sync path: bounded one-retry loop (spec B11); deadline t0 spans attempts.
+    // Sync path: bounded one-retry loop on the LEGACY path only (spec B11);
+    // deadline t0 spans attempts. The agents path never retries.
     let exclude: string[] | undefined = undefined
     for (let attemptNo = 0; ; attemptNo++) {
-      const r: ResolveOk = attemptNo === 0 ? first : resolveOrThrow(req.profile, req.depth, exclude)
+      const r: ResolvedDispatch = attemptNo === 0 ? first : resolveForThrow(req, exclude)
       const slot = `d${++seq}`
       inFlight.add(slot)
       try {
         return await runAttempt(r, req, parentSessionID, t0, undefined, undefined)
       } catch (e) {
-        const identity = r.identity
-        const retryable = e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response")
+        const identity = r.model
+        const retryable = !r.agentPath && e instanceof DispatchError && (e.code === "host-error" || e.code === "empty-response")
         if (!retryable || attemptNo > 0) throw e
         // Retry only when an alternative identity would actually serve; with
         // none, the ORIGINAL honest error stands (its guidance — e.g. the
         // keyless empty-response note — must not be swallowed by a menu).
-        const alternative = resolveDispatch(deps.cfg, { profile: req.profile, depth: req.depth, exclude: [identity] }, deps.available, deps.catalog)
+        const alternative = resolveDispatch(deps.cfg, { profile: req.agent, depth: req.depth, exclude: [identity] }, deps.available, deps.catalog)
         if (!alternative.ok) throw e
-        deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.profile, identity, note: `${identity}: ${(e as DispatchError).code}` })
+        deps.sink({ ts: new Date().toISOString(), event: "retry-excluded", tier: req.agent, agent: req.agent, identity, note: `${identity}: ${(e as DispatchError).code}` })
         exclude = [identity]
       } finally {
         inFlight.delete(slot)
@@ -501,8 +553,8 @@ class KillRequested extends Error {
 // nothing awaited — the pipeline continues detached).
 export type DispatchHandle = {
   dispatchId: string
-  tier: string
-  requested: { profile: string; depth?: string | null }
+  agent: string
+  requested: { agent: string; depth?: string | null }
   resolved: string
   depth: string | null
   queuedAt: string
