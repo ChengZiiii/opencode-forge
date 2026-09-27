@@ -177,3 +177,28 @@ test("1.3 repairing the file recovers on the next load", () => {
   assert.equal(recovered.source, "project")
   assert.deepEqual(recovered.findings, [])
 })
+
+// ---------------------------------------------------------------------------
+// 1.4 the unconfigured state carries one startup notice pointing at the recipe.
+
+test("1.4 unconfigured state surfaces one dispatch-unconfigured notice", () => {
+  const loaded = loaderWith({}).load()
+  assert.equal(loaded.source, "seed")
+  const notices = loaded.findings.filter((f) => f.code === "dispatch-unconfigured")
+  assert.equal(notices.length, 1)
+  assert.equal(notices[0].level, "notice")
+  assert.ok(notices[0].message.includes("forge.json"), "notice names the config file")
+  assert.ok(notices[0].message.toLowerCase().includes("dispatch"), "notice names the dispatch feature")
+})
+
+test("1.4 a configured state carries no notice", () => {
+  const loaded = loaderWith({ "/w/.opencode/forge.json": { text: PROJECT_TEXT } }).load()
+  assert.equal(loaded.findings.filter((f) => f.code === "dispatch-unconfigured").length, 0)
+})
+
+test("1.4 a broken file reports the parse error, not the unconfigured notice", () => {
+  const loaded = loaderWith({ "/w/.opencode/forge.json": { text: `{ broken` } }).load()
+  const codes = loaded.findings.map((f) => f.code)
+  assert.ok(codes.includes("config-parse-error"))
+  assert.ok(!codes.includes("dispatch-unconfigured"))
+})
