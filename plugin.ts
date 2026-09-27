@@ -1366,6 +1366,34 @@ function dispatchRecipeText(): string {
   })
 }
 
+// forge_dispatch_config (add-dispatch-onboarding): pure round-trip
+// introspection — the effective agents map exactly as the winning forge.json
+// defines it (writable back as valid agents content), the inline knobs, and
+// current findings. NO discovery fields: vocabulary constants live in the
+// tool descriptions/errors, detected identities only inside the unconfigured
+// recipe, in-flight state belongs to forge_dispatch_list.
+const forgeDispatchConfigTool = tool({
+  description:
+    "Read the effective forge dispatch configuration: {agents, knobs, findings}. agents mirrors the winning forge.json (project .opencode/forge.json > global ~/.config/opencode/forge.json > built-in seed) exactly — same keys, same shapes, writable back as valid forge.json agents content. knobs are the inline dispatch options {timeoutMs, maxConcurrent}. findings carry config state (config-parse-error, dispatch-unconfigured notice). Re-reads the file (mtime-cached) on every call, so edits are reflected immediately.",
+  args: {},
+  execute: async (_args, context) => {
+    const loaded = forgeLoader?.load() ?? { agents: {}, source: "seed", path: null, findings: [] }
+    context.metadata({ title: `dispatch config (${loaded.source})` })
+    return {
+      title: `dispatch config (${loaded.source}${loaded.path ? `: ${loaded.path}` : ""})`,
+      output: JSON.stringify(
+        {
+          agents: loaded.agents,
+          knobs: { timeoutMs: dispatchTimeoutMs, maxConcurrent: dispatchMaxConcurrent },
+          findings: loaded.findings,
+        },
+        null,
+        2,
+      ),
+    }
+  },
+})
+
 
 // forge_dispatch_list (3.4): in-flight + recent terminal background dispatches
 // with dispatchIds — the model's recovery path after context compaction.
@@ -1562,6 +1590,7 @@ function forgeTools(): Record<string, ToolDefinition> {
   }
   if (!dispatchDisabled && !forgeDisabled) {
     tools.forge_dispatch = forgeDispatchTool
+    tools.forge_dispatch_config = forgeDispatchConfigTool
     tools.forge_dispatch_list = forgeDispatchListTool
     tools.forge_dispatch_kill = forgeDispatchKillTool
     tools.crew_begin = crewBeginTool
