@@ -164,12 +164,13 @@ export function buildDispatchConfig(opts: {
     tiers[id] = { ...def, shape }
   }
 
-  // 2. Roster: user entries first (declaration order = priority), then
-  //    generated defaults for unlisted configured identities.
+  // 2. Roster: explicit user entries only (declaration order = priority).
+  //    add-dispatch-onboarding removed the zero-config auto-generation of
+  //    entries for unlisted configured identities (owner ruling: configured
+  //    != usable); dispatch configuration lives in forge.json, and this
+  //    inline roster is the documented legacy path.
   const roster: ResolvedRosterEntry[] = []
-  const listed = new Set<string>()
   for (const entry of opts.userRoster ?? []) {
-    listed.add(entry.model)
     const ladder = nativeLadder(catalog, entry.model)
     const verified = ladder !== null
     if (verified && catalogKnowsIdentity(catalog, entry.model)) {
@@ -213,16 +214,6 @@ export function buildDispatchConfig(opts: {
       })
       roster.push({ model: entry.model, expose: [...(entry.expose ?? [])], profiles: [...entry.profiles], verified: false })
     }
-  }
-  for (const identity of opts.configuredIdentities) {
-    if (listed.has(identity)) continue
-    const ladder = nativeLadder(catalog, identity)
-    roster.push({
-      model: identity,
-      expose: ladder ?? [],
-      profiles: ["scout", "quick"],
-      verified: ladder !== null,
-    })
   }
 
   // 3. Validation over the composed config.
