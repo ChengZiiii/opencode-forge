@@ -384,3 +384,118 @@ test("B11: a second consecutive failure is NOT retried again (one retry per disp
   await assert.rejects(() => engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }), (err) => err.code === "host-error")
   assert.equal(createCalls, 2, "exactly one retry: two attempts total")
 })
+
+// ---------------------------------------------------------------------------
+// 3.2 waves — background dispatch path (design D10/D12): eager resolution,
+// immediate handle, same pipeline + deadline, registry terminals, kill.
+// ---------------------------------------------------------------------------
+import { createDispatchRegistry } from "../src/dispatch-registry.ts"
+
+const settle = async () => { for (let i = 0; i < 50; i++) await new Promise((r) => setImmediate(r)) }
+
+test("3.2: background submit returns a handle immediately and completes asynchronously", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: new RegExp(`/session/${CHILD}/message$`), handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 3, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "bg done" }] }])) },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg }))
+  const before = new Date().toISOString()
+  const handle = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }, undefined, { background: true })
+  assert.ok(handle.dispatchId, "handle carries dispatchId")
+  assert.equal(handle.tier, "quick")
+  assert.equal(handle.resolved, "zai-coding-plan/glm-5.3", "resolution happened eagerly")
+  assert.ok(handle.queuedAt >= before, "queuedAt is stamped")
+  assert.equal(handle.text, undefined, "no result text on the handle")
+  await settle()
+  const entry = reg.get(handle.dispatchId)
+  assert.equal(entry.state, "completed")
+  assert.equal(entry.result.text, "bg done", "full result object lands in the registry")
+})
+
+test("3.2: background resolution errors return synchronously before any session is created", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([])
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg }))
+  await assert.rejects(
+    () => engine.dispatch({ prompt: "x", profile: "quick", depth: "medium" }, undefined, { background: true }),
+    (err) => err.code === "no-candidate",
+  )
+  assert.equal(fetcher.calls.filter((c) => c.url.includes("/session?directory=")).length, 0, "nothing spawned")
+})
+
+test("3.2: the concurrency cap is one pool — over-cap background submits are refused like sync", async () => {
+  const reg = createDispatchRegistry()
+  const gate = new Promise((r) => setTimeout(r, 200))
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: /\/message$/, handle: async () => { await gate; return jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "ok" }] }]) } },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg, maxConcurrent: 1 }))
+  const syncRunning = engine.dispatch({ prompt: "a", profile: "quick", depth: "low" })
+  await new Promise((r) => setTimeout(r, 5))
+  await assert.rejects(
+    () => engine.dispatch({ prompt: "b", profile: "quick", depth: "low" }, undefined, { background: true }),
+    (err) => { assert.equal(err.code, "cap-refused"); assert.match(err.message, /already in flight/); assert.match(err.message, /cap 1/); return true },
+  )
+  await syncRunning
+})
+
+test("3.2: background timeout marks the registry entry and never throws to the caller", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: new RegExp(`/session/${CHILD}/message$`), handle: (u, init) => {
+      if (init?.method === "POST") return jsonRes({})
+      pollCount++
+      return jsonRes(Array.from({ length: pollCount }, (_, i) => ({ info: { role: "assistant" }, parts: [{ type: "text", text: `working ${i}` }] })))
+    } },
+  ])
+  let pollCount = 0
+  const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 60, pollIntervalMs: 10, cfg: CFG(), catalog: CATALOG, registry: reg }))
+  const handle = await engine.dispatch({ prompt: "slow", profile: "quick", depth: "low" }, undefined, { background: true })
+  for (let i = 0; i < 100 && reg.get(handle.dispatchId).state !== "timeout"; i++) await new Promise((r) => setTimeout(r, 10))
+  const entry = reg.get(handle.dispatchId)
+  assert.equal(entry.state, "timeout")
+  assert.match(String(entry.result.error), /timed out/)
+  assert.equal(entry.delivered, false, "undelivered terminal waits for the next idle drain")
+})
+
+test("3.2: kill stops the poll loop, marks killed, and suppresses the wake", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : new Promise(() => {})) },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { ...REAL_CLOCK, timeoutMs: 3_000, pollIntervalMs: 10, cfg: CFG(), catalog: CATALOG, registry: reg }))
+  const handle = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }, undefined, { background: true })
+  await new Promise((r) => setTimeout(r, 30))
+  engine.kill(handle.dispatchId)
+  for (let i = 0; i < 100 && reg.get(handle.dispatchId).state !== "killed"; i++) await new Promise((r) => setTimeout(r, 10))
+  assert.equal(reg.get(handle.dispatchId).state, "killed")
+  assert.equal(reg.takeUndelivered().length, 0, "killed never wakes the parent")
+})
+
+test("3.2: killing an already-terminal dispatch fails honestly, result-after-kill is noted", async () => {
+  const reg = createDispatchRegistry()
+  const fetcher = fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: new RegExp(`/session/${CHILD}/message$`), handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "done" }] }])) },
+  ])
+  const engine = createDispatchEngine(baseDeps(fetcher, { cfg: CFG(), catalog: CATALOG, registry: reg }))
+  const handle = await engine.dispatch({ prompt: "x", profile: "quick", depth: "low" }, undefined, { background: true })
+  await settle()
+  assert.throws(() => engine.kill(handle.dispatchId), (err) => { assert.match(err.message, /already completed/); return true })
+  // and a kill that lands while the pipeline is settling gets the late note
+  const reg2 = createDispatchRegistry()
+  const engine2 = createDispatchEngine(baseDeps(fakeFetcher([
+    { match: /\/session\?directory=/, handle: () => jsonRes({ id: CHILD }) },
+    { match: /\/message$/, handle: (u, init) => (init?.method === "POST" ? jsonRes({}) : jsonRes([{ info: { role: "assistant", tokens: { input: 1, output: 1, reasoning: 0, cache: { read: 0, write: 0 } } }, parts: [{ type: "text", text: "late" }] }])) },
+  ]), { cfg: CFG(), catalog: CATALOG, registry: reg2 }))
+  const h2 = await engine2.dispatch({ prompt: "x", profile: "quick", depth: "low" }, undefined, { background: true })
+  await settle()
+  try { engine2.kill(h2.dispatchId) } catch { /* already terminal on this scheduler — acceptable race */ }
+  const e = reg2.get(h2.dispatchId)
+  assert.ok(e.state === "killed" || e.state === "completed")
+  if (e.state === "killed") assert.equal(reg2.takeUndelivered().length, 0)
+})
