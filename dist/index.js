@@ -15331,23 +15331,41 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
         parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, agent: req.agent, shape: r.shape, ...r.role ? { role: r.role } : {} }) }]
       })
     });
-    await Promise.race([turnPost, deadlinePromise]);
-    if (deadlineHit && deps.now() - t0 >= timeoutMs) {
-      const elapsed = deps.now() - t0;
+    turnPost.catch(() => {});
+    try {
+      await Promise.race([turnPost, deadlinePromise]);
+      if (deadlineHit && deps.now() - t0 >= timeoutMs) {
+        const elapsed = deps.now() - t0;
+        deps.sink({
+          ts: new Date().toISOString(),
+          event: "timeout",
+          tier: req.agent,
+          agent: req.agent,
+          identity: r.model,
+          depth: r.depth,
+          sessionID: childID,
+          durationMs: elapsed,
+          ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
+        });
+        throw new DispatchError(`forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`, "timeout");
+      }
+      await turnPost;
+    } catch (e) {
+      if (e instanceof DispatchError)
+        throw e;
       deps.sink({
         ts: new Date().toISOString(),
-        event: "timeout",
+        event: "transport-interrupted",
         tier: req.agent,
         agent: req.agent,
         identity: r.model,
         depth: r.depth,
         sessionID: childID,
-        durationMs: elapsed,
+        durationMs: deps.now() - t0,
+        note: e instanceof Error ? e.message : String(e),
         ...dispatchId !== undefined ? { dispatchId, parentSessionID: parentSessionID ?? "" } : {}
       });
-      throw new DispatchError(`forge_dispatch timed out after ${elapsed}ms (deadline ${timeoutMs}ms). Partial state: child session ${childID} is left for the host to reclaim; its transcript remains queryable via the host API.`, "timeout");
     }
-    await turnPost;
     let poll = null;
     let messages = [];
     for (;; ) {
@@ -15424,24 +15442,44 @@ Vocabulary: ${r.error.vocabulary.join(", ") || "(none)"}`, r.error.code);
     return result;
   }
   function bgTerminal(reg, dispatchId, identity, req, t0, e) {
+    let entrySessionID = "";
+    let parentSessionID = "";
+    try {
+      const entry = reg.get(dispatchId);
+      entrySessionID = entry.sessionID;
+      parentSessionID = entry.parentSessionID;
+    } catch {}
+    const durationMs = deps.now() - t0;
     const report = {
       agent: req.agent,
       requested: { agent: req.agent, depth: req.depth },
       actual: { model: identity, depth: null },
-      sessionID: "",
+      sessionID: entrySessionID,
       outcome: "error",
-      durationMs: deps.now() - t0,
+      durationMs,
       error: e instanceof Error ? e.message : String(e)
     };
     if (e instanceof DispatchError && e.code === "timeout") {
       report.outcome = "timeout";
       reg.markTimeout(dispatchId, report);
-      deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
+      deps.onTerminal?.(parentSessionID);
       return;
     }
-    deps.sink({ ts: new Date().toISOString(), event: "error", tier: req.agent, identity, outcome: "error", note: report.error });
+    deps.sink({
+      ts: new Date().toISOString(),
+      event: "error",
+      tier: req.agent,
+      agent: req.agent,
+      identity,
+      outcome: "error",
+      sessionID: entrySessionID,
+      durationMs,
+      note: report.error,
+      dispatchId,
+      parentSessionID
+    });
     reg.markError(dispatchId, report);
-    deps.onTerminal?.(reg.get(dispatchId).parentSessionID);
+    deps.onTerminal?.(parentSessionID);
   }
   async function dispatch(req, parentSessionID, opts) {
     const t0 = deps.now();
@@ -15736,7 +15774,7 @@ function validateCrewReport(report, ledgerRows, crew) {
       continue;
     if (row.ts < crew.startedAt)
       continue;
-    if (row.event === "validation" || row.event === "resolve-error" || row.event === "refused-cap" || row.event === "models-dev-degraded" || row.event === "retry-excluded" || row.event === "lost-on-exit" || row.event === "kill-late-completion")
+    if (row.event === "validation" || row.event === "resolve-error" || row.event === "refused-cap" || row.event === "models-dev-degraded" || row.event === "retry-excluded" || row.event === "lost-on-exit" || row.event === "kill-late-completion" || row.event === "transport-interrupted")
       continue;
     if (CREW_DISPATCH_EVENTS.has(row.event) && row.dispatchId)
       rowById.set(row.dispatchId, row);
