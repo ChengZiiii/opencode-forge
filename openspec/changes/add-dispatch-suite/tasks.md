@@ -17,11 +17,11 @@
 
 ## 3. waves：后台派发与唤醒
 
-- [ ] 3.1 实现 `src/dispatch-registry.ts`：后台注册表纯状态机（dispatchId 生成、deadline、`queued→running→completed|timeout|killed|error`、非法迁移拒绝、`delivered` 恰一次交付标记）。验证：`tests/dispatch-registry.test.mjs` 覆盖全迁移/非法迁移/交付幂等
-- [ ] 3.2 plugin.ts 后台路径：`background:true` 急解析 + 立即返回句柄 `{dispatchId, resolved, queuedAt}`；全局并发槽同步/后台共享；每派发轮询循环终态入账本。验证：stub client 覆盖后台提交/共享槽拒绝/后台超时/后台错误终态
-- [ ] 3.3 唤醒引擎：`session.idle` 监听 + `[forge:dispatch-complete]` brief 合成（自上 idle 全终态合并为一条/防抖/owner 检查/活跃回合不打断/每终态恰一次）+ 与 goal 续跑 brief 共存合并（单次再提示）。验证：注入 fake idle 事件断言单条 brief、合并行为、goal 共存合并
-- [ ] 3.4 `forge_dispatch_list`（在飞 + 近期结果，compaction 恢复）与 `forge_dispatch_kill`（best-effort：停轮询/标记 killed/抑制唤醒/晚到结果丢弃记账）。验证：stub 覆盖 list 恢复/kill 账本与唤醒抑制/kill-failed 原因记录
-- [ ] 3.5 run 模式披露：工具描述注明后台面向 TUI 会话、run 模式建议同步；run 下完成仅入账本不唤醒。验证：描述断言 + 免钥 run 冒烟
+- [x] 3.1 实现 `src/dispatch-registry.ts`：后台注册表纯状态机（dispatchId 生成、deadline、`queued→running→completed|timeout|killed|error`、非法迁移拒绝、`delivered` 恰一次交付标记）。验证：`tests/dispatch-registry.test.mjs` 覆盖全迁移/非法迁移/交付幂等
+- [x] 3.2 plugin.ts 后台路径：`background:true` 急解析 + 立即返回句柄 `{dispatchId, resolved, queuedAt}`；全局并发槽同步/后台共享；每派发轮询循环终态入账本。验证：stub client 覆盖后台提交/共享槽拒绝/后台超时/后台错误终态
+- [x] 3.3 唤醒引擎：`session.idle` 监听 + `[forge:dispatch-complete]` brief 合成（自上 idle 全终态合并为一条/防抖/owner 检查/活跃回合不打断/每终态恰一次）+ 与 goal 续跑 brief 共存合并（单次再提示）。验证：注入 fake idle 事件断言单条 brief、合并行为、goal 共存合并
+- [x] 3.4 `forge_dispatch_list`（在飞 + 近期结果，compaction 恢复）与 `forge_dispatch_kill`（best-effort：停轮询/标记 killed/抑制唤醒/晚到结果丢弃记账）。验证：stub 覆盖 list 恢复/kill 账本与唤醒抑制/kill-failed 原因记录
+- [x] 3.5 run 模式披露：工具描述注明后台面向 TUI 会话、run 模式建议同步；run 下完成仅入账本不唤醒。验证：描述断言 + 免钥 run 冒烟
 
 ## 4. crew：/crew 编排
 

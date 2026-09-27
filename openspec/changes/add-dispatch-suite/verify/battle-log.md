@@ -18,6 +18,15 @@ LIMITATION：B27（keyless×受限 tier 确定性空响应，外因；守卫与�
 
 ## 轮报
 
+### 阶段 D（2026-09-27，tasks 3.1–3.5 全绿，门 D 通过）
+
+- 范围：dispatch-registry 纯状态机（3.1）；引擎后台路径（3.2：runAttempt 提取、急解析、fire-and-forget 管线、共享槽池、kill abort-race、后台终态→registry+账本映射、后台同享一次排除重试）；唤醒引擎（3.3：父会话作用域 takeUndelivered、idle 驱动+终态驱动双去抖、单条合并 brief、恰一次、传输失败回滚 delivered、goal brief 同 idle 合并=先 drain 后发）；forge_dispatch background 分支 + forge_dispatch_list（compaction 恢复，有界）+ forge_dispatch_kill（诚实 kill-failed 包装）（3.4）；run/TUI 披露进工具描述与 background 参数（3.5）。
+- 全量绿证据：npm test → 248/248；typecheck → 0 errors。提交：59b7429→f89fb79（3.2）、074ab9e→dec8381（3.3/3.4）。
+- 关键设计落定（与 design 一致）：kill 先标 killed 再 fire abort（挂死的 fetch 由 abort-race 解缠）；「结果晚于 kill 到达」记 kill-late-completion 且永不唤醒；brief 合并顺序=派发结果在前、goal brief 在后；同 idle 双定时器（goal 先注册先触发，goal 发送前 drain 使派发定时器变 no-op——单次再提示）。
+- 仪器注意：wiring 套件共享进程内 registry 实例——用唯一 id + 断言包含，不假设精确计数。
+- 已知 flake（非本 change）：job-registry 5.2 relay 真实进程测试在全量并发负载下偶发（本阶段 2 次：阶段 C 末 1 次、加测试后 1 次；单跑/重跑均绿）。留 G 阶段 §6 自审裁决：加宽其时序预算或标注 flaky。
+- E 层待 G：3.5 的免钥 run 冒烟与 6.3 E2E（同步+后台唤醒各一）合并执行。
+
 ### 阶段 C（2026-09-27，战役Ⅰ B01–B33 全 verdict，0 OPEN，门 C 通过）
 
 - 范围：U/S 层条目以单测为证据逐条对账；E 层在真 serve（1.18.32，沙盒 43931，config `C:/tmp/forge-stage-c`，roster `opencode/ling-3.0-flash-fin-free` expose=[low] profiles=[scout,quick]）跑活体探针 `scripts/dispatch-probe-c.mjs`。
