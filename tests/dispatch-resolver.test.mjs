@@ -9,7 +9,12 @@ import assert from "node:assert/strict"
 //   B12 exact match, no clamping: {low,max} + "medium" is an error, not "high"
 
 import { buildDispatchConfig } from "../src/dispatch-roster.ts"
-import { resolveDispatch, exposedVocabulary } from "../src/dispatch-resolver.ts"
+import { resolveDispatch, exposedVocabulary, resolveAgent } from "../src/dispatch-resolver.ts"
+
+// add-dispatch-onboarding: agents-path resolution (spec delta — MODIFIED
+// "Exact-match resolution with no clamping": model pinned by the agent
+// definition, depth ∈ depths verbatim, default = first entry, no retry).
+import { SEED_AGENTS, PLACEHOLDER_IDENTITY } from "../src/forge-config.ts"
 
 const CATALOG = {
   providers: {
@@ -192,4 +197,78 @@ test("S1 through the resolver: same-name models stay independent candidates", ()
 test("exposedVocabulary is the union of every entry's expose", () => {
   const v = exposedVocabulary(CFG())
   assert.deepEqual([...v].sort(), ["low", "max", "medium"])
+})
+
+// ---------------------------------------------------------------------------
+// add-dispatch-onboarding — resolveAgent (2.1)
+
+const AGENTS = {
+  research: { model: "zai-coding-plan/glm-5.3", depths: ["low", "high", "max"], shape: "readonly" },
+  reviewer: { model: "anthropic/claude-haiku-4-5", depths: ["medium", "high"] },
+}
+
+test("2.1 default depth is the agent's first depths entry", () => {
+  const r = resolveAgent(AGENTS, { agent: "research" }, ok)
+  assert.equal(r.ok, true)
+  if (r.ok) {
+    assert.equal(r.model, "zai-coding-plan/glm-5.3")
+    assert.equal(r.depth, "low")
+  }
+})
+
+test("2.1 explicit depth in the set resolves verbatim", () => {
+  const r = resolveAgent(AGENTS, { agent: "research", depth: "max" }, ok)
+  assert.equal(r.ok, true)
+  if (r.ok) assert.equal(r.depth, "max")
+})
+
+test("2.1 out-of-set depth errors listing the agent's allowed set", () => {
+  const r = resolveAgent(AGENTS, { agent: "research", depth: "XHigh" }, ok)
+  assert.equal(r.ok, false)
+  if (!r.ok) {
+    assert.equal(r.error.code, "depth-not-in-set")
+    assert.match(r.error.message, /low.*high.*max/)
+    assert.match(r.error.message, /research/)
+  }
+})
+
+test("2.1 unknown agent errors listing defined agent names", () => {
+  const r = resolveAgent(AGENTS, { agent: "ghost" }, ok)
+  assert.equal(r.ok, false)
+  if (!r.ok) {
+    assert.equal(r.error.code, "unknown-agent")
+    assert.match(r.error.message, /research/)
+    assert.match(r.error.message, /reviewer/)
+  }
+})
+
+test("2.1 unavailable pinned model errors naming it — never a fallback", () => {
+  const r = resolveAgent(AGENTS, { agent: "research" }, () => false)
+  assert.equal(r.ok, false)
+  if (!r.ok) {
+    assert.equal(r.error.code, "pin-unavailable")
+    assert.match(r.error.message, /zai-coding-plan\/glm-5\.3/)
+    assert.match(r.error.message, /no fallback/i)
+  }
+})
+
+test("2.1 seed placeholder agent errors pin-unavailable on any host", () => {
+  const r = resolveAgent(SEED_AGENTS, { agent: "research" }, (id) => id !== PLACEHOLDER_IDENTITY)
+  assert.equal(r.ok, false)
+  if (!r.ok) {
+    assert.equal(r.error.code, "pin-unavailable")
+    assert.match(r.error.message, /Local\/GPT Luna/)
+  }
+})
+
+test("2.1 an agent with no depths errors with guidance to configure", () => {
+  const r = resolveAgent({ broken: { model: "x/y", depths: [] } }, { agent: "broken" }, ok)
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.equal(r.error.code, "depth-not-in-set")
+})
+
+test("2.1 an agent without a model string errors pin-unavailable", () => {
+  const r = resolveAgent({ modelless: { model: "", depths: ["low"] } }, { agent: "modelless" }, ok)
+  assert.equal(r.ok, false)
+  if (!r.ok) assert.equal(r.error.code, "pin-unavailable")
 })
