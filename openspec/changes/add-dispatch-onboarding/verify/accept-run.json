@@ -1,0 +1,36 @@
+{
+  "ok": 1,
+  "stages": [
+    {
+      "name": "typecheck (tsc --noEmit)",
+      "pass": true,
+      "detail": "0 errors"
+    },
+    {
+      "name": "full test suite",
+      "pass": true,
+      "detail": "325 pass / 0 fail"
+    },
+    {
+      "name": "bundle (npm run bundle)",
+      "pass": true,
+      "detail": "dist/index.js rebuilt"
+    },
+    {
+      "name": "sandbox E2E phase 1 — seed recipe + no-restart probe",
+      "pass": true,
+      "detail": "3/3 assertions"
+    },
+    {
+      "name": "sandbox E2E phase 2 — completion + introspection + cascade + red line",
+      "pass": true,
+      "detail": "10/10 assertions"
+    },
+    {
+      "name": "legacy inline roster still dispatches (quick write tier via agent id)",
+      "pass": true,
+      "detail": "Here is the verbatim result:\n\n**Tool result from `forge_dispatch`:**\n\n- **Status:** `[forge:dispatch] completed in 19441ms`\n- **agent:** `quick`\n- **model:** `opencode/ling-3.0-flash-fin-free`\n- **dep"
+    }
+  ],
+  "at": "2026-09-27T07:58:23.854Z"
+}

@@ -1,0 +1,57 @@
+{
+  "at": "2026-09-27T07:57:29.112Z",
+  "base": "http://127.0.0.1:43935",
+  "phase": "2",
+  "results": [
+    {
+      "name": "2b. configured write agent completes (model pinned, report complete)",
+      "pass": true,
+      "detail": "Here is the verbatim result from the `forge_dispatch` call:\n\n```\n[forge:dispatch] completed in 16171ms\nagent: research   model: opencode/ling-3.0-flash-fin-free"
+    },
+    {
+      "name": "2b. the report discloses the depth translation",
+      "pass": true,
+      "detail": "Here is the verbatim result from the `forge_dispatch` call:\n\n```\n[forge:dispatch] completed in 16171ms\nagent: research   model: opencode/ling-3.0-flash-fin-free"
+    },
+    {
+      "name": "2b. the worker really ran (file created in the workspace)",
+      "pass": true,
+      "detail": "onboarding-ok.txt content"
+    },
+    {
+      "name": "4. config tool round-trips the project agents",
+      "pass": true,
+      "detail": "Here is the verbatim result from `forge_dispatch_config`:\n\n```json\n{\n  \"agents\": {\n    \"research\": {\n      \"model\": \"opencode/ling-3.0-flash"
+    },
+    {
+      "name": "4. no discovery fields in the introspection output",
+      "pass": true,
+      "detail": "Here is the verbatim result from `forge_dispatch_config`:\n\n```json\n{\n  \"agents\": {\n    \"research\": {\n      \"model\": \"opencode/ling-3.0-flash"
+    },
+    {
+      "name": "4. project file wins over global (global-only agent absent)",
+      "pass": true,
+      "detail": "Agent ids listed:\n\n- **`research`**\n- **`smokeworker`**"
+    },
+    {
+      "name": "4. after deleting the project file, the global file serves",
+      "pass": true,
+      "detail": "Agent ids listed:\n\n- **`globalonly`**"
+    },
+    {
+      "name": "5. plugin never rewrote forge.json (content identical to what the driver wrote)",
+      "pass": true,
+      "detail": "{\n  \"agents\": {\n    \"research\": {\n      \"model\": \"opencode/ling-3.0-flash-fin-fr"
+    },
+    {
+      "name": "6. ledger has the resolve-error (seed pin) row",
+      "pass": true,
+      "detail": "11 rows since smoke start"
+    },
+    {
+      "name": "6. ledger has completed rows (tier field carries the agent id)",
+      "pass": true,
+      "detail": "11 rows"
+    }
+  ]
+}

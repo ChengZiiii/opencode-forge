@@ -30,6 +30,6 @@
 
 ## 5. 集成与交付
 
-- [ ] 5.1 README dispatch 章节重写（forge.json 优先/模板/元语表与 budget 表/配方截图式示例/legacy 高级节/热生效与物化滞后边界）+ 文件账本表加 forge.json（用户数据，只读）。验证：人工核对路径/默认值/表值与实现一致
-- [ ] 5.2 全量绿 + typecheck + bundle。验证：`npm test` 0 fail、`npm run typecheck` 0 errors、`npm run bundle`
-- [ ] 5.3 沙盒 E2E 冒烟（沙盒红线：专用 OPENCODE_CONFIG_DIR + 43930-43939 + 清理）：seed 首派报错含配方 → AI 代配写 forge.json → 下一派发热生效（探针记录宿主对未物化新 agent 名的接受/拒绝行为并存档） → 报告含 canonical→native 披露 → 项目级文件覆盖全局 → legacy inline 配置仍可派发。输出存档 `verify/`。验证：驱动脚本断言全 PASS
+- [x] 5.1 README dispatch 章节重写（forge.json 优先/模板/元语表与 budget 表/配方截图式示例/legacy 高级节/热生效与物化滞后边界）+ 文件账本表加 forge.json（用户数据，只读）。验证：人工核对路径/默认值/表值与实现一致
+- [x] 5.2 全量绿 + typecheck + bundle。验证：`npm test` 0 fail、`npm run typecheck` 0 errors、`npm run bundle`
+- [x] 5.3 沙盒 E2E 冒烟（沙盒红线：专用 OPENCODE_CONFIG_DIR + 43930-43939 + 清理）：seed 首派报错含配方 → AI 代配写 forge.json → 下一派发热生效（探针记录宿主对未物化新 agent 名的接受/拒绝行为并存档） → 报告含 canonical→native 披露 → 项目级文件覆盖全局 → legacy inline 配置仍可派发。输出存档 `verify/`。验证：驱动脚本断言全 PASS

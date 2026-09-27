@@ -1,0 +1,22 @@
+{
+  "at": "2026-09-27T07:55:55.043Z",
+  "base": "http://127.0.0.1:43934",
+  "phase": "1",
+  "results": [
+    {
+      "name": "1. seed dispatch fails pin-unavailable naming the placeholder",
+      "pass": true,
+      "detail": "Here is the full tool output verbatim, every line:\n\n```\n[forge:dispatch:pin-unavailable] agent \"research\" is pinned to Local/GPT Luna, which is not configured o"
+    },
+    {
+      "name": "1. the error carries the recipe (paths + template + verify)",
+      "pass": true,
+      "detail": "Here is the full tool output verbatim, every line:\n\n```\n[forge:dispatch:pin-unavailable] agent \"research\" is pinned to Local/GPT Luna, which is not configured o"
+    },
+    {
+      "name": "2a. unmaterialized new agent: outcome recorded honestly (completed/refused/quirk — never a silent drop)",
+      "pass": true,
+      "detail": "completed=false refused=true quirk=false :: Here is the FULL tool result verbatim, every line:\n\n```\n[forge:dispatch:host-error] POST /session/ses_f1e232851ffeKVU98g9qqo3f4B/message -> "
+    }
+  ]
+}
