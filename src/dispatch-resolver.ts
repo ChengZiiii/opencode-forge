@@ -10,6 +10,7 @@
 // error the calling agent must act on, not something the plugin fixes.
 
 import { type BuiltRoster, type CatalogSnapshot, identityCost } from "./dispatch-roster.ts"
+import type { ForgeAgentDef } from "./forge-config.ts"
 
 export type MenuLine = {
   identity: string
@@ -177,4 +178,85 @@ export function resolveDispatch(
     }
   }
   return { ok: true, identity: candidates[0].entry.model, depth, pinned: false }
+}
+
+// ---------------------------------------------------------------------------
+// Agents path (add-dispatch-onboarding, spec delta — MODIFIED "Exact-match
+// resolution with no clamping"). The model is pinned by the agent definition;
+// the ONLY config-side validation is dispatch-time set membership: depth must
+// appear in the agent's depths verbatim (default = first entry). No
+// alternative-candidate retry exists on this path — a pinned model that fails
+// reports the honest error.
+// ---------------------------------------------------------------------------
+
+export type AgentResolveOk = {
+  ok: true
+  model: string
+  depth: string
+  def: ForgeAgentDef
+}
+
+export type AgentResolveErr = {
+  ok: false
+  error: {
+    // unknown-agent | depth-not-in-set | pin-unavailable
+    code: string
+    message: string
+  }
+}
+
+export function resolveAgent(
+  agents: Record<string, ForgeAgentDef>,
+  req: { agent: string; depth?: string },
+  available: (identity: string) => boolean,
+): AgentResolveOk | AgentResolveErr {
+  const def = agents[req.agent]
+  if (!def || typeof def !== "object") {
+    return {
+      ok: false,
+      error: {
+        code: "unknown-agent",
+        message: `unknown dispatch agent "${req.agent}"; defined agents: ${Object.keys(agents).join(", ") || "(none)"}`,
+      },
+    }
+  }
+  if (!def.model || typeof def.model !== "string") {
+    return {
+      ok: false,
+      error: {
+        code: "pin-unavailable",
+        message: `agent "${req.agent}" has no usable model (model: ${JSON.stringify(def.model)}); fix its "model" in forge.json — no fallback model will be used`,
+      },
+    }
+  }
+  if (!available(def.model)) {
+    return {
+      ok: false,
+      error: {
+        code: "pin-unavailable",
+        message: `agent "${req.agent}" is pinned to ${def.model}, which is not configured on this host; fix the agent's "model" in forge.json — no fallback model will be used`,
+      },
+    }
+  }
+  const depths = Array.isArray(def.depths) ? def.depths : []
+  if (depths.length === 0) {
+    return {
+      ok: false,
+      error: {
+        code: "depth-not-in-set",
+        message: `agent "${req.agent}" defines no depths; give it at least one depth in forge.json (canonical words: none, low, medium, high, max — or the model's native level names)`,
+      },
+    }
+  }
+  const depth = req.depth ?? depths[0]
+  if (!depths.includes(depth)) {
+    return {
+      ok: false,
+      error: {
+        code: "depth-not-in-set",
+        message: `agent "${req.agent}" does not allow depth "${depth}" (allowed: ${depths.join(", ")}) — exact match only, the plugin never clamps`,
+      },
+    }
+  }
+  return { ok: true, model: def.model, depth, def }
 }
