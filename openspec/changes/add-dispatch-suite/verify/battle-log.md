@@ -10,13 +10,23 @@
 
 ```
 战役Ⅰ（B01–B33）：PASS 29 / FIXED 3 / LIMITATION 1 / BLOCKED 0 / OPEN 0
-战役Ⅱ（B34–B48）：PASS 0 / FIXED 0 / LIMITATION 0 / BLOCKED 0 / OPEN 15
-npm test: 227/227 pass (阶段C末全量)   typecheck: 0 errors
-FIXED：B11（spec 排除重试缺失，红→绿→活体）、B14（回合同步 POST 吞掉 deadline，race 修复）、B31（子会话挂起类，deadline 兜住）
+战役Ⅱ（B34–B48）：PASS 14 / FIXED 1 / LIMITATION 0 / BLOCKED 0 / OPEN 0
+npm test: 266/266 pass (阶段F末全量)   typecheck: 0 errors
+FIXED：B11（spec 排除重试缺失，红→绿→活体）、B14（回合同步 POST 吞掉 deadline，race 修复）、B31（子会话挂起类，deadline 兜住）、B34（唤醒 brief 打进活跃回合，投递前状态门修复）
 LIMITATION：B27（keyless×受限 tier 确定性空响应，外因；守卫与诚实性已证）
 ```
 
 ## 轮报
+
+### 阶段 F（2026-09-27，战役Ⅱ B34–B48 全 verdict + 战役Ⅰ回归抽查，门 F 通过）
+
+- 范围：战役Ⅱ 15 条边界（唤醒竞态/后台生命周期/crew 工作流）全部 verdict 化（PASS 14 / FIXED 1）；新增回归护栏测试 6 条（B34/B39反向/B42批量/B43披露/B47重启/B48模板）+ B36 共存合并测试；战役Ⅰ回归抽查 = 全量套件（266/266，含 B11×3/S7族/B27/B32/S19/账本/roster 全部回归文件）。
+- **B34 是真红（FIXED，fe11f4c→c3a161b）**：spec 明文「briefs SHALL never interrupt an active turn (delivery waits for the next idle)」，但 `injectDispatchBrief` 不查会话状态——终态驱动唤醒（1500ms 去抖）会在父回合仍活跃时硬投。红测试：busy 会话 idle 事件 → brief 照发（实际 1，期望 0）→ 修复 = 投递前先查 `client.session.status`，busy（或状态读取失败）则不排水、条目留待下一 idle 恰一次投递；同一道门同时看住 idle 驱动与终态驱动两条路径。
+- B36 红为测试参数错误（非产品缺陷）：测试把 `FORGE_DISPATCH_WAKE_DEBOUNCE_MS` 设为 5ms < goal 去抖 10ms，倒置了「goal 计时器先触发」的注册顺序前提——dispatch 唤醒先排水、goal 单独发送。goalProbe 证据：`continued session=ses_b36 turn=1/25`（goal 其实发了）。修正测试参数后合并断言绿；产品 drain-before-send 逻辑本就正确。
+- 既有 flake 根治：job-registry 5.2 relay（阶段D轮报记档的 ~1006ms/EPERM 间歇失败）定位为 Windows 上 taskkill 异步——子进程 pid 死后日志 fd 短暂仍被 OS 持有，紧跟的 `rmSync` 撞 EPERM。修复 = 清理重试（20×100ms，仅 EPERM）。非 dispatch 产品代码，测试基建加固。
+- 顺带：dist/index.js 重新打包与源码一致（B 阶段教训执行）；仓库根两个活体探针残留文件（done-late*.txt）清理。
+- 提交对：fe11f4c（红+战项探针）→ c3a161b（B34 修复 + bundle）。
+- E 层遗留（记 G 阶段 6.3）：B34/B35/B40/B41/B48 的活体 serve 复验随 6.3 E2E 冒烟一并执行（sync + background 唤醒 + 账本核对）。
 
 ### 阶段 E（2026-09-27，tasks 4.1–4.2 全绿，门 E 通过）
 
@@ -177,3 +187,39 @@ LIMITATION：B27（keyless×受限 tier 确定性空响应，外因；守卫与�
 - 观测：单测 400 on parent-bearing create → plain 重试，派发照常。回归：engine 套件 B32。
 ### B33 worker 提示三条款 — PASS
 - 观测：wiring S20：相对路径强制/拒绝原文上报/证据引用三条齐备，readonly 与执行模板可断言差异。回归：wiring 套件。
+
+## 证据区 · 战役Ⅱ（B34–B48，阶段 F）
+
+### B34 活跃回合竞态 — FIXED（fe11f4c→c3a161b）
+- 触发：对账 spec「SHALL never interrupt an active turn (delivery waits for the next idle)」发现 `injectDispatchBrief` 无状态检查——终态驱动唤醒 1500ms 到点即投，父回合活跃时照样 promptAsync。
+- 观测：红测试（busy 状态 + idle 事件 → 期望 0 条 brief、实际 1 条）→ 修复 = 投递前查 `session.status`，非 idle 或读取失败则返回（不排水，条目留待下一 idle）→ 绿（busy 零投递；转 idle 后恰一次、结果完整）。
+- 处置：状态门先于排水；idle 驱动与终态驱动共用此门。回归：wiring B34。
+### B35 合并与恰一次 — PASS
+- 观测：wiring 3.3：同 idle 两终态（completed+timeout）合一条 brief、双 dispatchId 与完整结果都在；第二次 idle 零重投。registry 套件：takeUndelivered 原子排水、重放不重复。回归：wiring+registry。
+### B36 goal 共存合并 — PASS
+- 观测：goal-mode B36：goal 计时器先触发 → drain-before-send → 单次再提示同携 `[forge:goal-continue]` + `[forge:dispatch-complete]`（dispatch 结果在前）；第二计时器扑空。红为测试参数倒置（见阶段F轮报），产品逻辑无缺陷。回归：goal-mode B36。
+### B37 完成风暴防抖 — PASS
+- 观测：`scheduleDispatchWake` timer-exists 即合并返回（同 sessionID 永远只有一个挂起计时器）；排水原子性使重复 brief 结构性不可能；3.3 双 idle 断言佐证。回归：wiring 3.3。
+### B38 compaction 恢复 — PASS
+- 观测：wiring 3.4：forge_dispatch_list 返回在飞 + 近期终态（TERMINAL_CAP=50 有界），dispatchId 齐备。回归：wiring 3.4。
+### B39 共享槽双向 — PASS
+- 观测：引擎 3.2 单池（sync 占槽 → bg 提交拒 cap-refused 带 "already in flight" 与 cap 数）+ 本阶段反向（bg running 持唯一槽 → 同步派发拒 cap-refused）。回归：engine 3.2+B39。
+### B40 后台超时 — PASS
+- 观测：引擎 3.2：后台 deadline 到 → registry markTimeout + 账本 timeout 行 + 错误进 entry（对调用者永不 throw，handle 先回）。回归：engine 3.2。E 层活体 timeout 证据见战役Ⅰ B14（同管线）。
+### B41 kill 全路径 — PASS
+- 观测：引擎 kill：mark killed 先行 → abort-race（fetchMessages 竞速 ctl）停轮询；killed 被 takeUndelivered 排除（brief 抑制）；晚到结果记 kill-late-completion 丢弃；kill 不存在 id → kill-failed "already completed"；wiring 3.4：工具路由 + DispatchError 包装 `[forge:dispatch:<code>]`。回归：engine+registry+wiring。
+### B42 宿主退出批量标记 — PASS
+- 观测：引擎新测试：两只后台在飞（registry 两条 running）→ dispose → 恰 2 条 lost-on-exit 账本行、各行点名自己的槽（无批次塌缩）；会话为宿主内存对象、无孤儿进程。回归：engine B42+S19。
+### B43 run 模式后台 — PASS
+- 触发：spec 三要素（TUI 专属 / run 建议 sync / 会话结束后完成仅入账本）——原 3.4 测试只断言 `/opencode run/` 一项，本阶段加严。
+- 观测：工具主描述含 "Background mode targets live TUI sessions" + "under `opencode run` prefer sync"；background 参数描述含 "ledger-only"。回归：wiring B43。
+### B44 crew 入口互操作 — PASS
+- 观测：crew_begin 在 draft 期拒绝并指向 plan_approve/discard（4.1）；goal 活跃 crew 期间 goal brief 与派发 brief 同 idle 合并共存 = B36 合并证据。回归：wiring 4.1+goal-mode B36。
+### B45 子任务失败路径 — PASS
+- 观测：crew-gate 套件：FAIL 判定要求 attempts ≥ 2（两次失败报告可见）；PASS-压-失败派发拒绝；引擎 B11 一次有界重试（排除失败身份）+ retry-excluded 账本。无静默丢失。回归：crew-gate+engine B11。
+### B46 crew_close 门 — PASS
+- 观测：wiring 4.2：缺 verdict / 证据无账本行 / 账本有 bg-2 而报告漏报 → 拒关点名缺口且 **零 ask**；全证据 → 恰一次 ask（crew_close 权限键）→ crew-summary 入账本 → crew 终结；再关拒绝 "No active crew"。对照按账本非会话记忆。回归：wiring 4.2+crew-gate 套件。
+### B47 crew 中途宿主重启 — PASS
+- 观测：crew 态唯一载体是进程内存 Map（无磁盘 crew 文件）；模拟进程死亡（清 Map）→ 同会话新 /crew 干净开始、无旧 objective 残留；派发账本（磁盘）完整保留历史。回归：wiring B47。
+### B48 波次节奏 — PASS
+- 观测：/crew 纪律模板写死节奏（"WAVES, NEVER FLOODS"、"no larger than the concurrency cap"、下一批仅由 `[forge:dispatch-complete]` 释放容量触发）；引擎 cap 双向拒绝兜底（B39）保证模型违令时被诚实拒绝而非洪水刷屏。回归：wiring B48+4.1+engine B39。
