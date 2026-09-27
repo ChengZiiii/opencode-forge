@@ -3,7 +3,7 @@ import { tool } from "@opencode-ai/plugin"
 import { execFileSync } from "node:child_process"
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
 import { isAbsolute, join, relative } from "node:path"
-import { tmpdir } from "node:os"
+import { tmpdir, homedir } from "node:os"
 import {
   PlanError,
   closeCheckFailures,
@@ -79,8 +79,9 @@ import { createDispatchLedger } from "./src/dispatch-ledger.ts"
 import { createDispatchRegistry, type DispatchRegistry, type RegistryEntry } from "./src/dispatch-registry.ts"
 import { validateCrewReport, type CrewSubtaskReport } from "./src/crew-gate.ts"
 import { composeWorkerPrompt } from "./src/dispatch-prompt.ts"
-import { tierAgentDef } from "./src/dispatch-tiers.ts"
+import { tierAgentDef, forgeAgentDef } from "./src/dispatch-tiers.ts"
 import { applyDepthTranslation, type DepthTranslation } from "./src/dispatch-depth.ts"
+import { createForgeConfigLoader, type LoadedForgeConfig } from "./src/forge-config.ts"
 import { loadModelsDevSnapshot } from "./src/models-dev.ts"
 
 const FORGE_AGENT = "forge"
@@ -199,6 +200,15 @@ let dispatchTimeoutMs = 600_000
 // Built once in the config hook (roster needs the user's provider config +
 // the models.dev snapshot).
 let dispatchBase: { cfg: BuiltRoster; catalog: CatalogSnapshot; findings: ValidationFinding[]; degraded: boolean } | null = null
+// forge.json loader (add-dispatch-onboarding): recreated when the host
+// worktree changes, otherwise persistent — hot-applies via its mtime cache on
+// every load() (the engine re-loads before each dispatch).
+let forgeLoader: ReturnType<typeof createForgeConfigLoader> | null = null
+let forgeLoaderDir: string | null = null
+// Last load() result: feeds materialization + forge_dispatch_config.
+let forgeConfigState: LoadedForgeConfig | null = null
+// Detected configured identities (recipe payload for pin-unavailable errors).
+let lastDetectedIdentities: string[] = []
 let activeDispatchEngine: DispatchEngine | null = null
 const dispatchLogDir = join(tmpdir(), "opencode-forge", "dispatch")
 const dispatchLedger = createDispatchLedger(join(dispatchLogDir, "ledger.jsonl"))
@@ -2005,10 +2015,10 @@ export const server: Plugin = async (input, options) => {
         if (permSection[gateKey] !== "deny") permSection[gateKey] = "ask"
       }
 
-      // Dispatch suite: build the roster (models.dev snapshot + the user's
-      // provider config + plugin options) and materialize tier agents. Nothing
-      // is written to disk except the bounded ledger; a user-defined
-      // forge-<tier> entry is never touched.
+      // Dispatch suite: load forge.json (dedicated config, hot-apply), build
+      // the legacy roster only when inline dispatch options exist, and
+      // materialize agents/tiers. Nothing is written to disk except the
+      // bounded ledger; user-defined forge-<id> entries are never touched.
       if (!dispatchDisabled) {
         const snapshot = process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1"
           ? { catalog: { providers: {} } as CatalogSnapshot, degraded: true, source: "test-off" }
@@ -2017,11 +2027,34 @@ export const server: Plugin = async (input, options) => {
           roster?: Array<{ model: string; expose?: string[]; profiles: string[] }>
           tiers?: Record<string, { shape?: "readonly" | "write"; defaultDepth?: string; model?: string; depth?: string }>
         }
+        const legacyInline = (dispatchOpts.roster?.length ?? 0) > 0 || dispatchOpts.tiers !== undefined
+
+        // forge.json: project file > global file > seed.
+        if (!forgeLoader || forgeLoaderDir !== hostWorktree) {
+          forgeLoader = createForgeConfigLoader({
+            projectDir: hostWorktree,
+            homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(),
+          })
+          forgeLoaderDir = hostWorktree
+        }
+        const loaded = forgeLoader.load()
+        forgeConfigState = loaded
+        for (const finding of loaded.findings) {
+          dispatchLedger.append({ ts: new Date().toISOString(), event: "validation", level: finding.level, code: finding.code, note: finding.message })
+        }
+        for (const [agentId, def] of Object.entries(loaded.agents)) {
+          const id = `forge-${agentId}`
+          if (agentSection[id] !== undefined) continue // no-clobber
+          agentSection[id] = forgeAgentDef(agentId, def)
+        }
+
+        const detected = configuredIdentitiesOf(cfg as Record<string, unknown>, snapshot.catalog)
+        lastDetectedIdentities = detected
         const built = buildDispatchConfig({
-          configuredIdentities: configuredIdentitiesOf(cfg as Record<string, unknown>, snapshot.catalog),
+          configuredIdentities: detected,
           catalog: snapshot.catalog,
-          userRoster: dispatchOpts.roster ?? [],
-          userTiers: dispatchOpts.tiers,
+          userRoster: legacyInline ? dispatchOpts.roster ?? [] : [],
+          userTiers: legacyInline ? dispatchOpts.tiers : undefined,
         })
         dispatchBase = { cfg: built, catalog: snapshot.catalog, findings: built.findings, degraded: snapshot.degraded }
         for (const finding of built.findings) {
@@ -2030,10 +2063,14 @@ export const server: Plugin = async (input, options) => {
         if (snapshot.degraded) {
           dispatchLedger.append({ ts: new Date().toISOString(), event: "models-dev-degraded", note: "models.dev snapshot unavailable — cost reporting degrades to null" })
         }
-        for (const [tierId, tier] of Object.entries(built.tiers)) {
-          const id = `forge-${tierId}`
-          if (agentSection[id] !== undefined) continue // no-clobber (S10)
-          agentSection[id] = tierAgentDef(tierId, tier)
+        // Legacy tier agents materialize ONLY when inline options exist —
+        // zero-config installs get the forge.json seed surface instead.
+        if (legacyInline) {
+          for (const [tierId, tier] of Object.entries(built.tiers)) {
+            const id = `forge-${tierId}`
+            if (agentSection[id] !== undefined) continue // no-clobber (S10)
+            agentSection[id] = tierAgentDef(tierId, tier)
+          }
         }
         const roster = built
         activeDispatchRegistry = activeDispatchRegistry ?? createDispatchRegistry()

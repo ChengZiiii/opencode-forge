@@ -76,8 +76,9 @@ test("4.1 unconfigured: the seed materializes research/review, readonly + task-d
     assert.equal(cfg.agent["forge-research"].permission[tool], "deny")
     assert.equal(cfg.agent["forge-review"].permission[tool], "deny")
   }
-  // zero inline config => no legacy tier agents in the Tab cycle
-  for (const tier of ["scout", "build", "review", "quick"]) {
+  // zero inline config => no legacy-only tier agents in the Tab cycle
+  // (forge-review exists but comes from the seed, not the legacy tier map)
+  for (const tier of ["scout", "build", "quick"]) {
     assert.equal(cfg.agent[`forge-${tier}`], undefined, `no legacy forge-${tier} without inline options`)
   }
 })

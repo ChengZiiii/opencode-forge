@@ -6,6 +6,7 @@
 // dispatch by the request body.
 
 import type { ResolvedTier } from "./dispatch-roster.ts"
+import type { ForgeAgentDef } from "./forge-config.ts"
 
 const MUTATING_TOOLS = ["write", "edit", "bash"] as const
 
@@ -44,6 +45,33 @@ const ROLE_PROMPTS: Record<string, string> = {
 export function rolePromptFor(agentId: string, def?: { prompt?: string }): string {
   if (def?.prompt && def.prompt.trim().length > 0) return def.prompt
   return ROLE_PROMPTS[agentId] ?? `You are forge-${agentId}, a dispatched worker. Execute the dispatched task exactly as scoped.`
+}
+
+// Materialize a forge.json agent as a hidden subagent (spec — ADDED "Agent
+// materialization as the permission vehicle"): create-only, NEVER a model
+// field (the brain is bound by the agent definition's pinned model at
+// dispatch time), deny-style permission (shape-derived, def.permission
+// override, task: deny ALWAYS forced — recursive dispatch stays physically
+// impossible).
+export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<string, unknown> {
+  const permission: Record<string, string> = { task: "deny" }
+  const shape = def.shape ?? "readonly"
+  if (shape === "readonly") {
+    for (const t of MUTATING_TOOLS) permission[t] = "deny"
+  }
+  Object.assign(permission, def.permission ?? {})
+  permission.task = "deny" // an override never lifts the recursion ban
+  const shapeLine =
+    shape === "readonly"
+      ? "Readonly agent: mutating tools are denied by design — report findings, never work around restrictions."
+      : "Write agent: execute the scoped task with minimal, focused changes."
+  return {
+    description: `forge dispatch agent "${agentId}" (${shape}) — spawned by forge_dispatch, not user-facing.`,
+    mode: "subagent",
+    hidden: true,
+    prompt: `${rolePromptFor(agentId, def)}\n\n${shapeLine}`,
+    permission,
+  }
 }
 
 export function tierAgentDef(tierId: string, tier: ResolvedTier): Record<string, unknown> {
