@@ -13,7 +13,8 @@ import type { DispatchRegistry } from "./dispatch-registry.ts"
 import type { ResolveOk } from "./dispatch-resolver.ts"
 import { composeWorkerPrompt } from "./dispatch-prompt.ts"
 import { resolveDispatch } from "./dispatch-resolver.ts"
-import type { BuiltRoster, CatalogSnapshot } from "./dispatch-roster.ts"
+import { translateDepth, type DepthFamilyID, type DepthTranslation } from "./dispatch-depth.ts"
+import { nativeLadder, type BuiltRoster, type CatalogSnapshot } from "./dispatch-roster.ts"
 
 export const DEFAULT_DISPATCH_TIMEOUT_MS = 600_000
 export const MAX_DISPATCH_TIMEOUT_MS = 600_000
@@ -33,7 +34,7 @@ export type DispatchResult = {
   costNote?: string
   priceSnapshot?: string
   text: string
-  depthInjected: string
+  depthTranslation: string
 }
 
 export type DispatchLedgerEvent = {
@@ -69,9 +70,10 @@ export type DispatchEngineDeps = {
   catalog: CatalogSnapshot
   available: (identity: string) => boolean
   sink: (entry: DispatchLedgerEvent) => void
-  // Registers the resolved depth for the child session (feeds the chat.params
-  // injection table); providerFamily resolves the option shape for disclosure.
-  onDepth: (sessionID: string, level: string, providerID: string) => void
+  // Registers the resolved depth translation for the child session (feeds
+  // the chat.params injection table); providerFamily resolves the option
+  // shape for translation and disclosure.
+  onDepth: (sessionID: string, translation: DepthTranslation) => void
   registry?: DispatchRegistry
   // Wake-engine hook: fired after a background dispatch reaches any
   // deliverable terminal state (killed never fires — its wake is suppressed).
@@ -139,6 +141,24 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     return r
   }
 
+  // Translate a resolved depth to the provider's native option (design D4:
+  // verbatim-first / no interpolation / full disclosure). A no-mapping result
+  // is a hard error — nothing may be spawned on an untranslatable depth.
+  const translationFor = (r: ResolveOk): DepthTranslation => {
+    const providerID = r.identity.slice(0, r.identity.indexOf("/"))
+    const family = (deps.providerFamily(providerID) ?? "unknown") as DepthFamilyID
+    const ladder = nativeLadder(deps.catalog, r.identity)
+    return translateDepth(r.depth, family, ladder)
+  }
+  const translationOrThrow = (r: ResolveOk): Exclude<DepthTranslation, { kind: "no-mapping" }> => {
+    const translation = translationFor(r)
+    if (translation.kind === "no-mapping") {
+      deps.sink({ ts: new Date().toISOString(), event: "resolve-error", tier: undefined, identity: r.identity, depth: r.depth, outcome: "no-native-mapping", note: translation.message })
+      throw new DispatchError(translation.message, "no-native-mapping")
+    }
+    return translation
+  }
+
   // One pipeline attempt: child session + depth hook + turn + completion poll.
   // Throws DispatchError (timeout / empty-response / host-error / menu codes);
   // the CALLER owns slot accounting, retries, and (for background) registry
@@ -153,6 +173,9 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     dispatchId?: string,
   ): Promise<DispatchResult> {
     const providerID = r.identity.slice(0, r.identity.indexOf("/"))
+    // Translation errors throw BEFORE the child session is created (nothing is
+    // spawned on an untranslatable depth).
+    const translation = translationOrThrow(r)
     let childID = ""
     // Child session: parentID is best-effort (dev-branch semantics; 1.18.32
     // rejects some unknown CreateInput fields with 400) — retry plain.
@@ -167,9 +190,8 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     if (!childID) throw new DispatchError("host returned no session id for the child session", "host-error")
     onChild?.(childID)
 
-    deps.onDepth(childID, r.depth, providerID)
-    const family = deps.providerFamily(providerID)
-    const depthInjected = family === null ? "not injected (unknown provider shape)" : `${family} <- ${r.depth}`
+    deps.onDepth(childID, translation)
+    const depthInjected = translation.disclose
 
     // The host's message POST is turn-synchronous (verified 1.18.32): it
     // does not return until the child's whole first turn settles, so the
@@ -274,7 +296,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       ...(cost.note ? { costNote: cost.note } : {}),
       ...(price?.label ? { priceSnapshot: price.label } : {}),
       text: textOf(messages),
-      depthInjected,
+      depthTranslation: depthInjected,
     }
     deps.sink({
       ts: new Date().toISOString(),
@@ -340,8 +362,10 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
     if (bg && !deps.registry) throw new DispatchError("background dispatch requires the dispatch registry (internal error)", "host-error")
 
     // Eager resolution for BOTH paths: menu/pin errors surface synchronously
-    // before anything is spawned.
+    // before anything is spawned — translation errors too (nothing may spawn
+    // on an untranslatable depth).
     const first: ResolveOk = resolveOrThrow(req.profile, req.depth, undefined)
+    translationOrThrow(first)
 
     if (bg) {
       const reg = deps.registry!

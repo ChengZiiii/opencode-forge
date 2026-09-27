@@ -81,8 +81,10 @@ export function translateDepth(depth: string, family: DepthFamilyID, ladder: str
   if (native !== null && native.includes(depth)) {
     return { kind: "verbatim", family: "openai", word: depth, disclose: (META_DEPTHS as readonly string[]).includes(depth) ? "verbatim" : `verbatim (native word "${depth}")` }
   }
-  if (native !== null && (META_DEPTHS as readonly string[]).includes(depth)) {
+  if (native !== null && native.length > 0 && (META_DEPTHS as readonly string[]).includes(depth)) {
     // A meta word the model does not natively offer: error, never a guess.
+    // (An EMPTY ladder is a toggle-shaped model the catalog cannot vouch for —
+    // that case passes through below; the provider is the final judge.)
     return noMapping(depth, family, native, (META_DEPTHS as readonly string[]).filter((w) => native.includes(w)))
   }
   // Unknown ladder (custom provider) or a native escape-hatch word the

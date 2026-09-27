@@ -80,6 +80,7 @@ import { createDispatchRegistry, type DispatchRegistry, type RegistryEntry } fro
 import { validateCrewReport, type CrewSubtaskReport } from "./src/crew-gate.ts"
 import { composeWorkerPrompt } from "./src/dispatch-prompt.ts"
 import { tierAgentDef } from "./src/dispatch-tiers.ts"
+import { applyDepthTranslation, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { loadModelsDevSnapshot } from "./src/models-dev.ts"
 
 const FORGE_AGENT = "forge"
@@ -214,17 +215,17 @@ const dispatchWakeTimers = new Map<string, ReturnType<typeof setTimeout>>()
 // /crew starts fresh. No file persistence by design.
 const crews = new Map<string, { objective: string; startedAt: string }>()
 
-// sessionID -> { level, family }: the chat.params injection table. "frozen"
-// means the level never changes after first registration (D2 stability).
-type DepthFamily = "openai" | "anthropic" | "zai" | "unknown"
-const dispatchDepths = new Map<string, { level: string; family: DepthFamily }>()
+// sessionID -> translation: the chat.params injection table. The translation
+// is computed once at dispatch time (engine) and re-applied verbatim by the
+// hook on every LLM request of that worker session — "frozen" means it never
+// changes after registration (D2 stability).
+const dispatchDepths = new Map<string, DepthTranslation>()
 
 // Provider option-shape families (D2). Explicit and conservative: an unknown
 // provider id injects NOTHING and is disclosed as such — never guessed.
 const OPENAI_FAMILY = new Set(["openai", "opencode", "openrouter", "groq", "xai", "azure", "github-copilot", "deepseek", "together", "vercel", "opus"])
 const ANTHROPIC_FAMILY = new Set(["anthropic"])
 const ZAI_FAMILY = new Set(["zai", "zai-coding-plan"])
-const ANTHROPIC_BUDGET: Record<string, number> = { off: 0, minimal: 1024, low: 4096, medium: 8192, high: 16384, xhigh: 24576, max: 32768 }
 
 function dispatchProviderFamily(providerID: string): "openai" | "anthropic" | "zai" | null {
   if (OPENAI_FAMILY.has(providerID)) return "openai"
@@ -233,25 +234,17 @@ function dispatchProviderFamily(providerID: string): "openai" | "anthropic" | "z
   return null
 }
 
-// Register the resolved depth for a child session. Returns false when the
-// session already has a level (frozen — a re-registration attempt with a
-// different level is refused, never silently applied).
-function queueDispatchDepth(sessionID: string, level: string, providerID: string): boolean {
+// Register the resolved depth translation for a child session. Returns false
+// when the session already has a different one (frozen — never silently
+// replaced). Identity = what actually gets injected, not the disclosure label
+// (two different verbatim words share the label but not the payload).
+function queueDispatchDepth(sessionID: string, translation: DepthTranslation): boolean {
+  const key = (t: DepthTranslation): string =>
+    t.kind === "verbatim" ? `verbatim:${t.word}` : t.kind === "tiered" ? `tiered:${t.budgetTokens}` : t.kind
   const existing = dispatchDepths.get(sessionID)
-  if (existing) return existing.level === level
-  dispatchDepths.set(sessionID, { level, family: dispatchProviderFamily(providerID) ?? "unknown" })
+  if (existing) return key(existing) === key(translation)
+  dispatchDepths.set(sessionID, translation)
   return true
-}
-
-function applyDepthToOptions(options: Record<string, unknown>, level: string, family: "openai" | "anthropic" | "zai"): void {
-  if (family === "openai") {
-    options.reasoningEffort = level
-  } else if (family === "anthropic") {
-    const budget = ANTHROPIC_BUDGET[level] ?? 8192
-    options.thinking = level === "off" ? { type: "disabled" } : { type: "enabled", budget_tokens: budget }
-  } else if (family === "zai") {
-    options.thinking = level === "off" ? { type: "disabled" } : { type: "enabled" }
-  }
 }
 
 // Configured provider/model identities from the user's opencode config:
@@ -1333,7 +1326,7 @@ const forgeDispatchTool = tool({
           `session: ${r.sessionID}`,
           `tokens: input ${tok.input ?? 0}, output ${tok.output ?? 0}, reasoning ${tok.reasoning ?? 0}, cache r/w ${tok.cache?.read ?? 0}/${tok.cache?.write ?? 0}`,
           `cost: ${costLine}`,
-          `depth injected: ${r.depthInjected}`,
+          `depthTranslation: ${r.depthTranslation}`,
           "",
           "Worker report:",
           r.text || "(empty worker report)",
@@ -2124,13 +2117,13 @@ export const server: Plugin = async (input, options) => {
 
     // Reasoning-depth injection for dispatched child sessions (D2): the host
     // rebuilds options for EVERY LLM request, so the hook re-applies the SAME
-    // level each time (inject-once would drop the depth on turn 2). The level
-    // itself is frozen at registration; an unknown provider family injects
-    // nothing (disclosed honestly in the dispatch result).
+    // translation each time (inject-once would drop the depth on turn 2). The
+    // translation is frozen at registration; an unknown provider family
+    // injects nothing (disclosed honestly in the dispatch result).
     "chat.params": async (input, output) => {
       const entry = dispatchDepths.get(input.sessionID)
-      if (!entry || entry.family === "unknown") return
-      applyDepthToOptions(output.options ?? (output.options = {}), entry.level, entry.family)
+      if (!entry || entry.kind === "not-injected") return
+      applyDepthTranslation(output.options ?? (output.options = {}), entry)
     },
 
     // Test seam (wiring tests drive server() with stubs; same pragmatic
