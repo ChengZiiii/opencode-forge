@@ -210,7 +210,7 @@ export function createDispatchEngine(deps: DispatchEngineDeps) {
       body: JSON.stringify({
         model: { providerID, modelID: r.identity.slice(r.identity.indexOf("/") + 1) },
         agent: `forge-${req.profile}`,
-        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, tier: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }],
+        parts: [{ type: "text", text: composeWorkerPrompt({ prompt: req.prompt, agent: req.profile, shape: deps.cfg.tiers[req.profile]?.shape ?? "readonly" }) }],
       }),
     })
     await Promise.race([turnPost, deadlinePromise])

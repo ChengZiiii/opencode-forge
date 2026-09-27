@@ -26,6 +26,26 @@ export function tierAgentPrompt(tierId: string): string {
   return TIER_PROMPTS[tierId] ?? `You are forge-${tierId}, a dispatched worker. Execute the dispatched task exactly as scoped.`
 }
 
+// ---------------------------------------------------------------------------
+// forge.json agent materialization (add-dispatch-onboarding, spec delta —
+// ADDED "Agent materialization as the permission vehicle" + MODIFIED "Worker
+// prompt discipline"). Role prompt layering: an explicit def.prompt overrides
+// everything; built-in roles (research, review) carry curated defaults; a
+// custom agent without a prompt gets the generic worker prompt.
+// ---------------------------------------------------------------------------
+
+const ROLE_PROMPTS: Record<string, string> = {
+  research:
+    "You are a research worker: search, read, and run read-only checks to answer the dispatched question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
+  review:
+    "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict.",
+}
+
+export function rolePromptFor(agentId: string, def?: { prompt?: string }): string {
+  if (def?.prompt && def.prompt.trim().length > 0) return def.prompt
+  return ROLE_PROMPTS[agentId] ?? `You are forge-${agentId}, a dispatched worker. Execute the dispatched task exactly as scoped.`
+}
+
 export function tierAgentDef(tierId: string, tier: ResolvedTier): Record<string, unknown> {
   const permission: Record<string, string> = { task: "deny" }
   if (tier.shape === "readonly") {

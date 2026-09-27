@@ -1,6 +1,6 @@
 // Worker prompt discipline for dispatched child sessions (spec: dispatch —
 // "Worker prompt discipline"). Every dispatched prompt is wrapped with the
-// tier's discipline template, which mandates:
+// outer discipline template, which mandates:
 //
 //   1. workspace-relative paths only (probe P3-d: a worker read "workspace
 //      root" as the filesystem root and hung on an unanswerable permission
@@ -8,13 +8,19 @@
 //   2. verbatim reporting of tool refusals instead of improvising workarounds,
 //   3. conclusions with evidence references.
 //
-// The template differs by tier shape: readonly tiers are told to report, not
-// to work around restrictions; write tiers get the execution variant.
+// The role prompt (add-dispatch-onboarding) rides INSIDE the wrapper: it
+// frames the worker (explicit def.prompt > built-in role default > generic)
+// but can never replace the mandates — the wrapper is always outermost.
+// The template differs by agent shape: readonly agents are told to report,
+// not to work around restrictions; write agents get the execution variant.
 
 export type PromptTemplateInput = {
   prompt: string
-  tier: string
+  agent: string
   shape: "readonly" | "write"
+  // The agent definition's role prompt (see rolePromptFor). Optional for the
+  // legacy tier path, which frames the role via the materialized tier agent.
+  role?: string
 }
 
 const COMMON_MANDATES = [
@@ -24,18 +30,19 @@ const COMMON_MANDATES = [
   "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced).",
 ].join("\n")
 
-const READONLY_DISCIPLINE = `You are a readonly ${"{tier}"} worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`
+const READONLY_DISCIPLINE = `You are a readonly {agent} worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`
 
-const WRITE_DISCIPLINE = `You are a ${"{tier}"} worker executing one scoped task. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no starting side quests.`
+const WRITE_DISCIPLINE = `You are an {agent} worker executing one scoped task. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no starting side quests.`
 
 export function composeWorkerPrompt(input: PromptTemplateInput): string {
   const discipline =
     input.shape === "readonly"
-      ? READONLY_DISCIPLINE.replaceAll("{tier}", input.tier)
-      : WRITE_DISCIPLINE.replaceAll("{tier}", input.tier)
+      ? READONLY_DISCIPLINE.replaceAll("{agent}", input.agent)
+      : WRITE_DISCIPLINE.replaceAll("{agent}", input.agent)
   return [
     "[forge:dispatch] You were dispatched by the forge main agent as a scoped worker.",
     discipline,
+    ...(input.role ? ["", "Your role:", input.role.trim()] : []),
     "",
     "Task:",
     input.prompt.trim(),
