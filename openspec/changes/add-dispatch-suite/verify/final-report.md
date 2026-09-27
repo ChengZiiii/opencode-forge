@@ -23,6 +23,7 @@ git：c7aec49a0e1ad01f87c1d185d3fbb0f48211e94c（代码终态；本报告提交�
 | 3 | 战役Ⅱ e2e 驱动首轮 7/10 | 三处失败全为驱动自身缺陷（dispatchId 真实格式 `bg-N`；账本整文件重写+轮转使字节偏移增量失效；模型回复引用 brief 标记词造成假阳性）——非插件缺陷 | 驱动修正后 10/10（二轮），过程记录在 e2e-smoke.md |
 | 4 | tasks.md 记账 | 阶段 E 提交信息声称 "tick 4.1-4.2" 但文件实际漏勾（工作本身有完整测试证据且门 E 已过） | 阶段 G 补勾至 23/23 |
 | 5 | roster.ts 自动生成条目（零配置 scout/quick 自动服务） | **用户已裁决：自动选模不可行**（配置≠可用，B27 活体实证）；经多轮演化定稿为 **ZCode-agent 式极简形态**（后续 change `add-dispatch-onboarding`）：主配置唯一形状 `dispatch.agents`——每个 agent `{model, depths}`，模型用户钉死（AI 无权换、坏模型诚实报错不跳）；`depths` 用户任意写、**逐字透传、零目录校验、零钳制**（GLM 只有 low/high/max 配错 medium → 原样传 → provider 报错原文回流，AI 检测后指引用户改；千问 none/low/medium/XHigh 等异构词汇直接写）；派发 `{prompt, agent, depth?}`，缺省=集合第一个，**唯一校验 = depth ∈ 集合**（下限/成本上限机制，报错列集合）；models.dev 目录降级为价目来源；seed = research[low,medium] + review[medium,high,max] 占位 pin `Local/GPT Luna`（pin-unavailable 配方引导）；旧 roster/tiers 完整形态保留为 legacy 兼容；AI 代配三件套（内省 round-trip / 启动 notice / 生效探针）不变；本 change 按冻结 spec 保留现状 |
+| 6 | 冻结 spec「No clamping, no translation」（深度精确匹配，B12） | **用户裁决演化：元语统一**——默认元语档 `none/low/medium/high/max`，插件按家族翻译（effort 直传/查表；budget 元语→预算档位表；toggle on/off）；三硬规则：逐字优先（元语=原生档名则直传零风险）、绝不插值（无对应物即报错，列双方词汇，不猜）、翻译全程披露（depthInjected 升级为 `canonical → native`）；表外模型逐字透传或报错 | 并入 `add-dispatch-onboarding`（注入层家族映射表+披露+报错文本；agents 形状不变）；本 change 按冻结 spec 保留现状（B12 语义不动） |
 
 ## LIMITATION 清单（知情项，验收时逐条过目）
 
