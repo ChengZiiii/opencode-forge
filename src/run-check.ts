@@ -9,7 +9,7 @@
 import { spawn } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { join, resolve, sep } from "node:path"
-import { killTree } from "./proc.ts"
+import { killTree, shellSpawn } from "./proc.ts"
 import {
   DEFAULT_TIMEOUT_SEC,
   MAX_TIMEOUT_SEC,
@@ -32,21 +32,20 @@ export type ShellRunner = (
 
 export const OUTPUT_LIMIT = 2048
 
-// Real shell execution: shell:true (cmd.exe on Windows, sh elsewhere),
-// stdout+stderr merged and truncated, hard kill on timeout. On Windows the
-// kill escalates to `taskkill /F /T` (the direct child is cmd.exe; the
-// command runs as a grand-child); on POSIX the child is spawned detached so
-// the whole process group can be signalled.
+// Real shell execution: the host-aligned interpreter (spec: job-supervisor —
+// "Host-aligned shell interpreter selection"; PowerShell on Windows, the
+// login shell with bash preferred on POSIX — the SAME interpreter forge_shell
+// uses, so a check drafted under the model's shell expectations behaves
+// identically at the gate), stdout+stderr merged and truncated, hard kill on
+// timeout. On Windows the kill escalates to `taskkill /F /T` (the direct
+// child is the interpreter wrapper; the command runs as a grand-child); on
+// POSIX the child is spawned detached so the whole process group can be
+// signalled.
 export const defaultShellRunner: ShellRunner = (cmd, opts) =>
   new Promise((resolveRun) => {
     let child
     try {
-      child = spawn(cmd, {
-        shell: true,
-        cwd: opts.cwd,
-        windowsHide: true,
-        ...(process.platform !== "win32" ? { detached: true } : {}),
-      })
+      child = shellSpawn(spawn, cmd, { cwd: opts.cwd })
     } catch (err) {
       resolveRun({ code: null, output: "", timedOut: false, spawnError: String(err) })
       return

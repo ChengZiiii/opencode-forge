@@ -12335,8 +12335,8 @@ function tool(input) {
 tool.schema = exports_external;
 // plugin.ts
 import { execFileSync as execFileSync3 } from "node:child_process";
-import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync5, readdirSync as readdirSync4, readFileSync as readFileSync8, statSync as statSync4, writeFileSync as writeFileSync5 } from "node:fs";
-import { isAbsolute, join as join5, relative } from "node:path";
+import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync5, readdirSync as readdirSync4, readFileSync as readFileSync8, statSync as statSync5, writeFileSync as writeFileSync5 } from "node:fs";
+import { isAbsolute, join as join6, relative } from "node:path";
 import { tmpdir as tmpdir3, homedir } from "node:os";
 
 // src/plan-file.ts
@@ -13118,13 +13118,97 @@ function completeCheckFailures(doc2, attestations) {
 // src/run-check.ts
 import { spawn as spawn2 } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { join, resolve, sep } from "node:path";
+import { join as join2, resolve, sep } from "node:path";
 
 // src/proc.ts
-import { spawn, spawnSync } from "node:child_process";
+import { spawn, spawnSync as spawnSync2 } from "node:child_process";
+
+// src/shell-select.ts
+import { spawnSync } from "node:child_process";
+import { statSync } from "node:fs";
+import { basename, dirname, join } from "node:path";
+var hostConfiguredShell;
+var memo;
+function setHostShell(shell) {
+  hostConfiguredShell = shell && shell.trim() ? shell.trim() : undefined;
+  memo = undefined;
+}
+var DENY = new Set(["fish", "nu"]);
+function shellName(bin) {
+  return basename(bin).replace(/\.exe$/i, "").toLowerCase();
+}
+function classify(bin) {
+  const name = shellName(bin);
+  if (name === "pwsh" || name === "powershell")
+    return { bin, family: "ps", login: false };
+  if (name === "cmd")
+    return { bin, family: "cmd", login: false };
+  return { bin, family: "posix", login: name === "bash" || name === "zsh" };
+}
+function defaultWhich(platform, env) {
+  return (bin) => {
+    try {
+      const r = spawnSync(platform === "win32" ? "where" : "which", [bin], {
+        env,
+        windowsHide: true,
+        timeout: 5000
+      });
+      if (r.status !== 0 || !r.stdout)
+        return;
+      const first = r.stdout.toString().split(/\r?\n/).find((l) => l.trim());
+      return first?.trim() || undefined;
+    } catch {
+      return;
+    }
+  };
+}
+function defaultStat(file2) {
+  return statSync(file2, { throwIfNoEntry: false }) ?? undefined;
+}
+function gitBash(which, stat) {
+  const git = which("git");
+  if (!git)
+    return;
+  const candidate = join(dirname(dirname(git)), "bin", "bash.exe");
+  return stat(candidate)?.isFile() ? candidate : undefined;
+}
+function resolveShell(deps = {}) {
+  const hasDeps = Object.keys(deps).length > 0;
+  if (!hasDeps && memo)
+    return memo;
+  const platform = deps.platform ?? process.platform;
+  const env = deps.env ?? process.env;
+  const which = deps.which ?? defaultWhich(platform, env);
+  const stat = deps.stat ?? defaultStat;
+  const pick2 = (candidate) => {
+    if (!candidate)
+      return;
+    if (DENY.has(shellName(candidate)))
+      return;
+    const resolved = /^[a-z]:[\\/]/i.test(candidate) || candidate.includes("/") || candidate.includes("\\") ? stat(candidate)?.isFile() ? candidate : which(candidate) : which(candidate);
+    return resolved ? classify(resolved) : undefined;
+  };
+  let result = pick2(hostConfiguredShell);
+  if (!result && platform === "win32") {
+    result = pick2("pwsh") ?? pick2("powershell") ?? pick2(gitBash(which, stat)) ?? pick2(env.COMSPEC || "cmd.exe");
+  }
+  if (!result && platform !== "win32") {
+    result = pick2(env.SHELL) ?? pick2("bash") ?? pick2("/bin/sh");
+  }
+  if (!result) {
+    result = platform === "win32" ? { bin: env.COMSPEC || "cmd.exe", family: "cmd", login: false } : { bin: "/bin/sh", family: "posix", login: false };
+  }
+  if (!hasDeps)
+    memo = result;
+  return result;
+}
+
+// src/proc.ts
 function shellSpawn(spawnFn, cmd, opts = {}) {
-  return spawnFn(cmd, {
-    shell: true,
+  const shell = opts.shell ?? resolveShell();
+  const argv = shell.family === "ps" ? ["-NoProfile", "-Command", `${cmd}
+exit $LASTEXITCODE`] : shell.family === "cmd" ? ["/c", cmd] : shell.login ? ["-l", "-c", cmd] : ["-c", cmd];
+  return spawnFn(shell.bin, argv, {
     ...opts.cwd !== undefined ? { cwd: opts.cwd } : {},
     env: opts.env ? { ...process.env, ...opts.env } : process.env,
     windowsHide: opts.windowsHide ?? true,
@@ -13171,7 +13255,7 @@ function pidAlive(pid) {
 function terminateTreeSync(pid, opts = {}) {
   const graceMs = Math.max(0, opts.graceMs ?? 0);
   const platform = opts.platform ?? process.platform;
-  const sync = opts.spawnSyncFn ?? spawnSync;
+  const sync = opts.spawnSyncFn ?? spawnSync2;
   const wait = opts.wait ?? true;
   const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   const run = (force) => {
@@ -13207,12 +13291,7 @@ var OUTPUT_LIMIT = 2048;
 var defaultShellRunner = (cmd, opts) => new Promise((resolveRun) => {
   let child;
   try {
-    child = spawn2(cmd, {
-      shell: true,
-      cwd: opts.cwd,
-      windowsHide: true,
-      ...process.platform !== "win32" ? { detached: true } : {}
-    });
+    child = shellSpawn(spawn2, cmd, { cwd: opts.cwd });
   } catch (err) {
     resolveRun({ code: null, output: "", timedOut: false, spawnError: String(err) });
     return;
@@ -13281,7 +13360,7 @@ function runContainsItem(item, index, worktree) {
   if (!insideWorktree(worktree, item.file)) {
     return { index, kind: "contains", label, ok: false, detail: "path escapes the workspace boundary", durationMs: Date.now() - started };
   }
-  const abs = join(worktree, item.file);
+  const abs = join2(worktree, item.file);
   let content;
   try {
     content = readFileSync(abs, "utf8");
@@ -13570,8 +13649,8 @@ function newJobId(now = Date.now) {
 
 // src/job-runner.ts
 import { spawn as spawn3 } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, readFileSync as readFileSync2, statSync, unlinkSync } from "node:fs";
-import { join as join2 } from "node:path";
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, readFileSync as readFileSync2, statSync as statSync2, unlinkSync } from "node:fs";
+import { join as join3 } from "node:path";
 import { tmpdir } from "node:os";
 var DEFAULT_IDLE_MS = 60000;
 var DEFAULT_MAX_WAIT_MS = 120000;
@@ -13582,17 +13661,17 @@ var JOB_ENV_MARKER = "FORGE_JOB_ID";
 var TAIL_POLL_MS = 200;
 var ADOPT_LIVENESS_MS = 1000;
 function jobsLogDir(base) {
-  return join2(base ?? join2(tmpdir(), "opencode-forge"), "jobs");
+  return join3(base ?? join3(tmpdir(), "opencode-forge"), "jobs");
 }
 var TAIL_CHUNK_BYTES = 4 * 1024 * 1024;
 function createFileTail(logPath, onText, pollMs = TAIL_POLL_MS) {
-  let pos = existsSync(logPath) ? statSync(logPath).size : 0;
+  let pos = existsSync(logPath) ? statSync2(logPath).size : 0;
   let stopped = false;
   const flush = () => {
     if (stopped)
       return;
     try {
-      let size = existsSync(logPath) ? statSync(logPath).size : 0;
+      let size = existsSync(logPath) ? statSync2(logPath).size : 0;
       if (size < pos)
         pos = size;
       const fd = openSync(logPath, "r");
@@ -13611,7 +13690,7 @@ function createFileTail(logPath, onText, pollMs = TAIL_POLL_MS) {
             break;
           pos += read;
           onText(buf.toString("utf8", 0, read));
-          size = existsSync(logPath) ? statSync(logPath).size : size;
+          size = existsSync(logPath) ? statSync2(logPath).size : size;
           if (stopped)
             break;
         }
@@ -13639,7 +13718,7 @@ function startJob(manager, opts) {
   const maxWaitMs = Math.min(Math.max(0, opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS), HARD_MAX_WAIT_MS);
   mkdirSync(opts.logDir, { recursive: true });
   const id = newJobId();
-  const logPath = join2(opts.logDir, `${id}.log`);
+  const logPath = join3(opts.logDir, `${id}.log`);
   let child;
   let settled = false;
   let exiting = false;
@@ -13695,6 +13774,7 @@ function startJob(manager, opts) {
   try {
     wfd = openSync(logPath, "a");
     child = shellSpawn(opts.spawnFn ?? spawn3, opts.cmd, {
+      shell: opts.shell,
       cwd: opts.cwd,
       env: { ...opts.env ?? {}, [JOB_ENV_MARKER]: id },
       stdio: ["ignore", wfd, wfd]
@@ -13872,7 +13952,7 @@ function readJobLog(logPath, opts = {}) {
   let windowed = false;
   try {
     if (existsSync(logPath)) {
-      const size = statSync(logPath).size;
+      const size = statSync2(logPath).size;
       if (size > LOG_READ_MAX_BYTES) {
         const fd = openSync(logPath, "r");
         try {
@@ -13910,7 +13990,7 @@ function rotateLogs(logDir, keep = DEFAULT_LOG_KEEP) {
   try {
     entries = readdirSync(logDir).filter((f) => f.endsWith(".log")).map((name) => {
       try {
-        return { name, mtime: statSync(join2(logDir, name)).mtimeMs };
+        return { name, mtime: statSync2(join3(logDir, name)).mtimeMs };
       } catch {
         return { name, mtime: 0 };
       }
@@ -13924,7 +14004,7 @@ function rotateLogs(logDir, keep = DEFAULT_LOG_KEEP) {
   entries.sort((a, b) => a.mtime - b.mtime);
   for (const e of entries.slice(0, excess)) {
     try {
-      unlinkSync(join2(logDir, e.name));
+      unlinkSync(join3(logDir, e.name));
     } catch {}
   }
 }
@@ -14144,9 +14224,9 @@ function createJobFence(opts = {}) {
 }
 
 // src/job-registry.ts
-import { closeSync as closeSync2, existsSync as existsSync2, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync3, readdirSync as readdirSync2, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { closeSync as closeSync2, existsSync as existsSync2, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync3, readdirSync as readdirSync2, statSync as statSync3, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
 import { execFileSync, spawn as spawn5 } from "node:child_process";
-import { dirname, join as join3 } from "node:path";
+import { dirname as dirname2, join as join4 } from "node:path";
 var REGISTRY_KEEP = 100;
 function structuralRelocate(deadPid, platform = process.platform) {
   if (deadPid <= 0)
@@ -14226,7 +14306,7 @@ function acquireLock(lockPath, timeoutMs = 2000) {
       if (err.code !== "EEXIST")
         throw err;
       try {
-        if (Date.now() - statSync2(lockPath).mtimeMs > 5000) {
+        if (Date.now() - statSync3(lockPath).mtimeMs > 5000) {
           unlinkSync2(lockPath);
           continue;
         }
@@ -14251,7 +14331,7 @@ function readRaw(path) {
   }
 }
 function writeRaw(path, entries) {
-  mkdirSync2(dirname(path), { recursive: true });
+  mkdirSync2(dirname2(path), { recursive: true });
   writeFileSync2(path, `${JSON.stringify({ version: 1, entries: entries.slice(0, REGISTRY_KEEP) }, null, 2)}
 `);
 }
@@ -14307,7 +14387,7 @@ function createJobRegistry(registryPath) {
   };
 }
 function registryPathFor(jobsDir) {
-  return join3(jobsDir, "registry.json");
+  return join4(jobsDir, "registry.json");
 }
 
 // src/host-exit.ts
@@ -14389,7 +14469,7 @@ function createExitCleanup(manager, opts = {}) {
 
 // src/watchdog.ts
 import { mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname2 } from "node:path";
+import { dirname as dirname3 } from "node:path";
 var WATCHDOG_ENV_MARK = "FORGE_WATCHDOG_MARK";
 var DEFAULT_STALL_MS = 600000;
 var MIN_STALL_MS = 60000;
@@ -14607,7 +14687,7 @@ function watchdogLogDir(base) {
 function createFileLedger(logPath, maxEntries = 200, maxBytes = 1e6) {
   const append = (entry) => {
     try {
-      mkdirSync3(dirname2(logPath), { recursive: true });
+      mkdirSync3(dirname3(logPath), { recursive: true });
       let lines = [];
       try {
         lines = readFileSync4(logPath, "utf8").split(`
@@ -14760,7 +14840,7 @@ function createLocator(platform = process.platform, posix = {}, win = {}) {
 
 // src/models-dev.ts
 import { mkdirSync as mkdirSync4, readFileSync as readFileSync6, writeFileSync as writeFileSync4 } from "node:fs";
-import { join as join4 } from "node:path";
+import { join as join5 } from "node:path";
 import { tmpdir as tmpdir2 } from "node:os";
 var DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json";
 function parseIdentity(identity) {
@@ -14782,7 +14862,7 @@ function nativeLadder(catalog, identity) {
   return Array.isArray(options) ? [...options] : null;
 }
 function modelsDevCacheDir(base) {
-  return join4(base ?? join4(tmpdir2(), "opencode-forge"), "models-dev");
+  return join5(base ?? join5(tmpdir2(), "opencode-forge"), "models-dev");
 }
 function namedLevels(rows) {
   const out = [];
@@ -14824,7 +14904,7 @@ function reduceModelsDev(raw) {
 async function loadModelsDevSnapshot(opts = {}) {
   const url2 = opts.url ?? process.env.OPENCODE_MODELS_URL ?? DEFAULT_MODELS_DEV_URL;
   const cacheDir = modelsDevCacheDir(opts.cacheDir);
-  const cacheFile = join4(cacheDir, "snapshot.json");
+  const cacheFile = join5(cacheDir, "snapshot.json");
   const fetcher = opts.fetcher;
   if (fetcher) {
     try {
@@ -15024,7 +15104,7 @@ function resolvePinnedDepth(thoughtLevel, family, ladder) {
 }
 
 // src/forge-config.ts
-import { readFileSync as readFileSync7, statSync as statSync3 } from "node:fs";
+import { readFileSync as readFileSync7, statSync as statSync4 } from "node:fs";
 function sanitizeJsonc(text) {
   const out = [];
   let i = 0;
@@ -15352,7 +15432,7 @@ function forgeConfigPaths(opts) {
 function createForgeConfigLoader(deps) {
   const stat = deps.stat ?? ((path) => {
     try {
-      const s = statSync3(path);
+      const s = statSync4(path);
       return { mtimeMs: s.mtimeMs, size: s.size };
     } catch {
       return null;
@@ -15596,11 +15676,11 @@ function jobStage() {
   return 0;
 }
 var jobLogDir = jobsLogDir();
-var jobLedgerPath = join5(jobLogDir, "ledger.jsonl");
+var jobLedgerPath = join6(jobLogDir, "ledger.jsonl");
 function jobLedgerSink(entry) {
   try {
     mkdirSync5(jobLogDir, { recursive: true });
-    if (existsSync3(jobLedgerPath) && statSync4(jobLedgerPath).size > 1e6)
+    if (existsSync3(jobLedgerPath) && statSync5(jobLedgerPath).size > 1e6)
       writeFileSync5(jobLedgerPath, "");
     appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}
 `);
@@ -15663,13 +15743,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 function planDirOf(worktree) {
-  return join5(worktree, ".opencode", "plan");
+  return join6(worktree, ".opencode", "plan");
 }
 function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join5(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join6(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -15695,7 +15775,7 @@ function resolveActivePlan(state) {
   const ranked = rankActivePlans(readPlanDir(state.worktree));
   if (ranked.length === 0)
     return null;
-  const path = join5(planDirOf(state.worktree), ranked[0].name);
+  const path = join6(planDirOf(state.worktree), ranked[0].name);
   state.planPath = path;
   return { path, doc: ranked[0].doc };
 }
@@ -15730,7 +15810,7 @@ var planWriteTool = tool({
     } else {
       const dir = planDirOf(state.worktree);
       mkdirSync5(dir, { recursive: true });
-      path = join5(dir, planFileName(localDate(), slugify(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md"))));
+      path = join6(dir, planFileName(localDate(), slugify(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
     const text = renderPlan(args, now, created);
@@ -15848,13 +15928,13 @@ var planDiscardTool = tool({
   }
 });
 function goalDirOf(worktree) {
-  return join5(worktree, ".opencode", "goal");
+  return join6(worktree, ".opencode", "goal");
 }
 function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join5(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join6(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
   if (state.goalPath && existsSync3(state.goalPath)) {
@@ -15865,7 +15945,7 @@ function resolveSessionGoal(state) {
   }
   const live = rankLiveGoals(readGoalDir(state.worktree))[0];
   if (live) {
-    const path = join5(goalDirOf(state.worktree), live.name);
+    const path = join6(goalDirOf(state.worktree), live.name);
     state.goalPath = path;
     return { path, doc: live.doc };
   }
@@ -15964,7 +16044,7 @@ var goalWriteTool = tool({
     const dir = goalDirOf(state.worktree);
     mkdirSync5(dir, { recursive: true });
     const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md")));
-    const path = join5(dir, name);
+    const path = join6(dir, name);
     const text = renderGoal(input, {
       now,
       status: arm ? "active" : "queued",
@@ -16093,7 +16173,7 @@ var goalResumeTool = tool({
     if (!goal || goal.doc.status === "queued") {
       const oldest = rankQueuedGoals(readGoalDir(state.worktree))[0];
       if (oldest) {
-        const path = join5(goalDirOf(state.worktree), oldest.name);
+        const path = join6(goalDirOf(state.worktree), oldest.name);
         state.goalPath = path;
         goal = { path, doc: oldest.doc };
       }
@@ -16143,7 +16223,8 @@ var FORGE_SHELL_DESCRIPTION = [
   "Run a shell command without ever blocking the session indefinitely. The call completes on the FIRST of: process exit (bound to the exit event — a detached grandchild holding the stdio pipes cannot suspend the call); success_pattern matching new output (opt-in regex); idle_ms with no new output (default 60000); max_wait_ms hard cap (default 120000, max 600000 — returns still-running, never kills).",
   "Idle/max-wait return `still-running` with a jobId — the process stays alive; keep watching with forge_jobs poll / log, stop it with forge_jobs kill. run_in_background returns {jobId, logPath} immediately.",
   "success_pattern semantics: a match completes the call as success; the process is kept alive by default (server semantics — the thing you just verified keeps running); pass keep_alive=false to kill its tree on match. Common patterns: dev servers `listening on|ready in|Local:`, builds `Compiled successfully|Done in`, test suites `passed|all tests`.",
-  "This tool is the forge agent's exec surface for every shell command — quick ones included. Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) should start with run_in_background and collect results via forge_jobs."
+  "This tool is the forge agent's exec surface for every shell command — quick ones included. Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) should start with run_in_background and collect results via forge_jobs.",
+  "Interpreter: commands run under the host-preferred shell — the PowerShell family on Windows (git-bash only on machines without PowerShell), the login shell with bash preferred on POSIX — the same interpreter the host's builtin shell tool uses."
 ].join(`
 `);
 var forgeShellTool = tool({
@@ -16175,7 +16256,7 @@ var forgeShellTool = tool({
       }
     }
     const { registry: registry2, fence } = ensureJobLifecycle();
-    const cwd = args.workdir ? isAbsolute(args.workdir) ? args.workdir : join5(state.worktree, args.workdir) : state.worktree;
+    const cwd = args.workdir ? isAbsolute(args.workdir) ? args.workdir : join6(state.worktree, args.workdir) : state.worktree;
     const started = startJob(jobManager, {
       cmd: args.command,
       cwd,
@@ -16511,7 +16592,7 @@ var pendingContinuationTurn = new Set;
 function goalProbe(line) {
   if (process.env.FORGE_GOAL_PROBE) {
     try {
-      appendFileSync(join5(tmpdir3(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
+      appendFileSync(join6(tmpdir3(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
 `);
     } catch {}
   }
@@ -16726,14 +16807,14 @@ var server = async (input, options) => {
   if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
     wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`);
   }
-  const watchdogLedger = createFileLedger(join5(watchdogLogDir(), "log.jsonl"));
+  const watchdogLedger = createFileLedger(join6(watchdogLogDir(), "log.jsonl"));
   const rawLocator = createLocator();
   const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1";
   const probeLine = (text) => {
     if (!probing())
       return;
     try {
-      appendFileSync(join5(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
+      appendFileSync(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
 `);
     } catch {}
   };
@@ -16789,6 +16870,7 @@ var server = async (input, options) => {
       forgeDisabled = forgeUserCfg?.disable === true;
       if (forgeDisabled)
         return;
+      setHostShell(typeof cfg.shell === "string" ? cfg.shell : undefined);
       cfg.default_agent ??= FORGE_AGENT;
       const existing = agentSection[FORGE_AGENT];
       agentSection[FORGE_AGENT] = {
@@ -16893,7 +16975,7 @@ var server = async (input, options) => {
     "tool.execute.before": async (input2, output) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join5(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
+          appendFileSync(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
 `);
         } catch {}
       }
@@ -16903,7 +16985,7 @@ var server = async (input, options) => {
         watchdog.track(input2.callID, input2.sessionID, input2.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync(join5(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
+            appendFileSync(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
 `);
           } catch {}
         }
@@ -16926,7 +17008,7 @@ var server = async (input, options) => {
           if (raw) {
             const state = stateForBan(input2.sessionID);
             const base = state?.worktree ?? hostWorktree ?? "";
-            const abs = (isAbsolute(raw) ? raw : join5(base, raw)).replaceAll("\\", "/").toLowerCase();
+            const abs = (isAbsolute(raw) ? raw : join6(base, raw)).replaceAll("\\", "/").toLowerCase();
             if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
               throw new Error(`[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`);
             }
@@ -17017,7 +17099,7 @@ var server = async (input, options) => {
       const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join5(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
+          appendFileSync(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
 `);
         } catch {}
       }
@@ -17071,7 +17153,7 @@ var server = async (input, options) => {
       watchdog.markSeen(input2.callID);
       if (process.env.FORGE_WATCHDOG_PROBE) {
         try {
-          appendFileSync(join5(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
+          appendFileSync(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
 `);
         } catch {}
       }
@@ -17081,7 +17163,7 @@ var server = async (input, options) => {
         watchdog.untrack(input2.callID);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync(join5(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
+            appendFileSync(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
 `);
           } catch {}
         }

@@ -50,6 +50,7 @@ import {
 } from "./src/goal-file.ts"
 import { formatOutcomes, outcomesAllOk, runChecks } from "./src/run-check.ts"
 import { killTree, pidAlive } from "./src/proc.ts"
+import { setHostShell } from "./src/shell-select.ts"
 import { createJobManager, type Job } from "./src/job-manager.ts"
 import { HARD_MAX_WAIT_MS, POLL_WAIT_MAX_MS, adoptSurvivor, jobsLogDir, pollJob, readJobLog, startJob } from "./src/job-runner.ts"
 import { createJobFence, type JobFence } from "./src/job-fence.ts"
@@ -1057,6 +1058,7 @@ const FORGE_SHELL_DESCRIPTION = [
   "Idle/max-wait return `still-running` with a jobId — the process stays alive; keep watching with forge_jobs poll / log, stop it with forge_jobs kill. run_in_background returns {jobId, logPath} immediately.",
   "success_pattern semantics: a match completes the call as success; the process is kept alive by default (server semantics — the thing you just verified keeps running); pass keep_alive=false to kill its tree on match. Common patterns: dev servers `listening on|ready in|Local:`, builds `Compiled successfully|Done in`, test suites `passed|all tests`.",
   "This tool is the forge agent's exec surface for every shell command — quick ones included. Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) should start with run_in_background and collect results via forge_jobs.",
+  "Interpreter: commands run under the host-preferred shell — the PowerShell family on Windows (git-bash only on machines without PowerShell), the login shell with bash preferred on POSIX — the same interpreter the host's builtin shell tool uses.",
 ].join("\n")
 
 const forgeShellTool = tool({
@@ -1790,6 +1792,11 @@ export const server: Plugin = async (input, options) => {
       const forgeUserCfg = agentSection[FORGE_AGENT] as { disable?: boolean } | undefined
       forgeDisabled = forgeUserCfg?.disable === true
       if (forgeDisabled) return
+
+      // Host-aligned interpreter (align-shell-interpreter): a host-configured
+      // shell, when the merged config exposes one, takes precedence over the
+      // plugin's platform chain (fail-soft: absent/blank = platform chain).
+      setHostShell(typeof (cfg as { shell?: unknown }).shell === "string" ? (cfg as { shell?: string }).shell : undefined)
 
       // Native build/plan agents are NOT disabled (partition era): forge
       // coexists with them in the Tab cycle, and their isolation from forge

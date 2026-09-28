@@ -17,6 +17,7 @@ import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, read
 import { join } from "node:path"
 import { tmpdir } from "node:os"
 import { killTree, pidAlive, shellSpawn, type JobFenceLike, type SpawnFn } from "./proc.ts"
+import type { ResolvedShell } from "./shell-select.ts"
 import { newJobId, type Job, type JobManager } from "./job-manager.ts"
 import type { JobRegistry, SurvivorEntry } from "./job-registry.ts"
 
@@ -49,6 +50,8 @@ export type StartOptions = {
   notify?: boolean
   env?: Record<string, string>
   spawnFn?: SpawnFn
+  /** Test seam: fixed interpreter instead of resolveShell() (align-shell-interpreter). */
+  shell?: ResolvedShell
   /** Cap on waiting for the final log flush after exit (default 500ms). */
   exitGraceMs?: number
   /** Opt-in: the job outlives this host process (recorded in the persistent registry). */
@@ -216,6 +219,7 @@ export function startJob(manager: JobManager, opts: StartOptions): StartedJob {
   try {
     wfd = openSync(logPath, "a")
     child = shellSpawn(opts.spawnFn ?? spawn, opts.cmd, {
+      shell: opts.shell,
       cwd: opts.cwd,
       env: { ...(opts.env ?? {}), [JOB_ENV_MARKER]: id },
       stdio: ["ignore", wfd, wfd] as unknown as ChildProcess["stdio"],

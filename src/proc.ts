@@ -3,6 +3,7 @@
 // fakes. No @opencode-ai imports; nothing here knows about opencode.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process"
+import { resolveShell, type ResolvedShell } from "./shell-select.ts"
 
 export type SpawnFn = typeof spawn
 export type SpawnSyncFn = typeof spawnSync
@@ -19,13 +20,33 @@ export type ShellSpawnOptions = {
   windowsHide?: boolean
   /** Full stdio override — job-runner passes ["ignore", logFd, logFd] so output lands in the log file directly. */
   stdio?: ChildProcess["stdio"]
+  /** Test seam: fixed interpreter instead of resolveShell(). */
+  shell?: ResolvedShell
 }
 
-// Spawn `cmd` through the platform shell. Defaults mirror the original
-// run-check behavior: hidden window on Windows, own process group on POSIX.
+// Spawn `cmd` through the host-aligned interpreter (spec: job-supervisor —
+// "Host-aligned shell interpreter selection"): PowerShell-family shells are
+// invoked DIRECTLY as `<shell> -NoProfile -Command <command>` with an
+// exit-code guard (a native command's exit status must propagate — precedent:
+// the fence watcher script), cmd.exe only as the machine-level fallback via
+// `/c`, POSIX shells via explicit argv (login form for bash/zsh). The Node
+// `shell: true` default (cmd.exe / plain sh) is deliberately gone: it landed
+// on the host's LAST-resort interpreter and broke PowerShell-syntax commands
+// re-issued from the refused builtin tool. Explicit argv also bypasses Node's
+// cmd-style flag injection for custom shells on Windows. Defaults mirror the
+// original behavior otherwise: hidden window on Windows, own process group on
+// POSIX.
 export function shellSpawn(spawnFn: SpawnFn, cmd: string, opts: ShellSpawnOptions = {}): ChildProcess {
-  return spawnFn(cmd, {
-    shell: true,
+  const shell = opts.shell ?? resolveShell()
+  const argv: string[] =
+    shell.family === "ps"
+      ? ["-NoProfile", "-Command", `${cmd}\nexit $LASTEXITCODE`]
+      : shell.family === "cmd"
+        ? ["/c", cmd]
+        : shell.login
+          ? ["-l", "-c", cmd]
+          : ["-c", cmd]
+  return spawnFn(shell.bin, argv, {
     ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
     env: opts.env ? { ...process.env, ...opts.env } : process.env,
     windowsHide: opts.windowsHide ?? true,
@@ -35,7 +56,8 @@ export function shellSpawn(spawnFn: SpawnFn, cmd: string, opts: ShellSpawnOption
 }
 
 // The platform plan for killing a shell child's whole tree. Windows: the
-// direct child is cmd.exe with the real command as a grandchild, so
+// direct child is the interpreter wrapper (PowerShell by default, cmd.exe on
+// fallback machines) with the real command as a grandchild, so
 // `taskkill /F /T` is required. POSIX: the child was spawned detached (own
 // process group), so the group can be signalled directly.
 export function treeKillPlan(platform: string, pid: number, force = true): { kind: "taskkill"; args: string[] } | { kind: "group"; signal: string } {
