@@ -436,7 +436,7 @@ agents into the global layer).
     "research": {
       "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string
       "thoughtLevel": "low",              // none/low/medium/high/max or a native level name
-      // "prompt": "optional role prompt; built-in research/review defaults exist",
+      // "prompt": "short role description — explicit prompts fully override the built-ins (only research/review ids have them; any other id without a prompt gets a generic one-liner)",
       // "shape": "write",   // default readonly denies write/edit/bash
       // "permission": { "bash": "deny" } // optional override; "task" is ALWAYS denied
     },

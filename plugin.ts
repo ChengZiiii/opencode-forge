@@ -1296,9 +1296,9 @@ const CREW_INIT_TEMPLATE = [
   "1. The user configures it themselves: create either layer — MERGED, the project layer overrides the global one per agent id (the project file is the nearest .opencode/forge.json walking up from the workspace root):",
   "{paths}",
   "",
-  "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead.",
+  "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent.",
   "",
-   "Template (JSONC — comments allowed): `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected.",
+  "Template (JSONC — comments allowed): `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job).",
   "{template}",
   "",
   "After the file is saved: NEW agents require a host restart to appear in the task tool; thoughtLevel edits on existing agents apply without restart. Until then, crew stays unavailable.",
@@ -1358,8 +1358,8 @@ const crewBeginTool = tool({
       const lines = [
         "[forge:crew] CREW IS NOT INITIALIZED on this host: no forge subagents are materialized. Crew orchestration is unavailable until the user sets it up.",
         `Two layers, MERGED (the project layer overrides the global one per agent id): ${paths.project} (nearest .opencode/forge.json walking up from the workspace) OR ${paths.global}.`,
-        'Template (JSONC): {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low"}}}',
-        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. Newly added agents need a host restart; thoughtLevel edits apply without one.",
+        'Template (JSONC): {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "prompt": "short role description"}}}',
+        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it, give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request) — without a prompt, custom ids get a generic one-liner and will not know their job. Newly added agents need a host restart; thoughtLevel edits apply without one.",
       ]
       if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject) {
         lines.push(
@@ -2007,7 +2007,7 @@ export const server: Plugin = async (input, options) => {
           agentIds.length > 0
             ? crewOrchestrationTemplate(agentIds)
             : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}\n   - ${forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`)
-              .replaceAll("{template}", JSON.stringify({ agents: { research: { model: "provider/model", thoughtLevel: "low" } } }, null, 2).split("\n").map((l) => "   " + l).join("\n"))
+              .replaceAll("{template}", JSON.stringify({ agents: { research: { model: "provider/model", thoughtLevel: "low", prompt: "short role description — what this agent does" } } }, null, 2).split("\n").map((l) => "   " + l).join("\n"))
         const description =
           agentIds.length > 0
             ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report"

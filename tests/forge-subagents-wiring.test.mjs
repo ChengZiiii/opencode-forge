@@ -288,6 +288,9 @@ test("crew command: unconfigured is a HARD gate with initialization guidance", a
   assert.match(cmd.template, /ONLY if the user explicitly asks/, "the AI-assist consent rule")
   assert.match(cmd.template, /host restart/, "the restart expectation")
   assert.match(cmd.template, /thoughtLevel/, "the hot-apply note")
+  assert.match(cmd.template, /"prompt"/, "the embedded example shows the prompt field")
+  assert.match(cmd.template, /SHORT prompt/, "the AI-assist short-prompt mandate")
+  assert.match(cmd.template, /research.*review.*built-in|built-in.*research/is, "discloses which ids carry built-in roles")
   assert.match(cmd.description, /NOT INITIALIZED/)
 })
 
@@ -344,6 +347,8 @@ test("crew_begin: HARD initialization gate — empty agent set refuses with guid
       assert.match(m, /forge\.json/)
       assert.match(m, /restart/)
       assert.match(m, /MERGED/, "the guidance states the merge semantics")
+      assert.match(m, /"prompt"/, "the refusal template shows the prompt field")
+      assert.match(m, /SHORT prompt/, "the refusal carries the short-prompt mandate")
       return true
     },
   )
