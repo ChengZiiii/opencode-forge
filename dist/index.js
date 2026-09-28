@@ -13449,8 +13449,11 @@ function createJobManager(opts = {}) {
     markTerminal(job, "killed", null);
   }
   function poll(job) {
-    if (isTerminal2(job))
+    if (isTerminal2(job)) {
       job.readAfterEnd = true;
+      jobs.delete(job.id);
+      rememberConsumed(job.id);
+    }
     const cursor = job.outLen;
     const start = job.pollCursor;
     const newOutput = sliceFromCursor(job, start);
@@ -16242,7 +16245,7 @@ ${r.outputTail || "(none yet)"}`,
 });
 var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"];
 var forgeJobsTool = tool({
-  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it; log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry (only early-returned/background jobs need this — synchronously consumed jobs self-clear at completion); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
     jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
