@@ -359,8 +359,10 @@ complete.
 ## Forge subagents (static worker agents in forge.json)
 
 Forge subagents are **static, user-authored worker agents**: each forge.json
-entry pins a model and an optional reasoning depth, materializes as a native
-`forge-<id>` subagent, and is dispatched through the host's **native `task`
+entry is either **pinned** (a model + a reasoning depth, bound at
+materialization) or an **Auto worker** (no model — it inherits the parent
+session's model at dispatch), materializes as a native `forge-<id>`
+subagent, and is dispatched through the host's **native `task`
 tool** — which means every run is visible in the TUI, expandable and
 monitorable, exactly like any native subagent. There is no dispatch tool, no
 child-session engine, and no configuration invitation anywhere: the session
@@ -381,16 +383,32 @@ cascade with a single winning source (never merged):
 {
   // forge subagents — definitions; see the restart table below for apply timing
   "agents": {
+    // PINNED worker: model + thoughtLevel form an ATOMIC PAIR — set BOTH
     "research": {
-      "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string — REQUIRED
-      "thoughtLevel": "low",              // optional: none/low/medium/high/max or a native level name
+      "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string
+      "thoughtLevel": "low",              // none/low/medium/high/max or a native level name
       // "prompt": "optional role prompt; built-in research/review defaults exist",
       // "shape": "write",   // default readonly denies write/edit/bash
       // "permission": { "bash": "deny" } // optional override; "task" is ALWAYS denied
-    }
+    },
+    // AUTO worker: set NEITHER — inherits the parent session's model at
+    // dispatch (snapshot semantics: later primary model switches affect only
+    // future dispatches), runs at the provider's default depth
+    "scout": {}
   }
 }
 ```
+
+**The atomic pair — the one rule that matters:**
+
+| `model` | `thoughtLevel` | result |
+| --- | --- | --- |
+| set | set | pinned worker (brain + depth bound at materialization) |
+| — | — | **Auto worker** (inherits the parent session's model; provider-default depth) |
+| set | — | ✗ rejected: entry skipped, error finding names the missing `thoughtLevel` |
+| — | set | ✗ rejected: entry skipped, error finding names the missing `model` |
+
+A rejected entry costs only itself — its siblings materialize normally.
 
 - **The plugin only ever reads this file.** It never creates, writes, or
   migrates it. The old AI-authored onboarding path (seed placeholder +
@@ -400,19 +418,28 @@ cascade with a single winning source (never merged):
   offered to YOU and happens only on your explicit go-ahead.
 - **Parsing is field-level fail-soft** (ZCode-style): a semantically bad
   agent entry is skipped with an error finding while its siblings apply; a
-  mistyped optional field is ignored with a warning; a syntactically broken
-  file empties the agent set with one parse-location error. There is no seed
-  in any failure path. Findings surface in the plugin diagnostics log.
+  mistyped optional field is ignored with a warning (and counts as absent
+  for the atomic pair — so a pinned `model` with a typo'd `thoughtLevel`
+  skips the whole entry); a syntactically broken file empties the agent set
+  with one parse-location error. There is no seed in any failure path.
+  Findings surface in the plugin diagnostics log.
 - **`depths` is deprecated**: the array is ignored with a warning finding.
   Pin ONE `thoughtLevel` per agent instead.
 - Each agent materializes as `forge-<id>` — a subagent-mode agent visible in
-  the task tool's vocabulary (never hidden), carrying the pinned `model`,
+  the task tool's vocabulary (never hidden), carrying the pinned `model`
+  (pinned workers) or NO model key at all (Auto workers — the description
+  says "inherits the parent session's model" instead of naming a brain),
   the worker discipline (workspace-relative paths only, verbatim reporting
   of tool refusals, evidence-bearing conclusions) around its role prompt,
   and a deny-style permission: `shape: "readonly"` (the default) denies
   `write`/`edit`/`bash`, `shape: "write"` allows them, an explicit
   `permission` map overrides the shape default — and `task` is ALWAYS
   denied (recursive spawning stays physically impossible).
+
+> **Upgrading from ≤ 0.5.0 (breaking):** agent entries that pinned `model`
+> without `thoughtLevel` used to be accepted; they are now SKIPPED with an
+> error finding naming the missing half. Fix per entry: add the missing
+> `thoughtLevel`, or delete `model` to make it an Auto worker.
 
 **What applies when** — edits take hold per field:
 

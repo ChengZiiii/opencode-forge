@@ -83,7 +83,7 @@ test("partition config: forge-* workers lose harness state tools but keep the ex
   const wt = mkdtempSync(join(tmpdir(), "part-worker-"))
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { builder: { model: "x/y", shape: "write" } } }))
+    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { builder: { model: "x/y", thoughtLevel: "low", shape: "write" } } }))
     const h = await server(inputFor(wt), {})
     const cfg = { agent: {} }
     await h.config(cfg)

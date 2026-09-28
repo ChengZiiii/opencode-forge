@@ -1224,7 +1224,7 @@ const CREW_INIT_TEMPLATE = [
   "",
   "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead.",
   "",
-  "Template (JSONC — comments allowed; `model` is the exact provider/model identity, `thoughtLevel` is optional: none/low/medium/high/max or a native level name):",
+   "Template (JSONC — comments allowed): `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected.",
   "{template}",
   "",
   "After the file is saved: NEW agents require a host restart to appear in the task tool; thoughtLevel edits on existing agents apply without restart. Until then, crew stays unavailable.",
@@ -2335,7 +2335,7 @@ export async function v2Setup(ctx: V2PluginContext): Promise<void> {
             agent.description = v1def.description
             agent.system = v1def.prompt
             agent.mode = v1def.mode
-            agent.model = v1def.model
+            if (v1def.model !== undefined) agent.model = v1def.model // Auto workers carry no model key
             agent.permission = v1def.permission
           })
         }

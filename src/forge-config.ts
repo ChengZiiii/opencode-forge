@@ -9,7 +9,8 @@
 // Validation is FIELD-LEVEL FAIL-SOFT (ZCode subagentMarkdown pattern): a
 // semantically invalid agent entry is skipped with an error finding while its
 // siblings still apply; a mistyped optional field is ignored with a finding
-// while the agent still materializes. Only a syntactically broken document
+// (and counts as absent for the atomic model/thoughtLevel pair — so a mistyped
+// member can invalidate its whole entry). Only a syntactically broken document
 // disables the whole (empty) agent set. There is NO seed and NO fallback: an
 // unconfigured host is inert and silent, and the plugin only ever READS the
 // file — onboarding is human-facing documentation, never an AI invitation.
@@ -18,11 +19,14 @@ import { readFileSync, statSync } from "node:fs"
 
 export type AgentShape = "readonly" | "write"
 
-// Validated agent definition. `model` is REQUIRED (an entry without it is
-// skipped with an error finding); everything else is optional and degrades
-// field-by-field.
+// Validated agent definition. `model` + `thoughtLevel` are an ATOMIC PAIR
+// (change auto-worker-inheritance): both present = pinned worker (brain and
+// depth bound at materialization); both absent = Auto worker (carries no
+// model key — the host inherits the parent session's model at dispatch, no
+// depth injected); exactly one present = invalid entry, skipped with an
+// error finding. Everything else is optional and degrades field-by-field.
 export type ForgeAgentDef = {
-  model: string
+  model?: string
   thoughtLevel?: string
   prompt?: string
   shape?: AgentShape
@@ -306,20 +310,39 @@ export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAg
       findings.push({ level: "error", code: "agent-not-object", message: `${label}: definition must be an object — entry skipped` })
       continue
     }
-    if (!nonEmptyString(entry.model)) {
-      findings.push({ level: "error", code: "agent-model-missing", message: `${label}.model: a non-empty "provider/model" string is required — entry skipped, siblings still apply` })
-      continue
-    }
-    const def: ForgeAgentDef = { model: entry.model.trim() }
     if (entry.depths !== undefined) {
       findings.push({ level: "warn", code: "depths-deprecated", message: `${label}.depths is no longer used (static agents pin one thoughtLevel) — ignored; set "thoughtLevel" instead` })
     }
+    // Normalize the atomic pair FIRST (design D3): a mistyped member counts
+    // as absent; the pair check below then decides the entry's fate.
+    let model: string | undefined
+    if (entry.model !== undefined) {
+      if (nonEmptyString(entry.model)) {
+        model = entry.model.trim()
+      } else {
+        findings.push({ level: "warn", code: "model-invalid", message: `${label}.model must be a non-empty string — field ignored (counts as absent for the model/thoughtLevel pair)` })
+      }
+    }
+    let thoughtLevel: string | undefined
     if (entry.thoughtLevel !== undefined) {
       if (nonEmptyString(entry.thoughtLevel)) {
-        def.thoughtLevel = entry.thoughtLevel.trim()
+        thoughtLevel = entry.thoughtLevel.trim()
       } else {
-        findings.push({ level: "warn", code: "thoughtlevel-invalid", message: `${label}.thoughtLevel must be a non-empty string — field ignored, the agent still materializes` })
+        findings.push({ level: "warn", code: "thoughtlevel-invalid", message: `${label}.thoughtLevel must be a non-empty string — field ignored (counts as absent for the model/thoughtLevel pair)` })
       }
+    }
+    // Atomic pair: both absent = Auto worker; both present = pinned; exactly
+    // one (either direction) = half-configured, entry skipped.
+    if ((model === undefined) !== (thoughtLevel === undefined)) {
+      const presentHalf = model !== undefined ? "model" : "thoughtLevel"
+      const missingHalf = model !== undefined ? "thoughtLevel" : "model"
+      findings.push({ level: "error", code: "agent-half-configured", message: `${label}: model and thoughtLevel form an atomic pair — ${presentHalf} is set but ${missingHalf} is missing; set BOTH to pin the brain and depth, or NEITHER for an Auto worker — entry skipped, siblings still apply` })
+      continue
+    }
+    const def: ForgeAgentDef = {}
+    if (model !== undefined) {
+      def.model = model
+      def.thoughtLevel = thoughtLevel
     }
     if (entry.prompt !== undefined) {
       if (nonEmptyString(entry.prompt)) {

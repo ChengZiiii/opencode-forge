@@ -115,13 +115,33 @@ test("v2 setup: never clobbers a user-defined forge-* entry", async () => {
   const prevCwd = process.cwd()
   try {
     mkdirSync(join(dir, ".opencode"), { recursive: true })
-    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm" } } }))
+    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
     process.chdir(dir)
     const { ctx, agents } = makeCtx()
     await v2Setup(ctx)
     agents.get("forge-research").system = "USER OWNED"
     await v2Setup(ctx)
     assert.equal(agents.get("forge-research").system, "USER OWNED")
+  } finally {
+    process.chdir(prevCwd)
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("v2 setup: an Auto worker registers without a model key", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-v2-"))
+  const prevCwd = process.cwd()
+  try {
+    mkdirSync(join(dir, ".opencode"), { recursive: true })
+    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ agents: { scout: {} } }))
+    process.chdir(dir)
+    const { ctx, agents } = makeCtx()
+    await v2Setup(ctx)
+    const sub = agents.get("forge-scout")
+    assert.ok(sub, "the Auto worker registers")
+    assert.equal(false, "model" in sub, "no model key on the v2 path either")
+    assert.equal(sub.mode, "subagent")
+    assert.match(sub.description, /inherits the parent session's model/)
   } finally {
     process.chdir(prevCwd)
     rmSync(dir, { recursive: true, force: true })

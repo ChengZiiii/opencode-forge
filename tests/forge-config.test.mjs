@@ -34,47 +34,78 @@ test("parse: syntax error carries a location and the agent set empties", () => {
 test("fail-soft: one bad entry skips only itself, siblings still apply", () => {
   const { agents, findings } = validateAgentSet({
     good: { model: "p/good", thoughtLevel: "low" },
-    bad: { thoughtLevel: "low" }, // missing model
+    bad: { thoughtLevel: "low" }, // thoughtLevel without model — half-configured
     alsobad: "not an object",
   })
   assert.deepEqual(Object.keys(agents), ["good"])
   assert.equal(agents.good.model, "p/good")
   assert.equal(findings.filter((f) => f.level === "error").length, 2)
-  assert.ok(findings.some((f) => f.code === "agent-model-missing"))
+  assert.ok(findings.some((f) => f.code === "agent-half-configured" && /model is missing/.test(f.message)))
   assert.ok(findings.some((f) => f.code === "agent-not-object"))
 })
 
+test("atomic pair: both absent = Auto worker, accepted with no finding", () => {
+  const { agents, findings } = validateAgentSet({ scout: {} })
+  assert.deepEqual(Object.keys(agents), ["scout"])
+  assert.equal(agents.scout.model, undefined)
+  assert.equal(agents.scout.thoughtLevel, undefined)
+  assert.ok(!("model" in agents.scout))
+  assert.deepEqual(findings, [])
+})
+
+test("atomic pair: model without thoughtLevel is half-configured and skipped", () => {
+  const { agents, findings } = validateAgentSet({ a: { model: "p/m" } })
+  assert.deepEqual(agents, {})
+  assert.ok(findings.some((f) => f.code === "agent-half-configured" && /thoughtLevel is missing/.test(f.message) && f.level === "error"))
+})
+
+test("atomic pair: empty-string model counts as absent — half-configured when thoughtLevel present", () => {
+  const { agents, findings } = validateAgentSet({ a: { model: "  ", thoughtLevel: "low" } })
+  assert.deepEqual(agents, {})
+  assert.ok(findings.some((f) => f.code === "model-invalid" && f.level === "warn"))
+  assert.ok(findings.some((f) => f.code === "agent-half-configured" && /model is missing/.test(f.message)))
+})
+
 test("fail-soft: invalid id skips the entry with an error finding", () => {
-  const { agents, findings } = validateAgentSet({ "Bad_Id!": { model: "p/m" } })
+  const { agents, findings } = validateAgentSet({ "Bad_Id!": { model: "p/m", thoughtLevel: "low" } })
   assert.deepEqual(agents, {})
   assert.ok(findings.some((f) => f.code === "agent-id-invalid"))
 })
 
-test("fail-soft: a mistyped optional field costs only itself", () => {
+test("fail-soft: a mistyped pair member invalidates its entry; other mistyped fields cost only themselves", () => {
   const { agents, findings } = validateAgentSet({
     a: { model: "p/m", thoughtLevel: 3, shape: "aggressive", permission: { bash: 1 } },
   })
-  assert.equal(agents.a.model, "p/m")
-  assert.equal(agents.a.thoughtLevel, undefined)
+  // thoughtLevel 3 counts as absent -> model-only -> the whole entry is skipped.
+  assert.deepEqual(agents, {})
+  assert.ok(findings.some((f) => f.code === "thoughtlevel-invalid" && f.level === "warn"))
+  assert.ok(findings.some((f) => f.code === "agent-half-configured" && f.level === "error"))
+})
+
+test("fail-soft: mistyped optional fields without pair involvement still degrade per field", () => {
+  const { agents, findings } = validateAgentSet({
+    a: { shape: "aggressive", permission: { bash: 1 }, prompt: "" },
+  })
+  assert.ok(agents.a, "an Auto entry with mistyped non-pair fields still materializes")
+  assert.equal(agents.a.model, undefined)
   assert.equal(agents.a.shape, undefined)
   assert.equal(agents.a.permission, undefined)
-  assert.ok(findings.some((f) => f.code === "thoughtlevel-invalid"))
   assert.ok(findings.some((f) => f.code === "shape-invalid"))
   assert.ok(findings.some((f) => f.code === "permission-invalid"))
-  assert.ok(findings.every((f) => f.code === "thoughtlevel-invalid" || f.code === "shape-invalid" || f.code === "permission-invalid" ? f.level === "warn" : true))
+  assert.ok(findings.some((f) => f.code === "prompt-invalid"))
 })
 
 test("depths is deprecated: warning finding, no behavior", () => {
-  const { agents, findings } = validateAgentSet({ a: { model: "p/m", depths: ["low", "medium"] } })
+  const { agents, findings } = validateAgentSet({ a: { model: "p/m", thoughtLevel: "low", depths: ["low", "medium"] } })
   assert.equal(agents.a.model, "p/m")
-  assert.equal(agents.a.thoughtLevel, undefined)
+  assert.equal(agents.a.thoughtLevel, "low")
   assert.ok(findings.some((f) => f.code === "depths-deprecated" && f.level === "warn"))
 })
 
 test("cascade: project fully wins over global (no merge)", () => {
   const files = {
-    "C:/proj/.opencode/forge.json": JSON.stringify({ agents: { research: { model: "proj/model" } } }),
-    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { research: { model: "global/model" }, review: { model: "global/model" } } }),
+    "C:/proj/.opencode/forge.json": JSON.stringify({ agents: { research: { model: "proj/model", thoughtLevel: "low" } } }),
+    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { research: { model: "global/model", thoughtLevel: "low" }, review: { model: "global/model", thoughtLevel: "low" } } }),
   }
   const l = loaderWith(files)
   const r = l.load()
@@ -85,7 +116,7 @@ test("cascade: project fully wins over global (no merge)", () => {
 
 test("cascade: global applies when no project file exists", () => {
   const files = {
-    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { review: { model: "global/model" } } }),
+    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { review: { model: "global/model", thoughtLevel: "low" } } }),
   }
   const l = loaderWith(files)
   const r = l.load()
@@ -114,7 +145,7 @@ test("unconfigured state is INERT and SILENT: empty agents, zero findings", () =
 
 test("hot-apply: an mtime/size change re-reads; unchanged stat hits the cache", () => {
   let mtime = 1
-  const content = { text: JSON.stringify({ agents: { a: { model: "p/v1" } } }) }
+  const content = { text: JSON.stringify({ agents: { a: { model: "p/v1", thoughtLevel: "low" } } }) }
   const l = createForgeConfigLoader({
     projectDir: "C:/proj",
     stat: () => ({ mtimeMs: mtime, size: content.text.length }),
@@ -122,7 +153,7 @@ test("hot-apply: an mtime/size change re-reads; unchanged stat hits the cache", 
   })
   assert.equal(l.load().agents.a.model, "p/v1")
   // Same content, new mtime: re-read happens but result matches (cache keyed on stat).
-  content.text = JSON.stringify({ agents: { a: { model: "p/v2" } } })
+  content.text = JSON.stringify({ agents: { a: { model: "p/v2", thoughtLevel: "low" } } })
   mtime = 2
   assert.equal(l.load().agents.a.model, "p/v2")
 })

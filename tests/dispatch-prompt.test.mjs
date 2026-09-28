@@ -78,3 +78,9 @@ test("agent description names the role, shape, and pinned brain for the task voc
   assert.match(d, /task tool/)
   assert.match(d, /forge-research/)
 })
+
+test("an Auto worker's description names inheritance instead of a pinned brain", () => {
+  const d = agentDescriptionFor("scout", {})
+  assert.match(d, /auto — inherits the parent session's model at dispatch/)
+  assert.doesNotMatch(d, /pinned/)
+})

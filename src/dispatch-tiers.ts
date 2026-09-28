@@ -1,14 +1,17 @@
 // forge subagent materialization source (spec: forge-subagents — "Static
 // agent definitions in a dedicated forge.json" + "Materialization as native
-// subagents with a pinned model"; change simplify-dispatch-to-static-agents).
+// subagents with a pinned model"; changes simplify-dispatch-to-static-agents,
+// auto-worker-inheritance).
 //
 // Each forge.json definition materializes as a subagent-mode agent
 // `forge-<id>` that IS visible to the host's native task tool (no hidden
 // flag — task-vocabulary discoverability is the point), carries the PINNED
-// `model` (the brain is bound at materialization; there is no per-call model
-// selection), a standing discipline prompt, and a deny-style permission with
-// `task: deny` ALWAYS forced (recursive spawning stays physically
-// impossible).
+// `model` when the definition is pinned (the brain is bound at
+// materialization; there is no per-call model selection) or NO model key at
+// all when the definition is an Auto worker (the host inherits the parent
+// session's model at dispatch), a standing discipline prompt, and a
+// deny-style permission with `task: deny` ALWAYS forced (recursive spawning
+// stays physically impossible).
 
 import type { ForgeAgentDef } from "./forge-config.ts"
 import { materializeAgentPrompt } from "./dispatch-prompt.ts"
@@ -31,18 +34,23 @@ export function rolePromptFor(agentId: string, def?: { prompt?: string }): strin
 }
 
 // Short task-tool description: this is what the dispatching model sees in
-// the task tool vocabulary, so it names the role and the pinned brain.
+// the task tool vocabulary, so it names the role and the brain — the pinned
+// identity for pinned workers, the inheritance semantics for Auto workers.
 export function agentDescriptionFor(agentId: string, def: ForgeAgentDef): string {
   const shape = def.shape === "write" ? "write" : "readonly"
-  return `forge subagent "${agentId}" (${shape}, pinned ${def.model}) — dispatch via the task tool with subagent_type "forge-${agentId}".`
+  const brain = def.model !== undefined ? `pinned ${def.model}` : "auto — inherits the parent session's model at dispatch"
+  return `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`
 }
 
-// Materialize one forge.json agent as a config-agent entry. The `model`
-// field is the reversal of the old "agents never carry a model" rule: the
-// brain is pinned by the definition, resolved by the host at spawn time.
-// `tools` carries the exec-partition surface (tool-partition spec): every
-// worker — regardless of shape — runs commands only through forge_shell, so
-// the builtin shell/bash pair is hidden at materialization.
+// Materialize one forge.json agent as a config-agent entry. A pinned
+// definition carries its `model` (the reversal of the old "agents never
+// carry a model" rule: the brain is pinned by the definition, resolved by
+// the host at spawn time); an Auto definition carries NO model key at all —
+// the host's native spawn behavior binds the parent session's current model
+// at dispatch (snapshot semantics). `tools` carries the exec-partition
+// surface (tool-partition spec): every worker — regardless of shape — runs
+// commands only through forge_shell, so the builtin shell/bash pair is
+// hidden at materialization.
 export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<string, unknown> {
   const permission: Record<string, string> = { task: "deny" }
   const shape = def.shape ?? "readonly"
@@ -51,10 +59,9 @@ export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<strin
   }
   Object.assign(permission, def.permission ?? {})
   permission.task = "deny" // an override never lifts the recursion ban
-  return {
+  const entry: Record<string, unknown> = {
     description: agentDescriptionFor(agentId, def),
     mode: "subagent",
-    model: def.model,
     prompt: materializeAgentPrompt({
       agent: agentId,
       shape,
@@ -63,4 +70,6 @@ export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<strin
     permission,
     tools: { shell: false, bash: false },
   }
+  if (def.model !== undefined) entry.model = def.model
+  return entry
 }

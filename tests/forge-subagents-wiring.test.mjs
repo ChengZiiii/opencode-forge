@@ -70,7 +70,7 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
     JSON.stringify({
       agents: {
         research: { model: "zai/glm-5.3", thoughtLevel: "low" },
-        builder: { model: "x/y", shape: "write", prompt: "You are a build worker." },
+        builder: { model: "x/y", thoughtLevel: "low", shape: "write", prompt: "You are a build worker." },
       },
     }),
   )
@@ -111,7 +111,7 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
 })
 
 test("materialization: a user-defined forge-<id> entry is never clobbered", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
@@ -125,14 +125,31 @@ test("materialization: a user-defined forge-<id> entry is never clobbered", asyn
 test("materialization: fail-soft — one broken entry does not disable its siblings", async (t) => {
   const dir = projectWithForgeJson(
     t,
-    JSON.stringify({ agents: { good: { model: "p/good" }, bad: { thoughtLevel: "low" } } }),
+    JSON.stringify({ agents: { good: { model: "p/good", thoughtLevel: "low" }, bad: { thoughtLevel: "low" } } }),
   )
   const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
   assert.ok(cfg.agent["forge-good"], "the valid agent still materializes")
-  assert.equal(cfg.agent["forge-bad"], undefined, "the entry without a model is skipped")
+  assert.equal(cfg.agent["forge-bad"], undefined, "the half-configured entry is skipped")
+})
+
+test("materialization: an Auto worker carries no model key and describes inheritance", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { scout: {} } }))
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  const scout = cfg.agent["forge-scout"]
+  assert.ok(scout, "the Auto worker materializes")
+  assert.equal(false, "model" in scout, "no model key at all — the host inherits the parent's model")
+  assert.equal(scout.mode, "subagent")
+  assert.equal(scout.permission.task, "deny", "recursion ban intact")
+  assert.match(scout.description, /auto — inherits the parent session's model at dispatch/, "the description names inheritance, not a pinned brain")
+  assert.doesNotMatch(scout.description, /pinned/, "no pinned claim for an Auto worker")
+  assert.equal(scout.tools.shell, false, "exec partition applies to Auto workers too")
+  assert.match(scout.prompt, /workspace-relative paths ONLY/, "discipline mandate present")
 })
 
 test("materialization: a broken forge.json empties the set (no seed resurrection)", async (t) => {
@@ -145,7 +162,7 @@ test("materialization: a broken forge.json empties the set (no seed resurrection
 })
 
 test("materialization: agent.forge.disable registers nothing", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
@@ -197,7 +214,7 @@ test("depth: a forge agent session gets its pinned word on the wire, frozen for 
 })
 
 test("depth: non-forge agents and agents without thoughtLevel get nothing", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { plain: { model: "openai/gpt" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { plain: {} } }))
   const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
@@ -244,7 +261,7 @@ test("depth: a no-mapping word injects nothing and records a bounded once-per-ag
 // "Unconfigured crew initialization gate")
 
 test("crew command: with agents it carries the orchestration rulebook and the roster", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm" }, review: { model: "zai/glm" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" }, review: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
@@ -288,7 +305,7 @@ test("crew command: a user-defined /crew command is never clobbered", async (t) 
 // gate" + declared-plan registration)
 
 test("crew_begin: registers the declared plan; refuses duplicates within the plan", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
@@ -361,7 +378,7 @@ test("crew_begin: refuses during a plan draft", async (t) => {
 })
 
 test("crew_close: incomplete, renegade, and honest-FAIL reports behave per spec", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())

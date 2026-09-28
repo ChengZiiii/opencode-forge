@@ -14893,7 +14893,8 @@ function rolePromptFor(agentId, def) {
 }
 function agentDescriptionFor(agentId, def) {
   const shape = def.shape === "write" ? "write" : "readonly";
-  return `forge subagent "${agentId}" (${shape}, pinned ${def.model}) — dispatch via the task tool with subagent_type "forge-${agentId}".`;
+  const brain = def.model !== undefined ? `pinned ${def.model}` : "auto — inherits the parent session's model at dispatch";
+  return `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`;
 }
 function forgeAgentDef(agentId, def) {
   const permission = { task: "deny" };
@@ -14904,10 +14905,9 @@ function forgeAgentDef(agentId, def) {
   }
   Object.assign(permission, def.permission ?? {});
   permission.task = "deny";
-  return {
+  const entry = {
     description: agentDescriptionFor(agentId, def),
     mode: "subagent",
-    model: def.model,
     prompt: materializeAgentPrompt({
       agent: agentId,
       shape,
@@ -14916,6 +14916,9 @@ function forgeAgentDef(agentId, def) {
     permission,
     tools: { shell: false, bash: false }
   };
+  if (def.model !== undefined)
+    entry.model = def.model;
+  return entry;
 }
 
 // src/dispatch-depth.ts
@@ -15250,20 +15253,35 @@ function validateAgentSet(raw) {
       findings.push({ level: "error", code: "agent-not-object", message: `${label}: definition must be an object — entry skipped` });
       continue;
     }
-    if (!nonEmptyString(entry.model)) {
-      findings.push({ level: "error", code: "agent-model-missing", message: `${label}.model: a non-empty "provider/model" string is required — entry skipped, siblings still apply` });
-      continue;
-    }
-    const def = { model: entry.model.trim() };
     if (entry.depths !== undefined) {
       findings.push({ level: "warn", code: "depths-deprecated", message: `${label}.depths is no longer used (static agents pin one thoughtLevel) — ignored; set "thoughtLevel" instead` });
     }
+    let model;
+    if (entry.model !== undefined) {
+      if (nonEmptyString(entry.model)) {
+        model = entry.model.trim();
+      } else {
+        findings.push({ level: "warn", code: "model-invalid", message: `${label}.model must be a non-empty string — field ignored (counts as absent for the model/thoughtLevel pair)` });
+      }
+    }
+    let thoughtLevel;
     if (entry.thoughtLevel !== undefined) {
       if (nonEmptyString(entry.thoughtLevel)) {
-        def.thoughtLevel = entry.thoughtLevel.trim();
+        thoughtLevel = entry.thoughtLevel.trim();
       } else {
-        findings.push({ level: "warn", code: "thoughtlevel-invalid", message: `${label}.thoughtLevel must be a non-empty string — field ignored, the agent still materializes` });
+        findings.push({ level: "warn", code: "thoughtlevel-invalid", message: `${label}.thoughtLevel must be a non-empty string — field ignored (counts as absent for the model/thoughtLevel pair)` });
       }
+    }
+    if (model === undefined !== (thoughtLevel === undefined)) {
+      const presentHalf = model !== undefined ? "model" : "thoughtLevel";
+      const missingHalf = model !== undefined ? "thoughtLevel" : "model";
+      findings.push({ level: "error", code: "agent-half-configured", message: `${label}: model and thoughtLevel form an atomic pair — ${presentHalf} is set but ${missingHalf} is missing; set BOTH to pin the brain and depth, or NEITHER for an Auto worker — entry skipped, siblings still apply` });
+      continue;
+    }
+    const def = {};
+    if (model !== undefined) {
+      def.model = model;
+      def.thoughtLevel = thoughtLevel;
     }
     if (entry.prompt !== undefined) {
       if (nonEmptyString(entry.prompt)) {
@@ -16272,7 +16290,7 @@ var CREW_INIT_TEMPLATE = [
   "",
   "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead.",
   "",
-  "Template (JSONC — comments allowed; `model` is the exact provider/model identity, `thoughtLevel` is optional: none/low/medium/high/max or a native level name):",
+  "Template (JSONC — comments allowed): `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected.",
   "{template}",
   "",
   "After the file is saved: NEW agents require a host restart to appear in the task tool; thoughtLevel edits on existing agents apply without restart. Until then, crew stays unavailable."
@@ -17112,7 +17130,8 @@ async function v2Setup(ctx) {
             agent.description = v1def.description;
             agent.system = v1def.prompt;
             agent.mode = v1def.mode;
-            agent.model = v1def.model;
+            if (v1def.model !== undefined)
+              agent.model = v1def.model;
             agent.permission = v1def.permission;
           });
         }
