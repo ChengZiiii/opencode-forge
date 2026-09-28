@@ -13419,6 +13419,9 @@ function createJobManager(opts = {}) {
     if (job.notify && job.wakeState === "none" && !job.terminalEvidence) {
       job.wakeState = "queued";
       job.wakeQueuedAt = now();
+      try {
+        opts.onWakeQueued?.(job);
+      } catch {}
     }
     if (job.terminalEvidence) {
       jobs.delete(job.id);
@@ -15603,8 +15606,15 @@ function jobLedgerSink(entry) {
 `);
   } catch {}
 }
-var jobManager = createJobManager({ sink: jobLedgerSink });
+var jobManager = createJobManager({
+  sink: jobLedgerSink,
+  onWakeQueued: (job) => {
+    if (idleJobSessions.has(job.ownerSession))
+      deliverJobWakes(job.ownerSession);
+  }
+});
 var jobClient = null;
+var idleJobSessions = new Set;
 function jobWakeText(job) {
   return [
     `[forge:job-complete] Background job ${job.id} finished (${job.state}${job.exitCode !== null ? `, exit ${job.exitCode}` : ""}).`,
@@ -16946,8 +16956,11 @@ var server = async (input, options) => {
       if (forgeDisabled)
         return;
       const raw = input2;
-      if (typeof raw.sessionID === "string" && raw.sessionID && typeof raw.agent === "string" && raw.agent) {
-        sessionAgents.set(raw.sessionID, raw.agent);
+      if (typeof raw.sessionID === "string" && raw.sessionID) {
+        idleJobSessions.delete(raw.sessionID);
+        if (typeof raw.agent === "string" && raw.agent) {
+          sessionAgents.set(raw.sessionID, raw.agent);
+        }
       }
     },
     "chat.params": async (input2, output) => {
@@ -17033,6 +17046,7 @@ var server = async (input, options) => {
         const sessionID = event.properties.sessionID;
         if (typeof sessionID === "string" && sessionID) {
           goalProbe(`idle event session=${sessionID}`);
+          idleJobSessions.add(sessionID);
           scheduleIdleContinuation(client, sessionID);
           deliverJobWakes(sessionID);
         }
