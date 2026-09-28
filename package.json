@@ -1,7 +1,7 @@
 {
   "name": "@sorenllm/opencode-forge",
-  "version": "0.3.4",
-  "description": "Single general-purpose forge agent for opencode with two orthogonal harnesses and two hang backstops: a plan harness (file-backed plans in .opencode/plan/, approve/close confirmation gates, tick discipline, hard write-ban while planning), a goal harness (autonomous, host-verified objectives in .opencode/goal/), a job supervisor (forge_shell with exit-bound completion — immune to stdio-EOF hangs — idle/success early return, background jobs with poll/log/kill/handoff, exit wakes on session idle), and a builtin-shell hang watchdog (marked timing across all sessions, graded tree-kill with dry-run/off modes, auditable ledger).",
+  "version": "0.4.0",
+  "description": "Single general-purpose forge agent for opencode: static worker subagents defined in forge.json (pinned model + optional reasoning depth, dispatched through the native task tool — TUI-visible), a plan harness (file-backed plans with approve/close confirmation gates and a hard draft write-ban), a goal harness (autonomous, host-verified objectives), a /crew orchestration command (declared-plan waves with an evidence-checked close gate), a job supervisor (forge_shell with exit-bound completion, idle/success early return, background jobs with poll/log/kill/handoff), and a builtin-shell hang watchdog.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
@@ -24,11 +24,14 @@
   "keywords": [
     "opencode",
     "opencode-plugin",
+    "subagents",
     "plan",
     "planning",
     "workflow",
     "single-agent",
     "goal",
+    "crew",
+    "orchestration",
     "background-jobs",
     "shell",
     "watchdog"

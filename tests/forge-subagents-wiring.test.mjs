@@ -276,7 +276,8 @@ test("crew command: a user-defined /crew command is never clobbered", async (t) 
 // gate" + declared-plan registration)
 
 test("crew_begin: registers the declared plan; refuses duplicates within the plan", async (t) => {
-  const h = await server(input(), {})
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm" } } }))
+  const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
@@ -299,6 +300,22 @@ test("crew_begin: registers the declared plan; refuses duplicates within the pla
   await assert.rejects(
     () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "same" }, { title: "same" }] }, allowCtx("ses_c2")),
     /unique/,
+  )
+})
+
+test("crew_begin: HARD initialization gate — empty agent set refuses with guidance", async (t) => {
+  const h = await server(input(), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, allowCtx("ses_gate")),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /CREW IS NOT INITIALIZED/)
+      assert.match(m, /forge\.json/)
+      assert.match(m, /restart/)
+      return true
+    },
   )
 })
 
@@ -332,7 +349,8 @@ test("crew_begin: refuses during a plan draft", async (t) => {
 })
 
 test("crew_close: incomplete, renegade, and honest-FAIL reports behave per spec", async (t) => {
-  const h = await server(input(), {})
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm" } } }))
+  const h = await server(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 

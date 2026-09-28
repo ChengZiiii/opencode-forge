@@ -1214,6 +1214,22 @@ const crewBeginTool = tool({
     if (active && active.doc.status === "draft") {
       throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.")
     }
+    // Hard initialization gate (spec: crew-harness — "Unconfigured crew
+    // initialization gate"): the /crew template refuses on an empty agent
+    // set, and this MECHANISM backstop stops a model that skips the template
+    // text. The refusal carries the same guidance the command shows.
+    const loaded = forgeLoader?.load()
+    if (!loaded || Object.keys(loaded.agents).length === 0) {
+      const paths = forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+      throw new Error(
+        [
+          "[forge:crew] CREW IS NOT INITIALIZED: no forge subagents are configured. Crew orchestration is unavailable until the user sets it up.",
+          `Create ONE of these files (project-level wins): ${paths.project} OR ${paths.global}`,
+          'Template (JSONC): {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low"}}}',
+          "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. Newly added agents need a host restart; thoughtLevel edits apply without one.",
+        ].join("\n"),
+      )
+    }
     if (!args.objective?.trim()) throw new Error("crew_begin requires a non-empty objective (from /crew <objective>).")
     const raw = Array.isArray(args.subtasks) ? args.subtasks : []
     if (raw.length === 0) throw new Error("[forge:crew] crew_begin requires subtasks[] — declare the plan before executing (decompose the objective into titled subtasks).")
