@@ -33,7 +33,7 @@
 ## 5. 回归与文档
 
 - [x] 5.1 全套回归：`bun run typecheck`、`node --test tests/*.test.mjs` 全绿。
-- [ ] 5.2 README：行为标准表（forge 族 vs 非 forge 面）、build/plan 共存与 Tab cycle 变化、keepBuiltinShell/mode:native 开关、混合会话小节、合并 config 键级注入说明、卸载自愈复核。验证：通读与实现一致，文件账本无新增残留路径。
-- [ ] 5.3 AGENTS.md 架构总览行与关键机制（第 2/6 条）随行为更新。验证：与代码一致性通读。
+- [x] 5.2 README：行为标准表（forge 族 vs 非 forge 面）、build/plan 共存与 Tab cycle 变化、keepBuiltinShell/mode:native 开关、混合会话小节、合并 config 键级注入说明、卸载自愈复核。验证：通读与实现一致，文件账本无新增残留路径。
+- [x] 5.3 AGENTS.md 架构总览行与关键机制（第 2/6 条）随行为更新。验证：与代码一致性通读。
 - [x] 5.4 打包与终验：`bun run bundle`（自包含重建）、`npm pack --dry-run` 核对 files、官方安装模式 E2E（`opencode plugin "git+file:///<绝对路径>" --global` + 沙盒配置）实测：forge 会话无 bash 有 forge_shell、build 会话有 bash 无 forge_shell 且系统提示零 `[forge:*]`、general 派生子代理同隔离、build 派发 forge-* 被拒、goal 会话切非 forge agent 后 idle 不续跑、非 forge 会话内置 shell 无 watchdog 标记。验证：transcript/日志摘录附到本 change verify 记录。
-- [ ] 5.5 归档时直接编辑 `openspec/specs/hang-watchdog/spec.md` 的 Purpose 行（"in any session" → forge 族管辖表述；delta 不承载 Purpose 修改）。验证：归档后 `openspec show hang-watchdog --type spec` 首段与新管辖域一致。
+- [x] 5.5 归档时直接编辑 `openspec/specs/hang-watchdog/spec.md` 的 Purpose 行（"in any session" → forge 族管辖表述；delta 不承载 Purpose 修改）。验证：归档后 `openspec show hang-watchdog --type spec` 首段与新管辖域一致。

@@ -125,26 +125,22 @@ Job output SHALL be tee'd to a log file inside the plugin's namespaced temporary
 
 ### Requirement: Model-facing guidance injection
 
-The plugin SHALL inject concise guidance into the system prompt of all sessions, including delegated ones: long-running or potentially non-exiting commands go through `forge_shell`; a delegated agent collects its job results via `poll` before yielding its conclusion.
+The plugin SHALL inject the job guidance into the system prompt of sessions whose agent belongs to the forge family (the forge primary agent and forge-* subagents), including delegated forge-family sessions; sessions of any other agent SHALL receive no forge-authored system text.
+
+#### Scenario: Forge-family sessions receive the guidance
+
+- **WHEN** a forge or forge-* session builds its system prompt
+- **THEN** it contains the forge_shell guidance and the delegated collection rule
 
 #### Scenario: Subagent sessions receive the collection rule
 
-- **WHEN** a delegated session is spawned while the plugin is loaded
+- **WHEN** a delegated forge-family session is spawned while the plugin is loaded
 - **THEN** its system prompt contains the rule to poll job results before yielding
 
-### Requirement: Capability probe and staged degradation
+#### Scenario: Non-forge sessions receive no forge text
 
-The plugin SHALL probe the host's native background capability via configuration flags, the native shell tool's parameter schema, and a manual `jobs.mode` option (`auto` | `forge` | `native`). Based on the probe it SHALL apply a stage matrix: with no native capability it provides the full forge path (stage 0); with an incomplete native capability it stops hiding the builtin shell and reduces `forge_shell` to an additive layer on top of native process management (stage 1); with a complete native capability it retires `forge_shell` and restores the builtin shell (stage 2). Model-facing semantics and naming SHALL remain constant across stages.
-
-#### Scenario: Stage 0 hides builtin shell on the forge agent
-
-- **WHEN** the probe finds no native background capability
-- **THEN** the forge agent's builtin shell tool is hidden via runtime config injection and `forge_shell` is the exec surface
-
-#### Scenario: Stage 2 retires forge_shell without prompt changes
-
-- **WHEN** the probe finds a complete native background capability
-- **THEN** `forge_shell` is no longer registered, the builtin shell is restored, and prompts written against the job verbs keep working through the native surface
+- **WHEN** a native or user-defined non-forge agent session builds its system prompt
+- **THEN** its system prompt contains no forge-authored guidance
 
 ### Requirement: Configuration surface and file ledger
 
@@ -201,3 +197,17 @@ A job SHALL survive host exit only when explicitly marked (per-call `survive` fl
 
 - **WHEN** a job is started without any survival opt-in and the host exits
 - **THEN** the job does not survive, regardless of how long it was configured to run
+
+### Requirement: Mode selection and supervisor retirement
+
+The plugin SHALL accept a manual `jobs.mode` option (`auto` | `forge` | `native`). The `auto` and `forge` modes SHALL be equivalent: the forge-side exec partition (builtin shell hidden on forge-family agents, per the tool-partition capability) SHALL hold regardless of any host background capability. Only `native` mode retires the supervisor: `forge_shell` and `forge_jobs` are no longer registered and the builtin shell is restored on the forge agent. Model-facing semantics and naming SHALL remain constant across modes.
+
+#### Scenario: Native backgrounding does not unhide the builtin shell
+
+- **WHEN** the host's builtin shell presents a run_in_background parameter and jobs.mode is `auto`
+- **THEN** the forge agent's builtin shell tool remains hidden and `forge_shell` stays the exec surface
+
+#### Scenario: Manual retirement restores the native surface without prompt changes
+
+- **WHEN** the user sets `jobs.mode` to `native`
+- **THEN** `forge_shell` is no longer registered, the builtin shell is restored, and prompts written against the job verbs keep working through the native surface

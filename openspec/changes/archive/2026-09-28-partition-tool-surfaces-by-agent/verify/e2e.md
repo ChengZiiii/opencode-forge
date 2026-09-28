@@ -20,3 +20,16 @@ Isolation: fake USERPROFILE/HOME (no user config, no npm forge copy) + OPENCODE_
 - forge.json fail-soft cross-check: a BOM-prefixed forge.json produced a located parse error and an empty agent set (no crash).
 
 Unit: 246/246 (node --test tests/*.test.mjs), tsc clean, bundle 0.60 MB self-contained, npm pack --dry-run = 3 files per whitelist.
+
+# Official-install verification (task 5.4, real environment)
+
+- Committed as `06056bf` (conventional: `plugin:`), then `opencode plugin "git+file:///<repo>" --global`.
+- User config plugin array: npm 0.4.0 entry REMOVED (upgrade semantics; dual-instance fight otherwise), git+file entry active. Rollback = delete the git+file line.
+- Fresh `opencode run` in the real workspace: default subject `> forge`; builtin bash call -> `[forge:partition] Builtin shell refused ...` (hard refusal, no execution); forge_shell / plan_write / goal_write / crew_begin all present (4/4) on the primary.
+
+# npm-channel verification (release 0.5.0)
+
+- Published @sorenllm/opencode-forge@0.5.0 (tarball 129.1 kB, 3 files); release commit 9f73872.
+- Global config switched to npm mode; opencode plugin cache still resolved 0.4.0 (stale lock) — refreshed cache to 0.5.0 (belt string present).
+- forge run: header forge; bash call -> [forge:partition] Builtin shell refused (verbatim, no execution).
+- build run: forge_shell call -> [forge:partition] Tool refused (...outside it...); system prompt PROMPT_FORGE:NO.
