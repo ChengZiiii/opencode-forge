@@ -102,16 +102,19 @@ test("depths is deprecated: warning finding, no behavior", () => {
   assert.ok(findings.some((f) => f.code === "depths-deprecated" && f.level === "warn"))
 })
 
-test("cascade: project fully wins over global (no merge)", () => {
+test("cascade: layers MERGE — project overrides global per agent id, wholesale", () => {
   const files = {
     "C:/proj/.opencode/forge.json": JSON.stringify({ agents: { research: { model: "proj/model", thoughtLevel: "low" } } }),
-    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { research: { model: "global/model", thoughtLevel: "low" }, review: { model: "global/model", thoughtLevel: "low" } } }),
+    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { research: { model: "global/model", thoughtLevel: "high" }, review: { model: "global/model", thoughtLevel: "low" } } }),
   }
   const l = loaderWith(files)
   const r = l.load()
-  assert.equal(r.source, "project")
-  assert.deepEqual(Object.keys(r.agents), ["research"])
-  assert.equal(r.agents.research.model, "proj/model")
+  assert.equal(r.source, "project+global")
+  assert.deepEqual(Object.keys(r.agents).sort(), ["research", "review"])
+  assert.equal(r.agents.research.model, "proj/model", "project definition wins the colliding id")
+  assert.equal(r.agents.research.thoughtLevel, "low", "wholesale — no cross-layer field blending")
+  assert.equal(r.agents.review.model, "global/model", "a global-only id survives the merge")
+  assert.equal(r.projectPath, "C:/proj/.opencode/forge.json")
 })
 
 test("cascade: global applies when no project file exists", () => {
@@ -122,9 +125,61 @@ test("cascade: global applies when no project file exists", () => {
   const r = l.load()
   assert.equal(r.source, "global")
   assert.equal(r.agents.review.model, "global/model")
+  assert.equal(r.projectPath, null)
 })
 
-test("broken JSON: empty set + one parse-location error finding; NO seed resurrects", () => {
+test("discovery: walks up — the NEAREST .opencode/forge.json wins and nothing above it is consulted", () => {
+  const files = {
+    "C:/work/repo/packages/app/.opencode/forge.json": JSON.stringify({ agents: { nested: { model: "p/n", thoughtLevel: "low" } } }),
+    "C:/work/repo/.opencode/forge.json": JSON.stringify({ agents: { repo: { model: "p/r", thoughtLevel: "low" } } }),
+    "C:/work/.opencode/forge.json": JSON.stringify({ agents: { above: { model: "p/a", thoughtLevel: "low" } } }),
+  }
+  const r = loaderWith(files, { projectDir: "C:/work/repo/packages/app" }).load()
+  assert.equal(r.projectPath, "C:/work/repo/packages/app/.opencode/forge.json")
+  assert.deepEqual(Object.keys(r.agents), ["nested"])
+})
+
+test("discovery: no file at the anchor still finds the ancestor's, then merges with global", () => {
+  const files = {
+    "C:/work/repo/.opencode/forge.json": JSON.stringify({ agents: { repo: {} } }),
+    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { g: {} } }),
+  }
+  const r = loaderWith(files, { projectDir: "C:/work/repo/packages/app" }).load()
+  assert.equal(r.source, "project+global")
+  assert.deepEqual(Object.keys(r.agents).sort(), ["g", "repo"])
+})
+
+test("fail-soft per layer: a broken project doc empties only its layer; global still applies", () => {
+  const files = {
+    "C:/proj/.opencode/forge.json": "{ agents: { broken",
+    "C:/home/.config/opencode/forge.json": JSON.stringify({ agents: { review: { model: "global/model", thoughtLevel: "low" } } }),
+  }
+  const r = loaderWith(files).load()
+  assert.deepEqual(Object.keys(r.agents), ["review"])
+  assert.equal(r.findings.length, 1)
+  assert.equal(r.findings[0].code, "config-parse-error")
+  assert.match(r.findings[0].message, /line \d+, column \d+/)
+})
+
+test("hot-apply: a project file appearing or vanishing on the chain applies without restart", () => {
+  const files = {}
+  let mtime = 1
+  const l = createForgeConfigLoader({
+    projectDir: "C:/proj",
+    homeDir: "C:/home",
+    stat: (p) => (files[p] === undefined ? null : { mtimeMs: mtime, size: files[p].length }),
+    readFile: (p) => files[p],
+  })
+  assert.equal(l.load().source, "none")
+  files["C:/proj/.opencode/forge.json"] = JSON.stringify({ agents: { a: { model: "p/m", thoughtLevel: "low" } } })
+  mtime++
+  assert.equal(l.load().source, "project")
+  delete files["C:/proj/.opencode/forge.json"]
+  mtime++
+  assert.equal(l.load().source, "none")
+})
+
+test("broken JSON with no other layer: empty set + one parse-location error finding; NO seed resurrects", () => {
   const files = { "C:/proj/.opencode/forge.json": "{ agents: { broken" }
   const l = loaderWith(files)
   const r = l.load()

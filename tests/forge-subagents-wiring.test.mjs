@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -343,9 +343,91 @@ test("crew_begin: HARD initialization gate — empty agent set refuses with guid
       assert.match(m, /CREW IS NOT INITIALIZED/)
       assert.match(m, /forge\.json/)
       assert.match(m, /restart/)
+      assert.match(m, /MERGED/, "the guidance states the merge semantics")
       return true
     },
   )
+})
+
+// ---------------------------------------------------------------------------
+// Session-anchored discovery + workspace-mismatch disclosure (change
+// align-forge-config-discovery)
+
+function workspaceWithForgeJson(t, json) {
+  const dir = mkdtempSync(join(tmpdir(), "forge-wiring-ws-"))
+  t.after(() => {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {}
+  })
+  mkdirSync(join(dir, ".opencode"), { recursive: true })
+  writeFileSync(join(dir, ".opencode", "forge.json"), json)
+  return dir
+}
+
+test("crew_begin: a workspace forge.json the host cannot see is DISCLOSED, not masked", async (t) => {
+  // Host launched with its own pool; the session works in another directory
+  // whose forge.json defines an agent the host never materialized.
+  const hostDir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  const ws = workspaceWithForgeJson(t, JSON.stringify({ agents: { localtool: { model: "zai/glm", thoughtLevel: "low" } } }))
+  const h = await server(input(hostDir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await h.tool.crew_begin.execute(
+    { objective: "o", subtasks: [{ title: "x", agent: "forge-research" }] },
+    { ...allowCtx("ses_ws1"), worktree: ws, directory: ws },
+  )
+  const text = typeof out === "string" ? out : out.output
+  assert.match(text, /NOT dispatchable on this host/)
+  assert.match(text, /forge-localtool/)
+  assert.match(text, /Relaunch opencode in that workspace/)
+})
+
+test("crew_begin: empty host set + usable workspace file → mismatch-explaining refusal", async (t) => {
+  const hostDir = mkdtempSync(join(tmpdir(), "forge-wiring-host-"))
+  t.after(() => {
+    try {
+      rmSync(hostDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const ws = workspaceWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  const h = await server(input(hostDir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, { ...allowCtx("ses_ws2"), worktree: ws, directory: ws }),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /CREW IS NOT INITIALIZED/)
+      assert.match(m, /this session's workspace DOES have a forge\.json/)
+      assert.match(m, /Relaunch opencode in that workspace/)
+      return true
+    },
+  )
+})
+
+test("sessionAnchor: a degenerate worktree with a distinct session directory anchors plans under the session directory", async (t) => {
+  const hostDir = mkdtempSync(join(tmpdir(), "forge-wiring-launch-"))
+  t.after(() => {
+    try {
+      rmSync(hostDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const ws = mkdtempSync(join(tmpdir(), "forge-wiring-anchor-"))
+  t.after(() => {
+    try {
+      rmSync(ws, { recursive: true, force: true })
+    } catch {}
+  })
+  const h = await server(input(hostDir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.plan_write.execute(
+    { goal: "anchor check", context: "c", approach: "a", tasks: ["t1"], risks: "r", acceptance: ["ac"] },
+    { ...allowCtx("ses_anchor"), worktree: "/", directory: ws },
+  )
+  assert.ok(existsSync(join(ws, ".opencode", "plan")), "the plan landed under the SESSION directory, not the launch dir")
+  assert.ok(!existsSync(join(hostDir, ".opencode", "plan")), "nothing leaked to the launch directory")
 })
 
 test("crew_begin: refuses during a plan draft", async (t) => {
