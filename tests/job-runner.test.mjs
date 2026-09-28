@@ -21,9 +21,9 @@ class FakeChild extends EventEmitter {
 
 function makeFakeSpawn() {
   const spawned = []
-  const spawnFn = (cmd, opts) => {
+  const spawnFn = (cmd, args, opts) => {
     const child = new FakeChild()
-    spawned.push({ cmd, opts, child })
+    spawned.push({ cmd, args, opts, child })
     return child
   }
   spawnFn.spawned = spawned
@@ -185,7 +185,7 @@ test("3.1b real #47350 repro: detached holder keeps the LOG fd, completion still
   )
   const t0 = Date.now()
   const { job, settle } = startJob(manager, {
-    cmd: `"${process.execPath}" "${join(dir, "launcher.js")}"`,
+    cmd: `node launcher.js`,
     cwd: dir,
     ownerSession: "ses_repro",
     worktree: dir,
@@ -396,5 +396,34 @@ test("2.3 file tail: poll cursor advances incrementally and the ring stays bound
   assert.equal(p2.newOutput, "y".repeat(60) + "\n", "only the delta is returned")
   assert.ok(job.tail.length <= 100, "ring is capped")
   fake.spawned[0].child.emit("exit", 0)
+  rmSync(dir, { recursive: true, force: true })
+})
+
+// align-shell-interpreter: the job spawns through the host-aligned argv —
+// PS-family wrapper invoked directly (no cmd.exe, no Node shell option),
+// with the exit-code guard and the job env marker riding along.
+test("align-shell-interpreter: startJob spawns the PS wrapper argv with the exit-code guard", async () => {
+  const dir = tmpLogDir()
+  const captured = []
+  const fake = (cmd, args, opts) => {
+    captured.push({ cmd, args, opts })
+    const child = new FakeChild()
+    setImmediate(() => child.emit("exit", 0))
+    return child
+  }
+  const { job, settle } = startJob(createJobManager(), {
+    ...BASE,
+    logDir: dir,
+    idleMs: 10_000,
+    maxWaitMs: 60_000,
+    spawnFn: fake,
+    exitGraceMs: 30,
+    shell: { bin: "pwsh.exe", family: "ps", login: false },
+  })
+  await settle
+  assert.equal(captured[0].cmd, "pwsh.exe")
+  assert.deepEqual(captured[0].args, ["-NoProfile", "-Command", `${BASE.cmd}\nexit $LASTEXITCODE`])
+  assert.equal("shell" in captured[0].opts, false, "no Node shell option — explicit argv only")
+  assert.equal(captured[0].opts.env[JOB_ENV_MARKER], job.id, "job env marker present")
   rmSync(dir, { recursive: true, force: true })
 })

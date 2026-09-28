@@ -92,7 +92,7 @@ test("5.2 relay: manager B adopts manager A's survivor — poll sees output, kil
   const script = "setInterval(() => console.log('tick'), 200)\n"
   writeFileSync(join(dir, "sleeper.js"), script)
   const { job } = startJob(managerA, {
-    cmd: `"${process.execPath}" "${join(dir, "sleeper.js")}"`,
+    cmd: `node sleeper.js`,
     cwd: dir,
     ownerSession: "ses_A",
     worktree: dir,

@@ -187,7 +187,7 @@ test("4.1 forge_shell execute: ask posture gates every run; deny short-circuits"
     return { status: "allow" }
   })
   const res = await h.tool.forge_shell.execute(
-    { command: `"${process.execPath}" -e "console.log('wired-ok')"`, idle_ms: 8000, max_wait_ms: 15000 },
+    { command: `node -e "console.log('wired-ok')"`, idle_ms: 8000, max_wait_ms: 15000 },
     allowCtx,
   )
   assert.equal(asks.length, 1, "exactly one ask per run")
@@ -199,7 +199,7 @@ test("4.1 forge_shell execute: ask posture gates every run; deny short-circuits"
     throw new Error("user denied")
   })
   await assert.rejects(
-    () => h.tool.forge_shell.execute({ command: `"${process.execPath}" -e "console.log('must-not-run')"` }, denyCtx),
+    () => h.tool.forge_shell.execute({ command: `node -e "console.log('must-not-run')"` }, denyCtx),
     /denied/,
   )
   const listed = await h.tool.forge_jobs.execute({ action: "list" }, denyCtx)
@@ -231,7 +231,7 @@ test("5.1 wake engine: exit queues, only session.idle delivers, exactly once", a
   const h = await server({ ...fakeInput(), client }, { jobs: { mode: "forge" } })
   const ctx = toolCtx("ses_wake", async () => ({ status: "allow" }))
   const started = await h.tool.forge_shell.execute(
-    { command: `"${process.execPath}" -e "setTimeout(()=>console.log('done'),150)"`, run_in_background: true },
+    { command: `node -e "setTimeout(()=>console.log('done'),150)"`, run_in_background: true },
     ctx,
   )
   assert.match(started.output, /jobId: j-/)
@@ -270,7 +270,7 @@ test("terminal evidence: a foreground quick command self-clears — no wake, no 
   const h = await server({ ...fakeInput(), client }, { jobs: { mode: "forge" } })
   const ctx = toolCtx("ses_te", async () => ({ status: "allow" }))
   const res = await h.tool.forge_shell.execute(
-    { command: `"${process.execPath}" -e "console.log('te-ok')"`, idle_ms: 8000, max_wait_ms: 15000 },
+    { command: `node -e "console.log('te-ok')"`, idle_ms: 8000, max_wait_ms: 15000 },
     ctx,
   )
   assert.match(res.output, /te-ok/)
@@ -299,7 +299,7 @@ test("read consumption: a background job polled to terminal self-clears — no w
   const h = await server({ ...fakeInput(), client }, { jobs: { mode: "forge" } })
   const ctx = toolCtx("ses_rc", async () => ({ status: "allow" }))
   const started = await h.tool.forge_shell.execute(
-    { command: `"${process.execPath}" -e "setTimeout(()=>console.log('rc-done'),120)"`, run_in_background: true },
+    { command: `node -e "setTimeout(()=>console.log('rc-done'),120)"`, run_in_background: true },
     ctx,
   )
   const jobId = /jobId: (j-\S+)/.exec(started.output)[1]
@@ -336,7 +336,7 @@ test("read consumption era: a completion arriving during idle is pushed immediat
   // is now believed idle.
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_push" } } })
   const started = await h.tool.forge_shell.execute(
-    { command: `"${process.execPath}" -e "setTimeout(()=>console.log('push-done'),150)"`, run_in_background: true },
+    { command: `node -e "setTimeout(()=>console.log('push-done'),150)"`, run_in_background: true },
     ctx,
   )
   assert.match(started.output, /jobId: j-/)
@@ -346,4 +346,14 @@ test("read consumption era: a completion arriving during idle is pushed immediat
   assert.equal(sent.length, 1, "the wake fired without a subsequent idle transition")
   assert.equal(sent[0].path.id, "ses_push")
   assert.match(sent[0].body.parts[0].text, /\[forge:job-complete\]/)
+})
+
+// align-shell-interpreter: the tool description discloses the interpreter
+// flavor so the model knows which syntax family forge_shell speaks.
+test("forge_shell description discloses the interpreter flavor", async () => {
+  const h = await hooks({ jobs: { mode: "forge" } })
+  const d = h.tool.forge_shell.description
+  assert.match(d, /PowerShell family on Windows/)
+  assert.match(d, /bash preferred on POSIX/)
+  assert.match(d, /git-bash/, "the no-PowerShell fallback is named")
 })

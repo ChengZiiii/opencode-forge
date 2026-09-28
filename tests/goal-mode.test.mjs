@@ -8,7 +8,7 @@ import { join } from "node:path"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 const { server } = await import("../plugin.ts")
 import { appendLedger, parseGoal } from "../src/goal-file.ts"
-import { setShellRunnerForTests } from "../src/run-check.ts"
+import { setShellRunnerForTests, runChecks } from "../src/run-check.ts"
 
 const NOW_PREFIX = "goal-mode-test"
 let sidCounter = 0
@@ -965,6 +965,22 @@ test("B36: goal continuation fires once per idle; no dispatch briefs exist", asy
     assert.equal(calls.filter((c) => JSON.stringify(c.body ?? c).includes("[forge:goal-continue]")).length, 1, "single goal re-prompt for one idle")
     assert.equal(calls.filter((c) => JSON.stringify(c.body ?? c).includes("[forge:dispatch-complete]")).length, 0, "no dispatch briefs exist anymore")
     await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// align-shell-interpreter: the goal gate's REAL shell runner (no fake
+// injected) executes through the host-aligned interpreter — a nonzero exit
+// must propagate through the wrapper's exit-code guard on every platform.
+test("align-shell-interpreter: run-check real runner propagates exit codes through the host shell", async () => {
+  setShellRunnerForTests(null) // restore the real defaultShellRunner (shared shellSpawn)
+  const wt = mkdtempSync(join(tmpdir(), "forge-runcheck-real-"))
+  try {
+    const outcomes = await runChecks([{ kind: "shell", cmd: "exit 3", timeoutSec: 60 }], wt)
+    assert.equal(outcomes.length, 1)
+    assert.equal(outcomes[0].ok, false, "exit 3 fails the check")
+    assert.match(outcomes[0].detail, /exit=3/, "the wrapper's exit-code guard carried 3 through")
   } finally {
     rmSync(wt, { recursive: true, force: true })
   }

@@ -88,8 +88,8 @@ test("3.2 invalid watchdog options fall back to defaults and ledger the fallback
 
 test("4.2 job-supervisor spawns carry the job marker but never the watchdog mark", async () => {
   const spawned = []
-  const spawnFn = (cmd, opts) => {
-    spawned.push({ cmd, opts })
+  const spawnFn = (cmd, args, opts) => {
+    spawned.push({ cmd, args, opts })
     return new EventEmitter()
   }
   const manager = createJobManager()
