@@ -428,6 +428,12 @@ workspace-local file that the host was not launched on is NOT silently
 ignored: `/crew` names it and tells you to relaunch there (or fold the
 agents into the global layer).
 
+**Id naming**: use plain role words (`research`, `coder`, …) — the plugin
+materializes every id as `forge-<id>` itself. A `forge-`-prefixed id in the
+file would double up (`forge-coder` → agent `forge-forge-coder`); the loader
+auto-strips the prefix (all repetitions) with a warning so existing files
+keep working, but rename the entries to silence it.
+
 ```jsonc
 {
   // forge subagents — definitions; see the restart table below for apply timing

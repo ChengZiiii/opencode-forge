@@ -290,8 +290,21 @@ test("crew command: unconfigured is a HARD gate with initialization guidance", a
   assert.match(cmd.template, /thoughtLevel/, "the hot-apply note")
   assert.match(cmd.template, /"prompt"/, "the embedded example shows the prompt field")
   assert.match(cmd.template, /SHORT prompt/, "the AI-assist short-prompt mandate")
+  assert.match(cmd.template, /WITHOUT the `forge-` prefix/, "the plain-role-word naming rule")
   assert.match(cmd.template, /research.*review.*built-in|built-in.*research/is, "discloses which ids carry built-in roles")
   assert.match(cmd.description, /NOT INITIALIZED/)
+})
+
+test("materialization: a forge--prefixed id self-heals — single-prefix agent, no doubling", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { "forge-coder": { model: "zai/glm", thoughtLevel: "low" } } }))
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  assert.ok(cfg.agent["forge-coder"], "materialized under the single-prefix name")
+  assert.ok(!cfg.agent["forge-forge-coder"], "no doubled prefix")
+  assert.match(cfg.command["crew"].template, /forge-coder/, "the roster lists the healed name")
+  assert.doesNotMatch(cfg.command["crew"].template, /forge-forge-coder/)
 })
 
 test("crew command: a user-defined /crew command is never clobbered", async (t) => {
@@ -349,6 +362,7 @@ test("crew_begin: HARD initialization gate — empty agent set refuses with guid
       assert.match(m, /MERGED/, "the guidance states the merge semantics")
       assert.match(m, /"prompt"/, "the refusal template shows the prompt field")
       assert.match(m, /SHORT prompt/, "the refusal carries the short-prompt mandate")
+      assert.match(m, /WITHOUT the `forge-` prefix/, "the refusal carries the naming rule")
       return true
     },
   )

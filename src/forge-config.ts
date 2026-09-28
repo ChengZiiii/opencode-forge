@@ -300,10 +300,26 @@ export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAg
     findings.push({ level: "error", code: "agents-not-object", message: 'forge.json "agents" must be an object mapping agent ids to definitions — the agent set is empty' })
     return { agents, findings }
   }
-  for (const [id, entry] of Object.entries(raw)) {
-    const label = `agents.${id}`
+  for (const [rawId, entry] of Object.entries(raw)) {
+    let label = `agents.${rawId}`
+    let id = rawId
+    // Reserved-prefix self-heal (change align-forge-config-discovery): the
+    // plugin materializes every id as `forge-<id>`, so a `forge-`-prefixed
+    // id would double the prefix (`forge-coder` -> agent `forge-forge-coder`).
+    // Strip the prefix (all repetitions) with a warn finding — the entry
+    // works under its intended name without forcing a file edit.
+    if (rawId.startsWith("forge-")) {
+      id = rawId.replace(/^(forge-)+/, "")
+      findings.push({ level: "warn", code: "agent-id-forge-prefix", message: `${label}: the forge- prefix is added automatically at materialization — stripped to "${id}"; rename the entry to silence this warning` })
+    }
     if (!AGENT_ID_RE.test(id)) {
       findings.push({ level: "error", code: "agent-id-invalid", message: `${label}: agent id must match [a-z0-9-] — entry skipped` })
+      continue
+    }
+    if (agents[id] !== undefined) {
+      // Only reachable via normalization (duplicate literal keys collapse at
+      // JSON.parse): the later entry loses, first-wins, honest error.
+      findings.push({ level: "error", code: "agent-id-collision", message: `${label}: normalizes to "${id}" which is already defined — entry skipped (first definition wins)` })
       continue
     }
     if (!isRecord(entry)) {

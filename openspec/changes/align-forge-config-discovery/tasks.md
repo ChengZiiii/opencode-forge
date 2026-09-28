@@ -14,6 +14,7 @@
 - [x] 2.3 Update the unconfigured-refusal message and `CREW_INIT_TEMPLATE`: two layers, "merged — project overrides global per agent", walk-up wording; keep the consent rule and restart/hot-apply timing lines
 - [x] 2.4 Config-hook loader creation and v2 setup unchanged in signature (walk-up + merge inherited); chat.params depth lookup stays host-anchored (depth must match the materialized model)
 - [x] 2.5 Prompt disclosure in the configuration guidance (follow-up): CREW_INIT_TEMPLATE template example + prose and the crew_begin refusal disclose the optional per-agent `prompt`; AI-assisted configuration mandates a SHORT prompt per agent from the requested role (one or two sentences; long only on explicit request)
+- [x] 2.6 Reserved-prefix self-heal (follow-up 2): the loader strips a `forge-` id prefix (all repetitions) with a warn finding; empty-after-strip is invalid; post-normalization collision skips the later entry with an error finding; the guidance states the plain-role-word naming rule in the template, the AI-assist mandate, and the refusal
 
 ## 3. Tests
 
@@ -21,7 +22,8 @@
 - [x] 3.2 forge-subagents-wiring: /crew template + gate message wording (merged, two layers); crew_begin mismatch disclosure when the session anchor discovers a project layer the host did not materialize; empty-host + workspace-file refusal names the file and the relaunch guidance
 - [x] 3.3 goal-mode / plan anchoring: a degenerate-worktree tool context with a distinct `directory` anchors plan/goal state under the session directory (not the launch dir)
 - [x] 3.4 Prompt-disclosure assertions: the /crew init template and the crew_begin refusal both show the `prompt` field and the short-prompt mandate
-- [x] 3.5 Full suite green (`node --test tests/*.test.mjs` — 281 pass) + `bun run typecheck` clean
+- [x] 3.5 Reserved-prefix tests: normalization (single + repeated prefix, warn finding, materialized single-prefix agent name), collision after normalization (later entry skipped with an error), guidance naming-rule assertions in the init template and refusal
+- [x] 3.6 Full suite green (`node --test tests/*.test.mjs`) + `bun run typecheck` clean
 
 ## 4. Docs & release
 

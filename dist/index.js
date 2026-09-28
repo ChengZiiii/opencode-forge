@@ -15358,10 +15358,19 @@ function validateAgentSet(raw) {
     findings.push({ level: "error", code: "agents-not-object", message: 'forge.json "agents" must be an object mapping agent ids to definitions — the agent set is empty' });
     return { agents, findings };
   }
-  for (const [id, entry] of Object.entries(raw)) {
-    const label = `agents.${id}`;
+  for (const [rawId, entry] of Object.entries(raw)) {
+    let label = `agents.${rawId}`;
+    let id = rawId;
+    if (rawId.startsWith("forge-")) {
+      id = rawId.replace(/^(forge-)+/, "");
+      findings.push({ level: "warn", code: "agent-id-forge-prefix", message: `${label}: the forge- prefix is added automatically at materialization — stripped to "${id}"; rename the entry to silence this warning` });
+    }
     if (!AGENT_ID_RE.test(id)) {
       findings.push({ level: "error", code: "agent-id-invalid", message: `${label}: agent id must match [a-z0-9-] — entry skipped` });
+      continue;
+    }
+    if (agents[id] !== undefined) {
+      findings.push({ level: "error", code: "agent-id-collision", message: `${label}: normalizes to "${id}" which is already defined — entry skipped (first definition wins)` });
       continue;
     }
     if (!isRecord(entry)) {
@@ -16491,9 +16500,9 @@ var CREW_INIT_TEMPLATE = [
   "1. The user configures it themselves: create either layer — MERGED, the project layer overrides the global one per agent id (the project file is the nearest .opencode/forge.json walking up from the workspace root):",
   "{paths}",
   "",
-  "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent.",
+  "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: name ids as PLAIN role words WITHOUT the `forge-` prefix — the plugin materializes every id as `forge-<id>` automatically (a `forge-`-prefixed id doubles up as `forge-forge-coder` and is auto-stripped with a warning). Give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent.",
   "",
-  "Template (JSONC — comments allowed): `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job).",
+  "Template (JSONC — comments allowed): ids are plain role words (research, coder, ...) — the plugin adds the `forge-` prefix at materialization; `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job).",
   "{template}",
   "",
   "After the file is saved: NEW agents require a host restart to appear in the task tool; thoughtLevel edits on existing agents apply without restart. Until then, crew stays unavailable."
@@ -16546,6 +16555,7 @@ var crewBeginTool = tool({
         "[forge:crew] CREW IS NOT INITIALIZED on this host: no forge subagents are materialized. Crew orchestration is unavailable until the user sets it up.",
         `Two layers, MERGED (the project layer overrides the global one per agent id): ${paths.project} (nearest .opencode/forge.json walking up from the workspace) OR ${paths.global}.`,
         'Template (JSONC): {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "prompt": "short role description"}}}',
+        "Agent ids are plain role words WITHOUT the `forge-` prefix — the plugin materializes each id as `forge-<id>` (a prefixed id is auto-stripped with a warning).",
         "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it, give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request) — without a prompt, custom ids get a generic one-liner and will not know their job. Newly added agents need a host restart; thoughtLevel edits apply without one."
       ];
       if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject) {

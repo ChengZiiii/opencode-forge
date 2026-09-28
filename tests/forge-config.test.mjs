@@ -72,6 +72,25 @@ test("fail-soft: invalid id skips the entry with an error finding", () => {
   assert.ok(findings.some((f) => f.code === "agent-id-invalid"))
 })
 
+test("id self-heal: a forge- prefix is stripped with a warn finding — no doubling at materialization", () => {
+  const { agents, findings } = validateAgentSet({ "forge-coder": { model: "p/m", thoughtLevel: "low" } })
+  assert.deepEqual(Object.keys(agents), ["coder"], "normalized to the plain role word")
+  assert.ok(findings.some((f) => f.code === "agent-id-forge-prefix" && f.level === "warn" && /stripped to "coder"/.test(f.message)))
+})
+
+test("id self-heal: repeated prefixes strip fully; empty-after-strip is invalid; post-normalization collision skips the later entry", () => {
+  const { agents, findings } = validateAgentSet({
+    "forge-forge-coder": { model: "p/m", thoughtLevel: "low" },
+    coder: { model: "p/other", thoughtLevel: "low" },
+    "forge-": { model: "p/x", thoughtLevel: "low" },
+  })
+  assert.deepEqual(Object.keys(agents), ["coder"])
+  assert.equal(agents.coder.model, "p/m", "the first definition wins")
+  assert.ok(findings.some((f) => f.code === "agent-id-forge-prefix" && /stripped to "coder"/.test(f.message)))
+  assert.ok(findings.some((f) => f.code === "agent-id-collision" && f.level === "error"))
+  assert.ok(findings.some((f) => f.code === "agent-id-invalid" && f.level === "error"))
+})
+
 test("fail-soft: a mistyped pair member invalidates its entry; other mistyped fields cost only themselves", () => {
   const { agents, findings } = validateAgentSet({
     a: { model: "p/m", thoughtLevel: 3, shape: "aggressive", permission: { bash: 1 } },
