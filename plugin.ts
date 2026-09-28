@@ -388,7 +388,17 @@ function jobLedgerSink(entry: Record<string, unknown>): void {
   }
 }
 
-const jobManager = createJobManager({ sink: jobLedgerSink })
+const jobManager = createJobManager({
+  sink: jobLedgerSink,
+  // Wake push at queue time (job-read-consumption D6): a completion that
+  // arrives while the owning session is ALREADY idle has no future idle
+  // edge to ride — the old idle-transition-only sweep would let it sit
+  // until the delivery window abandoned it. When the session is known-idle,
+  // deliver now; busy sessions stay on the idle-edge path.
+  onWakeQueued: (job) => {
+    if (idleJobSessions.has(job.ownerSession)) void deliverJobWakes(job.ownerSession)
+  },
+})
 
 // Message-send client for completion wakes (promptAsync: fire-and-forget,
 // does not block the plugin fiber) and session lookups for handoff roots.
@@ -399,6 +409,11 @@ type JobClient = {
   }
 }
 let jobClient: JobClient | null = null
+
+// Sessions believed idle (job-read-consumption D6): chat.message marks a
+// turn in flight (busy), session.idle marks it over. Unknown sessions are
+// treated as busy — they keep the conservative idle-edge delivery path.
+const idleJobSessions = new Set<string>()
 
 function jobWakeText(job: Job): string {
   return [
@@ -1154,7 +1169,7 @@ const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"]
 
 const forgeJobsTool = tool({
   description:
-    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it; log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry (only early-returned/background jobs need this — synchronously consumed jobs self-clear at completion); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
     jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
@@ -2054,8 +2069,13 @@ export const server: Plugin = async (input, options) => {
     "chat.message": async (input) => {
       if (forgeDisabled) return
       const raw = input as unknown as { sessionID?: unknown; agent?: unknown }
-      if (typeof raw.sessionID === "string" && raw.sessionID && typeof raw.agent === "string" && raw.agent) {
-        sessionAgents.set(raw.sessionID, raw.agent)
+      if (typeof raw.sessionID === "string" && raw.sessionID) {
+        // A turn just started in this session — it is busy until the next
+        // session.idle (wake-push gate, job-read-consumption D6).
+        idleJobSessions.delete(raw.sessionID)
+        if (typeof raw.agent === "string" && raw.agent) {
+          sessionAgents.set(raw.sessionID, raw.agent)
+        }
       }
     },
 
@@ -2171,6 +2191,7 @@ export const server: Plugin = async (input, options) => {
         const sessionID = (event as unknown as { properties: { sessionID: string } }).properties.sessionID
         if (typeof sessionID === "string" && sessionID) {
           goalProbe(`idle event session=${sessionID}`)
+          idleJobSessions.add(sessionID)
           scheduleIdleContinuation(client, sessionID)
           void deliverJobWakes(sessionID)
         }

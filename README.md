@@ -265,7 +265,7 @@ the stdio-EOF bug):
 | --- | --- | --- | --- |
 | process exit | — | final; exit code + output tail returned | **terminal evidence** — output delivered in full; the job self-clears from the registry (no wake, no clear needed) |
 | `success_pattern` regex matches new output | opt-in | completes as success; process kept alive by default (server semantics), `keep_alive: false` kills its tree | kept alive → later exit still wakes (the server dying is real news); killed inline → self-clears |
-| `idle_ms` with no new output | default 60000 | early return `still-running` + `jobId`; process stays alive | later exit queues a wake; entry stays listed until cleared |
+| `idle_ms` with no new output | default 60000 | early return `still-running` + `jobId`; process stays alive | later exit queues a wake — unless a poll has already read the terminal state (a terminal poll consumes the entry); stays listed until then |
 | `max_wait_ms` hard cap | default 120000, max 600000 | early return `still-running`; never kills | same as idle |
 
 `run_in_background: true` skips all waiting and returns
@@ -292,7 +292,11 @@ idle (exactly once; `notify: false` opts out per job). A foreground call
 resolved on the exit event is terminal evidence: the caller already holds
 the complete output, so no wake fires and the registry entry self-clears —
 a stale `poll`/`kill`/`clear` on such an id answers "already consumed"
-instead of "unknown job".
+instead of "unknown job". The same consumption applies to a poll that
+observes a finished job: the poll itself delivered the exit status and the
+drained output, so the queued wake is dropped and the entry self-clears —
+no duplicate notification, no manual clear. Wakes fire only for
+completions that were never read.
 
 **Ownership.** Jobs belong to the session that created them. Session
 deleted → its live session-scoped jobs are killed and the event is recorded

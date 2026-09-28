@@ -67,6 +67,8 @@ export type JobManagerOptions = {
   wakeWindowMs?: number
   /** Diagnostics ledger bound in entries (default 200). */
   maxLedgerEntries?: number
+  /** Fired synchronously when a completion wake is queued (job-read-consumption D6: the wiring pushes immediately when the owning session is already idle — otherwise a completion arriving during idle has no future idle edge to ride). */
+  onWakeQueued?: (job: Job) => void
   now?: () => number
   sink?: (entry: LedgerEntry) => void
 }
@@ -205,6 +207,11 @@ export function createJobManager(opts: JobManagerOptions = {}) {
     if (job.notify && job.wakeState === "none" && !job.terminalEvidence) {
       job.wakeState = "queued"
       job.wakeQueuedAt = now()
+      try {
+        opts.onWakeQueued?.(job)
+      } catch {
+        // A broken hook must never take the supervisor down.
+      }
     }
     if (job.terminalEvidence) {
       // Terminal evidence: the caller is holding the full output inline —
@@ -246,9 +253,18 @@ export function createJobManager(opts: JobManagerOptions = {}) {
   }
 
   // Poll result: output produced since the caller's previous poll plus the
-  // live exit status. Reading a terminal job marks its completion as read.
+  // live exit status. Reading a terminal job marks its completion as read —
+  // and CONSUMES it (job-read-consumption): the poll just delivered the
+  // exit status and the drained output, so a queued wake would be a
+  // duplicate (the OMO double-notify case) and the registry entry has no
+  // residual value. Same treatment as inline terminal evidence: self-clear
+  // + rememberConsumed, so stale verb calls self-describe.
   function poll(job: Job): { state: JobState; exitCode: number | null; newOutput: string; cursor: number; succeeded: boolean; logPath: string } {
-    if (isTerminal(job)) job.readAfterEnd = true
+    if (isTerminal(job)) {
+      job.readAfterEnd = true
+      jobs.delete(job.id)
+      rememberConsumed(job.id)
+    }
     const cursor = job.outLen
     const start = job.pollCursor
     const newOutput = sliceFromCursor(job, start)

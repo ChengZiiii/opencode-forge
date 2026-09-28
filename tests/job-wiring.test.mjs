@@ -285,3 +285,65 @@ test("terminal evidence: a foreground quick command self-clears — no wake, no 
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_te" } } })
   assert.equal(sent.length, 0, "no completion wake for a synchronously consumed job")
 })
+
+test("read consumption: a background job polled to terminal self-clears — no wake fires", async () => {
+  const sent = []
+  const client = {
+    session: {
+      promptAsync: async (req) => {
+        sent.push(req)
+      },
+      get: async () => ({}),
+    },
+  }
+  const h = await server({ ...fakeInput(), client }, { jobs: { mode: "forge" } })
+  const ctx = toolCtx("ses_rc", async () => ({ status: "allow" }))
+  const started = await h.tool.forge_shell.execute(
+    { command: `"${process.execPath}" -e "setTimeout(()=>console.log('rc-done'),120)"`, run_in_background: true },
+    ctx,
+  )
+  const jobId = /jobId: (j-\S+)/.exec(started.output)[1]
+  // Poll to completion (the live two-hop shape: output may arrive one poll
+  // before the exit; either way the terminal poll consumes the entry).
+  let terminal = false
+  for (let i = 0; i < 10 && !terminal; i++) {
+    const p = await h.tool.forge_jobs.execute({ action: "poll", jobId, waitMs: 30000 }, ctx)
+    terminal = !/\brunning\b/.test(String(p.title))
+  }
+  assert.ok(terminal, "a poll observed the terminal state")
+  // The consuming poll already removed the entry: stale verbs self-describe.
+  const after = await h.tool.forge_jobs.execute({ action: "list" }, ctx)
+  assert.ok(!String(after.output).includes(jobId), "the terminal poll consumed the entry — no manual clear")
+  await assert.rejects(() => h.tool.forge_jobs.execute({ action: "poll", jobId }, ctx), /already consumed/)
+  // And the idle event delivers nothing: the completion was already read.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_rc" } } })
+  assert.equal(sent.length, 0, "no wake for a poll-read completion")
+})
+
+test("read consumption era: a completion arriving during idle is pushed immediately (no further idle edge needed)", async () => {
+  const sent = []
+  const client = {
+    session: {
+      promptAsync: async (req) => {
+        sent.push(req)
+      },
+      get: async () => ({}),
+    },
+  }
+  const h = await server({ ...fakeInput(), client }, { jobs: { mode: "forge" } })
+  const ctx = toolCtx("ses_push", async () => ({ status: "allow" }))
+  // The host fires session.idle when the starting turn ends — the session
+  // is now believed idle.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_push" } } })
+  const started = await h.tool.forge_shell.execute(
+    { command: `"${process.execPath}" -e "setTimeout(()=>console.log('push-done'),150)"`, run_in_background: true },
+    ctx,
+  )
+  assert.match(started.output, /jobId: j-/)
+  // NO further idle event follows: the wake must be pushed at completion
+  // time instead of sitting queued until the delivery window abandons it.
+  await new Promise((r) => setTimeout(r, 2500))
+  assert.equal(sent.length, 1, "the wake fired without a subsequent idle transition")
+  assert.equal(sent[0].path.id, "ses_push")
+  assert.match(sent[0].body.parts[0].text, /\[forge:job-complete\]/)
+})

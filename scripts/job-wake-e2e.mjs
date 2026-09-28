@@ -31,6 +31,7 @@ const api = async (path, init) => {
   return text ? JSON.parse(text) : undefined
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+const allText = () => texts.map((t) => t.text).join("\n")
 
 const created = await api(`/session?directory=${encodeURIComponent(WS)}`, { method: "POST", body: JSON.stringify({}) })
 const sid = created.id
@@ -127,25 +128,44 @@ log("phase A list (tail):", aListTail.slice(-400).replace(/\n+/g, " | "))
 if (aListTail.includes("[forge:job-complete]")) fail("phase A: a completion wake fired for a synchronously consumed command")
 if (!/\(no jobs\)|no jobs/i.test(aListTail) && !aListTail.includes("(no jobs)")) fail("phase A: registry not clean — the consumed job lingered: " + aListTail.slice(-200))
 
-// ---- Phase B: background job polled to completion still wakes once ----
+// ---- Phase B1: a background job polled to terminal consumes itself — no wake ----
+const b0 = texts.length
 await send(
-  'Use forge_shell with run_in_background=true to run: node -e "setTimeout(()=>{console.log(\'bg-e2e-done\')},8000)". Then call forge_jobs poll {jobId, waitMs:30000} repeatedly until it reports exited, and report the final poll verbatim. Then stop.',
+  'Use forge_shell with run_in_background=true to run: node -e "setTimeout(()=>{console.log(\'bg-polled-done\')},3000)". Then call forge_jobs poll {jobId, waitMs:30000} repeatedly until a poll reports it exited (not running), and report the final poll verbatim. Then stop.',
 )
-if ((await waitForIdle()) === "timeout") fail("phase B never idled")
-log("phase B turn done; waiting for the deferred wake on idle...")
+if ((await waitForIdle()) === "timeout") fail("phase B1 never idled")
+await sleep(3000)
+const b1Text = texts.slice(b0).map((t) => t.text).join("\n")
+if (!/exit(ed)?=0|\bexited\b/i.test(b1Text)) fail("phase B1: the model never reported the terminal poll: " + b1Text.slice(-300))
+const wakesAfterB1 = allText().split("[forge:job-complete]").length - 1
+await sleep(8000) // give any (wrong) wake ample time to arrive
+if (allText().split("[forge:job-complete]").length - 1 !== wakesAfterB1) {
+  fail("phase B1: a completion wake fired for a poll-read completion (double-notify)")
+}
+await send("Call forge_jobs with action list and report its output verbatim, then stop.")
+if ((await waitForIdle()) === "timeout") fail("phase B1 list never idled")
+await sleep(2000)
+const listTail = texts.slice(-4).map((t) => t.text).join("\n")
+if (!listTail.includes("(no jobs)")) fail("phase B1: the consumed entry lingered in the registry: " + listTail.slice(-200))
+
+// ---- Phase B2: an unread background job still wakes exactly once ----
+await send(
+  'Use forge_shell with run_in_background=true to run: node -e "setTimeout(()=>{console.log(\'bg-unread-done\')},6000)". Report only the jobId — do NOT poll it and do NOT wait for it — then stop.',
+)
+if ((await waitForIdle()) === "timeout") fail("phase B2 never idled")
+const wakesAfterB2 = allText().split("[forge:job-complete]").length - 1
+log("phase B2 turn done; waiting for the unread-completion wake on idle...")
 let woke = false
 for (let i = 0; i < 30 && !woke; i++) {
   await sleep(3000)
-  const joined = texts.map((t) => t.text).join("\n")
-  woke = joined.split("[forge:job-complete]").length - 1 > aWakes
+  woke = allText().split("[forge:job-complete]").length - 1 > wakesAfterB2
 }
-if (!woke) fail("phase B: no completion wake for the background job within the bound")
-const allText = texts.map((t) => t.text).join("\n")
-const wakeCount = allText.split("[forge:job-complete]").length - 1
-log(`total wakes observed: ${wakeCount}`)
-if (!allText.includes("bg-e2e-done")) fail("phase B: wake arrived but without the job output")
-if (wakeCount !== aWakes + 1) fail(`phase B: expected exactly ONE new wake, total now ${wakeCount}`)
+if (!woke) fail("phase B2: no completion wake for the unread background job within the bound")
+const total = allText().split("[forge:job-complete]").length - 1
+log(`total wakes observed: ${total}`)
+if (!allText().includes("bg-unread-done")) fail("phase B2: wake arrived but without the job output")
+if (total !== wakesAfterB2 + 1) fail(`phase B2: expected exactly ONE new wake, total now ${total}`)
 
 controller.abort()
-log("PASS: negative path clean (no wake, no litter), positive path woke exactly once with output.")
+log("PASS: poll-read completion stays silent and self-clears; an unread background completion still wakes exactly once with output.")
 process.exit(0)

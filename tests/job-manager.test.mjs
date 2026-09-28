@@ -167,6 +167,53 @@ test("terminal evidence: consumed ids self-describe, FIFO-bounded like the finis
   assert.equal(manager.consumed("j-never-existed"), false)
 })
 
+test("read consumption: a terminal poll consumes the entry and drops the queued wake", () => {
+  const { manager } = makeManager()
+  const { job } = makeJob(manager, "j-rc")
+  manager.appendOutput(job, "out\n")
+  manager.markTerminal(job, "exited", 0)
+  assert.equal(job.wakeState, "queued")
+  const p = manager.poll(job)
+  assert.equal(p.state, "exited")
+  assert.equal(p.exitCode, 0, "the poll itself delivered the completion")
+  assert.equal(manager.get("j-rc"), undefined, "the terminal poll consumed the entry")
+  assert.equal(manager.consumed("j-rc"), true, "stale verbs will self-describe")
+  assert.equal(manager.deliverWakesFor("ses_a").length, 0, "the queued wake died with the entry — no double-notify")
+})
+
+test("read consumption: a wake already delivered, then polled — entry self-clears", () => {
+  const { manager } = makeManager()
+  const { job } = makeJob(manager, "j-rd")
+  manager.markTerminal(job, "exited", 2)
+  assert.equal(manager.deliverWakesFor("ses_a").length, 1)
+  manager.poll(job)
+  assert.equal(manager.get("j-rd"), undefined)
+  assert.equal(manager.consumed("j-rd"), true)
+})
+
+test("read consumption: a non-terminal poll never consumes; list never consumes", () => {
+  const { manager } = makeManager()
+  const { job } = makeJob(manager, "j-rn")
+  manager.appendOutput(job, "progress\n")
+  manager.poll(job)
+  assert.ok(manager.get("j-rn"), "a poll of a running job retains it")
+  manager.markTerminal(job, "exited", 0)
+  manager.list()
+  assert.ok(manager.get("j-rn"), "list does not consume — only poll asserts state")
+  manager.poll(job)
+  assert.equal(manager.get("j-rn"), undefined, "the terminal poll consumes")
+})
+
+test("wake queueing fires the onWakeQueued hook exactly once per job", () => {
+  const seen = []
+  const { manager } = makeManager({ onWakeQueued: (j) => seen.push(j.id) })
+  const { job } = makeJob(manager, "j-hook")
+  manager.markTerminal(job, "exited", 0)
+  assert.deepEqual(seen, ["j-hook"])
+  manager.markTerminal(job, "killed", null) // late transition must not re-fire
+  assert.deepEqual(seen, ["j-hook"])
+})
+
 test("wake: stale entries are abandoned to the ledger, not queued forever", () => {
   const { manager, clock, sinkEntries } = makeManager({ wakeWindowMs: 1000 })
   const { job } = makeJob(manager, "j-stale")
