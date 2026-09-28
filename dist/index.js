@@ -13416,11 +13416,29 @@ function createJobManager(opts = {}) {
     job.state = state;
     job.exitCode = exitCode;
     job.endedAt = now();
-    if (job.notify && job.wakeState === "none") {
+    if (job.notify && job.wakeState === "none" && !job.terminalEvidence) {
       job.wakeState = "queued";
       job.wakeQueuedAt = now();
     }
+    if (job.terminalEvidence) {
+      jobs.delete(job.id);
+      rememberConsumed(job.id);
+    }
     enforceCaps();
+  }
+  const consumedIds = new Set;
+  function rememberConsumed(id) {
+    if (consumedIds.has(id))
+      return;
+    consumedIds.add(id);
+    if (consumedIds.size > maxFinishedJobs) {
+      const oldest = consumedIds.values().next().value;
+      if (oldest !== undefined)
+        consumedIds.delete(oldest);
+    }
+  }
+  function consumed(id) {
+    return consumedIds.has(id);
   }
   function kill(job) {
     if (isTerminal2(job))
@@ -13533,6 +13551,7 @@ function createJobManager(opts = {}) {
     deliverWakesFor,
     abandonStaleWakes,
     ledgerEntries,
+    consumed,
     size: () => jobs.size
   };
 }
@@ -13640,6 +13659,11 @@ function startJob(manager, opts) {
     clearTimeout(maxWaitTimer);
   };
   const firstOutputHooks = [];
+  const foregroundWatch = !opts.runInBackground;
+  const stampTerminalEvidence = () => {
+    if (foregroundWatch && !settled)
+      job.terminalEvidence = true;
+  };
   function resolveStillRunning() {
     if (settled)
       return;
@@ -13675,6 +13699,7 @@ function startJob(manager, opts) {
         closeSync(wfd);
       } catch {}
     }
+    stampTerminalEvidence();
     manager.markTerminal(job, "killed", null);
     maxWaitTimer && clearTimeout(maxWaitTimer);
     resolveSettle({ status: "exited", exitCode: null, outputTail: "", spawnError: String(err) });
@@ -13726,6 +13751,8 @@ function startJob(manager, opts) {
           killTree(child);
           if (opts.survive)
             opts.registry?.remove(id);
+          if (foregroundWatch)
+            job.terminalEvidence = true;
           manager.markTerminal(job, "succeeded", null);
         }
         resolveSettle({ status: "succeeded", matched: m[0], outputTail: job.tail, keptAlive });
@@ -13747,6 +13774,7 @@ function startJob(manager, opts) {
       tail.flush();
       tail.stop();
       liveTails.delete(id);
+      stampTerminalEvidence();
       manager.markTerminal(job, "exited", code);
       if (opts.survive)
         opts.registry?.remove(id);
@@ -13765,6 +13793,7 @@ function startJob(manager, opts) {
     if (opts.survive)
       opts.registry?.remove(id);
     if (!settled) {
+      stampTerminalEvidence();
       settled = true;
       stopTimers();
       manager.markTerminal(job, "killed", null);
@@ -16169,6 +16198,8 @@ var forgeShellTool = tool({
         output: [
           `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
           `cwd: ${cwd}`,
+          `jobId: ${started.job.id}`,
+          `Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed).`,
           ...r.spawnError ? [`spawn error: ${r.spawnError}`] : [],
           `output:
 ${r.outputTail || "(none)"}`
@@ -16182,7 +16213,7 @@ ${r.outputTail || "(none)"}`
         output: [
           `[forge:job] Success pattern matched: "${r.matched}".`,
           `cwd: ${cwd}`,
-          r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : "The process tree was terminated (keep_alive=false).",
+          r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : `The process tree was terminated (keep_alive=false) — terminal evidence: job ${started.job.id} self-cleared from the registry (no wake, no clear needed).`,
           `output:
 ${r.outputTail}`
         ].join(`
@@ -16205,7 +16236,7 @@ ${r.outputTail || "(none yet)"}`,
 });
 var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"];
 var forgeJobsTool = tool({
-  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it; log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry; handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it; log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry (only early-returned/background jobs need this — synchronously consumed jobs self-clear at completion); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
     jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
@@ -16230,8 +16261,9 @@ var forgeJobsTool = tool({
     if (!args.jobId)
       throw new Error(`Action "${action}" requires jobId.`);
     const job = jobManager.get(args.jobId);
-    if (!job)
-      throw new Error(`No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`);
+    if (!job) {
+      throw new Error(jobManager.consumed(args.jobId) ? `Job ${args.jobId} was already consumed: a terminal-evidence foreground return delivered its complete output inline, so it self-cleared from the registry — no wake fires and no clear is needed.` : `No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`);
+    }
     if (action === "poll") {
       const p = await pollJob(jobManager, args.jobId, args.waitMs ?? 0);
       if (!p)
