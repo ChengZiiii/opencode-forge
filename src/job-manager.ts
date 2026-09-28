@@ -52,6 +52,8 @@ export type Job = {
   survive?: boolean
   /** Adopted from a previous host run (registry scan). */
   previousRun?: boolean
+  /** Terminal evidence (job-terminal-evidence): the foreground invocation that spawned this job resolved on this very transition — the complete output was delivered inline, so no wake fires and the entry self-clears from the registry. Stamped by the runner immediately before markTerminal. */
+  terminalEvidence?: boolean
 }
 
 export type JobManagerOptions = {
@@ -193,17 +195,44 @@ export function createJobManager(opts: JobManagerOptions = {}) {
   }
 
   // First terminal transition wins (exit vs kill vs success race); a queued
-  // wake is enqueued exactly once for notifying jobs.
+  // wake is enqueued exactly once for notifying jobs — never for
+  // terminal-evidence jobs, whose caller already holds the complete output.
   function markTerminal(job: Job, state: Exclude<JobState, "running">, exitCode: number | null): void {
     if (isTerminal(job)) return
     job.state = state
     job.exitCode = exitCode
     job.endedAt = now()
-    if (job.notify && job.wakeState === "none") {
+    if (job.notify && job.wakeState === "none" && !job.terminalEvidence) {
       job.wakeState = "queued"
       job.wakeQueuedAt = now()
     }
+    if (job.terminalEvidence) {
+      // Terminal evidence: the caller is holding the full output inline —
+      // the registry entry has no residual value (no wake to deliver, no
+      // poll to serve). Self-clear and remember the id so stale verb calls
+      // self-describe instead of failing as unknown.
+      jobs.delete(job.id)
+      rememberConsumed(job.id)
+    }
     enforceCaps()
+  }
+
+  // Ids of terminal-evidence jobs (self-cleared at completion), bounded like
+  // the finished-job cap: a stale poll/kill/clear on them resolves to an
+  // honest "already consumed" error instead of "unknown job".
+  const consumedIds = new Set<string>()
+
+  function rememberConsumed(id: string): void {
+    if (consumedIds.has(id)) return
+    consumedIds.add(id)
+    if (consumedIds.size > maxFinishedJobs) {
+      const oldest = consumedIds.values().next().value
+      if (oldest !== undefined) consumedIds.delete(oldest)
+    }
+  }
+
+  function consumed(id: string): boolean {
+    return consumedIds.has(id)
   }
 
   function kill(job: Job): void {
@@ -334,6 +363,7 @@ export function createJobManager(opts: JobManagerOptions = {}) {
     deliverWakesFor,
     abandonStaleWakes,
     ledgerEntries,
+    consumed,
     size: () => jobs.size,
   }
 }

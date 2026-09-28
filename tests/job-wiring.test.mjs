@@ -115,6 +115,40 @@ test("partition: system.transform job guidance reaches forge-family sessions, ne
   assert.ok(!out2.system.some((s) => s.startsWith("[forge:")), "unknown session receives no forge text")
 })
 
+test("forge-shell-mandate: prompt and guidance compose per config gate", async () => {
+  // Default partition: hard refusal wording in both the prompt and the guidance.
+  const h = await hooks({ jobs: { mode: "forge" } })
+  const cfg = freshCfg()
+  await h.config(cfg)
+  assert.match(cfg.agent.forge.prompt, /every shell command — quick ones included/)
+  assert.match(cfg.agent.forge.prompt, /refused on this agent/)
+  await h["chat.message"]({ sessionID: "mandate-ses", agent: "forge" }, { message: {}, parts: [] })
+  const out = { system: [] }
+  await h["experimental.chat.system.transform"]({ sessionID: "mandate-ses" }, out)
+  const g = out.system.find((s) => s.startsWith("[forge:job-guidance]"))
+  assert.match(g, /Every shell command — quick ones included/)
+  assert.match(g, /refused on this agent/)
+  assert.match(g, /delegated agents.*poll/i)
+  // Escape hatch: preference wording; no false refusal claim anywhere.
+  const h2 = await hooks({ jobs: { mode: "forge", keepBuiltinShell: true } })
+  const cfg2 = freshCfg()
+  await h2.config(cfg2)
+  assert.match(cfg2.agent.forge.prompt, /prefer the forge_shell tool/)
+  assert.ok(!/refused on this agent/.test(cfg2.agent.forge.prompt), "the builtin tool is legitimately present under keepBuiltinShell")
+  await h2["chat.message"]({ sessionID: "mandate-ses2", agent: "forge" }, { message: {}, parts: [] })
+  const out2 = { system: [] }
+  await h2["experimental.chat.system.transform"]({ sessionID: "mandate-ses2" }, out2)
+  const g2 = out2.system.find((s) => s.startsWith("[forge:job-guidance]"))
+  assert.match(g2, /Long-running or possibly non-exiting/)
+  assert.ok(!/refused on this agent/.test(g2))
+  // Supervisor retirement: the mandate vanishes with the tool.
+  const h3 = await hooks({ jobs: { mode: "native" } })
+  const cfg3 = freshCfg()
+  await h3.config(cfg3)
+  assert.ok(!/forge_shell/.test(cfg3.agent.forge.prompt ?? ""), "no exec-surface mandate under retirement")
+  assert.equal(cfg3.agent.forge.tools, undefined)
+})
+
 test("partition: capability probe and stage-1 note are retired (no tool.definition hook)", async () => {
   const h = await hooks({ jobs: { mode: "auto" } })
   assert.equal(h["tool.definition"], undefined, "the probe/STAGE1 hook is gone")
@@ -221,4 +255,33 @@ test("5.1 wake engine: exit queues, only session.idle delivers, exactly once", a
   assert.match(sent[0].body.parts[0].text, /\[forge:job-complete\]/)
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_wake" } } })
   assert.equal(sent.length, 1, "no duplicate delivery on a second idle")
+})
+
+test("terminal evidence: a foreground quick command self-clears — no wake, no registry litter, honest stale id", async () => {
+  const sent = []
+  const client = {
+    session: {
+      promptAsync: async (req) => {
+        sent.push(req)
+      },
+      get: async () => ({}),
+    },
+  }
+  const h = await server({ ...fakeInput(), client }, { jobs: { mode: "forge" } })
+  const ctx = toolCtx("ses_te", async () => ({ status: "allow" }))
+  const res = await h.tool.forge_shell.execute(
+    { command: `"${process.execPath}" -e "console.log('te-ok')"`, idle_ms: 8000, max_wait_ms: 15000 },
+    ctx,
+  )
+  assert.match(res.output, /te-ok/)
+  assert.match(res.output, /self-cleared/, "the inline return announces its own consumption")
+  const jobId = /jobId: (j-\S+)/.exec(res.output)[1]
+  // A stale verb call self-describes instead of failing as unknown.
+  await assert.rejects(() => h.tool.forge_jobs.execute({ action: "poll", jobId }, ctx), /already consumed/)
+  // No registry litter: the list never shows the consumed job.
+  const listed = await h.tool.forge_jobs.execute({ action: "list" }, ctx)
+  assert.ok(!String(listed.output).includes(jobId), "no manual clear needed — the entry is gone")
+  // And the idle event delivers nothing: the wake was never queued.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_te" } } })
+  assert.equal(sent.length, 0, "no completion wake for a synchronously consumed job")
 })

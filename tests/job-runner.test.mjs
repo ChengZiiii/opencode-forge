@@ -55,6 +55,99 @@ test("3.1 exit-bound completion: no pipes exist, exit completes the call", async
   rmSync(dir, { recursive: true, force: true })
 })
 
+// --- job-terminal-evidence: the resolution form decides wake + retention ---
+
+test("terminal evidence: a foreground exit-consumed job self-clears and never queues a wake", async () => {
+  const manager = createJobManager()
+  const dir = tmpLogDir()
+  const fake = makeFakeSpawn()
+  const { job, settle } = startJob(manager, { ...BASE, logDir: dir, idleMs: 10_000, maxWaitMs: 60_000, spawnFn: fake, exitGraceMs: 30 })
+  emit(job, "quick\n")
+  fake.spawned[0].child.emit("exit", 0)
+  const r = await settle
+  assert.equal(r.status, "exited")
+  assert.equal(job.terminalEvidence, true, "the foreground call resolved on this exit — inline delivery")
+  assert.equal(manager.get(job.id), undefined, "self-cleared from the registry at completion")
+  assert.equal(job.wakeState, "none", "no completion wake for a synchronously consumed job")
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test("terminal evidence: background-started jobs are never stamped — their completion still wakes", async () => {
+  const manager = createJobManager()
+  const dir = tmpLogDir()
+  const fake = makeFakeSpawn()
+  const { job, settle } = startJob(manager, { ...BASE, logDir: dir, runInBackground: true, spawnFn: fake, exitGraceMs: 30 })
+  fake.spawned[0].child.emit("exit", 0)
+  await settle
+  assert.notEqual(job.terminalEvidence, true, "background starts walked away — the wake is their news channel")
+  assert.equal(job.wakeState, "queued")
+  assert.ok(manager.get(job.id), "background jobs stay listed until cleared")
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test("terminal evidence: an idle-returned job is not stamped — its later completion still wakes", async () => {
+  const manager = createJobManager()
+  const dir = tmpLogDir()
+  const fake = makeFakeSpawn()
+  const { job, settle } = startJob(manager, { ...BASE, logDir: dir, idleMs: 30, maxWaitMs: 5_000, spawnFn: fake, exitGraceMs: 30 })
+  assert.equal((await settle).status, "still-running")
+  fake.spawned[0].child.emit("exit", 0)
+  await new Promise((r) => setTimeout(r, 80))
+  assert.notEqual(job.terminalEvidence, true, "the caller left before completion")
+  assert.equal(job.wakeState, "queued")
+  assert.ok(manager.get(job.id), "early-returned jobs keep their registry presence")
+  rmSync(dir, { recursive: true, force: true })
+})
+
+test("terminal evidence: keep_alive=false success is consumed inline; a kept-alive server later wakes", async () => {
+  const m1 = createJobManager()
+  const d1 = tmpLogDir()
+  const f1 = makeFakeSpawn()
+  const s1 = startJob(m1, { ...BASE, logDir: d1, idleMs: 60_000, maxWaitMs: 60_000, successPattern: /Done/, keepAlive: false, spawnFn: f1 })
+  emit(s1.job, "Done in 1s\n")
+  const r1 = await Promise.race([s1.settle, new Promise((res) => setTimeout(() => res("timeout"), 3_000))])
+  assert.equal(r1.status, "succeeded")
+  assert.equal(r1.keptAlive, false)
+  assert.equal(s1.job.terminalEvidence, true, "inline success + kill = consumed in the same call")
+  assert.equal(m1.get(s1.job.id), undefined)
+  const m2 = createJobManager()
+  const d2 = tmpLogDir()
+  const f2 = makeFakeSpawn()
+  const s2 = startJob(m2, { ...BASE, logDir: d2, idleMs: 60_000, maxWaitMs: 60_000, successPattern: /listening/, spawnFn: f2, exitGraceMs: 30 })
+  emit(s2.job, "listening on :3000\n")
+  const r2 = await Promise.race([s2.settle, new Promise((res) => setTimeout(() => res("timeout"), 3_000))])
+  assert.equal(r2.status, "succeeded")
+  assert.equal(r2.keptAlive, true)
+  assert.notEqual(s2.job.terminalEvidence, true, "a kept-alive server's eventual death is real news")
+  f2.spawned[0].child.emit("exit", 0)
+  await new Promise((r) => setTimeout(r, 80))
+  assert.equal(s2.job.wakeState, "queued")
+  assert.ok(m2.get(s2.job.id))
+  rmSync(d1, { recursive: true, force: true })
+  rmSync(d2, { recursive: true, force: true })
+})
+
+test("terminal evidence: a foreground spawn failure is consumed inline; a background one keeps the wake", async () => {
+  const m1 = createJobManager()
+  const d1 = tmpLogDir()
+  const boom = () => {
+    throw new Error("ENOENT")
+  }
+  const s1 = startJob(m1, { ...BASE, logDir: d1, spawnFn: boom })
+  const r1 = await s1.settle
+  assert.match(r1.spawnError, /ENOENT/)
+  assert.equal(s1.job.terminalEvidence, true)
+  assert.equal(m1.get(s1.job.id), undefined)
+  const m2 = createJobManager()
+  const d2 = tmpLogDir()
+  const s2 = startJob(m2, { ...BASE, logDir: d2, runInBackground: true, spawnFn: boom })
+  await s2.settle
+  assert.notEqual(s2.job.terminalEvidence, true, "a background start learns of the failure through the wake")
+  assert.equal(s2.job.wakeState, "queued")
+  rmSync(d1, { recursive: true, force: true })
+  rmSync(d2, { recursive: true, force: true })
+})
+
 test("3.1 spawn stdio is file-backed: the child gets no host pipes", async () => {
   const dir = tmpLogDir()
   const fake = makeFakeSpawn()

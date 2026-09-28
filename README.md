@@ -65,7 +65,11 @@ tool layer (verified against the host's `tools` filter):
 
 Escape hatches: `jobs.keepBuiltinShell: true` gives the forge family the
 builtin shell back; `jobs.mode: "native"` retires `forge_shell`/`forge_jobs`
-entirely (the hide is withdrawn in the same stroke). Mixed sessions (Tab
+entirely (the hide is withdrawn in the same stroke). The forge family is
+prompted to route every shell command through `forge_shell` — on hosts that
+ignore injected tools maps the builtin tool stays visible but is refused at
+call time, and the channel mandate is what keeps the model from trying it
+first (the belt refusal remains the backstop). Mixed sessions (Tab
 between agents in one session): harness state (plans/goals) stays
 session-bound, tool surfaces follow the current speaker, and the goal loop
 parks instead of driving a non-forge turn. One deliberate exception: a
@@ -257,12 +261,12 @@ Subagents have it worse: the native task tool has no timeout at all.
 exit condition is bound to the actual exit event (structural immunity to
 the stdio-EOF bug):
 
-| condition | knob | on trigger |
-| --- | --- | --- |
-| process exit | — | final; exit code + output tail returned |
-| `success_pattern` regex matches new output | opt-in | completes as success; process kept alive by default (server semantics), `keep_alive: false` kills its tree |
-| `idle_ms` with no new output | default 60000 | early return `still-running` + `jobId`; process stays alive |
-| `max_wait_ms` hard cap | default 120000, max 600000 | early return `still-running`; never kills |
+| condition | knob | on trigger | completion behavior |
+| --- | --- | --- | --- |
+| process exit | — | final; exit code + output tail returned | **terminal evidence** — output delivered in full; the job self-clears from the registry (no wake, no clear needed) |
+| `success_pattern` regex matches new output | opt-in | completes as success; process kept alive by default (server semantics), `keep_alive: false` kills its tree | kept alive → later exit still wakes (the server dying is real news); killed inline → self-clears |
+| `idle_ms` with no new output | default 60000 | early return `still-running` + `jobId`; process stays alive | later exit queues a wake; entry stays listed until cleared |
+| `max_wait_ms` hard cap | default 120000, max 600000 | early return `still-running`; never kills | same as idle |
 
 `run_in_background: true` skips all waiting and returns
 `{jobId, logPath}` immediately. Every run pops one permission dialog
@@ -274,14 +278,21 @@ disagrees with that line, the line wins.
 **`forge_jobs`** manages the registry: `list` / `poll {jobId, waitMs≤30s}`
 (bounded wait for new output or exit, drains it) / `log {jobId, offset?,
 limit?}` (line paging over the on-disk log) / `kill` (whole process tree) /
-`clear` (drop a finished entry) / `handoff` (rebind ownership to the root
-session so a subagent's job survives the subagent). Delegated agents are
-instructed to poll their jobs before yielding a conclusion.
+`clear` (drop a finished entry — only early-returned/background jobs need
+this; synchronously consumed jobs self-clear at completion) / `handoff`
+(rebind ownership to the root session so a subagent's job survives the
+subagent). Delegated agents are instructed to poll their jobs before
+yielding a conclusion.
 
-**Exit wakes.** A job that exits after its `forge_shell` call already
-returned queues a single `[forge:job-complete]` message, delivered into the
-owning session via `promptAsync` the next time it goes idle (exactly once;
-`notify: false` opts out per job).
+**Exit wakes.** A job whose caller last saw it before completion —
+`run_in_background` starts and `still-running`/kept-alive `success` early
+returns — queues a single `[forge:job-complete]` message when it finishes,
+delivered into the owning session via `promptAsync` the next time it goes
+idle (exactly once; `notify: false` opts out per job). A foreground call
+resolved on the exit event is terminal evidence: the caller already holds
+the complete output, so no wake fires and the registry entry self-clears —
+a stale `poll`/`kill`/`clear` on such an id answers "already consumed"
+instead of "unknown job".
 
 **Ownership.** Jobs belong to the session that created them. Session
 deleted → its live session-scoped jobs are killed and the event is recorded

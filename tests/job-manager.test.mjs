@@ -142,6 +142,31 @@ test("wake: notify=false never queues", () => {
   assert.equal(manager.deliverWakesFor("ses_a").length, 0)
 })
 
+test("terminal evidence: markTerminal self-clears the entry and never queues a wake", () => {
+  const { manager } = makeManager()
+  const { job } = makeJob(manager, "j-te")
+  job.terminalEvidence = true
+  manager.markTerminal(job, "exited", 0)
+  assert.equal(manager.get("j-te"), undefined, "self-cleared at completion — no manual clear")
+  assert.equal(job.wakeState, "none", "the caller already holds the full output")
+  assert.equal(manager.deliverWakesFor("ses_a").length, 0)
+  // The entry cannot be cleared again (it is gone) and leaves no unread ledger noise.
+  assert.equal(manager.clear("j-te"), false)
+})
+
+test("terminal evidence: consumed ids self-describe, FIFO-bounded like the finished cap", () => {
+  const { manager } = makeManager({ maxFinishedJobs: 2 })
+  for (const id of ["j-c1", "j-c2", "j-c3"]) {
+    const { job } = makeJob(manager, id)
+    job.terminalEvidence = true
+    manager.markTerminal(job, "exited", 0)
+  }
+  assert.equal(manager.consumed("j-c1"), false, "oldest consumed id fell off the bounded memory")
+  assert.equal(manager.consumed("j-c2"), true)
+  assert.equal(manager.consumed("j-c3"), true)
+  assert.equal(manager.consumed("j-never-existed"), false)
+})
+
 test("wake: stale entries are abandoned to the ledger, not queued forever", () => {
   const { manager, clock, sinkEntries } = makeManager({ wakeWindowMs: 1000 })
   const { job } = makeJob(manager, "j-stale")

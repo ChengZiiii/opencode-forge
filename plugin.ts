@@ -106,6 +106,23 @@ Workflow modes are strictly user-initiated. Never enter plan or goal mode — an
 
 Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch through the native task channel instead.`
 
+// Channel mandate (forge-shell-mandate): the exec-surface paragraph is
+// composed per config because its refusal claim is only TRUE while the exec
+// partition holds. Hard wording when the forge-family builtin shell is
+// hidden — on hosts that ignore injected tools maps (paseo) the tool stays
+// VISIBLE but every call is belt-refused, so the prompt must say so up
+// front instead of teaching it one wasted round-trip at a time. Preference
+// wording under the keepBuiltinShell escape hatch (the builtin tool is
+// legitimately present there). No paragraph at all under supervisor
+// retirement, and the bare FORGE_PROMPT under v2 (no tool domain — the
+// claim would be false there).
+function forgePromptText(opts: { hardRefusal: boolean }): string {
+  const mandate = opts.hardRefusal
+    ? "Exec surface: every shell command — quick ones included — runs through the forge_shell tool. The builtin shell/bash tools are refused on this agent; never try them first, not even for trivial commands."
+    : "Exec surface: prefer the forge_shell tool for every shell command — quick ones included; it is this agent's exec surface, and the builtin shell exists only as an explicit escape hatch."
+  return `${FORGE_PROMPT}\n\n${mandate} Long-running or non-exiting commands: forge_shell with run_in_background, then collect results via forge_jobs.`
+}
+
 // The single /plan command routes on its argument: empty = list, resume =
 // continue latest non-terminal plan, discard = abandon, anything else = start
 // planning with that text as the goal — the full plan discipline rides the
@@ -1024,7 +1041,7 @@ const FORGE_SHELL_DESCRIPTION = [
   "Run a shell command without ever blocking the session indefinitely. The call completes on the FIRST of: process exit (bound to the exit event — a detached grandchild holding the stdio pipes cannot suspend the call); success_pattern matching new output (opt-in regex); idle_ms with no new output (default 60000); max_wait_ms hard cap (default 120000, max 600000 — returns still-running, never kills).",
   "Idle/max-wait return `still-running` with a jobId — the process stays alive; keep watching with forge_jobs poll / log, stop it with forge_jobs kill. run_in_background returns {jobId, logPath} immediately.",
   "success_pattern semantics: a match completes the call as success; the process is kept alive by default (server semantics — the thing you just verified keeps running); pass keep_alive=false to kill its tree on match. Common patterns: dev servers `listening on|ready in|Local:`, builds `Compiled successfully|Done in`, test suites `passed|all tests`.",
-  "Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) MUST use this tool instead of the builtin shell.",
+  "This tool is the forge agent's exec surface for every shell command — quick ones included. Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) should start with run_in_background and collect results via forge_jobs.",
 ].join("\n")
 
 const forgeShellTool = tool({
@@ -1100,6 +1117,8 @@ const forgeShellTool = tool({
         output: [
           `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
           `cwd: ${cwd}`,
+          `jobId: ${started.job.id}`,
+          `Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed).`,
           ...(r.spawnError ? [`spawn error: ${r.spawnError}`] : []),
           `output:\n${r.outputTail || "(none)"}`,
         ].join("\n"),
@@ -1111,7 +1130,9 @@ const forgeShellTool = tool({
         output: [
           `[forge:job] Success pattern matched: "${r.matched}".`,
           `cwd: ${cwd}`,
-          r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : "The process tree was terminated (keep_alive=false).",
+          r.keptAlive
+            ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).`
+            : `The process tree was terminated (keep_alive=false) — terminal evidence: job ${started.job.id} self-cleared from the registry (no wake, no clear needed).`,
           `output:\n${r.outputTail}`,
         ].join("\n"),
       }
@@ -1133,7 +1154,7 @@ const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"]
 
 const forgeJobsTool = tool({
   description:
-    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it; log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry; handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it; log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry (only early-returned/background jobs need this — synchronously consumed jobs self-clear at completion); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
     jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
@@ -1155,7 +1176,13 @@ const forgeJobsTool = tool({
     }
     if (!args.jobId) throw new Error(`Action "${action}" requires jobId.`)
     const job = jobManager.get(args.jobId)
-    if (!job) throw new Error(`No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`)
+    if (!job) {
+      throw new Error(
+        jobManager.consumed(args.jobId)
+          ? `Job ${args.jobId} was already consumed: a terminal-evidence foreground return delivered its complete output inline, so it self-cleared from the registry — no wake fires and no clear is needed.`
+          : `No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`,
+      )
+    }
     if (action === "poll") {
       const p = await pollJob(jobManager, args.jobId, args.waitMs ?? 0)
       if (!p) throw new Error(`No job ${args.jobId}.`)
@@ -1769,7 +1796,12 @@ export const server: Plugin = async (input, options) => {
           (existing?.description as string | undefined) ??
           "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).",
         mode: (existing?.mode as "primary" | "subagent" | "all" | undefined) ?? "primary",
-        prompt: (existing?.prompt as string | undefined) ?? FORGE_PROMPT,
+        prompt:
+          (existing?.prompt as string | undefined) ??
+          // Channel mandate composed per gate (forge-shell-mandate): hard
+          // refusal while the partition holds, preference under
+          // keepBuiltinShell, bare prompt under retirement.
+          (jobStage() < 2 ? forgePromptText({ hardRefusal: !jobsKeepBuiltinShell }) : FORGE_PROMPT),
       }
 
       // Job-supervisor option sanity is unchanged; the capability probe is
@@ -2218,7 +2250,9 @@ export const server: Plugin = async (input, options) => {
       }
       if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
         output.system.push(
-          "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.",
+          jobsKeepBuiltinShell
+            ? "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion."
+            : "[forge:job-guidance] Every shell command — quick ones included — goes through forge_shell: the builtin shell/bash tools are refused on this agent, so never try them first. forge_shell returns on exit/success/idle with a jobId instead of blocking indefinitely; long-running or non-exiting commands use run_in_background. Manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.",
         )
       }
       const state = sessions.get(input.sessionID)

@@ -173,6 +173,20 @@ export function startJob(manager: JobManager, opts: StartOptions): StartedJob {
   // grandchild has started writing) — see the fence assignment block below.
   const firstOutputHooks: Array<() => void> = []
 
+  // Terminal evidence (job-terminal-evidence D1): a foreground invocation
+  // that resolves on THIS very terminal transition hands the complete output
+  // to the caller inline — a later wake would be a duplicate, and the
+  // registry entry has no residual value. Exactly one return form qualifies:
+  // the foreground (non-background) call still unsettled at the transition.
+  // Background starts walked away immediately (their completion is real
+  // news — this is what makes the wake channel work at all), and any
+  // earlier settle (still-running / success) means the caller already left;
+  // both keep the wake and the registry entry.
+  const foregroundWatch = !opts.runInBackground
+  const stampTerminalEvidence = (): void => {
+    if (foregroundWatch && !settled) job.terminalEvidence = true
+  }
+
   function resolveStillRunning(): void {
     if (settled) return
     settled = true
@@ -212,6 +226,10 @@ export function startJob(manager: JobManager, opts: StartOptions): StartedJob {
         closeSync(wfd)
       } catch {}
     }
+    // Foreground callers receive the spawn error inline (the settle resolves
+    // before any handle is returned); a background start instead learns of
+    // it through the wake channel — foregroundWatch keeps that path live.
+    stampTerminalEvidence()
     manager.markTerminal(job, "killed", null)
     maxWaitTimer && clearTimeout(maxWaitTimer)
     resolveSettle({ status: "exited", exitCode: null, outputTail: "", spawnError: String(err) })
@@ -277,6 +295,11 @@ export function startJob(manager: JobManager, opts: StartOptions): StartedJob {
         if (!keptAlive) {
           killTree(child)
           if (opts.survive) opts.registry?.remove(id)
+          // The success return lands inline with the kill (foreground): the
+          // caller holds everything; no wake, self-clear. (settled was
+          // latched above — this match IS the inline resolution, so the
+          // generic helper's !settled guard does not apply here.)
+          if (foregroundWatch) job.terminalEvidence = true
           manager.markTerminal(job, "succeeded", null)
         }
         resolveSettle({ status: "succeeded", matched: m[0], outputTail: job.tail, keptAlive })
@@ -302,6 +325,10 @@ export function startJob(manager: JobManager, opts: StartOptions): StartedJob {
       tail.flush()
       tail.stop()
       liveTails.delete(id)
+      // Stamp BEFORE markTerminal: an unsettled foreground call means this
+      // exit is its inline resolution — the manager must skip the wake and
+      // self-clear the entry in the same stroke.
+      stampTerminalEvidence()
       manager.markTerminal(job, "exited", code)
       if (opts.survive) opts.registry?.remove(id)
       rotateLogs(opts.logDir)
@@ -318,6 +345,7 @@ export function startJob(manager: JobManager, opts: StartOptions): StartedJob {
     liveTails.delete(id)
     if (opts.survive) opts.registry?.remove(id)
     if (!settled) {
+      stampTerminalEvidence()
       settled = true
       stopTimers()
       manager.markTerminal(job, "killed", null)
