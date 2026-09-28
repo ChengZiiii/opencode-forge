@@ -15429,6 +15429,24 @@ function forgeConfigPaths(opts) {
   const global = opts.homeDir ? `${opts.homeDir}${sep2}.config${sep2}opencode${sep2}forge.json` : "";
   return { project, global };
 }
+function isFsRoot(p) {
+  return p === "" || p === "/" || p === "\\" || /^[A-Za-z]:[\\/]?$/.test(p);
+}
+function parentDirOf(p) {
+  let s = p;
+  while (s.endsWith("/") || s.endsWith("\\")) {
+    if (isFsRoot(s))
+      return null;
+    s = s.slice(0, -1);
+    if (isFsRoot(s))
+      return null;
+  }
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"));
+  if (i < 0)
+    return null;
+  const parent = s.slice(0, i + 1);
+  return parent === "" ? null : parent;
+}
 function createForgeConfigLoader(deps) {
   const stat = deps.stat ?? ((path) => {
     try {
@@ -15439,7 +15457,7 @@ function createForgeConfigLoader(deps) {
     }
   });
   const readFile = deps.readFile ?? ((path) => readFileSync7(path, "utf8"));
-  const paths = forgeConfigPaths({ projectDir: deps.projectDir, homeDir: deps.homeDir });
+  const globalPath = forgeConfigPaths({ homeDir: deps.homeDir }).global;
   const cache = new Map;
   const readCandidate = (path, source) => {
     const st = stat(path);
@@ -15458,11 +15476,12 @@ function createForgeConfigLoader(deps) {
         agents: {},
         source,
         path,
+        projectPath: source === "project" ? path : null,
         findings: [
           {
             level: "error",
             code: "config-parse-error",
-            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — the agent set is empty until the file parses`
+            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — this layer contributes no agents until the file parses`
           }
         ]
       };
@@ -15473,25 +15492,55 @@ function createForgeConfigLoader(deps) {
           agents: {},
           source,
           path,
-          findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — the agent set is empty` }]
+          projectPath: source === "project" ? path : null,
+          findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this layer contributes no agents` }]
         };
       } else {
         const validated = validateAgentSet(top === undefined ? undefined : top.agents);
-        result = { agents: validated.agents, source, path, findings: validated.findings };
+        result = { agents: validated.agents, source, path, projectPath: source === "project" ? path : null, findings: validated.findings };
       }
     }
     cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result });
     return result;
   };
+  const candidateAt = (dir) => {
+    const sep2 = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+    const base = dir.endsWith("/") || dir.endsWith("\\") ? dir : `${dir}${sep2}`;
+    return `${base}.opencode${sep2}forge.json`;
+  };
+  const discoverProjectFile = (anchor) => {
+    let dir = (anchor ?? "").trim();
+    if (!dir)
+      return null;
+    for (;; ) {
+      const candidate = candidateAt(dir);
+      if (stat(candidate) !== null)
+        return candidate;
+      const parent = parentDirOf(dir);
+      if (parent === null || parent === dir)
+        return null;
+      dir = parent;
+    }
+  };
   return {
     load() {
-      const project = paths.project ? readCandidate(paths.project, "project") : null;
+      const projectPath = discoverProjectFile(deps.projectDir ?? "");
+      const project = projectPath ? readCandidate(projectPath, "project") : null;
+      const global = globalPath ? readCandidate(globalPath, "global") : null;
+      if (project && global) {
+        return {
+          agents: { ...global.agents, ...project.agents },
+          source: "project+global",
+          path: project.path,
+          projectPath: project.path,
+          findings: [...global.findings, ...project.findings]
+        };
+      }
       if (project)
-        return project;
-      const global = paths.global ? readCandidate(paths.global, "global") : null;
+        return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings };
       if (global)
-        return global;
-      return { agents: {}, source: "none", path: null, findings: [] };
+        return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings };
+      return { agents: {}, source: "none", path: null, projectPath: null, findings: [] };
     }
   };
 }
@@ -15609,6 +15658,22 @@ function noteToolAgent(context) {
 var forgeDisabled = false;
 var forgeLoader = null;
 var forgeLoaderDir = null;
+var sessionAnchorLoaders = new Map;
+function loaderForAnchor(anchor) {
+  const key = anchor || "-";
+  let l = sessionAnchorLoaders.get(key);
+  if (!l) {
+    l = createForgeConfigLoader({ projectDir: anchor, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
+    sessionAnchorLoaders.set(key, l);
+    while (sessionAnchorLoaders.size > 8) {
+      const oldest = sessionAnchorLoaders.keys().next().value;
+      if (oldest === undefined)
+        break;
+      sessionAnchorLoaders.delete(oldest);
+    }
+  }
+  return l;
+}
 var crews = new Map;
 var modelsDevCatalog = null;
 var depthFindingNotes = new Map;
@@ -15761,9 +15826,15 @@ function ensureSession(sessionID, worktree) {
   sessions.set(sessionID, state);
   return state;
 }
+function sessionAnchor(context) {
+  const viaDir = effectiveWorktree(context.worktree, context.directory);
+  if (viaDir && !isRootish(viaDir))
+    return viaDir;
+  return hostWorktree || (context.worktree ?? "").trim() || (context.directory ?? "").trim();
+}
 function worktreeFor(context) {
   noteToolAgent(context);
-  return effectiveWorktree(context.worktree, hostWorktree) || context.worktree;
+  return sessionAnchor(context) || context.worktree;
 }
 function resolveActivePlan(state) {
   if (state.planPath && existsSync3(state.planPath)) {
@@ -16417,7 +16488,7 @@ var CREW_INIT_TEMPLATE = [
   "",
   "CREW IS NOT INITIALIZED: no forge subagents are configured (no usable forge.json agents). Refuse to enter orchestration and tell the user this feature needs a one-time setup, offering BOTH options:",
   "",
-  "1. The user configures it themselves: create ONE of these files (project-level wins, never merged):",
+  "1. The user configures it themselves: create either layer — MERGED, the project layer overrides the global one per agent id (the project file is the nearest .opencode/forge.json walking up from the workspace root):",
   "{paths}",
   "",
   "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead.",
@@ -16463,15 +16534,24 @@ var crewBeginTool = tool({
     if (active && active.doc.status === "draft") {
       throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.");
     }
-    const loaded = forgeLoader?.load();
-    if (!loaded || Object.keys(loaded.agents).length === 0) {
-      const paths = forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
-      throw new Error([
-        "[forge:crew] CREW IS NOT INITIALIZED: no forge subagents are configured. Crew orchestration is unavailable until the user sets it up.",
-        `Create ONE of these files (project-level wins): ${paths.project} OR ${paths.global}`,
+    const hostLoaded = forgeLoader?.load();
+    const hostIds = hostLoaded ? Object.keys(hostLoaded.agents) : [];
+    const anchor = sessionAnchor(context);
+    const hostAnchorDir = forgeLoaderDir ?? "";
+    const sessionLoaded = anchor && anchor !== hostAnchorDir ? loaderForAnchor(anchor).load() : hostLoaded;
+    const sessionProject = sessionLoaded?.projectPath ?? null;
+    if (hostIds.length === 0) {
+      const paths = forgeConfigPaths({ projectDir: hostAnchorDir || undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
+      const lines = [
+        "[forge:crew] CREW IS NOT INITIALIZED on this host: no forge subagents are materialized. Crew orchestration is unavailable until the user sets it up.",
+        `Two layers, MERGED (the project layer overrides the global one per agent id): ${paths.project} (nearest .opencode/forge.json walking up from the workspace) OR ${paths.global}.`,
         'Template (JSONC): {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low"}}}',
         "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. Newly added agents need a host restart; thoughtLevel edits apply without one."
-      ].join(`
+      ];
+      if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject) {
+        lines.push(`NOTE: this session's workspace DOES have a forge.json (${sessionProject}) with usable agents — but this host instance was launched from ${hostAnchorDir || "a different directory"}, so they are not in the task vocabulary. Relaunch opencode in that workspace, or add the agents to the global layer.`);
+      }
+      throw new Error(lines.join(`
 `));
     }
     if (!args.objective?.trim())
@@ -16497,13 +16577,22 @@ var crewBeginTool = tool({
       throw new Error(`[forge:crew] This session already has an active crew: "${existing.objective}" (started ${existing.startedAt}). Finish and close it with crew_close before starting another.`);
     }
     crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso(), subtasks });
+    let disclosure = "";
+    if (sessionProject && sessionProject !== (hostLoaded?.projectPath ?? null)) {
+      const localOnly = Object.keys(sessionLoaded?.agents ?? {}).filter((id) => !hostIds.includes(id));
+      if (localOnly.length > 0) {
+        disclosure = `
+[forge:crew] NOTE: this session's workspace has its own forge.json (${sessionProject}) defining ${localOnly.map((id) => `forge-${id}`).join(", ")} — NOT dispatchable on this host (launched from ${hostAnchorDir || "a different directory"}). Relaunch opencode in that workspace to use them, or fold them into the global layer.`;
+      }
+    }
     return {
       title: `crew registered: ${args.objective.trim().slice(0, 60)}`,
       output: [
         `[forge:crew] Crew registered for this session. Objective: ${args.objective.trim()}`,
         `Declared plan (${subtasks.length}):`,
         ...subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
-        "Proceed with the discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask."
+        "Proceed with the discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+        ...disclosure ? [disclosure] : []
       ].join(`
 `)
     };

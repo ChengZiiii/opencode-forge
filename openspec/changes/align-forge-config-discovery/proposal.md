@@ -1,0 +1,22 @@
+## Why
+
+opencode's own configuration design language is documented as: "Configuration files are **merged together, not replaced**" (global base, later sources override only conflicting keys) and per-project config is discovered by "looking for a config file in the current directory, then traversing up". forge.json currently violates both:
+
+1. **Single-source shadowing** — a project `<worktree>/.opencode/forge.json` makes the global `~/.config/opencode/forge.json` disappear entirely (agents are not merged; the project file replaces the pool). Verified in the wild: a user with a shared global pool loses it in every workspace that defines one local agent.
+2. **One fixed path, no upward traversal** — only `<frozen-host-launch-worktree>/.opencode/forge.json` is probed. The anchor is captured once at `server()` from `PluginInput` and never re-derived, and the discovery never walks up from the working directory. Real-world repro (this machine): the host is launched through a wrapper rooted at `C:\Users\Soren\.paseo\opencode-home`, so `/crew` — gate, roster, and init guidance — only ever sees that directory's forge.json ("只会找全局的 forge 配置"); any workspace-local file is invisible, and nested/intermediate `.opencode/forge.json` files are unreachable in general.
+
+## What Changes
+
+- **Merge semantics** (opencode-aligned): the effective agent set is the union of the global layer (`~/.config/opencode/forge.json`) and the project layer, with the project definition winning per agent id on collision — no cross-layer field blending, exactly one definition per id.
+- **Upward discovery** for the project layer: the NEAREST `.opencode/forge.json` found by walking up from the discovery anchor to the filesystem root (first hit wins). The anchor is the session-effective worktree where the plugin can see one (crew_begin tool context), degrading to the host launch directory (config-hook materialization, /crew template).
+- **Per-layer fail-soft**: a syntactically broken document empties only its own layer (error finding with parse location preserved); the other layer still applies. Broken-doc + valid-global now yields the global agents plus the error finding instead of an empty set.
+- **Honest host-vs-workspace disclosure**: crew_begin stays gated on the host-materialized set (that is what the native task tool can actually dispatch — v1 API cannot materialize agents per session), but when the calling session's discovery anchor finds a project layer the host did not materialize, the gate output discloses it with the restart guidance; when the host set is empty but the session's workspace has a usable file, the refusal explains the mismatch instead of claiming the feature is unconfigured.
+- **Unified session-anchor chain for plan/goal/crew** (audit follow-up): the plan/goal worktree fallback previously jumped from a degenerate (global-project "/") worktree straight to the frozen host launch directory, skipping the session's own directory even though the tool context carries it (`ToolContext.directory` — "Prefer this over process.cwd()"). The anchor chain becomes: session worktree (non-degenerate) → session directory → host launch directory. Same class of bug (frozen launch anchor shadowing session-observable truth), milder strain — plan/goal files in multi-directory hosts landed under the launch directory instead of the session's workspace.
+- Guidance text (init template + refusal) updated: two layers listed, "merged — project overrides global per agent", project file discovered by walking up. `LoadedForgeConfig` gains `projectPath` and a `project+global` source value; findings from both layers surface.
+
+## Impact
+
+- Specs: `forge-subagents` (cascade requirement rewritten to merge + upward discovery; fail-soft requirement gains per-layer broken-doc semantics), `crew-harness` (initialization-guidance wording: two layers, merged), `goal-harness` (anchor-chain sentence: session directory before launch directory; plan-harness pins no anchor wording and needs no delta).
+- Code: `src/forge-config.ts` (loader: walk-up discovery + two-layer merge + new fields), `plugin.ts` (unified `sessionAnchor` used by `worktreeFor` and crew_begin; crew_begin gate disclosure + guidance text; loader-per-anchor cache, bounded).
+- Incompatibility: none for single-file setups (project-only or global-only behave identically to before). Setups running both layers gain the union instead of the project-only shadow — that is the intended fix.
+- Docs: README (configuration section), AGENTS.md (forge-config.ts row).

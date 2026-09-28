@@ -263,6 +263,24 @@ let forgeDisabled = false
 // load() (the config hook re-materializes; chat.params re-reads per request).
 let forgeLoader: ReturnType<typeof createForgeConfigLoader> | null = null
 let forgeLoaderDir: string | null = null
+// Session-anchored loaders (crew guidance + workspace-mismatch discovery):
+// bounded cache keyed on the session anchor; the host loader above stays the
+// materialization source of truth.
+const sessionAnchorLoaders = new Map<string, ReturnType<typeof createForgeConfigLoader>>()
+function loaderForAnchor(anchor: string): ReturnType<typeof createForgeConfigLoader> {
+  const key = anchor || "-"
+  let l = sessionAnchorLoaders.get(key)
+  if (!l) {
+    l = createForgeConfigLoader({ projectDir: anchor, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+    sessionAnchorLoaders.set(key, l)
+    while (sessionAnchorLoaders.size > 8) {
+      const oldest = sessionAnchorLoaders.keys().next().value
+      if (oldest === undefined) break
+      sessionAnchorLoaders.delete(oldest)
+    }
+  }
+  return l
+}
 // Crew orchestration state (spec: crew-harness): in-memory and session-bound —
 // a host restart kills it honestly and a new /crew starts fresh. The declared
 // subtask plan (registered at crew_begin) is the crew_close gate's source of
@@ -491,11 +509,23 @@ function ensureSession(sessionID: string, worktree: string): SessionState {
   return state
 }
 
+// Unified session anchor (change align-forge-config-discovery): the
+// session's real worktree, then the session's OWN directory
+// (ToolContext.directory / session record — a degenerate global-project
+// worktree never shadows it), then the host launch directory. Sessions in
+// other directories anchor their plan/goal state and crew guidance here
+// instead of inheriting the frozen launch anchor.
+function sessionAnchor(context: { worktree?: string; directory?: string }): string {
+  const viaDir = effectiveWorktree(context.worktree, context.directory)
+  if (viaDir && !isRootish(viaDir)) return viaDir
+  return hostWorktree || (context.worktree ?? "").trim() || (context.directory ?? "").trim()
+}
+
 // Where a plan_* tool call for this context should anchor: the session's real
-// worktree, with the launch directory as the global-project ("/") fallback.
-function worktreeFor(context: { sessionID: string; worktree: string; agent?: unknown }): string {
+// worktree, with the session directory and launch directory as fallbacks.
+function worktreeFor(context: { sessionID: string; worktree: string; directory?: string; agent?: unknown }): string {
   noteToolAgent(context)
-  return effectiveWorktree(context.worktree, hostWorktree) || context.worktree
+  return sessionAnchor(context) || context.worktree
 }
 
 type ActivePlan = { path: string; doc: PlanDoc }
@@ -1263,7 +1293,7 @@ const CREW_INIT_TEMPLATE = [
   "",
   "CREW IS NOT INITIALIZED: no forge subagents are configured (no usable forge.json agents). Refuse to enter orchestration and tell the user this feature needs a one-time setup, offering BOTH options:",
   "",
-  "1. The user configures it themselves: create ONE of these files (project-level wins, never merged):",
+  "1. The user configures it themselves: create either layer — MERGED, the project layer overrides the global one per agent id (the project file is the nearest .opencode/forge.json walking up from the workspace root):",
   "{paths}",
   "",
   "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead.",
@@ -1311,20 +1341,32 @@ const crewBeginTool = tool({
       throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.")
     }
     // Hard initialization gate (spec: crew-harness — "Unconfigured crew
-    // initialization gate"): the /crew template refuses on an empty agent
-    // set, and this MECHANISM backstop stops a model that skips the template
-    // text. The refusal carries the same guidance the command shows.
-    const loaded = forgeLoader?.load()
-    if (!loaded || Object.keys(loaded.agents).length === 0) {
-      const paths = forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
-      throw new Error(
-        [
-          "[forge:crew] CREW IS NOT INITIALIZED: no forge subagents are configured. Crew orchestration is unavailable until the user sets it up.",
-          `Create ONE of these files (project-level wins): ${paths.project} OR ${paths.global}`,
-          'Template (JSONC): {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low"}}}',
-          "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. Newly added agents need a host restart; thoughtLevel edits apply without one.",
-        ].join("\n"),
-      )
+    // initialization gate"): keyed on the HOST-materialized set — that is
+    // what the native task tool can dispatch. Session-anchored discovery
+    // (change align-forge-config-discovery) drives the guidance paths and
+    // the workspace-mismatch disclosure: a workspace file this host cannot
+    // see is named with the relaunch guidance, never masked as plain
+    // "unconfigured".
+    const hostLoaded = forgeLoader?.load()
+    const hostIds = hostLoaded ? Object.keys(hostLoaded.agents) : []
+    const anchor = sessionAnchor(context)
+    const hostAnchorDir = forgeLoaderDir ?? ""
+    const sessionLoaded = anchor && anchor !== hostAnchorDir ? loaderForAnchor(anchor).load() : hostLoaded
+    const sessionProject = sessionLoaded?.projectPath ?? null
+    if (hostIds.length === 0) {
+      const paths = forgeConfigPaths({ projectDir: hostAnchorDir || undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+      const lines = [
+        "[forge:crew] CREW IS NOT INITIALIZED on this host: no forge subagents are materialized. Crew orchestration is unavailable until the user sets it up.",
+        `Two layers, MERGED (the project layer overrides the global one per agent id): ${paths.project} (nearest .opencode/forge.json walking up from the workspace) OR ${paths.global}.`,
+        'Template (JSONC): {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low"}}}',
+        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. Newly added agents need a host restart; thoughtLevel edits apply without one.",
+      ]
+      if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject) {
+        lines.push(
+          `NOTE: this session's workspace DOES have a forge.json (${sessionProject}) with usable agents — but this host instance was launched from ${hostAnchorDir || "a different directory"}, so they are not in the task vocabulary. Relaunch opencode in that workspace, or add the agents to the global layer.`,
+        )
+      }
+      throw new Error(lines.join("\n"))
     }
     if (!args.objective?.trim()) throw new Error("crew_begin requires a non-empty objective (from /crew <objective>).")
     const raw = Array.isArray(args.subtasks) ? args.subtasks : []
@@ -1345,6 +1387,17 @@ const crewBeginTool = tool({
       throw new Error(`[forge:crew] This session already has an active crew: "${existing.objective}" (started ${existing.startedAt}). Finish and close it with crew_close before starting another.`)
     }
     crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso(), subtasks })
+    // Workspace-mismatch disclosure: the session's own discovery found
+    // project-layer agents this host did not materialize — they are NOT
+    // dispatchable here; say so instead of letting the crew discover it by
+    // failure.
+    let disclosure = ""
+    if (sessionProject && sessionProject !== (hostLoaded?.projectPath ?? null)) {
+      const localOnly = Object.keys(sessionLoaded?.agents ?? {}).filter((id) => !hostIds.includes(id))
+      if (localOnly.length > 0) {
+        disclosure = `\n[forge:crew] NOTE: this session's workspace has its own forge.json (${sessionProject}) defining ${localOnly.map((id) => `forge-${id}`).join(", ")} — NOT dispatchable on this host (launched from ${hostAnchorDir || "a different directory"}). Relaunch opencode in that workspace to use them, or fold them into the global layer.`
+      }
+    }
     return {
       title: `crew registered: ${args.objective.trim().slice(0, 60)}`,
       output: [
@@ -1352,6 +1405,7 @@ const crewBeginTool = tool({
         `Declared plan (${subtasks.length}):`,
         ...subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
         "Proceed with the discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+        ...(disclosure ? [disclosure] : []),
       ].join("\n"),
     }
   },

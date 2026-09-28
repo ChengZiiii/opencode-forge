@@ -371,16 +371,24 @@ export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAg
 }
 
 // ---------------------------------------------------------------------------
-// Cascade loader (project > global; hot-apply mtime cache; NO seed)
+// opencode-aligned cascade loader (change align-forge-config-discovery):
+// global base + NEAREST project override MERGED per agent id; the project
+// layer is discovered by walking UP from the anchor directory to the
+// filesystem root (first hit wins); hot-apply mtime cache; NO seed.
+// opencode's own config language: "merged together, not replaced", project
+// config found by "looking in the current directory, then traversing up".
 // ---------------------------------------------------------------------------
 
-export type ForgeConfigSource = "project" | "global" | "none"
+export type ForgeConfigSource = "project" | "global" | "project+global" | "none"
 
 export type LoadedForgeConfig = {
   agents: Record<string, ForgeAgentDef>
   source: ForgeConfigSource
   // null when no file backs the result (unconfigured or unreadable).
   path: string | null
+  // The discovered project-layer file (nearest .opencode/forge.json on the
+  // anchor's ancestor chain); null when no project layer exists.
+  projectPath: string | null
   findings: ForgeConfigFinding[]
 }
 
@@ -399,6 +407,27 @@ export type ForgeConfigLoaderDeps = {
   readFile?: (path: string) => string
 }
 
+// Filesystem-root predicate for the upward walk: "/", "\", drive roots
+// ("C:", "C:/", "C:\"), and the empty anchor terminate the chain.
+function isFsRoot(p: string): boolean {
+  return p === "" || p === "/" || p === "\\" || /^[A-Za-z]:[\\/]?$/.test(p)
+}
+
+// Strip the last path segment, preserving the caller's separator style.
+// Returns null at a filesystem root or for a bare separator-less name.
+function parentDirOf(p: string): string | null {
+  let s = p
+  while (s.endsWith("/") || s.endsWith("\\")) {
+    if (isFsRoot(s)) return null
+    s = s.slice(0, -1)
+    if (isFsRoot(s)) return null
+  }
+  const i = Math.max(s.lastIndexOf("/"), s.lastIndexOf("\\"))
+  if (i < 0) return null
+  const parent = s.slice(0, i + 1)
+  return parent === "" ? null : parent
+}
+
 export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): LoadedForgeConfig } {
   const stat =
     deps.stat ??
@@ -411,14 +440,17 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
       }
     })
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, "utf8"))
-  const paths = forgeConfigPaths({ projectDir: deps.projectDir, homeDir: deps.homeDir })
+  const globalPath = forgeConfigPaths({ homeDir: deps.homeDir }).global
 
   // Hot-apply cache: stat before every load; only an mtime/size change
   // triggers a re-read. Cached per path, INCLUDING parse failures, so a
-  // broken file does not re-parse on every lookup.
+  // broken file does not re-parse on every lookup. The upward DISCOVERY is
+  // re-run on every load (stat-per-level, cheap) so a project file appearing
+  // or disappearing anywhere on the anchor's chain applies without restart,
+  // exactly like an edit does.
   const cache = new Map<string, { mtimeMs: number; size: number; result: LoadedForgeConfig }>()
 
-  const readCandidate = (path: string, source: Exclude<ForgeConfigSource, "none">): LoadedForgeConfig | null => {
+  const readCandidate = (path: string, source: Exclude<ForgeConfigSource, "none" | "project+global">): LoadedForgeConfig | null => {
     const st = stat(path)
     if (st === null) {
       cache.delete(path)
@@ -430,17 +462,19 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
     const parsed = parseForgeJsonc(text)
     let result: LoadedForgeConfig
     if (!parsed.ok) {
-      // Broken document: the WHOLE set is empty with one error finding
-      // carrying the parse location. There is no seed to fall back to.
+      // Broken document: THIS layer's agent set is empty with one error
+      // finding carrying the parse location (fail-soft per layer — the other
+      // layer still applies). There is no seed to fall back to.
       result = {
         agents: {},
         source,
         path,
+        projectPath: source === "project" ? path : null,
         findings: [
           {
             level: "error",
             code: "config-parse-error",
-            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — the agent set is empty until the file parses`,
+            message: `${path}: ${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""} — this layer contributes no agents until the file parses`,
           },
         ],
       }
@@ -451,27 +485,62 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
           agents: {},
           source,
           path,
-          findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — the agent set is empty` }],
+          projectPath: source === "project" ? path : null,
+          findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this layer contributes no agents` }],
         }
       } else {
         const validated = validateAgentSet(top === undefined ? undefined : (top as Record<string, unknown>).agents)
-        result = { agents: validated.agents, source, path, findings: validated.findings }
+        result = { agents: validated.agents, source, path, projectPath: source === "project" ? path : null, findings: validated.findings }
       }
     }
     cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result })
     return result
   }
 
+  // Upward discovery: the NEAREST .opencode/forge.json from the anchor to
+  // the filesystem root is the project layer (first hit wins; nothing above
+  // it on the chain is consulted). Candidates preserve the anchor's
+  // separator style and never double a trailing separator (parent links
+  // keep theirs: "C:/work/repo/" → "C:/work/repo/.opencode/forge.json").
+  const candidateAt = (dir: string): string => {
+    const sep = dir.includes("\\") && !dir.includes("/") ? "\\" : "/"
+    const base = dir.endsWith("/") || dir.endsWith("\\") ? dir : `${dir}${sep}`
+    return `${base}.opencode${sep}forge.json`
+  }
+  const discoverProjectFile = (anchor: string): string | null => {
+    let dir = (anchor ?? "").trim()
+    if (!dir) return null
+    for (;;) {
+      const candidate = candidateAt(dir)
+      if (stat(candidate) !== null) return candidate
+      const parent = parentDirOf(dir)
+      if (parent === null || parent === dir) return null
+      dir = parent
+    }
+  }
+
   return {
     load(): LoadedForgeConfig {
-      const project = paths.project ? readCandidate(paths.project, "project") : null
-      if (project) return project
-      const global = paths.global ? readCandidate(paths.global, "global") : null
-      if (global) return global
+      const projectPath = discoverProjectFile(deps.projectDir ?? "")
+      const project = projectPath ? readCandidate(projectPath, "project") : null
+      const global = globalPath ? readCandidate(globalPath, "global") : null
+      // Merge, never replace: global base, project definition wins per agent
+      // id (wholesale — one definition per id, no cross-layer blending).
+      if (project && global) {
+        return {
+          agents: { ...global.agents, ...project.agents },
+          source: "project+global",
+          path: project.path,
+          projectPath: project.path,
+          findings: [...global.findings, ...project.findings],
+        }
+      }
+      if (project) return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings }
+      if (global) return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings }
       // Unconfigured: inert and silent (spec — "the unconfigured state SHALL
       // be inert: no subagents registered, no errors raised, no AI-facing
       // configuration recipe emitted").
-      return { agents: {}, source: "none", path: null, findings: [] }
+      return { agents: {}, source: "none", path: null, projectPath: null, findings: [] }
     },
   }
 }
