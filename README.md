@@ -33,8 +33,10 @@ OpenSpec spec workflows remain a third, separate lane.
 - Plan files: `.opencode/plan/<date>-<slug>.md` in your project, frontmatter
   state machine `draft → approved → done` (exit: `abandoned`).
 - While a plan is in draft, `write` / `edit` / `bash` / `task` are **denied
-  at the permission layer** — including your own `allow` config. The only
-  exits are approval and discard. This is deliberate; see Design stance.
+  at the permission layer** — including your own `allow` config, and for
+  every agent in that session (the draft protects shared session state; see
+  Agent partition below). The only exits are approval and discard. This is
+  deliberate; see Design stance.
 - `plan_approve` / `plan_close` are pinned to a confirmation dialog: the
   model can never flip the state itself.
 - Goal files: `.opencode/goal/<date>-<slug>.md`, state machine
@@ -42,9 +44,40 @@ OpenSpec spec workflows remain a third, separate lane.
   session plus a workspace queue. Completion is **verified by the plugin**,
   not attested by the model: `goal_complete` re-executes every check itself
   and refuses (fail-closed) on any failure.
-- The native `build` / `plan` agents are hidden while the plugin is loaded
-  (runtime injection, nothing written to your config). Uninstall restores
-  them automatically; plan and goal files are never deleted.
+- The native `build` / `plan` agents **stay installed and independent**:
+  forge coexists with them in the Tab cycle. The plugin hard-partitions the
+  two worlds (see Agent partition below) instead of hiding anything; plan
+  and goal files are never deleted on uninstall.
+
+## Agent partition (who sees what)
+
+The plugin draws a hard line between two agent families, enforced at the
+tool layer (verified against the host's `tools` filter):
+
+| | **forge family** — `forge` + your forge.json `forge-*` workers | **everyone else** — native `build` / `plan` / `general` / `explore` and your own agents |
+| --- | --- | --- |
+| exec surface | `forge_shell` / `forge_jobs` only; builtin `shell`/`bash` hidden (unconditional, probe-independent; covers user-defined `agent.forge` entries too) | builtin `shell`/`bash`, fully native |
+| forge tools (`plan_*`, `goal_*`, `crew_*`, `forge_shell`, `forge_jobs`) | `forge` sees all; `forge-*` workers only `forge_shell` + `forge_jobs` | none visible |
+| dispatching `forge-*` via `task` | allowed | refused at the tool layer |
+| writing `.opencode/plan/` / `.opencode/goal/` | allowed (state machine governs) | refused at the tool layer (reads stay open) |
+| forge system prompts (job guidance, plan/goal notices) | injected | never injected — zero forge text |
+| watchdog (stuck builtin shell) | governed | untouched — no markers, no kills |
+
+Escape hatches: `jobs.keepBuiltinShell: true` gives the forge family the
+builtin shell back; `jobs.mode: "native"` retires `forge_shell`/`forge_jobs`
+entirely (the hide is withdrawn in the same stroke). Mixed sessions (Tab
+between agents in one session): harness state (plans/goals) stays
+session-bound, tool surfaces follow the current speaker, and the goal loop
+parks instead of driving a non-forge turn. One deliberate exception: a
+draft-phase write ban binds the **session** (protecting shared state), so a
+non-forge agent is write-blocked until the draft is approved or discarded in
+forge. Running `/plan` `/goal` `/crew` under a non-forge agent redirects to
+forge instead of executing.
+
+**Default subject.** The host otherwise defaults new sessions to `build`
+once a build agent exists — the plugin pins `default_agent: "forge"`
+automatically (a `default_agent` you set yourself always wins), so bare
+runs and fresh sessions still land on forge under coexistence.
 
 ## Install
 
@@ -78,18 +111,19 @@ the plugin never writes them):
     "forge": {
       "model": "provider/model",   // pick any model for forge
       "disable": true              // one-knob return to native: no forge,
-                                   // build/plan restored, no tools/commands
+                                   // no injections at all, no tools/commands
     }
   },
   // per-plugin options ride the plugin entry as a [spec, options] tuple
   "plugin": [
     ["@sorenllm/opencode-forge", {
       "jobs": {
-        "mode": "auto",              // "auto" (default) | "forge" | "native" — see the stage matrix below
-        "keepBuiltinShell": false    // stage 0: keep the builtin shell visible alongside forge_shell
+        "mode": "auto",              // "auto" (default) | "forge" — equivalent, both keep the partition
+                                     // | "native" — retire the supervisor, builtin shell returns
+        "keepBuiltinShell": false    // true: give the forge family the builtin shell back (the one exec escape hatch)
       },
       "watchdog": {
-        "mode": "kill",              // "kill" (default) | "dry-run" | "off"
+        "mode": "kill",              // "kill" (default) | "dry-run" | "off" — forge-family sessions only
         "stallMs": 600000            // stall threshold, min 60000
       }
     }]
@@ -110,7 +144,8 @@ and the plugin's command of that name is not registered.
    `~/.cache/opencode/packages/github_ChengZiiii/opencode-forge/`).
 3. Delete the `agent["forge"]` block from your config if you added one
    (otherwise the name lingers in the agent list).
-4. Done — the hidden native `build`/`plan` agents come back automatically
+4. Done — all runtime injections (agents, tool hiding, commands) are gone
+   with the plugin; nothing was ever written to your config
    (the hide was runtime-only). Your `.opencode/plan/` and `.opencode/goal/`
    files are yours; delete them yourself if you want.
  5. Optional runtime debris: delete `<tmp>/opencode-forge/` (job logs, the
@@ -126,7 +161,7 @@ What this plugin touches, exhaustively:
 | --- | --- | --- |
 | `<project>/.opencode/plan/*.md` | plan files | user data — kept forever, uninstall never deletes |
 | `<project>/.opencode/goal/*.md` | goal files (contract, Check Log, Turn Ledger) | user data — kept forever, uninstall never deletes |
-| merged config object (RAM only) | forge agent, static `forge-<id>` subagents, native build/plan `disable`, `command.plan`, `command.goal`, `command.crew`, goal permission keys, `permission.forge_shell`, `permission.crew_close`, stage-0 builtin shell hide | vanishes when the plugin is removed; nothing is written to disk |
+| merged config object (RAM only) | forge agent, static `forge-<id>` subagents, tool-partition injections (forge family shell hide, non-forge forge-tool hide, native build/plan/general/explore minimal entries), `command.plan`, `command.goal`, `command.crew`, goal permission keys, `permission.forge_shell`, `permission.crew_close` | vanishes when the plugin is removed; nothing is written to disk |
 | `<tmp>/opencode-forge/jobs/<jobId>.log` | job output tee (full output; oldest rotated out above 50 files) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
@@ -293,19 +328,20 @@ as usual. Config `jobs.survive: "always"` flips the per-call default; config
 whose pid died are detected at next start, ledgered as orphans, and dropped
 from the registry. Stop survivors explicitly — nothing else will.
 
-### Stage matrix (future compatibility, by design)
+### Mode matrix (supervisor lifecycle)
 
-OpenCode upstream is converging on native backgrounding (PRs #47231 /
-#50276, umbrella #34366). The supervisor degrades ahead of it:
+The old three-stage capability probe is retired: the forge-side partition
+holds regardless of what the host's builtin shell can do, so `auto` and
+`forge` are equivalent. Only the manual `native` mode retires the
+supervisor:
 
-| stage | how you get there | builtin shell | forge_shell / forge_jobs |
+| mode | how you get there | builtin shell (forge family) | forge_shell / forge_jobs |
 | --- | --- | --- | --- |
-| 0 — full forge path | default (`jobs.mode: "auto"`, no native support detected) | hidden on the plugin-created forge agent (runtime injection only) | registered; the exec surface |
-| 1 — native backgrounding detected | automatic: `config.experimental` background flag, or the builtin shell's schema grows `run_in_background` | visible again | still registered as the additive layer (idle/success/wake supervision); its description now points plain backgrounding at the native parameter |
-| 2 — native confirmed complete | manual only: `jobs.mode: "native"` (never auto-detected — completeness is a semantic judgement) | visible | retired; calls throw with a pointer to the native parameter |
+| auto (default) / forge | nothing to do | hidden — the exec surface is forge_shell, always | registered |
+| native | manual only: `jobs.mode: "native"` | restored | retired; calls throw with a pointer to the native parameter |
 
-Pin `jobs.mode: "forge"` to stay on stage 0 forever; `jobs.keepBuiltinShell:
-true` keeps the builtin shell visible at any stage.
+`jobs.keepBuiltinShell: true` gives the forge family the builtin shell back
+in any mode (the watchdog keeps governing those calls).
 
 ### Artifacts and uninstall additions
 
@@ -453,10 +489,11 @@ delete the directory freely, also after uninstalling.
 ## Hang watchdog (a stuck builtin shell unblocks itself)
 
 `forge_shell` is structurally immune to the stdio-EOF hang, but the builtin
-`shell`/`bash` tool can still hang outside it — user-defined agents keep
-the builtin shell, and the stage matrix above restores it at stage 1/2.
-The watchdog is the independent backstop for those paths, in **every**
-session (primary and delegated subagents alike):
+`shell`/`bash` tool can still hang outside it — under `jobs.mode: "native"`
+or `jobs.keepBuiltinShell: true`, forge-family sessions carry it again. The
+watchdog is the independent backstop for those paths, in **forge-family
+sessions only** (primary and delegated forge-* workers alike) — non-forge
+agents' builtin shells are entirely native: no markers, no timing, no kills:
 
 1. The host's shell environment hook stamps each builtin shell call's
    process with a plugin-namespaced marker (`FORGE_WATCHDOG_MARK`), and the
@@ -519,11 +556,12 @@ read/grep/glob; if you genuinely need a shell command to decide the plan,
 approve the plan first (revising after approval is allowed via a new `/plan`).
 The escape hatches are `plan_approve` and `/plan discard`, by design.
 
-Separately, at stage 0 the builtin shell is hidden on the plugin-created
-forge agent on purpose — `forge_shell` is the exec surface there (see the
-job supervisor chapter above). A **user-defined** `agent.forge` entry,
-`jobs.keepBuiltinShell: true`, or any stage ≥ 1 keeps the builtin shell
-visible.
+Separately, the builtin shell is hidden on the forge agent on purpose —
+`forge_shell` is the exec surface there (see Agent partition and the job
+supervisor chapter above). The hide is unconditional: it covers a
+**user-defined** `agent.forge` entry too. The escape hatches are
+`jobs.keepBuiltinShell: true` (builtin shell back on the forge family) and
+`jobs.mode: "native"` (supervisor retired entirely).
 
 A process restart forgets the session binding: the write-ban soft-disables
 (safety over strictness) and the next session's system notice + `/plan

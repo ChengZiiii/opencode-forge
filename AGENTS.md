@@ -18,10 +18,10 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
 
 | 文件 | 职责 |
 | ---- | ---- |
-| `plugin.ts` | 双入口：`server`（v1 hooks 全功能：config 注册 forge agent + 静态 `forge-<id>` 子代理（带钉扎 model）+ `/plan` `/goal` `/crew` 命令、tool 注册 5 个 plan_* + 6 个 goal_* + 2 个 job + 2 个 crew 工具（共 15 个）、permission.ask 禁写+钉门+forge_shell/crew_close 门、event 播种会话与 idle 续跑调度+job 唤醒投递+session.deleted 收割（含会话深度表逐出）、tool.execute.after 活动标记、tool.definition 能力探测（stage 1 锁存）、chat.params 按 agent 名注入钉扎 thoughtLevel、system transform 注入 plan+goal+job+crew 提醒、compaction 钩子）+ `setup`（v2 防御式注册 forge agent 与静态子代理，create-only）。纪律载体：`/plan`、`/goal`、`/crew` 命令模板各自自含全量纪律（hermes 式：进入轮即规则书，系统提示词零纪律）；/crew 模板按配置组合——有 agent 给编排纪律+名册，零 agent 给初始化硬门+指引（唯一配置邀请面）。无捆绑 skill |
+| `plugin.ts` | 双入口：`server`（v1 hooks 全功能：config 注册 forge agent + 静态 `forge-<id>` 子代理（带钉扎 model）+ `/plan` `/goal` `/crew` 命令、tool 注册 5 个 plan_* + 6 个 goal_* + 2 个 job + 2 个 crew 工具（共 15 个）、permission.ask 禁写+钉门+forge_shell/crew_close 门、event 播种会话与 idle 续跑调度+job 唤醒投递+session.deleted 收割（会话深度表+agent 族表逐出）、chat.message/chat.params/工具上下文三源采集 sessionID→agent 族映射、tool.execute.before 活动标记+派发护栏+状态文件边界+draft 会话级写禁、chat.params 按 agent 名注入钉扎 thoughtLevel、system transform 全量 forge 注入按族门控、compaction 钩子随族门控）+ `setup`（v2 防御式注册 forge agent 与静态子代理，create-only，无 tool 域）。**工具面按 agent 族硬分区**（tool-partition spec）：forge 族 shell/bash 隐藏+forge_shell 强制，forge-* 工人只留执行对（状态工具 primary 专属），非 forge agent 全部 forge 工具隐藏+原生物化，watchdog 管辖收缩至 forge 族。纪律载体：`/plan`、`/goal`、`/crew` 命令模板各自自含全量纪律+族护栏（hermes 式：进入轮即规则书，系统提示词零纪律）；/crew 模板按配置组合。无捆绑 skill |
 | `src/forge-config.ts` | forge.json 纯函数核心：JSONC 解析（保留空白/报错定位）、**字段级 fail-soft** 语义校验（坏条目跳过+error finding、坏可选字段忽略+warn、`depths` 弃用告警、坏文档空集+定位错误；无 seed、无 recipe）、project>global 级联（单源不合并）、mtime 热应用缓存。**无副作用（fs 可注入）** |
-| `src/dispatch-tiers.ts` | 静态子代理物化源：角色 prompt 分层（显式 prompt > research/review 内置默认 > 通用）、形状权限（readonly deny write/edit/bash；task: deny 恒强制）、`forgeAgentDef` 物化定义（**写 model**、不 hidden、task 词汇表可见） |
-| `src/dispatch-prompt.ts` | 常驻纪律 prompt：三条 mandate（相对路径/原样上报拒绝/证据结论）+ 形状框架（readonly 报告型 / write 执行型）+ 角色文内嵌组合 |
+| `src/dispatch-tiers.ts` | 静态子代理物化源：角色 prompt 分层（显式 prompt > research/review 内置默认 > 通用）、形状权限（readonly deny write/edit/bash；task: deny 恒强制）、`forgeAgentDef` 物化定义（**写 model**、不 hidden、task 词汇表可见、**带执行面 tools 隐藏 shell/bash**——tool-partition） |
+| `src/dispatch-prompt.ts` | 常驻纪律 prompt：四条 mandate（相对路径/命令一律 forge_shell/原样上报拒绝/证据结论）+ 形状框架（readonly 报告型 / write 执行型）+ 角色文内嵌组合 |
 | `src/dispatch-depth.ts` | 思考档位翻译（纯函数）：canonical 词表 verbatim-first / 不插值 / 全披露；三族 wire 形状（openai effort / anthropic budget / zai toggle）；`resolvePinnedDepth` 包装（不可译词 → 注入 nothing + finding，绝不打断会话） |
 | `src/crew-gate.ts` | crew_close 门纯逻辑：报告对账**声明计划**（crew_begin 注册）——漏判/缺证据/野子任务/FAIL 双报告四类拒绝，标题归一化匹配。**无 ledger 依赖** |
 | `src/models-dev.ts` | models.dev 快照切片：reasoning ladder + 价目（价目现仅备查）、parseIdentity/nativeLadder（档位校验用；快照不可用 → null → verbatim 透传） |
@@ -45,7 +45,8 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
 2. **禁写**：permission.ask 里 draft 期对 write/edit/bash/task/patch 类
    无条件 deny，**高于用户 allow**（README Design stance 有声明）；字段
    取名按优先级链 `metadata.tool → permission → id → type`，未知会话保守
-   放行（宁漏禁不误杀）。
+   放行（宁漏禁不误杀）。**会话级**（D12）：draft 禁写对会话内任何 agent
+   生效——被动防护可达、主动驱动不可达，是分区下唯一声明的越界。
 3. **双门**：`plan_approve` / `plan_close` / `goal_write(arm)` /
    `goal_complete` / `goal_resume` 在 permission.ask 里除显式 deny
    外一律改写为 ask——用户确认框即门，模型无法自翻状态。
@@ -57,8 +58,16 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
    无进展核算+记账 / draft 冲突 / 预算 / status idle 复查）→
    `[forge:goal-continue]` brief + turns 计数。压缩安全：goal-brief 进
    compaction 上下文、autocontinue 对 active-goal 会话关闭。
-6. **一键回原生**：`agent["forge"].disable = true` → 全部注入跳过（含隐藏
-   build/plan），工具经 getter 摘除。插件永不写用户 `model` 字段。
+6. **一键回原生**：`agent["forge"].disable = true` → 全部注入跳过（含
+   工具面分区注入与命令注册），工具经 getter 摘除。插件永不写用户
+   `model` 字段。
+7. **工具面分区**（tool-partition）：sessionID→agent 族映射三源采集
+   （chat.message 主 / chat.params 辅 / 工具上下文最强），族门控覆盖全部
+   forge 系统注入、goal 续跑（调度时+发送前双闸）、watchdog（标记+计时）、
+   task 派发护栏（非 forge 派 forge-* 硬拒绝）、状态文件边界（非 forge 禁
+   写 .opencode/plan|goal）；未知会话对注入 fail-silent、对拒绝 belt
+   fail-open。stage 探测已退役：`auto`≡`forge`，仅 `native` 退役
+   supervisor（隐藏同撤）。
 
 ## v1 / v2 双入口
 

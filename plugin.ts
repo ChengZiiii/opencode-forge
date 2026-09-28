@@ -74,6 +74,32 @@ import { createForgeConfigLoader, forgeConfigPaths, type ForgeAgentDef, type Loa
 
 const FORGE_AGENT = "forge"
 
+// Tool-partition vocabulary (spec: tool-partition). Harness STATE tools are
+// primary-only; the exec/supervision pair rides with forge-* workers; the
+// full set is hidden from every non-forge agent.
+const FORGE_STATE_TOOLS = [
+  "plan_write",
+  "plan_tick",
+  "plan_approve",
+  "plan_close",
+  "plan_discard",
+  "goal_write",
+  "goal_check",
+  "goal_complete",
+  "goal_pause",
+  "goal_resume",
+  "goal_discard",
+  "crew_begin",
+  "crew_close",
+] as const
+const FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"] as const
+const FORGE_ALL_TOOLS: readonly string[] = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS]
+const FORGE_TOOL_SET = new Set<string>(FORGE_ALL_TOOLS)
+// Native agents the partition must cover even when absent from the user's
+// config (materialized as minimal tools-only entries; hidden utility agents
+// summary/title/compaction have no tool surface and are not touched).
+const NATIVE_PARTITION_FALLBACKS = ["build", "plan", "general", "explore"] as const
+
 const FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
 Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.
@@ -89,6 +115,8 @@ Subagent dispatch (task tool): when the work suits a scoped worker, prefer a con
 // string opencode substitutes.
 const PLAN_COMMAND_TEMPLATE = [
   '(forge plan harness routing. Argument: "$ARGUMENTS")',
+  "",
+  "FAMILY GUARD (step 0, before anything else): if you do not have the plan_write tool in your available tools, you are not in a forge session — STOP now: execute nothing below (including the directory listing), and tell the user that /plan belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
   "",
   "Current .opencode/plan/ directory:",
   "!`ls -1 .opencode/plan 2>/dev/null || echo '(empty)'`",
@@ -119,6 +147,8 @@ const PLAN_COMMAND_TEMPLATE = [
 // structured goal_write fields.
 const GOAL_COMMAND_TEMPLATE = [
   '(forge goal harness routing. Argument: "$ARGUMENTS")',
+  "",
+  "FAMILY GUARD (step 0, before anything else): if you do not have the goal_write tool in your available tools, you are not in a forge session — STOP now: execute nothing below (including the directory listing), and tell the user that /goal belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
   "",
   "Current .opencode/goal/ directory:",
   "!`ls -1 .opencode/goal 2>/dev/null || echo '(empty)'`",
@@ -171,6 +201,33 @@ type SessionState = {
 // /plan resume re-binds
 // implicitly on the next plan_* tool call via the directory fallback.
 const sessions = new Map<string, SessionState>()
+
+// sessionID -> current agent name (tool-partition family gate). Primary
+// source: chat.message (earliest per-turn signal); belt: chat.params (always
+// carries the agent, fires for task-spawned sessions too). Bounded by
+// session.deleted eviction. Unknown = no gate behavior (fail-open for refusal
+// belts, no injection for push paths).
+const sessionAgents = new Map<string, string>()
+
+function isForgeFamilyAgent(name: unknown): boolean {
+  if (typeof name !== "string") return false
+  const n = name.toLowerCase()
+  return n === FORGE_AGENT || n.startsWith("forge-")
+}
+
+function sessionIsForgeFamily(sessionID: string | undefined): boolean {
+  if (!sessionID) return false
+  return isForgeFamilyAgent(sessionAgents.get(sessionID))
+}
+
+// Third map source (strongest): every plugin-tool execution context carries
+// the calling session's agent verbatim. Harness tools are forge-family-only
+// post-partition, so a tool call is an authoritative speaker statement.
+function noteToolAgent(context: { sessionID?: string; agent?: unknown } | undefined): void {
+  if (context && typeof context.sessionID === "string" && context.sessionID && typeof context.agent === "string" && context.agent) {
+    sessionAgents.set(context.sessionID, context.agent)
+  }
+}
 
 // Captured in the config hook; flips the tool getter and skips every config
 // injection when the user sets agent["forge"].disable = true (one-knob
@@ -289,21 +346,14 @@ function ensureJobLifecycle(): { registry: JobRegistry | null; fence: JobFence |
   return { registry, fence: jobFence }
 }
 
-// Capability probe: set when the native shell tool presents a
-// run_in_background parameter (tool.definition hook) or an experimental
-// background flag shows up in the host config.
-let nativeBackgroundSeen = false
-
-// Stage matrix (design D10): 0 = no native capability (full forge path,
-// builtin shell hidden on the plugin-created forge agent); 1 = native
-// run_in_background detected (stop hiding the builtin shell; forge_shell
-// remains the additive layer); 2 = manual-only confirmation that native
-// backgrounding is complete (forge_shell retires). Stage 2 is NEVER
-// auto-detected — "complete" is a semantic judgment only the user can make.
-function jobStage(): 0 | 1 | 2 {
+// Stage matrix (partition era, tool-partition spec): the forge-side exec
+// partition holds regardless of any host background capability, so `auto` and
+// `forge` are equivalent. Only the manual `native` mode retires the
+// supervisor — tools unregistered and the builtin-shell hide withdrawn in the
+// same stroke, so the forge agent is never left without an exec surface.
+function jobStage(): 0 | 2 {
   if (jobsMode === "native") return 2
-  if (jobsMode === "forge") return 0
-  return nativeBackgroundSeen ? 1 : 0
+  return 0
 }
 
 const jobLogDir = jobsLogDir()
@@ -410,7 +460,8 @@ function ensureSession(sessionID: string, worktree: string): SessionState {
 
 // Where a plan_* tool call for this context should anchor: the session's real
 // worktree, with the launch directory as the global-project ("/") fallback.
-function worktreeFor(context: { sessionID: string; worktree: string }): string {
+function worktreeFor(context: { sessionID: string; worktree: string; agent?: unknown }): string {
+  noteToolAgent(context)
   return effectiveWorktree(context.worktree, hostWorktree) || context.worktree
 }
 
@@ -976,11 +1027,6 @@ const FORGE_SHELL_DESCRIPTION = [
   "Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) MUST use this tool instead of the builtin shell.",
 ].join("\n")
 
-// D10 stage-1 action: once the native run_in_background parameter exists,
-// forge_shell stays only as the supervision layer (idle/success/wake).
-const STAGE1_NOTE =
-  "Stage note: this host's builtin shell already offers a native run_in_background parameter — prefer that for plain backgrounding; keep using forge_shell when you need idle/success_pattern early return or exit wake messages."
-
 const forgeShellTool = tool({
   description: FORGE_SHELL_DESCRIPTION,
   args: {
@@ -1097,6 +1143,7 @@ const forgeJobsTool = tool({
   },
   execute: async (args, context) => {
     if (jobStage() >= 2) throw new Error("[forge] The job supervisor is retired on this host.")
+    noteToolAgent(context)
     const action = String(args.action ?? "")
     if (!FORGE_JOBS_ACTIONS.includes(action)) {
       throw new Error(`Unknown action "${action}" — use one of: ${FORGE_JOBS_ACTIONS.join(", ")}.`)
@@ -1168,6 +1215,8 @@ const forgeJobsTool = tool({
 const CREW_INIT_TEMPLATE = [
   "(forge crew orchestration. Argument: \"$ARGUMENTS\")",
   "",
+  "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
+  "",
   "CREW IS NOT INITIALIZED: no forge subagents are configured (no usable forge.json agents). Refuse to enter orchestration and tell the user this feature needs a one-time setup, offering BOTH options:",
   "",
   "1. The user configures it themselves: create ONE of these files (project-level wins, never merged):",
@@ -1184,6 +1233,8 @@ const CREW_INIT_TEMPLATE = [
 function crewOrchestrationTemplate(agentIds: string[]): string {
   return [
     "(forge crew orchestration. Argument: \"$ARGUMENTS\")",
+    "",
+    "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
     "",
     `Configured forge subagents (task-tool vocabulary): ${agentIds.map((id) => `forge-${id}`).join(", ")}`,
     "",
@@ -1209,6 +1260,7 @@ const crewBeginTool = tool({
     })).describe("The declared subtask plan — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list"),
   },
   execute: async (args, context) => {
+    noteToolAgent(context)
     const state = stateForBan(context.sessionID)
     const active = state ? resolveActivePlan(state) : null
     if (active && active.doc.status === "draft") {
@@ -1273,6 +1325,7 @@ const crewCloseTool = tool({
     })).describe("The full crew report — one entry per declared subtask"),
   },
   execute: async (args, context) => {
+    noteToolAgent(context)
     const crew = crews.get(context.sessionID)
     if (!crew) throw new Error("[forge:crew] No active crew in this session (crew state is in-memory and dies on host restart). Start one with /crew <objective>.")
     const report = (args.report ?? []) as CrewSubtaskReport[]
@@ -1505,6 +1558,13 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
       goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session || "(none)"}`)
       return
     }
+    // Send-time family re-check (tool-partition): the speaker may have
+    // switched agents between scheduling and this send — forge never drives
+    // a non-forge turn.
+    if (!sessionIsForgeFamily(sessionID)) {
+      goalProbe(`skip: agent switched to non-forge before send session=${sessionID}`)
+      return
+    }
     // No-progress accounting, only for turns the engine itself started. The
     // finished turn's activity is also recorded in the goal's Turn Ledger
     // (auditable anti-batching evidence, visible at the completion gate).
@@ -1579,6 +1639,12 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
 function scheduleIdleContinuation(client: GoalClient, sessionID: string): void {
   // Belt for the engine guard: a disabled plugin must not even arm a timer.
   if (forgeDisabled) return
+  // Family gate at scheduling time (tool-partition): a non-forge session's
+  // idle never arms a timer — no continuation, not even a session.get probe.
+  if (!sessionIsForgeFamily(sessionID)) {
+    goalProbe(`skip: non-forge agent at schedule session=${sessionID}`)
+    return
+  }
   const existing = idleTimers.get(sessionID)
   if (existing) clearTimeout(existing)
   idleTimers.set(
@@ -1683,19 +1749,20 @@ export const server: Plugin = async (input, options) => {
       forgeDisabled = forgeUserCfg?.disable === true
       if (forgeDisabled) return
 
-      // Hide the native build/plan agents for the lifetime of the plugin
-      // (runtime injection only — nothing is written to the user's config
-      // file, so uninstall self-heals). Other user fields on those entries
-      // are preserved.
-      for (const native of ["build", "plan"] as const) {
-        agentSection[native] = { ...(agentSection[native] ?? {}), disable: true }
-      }
+      // Native build/plan agents are NOT disabled (partition era): forge
+      // coexists with them in the Tab cycle, and their isolation from forge
+      // tooling is handled by the tool-partition injections below.
+
+      // Default subject (D13): the host falls back to "build" once a build
+      // agent exists — coexistence must not flip the default away from
+      // forge. `??=` keeps an explicit user `default_agent` (any value) as
+      // the user's own choice.
+      ;(cfg as { default_agent?: string }).default_agent ??= FORGE_AGENT
 
       // Register forge without clobbering user-set fields (model, temperature,
       // permission overrides stay theirs; prompt/description/mode only when
       // absent).
       const existing = agentSection[FORGE_AGENT] as Record<string, unknown> | undefined
-      const userDefinedForge = existing !== undefined
       agentSection[FORGE_AGENT] = {
         ...(existing ?? {}),
         description:
@@ -1705,22 +1772,16 @@ export const server: Plugin = async (input, options) => {
         prompt: (existing?.prompt as string | undefined) ?? FORGE_PROMPT,
       }
 
-      // Capability probe source 1: an experimental background flag in the
-      // host config (the upstream PRs gate behind such flags).
-      try {
-        const exp = JSON.stringify((cfg as { experimental?: unknown }).experimental ?? "")
-        if (/background/i.test(exp)) nativeBackgroundSeen = true
-      } catch {
-        // Unreadable experimental section — probe source 2 still exists.
-      }
+      // Job-supervisor option sanity is unchanged; the capability probe is
+      // retired — no experimental-flag scan, no native-parameter sniffing.
 
-      // Job supervisor stage 0 ONLY (D10): hide the builtin shell on the
-      // PLUGIN-CREATED forge entry (runtime injection, nothing written to the
-      // user's config file) — the exec surface becomes forge_shell. Stage 1
-      // (native run_in_background detected) withdraws the hide and keeps
-      // forge_shell as the additive layer; a user-defined forge entry,
-      // jobs.keepBuiltinShell, or stage 2 also keep the builtin shell.
-      if (!userDefinedForge && !jobsKeepBuiltinShell && jobStage() < 1) {
+      // Exec partition (tool-partition): the forge agent's builtin shell is
+      // hidden unconditionally — probe-independent, and INCLUDING on a
+      // user-defined forge entry (key-merge: only shell/bash are written,
+      // every other field of the entry stands). jobs.keepBuiltinShell is the
+      // single escape hatch; supervisor retirement withdraws the hide
+      // together with the tool registration.
+      if (!jobsKeepBuiltinShell && jobStage() < 2) {
         const entry = agentSection[FORGE_AGENT] as { tools?: Record<string, boolean> }
         entry.tools = { ...(entry.tools ?? {}), shell: false, bash: false }
       }
@@ -1782,6 +1843,37 @@ export const server: Plugin = async (input, options) => {
         materializedSnapshot[id] = entry
       }
 
+      // Tool-partition injections (spec: tool-partition, design D3/D9). Runs
+      // after materialization so every forge-* entry — plugin-created or
+      // user-defined (family rules follow the name, not the author) — is
+      // covered. Key-merge only: user-written fields and explicit `true`
+      // entries outside the forge family stand.
+      // (a) forge-* workers: harness STATE tools are primary-only.
+      for (const id of Object.keys(agentSection)) {
+        if (!id.startsWith("forge-")) continue
+        const entry = agentSection[id] as { tools?: Record<string, boolean> }
+        const tools = { ...(entry.tools ?? {}) }
+        for (const t of FORGE_STATE_TOOLS) if (tools[t] !== true) tools[t] = false
+        entry.tools = tools
+      }
+      // (b) every other agent: ALL plugin tools hidden (explicit `true`
+      // respected — the user's own opt-in wins).
+      for (const [id, entry] of Object.entries(agentSection)) {
+        if (id === FORGE_AGENT || id.startsWith("forge-")) continue
+        const e = entry as { tools?: Record<string, boolean> }
+        const tools = { ...(e.tools ?? {}) }
+        for (const t of FORGE_ALL_TOOLS) if (tools[t] !== true) tools[t] = false
+        e.tools = tools
+      }
+      // (c) native agents absent from config: minimal partition entries
+      // (host merges by name — probe-verified no native-definition loss).
+      for (const native of NATIVE_PARTITION_FALLBACKS) {
+        if (agentSection[native] !== undefined) continue
+        const tools: Record<string, boolean> = {}
+        for (const t of FORGE_ALL_TOOLS) tools[t] = false
+        agentSection[native] = { tools }
+      }
+
       // models.dev snapshot: optional ladder verification for depth injection.
       // Unavailable -> null -> verbatim pass-through (the provider judges).
       if (process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1") {
@@ -1835,8 +1927,10 @@ export const server: Plugin = async (input, options) => {
       }
       // hang-watchdog timing start (both builtin shell names count). The
       // command text feeds the Windows locator's needle branch (CIM ppid is
-      // unreliable there — see src/proc-locate.ts).
-      if (watchdog.mode !== "off" && (input.tool === "shell" || input.tool === "bash")) {
+      // unreliable there — see src/proc-locate.ts). Family gate
+      // (tool-partition): only forge-family sessions are tracked — non-forge
+      // and unknown sessions carry no marker and are never intervened upon.
+      if (watchdog.mode !== "off" && (input.tool === "shell" || input.tool === "bash") && sessionIsForgeFamily(input.sessionID)) {
         const a = (output?.args ?? {}) as { command?: unknown; cmd?: unknown }
         const cmdText = typeof a.command === "string" ? a.command : typeof a.cmd === "string" ? a.cmd : undefined
         watchdog.track(input.callID, input.sessionID, input.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined)
@@ -1846,19 +1940,91 @@ export const server: Plugin = async (input, options) => {
           } catch {}
         }
       }
+      // Dispatch belt (tool-partition): a non-forge session must not spawn
+      // forge-* workers (the task vocabulary is global; refusal is the only
+      // per-parent control). Unknown sessions fail open.
+      if (input.tool === "task") {
+        const speaker = sessionAgents.get(input.sessionID)
+        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+          const a = (output?.args ?? {}) as { subagent_type?: unknown; agent?: unknown }
+          const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined
+          if (target && target.toLowerCase().startsWith("forge-")) {
+            throw new Error(
+              `[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use the native general/explore subagents, or switch to the forge agent to dispatch forge-* workers.`,
+            )
+          }
+        }
+      }
+      // State-file boundary (tool-partition): non-forge sessions must not
+      // mutate the forge state directories. Reads stay unrestricted; this is
+      // a mis-touch guard, not a security boundary (those paths live inside
+      // the workspace). Unknown sessions fail open.
+      if ((input.tool === "write" || input.tool === "edit") && input.sessionID) {
+        const speaker = sessionAgents.get(input.sessionID)
+        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+          const a = (output?.args ?? {}) as { filePath?: unknown; path?: unknown }
+          const raw = typeof a.filePath === "string" ? a.filePath : typeof a.path === "string" ? a.path : undefined
+          if (raw) {
+            const state = stateForBan(input.sessionID)
+            const base = state?.worktree ?? hostWorktree ?? ""
+            const abs = (isAbsolute(raw) ? raw : join(base, raw)).replaceAll("\\", "/").toLowerCase()
+            if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
+              throw new Error(
+                `[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`,
+              )
+            }
+          }
+        }
+      }
       if (typeof input.tool === "string" && isWriteTool(input.tool)) {
         const state = stateForBan(input.sessionID)
         const active = state ? resolveActivePlan(state) : null
         if (active && active.doc.status === "draft") {
+          // Session-scoped safety interop (tool-partition, D12): the draft
+          // protects shared session state, so the ban binds the session, not
+          // the speaker. The wording is agent-agnostic: a blocked non-forge
+          // agent cannot see plan_approve and must be told the real way out.
           throw new Error(
-            `[forge] A plan is in draft; write operations are denied (${input.tool}). Present the plan summary and call plan_approve for user approval, or /plan discard to abandon it.`,
+            `[forge] A plan is in draft; write operations are denied (${input.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`,
           )
+        }
+      }
+      // Partition fallback belts (tool-partition fallback requirement): on
+      // hosts that ignore hook-injected tools maps (the owner's paseo build —
+      // E2E-verified), invisibility degrades to hard refusal. On hosts that
+      // honor the maps the hidden tools never reach a call, so these belts
+      // are dead code there. Placed AFTER the draft ban: during a draft the
+      // write ban's message is the more precise refusal for bash.
+      if (input.sessionID && typeof input.tool === "string") {
+        const speaker = sessionAgents.get(input.sessionID)
+        if (speaker !== undefined) {
+          if (!isForgeFamilyAgent(speaker) && FORGE_TOOL_SET.has(input.tool)) {
+            throw new Error(
+              `[forge:partition] Tool refused: "${input.tool}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`,
+            )
+          }
+          if (isForgeFamilyAgent(speaker) && (input.tool === "shell" || input.tool === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
+            throw new Error(
+              `[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`,
+            )
+          }
         }
       }
       // Draft-phase subagent-spawn ban is INHERITED: the native task tool is
       // in the write-ban class (isWriteTool covers "task"), so no plugin-side
       // dispatch refusal exists to maintain (spec: forge-subagents —
       // "Native-task dispatch surface").
+    },
+
+    // Family-map primary source (tool-partition): chat.message carries the
+    // agent for every incoming turn (earliest per-request signal; the belt is
+    // chat.params in case this hook does not fire on some host shape).
+    "chat.message": async (input) => {
+      if (forgeDisabled) return
+      const raw = input as unknown as { sessionID?: unknown; agent?: unknown }
+      if (typeof raw.sessionID === "string" && raw.sessionID && typeof raw.agent === "string" && raw.agent) {
+        sessionAgents.set(raw.sessionID, raw.agent)
+      }
     },
 
     // Reasoning-depth injection for forge subagent sessions (spec:
@@ -1877,6 +2043,9 @@ export const server: Plugin = async (input, options) => {
       const sessionID = raw.sessionID
       if (!sessionID) return
       const agentName = typeof raw.agent === "string" ? raw.agent : (raw.agent as { name?: unknown } | undefined)?.name
+      // Family-map upsert (tool-partition): fires for every request build,
+      // including task-spawned sessions (probe P1).
+      if (typeof agentName === "string" && agentName) sessionAgents.set(sessionID, agentName)
       if (typeof agentName !== "string" || !agentName.startsWith("forge-")) return
       const frozen = sessionDepths.get(sessionID)
       if (frozen) {
@@ -1982,6 +2151,8 @@ export const server: Plugin = async (input, options) => {
           jobManager.onSessionEnd(info.id)
           // The frozen depth translation dies with its session (bounded table).
           sessionDepths.delete(info.id)
+          // Same for the agent-family map (tool-partition).
+          sessionAgents.delete(info.id)
         }
       }
     },
@@ -1999,6 +2170,10 @@ export const server: Plugin = async (input, options) => {
       // No callID → no marker and no timing for this call (a table keyed on
       // undefined would mis-track); the command runs, just ungoverned.
       if (!input.callID) return
+      // Family gate (tool-partition): only forge-family sessions carry the
+      // marker — non-forge sessions are entirely outside the watchdog, down
+      // to the (invisible) environment variable.
+      if (!sessionIsForgeFamily(input.sessionID)) return
       output.env[WATCHDOG_ENV_MARK] = markerValue(input.callID)
       watchdog.markSeen(input.callID)
       if (process.env.FORGE_WATCHDOG_PROBE) {
@@ -2023,30 +2198,20 @@ export const server: Plugin = async (input, options) => {
       if (input.tool === "goal_check") act.checks++
     },
 
-    // Capability probe source 2 (read-only on the native tool): the native
-    // shell tool presenting a run_in_background parameter is stage-1
-    // evidence. On our own forge_shell, stage 1 prepends the native-first
-    // note (the probe has latched by the time this definition ships).
-    "tool.definition": async (input, output) => {
-      if (input.toolID === "shell" || input.toolID === "bash") {
-        const props = (output.parameters as { properties?: Record<string, unknown> } | undefined)?.properties
-        if (props && "run_in_background" in props) nativeBackgroundSeen = true
-      } else if (input.toolID === "forge_shell" && jobStage() === 1) {
-        if (!output.description.startsWith(STAGE1_NOTE)) {
-          output.description = `${STAGE1_NOTE}\n${output.description}`
-        }
-      }
-    },
-
     // Session-start notices + standing reminders: injected into the system
     // prompt whenever the session has a non-terminal plan or a live goal
     // (both coexist). The relay clause makes the first reply surface them to
     // the user (no native banner API exists for plugins).
     "experimental.chat.system.transform": async (input, output) => {
       if (!input.sessionID) return
-      // Job-supervisor guidance reaches EVERY session including delegated
-      // ones (subagents are not in the `sessions` map — that is why this
-      // push happens before the state lookup).
+      // Family gate (tool-partition): EVERY forge-authored system text —
+      // crew-active, job guidance, plan/goal notices — is forge-family-only.
+      // Unknown sessions receive nothing (fail-silent by design).
+      if (!sessionIsForgeFamily(input.sessionID)) return
+      // Job-supervisor guidance reaches every FORGE-FAMILY session including
+      // delegated ones (subagents are not in the `sessions` map — that is why
+      // this push happens before the state lookup); the family gate above
+      // keeps it out of all other agents' sessions.
       const crewActive = crews.get(input.sessionID)
       if (crewActive && !output.system.some((s) => s.startsWith("[forge:crew-active]"))) {
         output.system.push(`[forge:crew-active] A crew is ACTIVE in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict.`)
@@ -2090,6 +2255,8 @@ export const server: Plugin = async (input, options) => {
     "experimental.session.compacting": async (input, output) => {
       if (forgeDisabled) return
       if (!input.sessionID) return
+      // Family gate (tool-partition): the goal brief is forge-authored text.
+      if (!sessionIsForgeFamily(input.sessionID)) return
       const state = sessions.get(input.sessionID)
       if (!state) return
       const goal = resolveLiveGoal(state)
@@ -2113,7 +2280,10 @@ export const server: Plugin = async (input, options) => {
       const state = sessions.get(input.sessionID)
       if (!state) return
       const goal = resolveLiveGoal(state)
-      if (goal) output.enabled = false
+      // Family gate (tool-partition): suppression only while the session's
+      // current agent belongs to the forge family — a parked loop under a
+      // non-forge speaker must not suppress the host's native behavior.
+      if (goal && sessionIsForgeFamily(input.sessionID)) output.enabled = false
     },
   }
 }

@@ -30,11 +30,13 @@ test("role prompt layer 3: a custom agent without a prompt gets the generic work
   assert.match(generic, /task/i)
 })
 
-test("the materialized prompt embeds the three mandates (never replaceable)", () => {
+test("the materialized prompt embeds the mandates (never replaceable)", () => {
   const p = materializeAgentPrompt({ agent: "research", shape: "readonly", role: "ROLE TEXT" })
   assert.match(p, /workspace-relative paths ONLY/)
   assert.match(p, /report the refusal VERBATIM/)
   assert.match(p, /evidence references/)
+  assert.match(p, /Run every shell command through the forge_shell tool/, "exec-partition mandate present")
+  assert.match(p, /builtin shell is not part of your toolset/, "the hide is stated as the design")
   assert.match(p, /ROLE TEXT/, "the role text rides inside the frame")
   // The mandates sit AFTER the role text (outermost discipline at the bottom).
   assert.ok(p.indexOf("ROLE TEXT") < p.indexOf("Mandates"))

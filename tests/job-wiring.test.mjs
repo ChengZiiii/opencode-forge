@@ -12,8 +12,8 @@ import { server } from "../plugin.ts"
 process.env.FORGE_TEST_NO_FENCE = "1"
 
 // Module-level supervisor state is shared across server() calls; tests run
-// in file order and the capability-probe test (which latches stage 1) runs
-// LAST so earlier assertions see the pristine stage-0 state.
+// in file order. The partition made `auto` and `forge` modes equivalent, so
+// no capability-probe ordering trick is needed anymore.
 const fakeInput = () => ({
   client: { session: {} },
   project: { id: "p" },
@@ -40,22 +40,31 @@ test("4.1 tools: forge_shell/forge_jobs registered at stage 0, retired at stage 
   assert.equal(h2.tool.forge_jobs, undefined, "stage 2 retires forge_jobs")
 })
 
-test("4.2 config: builtin shell hidden on the plugin-created forge entry (stage 0)", async () => {
-  const h = await hooks({ jobs: { mode: "forge" } })
+test("partition config: builtin shell hidden on the forge entry in auto mode; build/plan alive and isolated", async () => {
+  const h = await hooks({ jobs: { mode: "auto" } })
   const cfg = freshCfg()
   await h.config(cfg)
   assert.equal(cfg.agent.forge.tools.shell, false)
   assert.equal(cfg.agent.forge.tools.bash, false)
-  assert.equal(cfg.agent.build.disable, true)
   assert.equal(cfg.agent.forge.mode, "primary")
+  // build/plan are no longer disabled; they are isolated from forge tools.
+  assert.equal(cfg.agent.build?.disable, undefined)
+  assert.equal(cfg.agent.build.tools.forge_shell, false)
+  assert.equal(cfg.agent.build.tools.bash, undefined, "builtin shell stays available on build")
+  assert.equal(cfg.agent.plan.tools.forge_shell, false)
+  // native fallback agents materialized as minimal partition entries
+  assert.equal(cfg.agent.general.tools.forge_shell, false)
+  assert.equal(cfg.agent.explore.tools.forge_shell, false)
 })
 
-test("4.2 config: a user-defined forge entry is never touched", async () => {
+test("partition config: a user-defined forge entry gets the exec partition as a key merge", async () => {
   const h = await hooks({ jobs: { mode: "forge" } })
-  const cfg = freshCfg({ forge: { prompt: "mine" } })
+  const cfg = freshCfg({ forge: { prompt: "mine", tools: { write: true, shell: true } } })
   await h.config(cfg)
-  assert.equal(cfg.agent.forge.prompt, "mine")
-  assert.equal(cfg.agent.forge.tools, undefined, "no shell-hide injected into a user-defined entry")
+  assert.equal(cfg.agent.forge.prompt, "mine", "user fields stand")
+  assert.equal(cfg.agent.forge.tools.write, true, "unrelated tool entries stand")
+  assert.equal(cfg.agent.forge.tools.shell, false, "builtin shell forced off (the single escape hatch is keepBuiltinShell)")
+  assert.equal(cfg.agent.forge.tools.bash, false)
 })
 
 test("4.2 config: keepBuiltinShell and stage 2 both retain the builtin shell", async () => {
@@ -90,40 +99,30 @@ test("4.1 permission.ask belt: forge_shell stays a real ask unless explicitly de
   assert.equal(out2.status, "deny")
 })
 
-test("4.3 system.transform: job guidance reaches sessions not in the map (subagents)", async () => {
+test("partition: system.transform job guidance reaches forge-family sessions, never unknown ones", async () => {
   const h = await hooks({ jobs: { mode: "forge" } })
+  // A delegated forge-* worker session: seeded through chat.message.
+  await h["chat.message"]({ sessionID: "subagent-session", agent: "forge-research" }, { message: {}, parts: [] })
   const out = { system: [] }
-  await h["experimental.chat.system.transform"]({ sessionID: "subagent-session-not-in-map" }, out)
+  await h["experimental.chat.system.transform"]({ sessionID: "subagent-session" }, out)
   const guidance = out.system.find((s) => s.startsWith("[forge:job-guidance]"))
   assert.ok(guidance)
   assert.match(guidance, /forge_shell/)
   assert.match(guidance, /delegated agents.*poll/i)
+  // Unknown sessions carry no forge-authored text at all.
+  const out2 = { system: [] }
+  await h["experimental.chat.system.transform"]({ sessionID: "unknown-session" }, out2)
+  assert.ok(!out2.system.some((s) => s.startsWith("[forge:")), "unknown session receives no forge text")
 })
 
-test("5.2 probe: native run_in_background in the shell schema latches stage 1", async () => {
+test("partition: capability probe and stage-1 note are retired (no tool.definition hook)", async () => {
   const h = await hooks({ jobs: { mode: "auto" } })
-  const desc = "native shell"
-  const out = { description: desc, parameters: { properties: { command: {}, run_in_background: {} } } }
-  await h["tool.definition"]({ toolID: "shell" }, out)
-  assert.equal(out.description, desc, "probe is read-only")
-  // Stage 1 evidence latched: the shell-hide stops applying on a fresh config.
+  assert.equal(h["tool.definition"], undefined, "the probe/STAGE1 hook is gone")
+  // auto mode hides just like forge mode (equivalent by design).
   const cfg = freshCfg()
   await h.config(cfg)
-  assert.equal(cfg.agent.forge.tools, undefined, "stage 1 stops hiding the builtin shell")
-  assert.ok(h.tool.forge_shell, "stage 1 keeps forge_shell as the additive layer")
-  // D10 stage-1 action on our own tool: the native-first note is prepended
-  // (idempotently) to forge_shell's description.
-  const mine = { description: "base description", parameters: { properties: {} } }
-  await h["tool.definition"]({ toolID: "forge_shell" }, mine)
-  assert.match(mine.description, /^Stage note: this host's builtin shell already offers/)
-  const once = mine.description
-  await h["tool.definition"]({ toolID: "forge_shell" }, mine)
-  assert.equal(mine.description, once, "note is prepended exactly once")
-  // Stage 2 retires forge_shell entirely, so no rewrite applies there.
-  const h2 = await hooks({ jobs: { mode: "native" } })
-  const late = { description: "base description", parameters: { properties: {} } }
-  await h2["tool.definition"]({ toolID: "forge_shell" }, late)
-  assert.equal(late.description, "base description")
+  assert.equal(cfg.agent.forge.tools.shell, false)
+  assert.ok(h.tool.forge_shell, "forge_shell stays registered")
 })
 
 test("5.1 events: session.deleted routes to job ownership cleanup without throwing", async () => {
@@ -173,8 +172,9 @@ test("4.1 forge_shell execute: ask posture gates every run; deny short-circuits"
   assert.ok(!String(listed.output).includes("must-not-run"), "denied command never became a job")
 })
 
-test("4.3 system.transform: guidance injected exactly once per output (idempotent)", async () => {
+test("partition: guidance injected exactly once per output (idempotent, family-seeded)", async () => {
   const h = await hooks({ jobs: { mode: "forge" } })
+  await h["chat.message"]({ sessionID: "sub-session", agent: "forge" }, { message: {}, parts: [] })
   const out = { system: [] }
   await h["experimental.chat.system.transform"]({ sessionID: "sub-session" }, out)
   const first = out.system.filter((s) => s.startsWith("[forge:job-guidance]")).length

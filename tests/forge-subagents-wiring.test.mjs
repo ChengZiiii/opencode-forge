@@ -95,6 +95,18 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
   assert.equal(builder.model, "x/y")
   assert.equal(builder.permission.write, undefined, "write shape drops the mutating denies")
   assert.equal(builder.permission.task, "deny", "task ban survives the shape")
+  // Exec partition (tool-partition): the builtin shell is hidden at
+  // materialization regardless of shape; after the config pass the harness
+  // STATE tools are primary-only (the worker keeps the exec pair).
+  for (const entry of [research, builder]) {
+    assert.equal(entry.tools.shell, false, "builtin shell hidden on every worker")
+    assert.equal(entry.tools.bash, false, "builtin bash hidden on every worker")
+    for (const t of ["plan_write", "plan_tick", "plan_approve", "plan_close", "plan_discard", "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard", "crew_begin", "crew_close"]) {
+      assert.equal(entry.tools[t], false, `harness state tool ${t} is primary-only`)
+    }
+    assert.equal(entry.tools.forge_shell, undefined, "worker keeps forge_shell")
+    assert.equal(entry.tools.forge_jobs, undefined, "worker keeps forge_jobs")
+  }
   assert.match(builder.prompt, /build worker/, "explicit prompt overrides the role default")
 })
 

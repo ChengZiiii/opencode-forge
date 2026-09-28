@@ -40,6 +40,9 @@ export function agentDescriptionFor(agentId: string, def: ForgeAgentDef): string
 // Materialize one forge.json agent as a config-agent entry. The `model`
 // field is the reversal of the old "agents never carry a model" rule: the
 // brain is pinned by the definition, resolved by the host at spawn time.
+// `tools` carries the exec-partition surface (tool-partition spec): every
+// worker — regardless of shape — runs commands only through forge_shell, so
+// the builtin shell/bash pair is hidden at materialization.
 export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<string, unknown> {
   const permission: Record<string, string> = { task: "deny" }
   const shape = def.shape ?? "readonly"
@@ -58,5 +61,6 @@ export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<strin
       role: rolePromptFor(agentId, def),
     }),
     permission,
+    tools: { shell: false, bash: false },
   }
 }

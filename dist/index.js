@@ -14867,6 +14867,7 @@ function validateCrewReport(report, declared) {
 var WORKER_MANDATES = [
   "Mandates (non-negotiable):",
   "- Use workspace-relative paths ONLY. Never write to or read from absolute paths outside this workspace; the workspace root is where you were started, not the filesystem root.",
+  "- Run every shell command through the forge_shell tool (the builtin shell is not part of your toolset by design). Long-running or non-exiting commands: forge_shell with run_in_background, then collect results via forge_jobs poll before yielding.",
   "- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial.",
   "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."
 ].join(`
@@ -14912,7 +14913,8 @@ function forgeAgentDef(agentId, def) {
       shape,
       role: rolePromptFor(agentId, def)
     }),
-    permission
+    permission,
+    tools: { shell: false, bash: false }
   };
 }
 
@@ -15363,6 +15365,25 @@ function createForgeConfigLoader(deps) {
 
 // plugin.ts
 var FORGE_AGENT = "forge";
+var FORGE_STATE_TOOLS = [
+  "plan_write",
+  "plan_tick",
+  "plan_approve",
+  "plan_close",
+  "plan_discard",
+  "goal_write",
+  "goal_check",
+  "goal_complete",
+  "goal_pause",
+  "goal_resume",
+  "goal_discard",
+  "crew_begin",
+  "crew_close"
+];
+var FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"];
+var FORGE_ALL_TOOLS = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS];
+var FORGE_TOOL_SET = new Set(FORGE_ALL_TOOLS);
+var NATIVE_PARTITION_FALLBACKS = ["build", "plan", "general", "explore"];
 var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
 Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.
@@ -15370,6 +15391,8 @@ Workflow modes are strictly user-initiated. Never enter plan or goal mode — an
 Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch through the native task channel instead.`;
 var PLAN_COMMAND_TEMPLATE = [
   '(forge plan harness routing. Argument: "$ARGUMENTS")',
+  "",
+  "FAMILY GUARD (step 0, before anything else): if you do not have the plan_write tool in your available tools, you are not in a forge session — STOP now: execute nothing below (including the directory listing), and tell the user that /plan belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
   "",
   "Current .opencode/plan/ directory:",
   "!`ls -1 .opencode/plan 2>/dev/null || echo '(empty)'`",
@@ -15396,6 +15419,8 @@ var PLAN_COMMAND_TEMPLATE = [
 `);
 var GOAL_COMMAND_TEMPLATE = [
   '(forge goal harness routing. Argument: "$ARGUMENTS")',
+  "",
+  "FAMILY GUARD (step 0, before anything else): if you do not have the goal_write tool in your available tools, you are not in a forge session — STOP now: execute nothing below (including the directory listing), and tell the user that /goal belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
   "",
   "Current .opencode/goal/ directory:",
   "!`ls -1 .opencode/goal 2>/dev/null || echo '(empty)'`",
@@ -15425,6 +15450,23 @@ function effectiveWorktree(worktree, fallback) {
   return (fallback ?? "").trim();
 }
 var sessions = new Map;
+var sessionAgents = new Map;
+function isForgeFamilyAgent(name) {
+  if (typeof name !== "string")
+    return false;
+  const n = name.toLowerCase();
+  return n === FORGE_AGENT || n.startsWith("forge-");
+}
+function sessionIsForgeFamily(sessionID) {
+  if (!sessionID)
+    return false;
+  return isForgeFamilyAgent(sessionAgents.get(sessionID));
+}
+function noteToolAgent(context) {
+  if (context && typeof context.sessionID === "string" && context.sessionID && typeof context.agent === "string" && context.agent) {
+    sessionAgents.set(context.sessionID, context.agent);
+  }
+}
 var forgeDisabled = false;
 var forgeLoader = null;
 var forgeLoaderDir = null;
@@ -15489,13 +15531,10 @@ function ensureJobLifecycle() {
   });
   return { registry: registry2, fence: jobFence };
 }
-var nativeBackgroundSeen = false;
 function jobStage() {
   if (jobsMode === "native")
     return 2;
-  if (jobsMode === "forge")
-    return 0;
-  return nativeBackgroundSeen ? 1 : 0;
+  return 0;
 }
 var jobLogDir = jobsLogDir();
 var jobLedgerPath = join5(jobLogDir, "ledger.jsonl");
@@ -15577,6 +15616,7 @@ function ensureSession(sessionID, worktree) {
   return state;
 }
 function worktreeFor(context) {
+  noteToolAgent(context);
   return effectiveWorktree(context.worktree, hostWorktree) || context.worktree;
 }
 function resolveActivePlan(state) {
@@ -16040,7 +16080,6 @@ var FORGE_SHELL_DESCRIPTION = [
   "Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) MUST use this tool instead of the builtin shell."
 ].join(`
 `);
-var STAGE1_NOTE = "Stage note: this host's builtin shell already offers a native run_in_background parameter — prefer that for plain backgrounding; keep using forge_shell when you need idle/success_pattern early return or exit wake messages.";
 var forgeShellTool = tool({
   description: FORGE_SHELL_DESCRIPTION,
   args: {
@@ -16159,6 +16198,7 @@ var forgeJobsTool = tool({
   execute: async (args, context) => {
     if (jobStage() >= 2)
       throw new Error("[forge] The job supervisor is retired on this host.");
+    noteToolAgent(context);
     const action = String(args.action ?? "");
     if (!FORGE_JOBS_ACTIONS.includes(action)) {
       throw new Error(`Unknown action "${action}" — use one of: ${FORGE_JOBS_ACTIONS.join(", ")}.`);
@@ -16223,6 +16263,8 @@ ${p.newOutput || "(none in this window)"}`,
 var CREW_INIT_TEMPLATE = [
   '(forge crew orchestration. Argument: "$ARGUMENTS")',
   "",
+  "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
+  "",
   "CREW IS NOT INITIALIZED: no forge subagents are configured (no usable forge.json agents). Refuse to enter orchestration and tell the user this feature needs a one-time setup, offering BOTH options:",
   "",
   "1. The user configures it themselves: create ONE of these files (project-level wins, never merged):",
@@ -16239,6 +16281,8 @@ var CREW_INIT_TEMPLATE = [
 function crewOrchestrationTemplate(agentIds) {
   return [
     '(forge crew orchestration. Argument: "$ARGUMENTS")',
+    "",
+    "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
     "",
     `Configured forge subagents (task-tool vocabulary): ${agentIds.map((id) => `forge-${id}`).join(", ")}`,
     "",
@@ -16263,6 +16307,7 @@ var crewBeginTool = tool({
     })).describe("The declared subtask plan — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list")
   },
   execute: async (args, context) => {
+    noteToolAgent(context);
     const state = stateForBan(context.sessionID);
     const active = state ? resolveActivePlan(state) : null;
     if (active && active.doc.status === "draft") {
@@ -16325,6 +16370,7 @@ var crewCloseTool = tool({
     })).describe("The full crew report — one entry per declared subtask")
   },
   execute: async (args, context) => {
+    noteToolAgent(context);
     const crew = crews.get(context.sessionID);
     if (!crew)
       throw new Error("[forge:crew] No active crew in this session (crew state is in-memory and dies on host restart). Start one with /crew <objective>.");
@@ -16509,6 +16555,10 @@ async function continueIfEligible(client, sessionID) {
       goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session || "(none)"}`);
       return;
     }
+    if (!sessionIsForgeFamily(sessionID)) {
+      goalProbe(`skip: agent switched to non-forge before send session=${sessionID}`);
+      return;
+    }
     if (accountedContinuationTurn) {
       if (turnHadActivity) {
         noProgressStreak.delete(sessionID);
@@ -16574,6 +16624,10 @@ async function continueIfEligible(client, sessionID) {
 function scheduleIdleContinuation(client, sessionID) {
   if (forgeDisabled)
     return;
+  if (!sessionIsForgeFamily(sessionID)) {
+    goalProbe(`skip: non-forge agent at schedule session=${sessionID}`);
+    return;
+  }
   const existing = idleTimers.get(sessionID);
   if (existing)
     clearTimeout(existing);
@@ -16666,23 +16720,15 @@ var server = async (input, options) => {
       forgeDisabled = forgeUserCfg?.disable === true;
       if (forgeDisabled)
         return;
-      for (const native of ["build", "plan"]) {
-        agentSection[native] = { ...agentSection[native] ?? {}, disable: true };
-      }
+      cfg.default_agent ??= FORGE_AGENT;
       const existing = agentSection[FORGE_AGENT];
-      const userDefinedForge = existing !== undefined;
       agentSection[FORGE_AGENT] = {
         ...existing ?? {},
         description: existing?.description ?? "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).",
         mode: existing?.mode ?? "primary",
         prompt: existing?.prompt ?? FORGE_PROMPT
       };
-      try {
-        const exp = JSON.stringify(cfg.experimental ?? "");
-        if (/background/i.test(exp))
-          nativeBackgroundSeen = true;
-      } catch {}
-      if (!userDefinedForge && !jobsKeepBuiltinShell && jobStage() < 1) {
+      if (!jobsKeepBuiltinShell && jobStage() < 2) {
         const entry = agentSection[FORGE_AGENT];
         entry.tools = { ...entry.tools ?? {}, shell: false, bash: false };
       }
@@ -16721,6 +16767,34 @@ var server = async (input, options) => {
         agentSection[id] = entry;
         materializedSnapshot[id] = entry;
       }
+      for (const id of Object.keys(agentSection)) {
+        if (!id.startsWith("forge-"))
+          continue;
+        const entry = agentSection[id];
+        const tools = { ...entry.tools ?? {} };
+        for (const t of FORGE_STATE_TOOLS)
+          if (tools[t] !== true)
+            tools[t] = false;
+        entry.tools = tools;
+      }
+      for (const [id, entry] of Object.entries(agentSection)) {
+        if (id === FORGE_AGENT || id.startsWith("forge-"))
+          continue;
+        const e = entry;
+        const tools = { ...e.tools ?? {} };
+        for (const t of FORGE_ALL_TOOLS)
+          if (tools[t] !== true)
+            tools[t] = false;
+        e.tools = tools;
+      }
+      for (const native of NATIVE_PARTITION_FALLBACKS) {
+        if (agentSection[native] !== undefined)
+          continue;
+        const tools = {};
+        for (const t of FORGE_ALL_TOOLS)
+          tools[t] = false;
+        agentSection[native] = { tools };
+      }
       if (process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1") {
         modelsDevCatalog = null;
       } else {
@@ -16754,7 +16828,7 @@ var server = async (input, options) => {
 `);
         } catch {}
       }
-      if (watchdog.mode !== "off" && (input2.tool === "shell" || input2.tool === "bash")) {
+      if (watchdog.mode !== "off" && (input2.tool === "shell" || input2.tool === "bash") && sessionIsForgeFamily(input2.sessionID)) {
         const a = output?.args ?? {};
         const cmdText = typeof a.command === "string" ? a.command : typeof a.cmd === "string" ? a.cmd : undefined;
         watchdog.track(input2.callID, input2.sessionID, input2.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined);
@@ -16765,12 +16839,56 @@ var server = async (input, options) => {
           } catch {}
         }
       }
+      if (input2.tool === "task") {
+        const speaker = sessionAgents.get(input2.sessionID);
+        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+          const a = output?.args ?? {};
+          const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined;
+          if (target && target.toLowerCase().startsWith("forge-")) {
+            throw new Error(`[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use the native general/explore subagents, or switch to the forge agent to dispatch forge-* workers.`);
+          }
+        }
+      }
+      if ((input2.tool === "write" || input2.tool === "edit") && input2.sessionID) {
+        const speaker = sessionAgents.get(input2.sessionID);
+        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+          const a = output?.args ?? {};
+          const raw = typeof a.filePath === "string" ? a.filePath : typeof a.path === "string" ? a.path : undefined;
+          if (raw) {
+            const state = stateForBan(input2.sessionID);
+            const base = state?.worktree ?? hostWorktree ?? "";
+            const abs = (isAbsolute(raw) ? raw : join5(base, raw)).replaceAll("\\", "/").toLowerCase();
+            if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
+              throw new Error(`[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`);
+            }
+          }
+        }
+      }
       if (typeof input2.tool === "string" && isWriteTool(input2.tool)) {
         const state = stateForBan(input2.sessionID);
         const active = state ? resolveActivePlan(state) : null;
         if (active && active.doc.status === "draft") {
-          throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Present the plan summary and call plan_approve for user approval, or /plan discard to abandon it.`);
+          throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`);
         }
+      }
+      if (input2.sessionID && typeof input2.tool === "string") {
+        const speaker = sessionAgents.get(input2.sessionID);
+        if (speaker !== undefined) {
+          if (!isForgeFamilyAgent(speaker) && FORGE_TOOL_SET.has(input2.tool)) {
+            throw new Error(`[forge:partition] Tool refused: "${input2.tool}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`);
+          }
+          if (isForgeFamilyAgent(speaker) && (input2.tool === "shell" || input2.tool === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
+            throw new Error(`[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`);
+          }
+        }
+      }
+    },
+    "chat.message": async (input2) => {
+      if (forgeDisabled)
+        return;
+      const raw = input2;
+      if (typeof raw.sessionID === "string" && raw.sessionID && typeof raw.agent === "string" && raw.agent) {
+        sessionAgents.set(raw.sessionID, raw.agent);
       }
     },
     "chat.params": async (input2, output) => {
@@ -16781,6 +16899,8 @@ var server = async (input, options) => {
       if (!sessionID)
         return;
       const agentName = typeof raw.agent === "string" ? raw.agent : raw.agent?.name;
+      if (typeof agentName === "string" && agentName)
+        sessionAgents.set(sessionID, agentName);
       if (typeof agentName !== "string" || !agentName.startsWith("forge-"))
         return;
       const frozen = sessionDepths.get(sessionID);
@@ -16863,6 +16983,7 @@ var server = async (input, options) => {
         if (typeof info?.id === "string" && info.id) {
           jobManager.onSessionEnd(info.id);
           sessionDepths.delete(info.id);
+          sessionAgents.delete(info.id);
         }
       }
     },
@@ -16870,6 +16991,8 @@ var server = async (input, options) => {
       if (watchdog.mode === "off")
         return;
       if (!input2.callID)
+        return;
+      if (!sessionIsForgeFamily(input2.sessionID))
         return;
       output.env[WATCHDOG_ENV_MARK] = markerValue(input2.callID);
       watchdog.markSeen(input2.callID);
@@ -16900,20 +17023,10 @@ var server = async (input, options) => {
       if (input2.tool === "goal_check")
         act.checks++;
     },
-    "tool.definition": async (input2, output) => {
-      if (input2.toolID === "shell" || input2.toolID === "bash") {
-        const props = output.parameters?.properties;
-        if (props && "run_in_background" in props)
-          nativeBackgroundSeen = true;
-      } else if (input2.toolID === "forge_shell" && jobStage() === 1) {
-        if (!output.description.startsWith(STAGE1_NOTE)) {
-          output.description = `${STAGE1_NOTE}
-${output.description}`;
-        }
-      }
-    },
     "experimental.chat.system.transform": async (input2, output) => {
       if (!input2.sessionID)
+        return;
+      if (!sessionIsForgeFamily(input2.sessionID))
         return;
       const crewActive = crews.get(input2.sessionID);
       if (crewActive && !output.system.some((s) => s.startsWith("[forge:crew-active]"))) {
@@ -16947,6 +17060,8 @@ ${output.description}`;
         return;
       if (!input2.sessionID)
         return;
+      if (!sessionIsForgeFamily(input2.sessionID))
+        return;
       const state = sessions.get(input2.sessionID);
       if (!state)
         return;
@@ -16968,7 +17083,7 @@ Post-compaction turns must keep following this goal and its constraints.`);
       if (!state)
         return;
       const goal = resolveLiveGoal(state);
-      if (goal)
+      if (goal && sessionIsForgeFamily(input2.sessionID))
         output.enabled = false;
     }
   };

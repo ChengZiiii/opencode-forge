@@ -101,6 +101,9 @@ test("v2 setup: registers forge subagents from the cwd forge.json (create-only)"
     assert.equal(sub.mode, "subagent")
     assert.equal(sub.model, "zai/glm")
     assert.equal(sub.permission.task, "deny")
+    // Partition boundary (task 3.2): v2 has no tool domain — the materialized
+    // subagent carries NO tools injection on this path.
+    assert.equal(sub.tools, undefined, "v2 performs no partition injection")
   } finally {
     process.chdir(prevCwd)
     rmSync(dir, { recursive: true, force: true })
