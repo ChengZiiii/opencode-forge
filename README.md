@@ -171,7 +171,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (the dispatch engine was removed); only present as inert debris from older versions | runtime debris — delete freely |
-| `<project>/.opencode/forge.json`, `~/.config/opencode/forge.json` | your static subagent definitions (JSONC). **User data — the plugin only reads it, never writes or migrates it** | yours — version the project one, keep the global one out of sync tools if it holds machine-specific models |
+| the nearest `.opencode/forge.json` on the workspace's ancestor chain, `~/.config/opencode/forge.json` | your static subagent definitions (JSONC), two MERGED layers (project overrides global per agent id). **User data — the plugin only reads it, never writes or migrates it** | yours — version the project one, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
 
@@ -405,11 +405,28 @@ subagent behavior is untouched. Onboarding is this README, for you the human.
 
 ### forge.json — the configuration
 
-A dedicated `forge.json` (JSONC — comments allowed), resolved by a two-level
-cascade with a single winning source (never merged):
+A dedicated `forge.json` (JSONC — comments allowed), resolved exactly like
+opencode's own config language — **merged together, not replaced**, project
+discovered by walking up:
 
-1. `<project>/.opencode/forge.json` — project-level, versionable, team-shared
-2. `~/.config/opencode/forge.json` — global
+1. the project layer: the **nearest** `.opencode/forge.json` walking up from
+   the workspace (session worktree → session directory → host launch
+   directory as the anchor chain; first file found on the ancestor chain
+   wins, nothing above it is consulted)
+2. the global layer: `~/.config/opencode/forge.json`
+
+The two layers **merge**: agents combine, and on an id collision the project
+definition wins wholesale (one definition per id — no cross-layer field
+blending). A broken file empties only its own layer (error finding with the
+parse location); the other layer still applies. Both layers hot-apply —
+edits, and files appearing or disappearing on the ancestor chain, take
+effect without a host restart (new agents still need the restart to enter
+the task vocabulary; see the apply-timing table below).
+
+One host instance materializes one pool (from its launch anchor) — a
+workspace-local file that the host was not launched on is NOT silently
+ignored: `/crew` names it and tells you to relaunch there (or fold the
+agents into the global layer).
 
 ```jsonc
 {
