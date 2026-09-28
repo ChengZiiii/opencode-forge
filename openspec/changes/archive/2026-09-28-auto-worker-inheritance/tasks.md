@@ -19,4 +19,4 @@
 ## 5. Verification
 
 - [x] 5.1 Full regression: `bun run typecheck` + `node --test tests/*.test.mjs` all green; `openspec validate --all` clean.
-- [ ] 5.2 E2E (real environment): forge.json with an Auto worker → `task` dispatch → child session header model == parent model; forge.json with a half-configured entry → startup finding names id + missing half, that agent absent from the task vocabulary. Evidence appended to verify/e2e.md.
+- [x] 5.2 E2E (real environment): forge.json with an Auto worker → `task` dispatch → child session header model == parent model; forge.json with a half-configured entry → startup finding names id + missing half, that agent absent from the task vocabulary. Evidence appended to verify/e2e.md.
