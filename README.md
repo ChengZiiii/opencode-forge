@@ -605,6 +605,32 @@ supervisor chapter above). The hide is unconditional: it covers a
 `jobs.keepBuiltinShell: true` (builtin shell back on the forge family) and
 `jobs.mode: "native"` (supervisor retired entirely).
 
+### The exec channel is final for this plugin-API generation (2026-09-28)
+
+The four layers — tools-map hide, prompt mandate, belt refusal, `forge_shell`
+itself — are the ceiling of what the current opencode plugin API can express,
+and the design is closed deliberately:
+
+- **Not expressible**: `tool.execute.before` can only mutate `args` or throw.
+  There is no tool-name rewrite, no executor replacement, no result injection —
+  "transparently reroute a builtin bash call through the job runner" cannot be
+  written. Registering a plugin tool named `bash` collides globally: tool
+  registration is not per-agent, and the per-agent mechanism is exactly the
+  tools map some hosts ignore.
+- **Prior art ships a subset**: OMO (oh-my-opencode-slim / oh-my-openagent,
+  the largest opencode plugin ecosystem) pairs a permission-deny boundary with
+  a prompt channel mandate and does not hide the builtin shell at plugin level
+  either — their models also see bash and pay one denial round.
+- **The residual is bounded and accepted**: on hosts where the hide does not
+  hold, a first bash attempt costs one round-trip per session — the belt
+  refuses pre-execution (~2 ms, the command never runs), the message names
+  `forge_shell`, and models re-issue once and stay on-channel. Field data
+  (2026-09-28): zero duplicate executions attributable to the belt.
+- **Reopen on upstream movement**: hosts honoring injected tools maps (the
+  belt becomes pure insurance), a tool-execute replacement hook (transparent
+  rerouting becomes expressible), or exit-based builtin-shell completion (the
+  watchdog retirement path above applies).
+
 A process restart forgets the session binding: the write-ban soft-disables
 (safety over strictness) and the next session's system notice + `/plan
 resume` re-bind from the plan file on disk, which is the source of truth.
