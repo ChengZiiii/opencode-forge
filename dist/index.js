@@ -15436,6 +15436,12 @@ var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. Y
 Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.
 
 Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch through the native task channel instead.`;
+function forgePromptText(opts) {
+  const mandate = opts.hardRefusal ? "Exec surface: every shell command — quick ones included — runs through the forge_shell tool. The builtin shell/bash tools are refused on this agent; never try them first, not even for trivial commands." : "Exec surface: prefer the forge_shell tool for every shell command — quick ones included; it is this agent's exec surface, and the builtin shell exists only as an explicit escape hatch.";
+  return `${FORGE_PROMPT}
+
+${mandate} Long-running or non-exiting commands: forge_shell with run_in_background, then collect results via forge_jobs.`;
+}
 var PLAN_COMMAND_TEMPLATE = [
   '(forge plan harness routing. Argument: "$ARGUMENTS")',
   "",
@@ -16124,7 +16130,7 @@ var FORGE_SHELL_DESCRIPTION = [
   "Run a shell command without ever blocking the session indefinitely. The call completes on the FIRST of: process exit (bound to the exit event — a detached grandchild holding the stdio pipes cannot suspend the call); success_pattern matching new output (opt-in regex); idle_ms with no new output (default 60000); max_wait_ms hard cap (default 120000, max 600000 — returns still-running, never kills).",
   "Idle/max-wait return `still-running` with a jobId — the process stays alive; keep watching with forge_jobs poll / log, stop it with forge_jobs kill. run_in_background returns {jobId, logPath} immediately.",
   "success_pattern semantics: a match completes the call as success; the process is kept alive by default (server semantics — the thing you just verified keeps running); pass keep_alive=false to kill its tree on match. Common patterns: dev servers `listening on|ready in|Local:`, builds `Compiled successfully|Done in`, test suites `passed|all tests`.",
-  "Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) MUST use this tool instead of the builtin shell."
+  "This tool is the forge agent's exec surface for every shell command — quick ones included. Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) should start with run_in_background and collect results via forge_jobs."
 ].join(`
 `);
 var forgeShellTool = tool({
@@ -16776,7 +16782,7 @@ var server = async (input, options) => {
         ...existing ?? {},
         description: existing?.description ?? "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).",
         mode: existing?.mode ?? "primary",
-        prompt: existing?.prompt ?? FORGE_PROMPT
+        prompt: existing?.prompt ?? (jobStage() < 2 ? forgePromptText({ hardRefusal: !jobsKeepBuiltinShell }) : FORGE_PROMPT)
       };
       if (!jobsKeepBuiltinShell && jobStage() < 2) {
         const entry = agentSection[FORGE_AGENT];
@@ -17083,7 +17089,7 @@ var server = async (input, options) => {
         output.system.push(`[forge:crew-active] A crew is ACTIVE in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict.`);
       }
       if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
-        output.system.push("[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.");
+        output.system.push(jobsKeepBuiltinShell ? "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion." : "[forge:job-guidance] Every shell command — quick ones included — goes through forge_shell: the builtin shell/bash tools are refused on this agent, so never try them first. forge_shell returns on exit/success/idle with a jobId instead of blocking indefinitely; long-running or non-exiting commands use run_in_background. Manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.");
       }
       const state = sessions.get(input2.sessionID);
       if (!state)
