@@ -275,6 +275,23 @@ Every result form carries `cwd:` — the absolute directory the command
 actually ran in. When the agent's narrative about the working directory
 disagrees with that line, the line wins.
 
+**Interpreter selection.** Commands run under the host-aligned shell —
+the same interpreter the host's builtin shell tool uses — never under
+Node's `shell: true` default (cmd.exe / plain sh). On Windows the chain
+is `pwsh → powershell → git-bash → %COMSPEC%` (cmd.exe only as a
+machine-level capability fallback); on POSIX the login shell with bash
+preferred and `/bin/sh` as the fallback. PowerShell-family shells are
+invoked directly (`<shell> -NoProfile -Command <command>` plus an
+exit-code guard, so a native command's exit status propagates as the
+job's exit status) — which means you write PowerShell syntax in
+`forge_shell` on Windows: `echo $env:USERNAME` expands, quoted-exe
+invocations use the call operator (`& "C:\path with spaces\tool.exe" args`).
+The tool description states the interpreter family, and there is no
+configuration knob: the interpreter follows the host, by design.
+Goal-harness verification checks run through the same resolver, so a
+check drafted under the model's shell expectations behaves identically
+at the completion gate.
+
 **`forge_jobs`** manages the registry: `list` / `poll {jobId, waitMs≤30s}`
 (bounded wait for new output or exit, drains it) / `log {jobId, offset?,
 limit?}` (line paging over the on-disk log) / `kill` (whole process tree) /
