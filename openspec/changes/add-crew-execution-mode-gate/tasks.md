@@ -30,5 +30,5 @@
 ## 4. Verification & release (gated on user go)
 
 - [x] 4.1 `openspec validate add-crew-execution-mode-gate --strict` passes; archive only on explicit user instruction
-- [ ] 4.2 Sandbox E2E on the built plugin: pending belt refusal → arm waves → waves flow; arm goal → conversion record; abandon → re-crew
-- [ ] 4.3 Version bump, CHANGELOG, commit, push (proxy), npm publish, switch local global install, live-env smoke
+- [x] 4.2 Sandbox E2E on the built plugin: pending belt refusal → arm waves → waves flow; arm goal → conversion record; abandon → re-crew
+- [x] 4.3 Version bump, CHANGELOG, commit, push (proxy), npm publish, switch local global install, live-env smoke
