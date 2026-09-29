@@ -1,7 +1,7 @@
 import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { execFileSync } from "node:child_process"
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs"
 import { isAbsolute, join, relative } from "node:path"
 import { tmpdir, homedir } from "node:os"
 import {
@@ -71,7 +71,7 @@ import { nativeLadder, loadModelsDevSnapshot, type CatalogSnapshot } from "./src
 import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
 import { forgeAgentDef } from "./src/dispatch-tiers.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthTranslation } from "./src/dispatch-depth.ts"
-import { createForgeConfigLoader, forgeConfigPaths, type ForgeAgentDef, type LoadedForgeConfig } from "./src/forge-config.ts"
+import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -258,11 +258,52 @@ let forgeDisabled = false
 // supervisor's style.
 // ---------------------------------------------------------------------------
 
-// forge.json loader (static subagents): recreated when the host worktree
-// changes, otherwise persistent — hot-applies via its mtime cache on every
-// load() (the config hook re-materializes; chat.params re-reads per request).
-let forgeLoader: ReturnType<typeof createForgeConfigLoader> | null = null
-let forgeLoaderDir: string | null = null
+// Hierarchical pool materialization (change hierarchical-pool-materialization,
+// spec: forge-subagents — "Hierarchical pool materialization on shared
+// hosts"). The old last-init-wins loader singleton was the tear source: a
+// shared host re-initializes plugins with different directories, flipping the
+// anchor mid-host (roster promised by the /crew template, then refused by the
+// crew_begin gate). The replacement is an APPEND-ONLY anchor set: every
+// server() initialization appends its effective directory (deduped by
+// normalized form); [0] is the primary anchor and nothing is ever removed.
+// Anchor flips can only ADD pools; file truth (edits/creations/deletions)
+// still hot-applies through the resolver's mtime caches on every resolve.
+const hostAnchors: string[] = []
+let poolResolver: ReturnType<typeof createPoolResolver> | null = null
+// Last config-hook resolution snapshot (roster surfaces + test seam); chat
+// params and the crew gate resolve FRESH per call (hot-apply parity).
+let poolResolution: PoolResolution | null = null
+
+// Anchor normalization: resolved real path, backslashes + case-folding on
+// win32 — "C:/Temp1" and "c:\temp1\" cannot double-add.
+function normalizeAnchorDir(dir: string): string {
+  let p = (dir ?? "").trim()
+  if (!p) return ""
+  try {
+    p = realpathSync(p)
+  } catch {
+    // Missing/unresolvable (e.g. tests with fake fs): keep the trimmed input.
+  }
+  if (process.platform === "win32") return p.replace(/\//g, "\\").toLowerCase()
+  return p
+}
+
+function rememberHostAnchor(dir: string): void {
+  const normalized = normalizeAnchorDir(dir)
+  if (!normalized) return
+  if (!hostAnchors.includes(normalized)) hostAnchors.push(normalized)
+  if (!poolResolver) {
+    poolResolver = createPoolResolver({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+  }
+}
+
+// Union resolve over the anchor set (fresh every call — the resolver's
+// caches make repeat resolves cheap). Null only before the first server()
+// initialization (tests calling tools directly).
+function resolvePools(): PoolResolution | null {
+  if (!poolResolver || hostAnchors.length === 0) return null
+  return poolResolver.resolve(hostAnchors)
+}
 // Session-anchored loaders (crew guidance + workspace-mismatch discovery):
 // bounded cache keyed on the session anchor; the host loader above stays the
 // materialization source of truth.
@@ -1361,26 +1402,34 @@ const CREW_INIT_TEMPLATE = [
   "",
   "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
   "",
-  "CREW IS NOT INITIALIZED: no forge subagents are configured (no usable forge.json agents). Refuse to enter orchestration and tell the user this feature needs a one-time setup, offering BOTH options:",
+  "CREW IS NOT INITIALIZED: no forge subagents are materialized across the whole host anchor set (zero pools). Refuse to enter orchestration and tell the user this feature needs a one-time setup, offering BOTH options:",
   "",
-  "1. The user configures it themselves: create either layer — MERGED, the project layer overrides the global one per agent id (the project file is the nearest .opencode/forge.json walking up from the workspace root):",
+  "1. The user configures it themselves: create either layer — MERGED, the project layer overrides the global one per agent id (the project file is the nearest .opencode/forge.json walking up from the workspace root; a .opencode/forge.json in any anchor subdirectory additionally forms a namespaced sub-pool family, its ids materializing as forge-<ns>-<id>):",
   "{paths}",
   "",
-  "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: name ids as PLAIN role words WITHOUT the `forge-` prefix — the plugin materializes every id as `forge-<id>` automatically (a `forge-`-prefixed id doubles up as `forge-forge-coder` and is auto-stripped with a warning). Give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent.",
+  "Two axes, distinct: POOLS follow host directories (the host's anchor set); SESSION ARTIFACTS (plan/goal/crew records) follow the session. A forge.json in a directory no host anchor covers is not dispatchable on this host.",
   "",
-  "Template (JSONC — comments allowed): ids are plain role words (research, coder, ...) — the plugin adds the `forge-` prefix at materialization; `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job).",
+  "2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: name ids as PLAIN role words WITHOUT the `forge-` prefix — the plugin materializes every id as `forge-<id>` automatically (a `forge-`-prefixed id doubles up as `forge-forge-coder` and is auto-stripped with a warning). Give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent. For sub-pool files, ALSO include a proposed short stable `pool` namespace (a [a-z0-9-] word up to 24 chars — e.g. \"aa\" for a devAa specialist pool) so the materialized ids survive directory renames.",
+  "",
+  "Template (JSONC — comments allowed): ids are plain role words (research, coder, ...) — the plugin adds the `forge-` prefix at materialization; `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job). Optional top level: `pool` — the file's namespace.",
   "{template}",
   "",
-  "After the file is saved: NEW agents require a host restart to appear in the task tool; thoughtLevel edits on existing agents apply without restart. Until then, crew stays unavailable.",
+  "After the file is saved: file edits, creations, and deletions apply at the next config hook — NO host restart is needed. Only the anchor set itself is fixed at host start: host re-initializations add anchors and pools, they never remove them.",
 ].join("\n")
 
-function crewOrchestrationTemplate(agentIds: string[]): string {
+function crewOrchestrationTemplate(resolution: PoolResolution | null): string {
+  const families = resolution?.families ?? []
+  const familyLines = families.map((f) => {
+    const label = f.primary ? "root pool (PRIMARY, plain ids)" : `pool ${f.ns} (forge-${f.ns}-*)`
+    return `  - ${label}: ${f.file} — ${f.materializedIds.map((id) => `forge-${id}`).join(", ") || "no agents"}`
+  })
   return [
     "(forge crew orchestration. Argument: \"$ARGUMENTS\")",
     "",
     "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
     "",
-    `Configured forge subagents (task-tool vocabulary): ${agentIds.map((id) => `forge-${id}`).join(", ")}`,
+    "Configured forge subagents (task-tool vocabulary), grouped by pool:",
+    ...(familyLines.length > 0 ? familyLines : ["  (none)"]),
     "",
     "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). The macro contract above the crew may come from an approved plan, a spec change, or inline text — the discipline is identical in all three cases and never requires a plan. Follow it exactly:",
     "",
@@ -1413,30 +1462,38 @@ const crewBeginTool = tool({
       throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.")
     }
     // Hard initialization gate (spec: crew-harness — "Unconfigured crew
-    // initialization gate"): keyed on the HOST-materialized set — that is
-    // what the native task tool can dispatch. Session-anchored discovery
-    // (change align-forge-config-discovery) drives the guidance paths and
-    // the workspace-mismatch disclosure: a workspace file this host cannot
-    // see is named with the relaunch guidance, never masked as plain
-    // "unconfigured".
-    const hostLoaded = forgeLoader?.load()
-    const hostIds = hostLoaded ? Object.keys(hostLoaded.agents) : []
+    // initialization gate"): keyed on the POOL-RESOLVED set across the whole
+    // anchor set — that is what the native task tool can dispatch (the union
+    // never flips: re-initializations only add pools). Session-anchored
+    // discovery drives the RESIDUAL mismatch disclosure: a workspace file no
+    // host anchor covers is named with the anchor guidance, never masked as
+    // plain "unconfigured".
+    const resolution = resolvePools()
+    const hostIds = resolution ? Object.keys(resolution.agents) : []
     const anchor = sessionAnchor(context)
-    const hostAnchorDir = forgeLoaderDir ?? ""
-    const sessionLoaded = anchor && anchor !== hostAnchorDir ? loaderForAnchor(anchor).load() : hostLoaded
+    const sessionLoaded = anchor ? loaderForAnchor(anchor).load() : null
     const sessionProject = sessionLoaded?.projectPath ?? null
+    // Coverage comparison is case-folded on win32 (family files derive from
+    // the normalized anchor, session discovery from the raw path).
+    const foldPath = (p: string) => (process.platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p)
+    const sessionCovered =
+      sessionProject === null ||
+      (resolution?.families.some((f) => foldPath(f.file) === foldPath(sessionProject)) ?? false)
     if (hostIds.length === 0) {
-      const paths = forgeConfigPaths({ projectDir: hostAnchorDir || undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+      const primaryAnchorDir = hostAnchors[0] ?? hostWorktree
+      const anchorNote = hostAnchors.length > 1 ? `host anchors: ${hostAnchors.join(", ")}` : `launched from ${primaryAnchorDir || "an unresolvable directory"}`
+      const paths = forgeConfigPaths({ projectDir: primaryAnchorDir || undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
       const lines = [
-        "[forge:crew] CREW IS NOT INITIALIZED on this host: no forge subagents are materialized. Crew orchestration is unavailable until the user sets it up.",
-        `Two layers, MERGED (the project layer overrides the global one per agent id): ${paths.project} (nearest .opencode/forge.json walking up from the workspace) OR ${paths.global}.`,
-        'Template (JSONC): {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "prompt": "short role description"}}}',
-        "Agent ids are plain role words WITHOUT the `forge-` prefix — the plugin materializes each id as `forge-<id>` (a prefixed id is auto-stripped with a warning).",
-        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it, give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request) — without a prompt, custom ids get a generic one-liner and will not know their job. Newly added agents need a host restart; thoughtLevel edits apply without one.",
+        `[forge:crew] CREW IS NOT INITIALIZED on this host: no forge subagents are materialized across the whole anchor set (${anchorNote}). Crew orchestration is unavailable until the user sets it up.`,
+        `Two layers, MERGED (the project layer overrides the global one per agent id): ${paths.project} (nearest .opencode/forge.json walking up from the workspace) OR ${paths.global}. Sub-pool files (.opencode/forge.json in an anchor's subdirectories) contribute additional namespaced families.`,
+        'Two axes, distinct: POOLS follow host directories (the anchor set above); SESSION ARTIFACTS (plan/goal/crew records) follow the session. A forge.json in an unanchored directory is not dispatchable on this host.',
+        'Template (JSONC): top-level optional "pool" names this file\'s namespace (short stable [a-z0-9-] up to 24 chars — sub-pool ids materialize as forge-<ns>-<id>); {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "prompt": "short role description"}}}',
+        "Agent ids are plain role words WITHOUT the `forge-` prefix — the plugin materializes each id as `forge-<id>` (namespaced pools: `forge-<ns>-<id>`); a prefixed id is auto-stripped with a warning.",
+        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it: give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request), and INCLUDE a proposed short stable `pool` namespace for sub-pool files so ids survive directory renames. File edits, creations, and deletions apply at the next config hook — no host restart; only the anchor set itself is fixed at host start (re-initializations add pools, never remove).",
       ]
-      if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject) {
+      if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject && !sessionCovered) {
         lines.push(
-          `NOTE: this session's workspace DOES have a forge.json (${sessionProject}) with usable agents — but this host instance was launched from ${hostAnchorDir || "a different directory"}, so they are not in the task vocabulary. Relaunch opencode in that workspace, or add the agents to the global layer.`,
+          `NOTE: this session's workspace DOES have a forge.json (${sessionProject}) with usable agents — but NO host anchor covers it (${anchorNote}). A host initialization in that workspace adds its pools; or fold the agents into the global layer.`,
         )
       }
       throw new Error(lines.join("\n"))
@@ -1534,30 +1591,36 @@ const crewBeginTool = tool({
     }
     crews.set(context.sessionID, { objective: objectiveText, startedAt: nowIso(), subtasks, mode: governed ? "executing" : "pending", recordPath })
     appendCrewRecord(recordPath, governed ? "registered (born armed under a governing goal)" : "registered (pending)", subtasks.map((s, i) => `${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`))
-    // Workspace-mismatch disclosure: the session's own discovery found
-    // project-layer agents this host did not materialize — they are NOT
+    // Residual workspace-mismatch disclosure: the session's own discovery
+    // found a forge.json NO host anchor covers — its roles are NOT
     // dispatchable here; say so instead of letting the crew discover it by
     // failure.
     let disclosure = ""
-    if (sessionProject && sessionProject !== (hostLoaded?.projectPath ?? null)) {
-      const localOnly = Object.keys(sessionLoaded?.agents ?? {}).filter((id) => !hostIds.includes(id))
+    if (sessionProject && !sessionCovered) {
+      const localOnly = Object.keys(sessionLoaded?.agents ?? {})
       if (localOnly.length > 0) {
-        disclosure = `\n[forge:crew] NOTE: this session's workspace has its own forge.json (${sessionProject}) defining ${localOnly.map((id) => `forge-${id}`).join(", ")} — NOT dispatchable on this host (launched from ${hostAnchorDir || "a different directory"}). Relaunch opencode in that workspace to use them, or fold them into the global layer.`
+        disclosure = `\n[forge:crew] NOTE: this session's workspace has its own forge.json (${sessionProject}) defining ${localOnly.map((id) => `forge-<ns>-${id} (namespaced by its pool)`).join(", ")} — NOT dispatchable on this host (no anchor covers it; anchors: ${hostAnchors.join(", ") || "none"}). A host initialization in that workspace adds its pools, or fold the agents into the global layer.`
       }
     }
-    // Origin disclosure (D8): always name WHERE the dispatchable roster came
-    // from — never let the model narrate the launch-anchor pool as "global".
-    const paths = forgeConfigPaths({ projectDir: hostAnchorDir || undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
-    const originDesc = hostLoaded?.projectPath
-      ? `the project layer ${hostLoaded.projectPath}${hostLoaded.source === "project+global" ? ` merged with the global layer (${paths.global})` : ""}`
-      : `the global layer (${paths.global})`
+    // Origin disclosure (generalized D8): always name WHERE the dispatchable
+    // roster came from, grouped by pool with the primary marked — never let
+    // the model narrate the launch-anchor pool as "global". Bounded at 8
+    // pools; the remainder are counted, not listed.
+    const familyLines: string[] = []
+    const families = resolution?.families ?? []
+    for (const f of families.slice(0, 8)) {
+      const label = f.primary ? "root pool (PRIMARY, plain ids)" : `pool ${f.ns} (forge-${f.ns}-*)`
+      familyLines.push(`   - ${label}: ${f.file} — ${f.materializedIds.map((id) => `forge-${id}`).join(", ") || "no agents"}`)
+    }
+    if (families.length > 8) familyLines.push(`   - …and ${families.length - 8} more pools`)
     const lines = [
       governed
         ? `[forge:crew] Crew registered UNDER THE GOVERNING GOAL — born armed, never pends. Objective: ${objectiveText}`
         : `[forge:crew] Crew registered PENDING for this session (execution has NOT started). Objective: ${objectiveText}`,
       `Declared plan (${subtasks.length}):`,
       ...subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
-      `Dispatchable roster origin: ${originDesc} — materialized by this host instance${hostAnchorDir ? ` (launched from ${hostAnchorDir})` : ""}.`,
+      `Dispatchable roster origin — ${families.length} pool${families.length === 1 ? "" : "s"} across the host anchor set${hostAnchors.length > 0 ? ` (anchors: ${hostAnchors.join(", ")})` : ""}:`,
+      ...familyLines,
       ...(recordNote ? [recordNote] : []),
       ...(disclosure ? [disclosure] : []),
     ]
@@ -1951,7 +2014,16 @@ function scheduleIdleContinuation(client: GoalClient, sessionID: string): void {
 // ---------------------------------------------------------------------------
 
 export const server: Plugin = async (input, options) => {
-  hostWorktree = effectiveWorktree(input.worktree, input.directory) || input.directory || ""
+  const effectiveInitDir = effectiveWorktree(input.worktree, input.directory) || input.directory || ""
+  // Session-state fallback axis (plan/goal/crew record binding when a session
+  // carries no observable anchor): last-init-wins is honest here — the most
+  // recent initialization directory is the most likely current project. The
+  // POOL axis is deliberately different: it resolves from the frozen anchor
+  // set (see hostAnchors) and never flips.
+  hostWorktree = effectiveInitDir
+  // Pool axis (hierarchical-pool-materialization): append-only — a shared
+  // host's re-initializations only ever ADD anchors/pools.
+  rememberHostAnchor(effectiveInitDir)
   const client = input.client as unknown as GoalClient
   jobClient = input.client as unknown as JobClient
   const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
@@ -2123,22 +2195,20 @@ export const server: Plugin = async (input, options) => {
       // subagents WITH their pinned models, and compose the /crew command for
       // the current agent set. Findings surface through the diagnostics log —
       // never silently swallowed, never an AI-facing configuration invitation.
-      if (!forgeLoader || forgeLoaderDir !== hostWorktree) {
-        forgeLoader = createForgeConfigLoader({
-          projectDir: hostWorktree,
-          homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(),
-        })
-        forgeLoaderDir = hostWorktree
-      }
-      const loaded = forgeLoader.load()
-      for (const finding of loaded.findings) {
+      // Anchor-set pool resolution (hierarchical-pool-materialization): the
+      // UNION materializes — anchor flips only add pools (D1/D2); file truth
+      // (edits/creations/deletions) hot-applies through the resolver's mtime
+      // caches on every resolve.
+      const resolution = resolvePools()
+      poolResolution = resolution
+      for (const finding of resolution?.findings ?? []) {
         console.warn(`[forge:config] ${finding.level}: ${finding.message}`)
       }
       materializedSnapshot = {}
-      for (const [agentId, def] of Object.entries(loaded.agents)) {
-        const id = `forge-${agentId}`
+      for (const [matId, agent] of Object.entries(resolution?.agents ?? {})) {
+        const id = `forge-${matId}`
         if (agentSection[id] !== undefined) continue // no-clobber
-        const entry = forgeAgentDef(agentId, def)
+        const entry = forgeAgentDef(matId, agent.def)
         agentSection[id] = entry
         materializedSnapshot[id] = entry
       }
@@ -2194,14 +2264,15 @@ export const server: Plugin = async (input, options) => {
       cfg.command ??= {}
       const existingCrew = cfg.command["crew"] as { template?: string } | undefined
       if (!existingCrew || String(existingCrew.template ?? "").startsWith("(forge crew")) {
-        const agentIds = Object.keys(loaded.agents)
+        const agentCount = Object.keys(resolution?.agents ?? {}).length
+        const primaryAnchorDir = hostAnchors[0] ?? undefined
         const template =
-          agentIds.length > 0
-            ? crewOrchestrationTemplate(agentIds)
-            : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}\n   - ${forgeConfigPaths({ projectDir: forgeLoaderDir ?? undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`)
-              .replaceAll("{template}", JSON.stringify({ agents: { research: { model: "provider/model", thoughtLevel: "low", prompt: "short role description — what this agent does" } } }, null, 2).split("\n").map((l) => "   " + l).join("\n"))
+          agentCount > 0
+            ? crewOrchestrationTemplate(resolution ?? null)
+            : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}\n   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`)
+              .replaceAll("{template}", JSON.stringify({ pool: "short-stable-namespace (optional, [a-z0-9-] up to 24 chars — only meaningful for sub-pool files)", agents: { research: { model: "provider/model", thoughtLevel: "low", prompt: "short role description — what this agent does" } } }, null, 2).split("\n").map((l) => "   " + l).join("\n"))
         const description =
-          agentIds.length > 0
+          agentCount > 0
             ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report"
             : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance"
         cfg.command["crew"] = { template, description }
@@ -2368,7 +2439,10 @@ export const server: Plugin = async (input, options) => {
         return
       }
       const agentId = agentName.slice("forge-".length)
-      const def: ForgeAgentDef | undefined = forgeLoader?.load().agents[agentId]
+      // Pool-set lookup (hierarchical-pool-materialization): the key is the
+      // materialized name sans prefix (plain or <ns>-<id>); fresh resolve per
+      // lookup keeps the hot-apply contract.
+      const def: ForgeAgentDef | undefined = resolvePools()?.agents[agentId]?.def
       if (!def?.thoughtLevel) return
       const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : ""
       const modelID = typeof raw.model?.modelID === "string" ? raw.model.modelID : ""
@@ -2398,6 +2472,15 @@ export const server: Plugin = async (input, options) => {
       },
       crewCommand: () => crewCommandSnapshot,
       materialized: () => materializedSnapshot,
+      // Anchor-set seam (hierarchical-pool-materialization): the anchor set
+      // is host-lifetime state; tests simulate a host restart by resetting.
+      resetAnchors: () => {
+        hostAnchors.length = 0
+        poolResolver = null
+        poolResolution = null
+      },
+      anchors: () => [...hostAnchors],
+      resolveNow: () => resolvePools(),
     },
 
     // permission.ask belt: on hosts/sessions where permission requests ARE
@@ -2642,22 +2725,23 @@ export async function v2Setup(ctx: V2PluginContext): Promise<void> {
         })
       }
       // Static forge subagents (spec: forge-subagents — v2 parity): same
-      // create-only discipline as the forge entry. The loader reads the
-      // process cwd (v2 ctx exposes no launch directory); any failure degrades
-      // to no subagents, never a throw.
+      // create-only discipline as the forge entry. The pool resolver reads
+      // the process cwd (v2 ctx exposes no launch directory) as the single
+      // anchor — plain ids, walk-up root pool plus subtree sub-pools; any
+      // failure degrades to no subagents, never a throw.
       try {
-        const loader = createForgeConfigLoader({ projectDir: process.cwd(), homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
-        const loaded = loader.load()
-        for (const [agentId, def] of Object.entries(loaded.agents)) {
-          const id = `forge-${agentId}`
+        const resolver = createPoolResolver({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+        const resolution = resolver.resolve([process.cwd()])
+        for (const [matId, agent] of Object.entries(resolution.agents)) {
+          const id = `forge-${matId}`
           if (draft.get(id) !== undefined) continue // create-only
-          const v1def = forgeAgentDef(agentId, def)
-          draft.update(id, (agent) => {
-            agent.description = v1def.description
-            agent.system = v1def.prompt
-            agent.mode = v1def.mode
-            if (v1def.model !== undefined) agent.model = v1def.model // Auto workers carry no model key
-            agent.permission = v1def.permission
+          const v1def = forgeAgentDef(matId, agent.def)
+          draft.update(id, (agentDraft) => {
+            agentDraft.description = v1def.description
+            agentDraft.system = v1def.prompt
+            agentDraft.mode = v1def.mode
+            if (v1def.model !== undefined) agentDraft.model = v1def.model // Auto workers carry no model key
+            agentDraft.permission = v1def.permission
           })
         }
       } catch {
