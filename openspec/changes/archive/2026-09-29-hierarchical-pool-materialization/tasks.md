@@ -25,6 +25,6 @@
 
 ## 4. Verification & release (gated on user go)
 
-- [ ] 4.1 `openspec validate hierarchical-pool-materialization --strict`; archive only on explicit user instruction AND after `align-forge-config-discovery` is archived (order dependency)
-- [ ] 4.2 Sandbox E2E on the built plugin: multi-pool host (root pool + sub-pool + second anchor) — roster grouping, crew dispatch of both plain and namespaced agents, freeze under re-init
-- [ ] 4.3 Version bump, layered commits, push (proxy), npm publish, switch local global install, live smoke in the multi-project layout
+- [x] 4.1 `openspec validate hierarchical-pool-materialization --strict`; archive only on explicit user instruction AND after `align-forge-config-discovery` is archived (order dependency)
+- [x] 4.2 Sandbox E2E on the built plugin: multi-pool host (root pool + sub-pool + second anchor) — roster grouping, crew dispatch of both plain and namespaced agents, freeze under re-init (scripts/e2e-hiero.mjs: real serve host, root+both sub-pools read, skip-list holds)
+- [x] 4.3 Version bump, layered commits, push (proxy), npm publish, switch local global install, live smoke in the multi-project layout (0.13.0 published; local cache re-installed at session creation with all hierarchical-pool markers)
