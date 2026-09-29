@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync, readFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -525,6 +525,179 @@ test("crew_close: no active crew refuses", async (t) => {
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await assert.rejects(() => h.tool.crew_close.execute({ report: [{ title: "a", verdict: "PASS", evidence: "e" }] }, allowCtx("ses_none")), /No active crew/)
+})
+
+// ---------------------------------------------------------------------------
+// Crew execution-mode gate (change add-crew-execution-mode-gate): two-phase
+// lifecycle (register PENDING -> arm), the pending dispatch belt, the goal
+// conversion path, the abandon path, origin disclosure, the crew record.
+
+const poolJson = JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+const beltArgs = () => ({ args: { subagent_type: "general", prompt: "x" } })
+
+test("crew lifecycle: registration PENDS — three-choice surface, dispatch belt, arm call", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+
+  const out = await h.tool.crew_begin.execute({ objective: "gate it", subtasks: [{ title: "one" }] }, allowCtx("ses_lifecycle"))
+  assert.match(out.output, /registered PENDING/, "registration announces the pending state")
+  assert.match(out.output, /supervised waves NOW/, "three-choice surface: waves")
+  assert.match(out.output, /convert to a goal contract/, "three-choice surface: goal")
+  assert.match(out.output, /standby/, "three-choice surface: standby")
+  assert.match(out.output, /END YOUR TURN/, "the stop mandate")
+  assert.match(out.output, /Dispatchable roster origin: the project layer/, "origin disclosure names the layer (D8)")
+  assert.doesNotMatch(out.output, /Proceed with the discipline/, "registration no longer orders immediate execution")
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_lifecycle").mode, "pending")
+
+  // Belt: every task dispatch refuses while the crew pends.
+  await assert.rejects(
+    () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_lifecycle", callID: "cb1" }, beltArgs()),
+    /PENDING/,
+  )
+
+  // Arm call (shape-disjoint: execution only, no plan payload).
+  const armed = await h.tool.crew_begin.execute({ execution: "waves" }, allowCtx("ses_lifecycle"))
+  assert.match(armed.output, /ARMED for supervised waves/)
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_lifecycle").mode, "executing")
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_lifecycle", callID: "cb2" }, beltArgs())
+
+  // Re-arm refuses; arm without a crew refuses; bogus execution value refuses.
+  await assert.rejects(() => h.tool.crew_begin.execute({ execution: "waves" }, allowCtx("ses_lifecycle")), /already armed/)
+  await assert.rejects(() => h.tool.crew_begin.execute({ execution: "waves" }, allowCtx("ses_noarm")), /No active crew to arm/)
+  await assert.rejects(() => h.tool.crew_begin.execute({ execution: "fast" }, allowCtx("ses_noarm")), /execution must be/)
+})
+
+test("crew lifecycle: goal conversion ends the crew and directs goal_write(arm)", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.crew_begin.execute({ objective: "convert me", subtasks: [{ title: "one" }, { title: "two", agent: "forge-research" }] }, allowCtx("ses_conv"))
+  const recordPath = h.__forgeSubagentsTest.crews().get("ses_conv").recordPath
+  const out = await h.tool.crew_begin.execute({ execution: "goal" }, allowCtx("ses_conv"))
+  assert.match(out.output, /CONVERSION record/)
+  assert.match(out.output, /goal_write with arm=true/)
+  assert.match(out.output, /1\. one/, "the declared plan rides along for folding")
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_conv"), undefined, "conversion ends the crew")
+  assert.match(readFileSync(recordPath, "utf8"), /converted to goal/, "the record carries the conversion")
+  // The belt is gone with the crew: task dispatch no longer refuses.
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_conv", callID: "cb3" }, beltArgs())
+})
+
+test("crew registration: an execution payload without a governing goal refuses", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }], execution: "waves" }, allowCtx("ses_nogoal")),
+    /cannot self-arm outside a governing goal/,
+  )
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }], execution: "goal" }, allowCtx("ses_nogoal")),
+    /converts an already-registered/,
+  )
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_nogoal"), undefined, "nothing was registered")
+})
+
+test("crew abandon: ask retained, no verdict demands, fresh begin after, works from pending AND executing", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.crew_begin.execute({ objective: "wrong shape", subtasks: [{ title: "a" }] }, allowCtx("ses_ab"))
+  const denied = { ...allowCtx("ses_ab"), ask: async () => { throw new Error("denied by user (test)") } }
+  await assert.rejects(() => h.tool.crew_close.execute({ abandon: true, reason: "bad plan" }, denied), /denied/i)
+  assert.ok(h.__forgeSubagentsTest.crews().get("ses_ab"), "a denied abandon keeps the crew")
+  const out = await h.tool.crew_close.execute({ abandon: true, reason: "bad plan" }, allowCtx("ses_ab"))
+  assert.match(out.output, /ABANDONED/)
+  assert.match(out.output, /mode at abandon: pending/)
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_ab"), undefined)
+  // The freed session registers fresh; abandon also works from EXECUTING.
+  await h.tool.crew_begin.execute({ objective: "reshard", subtasks: [{ title: "b" }] }, allowCtx("ses_ab"))
+  await h.tool.crew_begin.execute({ execution: "waves" }, allowCtx("ses_ab"))
+  const out2 = await h.tool.crew_close.execute({ abandon: true, reason: "mid-flight re-shard" }, allowCtx("ses_ab"))
+  assert.match(out2.output, /mode at abandon: executing/)
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_ab"), undefined)
+})
+
+test("crew record: registration writes it under the session anchor; arm/close append; fail-soft on an unwritable anchor", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const ws = workspaceWithForgeJson(t, poolJson)
+  const recCtx = (sid) => ({ ...allowCtx(sid), worktree: ws, directory: ws })
+
+  await h.tool.crew_begin.execute({ objective: "keep records", subtasks: [{ title: "one" }] }, recCtx("ses_rec"))
+  const crew = h.__forgeSubagentsTest.crews().get("ses_rec")
+  assert.ok(crew.recordPath?.startsWith(join(ws, ".opencode", "crew")), "the record lives under the session anchor")
+  assert.match(crew.recordPath, /\.md$/)
+  const rec = readFileSync(crew.recordPath, "utf8")
+  assert.match(rec, /# Crew Record: keep records/)
+  assert.match(rec, /1\. one/)
+  await h.tool.crew_begin.execute({ execution: "waves" }, recCtx("ses_rec"))
+  assert.match(readFileSync(crew.recordPath, "utf8"), /armed \(waves\)/)
+  await h.tool.crew_close.execute({ report: [{ title: "one", verdict: "PASS", evidence: "ok" }] }, recCtx("ses_rec"))
+  const closed = readFileSync(crew.recordPath, "utf8")
+  assert.match(closed, /— closed/)
+  assert.match(closed, /one: PASS/)
+
+  // Fail-soft: an anchor that cannot host the file degrades to a note; the crew still runs.
+  const asFile = join(tmpdir(), `forge-wiring-notdir-${Date.now()}.txt`)
+  writeFileSync(asFile, "i am a file, not a directory")
+  const soft = await h.tool.crew_begin.execute({ objective: "no record", subtasks: [{ title: "x" }] }, { ...allowCtx("ses_soft"), worktree: asFile, directory: asFile })
+  assert.match(soft.output, /could not be written \(fail-soft/, "unwritable anchor degrades to a note")
+  const softCrew = h.__forgeSubagentsTest.crews().get("ses_soft")
+  assert.equal(softCrew.recordPath, null)
+  assert.equal(softCrew.mode, "pending", "the crew still runs")
+})
+
+test("crew_begin origin disclosure: a global-layer host names the global path", async (t) => {
+  const home = process.env.FORGE_TEST_FORGE_HOME
+  mkdirSync(join(home, ".config", "opencode"), { recursive: true })
+  writeFileSync(join(home, ".config", "opencode", "forge.json"), poolJson)
+  t.after(() => {
+    try {
+      rmSync(join(home, ".config"), { recursive: true, force: true })
+    } catch {}
+  })
+  const dir = mkdtempSync(join(tmpdir(), "forge-wiring-nocfg-"))
+  t.after(() => {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {}
+  })
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, allowCtx("ses_origin"))
+  assert.match(out.output, /Dispatchable roster origin: the global layer/, "the global layer is named as the origin")
+  assert.match(out.output, /\.config[\\/]opencode[\\/]forge\.json/, "the global path is spelled out")
+  assert.doesNotMatch(out.output, /workspace has its own forge\.json/, "no mismatch disclosure without a session-side file")
+})
+
+// ---------------------------------------------------------------------------
+// Crew-harness template rewrite (change add-crew-execution-mode-gate): the
+// pause step, GUI-wave mutex, computer-tool preference, abandon exit, and the
+// source-agnostic framing.
+
+test("crew command template: the pause, GUI mutex, computer preference, abandon exit, source-agnostic framing", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await server(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  const tpl = cfg.command["crew"].template
+  assert.match(tpl, /THE PAUSE/, "the pause step exists")
+  assert.match(tpl, /END YOUR TURN/, "registration stops the turn")
+  assert.match(tpl, /may come from an approved plan, a spec change, or inline text/, "source-agnostic framing (no plan precedence)")
+  assert.match(tpl, /mutually exclusive within a wave/, "GUI/computer-use subtasks are serialized per wave")
+  assert.match(tpl, /`computer` tool/, "GUI walkthroughs prefer the computer tool")
+  assert.match(tpl, /abandon: true/, "the abandon exit is taught in the template")
+  assert.doesNotMatch(tpl, /Proceed with the discipline: waves/, "the immediate-execution order is gone")
 })
 
 // ---------------------------------------------------------------------------

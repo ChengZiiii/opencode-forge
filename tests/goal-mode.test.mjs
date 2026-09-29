@@ -589,6 +589,7 @@ test("idle continuation: armed goal continues the owner session with a compact b
     assert.match(brief, /make the suite green/)
     assert.match(brief, /shell `npm test`/)
     assert.match(brief, /0\/25 turns used/)
+    assert.match(brief, /Crew layer: you own it under this goal/, "the continuation brief carries the crew-layer directive")
     assert.equal(body.body.agent, undefined, "no agent override: single-principle, no switching")
     assert.match(goalFiles(wt)[0].text, /^turns_used: 1$/m)
     // Second idle evaluates turn 1 (ledger entry, no activity) and continues.
@@ -984,4 +985,92 @@ test("align-shell-interpreter: run-check real runner propagates exit codes throu
   } finally {
     rmSync(wt, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// Goal-delegated crew self-orchestration (change add-crew-execution-mode-gate,
+// D9): under a governing ACTIVE goal owned by the session, crews are born
+// armed in one call and crew gates stay internal to the loop.
+
+function crewWorktree(t) {
+  const wt = mkdtempSync(join(tmpdir(), "goal-crew-"))
+  t.after(() => {
+    try {
+      rmSync(wt, { recursive: true, force: true })
+    } catch {}
+  })
+  mkdirSync(join(wt, ".opencode"), { recursive: true })
+  writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  return wt
+}
+
+test("goal delegation: one-call born-armed crew; crew gates stay internal to the loop", async (t) => {
+  const wt = crewWorktree(t)
+  const { serverPromise } = makeHarness({ worktree: wt })
+  const hooks = await serverPromise
+  // Re-anchor the module-level host forge loader to THIS worktree (the loader
+  // is (re)created only inside the config hook).
+  await hooks.config({ agent: {} })
+  const sid = await armGoal(hooks, wt)
+
+  // One-call register+arm: born EXECUTING, never pends, no three-choice stop.
+  const out = await hooks.tool.crew_begin.execute(
+    { objective: "crew under goal", subtasks: [{ title: "one" }], execution: "waves" },
+    toolCtx(sid, wt),
+  )
+  assert.match(out.output, /born armed/)
+  assert.doesNotMatch(out.output, /PENDING for this session/)
+  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid).mode, "executing")
+
+  // Gates internal: the report close succeeds even when ask would deny.
+  const closed = await hooks.tool.crew_close.execute(
+    { report: [{ title: "one", verdict: "PASS", evidence: "ok" }] },
+    toolCtx(sid, wt, denyAsk),
+  )
+  assert.match(closed.output, /Crew closed/)
+
+  // Re-shard unattended: abandon is ask-free under the goal; a fresh one-call
+  // re-arm follows immediately.
+  const out2 = await hooks.tool.crew_begin.execute({ objective: "reshard", subtasks: [{ title: "two" }], execution: "waves" }, toolCtx(sid, wt))
+  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid).mode, "executing")
+  const abandoned = await hooks.tool.crew_close.execute({ abandon: true, reason: "wrong decomposition" }, toolCtx(sid, wt, denyAsk))
+  assert.match(abandoned.output, /ABANDONED/)
+  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid), undefined)
+
+  // Conversion is refused under a governing goal (already governed) — even
+  // for a pending crew registered plain inside the loop.
+  await hooks.tool.crew_begin.execute({ objective: "c", subtasks: [{ title: "t" }] }, toolCtx(sid, wt))
+  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid).mode, "pending")
+  await assert.rejects(() => hooks.tool.crew_begin.execute({ execution: "goal" }, toolCtx(sid, wt)), /refused under a governing goal/)
+  await hooks.tool.crew_close.execute({ abandon: true, reason: "cleanup" }, toolCtx(sid, wt))
+  await hooks.dispose?.()
+})
+
+test("goal delegation: outside a governing goal the one-call arm still refuses (no goal / paused goal)", async (t) => {
+  // No goal at all.
+  const wt0 = crewWorktree(t)
+  const h0 = await makeHarness({ worktree: wt0 }).serverPromise
+  await h0.config({ agent: {} })
+  const sid0 = nextSid()
+  await assert.rejects(
+    () => h0.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }], execution: "waves" }, toolCtx(sid0, wt0)),
+    /cannot self-arm outside a governing goal/,
+  )
+  await h0.dispose?.()
+
+  // A PAUSED goal does not govern: one-call arm still refuses.
+  const wt1 = crewWorktree(t)
+  const h1 = await makeHarness({ worktree: wt1 }).serverPromise
+  await h1.config({ agent: {} })
+  const sid1 = await armGoal(h1, wt1)
+  await h1.tool.goal_pause.execute({ blocker: "waiting on the user" }, toolCtx(sid1, wt1))
+  await assert.rejects(
+    () => h1.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }], execution: "waves" }, toolCtx(sid1, wt1)),
+    /cannot self-arm outside a governing goal/,
+  )
+  // Plain registration still works and PENDS (the three-choice pause is the
+  // user's decision point outside goal governance).
+  await h1.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, toolCtx(sid1, wt1))
+  assert.equal(h1.__forgeSubagentsTest.crews().get(sid1).mode, "pending")
+  await h1.dispose?.()
 })
