@@ -172,7 +172,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (the dispatch engine was removed); only present as inert debris from older versions | runtime debris — delete freely |
-| the nearest `.opencode/forge.json` on the workspace's ancestor chain, `~/.config/opencode/forge.json` | your static subagent definitions (JSONC), two MERGED layers (project overrides global per agent id). **User data — the plugin only reads it, never writes or migrates it** | yours — version the project one, keep the global one out of sync tools if it holds machine-specific models |
+| `.opencode/forge.json` files (the nearest on each host anchor's ancestor chain, every one in an anchor's subtree, and `~/.config/opencode/forge.json`) | your static subagent definitions (JSONC) — pool families MERGED over the global layer per agent id (primary anchor's root pool plain ids, others namespaced). **User data — the plugin only reads them, never writes or migrates them** | yours — version the project ones, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
 
@@ -418,26 +418,60 @@ discovered by walking up:
 
 The two layers **merge**: agents combine, and on an id collision the project
 definition wins wholesale (one definition per id — no cross-layer field
-blending). A broken file empties only its own layer (error finding with the
-parse location); the other layer still applies. Both layers hot-apply —
-edits, and files appearing or disappearing on the ancestor chain, take
-effect without a host restart (new agents still need the restart to enter
-the task vocabulary; see the apply-timing table below).
+blending). A broken file empties only its own layer/pool (error finding with
+the parse location); everything else still applies. Both layers hot-apply —
+edits, and files appearing or disappearing, take effect at the next config
+hook without a host restart (see the apply-timing table below).
 
-One host instance materializes one pool (from its launch anchor) — a
-workspace-local file that the host was not launched on is NOT silently
-ignored: `/crew` names it and tells you to relaunch there (or fold the
-agents into the global layer).
+**Hierarchical pools on a shared host.** Agent frontends (paseo and friends)
+routinely share ONE opencode host process across projects, re-initializing
+plugins with different directories. The plugin therefore keeps an
+**append-only anchor set**: every host initialization appends its directory
+(first one = the *primary anchor*), and pools resolve from the union —
+anchor flips can only ever ADD pools, never remove them. Per anchor the
+family is:
+
+- the **root pool** — the nearest forge.json walking up from that anchor
+  (merged over the global layer per agent id);
+- every **sub-pool** — a `.opencode/forge.json` anywhere in the anchor's
+  subdirectories, discovered by a bounded breadth-first scan (lexicographic
+  sibling order; dependency dirs like `node_modules`/`.git`/`dist` are
+  skipped; 2,000-directory budget per anchor).
+
+The **primary anchor's root pool keeps plain `forge-<id>` ids** (a
+single-project host is unchanged); every other family materializes
+**namespaced** as `forge-<ns>-<id>`. `ns` is the file's optional `pool`
+field, else the sanitized directory name. Pool identity is the absolute file
+path — the same file reached through two anchors materializes exactly once;
+namespace and materialized-id collisions resolve deterministically with an
+error finding, never by silent shadowing. The `/crew` roster and the
+`crew_begin` registration output list the dispatchable agents **grouped by
+pool** with each pool's origin path, the primary marked.
+
+| axis | follows | survives restart? |
+| --- | --- | --- |
+| pools (the `forge-*` vocabulary) | host directories — the anchor set | the set re-seeds from the spawn anchor only |
+| session artifacts (plan/goal/crew records) | the session's own workspace | files on disk are the source of truth |
+
+A forge.json in a directory NO host anchor covers is NOT silently ignored:
+`/crew` names it as the residual mismatch and tells you a host
+initialization in that workspace adds its pools (or fold the agents into the
+global layer).
 
 **Id naming**: use plain role words (`research`, `coder`, …) — the plugin
-materializes every id as `forge-<id>` itself. A `forge-`-prefixed id in the
-file would double up (`forge-coder` → agent `forge-forge-coder`); the loader
-auto-strips the prefix (all repetitions) with a warning so existing files
-keep working, but rename the entries to silence it.
+materializes every id as `forge-<id>` itself (namespaced pools:
+`forge-<ns>-<id>`). A `forge-`-prefixed id in the file would double up
+(`forge-coder` → agent `forge-forge-coder`); the loader auto-strips the
+prefix (all repetitions) with a warning so existing files keep working, but
+rename the entries to silence it. The namespace infix is never parsed back
+out of a materialized id.
 
 ```jsonc
 {
-  // forge subagents — definitions; see the restart table below for apply timing
+  // sub-pool files only: namespace for this family's ids (forge-<ns>-<id>).
+  // Short, stable, [a-z0-9-] up to 24 chars — ids survive directory renames.
+  // Invalid values degrade to a warning + the directory-derived namespace.
+  // "pool": "aa",
   "agents": {
     // PINNED worker: model + thoughtLevel form an ATOMIC PAIR — set BOTH
     "research": {
@@ -497,12 +531,14 @@ A rejected entry costs only itself — its siblings materialize normally.
 > error finding naming the missing half. Fix per entry: add the missing
 > `thoughtLevel`, or delete `model` to make it an Auto worker.
 
-**What applies when** — edits take hold per field:
+**What applies when** — file truth is hot; only the anchor set is frozen at
+host start:
 
 | change | needs a host restart? |
 | --- | --- |
 | `thoughtLevel` on an existing agent | no (applies to NEW sessions of that agent; running sessions keep their frozen depth) |
-| agent added / removed, or `model` / `prompt` / `permission` changed | yes (materialization runs on the config hook) |
+| agent added / removed / edited, any pool file created or deleted | no restart — applies at the next config hook (materialization re-runs there; the crew gate and depth lookups always resolve fresh) |
+| a NEW directory joining the host (another project's session on the shared host) | no restart — the re-initialization itself adds the anchor and its pools |
 
 ### Dispatching
 
@@ -545,10 +581,11 @@ requires a plan. The flow:
 1. **Register** the declared plan: `crew_begin {objective, subtasks}` — one
    titled subtask each, optionally naming the intended `forge-*` agent.
    Registration enters a **PENDING** crew: execution has not started. The
-   registration output confirms the roster **with its origin** (which
-   forge.json layer the dispatchable set materialized from), points at the
-   crew record file, presents the three execution-mode choices, and stops the
-   turn. Reconnaissance task calls are free BEFORE registration.
+   registration output confirms the roster **grouped by pool with its
+   origins** (which forge.json families the dispatchable set materialized
+   from, the primary marked), points at the crew record file, presents the
+   three execution-mode choices, and stops the turn. Reconnaissance task
+   calls are free BEFORE registration.
 2. **The pause is mechanical**: while the crew pends, every `task` dispatch is
    refused by an interception belt. The user chooses:
    - **supervised waves now** — `crew_begin {execution: "waves"}` lifts the
@@ -601,13 +638,16 @@ itself (a rootish guard keeps degenerate global-project worktrees from
 landing files on the drive root or the launch anchor). The anchor follows the
 session's workspace, never the objective's scope.
 
-**Not initialized?** `/crew` on a host with zero usable forge agents refuses
-with one-time setup guidance: the two file paths, a copy-paste template, and
-the choice of configuring it yourself OR having the session AI do it — the
-latter only on your explicit go-ahead in that conversation, through the
-normal visible write path. This is the plugin's only configuration
-invitation. After saving the file, restart opencode to materialize the
-agents.
+**Not initialized?** `/crew` on a host with ZERO pools across its whole
+anchor set refuses with one-time setup guidance: the two file paths, a
+copy-paste template, and the choice of configuring it yourself OR having the
+session AI do it — the latter only on your explicit go-ahead in that
+conversation, through the normal visible write path (when the AI writes a
+sub-pool file it also proposes a short stable `pool` namespace so ids
+survive directory renames). This is the plugin's only configuration
+invitation. Saved files apply at the next config hook — no restart needed;
+on a shared host, opening a session in a new workspace adds that anchor and
+its pools automatically.
 
 ### Debris note
 
