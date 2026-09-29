@@ -281,11 +281,81 @@ function loaderForAnchor(anchor: string): ReturnType<typeof createForgeConfigLoa
   }
   return l
 }
-// Crew orchestration state (spec: crew-harness): in-memory and session-bound —
-// a host restart kills it honestly and a new /crew starts fresh. The declared
-// subtask plan (registered at crew_begin) is the crew_close gate's source of
-// truth. No file persistence by design.
-const crews = new Map<string, { objective: string; startedAt: string; subtasks: CrewSubtask[] }>()
+// Crew orchestration state (spec: crew-harness, change
+// add-crew-execution-mode-gate): in-memory and session-bound — a host restart
+// kills it honestly and a new /crew starts fresh. A registered crew starts
+// PENDING (the execution-mode choice is the user's) and is armed to EXECUTING
+// by an explicit {execution} call — or born armed in one call when a live
+// active goal governs the session (contract-delegated orchestration). The map
+// holds ACTIVE crews only: converted / abandoned / closed crews are deleted
+// (their record file is the history). The declared subtask plan (registered at
+// crew_begin) is the crew_close gate's source of truth.
+type CrewMode = "pending" | "executing"
+type CrewEntry = { objective: string; startedAt: string; subtasks: CrewSubtask[]; mode: CrewMode; recordPath: string | null }
+const crews = new Map<string, CrewEntry>()
+
+// Crew record file (change add-crew-execution-mode-gate, D7): an
+// inspectable, compaction-recovery HISTORY artifact under the session
+// workspace's .opencode/crew/ — the same sessionAnchor chain as plan/goal
+// artifacts. Record-only: it never resumes a dead crew (host restart still
+// ends the crew honestly; a stale record is inert). All appends are
+// fail-soft — the record is history, never a gate.
+function crewRecordPathFor(worktree: string, objective: string): string {
+  const dir = join(worktree, ".opencode", "crew")
+  const date = localDateNow()
+  const slug = slugifyGoal(objective) || "crew"
+  let name = `${date}-${slug}.md`
+  let n = 2
+  while (existsSync(join(dir, name))) name = `${date}-${slug}-${n++}.md`
+  return join(dir, name)
+}
+
+function writeCrewRecord(path: string, objective: string, anchor: string, subtasks: CrewSubtask[]): void {
+  mkdirSync(join(path, ".."), { recursive: true })
+  writeFileSync(
+    path,
+    [
+      `# Crew Record: ${objective}`,
+      "",
+      `- registered: ${nowIso()}`,
+      `- anchor: ${anchor}`,
+      "",
+      `## Declared plan (${subtasks.length})`,
+      ...subtasks.map((s, i) => `${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
+      "",
+    ].join("\n") + "\n",
+    "utf8",
+  )
+}
+
+function appendCrewRecord(path: string | null, heading: string, lines: string[]): void {
+  if (!path) return
+  try {
+    appendFileSync(path, [`## ${nowIso()} — ${heading}`, ...lines, ""].join("\n") + "\n", "utf8")
+  } catch {
+    // fail-soft by design
+  }
+}
+
+// A live ACTIVE goal owned by this session governs it: the goal contract's
+// arming dialog already authorized autonomous orchestration, so crew gates
+// (the pending pause and the close/abandon asks) go internal (D9).
+function governingGoalFor(sessionID: string | undefined): boolean {
+  if (!sessionID) return false
+  const state = stateForBan(sessionID)
+  if (!state) return false
+  const goal = resolveLiveGoal(state)
+  return Boolean(goal && goal.doc.status === "active" && goal.doc.session === sessionID)
+}
+
+function crewPendingChoiceLines(): string[] {
+  return [
+    "[forge:crew] The crew is PENDING — execution has NOT started. Present the execution-mode choice to the user and END YOUR TURN (every task dispatch is refused while the crew pends):",
+    `  1. supervised waves NOW — when the user says go, call crew_begin {execution: "waves"} and run the wave discipline;`,
+    `  2. convert to a goal contract — call crew_begin {execution: "goal"} (the crew ends as a conversion record; no extra dialog here), then draft goal_write with arm=true folding the declared subtasks into criteria/checks — the arm dialog is the user's gate;`,
+    `  3. standby — no call; the crew waits until armed or abandoned.`,
+  ]
+}
 
 // models.dev snapshot (optional ladder verification for depth injection):
 // loaded in the config hook, null when unavailable (verbatim pass-through).
@@ -1312,22 +1382,24 @@ function crewOrchestrationTemplate(agentIds: string[]): string {
     "",
     `Configured forge subagents (task-tool vocabulary): ${agentIds.map((id) => `forge-${id}`).join(", ")}`,
     "",
-    "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). Follow it exactly:",
+    "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). The macro contract above the crew may come from an approved plan, a spec change, or inline text — the discipline is identical in all three cases and never requires a plan. Follow it exactly:",
     "",
-    "1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. Reconnaissance first if you need it to decompose well; a wrong plan is fixed by discarding and re-crewing, never by improvising outside the declared plan.",
-    "2. WAVES, NEVER FLOODS: execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in.",
-    "3. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, run that subtask through a native task call anyway AND tell the user about the gap — suggest configuring the missing role in forge.json.",
-    "4. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the task result text. A result that does not meet the statement is a failure even if the worker sounded confident.",
-    "5. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or agent. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
-    "6. CLOSE: when every declared subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks your report against the declared plan — a declared subtask missing from the report refuses the close, and so does an undeclared one. The user confirms the closing dialog.",
+    "1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). Reconnaissance BEFORE registration is free (task calls included). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. A wrong plan is fixed by abandoning and re-crewing (crew_close {abandon: true, reason}), never by improvising outside the declared plan.",
+    '2. THE PAUSE: registration enters a PENDING crew — execution has NOT started. STOP and present the user the three execution-mode choices (supervised waves now / convert to a goal contract / standby), then END YOUR TURN. Arm per the user\'s choice: waves → crew_begin {execution: "waves"}; conversion → crew_begin {execution: "goal"} followed by goal_write (arm=true — its dialog is the user\'s gate) folding the declared subtasks into criteria/checks; standby → no call. EXCEPTION: while a live active goal governs this session, register with execution: "waves" in the SAME call — the crew is born armed (the goal contract already authorized orchestration) and crew_close / abandon stay ask-free under that goal.',
+    "3. WAVES, NEVER FLOODS (armed crews only): execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in. GUI / computer-use subtasks are mutually exclusive within a wave (the desktop is a singleton resource — at most ONE in flight; non-GUI subtasks still parallelize freely), and GUI walkthroughs use the `computer` tool rather than DIY shell screenshot pipelines.",
+    "4. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, run that subtask through a native task call anyway AND tell the user about the gap — suggest configuring the missing role in forge.json.",
+    "5. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the task result text. A result that does not meet the statement is a failure even if the worker sounded confident.",
+    "6. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or agent. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
+    "7. CLOSE: when every declared subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks the report against the declared plan — a declared subtask missing from the report refuses the close, and so does an undeclared one. The user confirms the closing dialog (ask-free while a goal governs the session).",
   ].join("\n")
 }
 
 const crewBeginTool = tool({
   description:
-    "Register this session's crew (from /crew) with its DECLARED subtask plan. Refuses when a crew is already active in the session, while a plan draft is active, or when subtasks are missing/duplicated. Crew state is in-memory: a host restart ends it honestly.",
+    'Register this session\'s crew (from /crew) with its DECLARED subtask plan — the crew starts PENDING: the execution-mode choice (waves / convert to goal / standby) is the user\'s. Dual-purpose: called with {execution} ONLY (no objective/subtasks) it ARMS the pending crew — "waves" lifts the dispatch belt, "goal" ends the crew as a conversion record (the following goal_write arm dialog is the user\'s gate). One-call register+arm ({objective, subtasks, execution:"waves"}) is legal ONLY while a live active goal governs the session (born armed, never pends). Refuses: active crew, plan draft, missing/duplicated subtasks. Crew state is in-memory: a host restart ends it honestly.',
   args: {
-    objective: tool.schema.string().describe("One-line crew objective (from /crew)"),
+    objective: tool.schema.string().optional().describe("One-line crew objective (from /crew) — required on registration, ABSENT on the arm call"),
+    execution: tool.schema.string().optional().describe('Arm action: "waves" (supervised waves — lifts the belt) or "goal" (convert to a goal contract). Alone = arm the pending crew; with objective+subtasks = one-call born-armed registration, legal only under a governing active goal.'),
     subtasks: tool.schema.array(tool.schema.object({
       title: tool.schema.string().describe("Short unique subtask title — the crew_close report must use these exact titles"),
       agent: tool.schema.string().optional().describe("Intended forge-* agent id for this subtask, when one matches"),
@@ -1369,8 +1441,56 @@ const crewBeginTool = tool({
       }
       throw new Error(lines.join("\n"))
     }
-    if (!args.objective?.trim()) throw new Error("crew_begin requires a non-empty objective (from /crew <objective>).")
+    const execution = typeof args.execution === "string" ? args.execution.trim().toLowerCase() : ""
+    if (execution && execution !== "waves" && execution !== "goal") {
+      throw new Error('[forge:crew] execution must be "waves" or "goal".')
+    }
+    const objectiveText = String(args.objective ?? "").trim()
     const raw = Array.isArray(args.subtasks) ? args.subtasks : []
+    // ---- ARM PATH ({execution} only — shape-disjoint from registration) ----
+    if (execution && !objectiveText && raw.length === 0) {
+      const crew = crews.get(context.sessionID)
+      if (!crew) {
+        throw new Error("[forge:crew] No active crew to arm (crew state is in-memory and dies on host restart). Register one first: crew_begin {objective, subtasks}.")
+      }
+      if (crew.mode !== "pending") {
+        throw new Error(`[forge:crew] This crew is already armed (${crew.mode}) — execute "${crew.objective}" instead of re-arming.`)
+      }
+      // D9: a goal-governed session is already autonomous — conversion to a
+      // second goal contract is for standalone crews only.
+      if (execution === "goal" && governingGoalFor(context.sessionID)) {
+        throw new Error('[forge:crew] execution:"goal" is refused under a governing goal — this session already runs inside an active goal contract. Run supervised waves (arm or one-call register), or pause/discard the goal first if conversion is truly intended.')
+      }
+      if (execution === "goal") {
+        crews.delete(context.sessionID)
+        appendCrewRecord(crew.recordPath, "converted to goal", [
+          "The crew ends here as a conversion record; the objective moves to a goal contract.",
+          ...crew.subtasks.map((s, i) => `${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
+        ])
+        return {
+          title: `crew converted: ${crew.objective.slice(0, 60)}`,
+          output: [
+            `[forge:crew] Crew ended as a CONVERSION record: ${crew.objective}`,
+            "Now draft the goal contract: goal_write with arm=true, folding the declared subtasks below into its criteria and verification checks. The arm confirmation dialog is the user's gate for the whole autonomous path — do not ask again here.",
+            `Declared subtasks to fold in (${crew.subtasks.length}):`,
+            ...crew.subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
+          ].join("\n"),
+        }
+      }
+      crew.mode = "executing"
+      appendCrewRecord(crew.recordPath, "armed (waves)", ["The user chose supervised waves; the dispatch belt is lifted."])
+      return {
+        title: `crew armed: ${crew.objective.slice(0, 60)}`,
+        output: [
+          `[forge:crew] Crew ARMED for supervised waves: ${crew.objective}`,
+          `Declared plan (${crew.subtasks.length}):`,
+          ...crew.subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
+          "Proceed with the wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+        ].join("\n"),
+      }
+    }
+    // ---- REGISTRATION PATH ----
+    if (!objectiveText) throw new Error("crew_begin requires a non-empty objective (from /crew <objective>).")
     if (raw.length === 0) throw new Error("[forge:crew] crew_begin requires subtasks[] — declare the plan before executing (decompose the objective into titled subtasks).")
     const seen = new Set<string>()
     const subtasks: CrewSubtask[] = []
@@ -1387,7 +1507,33 @@ const crewBeginTool = tool({
     if (existing) {
       throw new Error(`[forge:crew] This session already has an active crew: "${existing.objective}" (started ${existing.startedAt}). Finish and close it with crew_close before starting another.`)
     }
-    crews.set(context.sessionID, { objective: args.objective.trim(), startedAt: nowIso(), subtasks })
+    // One-call register+arm is goal-governed ONLY (D9); conversion-at-register
+    // is meaningless (nothing to convert yet) — refuse both precisely.
+    if (execution === "waves" && !governingGoalFor(context.sessionID)) {
+      throw new Error('[forge:crew] crew_begin cannot self-arm outside a governing goal: register with {objective, subtasks} only — the pause is the user\'s decision point, armed by a follow-up crew_begin {execution} call per their choice.')
+    }
+    if (execution === "goal") {
+      throw new Error('[forge:crew] execution:"goal" converts an already-registered PENDING crew — register the plan first (no execution), then convert. Under a governing goal, only "waves" one-call arming is legal (the loop already owns the goal).')
+    }
+    const governed = execution === "waves"
+    // Crew record (D7): fail-soft — its absence never blocks the crew. Shares
+    // the sessionAnchor chain with plan/goal artifacts; record-only, never a
+    // resume mechanism.
+    const anchorDir = anchor || hostWorktree
+    let recordPath: string | null = null
+    let recordNote = ""
+    if (anchorDir) {
+      try {
+        recordPath = crewRecordPathFor(anchorDir, objectiveText)
+        writeCrewRecord(recordPath, objectiveText, anchorDir, subtasks)
+        recordNote = `Crew record (inspectable history; NOT a resume mechanism): ${relFrom(anchorDir, recordPath)}`
+      } catch {
+        recordPath = null
+        recordNote = "Crew record could not be written (fail-soft; the crew still runs)."
+      }
+    }
+    crews.set(context.sessionID, { objective: objectiveText, startedAt: nowIso(), subtasks, mode: governed ? "executing" : "pending", recordPath })
+    appendCrewRecord(recordPath, governed ? "registered (born armed under a governing goal)" : "registered (pending)", subtasks.map((s, i) => `${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`))
     // Workspace-mismatch disclosure: the session's own discovery found
     // project-layer agents this host did not materialize — they are NOT
     // dispatchable here; say so instead of letting the crew discover it by
@@ -1399,49 +1545,93 @@ const crewBeginTool = tool({
         disclosure = `\n[forge:crew] NOTE: this session's workspace has its own forge.json (${sessionProject}) defining ${localOnly.map((id) => `forge-${id}`).join(", ")} — NOT dispatchable on this host (launched from ${hostAnchorDir || "a different directory"}). Relaunch opencode in that workspace to use them, or fold them into the global layer.`
       }
     }
+    // Origin disclosure (D8): always name WHERE the dispatchable roster came
+    // from — never let the model narrate the launch-anchor pool as "global".
+    const paths = forgeConfigPaths({ projectDir: hostAnchorDir || undefined, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+    const originDesc = hostLoaded?.projectPath
+      ? `the project layer ${hostLoaded.projectPath}${hostLoaded.source === "project+global" ? ` merged with the global layer (${paths.global})` : ""}`
+      : `the global layer (${paths.global})`
+    const lines = [
+      governed
+        ? `[forge:crew] Crew registered UNDER THE GOVERNING GOAL — born armed, never pends. Objective: ${objectiveText}`
+        : `[forge:crew] Crew registered PENDING for this session (execution has NOT started). Objective: ${objectiveText}`,
+      `Declared plan (${subtasks.length}):`,
+      ...subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
+      `Dispatchable roster origin: ${originDesc} — materialized by this host instance${hostAnchorDir ? ` (launched from ${hostAnchorDir})` : ""}.`,
+      ...(recordNote ? [recordNote] : []),
+      ...(disclosure ? [disclosure] : []),
+    ]
+    if (governed) {
+      lines.push(
+        "Goal-delegated orchestration: the governing goal contract already authorized this crew — run the wave discipline NOW (crew gates stay internal to the loop; crew_close and abandon are ask-free under this goal), and re-shard via crew_close {abandon: true, reason} + a fresh one-call crew_begin when the decomposition proves wrong.",
+        "Wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+      )
+    } else {
+      lines.push(...crewPendingChoiceLines())
+    }
     return {
-      title: `crew registered: ${args.objective.trim().slice(0, 60)}`,
-      output: [
-        `[forge:crew] Crew registered for this session. Objective: ${args.objective.trim()}`,
-        `Declared plan (${subtasks.length}):`,
-        ...subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
-        "Proceed with the discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
-        ...(disclosure ? [disclosure] : []),
-      ].join("\n"),
+      title: `crew registered: ${objectiveText.slice(0, 60)}`,
+      output: lines.join("\n"),
     }
   },
 })
 
 const crewCloseTool = tool({
   description:
-    "Close this session's crew with the final report (ask-level user confirmation). The gate cross-checks the report against the declared subtask plan: every declared subtask needs a verdict (PASS/FAIL) and an evidence statement; an undeclared subtask in the report refuses the close; FAIL requires both failure reports (attempt + the one retry). On success the crew ends and the summary is the tool output (there is no persistent crew record).",
+    "Close this session's crew. Two paths: (a) final report — the gate cross-checks the report against the declared subtask plan (every declared subtask needs a verdict and an evidence statement; an undeclared subtask refuses the close; FAIL requires both failure reports); (b) abandon {abandon: true, reason} — the re-shard exit: no verdict requirements, ends the crew with an abandonment record, frees the session for a fresh crew_begin. Both paths are ask-gated UNLESS a live active goal governs the session (then ask-free — the goal's own gates are the user boundary).",
   args: {
     report: tool.schema.array(tool.schema.object({
       title: tool.schema.string().describe("Subtask title — must match a title declared at crew_begin"),
       verdict: tool.schema.string().describe("PASS or FAIL"),
       evidence: tool.schema.string().describe("Acceptance evidence: what the result contained that satisfies the acceptance statement"),
       attempts: tool.schema.array(tool.schema.string()).optional().describe("For FAIL: both failure reports (attempt and retry)"),
-    })).describe("The full crew report — one entry per declared subtask"),
+    })).optional().describe("The full crew report — one entry per declared subtask (not needed when abandoning)"),
+    abandon: tool.schema.boolean().optional().describe("true = abandon the crew (re-shard / standby-cancel): ends it with an abandonment record, no verdicts required"),
+    reason: tool.schema.string().optional().describe("Why the crew is abandoned (recorded in the crew record)"),
   },
   execute: async (args, context) => {
     noteToolAgent(context)
     const crew = crews.get(context.sessionID)
     if (!crew) throw new Error("[forge:crew] No active crew in this session (crew state is in-memory and dies on host restart). Start one with /crew <objective>.")
+    // Abandon path (D4): the re-shard exit — usable from PENDING (standby
+    // cancel) and EXECUTING (wrong decomposition, including mid-goal-loop
+    // re-sharding). Ask-gated unless a governing goal owns the session (D9).
+    if (args.abandon === true) {
+      const reason = String(args.reason ?? "").trim() || "(no reason given)"
+      if (!governingGoalFor(context.sessionID)) await gate(context.ask, "crew_close", `Abandon crew: ${crew.objective}`)
+      crews.delete(context.sessionID)
+      appendCrewRecord(crew.recordPath, "abandoned", [`mode at abandon: ${crew.mode}`, `reason: ${reason}`, "The session is free for a fresh crew_begin (re-shard or new objective)."])
+      return {
+        title: `crew abandoned: ${crew.objective.slice(0, 60)}`,
+        output: [
+          `[forge:crew] Crew ABANDONED: ${crew.objective}`,
+          `mode at abandon: ${crew.mode}`,
+          `reason: ${reason}`,
+          "The session is free for a fresh crew_begin — register the corrected plan next (it starts PENDING again unless a governing goal arms it in the same call).",
+        ].join("\n"),
+      }
+    }
     const report = (args.report ?? []) as CrewSubtaskReport[]
     const check = validateCrewReport(report, crew.subtasks)
     if (!check.ok) {
       throw new Error(`[forge:crew] crew_close refused — the report does not match the declared plan:\n${check.gaps.map((g) => `- ${g}`).join("\n")}\nThe crew stays active; complete or correct the report and call crew_close again.`)
     }
-    await gate(context.ask, "crew_close", `Close crew: ${crew.objective}`)
+    if (!governingGoalFor(context.sessionID)) await gate(context.ask, "crew_close", `Close crew: ${crew.objective}`)
     crews.delete(context.sessionID)
     const fails = report.filter((r) => String(r.verdict).toUpperCase() === "FAIL").length
+    appendCrewRecord(crew.recordPath, "closed", [
+      `subtasks: ${report.length} (PASS ${report.length - fails}, FAIL ${fails})`,
+      ...report.map((r) => `- ${r.title}: ${String(r.verdict).toUpperCase()} — ${String(r.evidence).slice(0, 200)}`),
+    ])
     return {
       title: `crew closed: ${crew.objective.slice(0, 60)}`,
       output: [
         `[forge:crew] Crew closed: ${crew.objective}`,
         `subtasks: ${report.length} (PASS ${report.length - fails}, FAIL ${fails})`,
         ...report.map((r) => `- ${r.title}: ${String(r.verdict).toUpperCase()} — ${String(r.evidence).slice(0, 200)}`),
-        "This output is the crew's record (crew state is in-memory; nothing persists).",
+        crew.recordPath
+          ? `Crew record (history): ${crew.recordPath}`
+          : "This output is the crew's record (crew state is in-memory; nothing persists).",
       ].join("\n"),
     }
   },
@@ -1540,6 +1730,7 @@ function goalBriefText(state: SessionState, goal: ActiveGoal): string {
       .join("\n")}`,
     d.constraints.trim() ? `Constraints: ${d.constraints.trim()}` : "",
     `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. Work the criteria now; call goal_check when you believe they hold, then goal_complete (it re-runs every check itself and asks the user). If genuinely blocked, call goal_pause with the blocker — do not spin.`,
+    `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), dispatch forge-* waves, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Crew gates stay internal to this loop.`,
     `Goal file: ${relFrom(state.worktree, goal.path)}`,
   ]
     .filter((s) => s.length > 0)
@@ -2063,6 +2254,16 @@ export const server: Plugin = async (input, options) => {
             )
           }
         }
+        // Crew pending belt (crew-harness, change add-crew-execution-mode-gate):
+        // a registered-but-unarmed crew refuses EVERY task dispatch — the
+        // registration→execution seam is a user decision point. Pre-registration
+        // recon dispatches freely; armed and ended crews never pend here.
+        const pendingCrew = input.sessionID ? crews.get(input.sessionID) : undefined
+        if (pendingCrew && pendingCrew.mode === "pending") {
+          throw new Error(
+            `[forge:crew] Dispatch refused: the crew "${pendingCrew.objective}" is PENDING (registered, not armed). Present the execution-mode choice to the user — supervised waves now / convert to a goal contract / standby — then arm per their choice with crew_begin {execution: "waves" | "goal"}. Reconnaissance task calls are free only BEFORE registration.`,
+          )
+        }
       }
       // State-file boundary (tool-partition): non-forge sessions must not
       // mutate the forge state directories. Reads stay unrestricted; this is
@@ -2329,7 +2530,10 @@ export const server: Plugin = async (input, options) => {
       // keeps it out of all other agents' sessions.
       const crewActive = crews.get(input.sessionID)
       if (crewActive && !output.system.some((s) => s.startsWith("[forge:crew-active]"))) {
-        output.system.push(`[forge:crew-active] A crew is ACTIVE in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict.`)
+        const modeText = crewActive.mode === "pending"
+          ? "PENDING (present the execution-mode choice; every task dispatch is refused until armed)"
+          : "armed (executing)"
+        output.system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict, or crew_close {abandon: true, reason} to re-shard.`)
       }
       if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
         output.system.push(
