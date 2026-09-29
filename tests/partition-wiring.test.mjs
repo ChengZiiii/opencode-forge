@@ -9,6 +9,16 @@ process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 process.env.FORGE_TEST_NO_FENCE = "1"
 const { server } = await import("../plugin.ts")
 
+// Host-lifetime simulation (hierarchical-pool-materialization): reset the
+// anchor set before each server() call so every test runs on a fresh host
+// (the primary anchor — plain-id pool — must be the test's own dir).
+let lastHost = null
+async function startServer(inputArg, opts) {
+  if (lastHost) lastHost.__forgeSubagentsTest.resetAnchors()
+  lastHost = await server(inputArg, opts)
+  return lastHost
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const allowAsk = async () => {}
 
@@ -42,7 +52,7 @@ const STATE_TOOLS = ALL_FORGE_TOOLS.filter((t) => t !== "forge_shell" && t !== "
 test("partition config: non-forge agents hide every plugin tool; explicit true is respected; nobody is disabled", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-cfg-"))
   try {
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     const cfg = { agent: { mine: { tools: { forge_shell: true } }, plain: {} } }
     await h.config(cfg)
     for (const t of ALL_FORGE_TOOLS) {
@@ -69,7 +79,7 @@ test("partition config: non-forge agents hide every plugin tool; explicit true i
 test("partition config: an explicit user default_agent is respected", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-def-"))
   try {
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     const cfg = { agent: {}, default_agent: "build" }
     await h.config(cfg)
     assert.equal(cfg.default_agent, "build", "the user's explicit choice stands")
@@ -84,7 +94,7 @@ test("partition config: forge-* workers lose harness state tools but keep the ex
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
     writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { builder: { model: "x/y", thoughtLevel: "low", shape: "write" } } }))
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     const cfg = { agent: {} }
     await h.config(cfg)
     const worker = cfg.agent["forge-builder"]
@@ -110,7 +120,7 @@ test("partition config: forge-* workers lose harness state tools but keep the ex
 test("partition belt: task dispatch of forge-* is refused for non-forge speakers, open for forge/unknown", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-dispatch-"))
   try {
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     await seed(h, "ses_b", "build")
     await seed(h, "ses_f", "forge")
     await seed(h, "ses_w", "forge-research")
@@ -134,7 +144,7 @@ test("partition belt: task dispatch of forge-* is refused for non-forge speakers
 test("partition belt: non-forge writes into forge state directories are refused; others pass", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-state-"))
   try {
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     await seed(h, "ses_b", "build")
     await seed(h, "ses_f", "forge")
     const planFile = join(wt, ".opencode", "plan", "x.md")
@@ -166,7 +176,7 @@ test("partition belt: non-forge writes into forge state directories are refused;
 test("partition fallback belts: forge bash refused, non-forge forge tools refused, hatches open, unknown open", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-belt-"))
   try {
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     await seed(h, "ses_f", "forge")
     await seed(h, "ses_b", "build")
     // Forge speaker: builtin shell hard-refused with forge_shell guidance.
@@ -188,7 +198,7 @@ test("partition fallback belts: forge bash refused, non-forge forge tools refuse
       /\[forge:partition\] Tool refused/,
     )
     // Escape hatch: keepBuiltinShell opens the builtin shell for the family.
-    const h2 = await server(inputFor(mkdtempSync(join(tmpdir(), "part-belt2-"))), { jobs: { keepBuiltinShell: true } })
+    const h2 = await startServer(inputFor(mkdtempSync(join(tmpdir(), "part-belt2-"))), { jobs: { keepBuiltinShell: true } })
     await seed(h2, "ses_f2", "forge")
     await h2["tool.execute.before"]({ tool: "bash", sessionID: "ses_f2", callID: "c5" }, { args: { command: "echo x" } })
     // Unknown speakers fail open on both belts.
@@ -206,7 +216,7 @@ test("partition fallback belts: forge bash refused, non-forge forge tools refuse
 test("partition: the draft write-ban message is agent-agnostic (D12, session-scoped)", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-draft-"))
   try {
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     const sid = "ses_draft"
     await h.tool.plan_write.execute(
       { goal: "draft ban wording", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
@@ -238,7 +248,7 @@ test("partition: /plan, /goal, /crew templates lead with the family guard", asyn
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
     writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "x/y" } } }))
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     const cfg = { agent: {} }
     await h.config(cfg)
     for (const [cmd, entryTool] of [["plan", "plan_write"], ["goal", "goal_write"]]) {
@@ -251,7 +261,7 @@ test("partition: /plan, /goal, /crew templates lead with the family guard", asyn
     assert.match(crew, /FAMILY GUARD \(step 0/)
     assert.ok(crew.indexOf("FAMILY GUARD") < crew.indexOf("crew_begin"), "crew guard precedes the discipline")
     // Unconfigured /crew (init-gate form) carries the same guard.
-    const h2 = await server(inputFor(mkdtempSync(join(tmpdir(), "part-cmd2-"))), {})
+    const h2 = await startServer(inputFor(mkdtempSync(join(tmpdir(), "part-cmd2-"))), {})
     const cfg2 = { agent: {} }
     await h2.config(cfg2)
     assert.match(cfg2.command.crew.template, /FAMILY GUARD \(step 0/)
@@ -277,7 +287,7 @@ test("partition: the goal loop parks under a non-forge speaker and resumes on fo
         status: async (o) => ({ [o.path.id]: { type: "idle" } }),
       },
     }
-    const h = await server({ ...inputFor(wt), client }, {})
+    const h = await startServer({ ...inputFor(wt), client }, {})
     const sid = "ses_goal"
     await h.tool.goal_write.execute(
       {
@@ -317,7 +327,7 @@ function readGoal(wt) {
 test("partition: compaction brief and auto-continue suppression follow the agent family", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-compact-"))
   try {
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     const sid = "ses_comp"
     await h.tool.goal_write.execute(
       {
@@ -354,7 +364,7 @@ test("partition: compaction brief and auto-continue suppression follow the agent
 test("partition: session.deleted evicts the family map", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-evict-"))
   try {
-    const h = await server(inputFor(wt), {})
+    const h = await startServer(inputFor(wt), {})
     await seed(h, "ses_x", "forge")
     const out1 = { system: [] }
     await h["experimental.chat.system.transform"]({ sessionID: "ses_x" }, out1)

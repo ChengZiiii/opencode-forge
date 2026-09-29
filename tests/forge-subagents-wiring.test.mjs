@@ -47,6 +47,15 @@ const allowCtx = (sessionID) => ({
 })
 
 const emptyCfg = () => ({ agent: {}, command: {}, permission: {} })
+// Host-lifetime simulation (hierarchical-pool-materialization): the anchor
+// set is host-level state that only grows within one host process. Each test
+// simulates a FRESH HOST by resetting the anchors before its server() call.
+let lastHost = null
+async function startServer(inputArg, opts) {
+  if (lastHost) lastHost.__forgeSubagentsTest.resetAnchors()
+  lastHost = await server(inputArg, opts) // replaced calls below use startServer
+  return lastHost
+}
 
 function projectWithForgeJson(t, json) {
   const dir = mkdtempSync(join(tmpdir(), "forge-wiring-proj-"))
@@ -74,7 +83,7 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
       },
     }),
   )
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -112,7 +121,7 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
 
 test("materialization: a user-defined forge-<id> entry is never clobbered", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   cfg.agent["forge-research"] = { description: "mine", mode: "subagent", prompt: "keep me" }
@@ -127,7 +136,7 @@ test("materialization: fail-soft — one broken entry does not disable its sibli
     t,
     JSON.stringify({ agents: { good: { model: "p/good", thoughtLevel: "low" }, bad: { thoughtLevel: "low" } } }),
   )
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -137,7 +146,7 @@ test("materialization: fail-soft — one broken entry does not disable its sibli
 
 test("materialization: an Auto worker carries no model key and describes inheritance", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { scout: {} } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -154,7 +163,7 @@ test("materialization: an Auto worker carries no model key and describes inherit
 
 test("materialization: a broken forge.json empties the set (no seed resurrection)", async (t) => {
   const dir = projectWithForgeJson(t, "{ broken")
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -163,7 +172,7 @@ test("materialization: a broken forge.json empties the set (no seed resurrection
 
 test("materialization: agent.forge.disable registers nothing", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   cfg.agent.forge = { disable: true }
@@ -174,7 +183,7 @@ test("materialization: agent.forge.disable registers nothing", async (t) => {
 })
 
 test("native-task surface: no forge_dispatch family is registered anywhere", async (t) => {
-  const h = await server(input(), {})
+  const h = await startServer(input(), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -195,7 +204,7 @@ test("native-task surface: no forge_dispatch family is registered anywhere", asy
 
 test("depth: a forge agent session gets its pinned word on the wire, frozen for the session", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "openai/gpt", thoughtLevel: "low" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
@@ -215,7 +224,7 @@ test("depth: a forge agent session gets its pinned word on the wire, frozen for 
 
 test("depth: non-forge agents and agents without thoughtLevel get nothing", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { plain: {} } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
@@ -230,7 +239,7 @@ test("depth: non-forge agents and agents without thoughtLevel get nothing", asyn
 
 test("depth: unknown provider family injects nothing, silently", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "weird/m", thoughtLevel: "low" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   const out = { options: {} }
@@ -240,7 +249,7 @@ test("depth: unknown provider family injects nothing, silently", async (t) => {
 
 test("depth: a no-mapping word injects nothing and records a bounded once-per-agent finding", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { picky: { model: "openai/gpt", thoughtLevel: "medium" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   // Catalog knows the model's native ladder: low/high/max only (no medium).
@@ -262,7 +271,7 @@ test("depth: a no-mapping word injects nothing and records a bounded once-per-ag
 
 test("crew command: with agents it carries the orchestration rulebook and the roster", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" }, review: { model: "zai/glm", thoughtLevel: "low" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -277,7 +286,7 @@ test("crew command: with agents it carries the orchestration rulebook and the ro
 })
 
 test("crew command: unconfigured is a HARD gate with initialization guidance", async (t) => {
-  const h = await server(input(), {})
+  const h = await startServer(input(), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -297,7 +306,7 @@ test("crew command: unconfigured is a HARD gate with initialization guidance", a
 
 test("materialization: a forge--prefixed id self-heals — single-prefix agent, no doubling", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { "forge-coder": { model: "zai/glm", thoughtLevel: "low" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -308,7 +317,7 @@ test("materialization: a forge--prefixed id self-heals — single-prefix agent, 
 })
 
 test("crew command: a user-defined /crew command is never clobbered", async (t) => {
-  const h = await server(input(), {})
+  const h = await startServer(input(), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   cfg.command["crew"] = { template: "MINE", description: "user owned" }
@@ -322,7 +331,7 @@ test("crew command: a user-defined /crew command is never clobbered", async (t) 
 
 test("crew_begin: registers the declared plan; refuses duplicates within the plan", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
@@ -349,7 +358,7 @@ test("crew_begin: registers the declared plan; refuses duplicates within the pla
 })
 
 test("crew_begin: HARD initialization gate — empty agent set refuses with guidance", async (t) => {
-  const h = await server(input(), {})
+  const h = await startServer(input(), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await assert.rejects(
@@ -389,7 +398,7 @@ test("crew_begin: a workspace forge.json the host cannot see is DISCLOSED, not m
   // whose forge.json defines an agent the host never materialized.
   const hostDir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const ws = workspaceWithForgeJson(t, JSON.stringify({ agents: { localtool: { model: "zai/glm", thoughtLevel: "low" } } }))
-  const h = await server(input(hostDir), {})
+  const h = await startServer(input(hostDir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   const out = await h.tool.crew_begin.execute(
@@ -398,8 +407,8 @@ test("crew_begin: a workspace forge.json the host cannot see is DISCLOSED, not m
   )
   const text = typeof out === "string" ? out : out.output
   assert.match(text, /NOT dispatchable on this host/)
-  assert.match(text, /forge-localtool/)
-  assert.match(text, /Relaunch opencode in that workspace/)
+  assert.match(text, /forge-<ns>-localtool/)
+  assert.match(text, /A host initialization in that workspace adds its pools/)
 })
 
 test("crew_begin: empty host set + usable workspace file → mismatch-explaining refusal", async (t) => {
@@ -410,7 +419,7 @@ test("crew_begin: empty host set + usable workspace file → mismatch-explaining
     } catch {}
   })
   const ws = workspaceWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
-  const h = await server(input(hostDir), {})
+  const h = await startServer(input(hostDir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await assert.rejects(
@@ -419,7 +428,7 @@ test("crew_begin: empty host set + usable workspace file → mismatch-explaining
       const m = String(err)
       assert.match(m, /CREW IS NOT INITIALIZED/)
       assert.match(m, /this session's workspace DOES have a forge\.json/)
-      assert.match(m, /Relaunch opencode in that workspace/)
+      assert.match(m, /NO host anchor covers it/)
       return true
     },
   )
@@ -438,7 +447,7 @@ test("sessionAnchor: a degenerate worktree with a distinct session directory anc
       rmSync(ws, { recursive: true, force: true })
     } catch {}
   })
-  const h = await server(input(hostDir), {})
+  const h = await startServer(input(hostDir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await h.tool.plan_write.execute(
@@ -457,7 +466,7 @@ test("crew_begin: refuses during a plan draft", async (t) => {
       rmSync(dir, { recursive: true, force: true })
     } catch {}
   })
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -480,7 +489,7 @@ test("crew_begin: refuses during a plan draft", async (t) => {
 
 test("crew_close: incomplete, renegade, and honest-FAIL reports behave per spec", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
@@ -521,7 +530,7 @@ test("crew_close: incomplete, renegade, and honest-FAIL reports behave per spec"
 })
 
 test("crew_close: no active crew refuses", async (t) => {
-  const h = await server(input(), {})
+  const h = await startServer(input(), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await assert.rejects(() => h.tool.crew_close.execute({ report: [{ title: "a", verdict: "PASS", evidence: "e" }] }, allowCtx("ses_none")), /No active crew/)
@@ -537,7 +546,7 @@ const beltArgs = () => ({ args: { subagent_type: "general", prompt: "x" } })
 
 test("crew lifecycle: registration PENDS — three-choice surface, dispatch belt, arm call", async (t) => {
   const dir = projectWithForgeJson(t, poolJson)
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
@@ -547,7 +556,8 @@ test("crew lifecycle: registration PENDS — three-choice surface, dispatch belt
   assert.match(out.output, /convert to a goal contract/, "three-choice surface: goal")
   assert.match(out.output, /standby/, "three-choice surface: standby")
   assert.match(out.output, /END YOUR TURN/, "the stop mandate")
-  assert.match(out.output, /Dispatchable roster origin: the project layer/, "origin disclosure names the layer (D8)")
+  assert.match(out.output, /Dispatchable roster origin — 1 pool across the host anchor set/, "origin disclosure enumerates pools")
+  assert.match(out.output, /root pool \(PRIMARY, plain ids\)/, "the primary root pool is marked (D8)")
   assert.doesNotMatch(out.output, /Proceed with the discipline/, "registration no longer orders immediate execution")
   assert.equal(h.__forgeSubagentsTest.crews().get("ses_lifecycle").mode, "pending")
 
@@ -571,7 +581,7 @@ test("crew lifecycle: registration PENDS — three-choice surface, dispatch belt
 
 test("crew lifecycle: goal conversion ends the crew and directs goal_write(arm)", async (t) => {
   const dir = projectWithForgeJson(t, poolJson)
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await h.tool.crew_begin.execute({ objective: "convert me", subtasks: [{ title: "one" }, { title: "two", agent: "forge-research" }] }, allowCtx("ses_conv"))
@@ -588,7 +598,7 @@ test("crew lifecycle: goal conversion ends the crew and directs goal_write(arm)"
 
 test("crew registration: an execution payload without a governing goal refuses", async (t) => {
   const dir = projectWithForgeJson(t, poolJson)
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await assert.rejects(
@@ -604,7 +614,7 @@ test("crew registration: an execution payload without a governing goal refuses",
 
 test("crew abandon: ask retained, no verdict demands, fresh begin after, works from pending AND executing", async (t) => {
   const dir = projectWithForgeJson(t, poolJson)
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await h.tool.crew_begin.execute({ objective: "wrong shape", subtasks: [{ title: "a" }] }, allowCtx("ses_ab"))
@@ -625,7 +635,7 @@ test("crew abandon: ask retained, no verdict demands, fresh begin after, works f
 
 test("crew record: registration writes it under the session anchor; arm/close append; fail-soft on an unwritable anchor", async (t) => {
   const dir = projectWithForgeJson(t, poolJson)
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   const ws = workspaceWithForgeJson(t, poolJson)
@@ -670,12 +680,12 @@ test("crew_begin origin disclosure: a global-layer host names the global path", 
       rmSync(dir, { recursive: true, force: true })
     } catch {}
   })
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   const out = await h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, allowCtx("ses_origin"))
-  assert.match(out.output, /Dispatchable roster origin: the global layer/, "the global layer is named as the origin")
-  assert.match(out.output, /\.config[\\/]opencode[\\/]forge\.json/, "the global path is spelled out")
+  assert.match(out.output, /Dispatchable roster origin — 1 pool across the host anchor set/, "the global fallback pool is the origin")
+  assert.match(out.output, /root pool \(PRIMARY, plain ids\): [^\n]*\.config[\\/]opencode[\\/]forge\.json/, "the global path is spelled out as the plain-id family")
   assert.doesNotMatch(out.output, /workspace has its own forge\.json/, "no mismatch disclosure without a session-side file")
 })
 
@@ -686,7 +696,7 @@ test("crew_begin origin disclosure: a global-layer host names the global path", 
 
 test("crew command template: the pause, GUI mutex, computer preference, abandon exit, source-agnostic framing", async (t) => {
   const dir = projectWithForgeJson(t, poolJson)
-  const h = await server(input(dir), {})
+  const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
@@ -704,7 +714,7 @@ test("crew command template: the pause, GUI mutex, computer preference, abandon 
 // Forge agent routing hint (task 3.6, D9: prompt-level discipline)
 
 test("forge agent prompt carries the routing hint", async (t) => {
-  const h = await server(input(), {})
+  const h = await startServer(input(), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
