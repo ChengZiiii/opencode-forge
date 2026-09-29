@@ -150,8 +150,8 @@ and the plugin's command of that name is not registered.
    (otherwise the name lingers in the agent list).
 4. Done — all runtime injections (agents, tool hiding, commands) are gone
    with the plugin; nothing was ever written to your config
-   (the hide was runtime-only). Your `.opencode/plan/` and `.opencode/goal/`
-   files are yours; delete them yourself if you want.
+   (the hide was runtime-only). Your `.opencode/plan/`, `.opencode/goal/`,
+   and `.opencode/crew/` files are yours; delete them yourself if you want.
  5. Optional runtime debris: delete `<tmp>/opencode-forge/` (job logs, the
     job registry ledger, the watchdog ledger, and any leftover dispatch
     ledger from older versions — the file ledger table above lists
@@ -165,6 +165,7 @@ What this plugin touches, exhaustively:
 | --- | --- | --- |
 | `<project>/.opencode/plan/*.md` | plan files | user data — kept forever, uninstall never deletes |
 | `<project>/.opencode/goal/*.md` | goal files (contract, Check Log, Turn Ledger) | user data — kept forever, uninstall never deletes |
+| `<project>/.opencode/crew/*.md` | crew records (declared plan + arm/convert/abandon/close history; written at `crew_begin` registration, appended at each transition; record-only — never a resume mechanism) | user data — kept forever, uninstall never deletes |
 | merged config object (RAM only) | forge agent, static `forge-<id>` subagents, tool-partition injections (forge family shell hide, non-forge forge-tool hide, native build/plan/general/explore minimal entries), `command.plan`, `command.goal`, `command.crew`, goal permission keys, `permission.forge_shell`, `permission.crew_close` | vanishes when the plugin is removed; nothing is written to disk |
 | `<tmp>/opencode-forge/jobs/<jobId>.log` | job output tee (full output; oldest rotated out above 50 files) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
@@ -536,23 +537,69 @@ mid-session never rewrites a running session).
 ## Crew workflow (`/crew`)
 
 `/crew <objective>` is the third state-activation command next to `/plan` and
-`/goal`: it enters crew orchestration discipline for the session. The flow:
+`/goal`: it enters crew orchestration discipline for the session. The macro
+contract above the crew may come from an approved plan, an OpenSpec change, or
+inline text — the discipline is identical in all three cases and never
+requires a plan. The flow:
 
 1. **Register** the declared plan: `crew_begin {objective, subtasks}` — one
    titled subtask each, optionally naming the intended `forge-*` agent.
-2. **Execute in waves** of parallel native `task` calls (results return
-   in-turn; the next wave launches only after the previous wave's results).
-3. **Missing role?** Run the subtask through a native task call anyway and
+   Registration enters a **PENDING** crew: execution has not started. The
+   registration output confirms the roster **with its origin** (which
+   forge.json layer the dispatchable set materialized from), points at the
+   crew record file, presents the three execution-mode choices, and stops the
+   turn. Reconnaissance task calls are free BEFORE registration.
+2. **The pause is mechanical**: while the crew pends, every `task` dispatch is
+   refused by an interception belt. The user chooses:
+   - **supervised waves now** — `crew_begin {execution: "waves"}` lifts the
+     belt and the wave discipline runs;
+   - **convert to a goal contract** — `crew_begin {execution: "goal"}` ends
+     the crew as a conversion record and the session drafts `goal_write`
+     (arm=true) folding the declared subtasks into criteria/checks; the arm
+     dialog is the user's gate;
+   - **standby** — no call; the crew waits until armed or abandoned.
+3. **Execute in waves** (armed crews only) of parallel native `task` calls
+   (results return in-turn; the next wave launches only after the previous
+   wave's results). GUI / computer-use subtasks are mutually exclusive within
+   a wave (the desktop is a singleton; non-GUI subtasks still parallelize
+   freely), and GUI walkthroughs use the `computer` tool rather than DIY
+   shell screenshot pipelines.
+4. **Missing role?** Run the subtask through a native task call anyway and
    tell the user — suggest configuring the missing role.
-4. **Verify** each subtask against its acceptance-evidence statement;
+5. **Verify** each subtask against its acceptance-evidence statement;
    retry a failure at most once.
-5. **Close** with `crew_close` — a hard, ask-gated gate cross-checking the
+6. **Close** with `crew_close` — a hard, ask-gated gate cross-checking the
    report against the DECLARED plan: every declared subtask needs a
    PASS/FAIL verdict with evidence; an undeclared subtask in the report
    refuses the close (fold discoveries into an existing verdict, or discard
-   and re-crew); a FAIL needs both failure reports. The close output is the
-   crew's record — crew state is in-memory and a host restart ends it
-   honestly.
+   and re-crew); a FAIL needs both failure reports.
+7. **Re-shard exit**: `crew_close {abandon: true, reason}` abandons the crew
+   — ask-gated like the close, no verdict requirements, usable from PENDING
+   (standby cancel) and EXECUTING (wrong decomposition) alike. The session is
+   immediately free for a fresh `crew_begin` with the corrected plan.
+
+**Crew record**: registration writes `.opencode/crew/<date>-<slug>.md` under
+the session anchor with the declared plan; arm / convert / abandon / close
+append to it. It is inspectable history and a compaction-recovery anchor —
+NOT a resume mechanism: crew state is in-memory and a host restart ends it
+honestly (a stale record is inert).
+
+**Goal-delegated orchestration**: while a live ACTIVE goal governs the
+session, the pause folds into the goal's own authorization —
+`crew_begin {objective, subtasks, execution: "waves"}` in ONE call is legal
+(born armed, never pends), `crew_close` (report and abandon) are ask-free
+(the goal's arm/complete/budget gates are the user boundary), and
+`execution: "goal"` is refused (already governed). The goal continuation
+brief carries the own-the-crew-layer directive, so an armed loop can crew,
+re-shard (`abandon` + fresh one-call registration), and close without a human
+turn. Neither harness requires its slash command — the ask dialogs are the
+authorization surfaces; the templates are discipline carriers.
+
+**Artifact anchoring** (plan / goal / crew alike): a git-repo session anchors
+artifacts at the repo root; a plain-folder session anchors at the folder
+itself (a rootish guard keeps degenerate global-project worktrees from
+landing files on the drive root or the launch anchor). The anchor follows the
+session's workspace, never the objective's scope.
 
 **Not initialized?** `/crew` on a host with zero usable forge agents refuses
 with one-time setup guidance: the two file paths, a copy-paste template, and
