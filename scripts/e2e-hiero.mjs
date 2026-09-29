@@ -74,15 +74,22 @@ try {
   // we surgically remove that line right after (UTF-8 safe, Node only).
   const repoUrl = "git+file://" + process.cwd().replace(/\\/g, "/")
   const realCfgPath = join(process.env.USERPROFILE || process.env.HOME || "", ".config", "opencode", "opencode.jsonc")
-  run("opencode", ["plugin", repoUrl, "--global", "--force"])
-  {
-    const fs = await import("node:fs")
-    const before = fs.readFileSync(realCfgPath, "utf8")
+  const stripRealConfigEntry = (phase) => {
+    const before = readFileSync(realCfgPath, "utf8")
     const line = `,\n    "${repoUrl}"`
     const after = before.includes(`"${repoUrl}"`) ? before.replace(line, "") : before
-    if (after !== before) fs.writeFileSync(realCfgPath, after, "utf8")
-    if (fs.readFileSync(realCfgPath, "utf8").includes(repoUrl)) throw new Error("real opencode.jsonc still carries the e2e git+file entry — refusing to continue")
+    if (after !== before) {
+      writeFileSync(realCfgPath, after, "utf8")
+      console.log(`[${phase}] stale e2e git+file entry removed from real opencode.jsonc`)
+    }
+    if (readFileSync(realCfgPath, "utf8").includes(repoUrl)) throw new Error("real opencode.jsonc still carries the e2e git+file entry — refusing to continue")
   }
+  // Self-heal first: a previous run killed between install and cleanup may have
+  // left the entry behind — strip it BEFORE touching the installer, so this
+  // script never inherits pollution.
+  stripRealConfigEntry("0")
+  run("opencode", ["plugin", repoUrl, "--global", "--force"])
+  stripRealConfigEntry("1")
   mkdirSync(configDir, { recursive: true })
   writeFileSync(join(configDir, "opencode.json"), JSON.stringify({ plugin: [repoUrl] }, null, 2))
   console.log("[1] git+file_ cache entry refreshed; real config cleaned; sandbox config assembled")
