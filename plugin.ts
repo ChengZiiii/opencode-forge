@@ -6,6 +6,7 @@ import { isAbsolute, join, relative } from "node:path"
 import { tmpdir, homedir } from "node:os"
 import {
   PlanError,
+  appendTerminalSection,
   closeCheckFailures,
   isTerminal,
   localDate,
@@ -142,7 +143,7 @@ const PLAN_COMMAND_TEMPLATE = [
   "Route on the argument above (decide silently; do not recite this routing text to the user):",
   '- Argument empty: for every non-terminal plan (status draft or approved) in the directory above, read its frontmatter and task checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.',
   '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked tasks to the user in one short list, then continue executing it — tick each task the moment it is done (plan_tick). If none exists, say so.',
-  '- Argument "discard": call the plan_discard tool, then tell the user the plan was abandoned and writes are restored.',
+  '- Argument "discard": call the plan_discard tool with a short reason, then tell the user the plan was abandoned and writes are restored. If the work is NOT ending but moving to another harness — crew orchestration (/crew) or a goal contract (/goal) — pass supersede with the successor artifact path (e.g. ".opencode/crew/2026-10-01-....md") so the plan is marked superseded instead, with the successor recorded in the plan file.',
   "- Any other argument: treat it as the task goal — you are now in planning mode for this goal. Follow the plan discipline below end to end.",
   "",
   "## Plan discipline",
@@ -155,7 +156,7 @@ const PLAN_COMMAND_TEMPLATE = [
   "4. Execution (tick as you go): work tasks in order; call plan_tick with the task number immediately after EACH task's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected task or ask about revising (/plan with the same goal re-enters planning).",
   "5. Completion (plan_close): when all tasks are ticked, self-check EVERY acceptance criterion with concrete evidence (file:line, command output, test result), then call plan_close with one check per criterion, pass/fail honest — a failing check refuses the close, and that is the design working, not an inconvenience. The user confirms closure in a dialog.",
   "",
-  "Boundaries: /plan discard abandons the plan (terminal, file kept as history, writes restored); /plan resume continues an unfinished plan from its remaining tasks. Work expected to span multiple sessions or days of multi-file change is spec work (e.g. OpenSpec), not plan work — say so once and let the user choose.",
+  "Boundaries: /plan discard abandons the plan (terminal, file kept as history, writes restored) — pass supersede (the successor artifact path) when the work moves to crew/goal rather than ends, marking it superseded; /plan resume continues an unfinished plan from its remaining tasks. Work expected to span multiple sessions or days of multi-file change is spec work (e.g. OpenSpec), not plan work — say so once and let the user choose.",
   "",
 ].join("\n")
 
@@ -351,7 +352,11 @@ function crewRecordPathFor(worktree: string, objective: string): string {
   return join(dir, name)
 }
 
-function writeCrewRecord(path: string, objective: string, anchor: string, subtasks: CrewSubtask[]): void {
+// lineage (change plan-supersession-and-lineage, 4.3): an EXPLICIT free-text
+// origin (e.g. the plan artifact path this crew descends from) is recorded as
+// a first-class header line; the plugin never infers lineage by linking a
+// recently-terminal plan.
+function writeCrewRecord(path: string, objective: string, anchor: string, subtasks: CrewSubtask[], lineage?: string): void {
   mkdirSync(join(path, ".."), { recursive: true })
   writeFileSync(
     path,
@@ -360,6 +365,7 @@ function writeCrewRecord(path: string, objective: string, anchor: string, subtas
       "",
       `- registered: ${nowIso()}`,
       `- anchor: ${anchor}`,
+      ...(lineage ? [`- lineage: ${lineage}`] : []),
       "",
       `## Declared plan (${subtasks.length})`,
       ...subtasks.map((s, i) => `${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
@@ -392,6 +398,7 @@ function governingGoalFor(sessionID: string | undefined): boolean {
 function crewPendingChoiceLines(): string[] {
   return [
     "[forge:crew] The crew is PENDING — execution has NOT started. Present the execution-mode choice to the user and END YOUR TURN (every task dispatch is refused while the crew pends):",
+    `RELAY FIRST: tell the user the crew record path (it leads this output) alongside this choice — the record is on disk from the registration moment, and the user must hear it.`,
     `  1. supervised waves NOW — when the user says go, call crew_begin {execution: "waves"} and run the wave discipline;`,
     `  2. convert to a goal contract — call crew_begin {execution: "goal"} (the crew ends as a conversion record; no extra dialog here), then draft goal_write with arm=true folding the declared subtasks into criteria/checks — the arm dialog is the user's gate;`,
     `  3. standby — no call; the crew waits until armed or abandoned.`,
@@ -811,29 +818,64 @@ const planCloseTool = tool({
     }
     // The completion gate: user confirms closure in the dialog this creates.
     await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`)
-    writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "done", nowIso()))
+    // Terminal lifecycle narrative (spec): the dated close section carrying
+    // the per-criterion pass/evidence summary the model already submitted
+    // lands in the SAME write as the done flip — one atomic writeFileSync.
+    const closedAt = nowIso()
+    const closed = appendTerminalSection(
+      transitionStatus(readFileSync(active.path, "utf8"), "done", closedAt),
+      "closed",
+      { reason: "completion gate passed (user confirmed)", checks: args.checks as CloseCheck[] },
+      closedAt,
+    )
+    writeFileSync(active.path, closed)
     context.metadata({ title: `Plan done: ${active.doc.goal}` })
     return {
       title: "plan done",
-      output: `Plan completed and closed (done): ${relFrom(state.worktree, active.path)}. All ${args.checks.length} self-checks passed.`,
+      output: `Plan completed and closed (done): ${relFrom(state.worktree, active.path)}. All ${args.checks.length} self-checks passed. Terminal section "## ${closedAt} — closed" appended with the per-criterion verdicts.`,
     }
   },
 })
 
 const planDiscardTool = tool({
   description:
-    "Abandon the session's active plan (draft/approved -> abandoned) and lift the draft write ban. Terminal: the file stays in .opencode/plan/ as history. Invoke via /plan discard or directly when the user cancels the task.",
+    "Abandon the session's active plan (draft/approved -> abandoned) and lift the draft write ban. Pass `supersede` (the successor artifact's path or identifier, e.g. a .opencode/crew/ or .opencode/goal/ file) when the work is not ending but moving to another harness (crew orchestration, a goal contract): the plan then becomes superseded instead of abandoned, with the successor recorded. Either way a dated terminal section carrying the reason verbatim (a missing reason lands as `reason: (none given)`) is appended to the file in the SAME write as the status flip, and the file stays in .opencode/plan/ as history. Invoke via /plan discard or directly when the user cancels the task.",
   args: {
-    reason: tool.schema.string().optional().describe("Short reason recorded in the reply"),
+    reason: tool.schema.string().optional().describe("Short reason recorded in the reply and in the appended terminal section, verbatim"),
+    supersede: tool.schema
+      .string()
+      .optional()
+      .describe(
+        "Successor artifact's path or identifier (crew record, goal contract, ...); when present the plan becomes superseded instead of abandoned and this value is persisted as the successor reference"
+      ),
   },
-  execute: async (_args, context) => {
+  execute: async (args, context) => {
     const state = ensureSession(context.sessionID, worktreeFor(context))
     const active = resolveActivePlan(state)
     if (!active) throw new PlanError("No plan to abandon in this workspace.")
-    writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "abandoned", nowIso()))
+    // Supersession is opt-in and never inferred (spec "Discard exit"): an
+    // absent/blank supersede argument is a plain abandonment. The dated
+    // narrative and the frontmatter status flip land in ONE atomic write.
+    const successor = (args.supersede ?? "").trim()
+    const superseding = successor.length > 0
+    const target = superseding ? "superseded" : "abandoned"
+    const exitedAt = nowIso()
+    const next = appendTerminalSection(
+      transitionStatus(readFileSync(active.path, "utf8"), target, exitedAt),
+      superseding ? "superseded" : "abandoned",
+      { reason: args.reason, ...(superseding ? { successor } : {}) },
+      exitedAt,
+    )
+    writeFileSync(active.path, next)
     state.planPath = undefined
-    context.metadata({ title: `Plan abandoned: ${active.doc.goal}` })
-    return { title: "plan abandoned", output: `Plan abandoned: ${relFrom(state.worktree, active.path)}. Write operations are restored.` }
+    const section = `## ${exitedAt} — ${target}`
+    context.metadata({ title: superseding ? `Plan superseded: ${active.doc.goal}` : `Plan abandoned: ${active.doc.goal}` })
+    return {
+      title: superseding ? "plan superseded" : "plan abandoned",
+      output: superseding
+        ? `Plan superseded (not abandoned): ${relFrom(state.worktree, active.path)}. Terminal section "${section}" appended (successor: ${successor}). Write operations are restored.`
+        : `Plan abandoned: ${relFrom(state.worktree, active.path)}. Terminal section "${section}" appended. Write operations are restored.`,
+    }
   },
 })
 
@@ -1433,7 +1475,7 @@ function crewOrchestrationTemplate(resolution: PoolResolution | null): string {
     "",
     "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). The macro contract above the crew may come from an approved plan, a spec change, or inline text — the discipline is identical in all three cases and never requires a plan. Follow it exactly:",
     "",
-    "1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). Reconnaissance BEFORE registration is free (task calls included). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. A wrong plan is fixed by abandoning and re-crewing (crew_close {abandon: true, reason}), never by improvising outside the declared plan.",
+    "1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). When the macro contract descends from a plan artifact, pass its path as the optional `lineage` argument (e.g. lineage: \".opencode/plan/2026-10-01-my-plan.md\") — the descent is recorded as a first-class line in the crew record header; lineage is never inferred. Reconnaissance BEFORE registration is free (task calls included). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. A wrong plan is fixed by abandoning and re-crewing (crew_close {abandon: true, reason}), never by improvising outside the declared plan.",
     '2. THE PAUSE: registration enters a PENDING crew — execution has NOT started. STOP and present the user the three execution-mode choices (supervised waves now / convert to a goal contract / standby), then END YOUR TURN. Arm per the user\'s choice: waves → crew_begin {execution: "waves"}; conversion → crew_begin {execution: "goal"} followed by goal_write (arm=true — its dialog is the user\'s gate) folding the declared subtasks into criteria/checks; standby → no call. EXCEPTION: while a live active goal governs this session, register with execution: "waves" in the SAME call — the crew is born armed (the goal contract already authorized orchestration) and crew_close / abandon stay ask-free under that goal.',
     "3. WAVES, NEVER FLOODS (armed crews only): execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in. GUI / computer-use subtasks are mutually exclusive within a wave (the desktop is a singleton resource — at most ONE in flight; non-GUI subtasks still parallelize freely), and GUI walkthroughs use the `computer` tool rather than DIY shell screenshot pipelines.",
     "4. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, run that subtask through a native task call anyway AND tell the user about the gap — suggest configuring the missing role in forge.json.",
@@ -1453,13 +1495,19 @@ const crewBeginTool = tool({
       title: tool.schema.string().describe("Short unique subtask title — the crew_close report must use these exact titles"),
       agent: tool.schema.string().optional().describe("Intended forge-* agent id for this subtask, when one matches"),
     })).describe("The declared subtask plan — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list"),
+    lineage: tool.schema.string().optional().describe("Free-text origin of the macro contract — e.g. the plan artifact path this crew descends from (.opencode/plan/<date>-<slug>.md). Recorded as a first-class lineage: line in the crew record header and disclosed in the registration output. Explicit argument only — never inferred from recently-terminal plans."),
   },
   execute: async (args, context) => {
     noteToolAgent(context)
     const state = stateForBan(context.sessionID)
     const active = state ? resolveActivePlan(state) : null
     if (active && active.doc.status === "draft") {
-      throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Call plan_approve for user approval, or /plan discard to abandon the plan.")
+      throw new Error(
+        "[forge:crew] A plan is in draft; crew orchestration is denied during planning. Three exits: " +
+          "plan_approve puts the plan to user approval (an APPROVED plan does not block /crew — only a draft does); " +
+          "/plan discard abandons the plan outright; " +
+          '/plan discard {supersede: "<successor path or id>"} moves the work into this crew (the plan becomes superseded, the successor recorded).',
+      )
     }
     // Hard initialization gate (spec: crew-harness — "Unconfigured crew
     // initialization gate"): keyed on the POOL-RESOLVED set across the whole
@@ -1573,6 +1621,10 @@ const crewBeginTool = tool({
       throw new Error('[forge:crew] execution:"goal" converts an already-registered PENDING crew — register the plan first (no execution), then convert. Under a governing goal, only "waves" one-call arming is legal (the loop already owns the goal).')
     }
     const governed = execution === "waves"
+    // lineage (plan-supersession-and-lineage 4.3): recorded ONLY when the
+    // caller explicitly passed it — never inferred from a recently-terminal
+    // plan.
+    const lineage = String(args.lineage ?? "").trim()
     // Crew record (D7): fail-soft — its absence never blocks the crew. Shares
     // the sessionAnchor chain with plan/goal artifacts; record-only, never a
     // resume mechanism.
@@ -1582,7 +1634,7 @@ const crewBeginTool = tool({
     if (anchorDir) {
       try {
         recordPath = crewRecordPathFor(anchorDir, objectiveText)
-        writeCrewRecord(recordPath, objectiveText, anchorDir, subtasks)
+        writeCrewRecord(recordPath, objectiveText, anchorDir, subtasks, lineage || undefined)
         recordNote = `Crew record (inspectable history; NOT a resume mechanism): ${relFrom(anchorDir, recordPath)}`
       } catch {
         recordPath = null
@@ -1613,7 +1665,13 @@ const crewBeginTool = tool({
       familyLines.push(`   - ${label}: ${f.file} — ${f.materializedIds.map((id) => `forge-${id}`).join(", ") || "no agents"}`)
     }
     if (families.length > 8) familyLines.push(`   - …and ${families.length - 8} more pools`)
+    // plan-supersession-and-lineage 4.1: the crew record path LEADS the
+    // output — first block, before the objective summary and the declared
+    // plan (the plan tools' "Plan created:" prominence); the roster-origin
+    // disclosure follows the declared plan.
     const lines = [
+      ...(recordNote ? [recordNote] : []),
+      ...(lineage ? [`Lineage: ${lineage}`] : []),
       governed
         ? `[forge:crew] Crew registered UNDER THE GOVERNING GOAL — born armed, never pends. Objective: ${objectiveText}`
         : `[forge:crew] Crew registered PENDING for this session (execution has NOT started). Objective: ${objectiveText}`,
@@ -1621,7 +1679,6 @@ const crewBeginTool = tool({
       ...subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
       `Dispatchable roster origin — ${families.length} pool${families.length === 1 ? "" : "s"} across the host anchor set${hostAnchors.length > 0 ? ` (anchors: ${hostAnchors.join(", ")})` : ""}:`,
       ...familyLines,
-      ...(recordNote ? [recordNote] : []),
       ...(disclosure ? [disclosure] : []),
     ]
     if (governed) {
