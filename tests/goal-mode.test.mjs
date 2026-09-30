@@ -8,6 +8,7 @@ import { join } from "node:path"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 const { server } = await import("../plugin.ts")
 import { appendLedger, parseGoal } from "../src/goal-file.ts"
+import { appendTerminalSection, parsePlan, rankActivePlans, transitionStatus } from "../src/plan-file.ts"
 import { setShellRunnerForTests, runChecks } from "../src/run-check.ts"
 
 const NOW_PREFIX = "goal-mode-test"
@@ -766,6 +767,259 @@ test("draft-conflict: a draft plan appearing mid-goal pauses the loop instead of
   }
 })
 
+// ---------------------------------------------------------------------------
+// plan terminal lifecycle wiring (spec: Discard exit / Terminal lifecycle
+// narrative): the dated narrative and the status flip land in ONE write;
+// supersession is opt-in via the supersede argument, never inferred.
+// ---------------------------------------------------------------------------
+
+function planArgs(overrides = {}) {
+  return {
+    goal: "supersedeable work",
+    context: "recon found the entry point",
+    approach: "direct edit; rejected the framework swap as too big",
+    tasks: ["step one", "step two"],
+    risks: "none",
+    acceptance: ["it works", "it is fast"],
+    ...overrides,
+  }
+}
+
+function planFile(worktree) {
+  const dir = join(worktree, ".opencode", "plan")
+  const names = readdirSync(dir).filter((f) => f.endsWith(".md"))
+  assert.equal(names.length, 1)
+  const path = join(dir, names[0])
+  return { name: names[0], path, text: readFileSync(path, "utf8") }
+}
+
+test("plan_discard {supersede}: superseded status + successor narrative, output names the section, one atomic write", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-supersede-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    await hooks.tool.plan_write.execute(planArgs(), toolCtx(sid, wt))
+    const before = planFile(wt)
+    const out = await hooks.tool.plan_discard.execute(
+      { reason: "work moved to crew orchestration", supersede: ".opencode/crew/2026-10-01-campaign.md" },
+      toolCtx(sid, wt),
+    )
+    const f = planFile(wt)
+    assert.equal(parsePlan(f.text).status, "superseded", "supersede present -> superseded, never abandoned")
+    // Single atomic write: the on-disk bytes equal exactly one composition of
+    // the status flip + narrative under ONE shared timestamp (a section date
+    // differing from `updated` would mean two writes happened).
+    const updated = f.text.match(/^updated: (.*)$/m)[1]
+    assert.equal(
+      f.text,
+      appendTerminalSection(
+        transitionStatus(before.text, "superseded", updated),
+        "superseded",
+        { reason: "work moved to crew orchestration", successor: ".opencode/crew/2026-10-01-campaign.md" },
+        updated,
+      ),
+    )
+    assert.ok(f.text.includes("reason: work moved to crew orchestration"))
+    assert.ok(f.text.includes("successor: .opencode/crew/2026-10-01-campaign.md"))
+    assert.match(out.output, /superseded/)
+    assert.match(out.output, /— superseded/, "output names the appended section")
+    assert.match(out.output, /successor/)
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("plan_discard without supersede stays abandoned; reason survives verbatim; missing reason lands (none given)", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-abandon-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    await hooks.tool.plan_write.execute(planArgs(), toolCtx(sid, wt))
+    const before = planFile(wt)
+    const out = await hooks.tool.plan_discard.execute({ reason: "user cancelled the task" }, toolCtx(sid, wt))
+    const f = planFile(wt)
+    assert.equal(parsePlan(f.text).status, "abandoned")
+    assert.ok(f.text.includes("reason: user cancelled the task"), "reason verbatim in the artifact")
+    assert.ok(!f.text.includes("successor:"), "no successor line on a plain discard")
+    const updated = f.text.match(/^updated: (.*)$/m)[1]
+    assert.equal(
+      f.text,
+      appendTerminalSection(transitionStatus(before.text, "abandoned", updated), "abandoned", { reason: "user cancelled the task" }, updated),
+    )
+    assert.match(out.output, /— abandoned/)
+    // Missing reason: the transition still appends the explicit (none given)
+    // marker — never silent. The abandoned plan is terminal, so a fresh
+    // session can plan again in the same workspace.
+    await hooks.tool.plan_write.execute(planArgs({ goal: "second attempt" }), toolCtx(nextSid(), wt))
+    await hooks.tool.plan_discard.execute({}, toolCtx(nextSid(), wt))
+    const others = readdirSync(join(wt, ".opencode", "plan")).filter((n) => n !== f.name)
+    assert.equal(others.length, 1)
+    const text2 = readFileSync(join(wt, ".opencode", "plan", others[0]), "utf8")
+    assert.equal(parsePlan(text2).status, "abandoned")
+    assert.ok(text2.includes("reason: (none given)"))
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("plan_close appends the dated close section with per-criterion verdicts in the same write as done", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-close-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    await hooks.tool.plan_write.execute(planArgs(), toolCtx(sid, wt))
+    await hooks.tool.plan_approve.execute({}, toolCtx(sid, wt))
+    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sid, wt))
+    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sid, wt))
+    const before = planFile(wt)
+    let asked = 0
+    const out = await hooks.tool.plan_close.execute(
+      {
+        checks: [
+          { criterion: "it works", pass: true, evidence: "node --test: 2 pass" },
+          { criterion: "it is fast", pass: true, evidence: "bench p95 12ms" },
+        ],
+      },
+      toolCtx(sid, wt, (req) => {
+        asked++
+        assert.equal(req.permission, "plan_close")
+      }),
+    )
+    assert.equal(asked, 1, "close gate must fire exactly once")
+    const f = planFile(wt)
+    assert.equal(parsePlan(f.text).status, "done")
+    const updated = f.text.match(/^updated: (.*)$/m)[1]
+    assert.equal(
+      f.text,
+      appendTerminalSection(
+        transitionStatus(before.text, "done", updated),
+        "closed",
+        {
+          reason: "completion gate passed (user confirmed)",
+          checks: [
+            { criterion: "it works", pass: true, evidence: "node --test: 2 pass" },
+            { criterion: "it is fast", pass: true, evidence: "bench p95 12ms" },
+          ],
+        },
+        updated,
+      ),
+    )
+    assert.ok(f.text.includes("- PASS — it works"))
+    assert.ok(f.text.includes("  evidence: node --test: 2 pass"))
+    assert.ok(f.text.includes("- PASS — it is fast"))
+    assert.match(out.output, /— closed/, "output names the appended section")
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+function planDirEntries(worktree) {
+  const dir = join(worktree, ".opencode", "plan")
+  return readdirSync(dir)
+    .filter((f) => f.endsWith(".md"))
+    .map((name) => ({ name, text: readFileSync(join(dir, name), "utf8") }))
+}
+
+// ---------------------------------------------------------------------------
+// plan terminal lifecycle edges (task 5.2): the blank-supersede fallback, the
+// exact section relay in tool outputs, superseded-as-terminal discovery.
+
+test("plan_discard: a blank/whitespace supersede is a plain abandonment — supersession stays opt-in", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-blank-supersede-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    await hooks.tool.plan_write.execute(planArgs({ goal: "blank supersede case" }), toolCtx(sid, wt))
+    const out = await hooks.tool.plan_discard.execute({ reason: "moved on", supersede: "   " }, toolCtx(sid, wt))
+    const f = planFile(wt)
+    assert.equal(parsePlan(f.text).status, "abandoned", "a whitespace-only supersede is treated as absent (S2 trade-off)")
+    assert.ok(!f.text.includes("successor:"), "no successor line without a real successor value")
+    assert.match(out.output, /— abandoned/, "the output announces the abandoned exit, never superseded")
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("terminal outputs relay the exact appended section: discard and close both name their `## <iso> — <kind>` heading", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-section-relay-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    // Discard relay.
+    const sidA = nextSid()
+    await hooks.tool.plan_write.execute(planArgs({ goal: "relay the discard section" }), toolCtx(sidA, wt))
+    const outA = await hooks.tool.plan_discard.execute({ reason: "user cancelled" }, toolCtx(sidA, wt))
+    const fA = planDirEntries(wt).find((e) => e.text.includes("goal: relay the discard section"))
+    const headingA = fA.text.match(/^## (.+ — abandoned)$/m)[1]
+    assert.ok(outA.output.includes(`## ${headingA}`), "the discard output carries the exact dated section heading from disk")
+    // Close relay.
+    const sidB = nextSid()
+    await hooks.tool.plan_write.execute(planArgs({ goal: "relay the close section" }), toolCtx(sidB, wt))
+    await hooks.tool.plan_approve.execute({}, toolCtx(sidB, wt))
+    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sidB, wt))
+    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sidB, wt))
+    const outB = await hooks.tool.plan_close.execute(
+      {
+        checks: [
+          { criterion: "it works", pass: true, evidence: "node --test: 2 pass" },
+          { criterion: "it is fast", pass: true, evidence: "bench p95 12ms" },
+        ],
+      },
+      toolCtx(sidB, wt),
+    )
+    const fB = planDirEntries(wt).find((e) => e.text.includes("goal: relay the close section"))
+    const headingB = fB.text.match(/^## (.+ — closed)$/m)[1]
+    assert.ok(outB.output.includes(`## ${headingB}`), "the close output carries the exact dated section heading from disk")
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("a superseded plan is an ordinary terminal artifact: discovery skips it and a fresh draft reclaims the session", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-superseded-terminal-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    await hooks.tool.plan_write.execute(planArgs({ goal: "the superseded ancestor" }), toolCtx(sid, wt))
+    await hooks.tool.plan_discard.execute(
+      { reason: "work moved to the crew", supersede: ".opencode/crew/2026-10-01-campaign.md" },
+      toolCtx(sid, wt),
+    )
+    const ancestor = planFile(wt)
+    assert.equal(parsePlan(ancestor.text).status, "superseded")
+    // Discovery ordering (pure core): rankActivePlans drops the superseded file entirely.
+    assert.deepEqual(rankActivePlans(planDirEntries(wt)), [])
+    // Wiring: resolveActivePlan no longer binds it — approval refuses with the no-plan contract string.
+    await assert.rejects(
+      () => hooks.tool.plan_approve.execute({}, toolCtx(sid, wt)),
+      /No plan awaiting approval\. Create one with plan_write first\./,
+    )
+    // A fresh session plans again in the same workspace and becomes the active plan.
+    const sid2 = nextSid()
+    await hooks.tool.plan_write.execute(planArgs({ goal: "the fresh successor plan" }), toolCtx(sid2, wt))
+    const ranked = rankActivePlans(planDirEntries(wt))
+    assert.equal(ranked.length, 1)
+    assert.equal(ranked[0].doc.status, "draft")
+    assert.equal(ranked[0].doc.goal, "the fresh successor plan")
+    await hooks.tool.plan_approve.execute({}, toolCtx(sid2, wt))
+    const successor = planDirEntries(wt).find((e) => e.text.includes("goal: the fresh successor plan"))
+    assert.equal(parsePlan(successor.text).status, "approved")
+    assert.equal(parsePlan(ancestor.text).status, "superseded", "the terminal ancestor stays frozen")
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
 // ---------------------------------------------------------------------------
 // compaction + notices
 // ---------------------------------------------------------------------------

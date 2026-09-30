@@ -483,7 +483,15 @@ test("crew_begin: refuses during a plan draft", async (t) => {
   )
   await assert.rejects(
     () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, allowCtx("ses_draft")),
-    /plan is in draft/,
+    (err) => {
+      const m = String(err)
+      assert.match(m, /plan is in draft/)
+      assert.match(m, /plan_approve/, "exit 1 named: approval")
+      assert.match(m, /an APPROVED plan does not block \/crew/, "the approved-plan note")
+      assert.match(m, /\/plan discard abandons the plan outright/, "exit 2 named: outright discard")
+      assert.match(m, /\/plan discard \{supersede/, "exit 3 named: the supersede exit into the crew")
+      return true
+    },
   )
 })
 
@@ -552,6 +560,11 @@ test("crew lifecycle: registration PENDS — three-choice surface, dispatch belt
 
   const out = await h.tool.crew_begin.execute({ objective: "gate it", subtasks: [{ title: "one" }] }, allowCtx("ses_lifecycle"))
   assert.match(out.output, /registered PENDING/, "registration announces the pending state")
+  const recLine = out.output.indexOf("Crew record (inspectable history")
+  const objLine = out.output.indexOf("registered PENDING")
+  const planLine = out.output.indexOf("Declared plan (")
+  assert.ok(recLine !== -1 && objLine !== -1 && planLine !== -1 && recLine < objLine && objLine < planLine, "the record path line leads the output, before the objective summary and the declared plan (4.1)")
+  assert.match(out.output, /RELAY FIRST: tell the user the crew record path/, "the PENDING pause text mandates relaying the record path to the user (4.2)")
   assert.match(out.output, /supervised waves NOW/, "three-choice surface: waves")
   assert.match(out.output, /convert to a goal contract/, "three-choice surface: goal")
   assert.match(out.output, /standby/, "three-choice surface: standby")
@@ -707,9 +720,121 @@ test("crew command template: the pause, GUI mutex, computer preference, abandon 
   assert.match(tpl, /mutually exclusive within a wave/, "GUI/computer-use subtasks are serialized per wave")
   assert.match(tpl, /`computer` tool/, "GUI walkthroughs prefer the computer tool")
   assert.match(tpl, /abandon: true/, "the abandon exit is taught in the template")
+  assert.match(tpl, /optional `lineage` argument/, "the REGISTER step teaches lineage when descending from a plan artifact (4.5)")
   assert.doesNotMatch(tpl, /Proceed with the discipline: waves/, "the immediate-execution order is gone")
 })
 
+// ---------------------------------------------------------------------------
+// plan-supersession-and-lineage wiring (task 5.2): registration output
+// ordering, lineage recording, the PENDING relay mandate, the draft-gate
+// exits, and the crew record's dated close section.
+
+test("crew registration output order: record path leads, then the objective, then the declared plan; explicit lineage is disclosed", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await h.tool.crew_begin.execute(
+    { objective: "descend from a plan", subtasks: [{ title: "one" }], lineage: ".opencode/plan/2026-10-01-my-plan.md" },
+    allowCtx("ses_order"),
+  )
+  const recLine = out.output.indexOf("Crew record (inspectable history")
+  const objLine = out.output.indexOf("Objective: descend from a plan")
+  const planLine = out.output.indexOf("Declared plan (")
+  assert.ok(recLine !== -1 && objLine !== -1 && planLine !== -1, "all three blocks are present")
+  assert.ok(recLine < objLine, "the crew record path line leads the output (4.1)")
+  assert.ok(objLine < planLine, "the objective summary precedes the declared plan (4.1)")
+  assert.match(out.output, /Lineage: \.opencode\/plan\/2026-10-01-my-plan\.md/, "an explicit lineage is disclosed in the registration output (4.3)")
+})
+
+test("crew record header: an explicit lineage lands as a sibling header line; without the argument there is none", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.crew_begin.execute(
+    { objective: "lineage present", subtasks: [{ title: "one" }], lineage: ".opencode/plan/2026-10-01-src.md" },
+    allowCtx("ses_lin_yes"),
+  )
+  const withLin = readFileSync(h.__forgeSubagentsTest.crews().get("ses_lin_yes").recordPath, "utf8")
+  const header = withLin.slice(0, withLin.indexOf("## Declared plan"))
+  const regAt = header.indexOf("- registered: ")
+  const anchorAt = header.indexOf("- anchor: ")
+  const linAt = header.indexOf("- lineage: .opencode/plan/2026-10-01-src.md")
+  assert.ok(regAt !== -1 && anchorAt !== -1 && linAt !== -1, "lineage is a header sibling of registered/anchor (4.3)")
+  assert.ok(regAt < anchorAt && anchorAt < linAt, "the lineage line sits in the header block after the anchor line")
+  // Explicit-only (negative): registration without the argument leaves no lineage line.
+  await h.tool.crew_begin.execute({ objective: "lineage absent", subtasks: [{ title: "one" }] }, allowCtx("ses_lin_no"))
+  const withoutLin = readFileSync(h.__forgeSubagentsTest.crews().get("ses_lin_no").recordPath, "utf8")
+  assert.doesNotMatch(withoutLin, /^- lineage:/m, "no lineage line without an explicit argument (never inferred)")
+  assert.match(withoutLin, /^- registered: /m)
+})
+
+test("PENDING pause: the relay-first mandate names the crew record path and precedes the three choices", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await h.tool.crew_begin.execute({ objective: "relay the path", subtasks: [{ title: "one" }] }, allowCtx("ses_relay"))
+  assert.match(out.output, /RELAY FIRST: tell the user the crew record path/, "the PENDING text mandates relaying the record path (4.2)")
+  const relayAt = out.output.indexOf("RELAY FIRST")
+  const choiceAt = out.output.indexOf("1. supervised waves NOW")
+  assert.ok(relayAt !== -1 && choiceAt !== -1 && relayAt < choiceAt, "the relay mandate precedes the execution-mode choices")
+})
+
+test("draft gate: the refusal names all three exits; an APPROVED plan really does not block registration", async (t) => {
+  // Own worktree: the leftover approved plan must not poison the other tests.
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.plan_write.execute(
+    { goal: "gate exits", context: "c", approach: "a", tasks: ["t1"], risks: "r", acceptance: ["a1"] },
+    allowCtx("ses_gate3"),
+  )
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "blocked while drafting", subtasks: [{ title: "x" }] }, allowCtx("ses_gate3")),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /plan_approve/, "exit 1: approval")
+      assert.match(m, /an APPROVED plan does not block \/crew/, "the approved-plan note rides the refusal (4.4)")
+      assert.match(m, /\/plan discard abandons the plan outright/, "exit 2: outright discard")
+      assert.match(m, /\/plan discard \{supersede:/, "exit 3: the supersede exit into the crew")
+      return true
+    },
+  )
+  // The note is behavior, not wording: after approval the registration goes through.
+  await h.tool.plan_approve.execute({}, allowCtx("ses_gate3"))
+  const out = await h.tool.crew_begin.execute({ objective: "unblocked after approval", subtasks: [{ title: "x" }] }, allowCtx("ses_gate3"))
+  assert.match(out.output, /registered PENDING/)
+})
+
+test("crew record: close appends a dated section carrying per-subtask verdicts (PASS and normalized FAIL)", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.crew_begin.execute(
+    { objective: "close the record", subtasks: [{ title: "alpha" }, { title: "beta" }] },
+    allowCtx("ses_closerec"),
+  )
+  const recPath = h.__forgeSubagentsTest.crews().get("ses_closerec").recordPath
+  const out = await h.tool.crew_close.execute(
+    {
+      report: [
+        { title: "alpha", verdict: "PASS", evidence: "tests green" },
+        { title: "beta", verdict: "fail", evidence: "both attempts blew up", attempts: ["attempt one", "retry one"] },
+      ],
+    },
+    allowCtx("ses_closerec"),
+  )
+  assert.match(out.output, /PASS 1, FAIL 1/)
+  const rec = readFileSync(recPath, "utf8")
+  assert.match(rec, /^## \S+ — closed$/m, "a dated close section is appended to the record")
+  assert.match(rec, /subtasks: 2 \(PASS 1, FAIL 1\)/)
+  assert.match(rec, /- alpha: PASS — tests green/)
+  assert.match(rec, /- beta: FAIL — both attempts blew up/, "a lowercase verdict is normalized to FAIL in the record")
+})
 // ---------------------------------------------------------------------------
 // Forge agent routing hint (task 3.6, D9: prompt-level discipline)
 

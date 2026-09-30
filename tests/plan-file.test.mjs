@@ -10,6 +10,7 @@ import {
   parsePlanLoose,
   tickTask,
   transitionStatus,
+  appendTerminalSection,
   progressOf,
   closeCheckFailures,
   rankActivePlans,
@@ -220,4 +221,176 @@ test("rankActivePlans: non-terminal by updated desc; terminal and garbage exclud
   ])
   assert.deepEqual(ranked.map((r) => r.name), ["c-draft.md", "b-approved.md"])
   assert.deepEqual(rankActivePlans([]), [])
+})
+
+test("superseded: legal from draft/approved, terminal and closed afterwards", () => {
+  const text = renderPlan(sampleInput(), NOW)
+  assert.ok(canTransition("draft", "superseded"))
+  assert.ok(canTransition("approved", "superseded"))
+  assert.ok(isTerminal("superseded"))
+  const superseded = transitionStatus(text, "superseded", "2026-09-25T11:00:00+08:00")
+  assert.equal(parsePlan(superseded).status, "superseded")
+  // terminal is terminal: nothing leaves superseded
+  assert.throws(() => transitionStatus(superseded, "approved", NOW), /Illegal/)
+  assert.throws(() => transitionStatus(superseded, "abandoned", NOW), /Illegal/)
+  assert.throws(() => transitionStatus(superseded, "done", NOW), /Illegal/)
+  assert.throws(() => transitionStatus(superseded, "superseded", NOW), /already superseded/)
+  // no other terminal reaches superseded either
+  const approved = transitionStatus(text, "approved", NOW)
+  const done = transitionStatus(approved, "done", NOW)
+  const abandoned = transitionStatus(text, "abandoned", NOW)
+  assert.ok(!canTransition("done", "superseded"))
+  assert.ok(!canTransition("abandoned", "superseded"))
+  assert.throws(() => transitionStatus(done, "superseded", NOW), /Illegal/)
+  assert.throws(() => transitionStatus(abandoned, "superseded", NOW), /Illegal/)
+  // the refusal names the superseded legal path alongside abandoned
+  assert.throws(
+    () => transitionStatus(done, "superseded", NOW),
+    (e) => e instanceof PlanError && e.message.includes("abandoned/superseded"),
+  )
+  // discovery treats superseded like any other terminal
+  const ranked = rankActivePlans([
+    { name: "s-superseded.md", text: superseded },
+    { name: "d-draft.md", text },
+  ])
+  assert.deepEqual(ranked.map((r) => r.name), ["d-draft.md"])
+})
+
+test("appendTerminalSection: close section carries reason and per-criterion pass/evidence", () => {
+  const text = renderPlan(sampleInput(), NOW)
+  const doc = parsePlan(text)
+  const closed = appendTerminalSection(
+    text,
+    "closed",
+    {
+      reason: "completion gate passed",
+      checks: [
+        { criterion: doc.acceptance[0], pass: true, evidence: "node --test: 12 pass" },
+        { criterion: doc.acceptance[1], pass: false, evidence: "" },
+      ],
+    },
+    "2026-09-25T18:00:00+08:00",
+  )
+  assert.ok(closed.includes("## 2026-09-25T18:00:00+08:00 — closed"))
+  assert.ok(closed.includes("reason: completion gate passed"))
+  assert.ok(closed.includes(`- PASS — ${doc.acceptance[0]}`))
+  assert.ok(closed.includes("  evidence: node --test: 12 pass"))
+  assert.ok(closed.includes(`- FAIL — ${doc.acceptance[1]}`))
+  assert.ok(closed.includes("  evidence: (none)"))
+  // appended at END of file, original bytes preserved verbatim
+  assert.ok(closed.indexOf("## 2026-09-25T18:00:00+08:00") > closed.indexOf("## Acceptance Criteria"))
+  assert.ok(closed.startsWith(text))
+  assert.ok(closed.endsWith("  evidence: (none)\n"))
+})
+
+test("appendTerminalSection: abandon and superseded carry reason; successor only on supersede", () => {
+  const text = renderPlan(sampleInput(), NOW)
+  const abandoned = appendTerminalSection(text, "abandoned", { reason: "user cancelled the task" }, "2026-09-25T17:00:00+08:00")
+  assert.ok(abandoned.includes("## 2026-09-25T17:00:00+08:00 — abandoned"))
+  assert.ok(abandoned.includes("reason: user cancelled the task"))
+  assert.ok(!abandoned.includes("successor:"))
+  assert.ok(!abandoned.includes("checks:"))
+
+  const superseded = appendTerminalSection(
+    text,
+    "superseded",
+    { reason: "work moved to crew orchestration", successor: ".opencode/crew/2026-10-01-campaign.md" },
+    "2026-09-25T17:30:00+08:00",
+  )
+  assert.ok(superseded.includes("## 2026-09-25T17:30:00+08:00 — superseded"))
+  assert.ok(superseded.includes("reason: work moved to crew orchestration"))
+  assert.ok(superseded.includes("successor: .opencode/crew/2026-10-01-campaign.md"))
+
+  // D4: the narrative is mandatory, the reason is not — a missing reason
+  // gets the explicit (none given) marker for every kind
+  for (const kind of ["closed", "abandoned", "superseded"]) {
+    const noReason = appendTerminalSection(text, kind, {}, "2026-09-25T17:45:00+08:00")
+    assert.ok(noReason.includes("reason: (none given)"))
+    assert.ok(noReason.includes(`## 2026-09-25T17:45:00+08:00 — ${kind}`))
+  }
+  // pure-function contract error: unknown kind throws (no fail-soft here)
+  assert.throws(() => appendTerminalSection(text, "resumed", {}, NOW), PlanError)
+  // input without a trailing newline still gets a clean blank-line separation
+  assert.ok(appendTerminalSection("no trailing newline", "abandoned", {}, NOW).startsWith("no trailing newline\n\n## "))
+})
+
+test("terminal sections are parser-inert: adversarial narrative changes no parse result", () => {
+  const text = tickTask(renderPlan(sampleInput(), NOW), 1, "2026-09-25T11:00:00+08:00")
+  const before = parsePlan(text)
+  // Reason text shaped like plan content: checkbox-like lines and
+  // status/updated/goal key-value lines. The narrative must never move
+  // status, ticks, or acceptance — spec inertness scope is exactly these.
+  const adversarialReason = [
+    "- [ ] 9. fake task injected by narrative",
+    "- [x] 2. fake pre-ticked task <!-- ticked: 2026-01-01T00:00:00+08:00 -->",
+    "status: approved",
+    "updated: 1999-01-01T00:00:00+08:00",
+    "goal: hijacked goal",
+    "created: 2000-01-01T00:00:00+08:00",
+  ].join("\n")
+  const T = "2026-09-25T18:00:00+08:00"
+  const finalText = appendTerminalSection(
+    transitionStatus(text, "superseded", T),
+    "superseded",
+    { reason: adversarialReason, successor: ".opencode/crew/2026-10-01-next.md" },
+    T,
+  )
+  assert.ok(finalText.includes("- [ ] 9. fake task injected by narrative"))
+  assert.ok(finalText.includes("status: approved"))
+  const after = parsePlan(finalText)
+  assert.equal(after.status, "superseded")
+  assert.deepEqual(after.tasks, before.tasks)
+  assert.deepEqual(progressOf(after), progressOf(before))
+  assert.deepEqual(after.acceptance, before.acceptance)
+  assert.equal(after.goal, before.goal)
+  assert.equal(after.created, before.created)
+  assert.equal(after.updated, T)
+  // the close-checks narrative is equally inert (criteria text re-quoted there)
+  const closedText = appendTerminalSection(text, "closed", {
+    reason: "gate passed",
+    checks: before.acceptance.map((c) => ({ criterion: c, pass: true, evidence: "e" })),
+  }, "2026-09-25T19:00:00+08:00")
+  const afterClose = parsePlan(closedText)
+  assert.equal(afterClose.status, "draft")
+  assert.deepEqual(afterClose.tasks, before.tasks)
+  assert.deepEqual(afterClose.acceptance, before.acceptance)
+})
+
+test("first-section-wins: a '## Task List' header quoted in the terminal reason is inert prose", () => {
+  const text = tickTask(renderPlan(sampleInput(), NOW), 1, "2026-09-25T11:00:00+08:00")
+  const T = "2026-09-25T18:00:00+08:00"
+  const abandonedText = transitionStatus(text, "abandoned", T)
+  const before = parsePlan(abandonedText)
+  // Verbatim reason quoting a plan-shaped fragment: the standalone "## Task List"
+  // line used to re-open the section, overwrite the real Task List with the fake
+  // content and make parsePlan throw ("Task list is empty or malformed"). With
+  // first-section-wins the repeat is inert prose folded into the preceding
+  // section's text: nothing re-opens, nothing throws, no count drifts.
+  const adversarialReason = [
+    "user pasted a plan fragment into the discard reason:",
+    "## Task List",
+    "- [ ] fake task",
+    "- [x] fake done",
+    "status: draft",
+    "1. fake criterion",
+  ].join("\n")
+  const finalText = appendTerminalSection(abandonedText, "abandoned", { reason: adversarialReason }, T)
+  // the reason survives verbatim, hostile header included
+  assert.ok(finalText.includes("reason: user pasted a plan fragment into the discard reason:\n## Task List"))
+  for (const frag of ["- [ ] fake task", "- [x] fake done", "status: draft", "1. fake criterion"]) {
+    assert.ok(finalText.includes(frag), `verbatim: ${frag}`)
+  }
+  let after
+  assert.doesNotThrow(() => {
+    after = parsePlan(finalText)
+  })
+  // status reads frontmatter only — the fake "status: draft" line is ignored
+  assert.equal(after.status, "abandoned")
+  assert.equal(after.status, before.status)
+  // tick counts read the real Task List section only
+  assert.equal(after.sections.get("Task List"), before.sections.get("Task List"))
+  assert.deepEqual(after.tasks, before.tasks)
+  assert.deepEqual(progressOf(after), progressOf(before))
+  // section structure: same recognized sections, no phantom reopened one
+  assert.deepEqual([...after.sections.keys()].sort(), [...before.sections.keys()].sort())
 })
