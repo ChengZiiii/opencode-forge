@@ -7,7 +7,7 @@
 // Document shape (rendered by renderPlan, parsed by parsePlan):
 //
 //   ---
-//   status: draft          # draft -> approved -> done; exit: abandoned
+//   status: draft          # draft -> approved -> done; exits: abandoned, superseded
 //   created: <ISO>
 //   updated: <ISO>
 //   goal: <one line>
@@ -22,7 +22,7 @@
 // emits it); Chinese headers from plans written by earlier plugin
 // versions still parse through SECTION_ALIASES.
 
-export type PlanStatus = "draft" | "approved" | "done" | "abandoned"
+export type PlanStatus = "draft" | "approved" | "done" | "abandoned" | "superseded"
 
 export type PlanTask = {
   n: number
@@ -64,15 +64,17 @@ export class PlanError extends Error {
   }
 }
 
-const TERMINAL: PlanStatus[] = ["done", "abandoned"]
+const TERMINAL: PlanStatus[] = ["done", "abandoned", "superseded"]
 
 // Legal status transitions. draft -> approved (user gate), approved -> done
-// (user gate after self-check), either active state -> abandoned (discard).
+// (user gate after self-check), either active state -> abandoned (discard)
+// or -> superseded (discard {supersede}: the work moved to another harness).
 const LEGAL_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
-  draft: ["approved", "abandoned"],
-  approved: ["done", "abandoned"],
+  draft: ["approved", "abandoned", "superseded"],
+  approved: ["done", "abandoned", "superseded"],
   done: [],
   abandoned: [],
+  superseded: [],
 }
 
 const SECTION_ORDER = [
@@ -232,20 +234,28 @@ function matchSectionHeader(line: string): string | null {
 
 function splitSections(body: string): Map<string, string> {
   const sections = new Map<string, string>()
+  const claimed = new Set<string>()
   let current: string | null = null
   const buf: string[] = []
   const flush = () => {
     if (current !== null) sections.set(current, buf.join("\n").trim())
     buf.length = 0
   }
+  // First-section-wins: a section key is owned by its FIRST header only.
+  // A later header repeating an already-claimed key is inert prose: it folds
+  // into the current section's text and never re-opens (or overwrites) the
+  // section, so verbatim free text quoting plan-shaped headers (e.g. a
+  // terminal-narrative reason containing "## Task List") can neither throw
+  // parsePlan nor drift tick counts (parser-inertness contract).
   for (const line of body.split(/\r?\n/)) {
     const header = matchSectionHeader(line)
-    if (header !== null) {
-      flush()
-      current = header
-    } else if (current !== null) {
-      buf.push(line)
+    if (header === null || claimed.has(header)) {
+      if (current !== null) buf.push(line)
+      continue
     }
+    flush()
+    claimed.add(header)
+    current = header
   }
   flush()
   return sections
@@ -258,7 +268,7 @@ const ACCEPT_RE = /^\s*(\d+)[.、)]\s*(.+)$/
 export function parsePlan(text: string): PlanDoc {
   const { fm, body } = parseFrontmatter(text)
   const status = (fm.status ?? "draft") as PlanStatus
-  if (!["draft", "approved", "done", "abandoned"].includes(status)) {
+  if (!["draft", "approved", "done", "abandoned", "superseded"].includes(status)) {
     throw new PlanError(`Unknown plan status: ${fm.status}`)
   }
   const sections = splitSections(body)
@@ -341,11 +351,57 @@ export function transitionStatus(text: string, to: PlanStatus, now: string): str
   if (from === to) throw new PlanError(`Plan is already ${to}`)
   if (!canTransition(from, to)) {
     throw new PlanError(
-      `Illegal status transition: ${from} -> ${to} (legal path: draft -> approved -> done; draft/approved -> abandoned)`,
+      `Illegal status transition: ${from} -> ${to} (legal path: draft -> approved -> done; draft/approved -> abandoned/superseded)`,
     )
   }
   const next = text.replace(/^status:.*$/m, `status: ${to}`)
   return setUpdated(next, now)
+}
+
+export type TerminalKind = "closed" | "abandoned" | "superseded"
+
+export type TerminalSectionOptions = {
+  reason?: string
+  successor?: string
+  checks?: CloseCheck[]
+}
+
+// Terminal lifecycle narrative (spec: "Terminal lifecycle narrative"): builds
+// a dated `## <now> — <kind>` section and appends it at END of file, returning
+// the new text. No fs here: the caller persists the returned text in the SAME
+// write as the frontmatter status flip (one atomic writeFileSync).
+//
+// Parser-inertness contract: the section never emits lines the plan parser
+// would misread (checkbox "- [x] N." / numbered "N." line starts, section
+// alias headers), so status (frontmatter-only) and tick counts (Task
+// List-only) stay unaffected no matter what the narrative carries.
+//
+// D4: the narrative is mandatory, the reason is best-effort — a missing
+// reason lands as an explicit `reason: (none given)` marker; the transition
+// never happens silently.
+export function appendTerminalSection(
+  text: string,
+  kind: TerminalKind,
+  opts: TerminalSectionOptions = {},
+  now: string = new Date().toISOString(),
+): string {
+  if (!["closed", "abandoned", "superseded"].includes(kind)) {
+    throw new PlanError(`Unknown terminal section kind: ${kind}`)
+  }
+  const lines: string[] = [`## ${now} — ${kind}`, ""]
+  const reason = (opts.reason ?? "").trim()
+  lines.push(`reason: ${reason.length > 0 ? reason : "(none given)"}`)
+  const successor = (opts.successor ?? "").trim()
+  if (successor.length > 0) lines.push(`successor: ${successor}`)
+  if (opts.checks && opts.checks.length > 0) {
+    lines.push("checks:")
+    for (const c of opts.checks) {
+      lines.push(`- ${c.pass ? "PASS" : "FAIL"} — ${c.criterion.trim()}`)
+      lines.push(`  evidence: ${c.evidence.trim() || "(none)"}`)
+    }
+  }
+  const base = text.replace(/\r?\n$/, "")
+  return `${base}\n\n${lines.join("\n")}\n`
 }
 
 export function progressOf(doc: PlanDoc): { total: number; done: number } {
