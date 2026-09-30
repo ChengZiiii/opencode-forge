@@ -35,4 +35,4 @@
 
 - [x] 6.1 README: plan 文件账本/生命周期段落补 superseded 状态与终态叙事；crew 章节补 lineage；**apply-timing 表改写（实测修正 2026-10-01）**：物化触发器=宿主 boot / 首次配置构建 / opencode 配置文件重载——**常驻共享宿主（paseo 类 serve）上新开会话不触发重建**，池变更须等下一次真实重建或重启；新进程（独立 CLI）boot 即读
 - [x] 6.2 手工冒烟（沙盒）：draft → discard{supersede} → crew_begin{lineage} 检查三份工件的链条叙事完整
-- [ ] 6.3 官方安装模式终验（git+file:// → 四步卸载干净）
+- [x] 6.3 官方安装模式终验（git+file:// → 四步卸载干净）
