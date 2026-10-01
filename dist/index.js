@@ -15824,6 +15824,7 @@ var FORGE_STATE_TOOLS = [
 var FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"];
 var FORGE_ALL_TOOLS = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS];
 var FORGE_TOOL_SET = new Set(FORGE_ALL_TOOLS);
+var FORGE_STATE_TOOL_SET = new Set(FORGE_STATE_TOOLS);
 var NATIVE_PARTITION_FALLBACKS = ["build", "plan", "general", "explore"];
 var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
@@ -17597,6 +17598,9 @@ var server = async (input, options) => {
           }
           if (isForgeFamilyAgent(speaker) && (input2.tool === "shell" || input2.tool === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
             throw new Error(`[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`);
+          }
+          if (isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT && FORGE_STATE_TOOL_SET.has(input2.tool)) {
+            throw new Error(`[forge:partition] Tool refused: "${input2.tool}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${input2.tool} at the gate.`);
           }
         }
       }

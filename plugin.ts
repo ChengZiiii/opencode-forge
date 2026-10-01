@@ -97,6 +97,7 @@ const FORGE_STATE_TOOLS = [
 const FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"] as const
 const FORGE_ALL_TOOLS: readonly string[] = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS]
 const FORGE_TOOL_SET = new Set<string>(FORGE_ALL_TOOLS)
+const FORGE_STATE_TOOL_SET = new Set<string>(FORGE_STATE_TOOLS)
 // Native agents the partition must cover even when absent from the user's
 // config (materialized as minimal tools-only entries; hidden utility agents
 // summary/title/compaction have no tool surface and are not touched).
@@ -2444,6 +2445,18 @@ export const server: Plugin = async (input, options) => {
           if (isForgeFamilyAgent(speaker) && (input.tool === "shell" || input.tool === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
             throw new Error(
               `[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`,
+            )
+          }
+          // R1-degradation third quadrant (tool-partition fallback): on
+          // ignore-host builds STATE tools stay visible to forge-* workers
+          // but must be unusable; the refusal fires before any execution or
+          // ask gate, so the call never reaches a user confirmation dialog.
+          // Unknown sessions fail open (same posture as every belt above);
+          // on hosts that honor injected tools maps these tools are already
+          // hidden from workers, so the belt is dead code there.
+          if (isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT && FORGE_STATE_TOOL_SET.has(input.tool)) {
+            throw new Error(
+              `[forge:partition] Tool refused: "${input.tool}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${input.tool} at the gate.`,
             )
           }
         }
