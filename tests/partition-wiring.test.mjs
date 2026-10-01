@@ -213,6 +213,65 @@ test("partition fallback belts: forge bash refused, non-forge forge tools refuse
   }
 })
 
+test("partition fallback belts: forge-* worker state-tool calls are refused with primary-only guidance; primary, worker exec pair, and unknown sessions pass", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-worker-state-"))
+  try {
+    const h = await startServer(inputFor(wt), {})
+    await seed(h, "ses_w", "forge-verifier")
+    await seed(h, "ses_f", "forge")
+    // Worker quadrant (forge-* non-primary): one representative per state
+    // family (plan_* / goal_* / crew_*) is hard-refused before any execution
+    // or gate ask, with guidance naming the tool, the worker, and the way out.
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "goal_complete", sessionID: "ses_w", callID: "c1" }, { args: {} }),
+      /\[forge:partition\] Tool refused: "goal_complete" is a harness state tool reserved for the primary forge agent; "forge-verifier" is a forge worker\. Report your findings back to the orchestrating session/,
+    )
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "plan_close", sessionID: "ses_w", callID: "c2" }, { args: {} }),
+      /"plan_close" is a harness state tool reserved for the primary forge agent; "forge-verifier" is a forge worker.*Report your findings back to the orchestrating session/,
+    )
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "crew_begin", sessionID: "ses_w", callID: "c3" }, { args: {} }),
+      /"crew_begin" is a harness state tool reserved for the primary forge agent; "forge-verifier" is a forge worker.*Report your findings back to the orchestrating session/,
+    )
+    // Primary is not hit: the belt never fires for the forge agent itself —
+    // the call proceeds to its own validation and gate.
+    await h["tool.execute.before"]({ tool: "goal_complete", sessionID: "ses_f", callID: "c4" }, { args: {} })
+    // Worker exec pair is not hit: forge_shell rides with forge-* workers.
+    await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_w", callID: "c5" }, { args: { command: "echo x" } })
+    // Unknown sessions fail open (same posture as every belt).
+    await h["tool.execute.before"]({ tool: "goal_complete", sessionID: "ses_u", callID: "c6" }, { args: {} })
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("partition fallback belts: non-forge refusal keeps its wording precedence over the worker state-tool refusal (zero regression)", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-belt-prece-"))
+  try {
+    const h = await startServer(inputFor(wt), {})
+    await seed(h, "ses_b", "build")
+    // A non-forge speaker calling a STATE tool hits the pre-existing
+    // non-forge branch first: refused with the family wording, never the new
+    // primary-only STATE wording.
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "goal_complete", sessionID: "ses_b", callID: "c1" }, { args: {} }),
+      (err) => {
+        assert.match(
+          err.message,
+          /\[forge:partition\] Tool refused: "goal_complete" belongs to the forge agent family and the current agent \("build"\) is outside it/,
+        )
+        assert.doesNotMatch(err.message, /harness state tool reserved for the primary forge agent/)
+        return true
+      },
+    )
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
 test("partition: the draft write-ban message is agent-agnostic (D12, session-scoped)", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-draft-"))
   try {
