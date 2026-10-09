@@ -14877,7 +14877,7 @@ function parseIdentity(identity) {
     return null;
   return { provider: identity.slice(0, slash), model: identity.slice(slash + 1) };
 }
-function nativeLadder(catalog, identity) {
+function modelDepthShape(catalog, identity) {
   if (!catalog)
     return null;
   const parsed = parseIdentity(identity);
@@ -14886,8 +14886,13 @@ function nativeLadder(catalog, identity) {
   const entry = catalog.providers?.[parsed.provider]?.models?.[parsed.model];
   if (!entry)
     return null;
-  const options = entry.reasoningOptions;
-  return Array.isArray(options) ? [...options] : null;
+  if (entry.reasoningShape === "toggle")
+    return { shape: "toggle" };
+  if (entry.reasoningShape === "budget_tokens")
+    return { shape: "budget_tokens" };
+  if (entry.reasoningShape === "effort")
+    return { shape: "effort", ladder: entry.reasoningOptions ? [...entry.reasoningOptions] : [] };
+  return null;
 }
 function modelsDevCacheDir(base) {
   return join5(base ?? join5(tmpdir2(), "opencode-forge"), "models-dev");
@@ -14906,6 +14911,16 @@ function namedLevels(rows) {
   }
   return out;
 }
+function shapeOf(rows) {
+  for (const r of rows) {
+    if (r && typeof r === "object") {
+      const t = r.type;
+      if (t === "effort" || t === "toggle" || t === "budget_tokens")
+        return t;
+    }
+  }
+  return;
+}
 function reduceModelsDev(raw) {
   const catalog = { providers: {} };
   const providers = raw?.constructor === Object ? raw : null;
@@ -14918,10 +14933,13 @@ function reduceModelsDev(raw) {
     const out = { models: {} };
     for (const [modelID, model] of Object.entries(models)) {
       const m = model;
-      const options = Array.isArray(m.reasoning_options) ? namedLevels(m.reasoning_options) : undefined;
+      const rows = Array.isArray(m.reasoning_options) ? m.reasoning_options : undefined;
+      const shape = rows !== undefined ? shapeOf(rows) : undefined;
+      const options = rows !== undefined && shape === "effort" ? namedLevels(rows) : undefined;
       const cost = m.cost && typeof m.cost === "object" ? m.cost : undefined;
       out.models[modelID] = {
-        ...options ? { reasoningOptions: options } : {},
+        ...shape !== undefined ? { reasoningShape: shape } : {},
+        ...options && options.length > 0 ? { reasoningOptions: options } : {},
         ...cost ? { cost } : {}
       };
     }
@@ -15063,71 +15081,97 @@ function forgeAgentDef(agentId, def) {
     entry.model = def.model;
   return entry;
 }
+function effectiveReadonlyShape(def) {
+  if (def.shape === "write")
+    return false;
+  const perm = def.permission ?? {};
+  for (const t of MUTATING_TOOLS) {
+    const v = perm[t];
+    if (v !== undefined && v !== "deny")
+      return false;
+  }
+  return true;
+}
 
 // src/dispatch-depth.ts
-var META_DEPTHS = ["none", "low", "medium", "high", "max"];
+var META_DEPTHS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 var BUDGET_TIERS = {
+  minimal: 1024,
   low: 8192,
   medium: 16384,
   high: 24576,
+  xhigh: 28672,
   max: 32768
 };
-function noMapping(depth, family, nativeVocabulary, metaAvailable) {
+function noMapping(depth, channel, shapeVocabulary) {
   return {
     kind: "no-mapping",
-    family,
-    message: `depth "${depth}" has no native counterpart on this model — the plugin never interpolates. Native levels: ${nativeVocabulary.join(", ") || "(none named)"}. Meta words this model accepts: ${metaAvailable.join(", ") || "(none)"}.`,
-    nativeVocabulary,
-    metaAvailable
+    channel,
+    message: `depth "${depth}" has no channel on this shape (${channel} — the endpoint cannot express it). Shape vocabulary: ${shapeVocabulary.join(", ") || "(none)"}. Dictionary words: ${META_DEPTHS.join(", ")}. The plugin never interpolates; fix the pinned thoughtLevel or the model's wire shape.`,
+    shapeVocabulary,
+    dictionary: [...META_DEPTHS]
   };
 }
-function translateDepth(depth, family, ladder) {
-  if (family === "unknown") {
-    return { kind: "not-injected", family, disclose: "not injected (unknown provider shape)" };
-  }
-  if (family === "anthropic") {
-    if (depth === "none")
-      return { kind: "off", family, disclose: "canonical none → native thinking:off" };
-    const budget = BUDGET_TIERS[depth];
-    if (budget !== undefined) {
-      return { kind: "tiered", family, budgetTokens: budget, disclose: `canonical ${depth} → native thinking budget:${budget}` };
+function ladderWord(ladder, depth) {
+  if (ladder === null)
+    return null;
+  for (const w of ladder)
+    if (w.toLowerCase() === depth)
+      return w;
+  return null;
+}
+function translateDepth(depth, channel) {
+  const d = depth.trim().toLowerCase();
+  if (channel.kind === "effort" || channel.kind === "adaptive-effort") {
+    const native = channel.kind === "effort" ? ladderWord(channel.ladder, d) : null;
+    if (native !== null) {
+      return {
+        kind: "verbatim",
+        channel: channel.kind,
+        word: native,
+        confirmed: true,
+        disclose: `canonical ${d} → native "${native}" (catalog-confirmed)`
+      };
     }
-    return noMapping(depth, family, [], [...META_DEPTHS]);
+    const why = channel.kind === "effort" && channel.ladder !== null ? `catalog ladder does not list "${d}"` : "no catalog ladder for this endpoint";
+    return {
+      kind: "verbatim",
+      channel: channel.kind,
+      word: d,
+      confirmed: false,
+      disclose: `verbatim (unverified — ${why}; the provider judges)`
+    };
   }
-  if (family === "zai") {
-    if (depth === "none")
-      return { kind: "off", family, disclose: "canonical none → native thinking:off" };
-    if (META_DEPTHS.includes(depth)) {
-      return { kind: "toggle-on", family, disclose: `canonical ${depth} → native thinking:on (this provider shape takes a toggle, not a level)` };
-    }
-    return noMapping(depth, family, ["thinking on/off"], [...META_DEPTHS]);
+  if (channel.kind === "toggle") {
+    if (d === "none")
+      return { kind: "off", channel: "toggle", disclose: "canonical none → native thinking:off" };
+    return noMapping(d, "toggle", ["none (thinking on/off only)"]);
   }
-  const native = ladder ?? null;
-  if (native !== null && native.includes(depth)) {
-    return { kind: "verbatim", family: "openai", word: depth, disclose: META_DEPTHS.includes(depth) ? "verbatim" : `verbatim (native word "${depth}")` };
+  if (d === "none")
+    return { kind: "off", channel: "budget", disclose: "canonical none → native thinking:off" };
+  const budget = BUDGET_TIERS[d];
+  if (budget !== undefined) {
+    return { kind: "tiered", channel: "budget", budgetTokens: budget, disclose: `canonical ${d} → native thinking budget:${budget}` };
   }
-  if (native !== null && native.length > 0 && META_DEPTHS.includes(depth)) {
-    return noMapping(depth, family, native, META_DEPTHS.filter((w) => native.includes(w)));
-  }
-  return { kind: "verbatim", family: "openai", word: depth, disclose: `verbatim (unverified — ${native === null ? "catalog does not know this model" : `catalog ladder does not list "${depth}"`}; the provider judges)` };
+  return noMapping(d, "budget", ["none", ...Object.keys(BUDGET_TIERS)]);
 }
 function applyDepthTranslation(options, t) {
   if (t.kind === "verbatim") {
-    options.reasoningEffort = t.word;
+    if (t.channel === "adaptive-effort") {
+      options.effort = t.word;
+    } else {
+      options.reasoningEffort = t.word;
+    }
   } else if (t.kind === "tiered") {
     options.thinking = { type: "enabled", budget_tokens: t.budgetTokens };
   } else if (t.kind === "off") {
     options.thinking = { type: "disabled" };
-  } else if (t.kind === "toggle-on") {
-    options.thinking = { type: "enabled" };
   }
 }
-function resolvePinnedDepth(thoughtLevel, family, ladder) {
-  const t = translateDepth(thoughtLevel, family, ladder);
+function resolvePinnedDepth(thoughtLevel, channel) {
+  const t = translateDepth(thoughtLevel, channel);
   if (t.kind === "no-mapping")
     return { translation: null, findingMessage: t.message };
-  if (t.kind === "not-injected")
-    return { translation: null };
   return { translation: t };
 }
 
@@ -15420,6 +15464,11 @@ function validateAgentSet(raw) {
     if (entry.thoughtLevel !== undefined) {
       if (nonEmptyString(entry.thoughtLevel)) {
         thoughtLevel = entry.thoughtLevel.trim();
+        const normalized = thoughtLevel.toLowerCase();
+        if (normalized !== thoughtLevel) {
+          findings.push({ level: "warn", code: "thoughtlevel-normalized", message: `${label}.thoughtLevel "${thoughtLevel}" normalized to "${normalized}" (config is lowercase; the catalog decides wire casing)` });
+        }
+        thoughtLevel = normalized;
       } else {
         findings.push({ level: "warn", code: "thoughtlevel-invalid", message: `${label}.thoughtLevel must be a non-empty string — field ignored (counts as absent for the model/thoughtLevel pair)` });
       }
@@ -15855,7 +15904,7 @@ var PLAN_COMMAND_TEMPLATE = [
   "",
   "Plans are short-horizon, single-task-goal documents (.opencode/plan/<date>-<slug>.md). The harness enforces the hard parts (draft write-ban, approval/close dialogs); you supply the engineering judgment. Never edit or create plan files by hand — every change goes through the plan_* tools.",
   "",
-  "1. Reconnaissance and alignment (read-only): explore with read/grep/glob only — all write tools, bash, and subagents are DENIED while a draft exists; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous or leaves meaningful choices open (scope, approach, acceptance), settle them with the user FIRST — 1-3 focused questions — and only write the draft once the shape is agreed; never plan against assumptions the user could settle in one line.",
+  "1. Reconnaissance and alignment (read-only): explore with read/grep/glob, and dispatch readonly-shape forge scouts (task tool) for breadth evidence — reconnaissance dispatch to effective-readonly workers keeps this session's context lean and is allowed both BEFORE and DURING the draft. All write tools and bash are DENIED while a draft exists, and so is dispatching write-shaped workers or native agents; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous or leaves meaningful choices open (scope, approach, acceptance), settle them with the user FIRST — 1-3 focused questions — and only write the draft once the shape is agreed; never plan against assumptions the user could settle in one line.",
   "2. Draft (plan_write): call plan_write with structured fields; the tool renders and validates the fixed sections, so a malformed plan cannot exist. Quality bar: goal = one line, the outcome not the activity; context = verified findings with file:line evidence, including what you ruled out and why; approach = the chosen approach AND at least one rejected alternative with the reason (a plan with no considered alternative is a guess); tasks = 3-8 concrete, independently verifiable steps, each doable in one sitting ('improve the code' is invalid; 'extract the timeout constant into config.ts and default it to 3000' is valid); risks = what could break, blast radius, rollback path; acceptance = criteria verifiable by a command, a file, or an observable behavior (vague criteria will fail the close); nonGoals = explicit out-of-scope items. To revise after feedback, call plan_write again — while in draft it overwrites the same file.",
   `3. User review, then approval (plan_approve): after plan_write, present the plan in chat — goal, chosen approach with one line why, the numbered task list, the acceptance criteria — then STOP: end your turn and wait. The user owns the review, at their own pace: feedback → revise with plan_write, re-present, and wait again; rejection → /plan discard (or re-plan together); explicit go-ahead (e.g. "execute", "批准", "looks good") → call plan_approve — its confirmation dialog is the final hard gate, and the user's Allow starts execution. Never call plan_approve in the same turn that presents a draft, and never implement before approval succeeds.`,
   "4. Execution (tick as you go): work tasks in order; call plan_tick with the task number immediately after EACH task's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected task or ask about revising (/plan with the same goal re-enters planning).",
@@ -16031,6 +16080,34 @@ function dispatchProviderFamily(providerID) {
   if (ZAI_FAMILY.has(providerID))
     return "zai";
   return null;
+}
+function isAdaptiveAnthropic(modelID) {
+  const id = modelID.toLowerCase();
+  const m = /^claude-(?:(?:opus|sonnet|haiku)[-.])?(\d+)(?:[.-](\d+))?/.exec(id);
+  if (!m)
+    return false;
+  const major = Number(m[1]);
+  const minor = m[2] !== undefined ? Number(m[2]) : 0;
+  return major > 4 || major === 4 && minor >= 7;
+}
+function resolveDepthChannel(providerID, modelID) {
+  const shape = modelDepthShape(modelsDevCatalog, `${providerID}/${modelID}`);
+  if (shape) {
+    if (shape.shape === "effort")
+      return { kind: "effort", ladder: shape.ladder };
+    if (shape.shape === "toggle")
+      return { kind: "toggle" };
+    return { kind: "budget" };
+  }
+  const family = dispatchProviderFamily(providerID);
+  if (family === "openai")
+    return { kind: "effort", ladder: null };
+  if (family === "zai")
+    return { kind: "toggle" };
+  if (family === "anthropic") {
+    return isAdaptiveAnthropic(modelID) ? { kind: "adaptive-effort" } : { kind: "budget" };
+  }
+  return { kind: "effort", ladder: null };
 }
 var jobsMode = "auto";
 var jobsKeepBuiltinShell = false;
@@ -17587,7 +17664,25 @@ var server = async (input, options) => {
         const state = stateForBan(input2.sessionID);
         const active = state ? resolveActivePlan(state) : null;
         if (active && active.doc.status === "draft") {
-          throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`);
+          if (input2.tool === "task") {
+            const a = output?.args ?? {};
+            const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined;
+            const agentId = target !== undefined && target.toLowerCase().startsWith("forge-") ? target.slice("forge-".length) : undefined;
+            const def = agentId !== undefined ? resolvePools()?.agents[agentId]?.def : undefined;
+            if (def !== undefined && effectiveReadonlyShape(def)) {} else {
+              const roster = [];
+              const pools = resolvePools();
+              if (pools) {
+                for (const [id, entry] of Object.entries(pools.agents))
+                  if (effectiveReadonlyShape(entry.def))
+                    roster.push(`forge-${id}`);
+              }
+              roster.sort();
+              throw new Error(`[forge] A plan is in draft; dispatch is denied for this target. ` + (roster.length > 0 ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. ` : `No readonly worker is configured — define one in forge.json (shape defaults to readonly) to enable draft-phase reconnaissance. `) + `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`);
+            }
+          } else {
+            throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`);
+          }
         }
       }
       if (input2.sessionID && typeof input2.tool === "string") {
@@ -17639,10 +17734,8 @@ var server = async (input, options) => {
         return;
       const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : "";
       const modelID = typeof raw.model?.modelID === "string" ? raw.model.modelID : "";
-      const family = dispatchProviderFamily(providerID);
-      if (!family)
-        return;
-      const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, family, nativeLadder(modelsDevCatalog, `${providerID}/${modelID}`));
+      const channel = resolveDepthChannel(providerID, modelID);
+      const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel);
       if (!translation) {
         if (findingMessage && !depthFindingNotes.has(agentId)) {
           depthFindingNotes.set(agentId, findingMessage);
