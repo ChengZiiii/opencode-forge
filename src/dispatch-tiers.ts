@@ -73,3 +73,19 @@ export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<strin
   if (def.model !== undefined) entry.model = def.model
   return entry
 }
+
+// allow-readonly-recon-during-plan-draft: EFFECTIVE readonly shape — what the
+// draft-phase dispatch gate keys on. The declared shape is not enough: a user
+// permission override can lift write/edit/bash off "deny" (any other value —
+// allow OR ask — counts as lifted; the judgment is fail-closed). A write
+// shape is never effective-readonly regardless of overrides. Recursion is
+// irrelevant here (task: deny is forced on every worker already).
+export function effectiveReadonlyShape(def: ForgeAgentDef): boolean {
+  if (def.shape === "write") return false
+  const perm = def.permission ?? {}
+  for (const t of MUTATING_TOOLS) {
+    const v = perm[t]
+    if (v !== undefined && v !== "deny") return false
+  }
+  return true
+}
