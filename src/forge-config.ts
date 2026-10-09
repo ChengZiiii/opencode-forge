@@ -343,6 +343,14 @@ export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAg
     if (entry.thoughtLevel !== undefined) {
       if (nonEmptyString(entry.thoughtLevel)) {
         thoughtLevel = entry.thoughtLevel.trim()
+        // catalog-driven-depth-shapes: the config boundary normalizes to
+        // lowercase (the dictionary and the user's writing surface are
+        // lowercase; the catalog vouches for native casing on the wire).
+        const normalized = thoughtLevel.toLowerCase()
+        if (normalized !== thoughtLevel) {
+          findings.push({ level: "warn", code: "thoughtlevel-normalized", message: `${label}.thoughtLevel "${thoughtLevel}" normalized to "${normalized}" (config is lowercase; the catalog decides wire casing)` })
+        }
+        thoughtLevel = normalized
       } else {
         findings.push({ level: "warn", code: "thoughtlevel-invalid", message: `${label}.thoughtLevel must be a non-empty string — field ignored (counts as absent for the model/thoughtLevel pair)` })
       }

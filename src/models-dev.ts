@@ -18,7 +18,8 @@ export const DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json"
 // dispatch-roster module). Prices are USD per million tokens (models.dev
 // shape).
 export type CatalogCost = { input?: number; output?: number }
-export type CatalogModel = { reasoningOptions?: string[]; cost?: CatalogCost }
+export type ReasoningShape = "effort" | "toggle" | "budget_tokens"
+export type CatalogModel = { reasoningShape?: ReasoningShape; reasoningOptions?: string[]; cost?: CatalogCost }
 export type CatalogSnapshot = { providers: Record<string, { models: Record<string, CatalogModel> }> }
 
 export type ModelsDevResult = {
@@ -35,7 +36,8 @@ export function parseIdentity(identity: string): { provider: string; model: stri
   return { provider: identity.slice(0, slash), model: identity.slice(slash + 1) }
 }
 
-// The identity's native ladder, or null when the catalog does not know it.
+// The identity's native ladder (effort values), or null when the catalog does
+// not know it or the model's shape carries no named levels (toggle/budget).
 export function nativeLadder(catalog: CatalogSnapshot | null | undefined, identity: string): string[] | null {
   if (!catalog) return null
   const parsed = parseIdentity(identity)
@@ -44,6 +46,24 @@ export function nativeLadder(catalog: CatalogSnapshot | null | undefined, identi
   if (!entry) return null
   const options = entry.reasoningOptions
   return Array.isArray(options) ? [...options] : null
+}
+
+// catalog-driven-depth-shapes: the resolved wire shape for a model — effort
+// (with its named ladder), toggle, or budget_tokens — or null when the
+// catalog is silent on the model (callers fall back to the provider-prefix
+// family, then to the default effort word channel).
+export type ModelDepthShape = { shape: "effort"; ladder: string[] } | { shape: "toggle" } | { shape: "budget_tokens" }
+
+export function modelDepthShape(catalog: CatalogSnapshot | null | undefined, identity: string): ModelDepthShape | null {
+  if (!catalog) return null
+  const parsed = parseIdentity(identity)
+  if (!parsed) return null
+  const entry = catalog.providers?.[parsed.provider]?.models?.[parsed.model]
+  if (!entry) return null
+  if (entry.reasoningShape === "toggle") return { shape: "toggle" }
+  if (entry.reasoningShape === "budget_tokens") return { shape: "budget_tokens" }
+  if (entry.reasoningShape === "effort") return { shape: "effort", ladder: entry.reasoningOptions ? [...entry.reasoningOptions] : [] }
+  return null
 }
 
 export function modelsDevCacheDir(base?: string): string {
@@ -56,8 +76,9 @@ type FetchLike = (url: string, init?: { signal?: AbortSignal }) => Promise<{ ok:
 //   [{type:"effort", values:["low","high","max"]}]   — named effort ladder
 //   [{type:"toggle"}]                                — on/off, no named levels
 //   [{type:"budget_tokens", min|max}]                — budget range, no names
-// The named ladder is the union of effort "values"; toggle/budget models
-// reduce to [] (no cataloged names — expose must be user-curated).
+// The named ladder is the union of effort "values"; the SHAPE is the first
+// row's type — kept in the slice since catalog-driven-depth-shapes (the wire
+// channel comes from the data, not from provider-prefix guessing).
 function namedLevels(rows: unknown[]): string[] {
   const out: string[] = []
   for (const r of rows) {
@@ -67,6 +88,16 @@ function namedLevels(rows: unknown[]): string[] {
     }
   }
   return out
+}
+
+function shapeOf(rows: unknown[]): ReasoningShape | undefined {
+  for (const r of rows) {
+    if (r && typeof r === "object") {
+      const t = (r as { type?: unknown }).type
+      if (t === "effort" || t === "toggle" || t === "budget_tokens") return t
+    }
+  }
+  return undefined
 }
 
 // Shape reducer: models.dev api.json -> the minimal catalog slice. Never
@@ -81,10 +112,13 @@ export function reduceModelsDev(raw: unknown): CatalogSnapshot {
     const out: CatalogSnapshot["providers"][string] = { models: {} }
     for (const [modelID, model] of Object.entries(models as Record<string, unknown>)) {
       const m = model as { reasoning_options?: unknown; cost?: Record<string, unknown> }
-      const options = Array.isArray(m.reasoning_options) ? namedLevels(m.reasoning_options) : undefined
+      const rows = Array.isArray(m.reasoning_options) ? (m.reasoning_options as unknown[]) : undefined
+      const shape = rows !== undefined ? shapeOf(rows) : undefined
+      const options = rows !== undefined && shape === "effort" ? namedLevels(rows) : undefined
       const cost = m.cost && typeof m.cost === "object" ? m.cost : undefined
       out.models[modelID] = {
-        ...(options ? { reasoningOptions: options } : {}),
+        ...(shape !== undefined ? { reasoningShape: shape } : {}),
+        ...(options && options.length > 0 ? { reasoningOptions: options } : {}),
         ...(cost ? { cost: cost as { input?: number; output?: number } } : {}),
       }
     }
