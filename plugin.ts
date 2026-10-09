@@ -68,10 +68,10 @@ import {
   type Watchdog,
 } from "./src/watchdog.ts"
 import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
-import { nativeLadder, loadModelsDevSnapshot, type CatalogSnapshot } from "./src/models-dev.ts"
+import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, type CatalogSnapshot } from "./src/models-dev.ts"
 import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
-import { forgeAgentDef } from "./src/dispatch-tiers.ts"
-import { applyDepthTranslation, resolvePinnedDepth, type DepthTranslation } from "./src/dispatch-depth.ts"
+import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
+import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 
 const FORGE_AGENT = "forge"
@@ -151,7 +151,7 @@ const PLAN_COMMAND_TEMPLATE = [
   "",
   "Plans are short-horizon, single-task-goal documents (.opencode/plan/<date>-<slug>.md). The harness enforces the hard parts (draft write-ban, approval/close dialogs); you supply the engineering judgment. Never edit or create plan files by hand — every change goes through the plan_* tools.",
   "",
-  "1. Reconnaissance and alignment (read-only): explore with read/grep/glob only — all write tools, bash, and subagents are DENIED while a draft exists; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous or leaves meaningful choices open (scope, approach, acceptance), settle them with the user FIRST — 1-3 focused questions — and only write the draft once the shape is agreed; never plan against assumptions the user could settle in one line.",
+  "1. Reconnaissance and alignment (read-only): explore with read/grep/glob, and dispatch readonly-shape forge scouts (task tool) for breadth evidence — reconnaissance dispatch to effective-readonly workers keeps this session's context lean and is allowed both BEFORE and DURING the draft. All write tools and bash are DENIED while a draft exists, and so is dispatching write-shaped workers or native agents; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous or leaves meaningful choices open (scope, approach, acceptance), settle them with the user FIRST — 1-3 focused questions — and only write the draft once the shape is agreed; never plan against assumptions the user could settle in one line.",
   "2. Draft (plan_write): call plan_write with structured fields; the tool renders and validates the fixed sections, so a malformed plan cannot exist. Quality bar: goal = one line, the outcome not the activity; context = verified findings with file:line evidence, including what you ruled out and why; approach = the chosen approach AND at least one rejected alternative with the reason (a plan with no considered alternative is a guess); tasks = 3-8 concrete, independently verifiable steps, each doable in one sitting ('improve the code' is invalid; 'extract the timeout constant into config.ts and default it to 3000' is valid); risks = what could break, blast radius, rollback path; acceptance = criteria verifiable by a command, a file, or an observable behavior (vague criteria will fail the close); nonGoals = explicit out-of-scope items. To revise after feedback, call plan_write again — while in draft it overwrites the same file.",
   "3. User review, then approval (plan_approve): after plan_write, present the plan in chat — goal, chosen approach with one line why, the numbered task list, the acceptance criteria — then STOP: end your turn and wait. The user owns the review, at their own pace: feedback → revise with plan_write, re-present, and wait again; rejection → /plan discard (or re-plan together); explicit go-ahead (e.g. \"execute\", \"批准\", \"looks good\") → call plan_approve — its confirmation dialog is the final hard gate, and the user's Allow starts execution. Never call plan_approve in the same turn that presents a draft, and never implement before approval succeeds.",
   "4. Execution (tick as you go): work tasks in order; call plan_tick with the task number immediately after EACH task's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected task or ask about revising (/plan with the same goal re-enters planning).",
@@ -433,6 +433,41 @@ function dispatchProviderFamily(providerID: string): "openai" | "anthropic" | "z
   if (ANTHROPIC_FAMILY.has(providerID)) return "anthropic"
   if (ZAI_FAMILY.has(providerID)) return "zai"
   return null
+}
+
+// catalog-driven-depth-shapes: the wire-shape fallback chain — catalog
+// reasoning_options first (effort values / toggle / budget_tokens); a
+// catalog-silent model falls back to the provider-prefix family; a provider
+// absent from both defaults to the effort WORD channel (the dictionary is a
+// dictionary, not a whitelist — unmatched words pass through and the
+// provider judges).
+function isAdaptiveAnthropic(modelID: string): boolean {
+  const id = modelID.toLowerCase()
+  const m = /^claude-(?:(?:opus|sonnet|haiku)[-.])?(\d+)(?:[.-](\d+))?/.exec(id)
+  if (!m) return false
+  const major = Number(m[1])
+  const minor = m[2] !== undefined ? Number(m[2]) : 0
+  return major > 4 || (major === 4 && minor >= 7)
+}
+
+function resolveDepthChannel(providerID: string, modelID: string): DepthChannel {
+  const shape = modelDepthShape(modelsDevCatalog, `${providerID}/${modelID}`)
+  if (shape) {
+    if (shape.shape === "effort") return { kind: "effort", ladder: shape.ladder }
+    if (shape.shape === "toggle") return { kind: "toggle" }
+    return { kind: "budget" }
+  }
+  const family = dispatchProviderFamily(providerID)
+  if (family === "openai") return { kind: "effort", ladder: null }
+  if (family === "zai") return { kind: "toggle" }
+  if (family === "anthropic") {
+    // Catalog-silent Anthropic: adaptive-era models (major > 4 or 4.7+) speak
+    // the effort word channel; legacy models take the budget tier table.
+    return isAdaptiveAnthropic(modelID) ? { kind: "adaptive-effort" } : { kind: "budget" }
+  }
+  // Unknown endpoint (custom relay, any provider x any protocol): default to
+  // the effort word channel — pass-through territory, provider judges.
+  return { kind: "effort", ladder: null }
 }
 
 
@@ -2423,9 +2458,42 @@ export const server: Plugin = async (input, options) => {
           // protects shared session state, so the ban binds the session, not
           // the speaker. The wording is agent-agnostic: a blocked non-forge
           // agent cannot see plan_approve and must be told the real way out.
-          throw new Error(
-            `[forge] A plan is in draft; write operations are denied (${input.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`,
-          )
+          if (input.tool === "task") {
+            // allow-readonly-recon-during-plan-draft: the spawn carve-out is
+            // keyed on the TARGET's effective readonly shape, not a wholesale
+            // deny. A dispatch to a provably non-mutating forge worker passes
+            // as reconnaissance (breadth evidence without spending the
+            // planning session's context); every other target — write-shape
+            // workers, native agents, absent/unresolvable targets — is denied
+            // with the dispatchable readonly roster and the exits. Speaker-
+            // agnostic like the ban itself; the family dispatch guard above
+            // has already refused non-forge speakers dispatching forge-*.
+            const a = (output?.args ?? {}) as { subagent_type?: unknown; agent?: unknown }
+            const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined
+            const agentId = target !== undefined && target.toLowerCase().startsWith("forge-") ? target.slice("forge-".length) : undefined
+            const def = agentId !== undefined ? resolvePools()?.agents[agentId]?.def : undefined
+            if (def !== undefined && effectiveReadonlyShape(def)) {
+              // Reconnaissance dispatch: passes the write-class ban. The
+              // worker's own materialized permission denies write/edit/bash
+              // (and task, always) — no mutation path is transported.
+            } else {
+              const roster: string[] = []
+              const pools = resolvePools()
+              if (pools) for (const [id, entry] of Object.entries(pools.agents)) if (effectiveReadonlyShape(entry.def)) roster.push(`forge-${id}`)
+              roster.sort()
+              throw new Error(
+                `[forge] A plan is in draft; dispatch is denied for this target. ` +
+                  (roster.length > 0
+                    ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. `
+                    : `No readonly worker is configured — define one in forge.json (shape defaults to readonly) to enable draft-phase reconnaissance. `) +
+                  `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`,
+              )
+            }
+          } else {
+            throw new Error(
+              `[forge] A plan is in draft; write operations are denied (${input.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`,
+            )
+          }
         }
       }
       // Partition fallback belts (tool-partition fallback requirement): on
@@ -2461,10 +2529,11 @@ export const server: Plugin = async (input, options) => {
           }
         }
       }
-      // Draft-phase subagent-spawn ban is INHERITED: the native task tool is
-      // in the write-ban class (isWriteTool covers "task"), so no plugin-side
-      // dispatch refusal exists to maintain (spec: forge-subagents —
-      // "Native-task dispatch surface").
+      // Draft-phase subagent-spawn gate is INHERITED: the native task tool is
+      // in the write-ban class (isWriteTool covers "task"), and the block
+      // above carves out effective-readonly targets per
+      // allow-readonly-recon-during-plan-draft (spec: forge-subagents —
+      // "Native-task dispatch surface" shape-gated interop).
     },
 
     // Family-map primary source (tool-partition): chat.message carries the
@@ -2490,9 +2559,11 @@ export const server: Plugin = async (input, options) => {
     // per-dispatch table. The FIRST request of a session freezes the
     // translation (never rewritten mid-session); the config is re-read per
     // lookup (mtime-cached hot-apply) for NEW sessions. An untranslatable
-    // word injects nothing and records a bounded once-per-agent finding; an
-    // unknown provider family injects nothing, silently (not this plugin's
-    // vocabulary to guess).
+    // word on a word-shaped channel passes through VERBATIM (disclosed
+    // unverified — provider judges); the only dead ends (legacy budget,
+    // pure toggle) inject nothing and record a bounded once-per-agent
+    // finding; a provider absent from catalog and prefix map defaults to
+    // the effort word channel (pass-through, never silent).
     "chat.params": async (input, output) => {
       if (forgeDisabled) return
       const raw = input as unknown as { sessionID?: string; agent?: unknown; model?: { providerID?: unknown; modelID?: unknown } }
@@ -2516,9 +2587,8 @@ export const server: Plugin = async (input, options) => {
       if (!def?.thoughtLevel) return
       const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : ""
       const modelID = typeof raw.model?.modelID === "string" ? raw.model.modelID : ""
-      const family = dispatchProviderFamily(providerID)
-      if (!family) return // unknown provider shape: inject nothing, silently
-      const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, family, nativeLadder(modelsDevCatalog, `${providerID}/${modelID}`))
+      const channel = resolveDepthChannel(providerID, modelID)
+      const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel)
       if (!translation) {
         if (findingMessage && !depthFindingNotes.has(agentId)) {
           depthFindingNotes.set(agentId, findingMessage)
