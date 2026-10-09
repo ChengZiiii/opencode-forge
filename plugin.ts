@@ -2585,10 +2585,27 @@ export const server: Plugin = async (input, options) => {
       // lookup keeps the hot-apply contract.
       const def: ForgeAgentDef | undefined = resolvePools()?.agents[agentId]?.def
       if (!def?.thoughtLevel) return
+      const modelObj = raw.model as { modelID?: unknown; id?: unknown } | undefined
       const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : ""
-      const modelID = typeof raw.model?.modelID === "string" ? raw.model.modelID : ""
+      // Host shape (empirically, 1.18.34): chat.params carries the full ModelInfo
+      // with the model name under `id` — `modelID` is the plugin-SDK test shape.
+      // Accept both; an empty model id degrades to the prefix-family fallback.
+      const modelID =
+        typeof modelObj?.modelID === "string" ? modelObj.modelID : typeof modelObj?.id === "string" ? modelObj.id : ""
       const channel = resolveDepthChannel(providerID, modelID)
       const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel)
+      // Env-gated trace (same style as FORGE_GOAL_PROBE): one line per depth
+      // resolution, for sandbox E2E attribution (verify/adaptive-key.md).
+      if (process.env.FORGE_DEPTH_PROBE) {
+        try {
+          appendFileSync(
+            join(tmpdir(), "forge-depth-probe.log"),
+            `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}\n` +
+              `    input=${JSON.stringify(raw).slice(0, 600)}\n` +
+              `    optionsAfter=${JSON.stringify(output.options ?? {})}\n`,
+          )
+        } catch {}
+      }
       if (!translation) {
         if (findingMessage && !depthFindingNotes.has(agentId)) {
           depthFindingNotes.set(agentId, findingMessage)

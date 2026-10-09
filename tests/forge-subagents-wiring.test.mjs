@@ -327,6 +327,17 @@ test("depth: catalog-silent anthropic resolves adaptive vs budget by model id", 
   // wire capture lives at verify/adaptive-key.md).
   assert.equal(neo.options.effort, "xhigh", "adaptive-era models receive the effort word on the effort option key")
   assert.equal(neo.options.reasoningEffort, undefined, "the dropped-by-transport key is not stamped for the adaptive channel")
+
+  // Host shape regression (empirical, 1.18.34): the real host's chat.params
+  // carries the full ModelInfo with the model name under `id` — not `modelID`.
+  // Reading modelID only silently degraded every real-host adaptive model to
+  // the budget channel (caught by the postpublish behavioral E2E).
+  const hostShape = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_a3", agent: "forge-claude-new", model: { id: "claude-opus-4-7", providerID: "anthropic" } }, hostShape)
+  assert.equal(hostShape.options.effort, "xhigh", "the ModelInfo.id shape resolves the adaptive channel too")
+  const hostShapeEmpty = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_a4", agent: "forge-claude-old", model: { id: "claude-4-6", providerID: "anthropic" } }, hostShapeEmpty)
+  assert.deepEqual(hostShapeEmpty.options, { thinking: { type: "enabled", budget_tokens: 24576 } }, "the ModelInfo.id shape resolves the budget channel for legacy models")
 })
 
 // ---------------------------------------------------------------------------
