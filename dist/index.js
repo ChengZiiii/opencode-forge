@@ -17732,10 +17732,19 @@ var server = async (input, options) => {
       const def = resolvePools()?.agents[agentId]?.def;
       if (!def?.thoughtLevel)
         return;
+      const modelObj = raw.model;
       const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : "";
-      const modelID = typeof raw.model?.modelID === "string" ? raw.model.modelID : "";
+      const modelID = typeof modelObj?.modelID === "string" ? modelObj.modelID : typeof modelObj?.id === "string" ? modelObj.id : "";
       const channel = resolveDepthChannel(providerID, modelID);
       const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel);
+      if (process.env.FORGE_DEPTH_PROBE) {
+        try {
+          appendFileSync(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}
+` + `    input=${JSON.stringify(raw).slice(0, 600)}
+` + `    optionsAfter=${JSON.stringify(output.options ?? {})}
+`);
+        } catch {}
+      }
       if (!translation) {
         if (findingMessage && !depthFindingNotes.has(agentId)) {
           depthFindingNotes.set(agentId, findingMessage);

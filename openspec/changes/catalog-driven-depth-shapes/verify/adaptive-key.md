@@ -1,48 +1,21 @@
-# Verify — 宿主 adaptive effort options 键实证（task 3.2）
+# Verify — 宿主 adaptive effort options 键实证（task 3.2，修订版）
 
-日期：2026-10-09 · 方法：沙盒 `opencode serve`（1.18.34）+ 假 Anthropic catch server 抓线上请求体 · 驱动脚本 `scripts/adaptive-key-e2e.mjs` + 候选探针 `scripts/adaptive-key-probe-plugin.mjs`（可复现：`node scripts/adaptive-key-e2e.mjs`，dump 留存 `%TEMP%\adaptive-key-catch-*.json`）
+日期：2026-10-09（当日两轮：首轮探针作废，修订轮端到端闭环）· 方法：沙盒 `opencode serve`（1.18.34）+ 假 Anthropic catch server 抓线上请求体 · 驱动：`scripts/adaptive-key-e2e.mjs` + `scripts/npm-postpublish-e2e.mjs`（后者含内容路由 tool_use 脚本化派发）
 
-## 实验设计
+## 方法论更正（如实记录）
 
-- 沙盒（OPENCODE_CONFIG_DIR + XDG 三件套隔离）：provider id `anthropic` 覆盖 → baseURL 指向本机 catch server；模型 `claude-opus-4-8-sandbox`（目录必然静默的伪 id，插件前缀回退 → anthropic 家族 → 世代启发 `4.8 ≥ 4.7` → **adaptive-effort 通道**）。
-- 工作区 forge.json：`scout` 钉 `thoughtLevel:"xhigh"`（插件注入标记词 **xhigh**）。
-- 候选探针插件（第二次运行挂载）注入三个可区分标记：
-  - `options.reasoningEffort`（无——这是插件当时的既有注入，标记词 **xhigh**）
-  - 顶层 `options.effort = "low"`（标记词 **low**）
-  - 名字空间 `options.anthropic.output_config.effort = "medium"` + `thinking:{type:"adaptive"}`（标记词 **medium**）
-- 三个标记词互不相同、且都不是宿主默认值的可能取值之外的歧义来源（对照运行排除默认值假说，见下）。
+首轮实验的候选探针插件（`export async function server()` 形状 + file:// 直指 .mjs）**从未被宿主加载**——宿主要求 `export default { id, server }` 且 file:// 条目必须是带 package.json 的目录包（归档 FINDINGS 佐证 + 当日微实验复核）。因此首轮 Run B 的"候选键差分"归因无效。修订轮不再依赖外挂探针：以插件自身注入 + `FORGE_DEPTH_PROBE=1` 内置 trace（plugin.ts chat.params 内 env 门控日志）完成归因，线上体为唯一仲裁。
 
-## 线上证据（两次运行差分）
+## 宿主形状发现（比键名更根本）
 
-**Run A（无探针，只有插件自身的 `reasoningEffort:"xhigh"` 注入）**——scout 轮请求体头部：
-
-```json
-{"model":"claude-opus-4-8-sandbox","max_tokens":8192,"system":[...]}
-```
-
-无 `thinking`、无 `output_config`、无任何 effort 字段 → **`options.reasoningEffort` 被 anthropic 传输静默丢弃**。
-
-**Run B（探针挂载，三候选同时在场上）**——scout 轮请求体头部：
-
-```json
-{"model":"claude-opus-4-8-sandbox","max_tokens":8192,"output_config":{"effort":"low"},"system":[...]}
-```
-
-- 线上出现 `output_config:{effort:"low"}`——标记词是 **low** → **顶层 `options.effort` 存活**，宿主把它映射为 adaptive 世代原生的 `output_config.effort` 线上形状。
-- 名字空间候选死亡：线上是 `low` 不是 `medium`，且无 `thinking` 块 → `options.anthropic.output_config.*` 整体被丢弃。
-- 默认值假说排除：Run A 同一调用（无任何注入存活时）线上**没有** output_config——若宿主对该传输默认填 `effort:"low"`，Run A 也应出现；没有，故 Run B 的 low 只能来自注入。
-- `reasoningEffort` 双重死亡：Run A 证明它单独不上线；Run B 线上是 low 不是 xhigh，证明它在三候选同场时也不上线。
-
-**宿主原生词汇佐证**——宿主自己的 title-gen 调用（claude-haiku-5-5，宿主目录已知 adaptive 世代）线上形状：
-
-```json
-"thinking":{"type":"adaptive","display":"summarized","block_binding":{...}},"output_config":{"effort":"low"}
-```
-
-即 patch 过的 @ai-sdk/anthropic 的 adaptive 原生词汇就是 `thinking{type:adaptive} + output_config.effort`——`options.effort` 正好落进这条通道。
+修订轮 trace 实锤：宿主 chat.params 的 `model` 是完整 ModelInfo 对象——**模型名在 `model.id`**，不是插件 SDK 测试形状的 `model.modelID`。只读 modelID 时 adaptive 世代模型在真实宿主上静默降级为 budget 通道（trace：`model= channel={"kind":"budget"}`，注入 thinking budget 28672，宿主钳制为 1024 上线）。已修复：plugin.ts 同时接受 `model.modelID`（SDK 测试形状）与 `model.id`（宿主 ModelInfo 形状），含 wiring 回归测试。
 
 ## conclusion
 
-**可行分支成立：宿主 chat.params 接受顶层 `options.effort` 键并把它送上 anthropic 线（映射为 `output_config:{effort:<word>}`）；`options.reasoningEffort` 与名字空间 `options.anthropic.output_config` 均被静默丢弃。** 已按实证调整实现：adaptive-effort 通道注入 `options.effort = <word>`（`src/dispatch-depth.ts` applyDepthTranslation，effort 通道维持 `reasoningEffort` 不变），wiring 断言与单测同步（`tests/forge-subagents-wiring.test.mjs` adaptive 分支、`tests/dispatch-depth.test.mjs` 键契约测试）。
+**可行分支成立，端到端闭环（无外挂探针，插件自身的注入上线上体）：**
 
-边界如实记录：catch server 逐字收下了仅带 `output_config.effort`（无 `thinking` 块）的请求——真实 Anthropic API 是否要求 `thinking{type:adaptive}` 同时在场是 provider 侧事实，插件不伪造（词典非白名单公理：provider 是最终裁判，错误上浮即设计内结局）。本实证回答的是"宿主接受并传输哪个 options 键"这一问题本身。
+- 插件在 adaptive-effort 通道盖 **顶层 `options.effort = <word>`**（`src/dispatch-depth.ts` applyDepthTranslation；effort 通道维持 `reasoningEffort`）；
+- 宿主（patch 过的 @ai-sdk/anthropic）把它映射为 adaptive 世代原生线上形状 **`"output_config":{"effort":"xhigh"}`** —— scout 子会话真实请求体逐字（npm-postpublish 驱动抓取，`thoughtLevel:"XHigh"` 配置归一为 `xhigh` 后上线，原始大小写绝迹）；
+- trace 佐证：`channel={"kind":"adaptive-effort"} translation=verbatim xhigh`；`reasoningEffort` 键在 anthropic 传输上不被宿主转送（本轮插件未盖该键；宿主 title-gen 自身调用证实 `output_config.effort` 即原生 adaptive 词汇 `thinking:{type:"adaptive"} + output_config:{effort:"low"}`）。
+
+边界如实记录：catch server 逐字收下仅带 `output_config.effort`（无 thinking 块）的请求——真实 Anthropic API 是否要求 `thinking{type:adaptive}` 同场是 provider 侧事实，插件不伪造（词典非白名单公理：provider 是最终裁判）。首轮 Run B 观察到的 `effort:"low"` 来源已不可归因（探针未加载，该轮实验作废），修订轮不依赖它。
