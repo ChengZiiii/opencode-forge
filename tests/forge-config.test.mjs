@@ -121,6 +121,17 @@ test("depths is deprecated: warning finding, no behavior", () => {
   assert.ok(findings.some((f) => f.code === "depths-deprecated" && f.level === "warn"))
 })
 
+test("thoughtLevel normalizes to lowercase at the boundary with a finding when it changed", () => {
+  const { agents, findings } = validateAgentSet({ a: { model: "p/m", thoughtLevel: "XHigh" }, b: { model: "p/m", thoughtLevel: " High " }, c: { model: "p/m", thoughtLevel: "xhigh" } })
+  assert.equal(agents.a.thoughtLevel, "xhigh", "XHigh behaves exactly as xhigh")
+  assert.equal(agents.b.thoughtLevel, "high", "trim + lowercase")
+  assert.equal(agents.c.thoughtLevel, "xhigh")
+  const normalized = findings.filter((f) => f.code === "thoughtlevel-normalized")
+  assert.equal(normalized.length, 2, "only the entries whose value changed record the finding")
+  assert.ok(normalized.every((f) => f.level === "warn"))
+  assert.ok(normalized.some((f) => /XHigh.*xhigh/.test(f.message)))
+})
+
 test("cascade: layers MERGE — project overrides global per agent id, wholesale", () => {
   const files = {
     "C:/proj/.opencode/forge.json": JSON.stringify({ agents: { research: { model: "proj/model", thoughtLevel: "low" } } }),

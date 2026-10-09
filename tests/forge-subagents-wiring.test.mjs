@@ -237,32 +237,96 @@ test("depth: non-forge agents and agents without thoughtLevel get nothing", asyn
   assert.equal(out2.options.reasoningEffort, undefined, "non-forge agents are untouched")
 })
 
-test("depth: unknown provider family injects nothing, silently", async (t) => {
+test("depth: unknown provider defaults to the effort word channel — pass-through, provider judges", async (t) => {
   const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "weird/m", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   const out = { options: {} }
   await h["chat.params"]({ sessionID: "ses_u", agent: "forge-research", model: { providerID: "weird", modelID: "m" } }, out)
-  assert.deepEqual(out.options, {}, "unknown family -> no injection, no crash")
+  assert.equal(out.options.reasoningEffort, "low", "dictionary-not-whitelist: unknown endpoints are word channels")
+  assert.equal(h.__forgeSubagentsTest.depthFinding("research"), null, "pass-through is not a failure")
 })
 
-test("depth: a no-mapping word injects nothing and records a bounded once-per-agent finding", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { picky: { model: "openai/gpt", thoughtLevel: "medium" } } }))
+test("depth: catalog shape drives the channel — effort ladder, unmatched words pass through", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { picky: { model: "openai/gpt", thoughtLevel: "xhigh" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
-  // Catalog knows the model's native ladder: low/high/max only (no medium).
-  h.__forgeSubagentsTest.setCatalog({ providers: { openai: { models: { gpt: { reasoningOptions: ["low", "high", "max"] } } } } })
+  // Catalog shape: effort ladder low/high/max (no xhigh) — a word channel, so
+  // the unmatched word passes through unverified instead of erroring.
+  h.__forgeSubagentsTest.setCatalog({ providers: { openai: { models: { gpt: { reasoningShape: "effort", reasoningOptions: ["low", "high", "max"] } } } } })
 
   const out = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_n1", agent: "forge-picky", model: { providerID: "openai", modelID: "gpt" } }, out)
-  assert.equal(out.options.reasoningEffort, undefined, "nothing is injected — the session is never broken")
-  assert.match(h.__forgeSubagentsTest.depthFinding("picky") ?? "", /medium/, "a finding names the word")
+  await h["chat.params"]({ sessionID: "ses_c1", agent: "forge-picky", model: { providerID: "openai", modelID: "gpt" } }, out)
+  assert.equal(out.options.reasoningEffort, "xhigh", "unmatched word on a word channel passes through — the provider judges")
+  assert.equal(h.__forgeSubagentsTest.depthFinding("picky"), null)
+})
+
+test("depth: catalog toggle shape is a dead end for level words — finding, never collapsed to on", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { togs: { model: "openai/gpt", thoughtLevel: "high" } } }))
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  h.__forgeSubagentsTest.setCatalog({ providers: { openai: { models: { gpt: { reasoningShape: "toggle" } } } } })
+
+  const out = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_t1", agent: "forge-togs", model: { providerID: "openai", modelID: "gpt" } }, out)
+  assert.deepEqual(out.options, {}, "nothing injected — the session is never broken")
+  assert.match(h.__forgeSubagentsTest.depthFinding("togs") ?? "", /high/)
+  assert.match(h.__forgeSubagentsTest.depthFinding("togs") ?? "", /toggle/)
 
   // Bounded: a second session with the same agent does not duplicate it.
-  await h["chat.params"]({ sessionID: "ses_n2", agent: "forge-picky", model: { providerID: "openai", modelID: "gpt" } }, { options: {} })
-  assert.match(h.__forgeSubagentsTest.depthFinding("picky") ?? "", /medium/)
+  await h["chat.params"]({ sessionID: "ses_t2", agent: "forge-togs", model: { providerID: "openai", modelID: "gpt" } }, { options: {} })
+  assert.match(h.__forgeSubagentsTest.depthFinding("togs") ?? "", /high/)
+})
+
+test("depth: catalog-silent zai falls back to the toggle family (GLM today) — level word is a dead-end finding", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { glm: { model: "zai/glm-5.3", thoughtLevel: "xhigh" } } }))
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  // Real-world shape today: models.dev carries nothing for zai/glm-5.3.
+  h.__forgeSubagentsTest.setCatalog({ providers: {} })
+  const out = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_g1", agent: "forge-glm", model: { providerID: "zai", modelID: "glm-5.3" } }, out)
+  assert.deepEqual(out.options, {}, "prefix fallback lands on the toggle dead end")
+  assert.match(h.__forgeSubagentsTest.depthFinding("glm") ?? "", /xhigh/)
+})
+
+test("depth: XHigh in forge.json normalizes at the boundary and ladder-matches", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { mixed: { model: "openai/gpt", thoughtLevel: "XHigh" } } }))
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  h.__forgeSubagentsTest.setCatalog({ providers: { openai: { models: { gpt: { reasoningShape: "effort", reasoningOptions: ["low", "xhigh"] } } } } })
+  const out = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_x1", agent: "forge-mixed", model: { providerID: "openai", modelID: "gpt" } }, out)
+  assert.equal(out.options.reasoningEffort, "xhigh")
+})
+
+test("depth: catalog-silent anthropic resolves adaptive vs budget by model id", async (t) => {
+  const dir = projectWithForgeJson(
+    t,
+    JSON.stringify({ agents: { "claude-old": { model: "anthropic/claude-4-6", thoughtLevel: "high" }, "claude-new": { model: "anthropic/claude-opus-4-7", thoughtLevel: "xhigh" } } }),
+  )
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  h.__forgeSubagentsTest.setCatalog({ providers: {} })
+
+  const old = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_a1", agent: "forge-claude-old", model: { providerID: "anthropic", modelID: "claude-4-6" } }, old)
+  assert.deepEqual(old.options, { thinking: { type: "enabled", budget_tokens: 24576 } }, "legacy budget tiers serve pre-adaptive models")
+
+  const neo = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_a2", agent: "forge-claude-new", model: { providerID: "anthropic", modelID: "claude-opus-4-7" } }, neo)
+  // Empirically verified option key for the adaptive channel: the host maps
+  // top-level options.effort to the native output_config:{effort} wire shape
+  // and silently drops reasoningEffort on anthropic transports (the sandbox
+  // wire capture lives at verify/adaptive-key.md).
+  assert.equal(neo.options.effort, "xhigh", "adaptive-era models receive the effort word on the effort option key")
+  assert.equal(neo.options.reasoningEffort, undefined, "the dropped-by-transport key is not stamped for the adaptive channel")
 })
 
 // ---------------------------------------------------------------------------

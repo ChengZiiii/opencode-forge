@@ -1,12 +1,13 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 
-// Spec: dispatch — cost reporting with self-computed prices; design D5/D6.
+// Spec: catalog-driven-depth-shapes — the models.dev slice keeps the
+// reasoning SHAPE (effort/toggle/budget_tokens), not just the effort values:
 //   fetch success -> reduced snapshot, not degraded
 //   fetch failure -> degraded empty catalog (dispatch keeps working)
 //   OPENCODE_MODELS_URL is respected as the source
 
-import { loadModelsDevSnapshot, reduceModelsDev } from "../src/models-dev.ts"
+import { loadModelsDevSnapshot, reduceModelsDev, modelDepthShape, nativeLadder } from "../src/models-dev.ts"
 
 const SAMPLE = {
   "zai-coding-plan": {
@@ -20,15 +21,39 @@ const SAMPLE = {
   },
 }
 
-test("reduceModelsDev keeps reasoning_options + cost, skips malformed entries", () => {
+test("reduceModelsDev keeps the shape + effort values + cost, skips malformed entries", () => {
   const c = reduceModelsDev(SAMPLE)
   const glm = c.providers["zai-coding-plan"].models["glm-5.3"]
+  assert.equal(glm.reasoningShape, "effort")
   assert.deepEqual(glm.reasoningOptions, ["low", "high", "max"], "effort values are the named ladder")
-  assert.deepEqual(c.providers["zai-coding-plan"].models["glm-4.7"].reasoningOptions, [], "toggle models have no named levels")
-  assert.deepEqual(c.providers["zai-coding-plan"].models["claude-x"].reasoningOptions, [], "budget-only models have no named levels")
+
+  const toggle = c.providers["zai-coding-plan"].models["glm-4.7"]
+  assert.equal(toggle.reasoningShape, "toggle")
+  assert.equal(toggle.reasoningOptions, undefined, "toggle models carry the shape, not a fake empty ladder")
+
+  const budget = c.providers["zai-coding-plan"].models["claude-x"]
+  assert.equal(budget.reasoningShape, "budget_tokens")
+  assert.equal(budget.reasoningOptions, undefined, "budget-only models have no named levels")
+
   assert.equal(glm.cost.input, 0.6)
   assert.ok(c.providers["zai-coding-plan"].models.weird, "model kept even with a malformed cost")
   assert.equal(reduceModelsDev(null).providers && Object.keys(reduceModelsDev(null).providers).length, 0)
+})
+
+test("modelDepthShape: the catalog decides the channel; silence yields null", () => {
+  const c = reduceModelsDev(SAMPLE)
+  assert.deepEqual(modelDepthShape(c, "zai-coding-plan/glm-5.3"), { shape: "effort", ladder: ["low", "high", "max"] })
+  assert.deepEqual(modelDepthShape(c, "zai-coding-plan/glm-4.7"), { shape: "toggle" })
+  assert.deepEqual(modelDepthShape(c, "zai-coding-plan/claude-x"), { shape: "budget_tokens" })
+  assert.equal(modelDepthShape(c, "zai-coding-plan/weird"), null, "no reasoning_options row -> catalog-silent")
+  assert.equal(modelDepthShape(c, "unknown-provider/whatever"), null)
+  assert.equal(modelDepthShape(null, "zai-coding-plan/glm-5.3"), null, "degraded snapshot fails soft")
+})
+
+test("nativeLadder: toggle/budget models now yield null (no fake empty ladder)", () => {
+  const c = reduceModelsDev(SAMPLE)
+  assert.deepEqual(nativeLadder(c, "zai-coding-plan/glm-5.3"), ["low", "high", "max"])
+  assert.equal(nativeLadder(c, "zai-coding-plan/glm-4.7"), null)
 })
 
 test("fetch success -> snapshot, not degraded; failure -> degraded empty", async () => {

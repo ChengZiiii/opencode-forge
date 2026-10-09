@@ -8,7 +8,7 @@ import assert from "node:assert/strict"
 // description is the task-tool vocabulary entry.
 
 import { materializeAgentPrompt, WORKER_MANDATES } from "../src/dispatch-prompt.ts"
-import { rolePromptFor, forgeAgentDef, agentDescriptionFor } from "../src/dispatch-tiers.ts"
+import { rolePromptFor, forgeAgentDef, agentDescriptionFor, effectiveReadonlyShape } from "../src/dispatch-tiers.ts"
 
 test("role prompt layer 1: an explicit def.prompt overrides everything", () => {
   const role = rolePromptFor("auditor", { prompt: "You are a dependency auditor; check licenses.", model: "x/y" })
@@ -69,6 +69,26 @@ test("forgeAgentDef: a write shape drops the mutating denies; an override never 
   const o = forgeAgentDef("ops", { model: "prov/x", shape: "write", permission: { bash: "deny" } })
   assert.equal(o.permission.bash, "deny")
   assert.equal(o.permission.task, "deny")
+})
+
+// allow-readonly-recon-during-plan-draft: the six-way effectiveness matrix
+// the draft dispatch gate keys on. Declared shape AND materialized permission
+// must agree; any override lifting a mutating tool off "deny" breaks it.
+test("effectiveReadonlyShape: six-way effectiveness matrix (fail-closed on overrides)", () => {
+  // 1. default shape (readonly implied) -> effective
+  assert.equal(effectiveReadonlyShape({ model: "prov/x" }), true)
+  // 2. explicit write shape -> never effective
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "write" }), false)
+  // 3. a permission override allowing ANY mutating tool breaks it
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { write: "allow" } }), false)
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { edit: "allow" } }), false)
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { bash: "allow" } }), false)
+  // 4. "ask" counts as lifted (fail closed — the user gate could approve)
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { bash: "ask" } }), false)
+  // 5. overrides on irrelevant tools change nothing
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { forge_shell: "allow", task: "allow" } }), true)
+  // 6. explicit deny on a mutating tool is confirmation, not a lift
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { write: "deny" } }), true)
 })
 
 test("agent description names the role, shape, and pinned brain for the task vocabulary", () => {

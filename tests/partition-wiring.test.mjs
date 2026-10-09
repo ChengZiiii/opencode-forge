@@ -299,6 +299,166 @@ test("partition: the draft write-ban message is agent-agnostic (D12, session-sco
 })
 
 // ---------------------------------------------------------------------------
+// draft recon shape gate (allow-readonly-recon-during-plan-draft)
+// ---------------------------------------------------------------------------
+
+const RECON_ROSTER = {
+  scout: { model: "x/y", thoughtLevel: "low" }, // default shape = readonly
+  coder: { model: "x/y", thoughtLevel: "low", shape: "write" },
+  lifted: { model: "x/y", thoughtLevel: "low", permission: { write: "allow" } }, // override lifts write off deny
+  asking: { model: "x/y", thoughtLevel: "low", permission: { bash: "ask" } }, // ask counts as lifted too
+}
+
+test("recon gate: effective-readonly dispatch passes during draft; every other target is denied with the roster", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-recon-"))
+  try {
+    mkdirSync(join(wt, ".opencode"), { recursive: true })
+    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: RECON_ROSTER }))
+    const h = await startServer(inputFor(wt), {})
+    const cfg = { agent: {} }
+    await h.config(cfg)
+    const sid = "ses_recon"
+    await h.tool.plan_write.execute(
+      { goal: "recon gate", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
+      ctx(sid, wt),
+    )
+
+    // 1. effective-readonly target passes the write-class ban (no throw).
+    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1" }, { args: { subagent_type: "forge-scout", prompt: "x" } })
+
+    // 2. write shape: denied, roster lists ONLY the effective-readonly worker.
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r2" }, { args: { subagent_type: "forge-coder", prompt: "x" } }),
+      (err) => {
+        assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
+        assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-scout\./, "roster carries exactly the effective-readonly worker")
+        assert.ok(!err.message.includes("forge-coder") || !/dispatchable during draft: [^.]*coder/.test(err.message))
+        assert.match(err.message, /plan_approve/)
+        assert.match(err.message, /\/plan discard/)
+        return true
+      },
+    )
+
+    // 3. permission override lifting write (or bash to ask) breaks effectiveness.
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r3" }, { args: { subagent_type: "forge-lifted", prompt: "x" } }),
+      /dispatch is denied for this target/,
+    )
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r4" }, { args: { subagent_type: "forge-asking", prompt: "x" } }),
+      /dispatch is denied for this target/,
+    )
+
+    // 4. native / absent / resume-style targets fail closed.
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r5" }, { args: { subagent_type: "general", prompt: "x" } }),
+      /dispatch is denied for this target/,
+    )
+    await assert.rejects(h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r6" }, { args: {} }), /dispatch is denied for this target/)
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r7" }, { args: { task_id: "ses_prev", prompt: "x" } }),
+      /dispatch is denied for this target/,
+    )
+
+    // 5. non-task write tools keep the original agent-agnostic wording.
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "write", sessionID: sid, callID: "r8" }, { args: { filePath: "x" } }),
+      /write operations are denied \(write\)/,
+    )
+
+    // 6. the permission.ask belt stays deny for task during draft (fail-closed
+    //    side belt: user-configured ask hosts degrade to today's behavior).
+    const askOut = { status: "allow" }
+    await h["permission.ask"]({ sessionID: sid, id: "task", metadata: { tool: "task" } }, askOut)
+    assert.equal(askOut.status, "deny")
+
+    // 7. with no draft in the worktree, every dispatch passes.
+    const wt2 = mkdtempSync(join(tmpdir(), "part-recon2-"))
+    try {
+      mkdirSync(join(wt2, ".opencode"), { recursive: true })
+      writeFileSync(join(wt2, ".opencode", "forge.json"), JSON.stringify({ agents: RECON_ROSTER }))
+      const h2 = await startServer(inputFor(wt2), {})
+      await h2.config({ agent: {} })
+      await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_free", callID: "f1" }, { args: { subagent_type: "forge-coder", prompt: "x" } })
+      await h2.dispose?.()
+    } finally {
+      rmSync(wt2, { recursive: true, force: true })
+    }
+
+    // 8. /plan template states the carve-out accurately.
+    assert.match(cfg.command.plan.template, /readonly-shape forge scouts/)
+    assert.match(cfg.command.plan.template, /so is dispatching write-shaped workers or native agents/)
+    assert.match(cfg.command.plan.template, /write tools and bash are DENIED while a draft exists/)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("recon gate: an empty roster refuses with configuration guidance, not a bare wall", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-recon0-"))
+  try {
+    const h = await startServer(inputFor(wt), {})
+    const sid = "ses_recon0"
+    await h.tool.plan_write.execute(
+      { goal: "empty roster", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
+      ctx(sid, wt),
+    )
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "e1" }, { args: { subagent_type: "forge-scout", prompt: "x" } }),
+      (err) => {
+        assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
+        assert.match(err.message, /No readonly worker is configured — define one in forge\.json/)
+        assert.match(err.message, /plan_approve/)
+        return true
+      },
+    )
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// Belt 3.1 (task 3.1): a task-spawned CHILD session is an independent
+// sessionID, but the launch-worktree seeding + resolveActivePlan directory
+// fallback re-binds it to the same draft — the session-level write ban is
+// ambient for the child. The scout's forge_shell stays ask-gated, not
+// denied: same posture as the primary agent.
+test("recon gate ambient belt: a child session inherits the draft write ban; forge_shell keeps its ask posture", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-ambient-"))
+  try {
+    mkdirSync(join(wt, ".opencode"), { recursive: true })
+    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { scout: { model: "x/y" } } }))
+    const h = await startServer(inputFor(wt), {})
+    await h.config({ agent: {} })
+    await h.tool.plan_write.execute(
+      { goal: "ambient belt", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
+      ctx("ses_parent", wt),
+    )
+    // The child sessionID was NEVER seen by the host (no chat.message, no
+    // tool context) — stateForBan seeds it from the launch worktree and the
+    // directory fallback resolves the draft: writes are refused in the child.
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "write", sessionID: "ses_child", callID: "a1" }, { args: { filePath: "x" } }),
+      /A plan is in draft; write operations are denied \(write\)/,
+    )
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "bash", sessionID: "ses_child", callID: "a2" }, { args: { command: "ls" } }),
+      /A plan is in draft; write operations are denied \(bash\)/,
+    )
+    // forge_shell is not in the write class: it passes tool.execute.before
+    // (no throw) and the permission.ask belt holds it at ask, not deny.
+    await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_child", callID: "a3" }, { args: { command: "ls" } })
+    const askOut = { status: "allow" }
+    await h["permission.ask"]({ sessionID: "ses_child", id: "forge_shell", metadata: { tool: "forge_shell" } }, askOut)
+    assert.equal(askOut.status, "ask", "forge_shell degrades to ask (its confirmation gate), never a silent deny")
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
 // command templates (task 4.6)
 // ---------------------------------------------------------------------------
 
