@@ -43,11 +43,13 @@ OpenSpec spec workflows remain a third, separate lane.
   counts read the Task List only — and a superseded plan's Task List
   stays the frozen decision snapshot: closure IS the supersession, and
   crew/goal results never tick it.
-- While a plan is in draft, `write` / `edit` / `bash` / `task` are **denied
-  at the permission layer** — including your own `allow` config, and for
-  every agent in that session (the draft protects shared session state; see
-  Agent partition below). The only exits are approval and discard. This is
-  deliberate; see Design stance.
+- While a plan is in draft, `write` / `edit` / `bash` are **denied at the
+  permission layer** — including your own `allow` config, and for every agent
+  in that session (the draft protects shared session state; see Agent
+  partition below) — and `task` is **shape-gated**: dispatch to an
+  effective-readonly forge scout passes, every other target is denied (see
+  Design stance). The only exits are approval and discard. This is deliberate;
+  see Design stance.
 - `plan_approve` / `plan_close` are pinned to a confirmation dialog: the
   model can never flip the state itself.
 - Goal files: `.opencode/goal/<date>-<slug>.md`, state machine
@@ -498,7 +500,7 @@ out of a materialized id.
     // PINNED worker: model + thoughtLevel form an ATOMIC PAIR — set BOTH
     "research": {
       "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string
-      "thoughtLevel": "low",              // none/low/medium/high/max or a native level name
+      "thoughtLevel": "low",              // none/minimal/low/medium/high/xhigh/max, or any word — write lowercase
       // "prompt": "short role description — explicit prompts fully override the built-ins (only research/review ids have them; any other id without a prompt gets a generic one-liner)",
       // "shape": "write",   // default readonly denies write/edit/bash
       // "permission": { "bash": "deny" } // optional override; "task" is ALWAYS denied
@@ -572,8 +574,10 @@ Say "dispatch a subagent..." in a forge session and the model picks from the
 task tool vocabulary: a configured `forge-*` agent whose description matches
 runs on its pinned brain; if none matches, forge is instructed to say so
 plainly and fall back to the native task channel. During a plan draft the
-native `task` tool is already denied by the plan harness — no plugin-side
-rule needed.
+`task` tool is gated by the dispatch target's effective readonly shape:
+readonly scout dispatch passes as reconnaissance (breadth evidence without
+burning the planning session's context), write-shaped workers and native
+agents are denied with the dispatchable roster and the two exits.
 
 **Known pitfall — keyless endpoints × readonly agents**: free/keyless
 providers can return a deterministic EMPTY response for any toolset-reduced
@@ -583,18 +587,42 @@ attributable task failure; the mitigation is unchanged — use
 
 ### The thoughtLevel word
 
-One word per agent: the canonical `none | low | medium | high | max`, or the
-model's native level name verbatim (e.g. Qwen's `XHigh`). Injection rides the
-`chat.params` hook keyed by agent name, translated per provider family:
-effort-style (OpenAI-compatible) receives `reasoningEffort = <word>`;
-budget-style (Anthropic-style) receives a published thinking tier
-(`low → 8192`, `medium → 16384`, `high → 24576`, `max → 32768`,
-`none → off`); toggle-style (zai/GLM) receives thinking on/off. Rules:
-verbatim-first, no interpolation, unknown family injects nothing. A word the
-model does not natively offer injects NOTHING and records one finding naming
-both vocabularies — the session is never broken by a config word. A
-session's depth is frozen at its first request (editing forge.json
-mid-session never rewrites a running session).
+One word per agent: the canonical seven-word dictionary
+`none | minimal | low | medium | high | xhigh | max`, or any native level
+name. **Write lowercase**: the value is normalized at the config boundary
+(trimmed and lowercased), so `High` and `XHigh` behave exactly as `high` and
+`xhigh`; normalization that changes what you wrote records one warn finding.
+Native casing on the wire is the catalog's business, never yours. Injection
+rides the `chat.params` hook keyed by agent name. The wire shape comes from
+data, not guessing: a model the models.dev catalog knows by
+`reasoning_options` is translated per that catalog shape (effort word list /
+toggle / token budget); a catalog-silent model falls back to the
+provider-prefix family; a provider absent from both is treated as an effort
+**word channel** by default (custom relays and unknown endpoints — the most
+universal shape). Adaptive-era Anthropic models (major > 4 or 4.7+) receive
+the effort word directly instead of a budget number, on the empirically
+verified `effort` option key (the host transports it as the adaptive-era
+native `output_config: {effort: <word>}` wire shape; a `reasoningEffort`
+key is silently dropped by anthropic transports). **The dictionary is a
+dictionary, never a whitelist**: a word matching neither the dictionary nor
+the model's ladder passes through VERBATIM on word-shaped channels
+(`reasoningEffort = <word>`, or `effort = <word>` on the adaptive channel),
+disclosed as unverified — the provider is the
+final judge, and a provider-side rejection surfaces as the request's own
+error. Ladder matching is case-insensitive and emits the catalog's native
+casing (`xhigh` in, `XHigh` out when the catalog says so). **The only dead
+ends are the two shapes with no word channel**: budget-style (legacy
+Anthropic-style) models have a published thinking tier instead
+(`minimal → 1024` — the Anthropic API hard floor, the only cross-project
+consensus number; `low → 8192`, `medium → 16384`, `high → 24576`,
+`xhigh → 28672` — a half step between high and max; `max → 32768`;
+`none → off`. **This tier table is this plugin's selection — there is no
+community-standard tier table**), and pure toggle endpoints (zai/GLM: a level
+word has no toggle counterpart) — there the plugin injects nothing and
+records one bounded finding naming both vocabularies. No interpolation
+anywhere; the session is never broken by a config word. A session's depth is
+frozen at its first request (editing forge.json mid-session never rewrites a
+running session).
 
 ## Crew workflow (`/crew`)
 
@@ -761,6 +789,28 @@ denied, and an `allow` in your config does not override it. Reconnaissance is
 read/grep/glob; if you genuinely need a shell command to decide the plan,
 approve the plan first (revising after approval is allowed via a new `/plan`).
 The escape hatches are `plan_approve` and `/plan discard`, by design.
+
+One carve-out, keyed on the target rather than the tool: during a draft the
+`task` tool is gated by the dispatch target's **effective readonly shape**. A
+dispatch to a forge worker whose shape is not `write` AND whose permission
+overrides do not lift `write`/`edit`/`bash` off `deny` (`ask` counts as
+lifted — fail-closed) passes as a reconnaissance dispatch: readonly scouts
+may be spawned both before and during the draft, so breadth
+evidence-gathering does not burn the planning session's context. Every other
+target — write-shaped workers, native agents, absent or unresolvable targets
+(including resume calls that carry no target) — is denied like any write-class
+tool. The refusal names the currently dispatchable effective-readonly roster,
+points to defining a readonly worker in forge.json when the roster is empty
+(an unconfigured host stays fully denied — same behavior as before, just more
+actionable wording), and names the two exits (`plan_approve`, `/plan
+discard`). Invariant strength is unchanged: the scout's materialized
+permission hard-denies write/edit/bash (and `task`, always — no chained
+spawning), the scout's own session is ambient-bound to the same draft write
+ban, and its `forge_shell` calls ride the same per-call ask gate the primary
+agent faces. The `permission.ask` belt does not follow the exemption: on a
+host configured with `task: "ask"` a draft-phase dispatch is still denied
+(fail-closed degradation by design — the side belt does not resolve target
+shapes).
 
 Separately, the builtin shell is hidden on the forge agent on purpose —
 `forge_shell` is the exec surface there (see Agent partition and the job
