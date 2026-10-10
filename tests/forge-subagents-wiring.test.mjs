@@ -5,6 +5,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 
 import { server } from "../plugin.ts"
+import { reduceModelsDev } from "../src/models-dev.ts"
 
 // Task 5.2 — forge-subagents wiring suite (spec: forge-subagents +
 // crew-harness delta; change simplify-dispatch-to-static-agents). Covers:
@@ -12,6 +13,9 @@ import { server } from "../plugin.ts"
 //   - no-clobber of user-defined forge-<id> entries; disable knob silence
 //   - the native-task surface: no forge_dispatch tools registered
 //   - chat.params keyed by agent name: injection, freeze, no-mapping finding
+//   - production-catalog P0-1 regression: catalog effort claims never pick
+//     the anthropic channel; dead-end freeze survives mid-session config
+//     fixes (postrelease-hardening task 5)
 //   - /crew command composition: orchestration roster vs init hard gate (4.5)
 //   - crew_begin declared plan + crew_close gate wiring (4.1-4.4)
 
@@ -286,7 +290,11 @@ test("depth: catalog-silent zai falls back to the toggle family (GLM today) — 
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
-  // Real-world shape today: models.dev carries nothing for zai/glm-5.3.
+  // Catalog pinned EMPTY on purpose: real models.dev snapshots DO carry
+  // glm-5.3 now (zai-coding-plan/glm-5.3: reasoning_options type=effort,
+  // values low/high/max — the old "models.dev carries nothing for
+  // zai/glm-5.3" note was outdated). With an empty catalog the
+  // provider-prefix toggle fallback (GLM family) is what fires.
   h.__forgeSubagentsTest.setCatalog({ providers: {} })
   const out = { options: {} }
   await h["chat.params"]({ sessionID: "ses_g1", agent: "forge-glm", model: { providerID: "zai", modelID: "glm-5.3" } }, out)
@@ -338,6 +346,159 @@ test("depth: catalog-silent anthropic resolves adaptive vs budget by model id", 
   const hostShapeEmpty = { options: {} }
   await h["chat.params"]({ sessionID: "ses_a4", agent: "forge-claude-old", model: { id: "claude-4-6", providerID: "anthropic" } }, hostShapeEmpty)
   assert.deepEqual(hostShapeEmpty.options, { thinking: { type: "enabled", budget_tokens: 24576 } }, "the ModelInfo.id shape resolves the budget channel for legacy models")
+})
+
+// ---------------------------------------------------------------------------
+// Production-catalog simulation (postrelease-hardening task 5.1 — the P0-1
+// blind-spot regression): the REAL models.dev snapshot carries
+// reasoning_options of type effort for bare claude ids. Before the family
+// gate that data outranked the anthropic transport matrix and routed pinned
+// words onto options.reasoningEffort — the key the host's anthropic
+// transport silently drops (silent dead injection on every production
+// claude session). The slice below flows through the PRODUCTION reducer so
+// the raw structured models.dev shape is what gets injected (the reducer
+// eats the raw api.json form: top-level keys ARE provider ids).
+
+const PRODUCTION_RAW = {
+  anthropic: {
+    models: {
+      "claude-opus-4-7": { reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }] },
+      "claude-opus-4-8": { reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }] },
+      "claude-opus-4-6": { reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }] },
+      "claude-opus-4": { reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }] },
+    },
+  },
+  "zai-coding-plan": {
+    models: {
+      "glm-5.3": { reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] },
+    },
+  },
+}
+
+test("depth: the production catalog's effort claims for anthropic never pick the channel (P0-1 regression)", async (t) => {
+  const dir = projectWithForgeJson(
+    t,
+    JSON.stringify({
+      agents: {
+        "opus47": { model: "anthropic/claude-opus-4-7", thoughtLevel: "xhigh" },
+        "opus48": { model: "anthropic/claude-opus-4-8", thoughtLevel: "xhigh" },
+        "opus47high": { model: "anthropic/claude-opus-4-7", thoughtLevel: "high" },
+        "opus46": { model: "anthropic/claude-opus-4-6", thoughtLevel: "xhigh" },
+        "opus4": { model: "anthropic/claude-opus-4", thoughtLevel: "minimal" },
+        "glmcat": { model: "zai-coding-plan/glm-5.3", thoughtLevel: "high" },
+      },
+    }),
+  )
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  h.__forgeSubagentsTest.setCatalog(reduceModelsDev(PRODUCTION_RAW))
+  // The simulation is real: the injected slice IS the production form —
+  // without this guard the assertions below would pass vacuously on a null
+  // catalog (the blind spot was exactly a LOADED catalog outranking the
+  // matrix, not an absent one).
+  assert.equal(h.__forgeSubagentsTest.catalog()?.providers.anthropic?.models["claude-opus-4-7"]?.reasoningShape, "effort")
+  assert.deepEqual(h.__forgeSubagentsTest.catalog()?.providers.anthropic?.models["claude-opus-4-7"]?.reasoningOptions, ["low", "medium", "high"])
+
+  const call = async (sessionID, agent, providerID, modelID) => {
+    const out = { options: {} }
+    await h["chat.params"]({ sessionID, agent: `forge-${agent}`, model: { providerID, modelID } }, out)
+    return out.options
+  }
+
+  // Adaptive era (4-7 / 4-8): the effort word rides options.effort and the
+  // dropped-by-transport key NEVER appears — deepEqual pins the options
+  // object to EXACTLY that one key.
+  assert.deepEqual(await call("ses_p47x", "opus47", "anthropic", "claude-opus-4-7"), { effort: "xhigh" })
+  assert.deepEqual(await call("ses_p48x", "opus48", "anthropic", "claude-opus-4-8"), { effort: "xhigh" })
+  // A ladder-MATCHED word bypasses the catalog too: had the catalog been
+  // consulted, "high" would ride reasoningEffort (confirmed) — the key the
+  // transport drops. This is the exact P0-1 production failure.
+  assert.deepEqual(await call("ses_p47h", "opus47high", "anthropic", "claude-opus-4-7"), { effort: "high" })
+  // Legacy era (4-6): the budget tier table — the catalog effort claim is
+  // not consulted for shape selection.
+  assert.deepEqual(await call("ses_p46x", "opus46", "anthropic", "claude-opus-4-6"), { thinking: { type: "enabled", budget_tokens: 28672 } })
+  // No minor version = legacy (matrix boundary preserved); the 1024
+  // API-minimum tier serves `minimal`.
+  assert.deepEqual(await call("ses_p4m", "opus4", "anthropic", "claude-opus-4"), { thinking: { type: "enabled", budget_tokens: 1024 } })
+  // Control (catalog authority intact everywhere else): a non-anthropic
+  // catalog effort model still translates by its catalog ladder, matched
+  // word confirmed.
+  assert.deepEqual(await call("ses_glmcat", "glmcat", "zai-coding-plan", "glm-5.3"), { reasoningEffort: "high" })
+  // None of this matrix is a dead end: no findings.
+  assert.equal(h.__forgeSubagentsTest.depthFinding("opus47"), null)
+  assert.equal(h.__forgeSubagentsTest.depthFinding("opus46"), null)
+  assert.equal(h.__forgeSubagentsTest.depthFinding("glmcat"), null)
+})
+
+// ---------------------------------------------------------------------------
+// Dead-end freeze (postrelease-hardening task 5.3, spec scenario "A dead-end
+// resolution freezes like any other"): a no-mapping FIRST resolution lands in
+// the session table as { translation: null }, so mid-session forge.json edits
+// that would make the word translatable never rewrite the running session;
+// only sessions created after the edit resolve fresh.
+
+test("depth freeze: a legacy-budget dead end freezes nothing-injected; a mid-session word fix reaches only fresh sessions", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { "legacy-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "ultra" } } }))
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  h.__forgeSubagentsTest.setCatalog({ providers: {} })
+
+  // First resolution: "ultra" has no budget tier -> nothing injected + one finding.
+  const first = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_fz1", agent: "forge-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, first)
+  assert.deepEqual(first.options, {}, "a dead end injects nothing — the session is never broken")
+  assert.match(h.__forgeSubagentsTest.depthFinding("legacy-ultra") ?? "", /ultra/)
+  assert.match(h.__forgeSubagentsTest.depthFinding("legacy-ultra") ?? "", /budget/, "the finding names the shape")
+  assert.equal(h.__forgeSubagentsTest.depthState("ses_fz1"), null, "the dead end froze as a null translation")
+
+  // Mid-session hot edit: the pinned word becomes translatable (a tier word).
+  writeFileSync(
+    join(dir, ".opencode", "forge.json"),
+    JSON.stringify({ agents: { "legacy-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "high" } } }),
+  )
+  const second = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_fz1", agent: "forge-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, second)
+  assert.deepEqual(second.options, {}, "the frozen dead end holds: nothing is injected for the remainder of the session")
+  assert.equal(h.__forgeSubagentsTest.depthState("ses_fz1"), null, "the frozen null is not re-resolved by the hot edit")
+  assert.match(h.__forgeSubagentsTest.depthFinding("legacy-ultra") ?? "", /ultra/, "the bounded finding is neither re-recorded nor replaced")
+
+  // A session created after the edit resolves fresh and injects.
+  const fresh = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_fz2", agent: "forge-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, fresh)
+  assert.deepEqual(fresh.options, { thinking: { type: "enabled", budget_tokens: 24576 } }, "the new session resolves the fixed word on the budget tier table")
+})
+
+test("depth freeze: a dead end stays dead across a mid-session model swap to a word channel; fresh sessions ride the new channel", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { "swap-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "ultra" } } }))
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  h.__forgeSubagentsTest.setCatalog({ providers: {} })
+
+  const first = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_sw1", agent: "forge-swap-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, first)
+  assert.deepEqual(first.options, {}, "budget-era dead end: nothing injected")
+  assert.equal(h.__forgeSubagentsTest.depthState("ses_sw1"), null)
+  assert.match(h.__forgeSubagentsTest.depthFinding("swap-ultra") ?? "", /budget/)
+
+  // Mid-session swap: the same pinned word now sits on a WORD channel
+  // (openai-family effort) where it would pass through verbatim.
+  writeFileSync(
+    join(dir, ".opencode", "forge.json"),
+    JSON.stringify({ agents: { "swap-ultra": { model: "openai/gpt", thoughtLevel: "ultra" } } }),
+  )
+  const second = { options: {} }
+  // The request itself now carries the effort-channel model — the freeze
+  // binds the SESSION, so the resolution still does not flip.
+  await h["chat.params"]({ sessionID: "ses_sw1", agent: "forge-swap-ultra", model: { providerID: "openai", modelID: "gpt" } }, second)
+  assert.deepEqual(second.options, {}, "the frozen dead end survives the model swap for the running session")
+  assert.equal(h.__forgeSubagentsTest.depthState("ses_sw1"), null)
+
+  const fresh = { options: {} }
+  await h["chat.params"]({ sessionID: "ses_sw2", agent: "forge-swap-ultra", model: { providerID: "openai", modelID: "gpt" } }, fresh)
+  assert.deepEqual(fresh.options, { reasoningEffort: "ultra" }, "the fresh session resolves on the new word channel — pass-through, provider judges")
 })
 
 // ---------------------------------------------------------------------------

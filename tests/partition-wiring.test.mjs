@@ -419,6 +419,94 @@ test("recon gate: an empty roster refuses with configuration guidance, not a bar
   }
 })
 
+// ---------------------------------------------------------------------------
+// patch-family shape gate (postrelease-hardening task 5.2): the draft gate's
+// lifting test keys on MUTATING_TOOLS — a permission override that lifts ANY
+// patch-family member (allow or ask) disqualifies the readonly exemption,
+// exactly like a write/edit/bash lift.
+
+const PATCH_LIFT_ROSTER = {
+  scout: { model: "x/y", thoughtLevel: "low" }, // effective readonly — the only exempt target
+  patched: { model: "x/y", thoughtLevel: "low", permission: { patch: "allow" } },
+  applied: { model: "x/y", thoughtLevel: "low", permission: { apply: "ask" } },
+  applypatched: { model: "x/y", thoughtLevel: "low", permission: { applypatch: "allow" } },
+  multiedited: { model: "x/y", thoughtLevel: "low", permission: { multiedit: "ask" } },
+}
+
+test("recon gate: a patch-family permission lift kills the readonly exemption with the same refusal", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-patchlift-"))
+  try {
+    mkdirSync(join(wt, ".opencode"), { recursive: true })
+    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: PATCH_LIFT_ROSTER }))
+    const h = await startServer(inputFor(wt), {})
+    await h.config({ agent: {} })
+    const sid = "ses_patchlift"
+    await h.tool.plan_write.execute(
+      { goal: "patch lift gate", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
+      ctx(sid, wt),
+    )
+    // Every lifted member is refused like any write-class target, and the
+    // roster still names exactly the effective-readonly worker.
+    for (const [callID, target] of [["p1", "forge-patched"], ["p2", "forge-applied"], ["p3", "forge-applypatched"], ["p4", "forge-multiedited"]]) {
+      await assert.rejects(
+        h["tool.execute.before"]({ tool: "task", sessionID: sid, callID }, { args: { subagent_type: target, prompt: "x" } }),
+        (err) => {
+          assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
+          assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-scout\./, "the roster carries exactly the untouched readonly worker")
+          assert.match(err.message, /plan_approve/)
+          return true
+        },
+      )
+    }
+    // ...while the untouched readonly scout keeps the exemption.
+    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "p5" }, { args: { subagent_type: "forge-scout", prompt: "x" } })
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// both-fields roster seam (postrelease-hardening task 5.4): the gate extracts
+// the target as `subagent_type ?? agent` — a both-fields call resolves
+// through subagent_type FIRST, and the agent field never overrides it. (The
+// host schema refuses agent-only calls; the seam itself is what this pins.)
+
+test("recon gate: a both-fields task call resolves through the subagent_type-first seam", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-bothfields-"))
+  try {
+    mkdirSync(join(wt, ".opencode"), { recursive: true })
+    writeFileSync(
+      join(wt, ".opencode", "forge.json"),
+      JSON.stringify({
+        agents: {
+          scout: { model: "x/y", thoughtLevel: "low" },
+          coder: { model: "x/y", thoughtLevel: "low", shape: "write" },
+        },
+      }),
+    )
+    const h = await startServer(inputFor(wt), {})
+    await h.config({ agent: {} })
+    const sid = "ses_bothfields"
+    await h.tool.plan_write.execute(
+      { goal: "both fields seam", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
+      ctx(sid, wt),
+    )
+    // Both fields agree on the readonly scout: the draft exemption holds.
+    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b1" }, { args: { subagent_type: "forge-scout", agent: "forge-scout", prompt: "x" } })
+    // subagent_type (readonly) wins over a write-shaped agent field: exempt.
+    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b2" }, { args: { subagent_type: "forge-scout", agent: "forge-coder", prompt: "x" } })
+    // Mirror: subagent_type (write) wins over a readonly agent field — refused.
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b3" }, { args: { subagent_type: "forge-coder", agent: "forge-scout", prompt: "x" } }),
+      /A plan is in draft; dispatch is denied for this target/,
+    )
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
 // Belt 3.1 (task 3.1): a task-spawned CHILD session is an independent
 // sessionID, but the launch-worktree seeding + resolveActivePlan directory
 // fallback re-binds it to the same draft — the session-level write ban is
