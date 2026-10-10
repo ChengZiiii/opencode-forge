@@ -502,7 +502,8 @@ out of a materialized id.
       "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string
       "thoughtLevel": "low",              // none/minimal/low/medium/high/xhigh/max, or any word — write lowercase
       // "prompt": "short role description — explicit prompts fully override the built-ins (only research/review ids have them; any other id without a prompt gets a generic one-liner)",
-      // "shape": "write",   // default readonly denies write/edit/bash
+      // "shape": "write",   // default readonly denies write/edit/bash + the
+                              // patch family (patch/applypatch/apply/multiedit)
       // "permission": { "bash": "deny" } // optional override; "task" is ALWAYS denied
     },
     // AUTO worker: set NEITHER — inherits the parent session's model at
@@ -545,10 +546,13 @@ A rejected entry costs only itself — its siblings materialize normally.
   says "inherits the parent session's model" instead of naming a brain),
   the worker discipline (workspace-relative paths only, verbatim reporting
   of tool refusals, evidence-bearing conclusions) around its role prompt,
-  and a deny-style permission: `shape: "readonly"` (the default) denies
-  `write`/`edit`/`bash`, `shape: "write"` allows them, an explicit
-  `permission` map overrides the shape default — and `task` is ALWAYS
-  denied (recursive spawning stays physically impossible).
+   and a deny-style permission: `shape: "readonly"` (the default) denies
+   the full mutating-tool family — `write`/`edit`/`bash` plus the host's
+   patch family (`patch`/`applypatch`/`apply`/`multiedit`) — `shape:
+   "write"` allows them, an explicit `permission` map overrides the shape
+   default (lifting ANY member of that family off `deny` forfeits the
+   draft-phase readonly exemption) — and `task` is ALWAYS
+   denied (recursive spawning stays physically impossible).
 
 > **Upgrading from ≤ 0.5.0 (breaking):** agent entries that pinned `model`
 > without `thoughtLevel` used to be accepted; they are now SKIPPED with an
@@ -594,22 +598,32 @@ name. **Write lowercase**: the value is normalized at the config boundary
 `xhigh`; normalization that changes what you wrote records one warn finding.
 Native casing on the wire is the catalog's business, never yours. Injection
 rides the `chat.params` hook keyed by agent name. The wire shape comes from
-data, not guessing: a model the models.dev catalog knows by
+data, not guessing — with ONE family decided ahead of the catalog: for the
+**anthropic family** the channel is read straight off the empirically
+verified transport matrix — adaptive-era models (major > 4 or 4.7+) take
+the adaptive effort key `options.effort` (the host transports it as the
+adaptive-era native `output_config: {effort: <word>}` wire shape), legacy-era
+models take the budget tier table below — and the models.dev catalog is
+**not consulted** for this family: its effort claim cannot sound on the
+current host generation's anthropic transport, which silently drops the
+`reasoningEffort` key a catalog effort shape would select. For every other
+family the catalog remains the shape authority: a model the models.dev
+catalog knows by
 `reasoning_options` is translated per that catalog shape (effort word list /
 toggle / token budget); a catalog-silent model falls back to the
 provider-prefix family; a provider absent from both is treated as an effort
 **word channel** by default (custom relays and unknown endpoints — the most
-universal shape). Adaptive-era Anthropic models (major > 4 or 4.7+) receive
-the effort word directly instead of a budget number, on the empirically
-verified `effort` option key (the host transports it as the adaptive-era
-native `output_config: {effort: <word>}` wire shape; a `reasoningEffort`
-key is silently dropped by anthropic transports). **The dictionary is a
+universal shape). **The dictionary is a
 dictionary, never a whitelist**: a word matching neither the dictionary nor
 the model's ladder passes through VERBATIM on word-shaped channels
 (`reasoningEffort = <word>`, or `effort = <word>` on the adaptive channel),
 disclosed as unverified — the provider is the
 final judge, and a provider-side rejection surfaces as the request's own
-error. Ladder matching is case-insensitive and emits the catalog's native
+error. Known host-side limitation: the adaptive channel passes `none`
+through verbatim per the dictionary axiom, but the current host generation's
+anthropic transport refuses to send such a request (it silently never
+reaches the wire) — documented here, deliberately not worked around. Ladder
+matching is case-insensitive and emits the catalog's native
 casing (`xhigh` in, `XHigh` out when the catalog says so). **The only dead
 ends are the two shapes with no word channel**: budget-style (legacy
 Anthropic-style) models have a published thinking tier instead
@@ -619,7 +633,13 @@ consensus number; `low → 8192`, `medium → 16384`, `high → 24576`,
 `none → off`. **This tier table is this plugin's selection — there is no
 community-standard tier table**), and pure toggle endpoints (zai/GLM: a level
 word has no toggle counterpart) — there the plugin injects nothing and
-records one bounded finding naming both vocabularies. No interpolation
+records one bounded finding naming both vocabularies. **Host-transport
+caveat (observed on the opencode 1.18.34 generation):** the anthropic
+transport rewrites the thinking `budget_tokens` value this plugin injects
+to 1024 regardless of the selected tier (characterized by four paired
+probe experiments). The tier table above is the plugin-side truth —
+verifiable with a `FORGE_DEPTH_PROBE=1` trace — while the value that
+actually reaches the wire is the host's to rewrite. No interpolation
 anywhere; the session is never broken by a config word. A session's depth is
 frozen at its first request (editing forge.json mid-session never rewrites a
 running session).
@@ -793,7 +813,8 @@ The escape hatches are `plan_approve` and `/plan discard`, by design.
 One carve-out, keyed on the target rather than the tool: during a draft the
 `task` tool is gated by the dispatch target's **effective readonly shape**. A
 dispatch to a forge worker whose shape is not `write` AND whose permission
-overrides do not lift `write`/`edit`/`bash` off `deny` (`ask` counts as
+overrides do not lift `write`/`edit`/`bash` — nor any host patch-family tool
+(`patch`/`applypatch`/`apply`/`multiedit`) — off `deny` (`ask` counts as
 lifted — fail-closed) passes as a reconnaissance dispatch: readonly scouts
 may be spawned both before and during the draft, so breadth
 evidence-gathering does not burn the planning session's context. Every other
@@ -804,7 +825,8 @@ points to defining a readonly worker in forge.json when the roster is empty
 (an unconfigured host stays fully denied — same behavior as before, just more
 actionable wording), and names the two exits (`plan_approve`, `/plan
 discard`). Invariant strength is unchanged: the scout's materialized
-permission hard-denies write/edit/bash (and `task`, always — no chained
+permission hard-denies the mutating-tool family — write/edit/bash and the
+patch family (and `task`, always — no chained
 spawning), the scout's own session is ambient-bound to the same draft write
 ban, and its `forge_shell` calls ride the same per-call ask gate the primary
 agent faces. The `permission.ask` belt does not follow the exemption: on a

@@ -27,7 +27,7 @@
 
 1. **宿主坑（非本插件）**：`OPENCODE_CONFIG_DIR` 单独不足以隔离插件清单——真实全局 `~/.config/opencode/opencode.jsonc` 的 plugin 列表泄入沙盒（携带 10/1 旧发布副本，其旧版整类禁写文案先抛）。修复：XDG_CONFIG/DATA/CACHE_HOME 三件套指进沙盒。**后续所有沙盒 E2E 必带 XDG 三件套**（已同步进 adaptive-key 实验脚本）。
 2. 宿主 task 工具必填 `description`（SchemaError）；且 schema 校验发生在插件 `tool.execute.before` 之后——无 description 的输入仍先撞形状闸（B 拒 A 过闸后撞 schema），反证闸位与行为正确。
-3. 未覆盖（超出本 task，单测已覆盖）：空名册文案分支、override 抬离拒绝、`agent` fallback 字段、无 draft 放行——见 `tests/partition-wiring.test.mjs` recon gate 测试组。
+3. 未覆盖（超出本 task，单测已覆盖）：空名册文案分支、override 抬离拒绝、无 draft 放行——见 `tests/partition-wiring.test.mjs` recon gate 测试组。`agent` fallback 字段单独如实披露（本条原写「单测已覆盖」为失实声明，pre-archive 修正）：both-fields 形态 E2E PASS（recon 矩阵 L6）；agent-only 形态被宿主 task schema 先拒（SchemaError）不可达；代码缝 `plugin.ts` 的 `target = subagent_type ?? agent` 存在但无单测——postrelease-hardening task 5 补。
 
 ## 判定
 
