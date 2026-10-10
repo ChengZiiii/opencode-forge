@@ -416,11 +416,14 @@ const depthFindingNotes = new Map<string, string>()
 let crewCommandSnapshot: { template: string; description: string } | null = null
 let materializedSnapshot: Record<string, Record<string, unknown>> = {}
 
-// sessionID -> frozen translation: the chat.params injection table. The FIRST
-// request of a forge-agent session freezes the translation (D3 stability:
+// sessionID -> frozen resolution: the chat.params injection table. The FIRST
+// request of a forge-agent session freezes the resolution (D3 stability:
 // never rewritten mid-session even if forge.json changes under it); later
-// requests of the same session re-apply it verbatim.
-const sessionDepths = new Map<string, { translation: DepthTranslation }>()
+// requests of the same session re-apply it verbatim. postrelease-hardening
+// D2: dead ends freeze too — a no-mapping first resolution lands as
+// { translation: null }, so the session keeps injecting nothing for its
+// whole lifetime; only sessions created after the config edit re-resolve.
+const sessionDepths = new Map<string, { translation: DepthTranslation | null }>()
 
 // Provider option-shape families (inherited from the dispatch era). Explicit
 // and conservative: an unknown provider id injects NOTHING — never guessed.
@@ -435,12 +438,24 @@ function dispatchProviderFamily(providerID: string): "openai" | "anthropic" | "z
   return null
 }
 
-// catalog-driven-depth-shapes: the wire-shape fallback chain — catalog
-// reasoning_options first (effort values / toggle / budget_tokens); a
-// catalog-silent model falls back to the provider-prefix family; a provider
-// absent from both defaults to the effort WORD channel (the dictionary is a
-// dictionary, not a whitelist — unmatched words pass through and the
-// provider judges).
+// catalog-driven-depth-shapes + postrelease-hardening D1: the wire-shape
+// fallback chain, with ONE family gate ahead of the catalog. For the
+// anthropic family the shape comes from the EMPIRICALLY VERIFIED TRANSPORT
+// MATRIX OF THE CURRENT HOST GENERATION — never from the catalog — because
+// this host generation's anthropic transport silently drops the effort-word
+// key (`options.reasoningEffort`) that a catalog effort shape selects
+// (verify/adaptive-key.md): routing the production catalog's effort
+// reasoning_options for bare claude ids onto that wire is silent dead
+// injection (the P0-1 blind spot). Adaptive-era models speak the adaptive
+// effort channel (`options.effort` → wire `output_config:{effort}`); legacy
+// era takes the budget tier table. The catalog (reasoning_options: effort
+// values / toggle / budget_tokens) stays the shape authority for every OTHER
+// family; a catalog-silent model falls back to the provider-prefix family; a
+// provider absent from both defaults to the effort WORD channel (the
+// dictionary is a dictionary, not a whitelist — unmatched words pass through
+// and the provider judges). If a future host natively honors catalog effort
+// shapes on anthropic, a new change must hand authority back to the catalog
+// here — the matrix is deliberately isolated in resolveDepthChannel alone.
 function isAdaptiveAnthropic(modelID: string): boolean {
   const id = modelID.toLowerCase()
   const m = /^claude-(?:(?:opus|sonnet|haiku)[-.])?(\d+)(?:[.-](\d+))?/.exec(id)
@@ -451,6 +466,13 @@ function isAdaptiveAnthropic(modelID: string): boolean {
 }
 
 function resolveDepthChannel(providerID: string, modelID: string): DepthChannel {
+  // Family gate FIRST (postrelease-hardening D1): for anthropic, the
+  // empirical transport matrix outranks whatever the catalog carries. The
+  // matrix keys on the model id only — non-catalog ids (`-sandbox` suffixes
+  // etc.) ride it identically, matching the existing E2E posture.
+  if (dispatchProviderFamily(providerID) === "anthropic") {
+    return isAdaptiveAnthropic(modelID) ? { kind: "adaptive-effort" } : { kind: "budget" }
+  }
   const shape = modelDepthShape(modelsDevCatalog, `${providerID}/${modelID}`)
   if (shape) {
     if (shape.shape === "effort") return { kind: "effort", ladder: shape.ladder }
@@ -460,11 +482,6 @@ function resolveDepthChannel(providerID: string, modelID: string): DepthChannel 
   const family = dispatchProviderFamily(providerID)
   if (family === "openai") return { kind: "effort", ladder: null }
   if (family === "zai") return { kind: "toggle" }
-  if (family === "anthropic") {
-    // Catalog-silent Anthropic: adaptive-era models (major > 4 or 4.7+) speak
-    // the effort word channel; legacy models take the budget tier table.
-    return isAdaptiveAnthropic(modelID) ? { kind: "adaptive-effort" } : { kind: "budget" }
-  }
   // Unknown endpoint (custom relay, any provider x any protocol): default to
   // the effort word channel — pass-through territory, provider judges.
   return { kind: "effort", ladder: null }
@@ -2576,7 +2593,19 @@ export const server: Plugin = async (input, options) => {
       if (typeof agentName !== "string" || !agentName.startsWith("forge-")) return
       const frozen = sessionDepths.get(sessionID)
       if (frozen) {
-        applyDepthTranslation(output.options ?? (output.options = {}), frozen.translation)
+        // Frozen hit (postrelease-hardening D2): a null translation is a
+        // frozen dead end — the session's FIRST resolution had no counterpart
+        // shape, so nothing is injected for the remainder of the session,
+        // even if forge.json is edited mid-session (new sessions re-resolve).
+        if (process.env.FORGE_DEPTH_PROBE) {
+          try {
+            appendFileSync(
+              join(tmpdir(), "forge-depth-probe.log"),
+              `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}\n`,
+            )
+          } catch {}
+        }
+        if (frozen.translation) applyDepthTranslation(output.options ?? (output.options = {}), frozen.translation)
         return
       }
       const agentId = agentName.slice("forge-".length)
@@ -2594,8 +2623,25 @@ export const server: Plugin = async (input, options) => {
         typeof modelObj?.modelID === "string" ? modelObj.modelID : typeof modelObj?.id === "string" ? modelObj.id : ""
       const channel = resolveDepthChannel(providerID, modelID)
       const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel)
+      // Freeze FIRST (postrelease-hardening D2): BOTH outcomes freeze the
+      // session — a translation re-applies verbatim on later requests, a dead
+      // end (translation: null) keeps injecting nothing. Mid-session config
+      // edits only ever affect sessions created after them (sessionDepths
+      // evicts on session.deleted). The once-per-agent finding bound is
+      // unchanged: dead ends land here exactly once per agent.
+      sessionDepths.set(sessionID, { translation })
+      if (translation) {
+        applyDepthTranslation(output.options ?? (output.options = {}), translation)
+      } else if (findingMessage && !depthFindingNotes.has(agentId)) {
+        depthFindingNotes.set(agentId, findingMessage)
+        console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`)
+      }
       // Env-gated trace (same style as FORGE_GOAL_PROBE): one line per depth
       // resolution, for sandbox E2E attribution (verify/adaptive-key.md).
+      // `optionsAfter` is serialized AFTER the apply (postrelease-hardening
+      // task 4): it must reflect the options that actually ship — serializing
+      // before the apply made triage misread a dropped key as "never
+      // injected". Frozen hits trace separately (frozen-apply, above).
       if (process.env.FORGE_DEPTH_PROBE) {
         try {
           appendFileSync(
@@ -2606,15 +2652,6 @@ export const server: Plugin = async (input, options) => {
           )
         } catch {}
       }
-      if (!translation) {
-        if (findingMessage && !depthFindingNotes.has(agentId)) {
-          depthFindingNotes.set(agentId, findingMessage)
-          console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`)
-        }
-        return
-      }
-      sessionDepths.set(sessionID, { translation })
-      applyDepthTranslation(output.options ?? (output.options = {}), translation)
     },
 
     // Test seam (wiring tests drive server() with stubs; same pragmatic

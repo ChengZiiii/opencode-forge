@@ -16,7 +16,13 @@
 import type { ForgeAgentDef } from "./forge-config.ts"
 import { materializeAgentPrompt } from "./dispatch-prompt.ts"
 
-const MUTATING_TOOLS = ["write", "edit", "bash"] as const
+// The FULL host mutating-tool family (postrelease-hardening D3 — the
+// readonly deny face must match the host's actual write surface, and this
+// host carries a patch family the original trio missed). ONE constant feeds
+// BOTH faces — forgeAgentDef's materialized readonly permission AND
+// effectiveReadonlyShape's draft-dispatch lifting test — so they can never
+// drift apart again.
+const MUTATING_TOOLS = ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"] as const
 
 // Built-in role defaults: an explicit def.prompt overrides everything;
 // research/review carry curated defaults; a custom agent without a prompt
@@ -76,10 +82,11 @@ export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<strin
 
 // allow-readonly-recon-during-plan-draft: EFFECTIVE readonly shape — what the
 // draft-phase dispatch gate keys on. The declared shape is not enough: a user
-// permission override can lift write/edit/bash off "deny" (any other value —
-// allow OR ask — counts as lifted; the judgment is fail-closed). A write
-// shape is never effective-readonly regardless of overrides. Recursion is
-// irrelevant here (task: deny is forced on every worker already).
+// permission override can lift any mutating tool off "deny" (any other value —
+// allow OR ask — counts as lifted; the judgment is fail-closed) — the family
+// is MUTATING_TOOLS, patch family included (postrelease-hardening D3). A
+// write shape is never effective-readonly regardless of overrides. Recursion
+// is irrelevant here (task: deny is forced on every worker already).
 export function effectiveReadonlyShape(def: ForgeAgentDef): boolean {
   if (def.shape === "write") return false
   const perm = def.permission ?? {}
