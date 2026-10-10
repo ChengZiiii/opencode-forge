@@ -15042,7 +15042,7 @@ function materializeAgentPrompt(input) {
 }
 
 // src/dispatch-tiers.ts
-var MUTATING_TOOLS = ["write", "edit", "bash"];
+var MUTATING_TOOLS = ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"];
 var ROLE_PROMPTS = {
   research: "You are a research worker: search, read, and run read-only checks to answer the assigned question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
   review: "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict."
@@ -16091,6 +16091,9 @@ function isAdaptiveAnthropic(modelID) {
   return major > 4 || major === 4 && minor >= 7;
 }
 function resolveDepthChannel(providerID, modelID) {
+  if (dispatchProviderFamily(providerID) === "anthropic") {
+    return isAdaptiveAnthropic(modelID) ? { kind: "adaptive-effort" } : { kind: "budget" };
+  }
   const shape = modelDepthShape(modelsDevCatalog, `${providerID}/${modelID}`);
   if (shape) {
     if (shape.shape === "effort")
@@ -16104,9 +16107,6 @@ function resolveDepthChannel(providerID, modelID) {
     return { kind: "effort", ladder: null };
   if (family === "zai")
     return { kind: "toggle" };
-  if (family === "anthropic") {
-    return isAdaptiveAnthropic(modelID) ? { kind: "adaptive-effort" } : { kind: "budget" };
-  }
   return { kind: "effort", ladder: null };
 }
 var jobsMode = "auto";
@@ -17725,7 +17725,14 @@ var server = async (input, options) => {
         return;
       const frozen = sessionDepths.get(sessionID);
       if (frozen) {
-        applyDepthTranslation(output.options ?? (output.options = {}), frozen.translation);
+        if (process.env.FORGE_DEPTH_PROBE) {
+          try {
+            appendFileSync(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}
+`);
+          } catch {}
+        }
+        if (frozen.translation)
+          applyDepthTranslation(output.options ?? (output.options = {}), frozen.translation);
         return;
       }
       const agentId = agentName.slice("forge-".length);
@@ -17737,6 +17744,13 @@ var server = async (input, options) => {
       const modelID = typeof modelObj?.modelID === "string" ? modelObj.modelID : typeof modelObj?.id === "string" ? modelObj.id : "";
       const channel = resolveDepthChannel(providerID, modelID);
       const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel);
+      sessionDepths.set(sessionID, { translation });
+      if (translation) {
+        applyDepthTranslation(output.options ?? (output.options = {}), translation);
+      } else if (findingMessage && !depthFindingNotes.has(agentId)) {
+        depthFindingNotes.set(agentId, findingMessage);
+        console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`);
+      }
       if (process.env.FORGE_DEPTH_PROBE) {
         try {
           appendFileSync(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}
@@ -17745,15 +17759,6 @@ var server = async (input, options) => {
 `);
         } catch {}
       }
-      if (!translation) {
-        if (findingMessage && !depthFindingNotes.has(agentId)) {
-          depthFindingNotes.set(agentId, findingMessage);
-          console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`);
-        }
-        return;
-      }
-      sessionDepths.set(sessionID, { translation });
-      applyDepthTranslation(output.options ?? (output.options = {}), translation);
     },
     __forgeSubagentsTest: {
       crews: () => crews,
