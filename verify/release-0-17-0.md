@@ -41,8 +41,14 @@
 - **npm 缓存 shim 实测**：`~\.cache\opencode\packages\npm_@sorenllm\opencode-forge\node_modules\@sorenllm\opencode-forge\package.json` → **0.17.0**；其 dist 三锚点命中（4/2/1，与注册表体一致）；mtime 2026-10-12 19:41（本地时）= 沙盒 serve 启动时 `npm:` 源解析 latest 现场拉取——切换链路真实走通，非手工摆放
 - 本地仓库 tgz 构建产物已清理；当前 dev 会话（host 启动于 0.16.0 时期）内存中保持 0.16.0 直到宿主重启——预期行为，非缺陷
 
-## 本地终测（沙盒 serve）
+## 本地终测（沙盒 serve，活体证据）
 
-- 沙盒宿主（`OPENCODE_CONFIG_DIR` 指向临时配置，含 `npm:@sorenllm/opencode-forge` 单插件）`opencode serve` 启动：监听正常、`/app` 端点 OK、serve 日志零 forge 错误行——插件加载无初始化故障（该次启动触发了上述 npm 0.17.0 现场拉取）
-- 已知局限（诚实披露）：OPENCODE_CONFIG_DIR 未完全隔离（vision-agent 等全局配置条目漏入该沙盒），`/agent` 端点未列 task 词汇表工人——派发级行为（exec 封禁拒文案、跨工作区拒）本轮未做活体 E2E，其行为正确性由 377 项 hook 级测试矩阵 + 注册表包体锚点背书；后续如需活体 E2E 可复用 scripts/sandbox-e2e-setup.mjs 模式扩展
+- 沙盒宿主（临时配置 + `npm:@sorenllm/opencode-forge`）`opencode serve` 启动：监听正常、`/app` OK、日志零 forge 错误——该启动触发了上述 npm 0.17.0 现场拉取
+- **首轮探针失败根因**：探针 forge.json 违反原子对规则（钉 model 未钉 thoughtLevel）→ 插件按 spec fail-soft 跳过两条目并出 `[forge:config] error` finding（本身即 0.17.0 池发现+校验链工作的证据）
+- **修正探针后活体物化实测**（`/agent` 端点）：
+  - `forge-worker-bare [subagent]`：denies = task + STATE 族，**无 write/edit/bash**——缺 shape 默认开放写权限（change A 翻转）✔
+  - `forge-scout-ro [subagent]`：denies = task + **write,edit,bash,patch,applypatch,apply,multedit**——显式 readonly 封全变异族 ✔
+  - 两工人自工作区池物化（sbx 主池纯 id）——workspace-pool-ownership 发现链 ✔
+- 仍属 hook 级未活体 E2E 的：exec 封禁拒文案触发、跨工作区派发拒触发（由 377 项测试矩阵背书）
+- 已知环境噪音：OPENCODE_CONFIG_DIR 未完全隔离（vision-agent 等全局条目漏入沙盒），不影响上述插件行为结论
 
