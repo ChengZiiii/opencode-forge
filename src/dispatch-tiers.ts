@@ -43,7 +43,7 @@ export function rolePromptFor(agentId: string, def?: { prompt?: string }): strin
 // the task tool vocabulary, so it names the role and the brain — the pinned
 // identity for pinned workers, the inheritance semantics for Auto workers.
 export function agentDescriptionFor(agentId: string, def: ForgeAgentDef): string {
-  const shape = def.shape === "write" ? "write" : "readonly"
+  const shape = def.shape === "readonly" ? "readonly" : "write"
   const brain = def.model !== undefined ? `pinned ${def.model}` : "auto — inherits the parent session's model at dispatch"
   return `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`
 }
@@ -59,7 +59,11 @@ export function agentDescriptionFor(agentId: string, def: ForgeAgentDef): string
 // hidden at materialization.
 export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<string, unknown> {
   const permission: Record<string, string> = { task: "deny" }
-  const shape = def.shape ?? "readonly"
+  // shape-default-open: an ABSENT shape defaults to WRITE (open permissions
+  // — readonly is a restriction the pool author must ask for explicitly,
+  // never a surprise default). Only an explicit "readonly" seals the
+  // mutating-tool family.
+  const shape = def.shape ?? "write"
   if (shape === "readonly") {
     for (const t of MUTATING_TOOLS) permission[t] = "deny"
   }
@@ -84,11 +88,14 @@ export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<strin
 // draft-phase dispatch gate keys on. The declared shape is not enough: a user
 // permission override can lift any mutating tool off "deny" (any other value —
 // allow OR ask — counts as lifted; the judgment is fail-closed) — the family
-// is MUTATING_TOOLS, patch family included (postrelease-hardening D3). A
-// write shape is never effective-readonly regardless of overrides. Recursion
+// is MUTATING_TOOLS, patch family included (postrelease-hardening D3). The
+// exemption keys on an EXPLICIT `shape === "readonly"` (shape-default-open):
+// an absent shape defaults to write and is NOT exempt — the exemption is a
+// pass, so it must be asked for explicitly (fail-closed direction; this also
+// closes the hole where any shape-less entry counted as readonly). Recursion
 // is irrelevant here (task: deny is forced on every worker already).
 export function effectiveReadonlyShape(def: ForgeAgentDef): boolean {
-  if (def.shape === "write") return false
+  if (def.shape !== "readonly") return false
   const perm = def.permission ?? {}
   for (const t of MUTATING_TOOLS) {
     const v = perm[t]

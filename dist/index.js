@@ -15053,13 +15053,13 @@ function rolePromptFor(agentId, def) {
   return ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`;
 }
 function agentDescriptionFor(agentId, def) {
-  const shape = def.shape === "write" ? "write" : "readonly";
+  const shape = def.shape === "readonly" ? "readonly" : "write";
   const brain = def.model !== undefined ? `pinned ${def.model}` : "auto — inherits the parent session's model at dispatch";
   return `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`;
 }
 function forgeAgentDef(agentId, def) {
   const permission = { task: "deny" };
-  const shape = def.shape ?? "readonly";
+  const shape = def.shape ?? "write";
   if (shape === "readonly") {
     for (const t of MUTATING_TOOLS)
       permission[t] = "deny";
@@ -15082,7 +15082,7 @@ function forgeAgentDef(agentId, def) {
   return entry;
 }
 function effectiveReadonlyShape(def) {
-  if (def.shape === "write")
+  if (def.shape !== "readonly")
     return false;
   const perm = def.permission ?? {};
   for (const t of MUTATING_TOOLS) {
@@ -16922,9 +16922,9 @@ var CREW_INIT_TEMPLATE = [
   "",
   "Two axes, distinct: POOLS follow host directories (the host's anchor set); SESSION ARTIFACTS (plan/goal/crew records) follow the session. A forge.json in a directory no host anchor covers is not dispatchable on this host.",
   "",
-  '2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: name ids as PLAIN role words WITHOUT the `forge-` prefix — the plugin materializes every id as `forge-<id>` automatically (a `forge-`-prefixed id doubles up as `forge-forge-coder` and is auto-stripped with a warning). Give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent. For sub-pool files, ALSO include a proposed short stable `pool` namespace (a [a-z0-9-] word up to 24 chars — e.g. "aa" for a devAa specialist pool) so the materialized ids survive directory renames.',
+  '2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: name ids as PLAIN role words WITHOUT the `forge-` prefix — the plugin materializes every id as `forge-<id>` automatically (a `forge-`-prefixed id doubles up as `forge-forge-coder` and is auto-stripped with a warning). Give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent. Give EVERY agent an EXPLICIT `shape`: `readonly` for read-only roles (reviewer/scout/planner — denies write/edit/bash and the patch family), `write` for implementers and build drivers. For sub-pool files, ALSO include a proposed short stable `pool` namespace (a [a-z0-9-] word up to 24 chars — e.g. "aa" for a devAa specialist pool) so the materialized ids survive directory renames.',
   "",
-  "Template (JSONC — comments allowed): ids are plain role words (research, coder, ...) — the plugin adds the `forge-` prefix at materialization; `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job). Optional top level: `pool` — the file's namespace.",
+  "Template (JSONC — comments allowed): ids are plain role words (research, coder, ...) — the plugin adds the `forge-` prefix at materialization; `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job). Optional per agent: `shape` — an ABSENT shape defaults to WRITE (open permissions — the compatibility-preserving default for existing pools); `shape: \"readonly\"` is the explicit seal that denies the mutating-tool family (write/edit/bash + patch/applypatch/apply/multiedit) for read-only roles. Optional top level: `pool` — the file's namespace.",
   "{template}",
   "",
   "After the file is saved: file edits, creations, and deletions apply at the next config hook — NO host restart is needed. Only the anchor set itself is fixed at host start: host re-initializations add anchors and pools, they never remove them."
@@ -16989,9 +16989,9 @@ var crewBeginTool = tool({
         `[forge:crew] CREW IS NOT INITIALIZED on this host: no forge subagents are materialized across the whole anchor set (${anchorNote}). Crew orchestration is unavailable until the user sets it up.`,
         `Two layers, MERGED (the project layer overrides the global one per agent id): ${paths.project} (nearest .opencode/forge.json walking up from the workspace) OR ${paths.global}. Sub-pool files (.opencode/forge.json in an anchor's subdirectories) contribute additional namespaced families.`,
         "Two axes, distinct: POOLS follow host directories (the anchor set above); SESSION ARTIFACTS (plan/goal/crew records) follow the session. A forge.json in an unanchored directory is not dispatchable on this host.",
-        `Template (JSONC): top-level optional "pool" names this file's namespace (short stable [a-z0-9-] up to 24 chars — sub-pool ids materialize as forge-<ns>-<id>); {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "prompt": "short role description"}}}`,
+        `Template (JSONC): top-level optional "pool" names this file's namespace (short stable [a-z0-9-] up to 24 chars — sub-pool ids materialize as forge-<ns>-<id>); {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "shape": "readonly", "prompt": "short role description"}}} — an absent shape defaults to WRITE (open permissions); "shape": "readonly" is the explicit seal denying write/edit/bash + the patch family for read-only roles.`,
         "Agent ids are plain role words WITHOUT the `forge-` prefix — the plugin materializes each id as `forge-<id>` (namespaced pools: `forge-<ns>-<id>`); a prefixed id is auto-stripped with a warning.",
-        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it: give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request), and INCLUDE a proposed short stable `pool` namespace for sub-pool files so ids survive directory renames. File edits, creations, and deletions apply at the next config hook — no host restart; only the anchor set itself is fixed at host start (re-initializations add pools, never remove)."
+        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it: give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request), give every agent an EXPLICIT shape (readonly for read-only roles like reviewer/scout/planner; write for implementers and build drivers), and INCLUDE a proposed short stable `pool` namespace for sub-pool files so ids survive directory renames. File edits, creations, and deletions apply at the next config hook — no host restart; only the anchor set itself is fixed at host start (re-initializations add pools, never remove)."
       ];
       if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject && !sessionCovered) {
         lines2.push(`NOTE: this session's workspace DOES have a forge.json (${sessionProject}) with usable agents — but NO host anchor covers it (${anchorNote}). A host initialization in that workspace adds its pools; or fold the agents into the global layer.`);
@@ -17602,7 +17602,7 @@ var server = async (input, options) => {
         const agentCount = Object.keys(resolution?.agents ?? {}).length;
         const primaryAnchorDir = hostAnchors[0] ?? undefined;
         const template = agentCount > 0 ? crewOrchestrationTemplate(resolution ?? null) : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}
-   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`).replaceAll("{template}", JSON.stringify({ pool: "short-stable-namespace (optional, [a-z0-9-] up to 24 chars — only meaningful for sub-pool files)", agents: { research: { model: "provider/model", thoughtLevel: "low", prompt: "short role description — what this agent does" } } }, null, 2).split(`
+   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`).replaceAll("{template}", JSON.stringify({ pool: "short-stable-namespace (optional, [a-z0-9-] up to 24 chars — only meaningful for sub-pool files)", agents: { research: { model: "provider/model", thoughtLevel: "low", shape: "readonly", prompt: "short role description — what this agent does" }, coder: { model: "provider/model", thoughtLevel: "low", shape: "write", prompt: "short role description — what this agent does" } } }, null, 2).split(`
 `).map((l) => "   " + l).join(`
 `));
         const description = agentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance";
@@ -17678,7 +17678,7 @@ var server = async (input, options) => {
                     roster.push(`forge-${id}`);
               }
               roster.sort();
-              throw new Error(`[forge] A plan is in draft; dispatch is denied for this target. ` + (roster.length > 0 ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. ` : `No readonly worker is configured — define one in forge.json (shape defaults to readonly) to enable draft-phase reconnaissance. `) + `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`);
+              throw new Error(`[forge] A plan is in draft; dispatch is denied for this target. ` + (roster.length > 0 ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. ` : `No readonly worker is configured — define one in forge.json with an explicit "shape": "readonly" to enable draft-phase reconnaissance. `) + `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`);
             }
           } else {
             throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`);
