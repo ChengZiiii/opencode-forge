@@ -992,6 +992,14 @@ test("crew command template: the pause, GUI mutex, computer preference, abandon 
   assert.match(tpl, /`computer` tool/, "GUI walkthroughs prefer the computer tool")
   assert.match(tpl, /abandon: true/, "the abandon exit is taught in the template")
   assert.match(tpl, /optional `lineage` argument/, "the REGISTER step teaches lineage when descending from a plan artifact (4.5)")
+  // crew-contract-relay task 3: the contract-relay hard clause (dispatch
+  // prompts must explicitly carry the artifact path / exact slice; close
+  // evidence names the contract).
+  assert.match(tpl, /CONTRACT RELAY/, "the contract-relay clause is a named discipline step (crew-contract-relay 1)")
+  assert.match(tpl, /explicitly carry/, "dispatch prompts must explicitly carry the artifact path or exact slice (crew-contract-relay 1)")
+  assert.match(tpl, /never your paraphrase/, "the worker reads the contract itself, not a paraphrase (crew-contract-relay 1)")
+  assert.match(tpl, /NEVER dropped for being too long/, "large artifacts relay by exact slice, never dropped (slice semantics)")
+  assert.match(tpl, /close-report evidence statement MUST name the contract/, "close evidence names the contract (or slice) it worked against (crew-contract-relay 1)")
   assert.doesNotMatch(tpl, /Proceed with the discipline: waves/, "the immediate-execution order is gone")
 })
 
@@ -1016,6 +1024,30 @@ test("crew registration output order: record path leads, then the objective, the
   assert.ok(recLine < objLine, "the crew record path line leads the output (4.1)")
   assert.ok(objLine < planLine, "the objective summary precedes the declared plan (4.1)")
   assert.match(out.output, /Lineage: \.opencode\/plan\/2026-10-01-my-plan\.md/, "an explicit lineage is disclosed in the registration output (4.3)")
+})
+
+// crew-contract-relay task 3: the registration output reminds the session AI
+// of the relay rule whenever lineage is present — and stays silent without it.
+test("crew registration relay rule: the reminder line appears with lineage and is absent without it", async (t) => {
+  const dir = projectWithForgeJson(t, poolJson)
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const withLin = await h.tool.crew_begin.execute(
+    { objective: "relay the contract", subtasks: [{ title: "one" }], lineage: ".opencode/plan/2026-10-01-src.md" },
+    allowCtx("ses_relay_rule_yes"),
+  )
+  assert.match(
+    withLin.output,
+    /RELAY RULE: this crew descends from \.opencode\/plan\/2026-10-01-src\.md — every dispatch prompt must explicitly carry the artifact path \(or its exact slice\), and every close-report evidence statement must name the contract it worked against\./,
+    "lineage present → the relay-rule reminder line spells out both halves (crew-contract-relay 2)",
+  )
+  const linAt = withLin.output.indexOf("Lineage: .opencode/plan/2026-10-01-src.md")
+  const ruleAt = withLin.output.indexOf("RELAY RULE:")
+  assert.ok(linAt !== -1 && ruleAt !== -1 && linAt < ruleAt, "the reminder follows the lineage disclosure line")
+  const withoutLin = await h.tool.crew_begin.execute({ objective: "no contract artifact", subtasks: [{ title: "one" }] }, allowCtx("ses_relay_rule_no"))
+  assert.doesNotMatch(withoutLin.output, /RELAY RULE/, "no lineage → no relay-rule reminder (never inferred)")
+  assert.doesNotMatch(withoutLin.output, /Lineage: /, "no lineage → no lineage disclosure line")
 })
 
 test("crew record header: an explicit lineage lands as a sibling header line; without the argument there is none", async (t) => {
