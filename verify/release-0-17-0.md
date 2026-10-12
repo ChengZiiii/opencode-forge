@@ -49,6 +49,22 @@
   - `forge-worker-bare [subagent]`：denies = task + STATE 族，**无 write/edit/bash**——缺 shape 默认开放写权限（change A 翻转）✔
   - `forge-scout-ro [subagent]`：denies = task + **write,edit,bash,patch,applypatch,apply,multedit**——显式 readonly 封全变异族 ✔
   - 两工人自工作区池物化（sbx 主池纯 id）——workspace-pool-ownership 发现链 ✔
-- 仍属 hook 级未活体 E2E 的：exec 封禁拒文案触发、跨工作区派发拒触发（由 377 项测试矩阵背书）
-- 已知环境噪音：OPENCODE_CONFIG_DIR 未完全隔离（vision-agent 等全局条目漏入沙盒），不影响上述插件行为结论
+
+## 深度活体 E2E（2026-10-12 下午，密闭沙盒三轮）
+
+**环境**：XDG_CONFIG/CACHE/DATA_HOME 三重定向 + `FORGE_TEST_FORGE_HOME` 测试缝（plugin.ts:302），真实全局配置/paseo home/真实 npm 缓存/auth 全程零接触（隔离验证：vision-agent 等全局条目不泄漏；测毕沙盒整体删除，auth 副本销毁）。模型链路：glm-5.3-flash 真调用（第一轮 baseURL 笔误 404 修正后全通）。
+
+**第一轮（物化矩阵 + 行为面）**：
+- 物化五工人全中：bare=开放 / write=开放 / readonly=全族封 / **readonly+bash:allow override→bash 被抬离 deny 面** / 钉扎 model+depth 对合法 ✔
+- 嵌套 forge.json（nested-deep）**未物化**——子树忽略 ✔
+- **T1 exec 封印活体命中**：readonly scout 经 forge_shell 执行 `echo seal > sealtest.txt` → belt 拒绝，finding 逐字：`[forge:seal] Exec refused ... (explicit "shape": "readonly") ... classified WRITE-CLASS — indicator "redirect" (>) ... set "shape": "write" ...`，工人逐字上报回传，`sealtest.txt` 未创建 ✔
+- **T4 开放工人放行**：bare 工人同命令经 forge_shell 成功（exit=0），`baretest.txt` 创建 ✔（封印不误伤）
+- 跨工作区（ws-c 池）：serve 宿主为单锚进程（`rememberHostAnchor` 仅 server() 初始化时执行，plugin.ts:2207），ws-c 不进词汇表 → 派发以"unknown agent type"拒绝——**fail-closed 更强形式**；belt 拒文案路径由 25 项 wiring 测试背书并在第二轮经全局层活体打出（见 R2-T1）✔
+
+**第二轮（全局层 + belt 拒文案，FORGE_TEST_FORGE_HOME）**：
+- 全局层与工作区池**并集物化**：`forge-globaltest-global-ro [subagent]`（命名空间）与 ws-a 池纯 id 工人并存 ✔
+- **R2-T1 belt 拒活体命中**：从有池的 ws-a 派全局工人 → 拒，文案逐字含 `not dispatchable from this session` + 来源池路径 + 本会话可派 roster + **三出口** ✔
+- **R2-T2 兜底放行**：无池 ws-b 派同一全局工人 → 成功回复 `globalok`（fallback 不合并语义的正反面双向实证）✔
+
+**结论**：四 change 全部行为在真实宿主+真实模型链路活体验证通过。已知边界（如实）：serve 型宿主单锚（跨池物化需宿主在多目录初始化过，TUI 每工作区一进程的常态下跨派在词汇表层即不可能）；全局层路径按 spec 字面读 `~/.config/opencode/forge.json` 不随 XDG 走（沙盒需专用测试缝重定向，非缺陷）。
 
