@@ -82,8 +82,9 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
     t,
     JSON.stringify({
       agents: {
-        research: { model: "zai/glm-5.3", thoughtLevel: "low" },
+        research: { model: "zai/glm-5.3", thoughtLevel: "low", shape: "readonly" },
         builder: { model: "x/y", thoughtLevel: "low", shape: "write", prompt: "You are a build worker." },
+        "ta-tool": { model: "x/y2", thoughtLevel: "low" }, // absent shape — shape-default-open
       },
     }),
   )
@@ -98,7 +99,17 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
   assert.equal(research.mode, "subagent")
   assert.equal(research.hidden, undefined, "agents stay in the task-tool vocabulary")
   assert.equal(research.permission.task, "deny")
-  for (const tool of ["write", "edit", "bash"]) assert.equal(research.permission[tool], "deny", "readonly default denies mutating tools")
+  for (const tool of ["write", "edit", "bash"]) assert.equal(research.permission[tool], "deny", "explicit readonly denies mutating tools")
+
+  // shape-default-open: an absent shape materializes with OPEN write
+  // permissions (readonly is never a surprise default); only task stays denied.
+  const ta = cfg.agent["forge-ta-tool"]
+  assert.ok(ta, "forge-ta-tool must be injected")
+  assert.equal(ta.permission.task, "deny")
+  for (const tool of ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"]) {
+    assert.equal(ta.permission[tool], undefined, `absent shape leaves ${tool} open (write default)`)
+  }
+  assert.match(ta.description, /write/, "the description names the write default")
   assert.match(research.prompt, /research/i)
   assert.match(research.prompt, /workspace-relative paths ONLY/, "discipline mandate present")
   assert.match(research.prompt, /report the refusal VERBATIM/, "verbatim-refusal mandate present")
@@ -534,6 +545,9 @@ test("crew command: unconfigured is a HARD gate with initialization guidance", a
   assert.match(cmd.template, /host restart/, "the restart expectation")
   assert.match(cmd.template, /thoughtLevel/, "the hot-apply note")
   assert.match(cmd.template, /"prompt"/, "the embedded example shows the prompt field")
+  assert.match(cmd.template, /"shape"/, "the embedded example shows the shape field on every agent entry")
+  assert.match(cmd.template, /ABSENT shape defaults to WRITE/, "the absent-defaults-to-write rule is disclosed")
+  assert.match(cmd.template, /EXPLICIT `shape`/, "the AI-assist explicit-shape mandate is present")
   assert.match(cmd.template, /SHORT prompt/, "the AI-assist short-prompt mandate")
   assert.match(cmd.template, /WITHOUT the `forge-` prefix/, "the plain-role-word naming rule")
   assert.match(cmd.template, /research.*review.*built-in|built-in.*research/is, "discloses which ids carry built-in roles")
@@ -606,6 +620,9 @@ test("crew_begin: HARD initialization gate — empty agent set refuses with guid
       assert.match(m, /restart/)
       assert.match(m, /MERGED/, "the guidance states the merge semantics")
       assert.match(m, /"prompt"/, "the refusal template shows the prompt field")
+      assert.match(m, /"shape": "readonly"/, "the refusal template shows the explicit shape field")
+      assert.match(m, /absent shape defaults to WRITE/, "the refusal discloses the absent-shape default")
+      assert.match(m, /EXPLICIT shape/, "the refusal carries the explicit-shape mandate")
       assert.match(m, /SHORT prompt/, "the refusal carries the short-prompt mandate")
       assert.match(m, /WITHOUT the `forge-` prefix/, "the refusal carries the naming rule")
       return true

@@ -50,7 +50,7 @@ test("the frame differs by shape: readonly reports, write executes", () => {
 })
 
 test("forgeAgentDef pins the model, drops hidden, and always denies task", () => {
-  const def = forgeAgentDef("research", { model: "prov/x", thoughtLevel: "low" })
+  const def = forgeAgentDef("research", { model: "prov/x", thoughtLevel: "low", shape: "readonly" })
   assert.equal(def.model, "prov/x")
   assert.equal(def.mode, "subagent")
   assert.equal(def.hidden, undefined, "agents must stay in the task-tool vocabulary")
@@ -59,6 +59,16 @@ test("forgeAgentDef pins the model, drops hidden, and always denies task", () =>
   assert.equal(permission.write, "deny")
   assert.equal(permission.edit, "deny")
   assert.equal(permission.bash, "deny")
+})
+
+// shape-default-open: an ABSENT shape defaults to WRITE (open permissions) —
+// readonly is a restriction the pool author must ask for explicitly.
+test("forgeAgentDef: an absent shape defaults to OPEN write permissions; task stays denied", () => {
+  const def = forgeAgentDef("ta-tool", { model: "prov/x", thoughtLevel: "low" })
+  for (const tool of ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"]) {
+    assert.equal(def.permission[tool], undefined, `absent shape leaves ${tool} open (write default)`)
+  }
+  assert.equal(def.permission.task, "deny", "the recursion ban survives the absent shape")
 })
 
 test("forgeAgentDef: a write shape drops the mutating denies; an override never lifts the task ban", () => {
@@ -71,24 +81,27 @@ test("forgeAgentDef: a write shape drops the mutating denies; an override never 
   assert.equal(o.permission.task, "deny")
 })
 
-// allow-readonly-recon-during-plan-draft: the six-way effectiveness matrix
-// the draft dispatch gate keys on. Declared shape AND materialized permission
-// must agree; any override lifting a mutating tool off "deny" breaks it.
-test("effectiveReadonlyShape: six-way effectiveness matrix (fail-closed on overrides)", () => {
-  // 1. default shape (readonly implied) -> effective
-  assert.equal(effectiveReadonlyShape({ model: "prov/x" }), true)
-  // 2. explicit write shape -> never effective
+// allow-readonly-recon-during-plan-draft + shape-default-open: the
+// effectiveness matrix the draft dispatch gate keys on. The exemption keys
+// on an EXPLICIT readonly shape (absent defaults to write — not exempt);
+// any override lifting a mutating tool off "deny" breaks it.
+test("effectiveReadonlyShape: effectiveness matrix (explicit readonly only; fail-closed on overrides)", () => {
+  // 1. absent shape -> write default -> NOT effective
+  assert.equal(effectiveReadonlyShape({ model: "prov/x" }), false)
+  // 2. explicit readonly -> effective
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly" }), true)
+  // 3. explicit write shape -> never effective
   assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "write" }), false)
-  // 3. a permission override allowing ANY mutating tool breaks it
-  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { write: "allow" } }), false)
-  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { edit: "allow" } }), false)
-  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { bash: "allow" } }), false)
-  // 4. "ask" counts as lifted (fail closed — the user gate could approve)
-  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { bash: "ask" } }), false)
-  // 5. overrides on irrelevant tools change nothing
-  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { forge_shell: "allow", task: "allow" } }), true)
-  // 6. explicit deny on a mutating tool is confirmation, not a lift
-  assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { write: "deny" } }), true)
+  // 4. a permission override allowing ANY mutating tool breaks it
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { write: "allow" } }), false)
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { edit: "allow" } }), false)
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { bash: "allow" } }), false)
+  // 5. "ask" counts as lifted (fail closed — the user gate could approve)
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { bash: "ask" } }), false)
+  // 6. overrides on irrelevant tools change nothing
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { forge_shell: "allow", task: "allow" } }), true)
+  // 7. explicit deny on a mutating tool is confirmation, not a lift
+  assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { write: "deny" } }), true)
 })
 
 test("agent description names the role, shape, and pinned brain for the task vocabulary", () => {
@@ -97,6 +110,7 @@ test("agent description names the role, shape, and pinned brain for the task voc
   assert.match(d, /prov\/x/)
   assert.match(d, /task tool/)
   assert.match(d, /forge-research/)
+  assert.match(d, /write/, "an absent shape is described as the write default")
 })
 
 test("an Auto worker's description names inheritance instead of a pinned brain", () => {
@@ -111,7 +125,7 @@ test("an Auto worker's description names inheritance instead of a pinned brain",
 // that feeds the draft gate's lifting test, so the two faces cannot drift.
 
 test("forgeAgentDef: the readonly deny face covers the patch family; task stays denied", () => {
-  const def = forgeAgentDef("auditor", { model: "prov/x" })
+  const def = forgeAgentDef("auditor", { model: "prov/x", shape: "readonly" })
   const permission = def.permission
   for (const tool of ["patch", "applypatch", "apply", "multiedit"]) {
     assert.equal(permission[tool], "deny", `readonly denies the patch-family tool ${tool}`)
@@ -136,8 +150,8 @@ test("forgeAgentDef: a write shape drops the patch family too; an override never
 
 test("effectiveReadonlyShape: every patch-family member lifts effectiveness like the original trio (allow AND ask)", () => {
   for (const tool of ["patch", "applypatch", "apply", "multiedit"]) {
-    assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { [tool]: "allow" } }), false, `${tool}: allow lifts the readonly effectiveness`)
-    assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { [tool]: "ask" } }), false, `${tool}: ask counts as lifted (fail closed)`)
-    assert.equal(effectiveReadonlyShape({ model: "prov/x", permission: { [tool]: "deny" } }), true, `${tool}: explicit deny is confirmation, not a lift`)
+    assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { [tool]: "allow" } }), false, `${tool}: allow lifts the readonly effectiveness`)
+    assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { [tool]: "ask" } }), false, `${tool}: ask counts as lifted (fail closed)`)
+    assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { [tool]: "deny" } }), true, `${tool}: explicit deny is confirmation, not a lift`)
   }
 })

@@ -303,13 +303,14 @@ test("partition: the draft write-ban message is agent-agnostic (D12, session-sco
 // ---------------------------------------------------------------------------
 
 const RECON_ROSTER = {
-  scout: { model: "x/y", thoughtLevel: "low" }, // default shape = readonly
+  scout: { model: "x/y", thoughtLevel: "low", shape: "readonly" }, // EXPLICIT readonly — the exemption keys on this
+  bare: { model: "x/y", thoughtLevel: "low" }, // absent shape — defaults to write, NOT draft-exempt
   coder: { model: "x/y", thoughtLevel: "low", shape: "write" },
-  lifted: { model: "x/y", thoughtLevel: "low", permission: { write: "allow" } }, // override lifts write off deny
-  asking: { model: "x/y", thoughtLevel: "low", permission: { bash: "ask" } }, // ask counts as lifted too
+  lifted: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { write: "allow" } }, // override lifts write off deny
+  asking: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { bash: "ask" } }, // ask counts as lifted too
 }
 
-test("recon gate: effective-readonly dispatch passes during draft; every other target is denied with the roster", async () => {
+test("recon gate: explicit-readonly dispatch passes during draft; every other target is denied with the roster", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-recon-"))
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
@@ -323,8 +324,21 @@ test("recon gate: effective-readonly dispatch passes during draft; every other t
       ctx(sid, wt),
     )
 
-    // 1. effective-readonly target passes the write-class ban (no throw).
+    // 1. explicit-readonly target passes the write-class ban (no throw).
     await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1" }, { args: { subagent_type: "forge-scout", prompt: "x" } })
+
+    // 1b. shape-default-open: an absent shape defaults to write — the scout
+    //     is NOT draft-exempt (same refusal, roster unchanged).
+    await assert.rejects(
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1b" }, { args: { subagent_type: "forge-bare", prompt: "x" } }),
+      (err) => {
+        assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
+        assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-scout\./, "roster carries exactly the explicit-readonly worker")
+        assert.match(err.message, /plan_approve/)
+        assert.match(err.message, /\/plan discard/)
+        return true
+      },
+    )
 
     // 2. write shape: denied, roster lists ONLY the effective-readonly worker.
     await assert.rejects(
@@ -409,6 +423,7 @@ test("recon gate: an empty roster refuses with configuration guidance, not a bar
       (err) => {
         assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
         assert.match(err.message, /No readonly worker is configured — define one in forge\.json/)
+        assert.match(err.message, /"shape": "readonly"/, "the empty-roster guidance teaches the explicit readonly shape")
         assert.match(err.message, /plan_approve/)
         return true
       },
@@ -426,11 +441,11 @@ test("recon gate: an empty roster refuses with configuration guidance, not a bar
 // exactly like a write/edit/bash lift.
 
 const PATCH_LIFT_ROSTER = {
-  scout: { model: "x/y", thoughtLevel: "low" }, // effective readonly — the only exempt target
-  patched: { model: "x/y", thoughtLevel: "low", permission: { patch: "allow" } },
-  applied: { model: "x/y", thoughtLevel: "low", permission: { apply: "ask" } },
-  applypatched: { model: "x/y", thoughtLevel: "low", permission: { applypatch: "allow" } },
-  multiedited: { model: "x/y", thoughtLevel: "low", permission: { multiedit: "ask" } },
+  scout: { model: "x/y", thoughtLevel: "low", shape: "readonly" }, // effective readonly — the only exempt target
+  patched: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { patch: "allow" } },
+  applied: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { apply: "ask" } },
+  applypatched: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { applypatch: "allow" } },
+  multiedited: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { multiedit: "ask" } },
 }
 
 test("recon gate: a patch-family permission lift kills the readonly exemption with the same refusal", async () => {
@@ -480,7 +495,7 @@ test("recon gate: a both-fields task call resolves through the subagent_type-fir
       join(wt, ".opencode", "forge.json"),
       JSON.stringify({
         agents: {
-          scout: { model: "x/y", thoughtLevel: "low" },
+          scout: { model: "x/y", thoughtLevel: "low", shape: "readonly" },
           coder: { model: "x/y", thoughtLevel: "low", shape: "write" },
         },
       }),

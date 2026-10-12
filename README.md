@@ -502,8 +502,10 @@ out of a materialized id.
       "model": "zai-coding-plan/glm-5.3", // exact "provider/model" string
       "thoughtLevel": "low",              // none/minimal/low/medium/high/xhigh/max, or any word — write lowercase
       // "prompt": "short role description — explicit prompts fully override the built-ins (only research/review ids have them; any other id without a prompt gets a generic one-liner)",
-      // "shape": "write",   // default readonly denies write/edit/bash + the
-                              // patch family (patch/applypatch/apply/multiedit)
+      // "shape": "readonly", // absent shape defaults to WRITE (open
+                               // permissions); "readonly" is the explicit seal
+                               // denying write/edit/bash + the patch family
+                               // (patch/applypatch/apply/multiedit)
       // "permission": { "bash": "deny" } // optional override; "task" is ALWAYS denied
     },
     // AUTO worker: set NEITHER — inherits the parent session's model at
@@ -546,13 +548,18 @@ A rejected entry costs only itself — its siblings materialize normally.
   says "inherits the parent session's model" instead of naming a brain),
   the worker discipline (workspace-relative paths only, verbatim reporting
   of tool refusals, evidence-bearing conclusions) around its role prompt,
-   and a deny-style permission: `shape: "readonly"` (the default) denies
+   and a deny-style permission: an ABSENT `shape` defaults to WRITE (open
+   permissions — the compatibility-preserving default for existing pools);
+   an explicit `shape: "readonly"` denies
    the full mutating-tool family — `write`/`edit`/`bash` plus the host's
    patch family (`patch`/`applypatch`/`apply`/`multiedit`) — `shape:
-   "write"` allows them, an explicit `permission` map overrides the shape
+   "write"` allows them (same as absent), an explicit `permission` map overrides the shape
    default (lifting ANY member of that family off `deny` forfeits the
    draft-phase readonly exemption) — and `task` is ALWAYS
-   denied (recursive spawning stays physically impossible).
+   denied (recursive spawning stays physically impossible). Readonly is a
+   restriction you ask for explicitly, never a surprise default — new pools
+   should give every agent an explicit `shape` (the `/crew` initialization
+   gate teaches the AI author exactly this).
 
 > **Upgrading from ≤ 0.5.0 (breaking):** agent entries that pinned `model`
 > without `thoughtLevel` used to be accepted; they are now SKIPPED with an
@@ -725,7 +732,9 @@ session's workspace, never the objective's scope.
 anchor set refuses with one-time setup guidance: the two file paths, a
 copy-paste template, and the choice of configuring it yourself OR having the
 session AI do it — the latter only on your explicit go-ahead in that
-conversation, through the normal visible write path (when the AI writes a
+conversation, through the normal visible write path (when the AI writes the
+file every agent gets an explicit `shape` — `readonly` for read-only roles,
+`write` for implementers — and for a
 sub-pool file it also proposes a short stable `pool` namespace so ids
 survive directory renames). This is the plugin's only configuration
 invitation. Saved files apply at the next real materialization — no
@@ -812,16 +821,20 @@ The escape hatches are `plan_approve` and `/plan discard`, by design.
 
 One carve-out, keyed on the target rather than the tool: during a draft the
 `task` tool is gated by the dispatch target's **effective readonly shape**. A
-dispatch to a forge worker whose shape is not `write` AND whose permission
+dispatch to a forge worker whose shape is EXPLICITLY `readonly` AND whose
+permission
 overrides do not lift `write`/`edit`/`bash` — nor any host patch-family tool
 (`patch`/`applypatch`/`apply`/`multiedit`) — off `deny` (`ask` counts as
 lifted — fail-closed) passes as a reconnaissance dispatch: readonly scouts
 may be spawned both before and during the draft, so breadth
-evidence-gathering does not burn the planning session's context. Every other
-target — write-shaped workers, native agents, absent or unresolvable targets
+evidence-gathering does not burn the planning session's context. A worker
+with NO shape field is not exempt (absent defaults to write). Every other
+target — write-shaped and shape-less workers, native agents, absent or
+unresolvable targets
 (including resume calls that carry no target) — is denied like any write-class
 tool. The refusal names the currently dispatchable effective-readonly roster,
-points to defining a readonly worker in forge.json when the roster is empty
+points to defining a readonly worker in forge.json (explicit
+`"shape": "readonly"`) when the roster is empty
 (an unconfigured host stays fully denied — same behavior as before, just more
 actionable wording), and names the two exits (`plan_approve`, `/plan
 discard`). Invariant strength is unchanged: the scout's materialized
