@@ -74,10 +74,16 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
    forge 系统注入、goal 续跑（调度时+发送前双闸）、watchdog（标记+计时）、
    task 派发护栏（非 forge 派 forge-* 硬拒绝）、状态文件边界（非 forge 禁
    写 .opencode/plan|goal）、工人→STATE 工具拒绝（forge-* 调
-   plan_*/goal_*/crew_* primary-only，先于任何执行与用户确认门）；
-   未知会话对注入 fail-silent、对拒绝 belt
-   fail-open。stage 探测已退役：`auto`≡`forge`，仅 `native` 退役
-   supervisor（隐藏同撤）。
+    plan_*/goal_*/crew_* primary-only，先于任何执行与用户确认门）；
+    **执行通道封禁**（readonly-exec-seal）：显式 readonly 的 forge-* 工人
+    其 forge_shell 在 spawn 前过纯函数命令分类闸
+    （`src/exec-classify.ts`：重定向/变异 cmdlet/git 变更/包管理写/工作区
+    显式路径写入 → WRITE-CLASS 拒+有界 finding，不可分类 → READ-CLASS
+    fail-open；primary 与未知会话不封，belt-in-depth 非沙箱，绕过面 README
+    逐字披露）；
+    未知会话对注入 fail-silent、对拒绝 belt
+    fail-open。stage 探测已退役：`auto`≡`forge`，仅 `native` 退役
+    supervisor（隐藏同撤）。
 
 ## v1 / v2 双入口
 

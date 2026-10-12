@@ -596,6 +596,50 @@ providers can return a deterministic EMPTY response for any toolset-reduced
 attributable task failure; the mitigation is unchanged — use
 `shape: "write"` for such endpoints, or a keyed provider.
 
+### Readonly exec seal (the sealed supervised-exec channel)
+
+The readonly shape used to seal only the TOOL face (write/edit/bash + the
+patch family) — a readonly worker could still mutate the world through its
+exec channel (`forge_shell`). The exec seal closes that hole: a session whose
+running `forge-*` worker has an **explicit** `shape: "readonly"` (an absent
+shape defaults to write and is **never** sealed) has its `forge_shell` calls
+classified BEFORE spawn by a pure string classifier (`src/exec-classify.ts`,
+no fs access at classify time). READ-CLASS commands (inspection, search,
+read-only evals — `rg`, `git log`/`status`/`diff`, `node -e`/`python -c`
+read evals, version/help queries) flow normally; **WRITE-CLASS commands are
+denied** with a bounded finding (once per session per indicator class) that
+names the readonly shape, names the classified write indicator, and points
+at the remedy: `"shape": "write"` on that agent when its job legitimately
+mutates. The worker is told to report the refusal verbatim, not work around
+it. The primary forge session is never sealed; a session whose agent cannot
+be resolved fails open (one-time disclosure). The seal composes with — never
+replaces — the draft-phase ask/deny posture on the channel.
+
+Covered WRITE-CLASS indicators:
+
+| indicator | covers |
+| --- | --- |
+| `redirect` | output redirection to files — `>` `>>` and fd forms (`2>`, `1>`, `*>`); the PowerShell family uses the same operators |
+| `mutating-cmdlet` | `Set-Content`, `Out-File`, `New-Item`, `Remove-Item`, `Move-Item`, `Copy-Item`, `Add-Content`, `Clear-Content` |
+| `git-mutation` | `git add/commit/push/reset/checkout/rebase/merge/clean/rm` |
+| `pkg-mutation` | `npm publish`, `npm install` (incl. `npm i`/`ci`/`add`), `bun add`/`install`, `pip`/`pip3 install` |
+| `workspace-write` | output-target flags (`--out`, `--output`, `--out-file`/`--outfile`/`--outFile`, `--dest`, `--destination`, `-o`) whose parsed value is a workspace-relative path, or an absolute path under the session workspace |
+
+**Honest positioning — this is belt-in-depth, NOT a sandbox.** A command
+that fails to classify is treated as READ-CLASS (fail-open on the channel,
+the same posture as every refusal belt). The known bypass surface, verbatim:
+**indirect writes** (a script that writes internally — `node build.js` with
+no redirect is indirection the classifier does not model), **`Start-Process`
+writers** (spawning a writer process is explicitly out of scope), and
+**encoded payloads** (`powershell -EncodedPayload …`, base64 blobs) are NOT
+covered; they flow on the readonly channel. The seal narrows the exec hole
+from "completely open" to "explicitly constructed indirection" — a true OS
+level seal (write-time redirection, shadow copies, containers, win32+POSIX
+dual implementations) was evaluated and rejected as a disproportionate
+rewrite (see `openspec/changes/readonly-exec-seal/design.md`, option D3).
+The tool-face deny remains the first belt; this is the second.
+
+
 ### The thoughtLevel word
 
 One word per agent: the canonical seven-word dictionary

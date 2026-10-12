@@ -15093,6 +15093,165 @@ function effectiveReadonlyShape(def) {
   return true;
 }
 
+// src/exec-classify.ts
+var READ_CLASS = "READ";
+var WRITE_CLASS = "WRITE";
+var REDIRECT_INDICATOR = "redirect";
+var MUTATING_CMDLETS = [
+  "Set-Content",
+  "Out-File",
+  "New-Item",
+  "Remove-Item",
+  "Move-Item",
+  "Copy-Item",
+  "Add-Content",
+  "Clear-Content"
+];
+var GIT_MUTATING_SUBCOMMANDS = [
+  "add",
+  "commit",
+  "push",
+  "reset",
+  "checkout",
+  "rebase",
+  "merge",
+  "clean",
+  "rm"
+];
+var PKG_MUTATING_COMMANDS = ["npm publish", "npm install", "bun add", "pip install"];
+var PKG_MUTATING_PATTERNS = [
+  /\bnpm\s+(?:publish|install|i|ci|add)\b/i,
+  /\bbun\s+(?:add|install)\b/i,
+  /\bpip3?\s+install\b/i
+];
+var WRITE_TARGET_FLAGS = [
+  "--out",
+  "--output",
+  "--out-file",
+  "--outfile",
+  "--outFile",
+  "--dest",
+  "--destination",
+  "-o"
+];
+var EXEC_SEAL_INDICATORS = [
+  { id: REDIRECT_INDICATOR, covers: "`>` `>>` and fd forms (`2>` `*>`) — bash and the PowerShell family share the operators" },
+  { id: "mutating-cmdlet", covers: MUTATING_CMDLETS.join(", ") },
+  { id: "git-mutation", covers: `git ${GIT_MUTATING_SUBCOMMANDS.join("/")}` },
+  { id: "pkg-mutation", covers: PKG_MUTATING_COMMANDS.join(", ") + " (with common aliases: npm i/ci/add, bun install, pip3 install)" },
+  { id: "workspace-write", covers: `output-target flags ${WRITE_TARGET_FLAGS.join(" ")} whose parsed value is a workspace-relative path (or an absolute path under the provided workspaceRoot)` }
+];
+function stripQuoted(cmd) {
+  let out = "";
+  let quote = null;
+  for (const ch of cmd) {
+    if (quote) {
+      if (ch === quote)
+        quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    out += ch;
+  }
+  return out;
+}
+function redirectMatch(cmd) {
+  const bare = stripQuoted(cmd).replace(/\r?\n/g, " ");
+  const m = /(?:^|[^>&])>{1,2}(?!&)[^\s;&|]*/.exec(bare);
+  if (m)
+    return { detail: m[0].trim() };
+  return null;
+}
+function wordMatch(cmd, needle) {
+  const re = new RegExp(`(^|[\\s;&|(])${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
+  const m = re.exec(cmd);
+  if (m)
+    return { detail: m[0].trim() };
+  return null;
+}
+function gitMutationMatch(cmd) {
+  const bare = stripQuoted(cmd);
+  for (const sub of GIT_MUTATING_SUBCOMMANDS) {
+    const m = new RegExp(`(?:^|[\\s;&|(])git\\s+${sub}\\b`, "i").exec(bare);
+    if (m)
+      return { detail: m[0].trim() };
+  }
+  return null;
+}
+function pkgMutationMatch(cmd) {
+  const bare = stripQuoted(cmd);
+  for (const re of PKG_MUTATING_PATTERNS) {
+    const m = re.exec(bare);
+    if (m)
+      return { detail: m[0].trim() };
+  }
+  return null;
+}
+function isDriveRelative(p) {
+  return /^[a-zA-Z]:/.test(p);
+}
+function pathLike(p) {
+  return /^[^;&|<>]+$/.test(p) && /[./\\]/.test(p);
+}
+function insideWorkspace(value, workspaceRoot) {
+  const norm = (s) => s.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  if (!isDriveRelative(value) && !value.startsWith("/") && !value.startsWith("\\\\")) {
+    return true;
+  }
+  if (workspaceRoot === undefined)
+    return false;
+  return norm(value).startsWith(`${norm(workspaceRoot)}/`) || norm(value) === norm(workspaceRoot);
+}
+function workspaceWriteMatch(cmd, workspaceRoot) {
+  const tokens = stripQuoted(cmd).split(/\s+/).filter(Boolean);
+  for (let i = 0;i < tokens.length; i++) {
+    const tok = tokens[i];
+    let flag = "";
+    let value;
+    const eq = tok.indexOf("=");
+    if (eq > 0 && tok.startsWith("--")) {
+      flag = tok.slice(0, eq);
+      value = tok.slice(eq + 1);
+    } else if (WRITE_TARGET_FLAGS.includes(tok)) {
+      flag = tok;
+      value = tokens[i + 1];
+    }
+    if (!flag || value === undefined)
+      continue;
+    if (value.startsWith("-"))
+      continue;
+    if (pathLike(value) && insideWorkspace(value, workspaceRoot)) {
+      return { detail: `${flag} ${value}` };
+    }
+  }
+  return null;
+}
+function classifyExecCommand(cmd, opts) {
+  if (typeof cmd !== "string" || cmd.length === 0)
+    return { klass: READ_CLASS };
+  const r = redirectMatch(cmd);
+  if (r)
+    return { klass: WRITE_CLASS, indicator: REDIRECT_INDICATOR, detail: r.detail };
+  for (const cmdlet of MUTATING_CMDLETS) {
+    const m = wordMatch(cmd, cmdlet);
+    if (m)
+      return { klass: WRITE_CLASS, indicator: "mutating-cmdlet", detail: m.detail };
+  }
+  const g = gitMutationMatch(cmd);
+  if (g)
+    return { klass: WRITE_CLASS, indicator: "git-mutation", detail: g.detail };
+  const p = pkgMutationMatch(cmd);
+  if (p)
+    return { klass: WRITE_CLASS, indicator: "pkg-mutation", detail: p.detail };
+  const w = workspaceWriteMatch(cmd, opts?.workspaceRoot);
+  if (w)
+    return { klass: WRITE_CLASS, indicator: "workspace-write", detail: w.detail };
+  return { klass: READ_CLASS };
+}
+
 // src/dispatch-depth.ts
 var META_DEPTHS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 var BUDGET_TIERS = {
@@ -15948,6 +16107,8 @@ function effectiveWorktree(worktree, fallback) {
 }
 var sessions = new Map;
 var sessionAgents = new Map;
+var sealFindings = new Map;
+var sealUnknownNotes = new Set;
 function isForgeFamilyAgent(name) {
   if (typeof name !== "string")
     return false;
@@ -17685,6 +17846,35 @@ var server = async (input, options) => {
           }
         }
       }
+      if (input2.tool === "forge_shell" && input2.sessionID) {
+        const a = output?.args ?? {};
+        const cmd = typeof a.command === "string" ? a.command : undefined;
+        if (cmd) {
+          const speaker = sessionAgents.get(input2.sessionID);
+          const workerId = speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT ? speaker.slice("forge-".length) : undefined;
+          if (workerId !== undefined) {
+            const def = resolvePools()?.agents[workerId]?.def;
+            if (def !== undefined && effectiveReadonlyShape(def)) {
+              const verdict = classifyExecCommand(cmd);
+              if (verdict.klass === WRITE_CLASS) {
+                const seen = sealFindings.get(input2.sessionID) ?? new Set;
+                if (!seen.has(verdict.indicator)) {
+                  seen.add(verdict.indicator);
+                  sealFindings.set(input2.sessionID, seen);
+                  console.warn(`[forge:seal] session ${input2.sessionID} (readonly worker "${speaker}"): write-class forge_shell command denied — indicator "${verdict.indicator}" (${verdict.detail ?? cmd.slice(0, 60)}). Remedy: "shape": "write" on the agent when its job legitimately mutates.`);
+                }
+                throw new Error(`[forge:seal] Exec refused: this session runs the readonly worker "${speaker}" (explicit "shape": "readonly") and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. READ-CLASS commands (inspection, search, read-only evals) flow normally. If this worker's job legitimately mutates, set "shape": "write" on its forge.json entry. Report this refusal VERBATIM — do not work around it.`);
+              }
+            }
+          } else if (speaker === undefined) {
+            const verdict = classifyExecCommand(cmd);
+            if (verdict.klass === WRITE_CLASS && !sealUnknownNotes.has(input2.sessionID)) {
+              sealUnknownNotes.add(input2.sessionID);
+              console.warn(`[forge:seal] session ${input2.sessionID}: a WRITE-CLASS forge_shell command (${verdict.indicator}) flowed UNSEALED — the session's agent is unknown (fail-open; the exec seal binds explicit-readonly forge-* workers only).`);
+            }
+          }
+        }
+      }
       if (input2.sessionID && typeof input2.tool === "string") {
         const speaker = sessionAgents.get(input2.sessionID);
         if (speaker !== undefined) {
@@ -17762,6 +17952,7 @@ var server = async (input, options) => {
     },
     __forgeSubagentsTest: {
       crews: () => crews,
+      sealFindings: (sessionID) => [...sealFindings.get(sessionID) ?? []],
       depthState: (sessionID) => sessionDepths.get(sessionID)?.translation ?? null,
       depthFinding: (agentId) => depthFindingNotes.get(agentId) ?? null,
       catalog: () => modelsDevCatalog,
@@ -17824,6 +18015,8 @@ var server = async (input, options) => {
           jobManager.onSessionEnd(info.id);
           sessionDepths.delete(info.id);
           sessionAgents.delete(info.id);
+          sealFindings.delete(info.id);
+          sealUnknownNotes.delete(info.id);
         }
       }
     },

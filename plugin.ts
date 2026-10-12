@@ -71,6 +71,7 @@ import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./
 import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, type CatalogSnapshot } from "./src/models-dev.ts"
 import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
+import { classifyExecCommand, WRITE_CLASS } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 
@@ -228,6 +229,15 @@ const sessions = new Map<string, SessionState>()
 // session.deleted eviction. Unknown = no gate behavior (fail-open for refusal
 // belts, no injection for push paths).
 const sessionAgents = new Map<string, string>()
+
+// Exec-seal findings (readonly-exec-seal, tool-partition): bounded per
+// session per WRITE-CLASS indicator — a denial throws on EVERY write-class
+// call, but the console finding is recorded once per session per indicator
+// class so the transcript never floods. Evicted on session.deleted like the
+// maps above. `sealUnknownNotes` bounds the one-time fail-open disclosure
+// for sessions whose agent cannot be resolved.
+const sealFindings = new Map<string, Set<string>>()
+const sealUnknownNotes = new Set<string>()
 
 function isForgeFamilyAgent(name: unknown): boolean {
   if (typeof name !== "string") return false
@@ -2513,6 +2523,56 @@ export const server: Plugin = async (input, options) => {
           }
         }
       }
+      // Exec seal (readonly-exec-seal, tool-partition — "Readonly workers
+      // execute on a sealed supervised-exec channel"): a session whose
+      // running forge-* worker has an EXPLICIT readonly shape
+      // (effectiveReadonlyShape — shape-default-open: an absent shape is
+      // write and is NEVER sealed) gets its forge_shell channel gated before
+      // spawn: WRITE-CLASS commands (pure-string classifier,
+      // src/exec-classify.ts) are denied with a bounded finding naming the
+      // shape, the indicator and the `shape: "write"` remedy. The primary
+      // forge session is never sealed; an UNKNOWN session fails open (belt
+      // posture) with a once-per-session disclosure. Composes with, never
+      // replaces, the draft-phase ask/deny posture above — that block treats
+      // forge_shell via permission.ask only and is untouched here.
+      if (input.tool === "forge_shell" && input.sessionID) {
+        const a = (output?.args ?? {}) as { command?: unknown }
+        const cmd = typeof a.command === "string" ? a.command : undefined
+        if (cmd) {
+          const speaker = sessionAgents.get(input.sessionID)
+          const workerId =
+            speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT ? speaker.slice("forge-".length) : undefined
+          if (workerId !== undefined) {
+            const def = resolvePools()?.agents[workerId]?.def
+            if (def !== undefined && effectiveReadonlyShape(def)) {
+              const verdict = classifyExecCommand(cmd)
+              if (verdict.klass === WRITE_CLASS) {
+                const seen = sealFindings.get(input.sessionID) ?? new Set<string>()
+                if (!seen.has(verdict.indicator!)) {
+                  seen.add(verdict.indicator!)
+                  sealFindings.set(input.sessionID, seen)
+                  console.warn(
+                    `[forge:seal] session ${input.sessionID} (readonly worker "${speaker}"): write-class forge_shell command denied — indicator "${verdict.indicator}" (${verdict.detail ?? cmd.slice(0, 60)}). Remedy: "shape": "write" on the agent when its job legitimately mutates.`,
+                  )
+                }
+                throw new Error(
+                  `[forge:seal] Exec refused: this session runs the readonly worker "${speaker}" (explicit "shape": "readonly") and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. READ-CLASS commands (inspection, search, read-only evals) flow normally. If this worker's job legitimately mutates, set "shape": "write" on its forge.json entry. Report this refusal VERBATIM — do not work around it.`,
+                )
+              }
+            }
+          } else if (speaker === undefined) {
+            // Unknown session: fail-open on the channel (the seal keys on
+            // the explicit readonly shape only), disclosed once per session.
+            const verdict = classifyExecCommand(cmd)
+            if (verdict.klass === WRITE_CLASS && !sealUnknownNotes.has(input.sessionID)) {
+              sealUnknownNotes.add(input.sessionID)
+              console.warn(
+                `[forge:seal] session ${input.sessionID}: a WRITE-CLASS forge_shell command (${verdict.indicator}) flowed UNSEALED — the session's agent is unknown (fail-open; the exec seal binds explicit-readonly forge-* workers only).`,
+              )
+            }
+          }
+        }
+      }
       // Partition fallback belts (tool-partition fallback requirement): on
       // hosts that ignore hook-injected tools maps (the owner's paseo build —
       // E2E-verified), invisibility degrades to hard refusal. On hosts that
@@ -2658,6 +2718,7 @@ export const server: Plugin = async (input, options) => {
     // module-state style as FORGE_TEST_NO_FENCE). Not part of the plugin API.
     __forgeSubagentsTest: {
       crews: () => crews,
+      sealFindings: (sessionID: string) => [...(sealFindings.get(sessionID) ?? [])],
       depthState: (sessionID: string) => sessionDepths.get(sessionID)?.translation ?? null,
       depthFinding: (agentId: string) => depthFindingNotes.get(agentId) ?? null,
       catalog: () => modelsDevCatalog,
@@ -2746,6 +2807,9 @@ export const server: Plugin = async (input, options) => {
           sessionDepths.delete(info.id)
           // Same for the agent-family map (tool-partition).
           sessionAgents.delete(info.id)
+          // And the exec-seal finding bounds (readonly-exec-seal).
+          sealFindings.delete(info.id)
+          sealUnknownNotes.delete(info.id)
         }
       }
     },
