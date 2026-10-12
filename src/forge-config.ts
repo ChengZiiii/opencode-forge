@@ -15,7 +15,7 @@
 // unconfigured host is inert and silent, and the plugin only ever READS the
 // file — onboarding is human-facing documentation, never an AI invitation.
 
-import { readdirSync, readFileSync, statSync, type Dirent } from "node:fs"
+import { readFileSync, statSync } from "node:fs"
 
 export type AgentShape = "readonly" | "write"
 
@@ -579,31 +579,42 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
 }
 
 // ---------------------------------------------------------------------------
-// Hierarchical pool materialization (change hierarchical-pool-materialization,
-// spec: forge-subagents — "Hierarchical pool materialization on shared
-// hosts"). An append-only anchor set resolves pool families: per anchor, the
-// walk-up root pool PLUS every sub-pool forge.json in the anchor's subtree
-// (bounded BFS, lexicographic sibling order, dependency skip-list, per-anchor
-// scanned-directory budget, directory-mtime cache). Pool identity = absolute
-// file path (dedup across anchors). The PRIMARY anchor's root pool keeps
-// plain ids; every other family materializes as <ns>-<id> where ns is the
-// file's `pool` field (fail-soft validated) else the sanitized directory
-// basename. Resolution order is deterministic: primary root first, then
-// lexicographic by file path — every collision rule keys off that order.
-// Everything here is data in, data out (fs injectable), same discipline as
-// the loader above.
+// Workspace pool ownership + global fallback (change sole-pool-ownership,
+// spec: forge-subagents — "Workspace pool ownership and global fallback").
+// A session's dispatchable pool set is exactly its WORKSPACE pool — the
+// NEAREST `.opencode/forge.json` walking up from the workspace directory —
+// with the global layer (`~/.config/opencode/forge.json`) as a FALLBACK
+// ONLY: fallback, not merge — a workspace with a pool never sees the
+// global layer's agents in its roster. `forge.json` files nested DEEPER in
+// a workspace's subtree are ignored entirely (the same workspace-ownership
+// strictness as the host's native MCP config; there is NO subtree scan).
+//
+// The HOST-WIDE materialization set is the union of the global layer and
+// every workspace pool the host has seen (one pool per seen directory: its
+// walk-up nearest file). Everything re-resolves per call through the mtime
+// caches — there is NO append-only anchor set: a pool file deleted from
+// disk disappears from materialization at the next resolve (deletion is
+// real, no zombie pools). The FIRST anchor's pool is the primary family
+// (plain ids); every other family materializes as <ns>-<id> where ns is
+// the file's `pool` field (fail-soft validated) else the sanitized pool
+// directory basename (the global fallback family derives "global").
+// Resolution order is deterministic: primary first, then lexicographic by
+// absolute file path — every collision rule keys off that order.
+// Everything here is data in, data out (fs injectable), same discipline
+// as the loader above.
 // ---------------------------------------------------------------------------
 
 export type PoolFamilyOrigin = {
   // Absolute forge.json path — the pool's identity.
   file: string
-  // Null on the primary anchor's root pool (plain ids); the namespace of
-  // every other family (declared `pool` field, else sanitized dir basename,
-  // disambiguated with an incrementing suffix on collision).
+  // Null on the primary anchor's pool (plain ids); the namespace of every
+  // other family (declared `pool` field, else sanitized pool-dir basename —
+  // "global" for the global fallback file — disambiguated with an
+  // incrementing suffix on collision).
   ns: string | null
   // The file's declared `pool` field as written (null when absent).
   declaredPool: string | null
-  // True only for the primary anchor's root pool.
+  // True only for the primary anchor's pool.
   primary: boolean
   // Materialized ids (without the `forge-` prefix) this pool contributes
   // after cross-family collision resolution.
@@ -630,19 +641,7 @@ export type PoolResolverDeps = {
   // Injectable for tests; null stat = file missing.
   stat?: (path: string) => { mtimeMs: number; size: number } | null
   readFile?: (path: string) => string
-  // Directory listing with dir-ness per entry; null/throw = unreadable.
-  // Default: readdirSync(dir, { withFileTypes: true }).
-  readdir?: (dir: string) => Array<{ name: string; dir: boolean }> | null
-  // Per-anchor scanned-directory budget (default 2,000).
-  scanBudget?: number
 }
-
-// Dependency dirs never descended into (exhaustive by design — the spec list
-// is the normative set). `.opencode` is added at scan time: its forge.json is
-// checked per-parent as a pool candidate, but the directory itself is never
-// descended into.
-const POOL_SKIP_DIRS = new Set(["node_modules", ".git", "dist", "build", "out", "target", ".cache", "venv", ".venv", "__pycache__", "coverage"])
-const POOL_SCAN_BUDGET = 2000
 
 // Namespace sanitization (spec-exact): lowercase; each run of characters
 // outside [a-z0-9-] collapsed to a single "-"; leading/trailing "-" trimmed;
@@ -673,7 +672,13 @@ function codepointCompare(a: string, b: string): number {
   return a < b ? -1 : a > b ? 1 : 0
 }
 
-export function createPoolResolver(deps: PoolResolverDeps): { resolve(anchors: string[]): PoolResolution } {
+export function createPoolResolver(deps: PoolResolverDeps): {
+  resolve(anchors: string[]): PoolResolution
+  /** The workspace pool file owning an anchor (nearest forge.json walking
+   *  up from it) — the session-scoping primitive; null when the workspace
+   *  has no pool (the global fallback applies). */
+  workspacePoolOf(anchor: string): string | null
+} {
   const stat =
     deps.stat ??
     ((path: string) => {
@@ -685,16 +690,6 @@ export function createPoolResolver(deps: PoolResolverDeps): { resolve(anchors: s
       }
     })
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, "utf8"))
-  const readdir =
-    deps.readdir ??
-    ((dir: string) => {
-      try {
-        return readdirSync(dir, { withFileTypes: true }).map((d: Dirent) => ({ name: d.name, dir: d.isDirectory() }))
-      } catch {
-        return null
-      }
-    })
-  const budget = typeof deps.scanBudget === "number" && deps.scanBudget > 0 ? deps.scanBudget : POOL_SCAN_BUDGET
   const globalPath = forgeConfigPaths({ homeDir: deps.homeDir }).global
 
   // ---- mtime-cached parsed pool file (includes parse failures; the file
@@ -704,6 +699,7 @@ export function createPoolResolver(deps: PoolResolverDeps): { resolve(anchors: s
   const readPool = (path: string): ParsedPool | null => {
     const st = stat(path)
     if (st === null) {
+      // Deletion hot-applies: the cached parse dies with the file.
       fileCache.delete(path)
       return null
     }
@@ -735,64 +731,15 @@ export function createPoolResolver(deps: PoolResolverDeps): { resolve(anchors: s
     return parsed
   }
 
-  // ---- mtime-cached directory listing. The pool-file existence check for a
-  // directory lives INSIDE its own cached entry (creating .opencode/forge.json
-  // inside a directory changes THAT directory's mtime), so subtree scans stay
-  // honest without re-statting every candidate on every resolve.
-  type DirEntry = { mtimeMs: number; children: Array<{ name: string; dir: boolean }> | null; poolFile: string | null }
-  const dirCache = new Map<string, DirEntry>()
-  const listDir = (dir: string): DirEntry | null => {
-    const st = stat(dir)
-    if (st === null) {
-      dirCache.delete(dir)
-      return null
-    }
-    const hit = dirCache.get(dir)
-    if (hit && hit.mtimeMs === st.mtimeMs) return hit
-    const listing = readdir(dir)
-    const children = listing === null ? null : [...listing].sort((a, b) => codepointCompare(a.name, b.name))
-    // The directory's OWN forge.json candidate (its root-pool file when the
-    // directory is itself a pool). Checked once per mtime change.
-    let poolFile: string | null = null
-    const candidate = forgeCandidateAt(dir)
-    if (stat(candidate) !== null) poolFile = candidate
-    const entry: DirEntry = { mtimeMs: st.mtimeMs, children, poolFile }
-    dirCache.set(dir, entry)
-    return entry
-  }
-
-  // ---- bounded BFS subtree scan (spec-exact): breadth-first, lexicographic
-  // sibling order, dependency skip-list, per-anchor scanned-directory budget.
-  // A sub-pool file is `<subdirectory>/.opencode/forge.json` STRICTLY below
-  // the anchor (the anchor's own file belongs to the walk-up root pool).
-  // Returns pool files in deterministic discovery order.
-  const scanSubtree = (anchor: string): string[] => {
-    const files: string[] = []
-    const seen = new Set<string>()
-    let opened = 0
-    const sep = anchor.includes("\\") && !anchor.includes("/") ? "\\" : "/"
-    const joinDir = (parent: string, name: string) => (parent.endsWith("/") || parent.endsWith("\\") ? `${parent}${name}` : `${parent}${sep}${name}`)
-    const queue: string[] = [anchor]
-    while (queue.length > 0 && opened < budget) {
-      const dir = queue.shift()!
-      if (seen.has(dir)) continue
-      seen.add(dir)
-      const entry = listDir(dir)
-      opened++
-      if (entry === null || entry.children === null) continue
-      // The anchor's own pool file is the root pool, not a sub-pool.
-      const isAnchor = dir === anchor
-      if (!isAnchor && entry.poolFile !== null) files.push(entry.poolFile)
-      for (const child of entry.children) {
-        if (!child.dir) continue
-        if (POOL_SKIP_DIRS.has(child.name) || child.name === ".opencode") continue
-        queue.push(joinDir(dir, child.name))
-      }
-    }
-    return files
+  const workspacePoolOf = (anchor: string): string | null => {
+    const dir = (anchor ?? "").trim()
+    if (!dir) return null
+    return discoverProjectFileWith(stat, dir)
   }
 
   return {
+    workspacePoolOf,
+
     resolve(anchorsInput: string[]): PoolResolution {
       // Dedup preserving order (the caller normalizes, this is belt-and-
       // braces); [0] is the primary anchor.
@@ -802,29 +749,25 @@ export function createPoolResolver(deps: PoolResolverDeps): { resolve(anchors: s
         if (t && !anchors.includes(t)) anchors.push(t)
       }
       const findings: ForgeConfigFinding[] = []
-      // Global layer: the base of EVERY family (per-id wholesale override by
-      // the family file). Its findings flow once per resolve.
       const globalParsed = globalPath ? readPool(globalPath) : null
       if (globalParsed) findings.push(...globalParsed.findings)
 
-      // ---- collect unique pool files across all anchors' chains + subtrees.
-      const primaryRootFile = anchors.length > 0 ? discoverProjectFileWith(stat, anchors[0]) : null
+      // ---- one pool per seen workspace directory: its walk-up NEAREST
+      // forge.json. Nested (deeper) forge.json files are invisible here —
+      // nothing scans subtrees. Pool identity = absolute path, so the same
+      // file reached through several anchors materializes exactly once.
       const uniqueFiles = new Set<string>()
-      if (primaryRootFile) uniqueFiles.add(primaryRootFile)
       for (const anchor of anchors) {
-        for (const f of scanSubtree(anchor)) uniqueFiles.add(f)
-        // Non-primary anchors' walk-up roots are families too (namespaced).
-        if (anchor !== anchors[0]) {
-          const rootFile = discoverProjectFileWith(stat, anchor)
-          if (rootFile) uniqueFiles.add(rootFile)
-        }
+        const f = workspacePoolOf(anchor)
+        if (f) uniqueFiles.add(f)
       }
-      // ---- deterministic resolution order: primary root pool first, then
-      // lexicographic by absolute file path. When NO project pool exists
-      // anywhere, the global layer materializes as the plain-id family (the
-      // legacy global-only host keeps its roster); otherwise it merges as
-      // the base of every family.
-      const plainPoolFile = primaryRootFile ?? (globalParsed !== null && globalPath ? globalPath : null)
+      const anyWorkspacePool = uniqueFiles.size > 0
+      if (globalPath && globalParsed) uniqueFiles.add(globalPath)
+
+      // ---- plain-id family: the primary anchor's pool; a host with NO
+      // workspace pool keeps the legacy global-only roster as plain ids.
+      const primaryFile = anchors.length > 0 ? workspacePoolOf(anchors[0]) : null
+      const plainPoolFile = primaryFile ?? (!anyWorkspacePool && globalParsed !== null && globalPath ? globalPath : null)
       const orderedFiles = [plainPoolFile, ...[...uniqueFiles].filter((f) => f !== plainPoolFile).sort(codepointCompare)].filter((f): f is string => f !== null)
 
       // ---- parse every file once; validate its `pool` field fail-soft.
@@ -851,15 +794,19 @@ export function createPoolResolver(deps: PoolResolverDeps): { resolve(anchors: s
       }
 
       // ---- namespace assignment in resolution order: declared ?? sanitized
-      // basename; collisions get an incrementing -2/-3/... suffix unique
-      // across both derived and declared namespaces; error finding names both
-      // files.
+      // pool-dir basename (the global file derives "global"); collisions
+      // get an incrementing -2/-3/... suffix unique across both derived and
+      // declared namespaces; error finding names both files.
       const allDeclared = new Set<string>()
       for (const f of families) if (f.declaredPool) allDeclared.add(f.declaredPool)
       const usedNs = new Map<string, string>() // ns -> owning file
       for (const f of families) {
         if (f.primary) continue
-        const base = f.declaredPool ?? sanitizeNamespace(dirBasename(parentDirLabel(parentDirLabel(f.file))))
+        const base =
+          f.declaredPool ??
+          (f.file === globalPath
+            ? "global"
+            : sanitizeNamespace(dirBasename(parentDirLabel(parentDirLabel(f.file)))))
         let ns = base
         let suffix = 2
         while ((usedNs.has(ns) || (ns !== base && allDeclared.has(ns))) && suffix < 100) {
@@ -873,23 +820,24 @@ export function createPoolResolver(deps: PoolResolverDeps): { resolve(anchors: s
         usedNs.set(ns, f.file)
       }
 
-      // ---- materialize: global base under each family (per-id wholesale
-      // override); namespaced ids <ns>-<id>; cross-family materialized-id
-      // collisions resolve in resolution order (earlier family wins, later
-      // agent skipped + error finding naming both files).
+      // ---- materialize: each family contributes ONLY its own file's agents
+      // (sole ownership — the global layer is a fallback family, NEVER a
+      // per-id merge base); namespaced ids <ns>-<id>; cross-family
+      // materialized-id collisions resolve in resolution order (earlier
+      // family wins, later agent skipped + error finding naming both files).
       const agents: Record<string, MaterializedPoolAgent> = {}
       const origins: PoolFamilyOrigin[] = []
       for (const f of families) {
-        const merged: Record<string, ForgeAgentDef> = { ...(globalParsed?.agents ?? {}), ...(f.parsed?.agents ?? {}) }
+        const own = f.parsed?.agents ?? {}
         const ids: string[] = []
-        for (const rawId of Object.keys(merged)) {
+        for (const rawId of Object.keys(own)) {
           const matId = f.ns === null ? rawId : `${f.ns}-${rawId}`
           const existing = agents[matId]
           if (existing !== undefined) {
             findings.push({ level: "error", code: "materialized-id-collision", message: `materialized agent forge-${matId} from ${f.file} collides with the one from ${existing.file} — the earlier pool in resolution order wins, this agent is skipped` })
             continue
           }
-          agents[matId] = { materializedId: matId, def: merged[rawId], ns: f.ns, file: f.file }
+          agents[matId] = { materializedId: matId, def: own[rawId], ns: f.ns, file: f.file }
           ids.push(matId)
         }
         origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, primary: f.primary, materializedIds: ids })

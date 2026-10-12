@@ -195,7 +195,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (the dispatch engine was removed); only present as inert debris from older versions | runtime debris — delete freely |
-| `.opencode/forge.json` files (the nearest on each host anchor's ancestor chain, every one in an anchor's subtree, and `~/.config/opencode/forge.json`) | your static subagent definitions (JSONC) — pool families MERGED over the global layer per agent id (primary anchor's root pool plain ids, others namespaced). **User data — the plugin only reads them, never writes or migrates them** | yours — version the project ones, keep the global one out of sync tools if it holds machine-specific models |
+| `.opencode/forge.json` (the NEAREST one walking up from the session's worktree — sole ownership) and `~/.config/opencode/forge.json` (global FALLBACK only, never merged) | your static subagent definitions (JSONC) — the workspace pool IS the session's whole roster; nested forge.json files are ignored. **User data — the plugin only reads them, never writes or migrates them** | yours — version the project ones, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
 
@@ -429,58 +429,67 @@ subagent behavior is untouched. Onboarding is this README, for you the human.
 
 ### forge.json — the configuration
 
-A dedicated `forge.json` (JSONC — comments allowed), resolved exactly like
-opencode's own config language — **merged together, not replaced**, project
-discovered by walking up:
+A dedicated `forge.json` (JSONC — comments allowed) with **workspace pool
+ownership and a global fallback** (sole ownership — the same
+workspace-ownership strictness as opencode's native MCP config):
 
-1. the project layer: the **nearest** `.opencode/forge.json` walking up from
-   the workspace (session worktree → session directory → host launch
-   directory as the anchor chain; first file found on the ancestor chain
-   wins, nothing above it is consulted)
-2. the global layer: `~/.config/opencode/forge.json`
+1. the **workspace pool**: the **nearest** `.opencode/forge.json` walking up
+   from the session's worktree (session worktree → session directory → host
+   launch directory as the anchor chain; first file found on the ancestor
+   chain wins, nothing above it is consulted). When it exists, it **IS the
+   session's whole dispatch roster**.
+2. the **global layer**: `~/.config/opencode/forge.json` — a **fallback
+   ONLY**: when the workspace has no pool file, the global layer serves as
+   the whole roster; when the workspace has one, the global layer is NOT
+   consulted for that session (**a fallback, not a merge** — no per-id
+   blending, global agents never ride a workspace pool).
 
-The two layers **merge**: agents combine, and on an id collision the project
-definition wins wholesale (one definition per id — no cross-layer field
-blending). A broken file empties only its own layer/pool (error finding with
-the parse location); everything else still applies. Both layers re-read at
-every real materialization — host boot, a first config build, or an
-opencode config reload — without a restart; a new session alone does
-not re-read them (see the apply-timing table below).
+`forge.json` files nested **deeper** in the workspace's subtree (a cloned
+repo or subfolder carrying its own file) are **ignored entirely** — they
+contribute no agents, split no pools, and extend nothing (a git checkout
+does not change your roster). A broken file empties only its own pool
+(error finding with the parse location); everything else still applies.
+Both layers re-read at every real materialization — host boot, a first
+config build, or an opencode config reload — without a restart; a new
+session alone does not re-read them, and a **deleted pool file
+un-materializes its agents** (deletion is real — no zombie pools).
 
-**Hierarchical pools on a shared host.** Agent frontends (paseo and friends)
-routinely share ONE opencode host process across projects, re-initializing
-plugins with different directories. The plugin therefore keeps an
-**append-only anchor set**: every host initialization appends its directory
-(first one = the *primary anchor*), and pools resolve from the union —
-anchor flips can only ever ADD pools, never remove them. Per anchor the
-family is:
+**Pools on a shared host.** Agent frontends (paseo and friends) routinely
+share ONE opencode host process across projects, re-initializing plugins
+with different directories. The host therefore remembers every workspace
+directory it was initialized in, and the **host-wide materialization set**
+is the global layer plus each seen workspace's pool (one pool per
+directory: its walk-up nearest file). Pool membership is re-derived from
+disk truth on every resolve — a deleted pool file disappears at the next
+config hook. The FIRST seen workspace's pool keeps **plain `forge-<id>`
+ids** (a single-project host is unchanged); every other pool materializes
+**namespaced** as `forge-<ns>-<id>` (`ns` = the file's optional `pool`
+field, else the sanitized pool-directory name; the global fallback family
+derives `global`). Namespace and materialized-id collisions resolve
+deterministically with an error finding, never by silent shadowing.
 
-- the **root pool** — the nearest forge.json walking up from that anchor
-  (merged over the global layer per agent id);
-- every **sub-pool** — a `.opencode/forge.json` anywhere in the anchor's
-  subdirectories, discovered by a bounded breadth-first scan (lexicographic
-  sibling order; dependency dirs like `node_modules`/`.git`/`dist` are
-  skipped; 2,000-directory budget per anchor).
-
-The **primary anchor's root pool keeps plain `forge-<id>` ids** (a
-single-project host is unchanged); every other family materializes
-**namespaced** as `forge-<ns>-<id>`. `ns` is the file's optional `pool`
-field, else the sanitized directory name. Pool identity is the absolute file
-path — the same file reached through two anchors materializes exactly once;
-namespace and materialized-id collisions resolve deterministically with an
-error finding, never by silent shadowing. The `/crew` roster and the
-`crew_begin` registration output list the dispatchable agents **grouped by
-pool** with each pool's origin path, the primary marked.
+**Dispatch is gated to the session's own pool.** Materializing every pool
+host-wide is a vocabulary necessity (the task tool's agent list is
+host-level); what a given session may actually DISPATCH is scoped
+session-locally: a task call targeting an agent whose pool belongs to
+ANOTHER workspace is refused with a finding naming the target's origin
+pool path, stating it is *not dispatchable from this session*, and the
+exits — open a session in that workspace, or configure the role into this
+workspace's pool / the global layer. The `/crew` roster and the
+`crew_begin` registration output lead with the session's dispatchable pool
+(its forge.json origin — workspace pool, or the global layer marked as
+fallback) and list every other host pool as NOT dispatchable with its
+origin path.
 
 | axis | follows | survives restart? |
 | --- | --- | --- |
-| pools (the `forge-*` vocabulary) | host directories — the anchor set | the set re-seeds from the spawn anchor only |
+| pools (the `forge-*` vocabulary) | workspaces — sole ownership + global fallback | the workspace registry re-seeds from the spawn anchor only |
 | session artifacts (plan/goal/crew records) | the session's own workspace | files on disk are the source of truth |
 
-A forge.json in a directory NO host anchor covers is NOT silently ignored:
-`/crew` names it as the residual mismatch and tells you a host
-initialization in that workspace adds its pools (or fold the agents into the
-global layer).
+A forge.json in a workspace this host has never been initialized in is NOT
+silently ignored: `/crew` names it as the residual mismatch and tells you
+a host re-initialization in that workspace materializes it (or move the
+agents into the global layer).
 
 **Id naming**: use plain role words (`research`, `coder`, …) — the plugin
 materializes every id as `forge-<id>` itself (namespaced pools:
@@ -492,7 +501,7 @@ out of a materialized id.
 
 ```jsonc
 {
-  // sub-pool files only: namespace for this family's ids (forge-<ns>-<id>).
+  // non-primary pool files: namespace for this pool's ids (forge-<ns>-<id>).
   // Short, stable, [a-z0-9-] up to 24 chars — ids survive directory renames.
   // Invalid values degrade to a warning + the directory-derived namespace.
   // "pool": "aa",
@@ -567,17 +576,17 @@ A rejected entry costs only itself — its siblings materialize normally.
 > `thoughtLevel`, or delete `model` to make it an Auto worker.
 
 **What applies when** — only a real materialization re-reads the pool
-files into the `forge-*` vocabulary; the anchor set itself only ever grows.
-Materialization triggers (2026-10-01 live finding): host boot (a freshly
-started CLI process reads the files as they are), the FIRST config build
-for a directory on this host, and opencode config file reloads. A NEW
-session on a long-lived shared host (serve-type) does NOT re-materialize:
+files into the `forge-*` vocabulary. Materialization triggers (2026-10-01
+live finding): host boot (a freshly started CLI process reads the files as
+they are), the FIRST config build for a directory on this host, and
+opencode config file reloads. A NEW session on a long-lived shared host
+(serve-type) does NOT re-materialize:
 
 | change | needs a host restart? |
 | --- | --- |
 | `thoughtLevel` on an existing agent | no (applies to NEW sessions of that agent; running sessions keep their frozen depth) — depth lookups resolve the pool files fresh at every dispatch, independent of materialization |
-| agent added / removed / edited, any pool file created or deleted | no restart — but not at the next session either: the materialized `forge-*` set rebuilds only at the next REAL materialization (host boot, opencode config reload, or a first config build); on a long-lived shared host pool changes wait for that rebuild or a restart. The crew gate and depth lookups resolve the pool files fresh regardless |
-| a NEW directory joining the host (the first session of another project on the shared host) | no restart — that first config build itself re-initializes the plugin and appends the anchor and its pools (append-only; existing pools never flip) |
+| agent added / removed / edited, any pool file created or deleted | no restart — but not at the next session either: the materialized `forge-*` set rebuilds only at the next REAL materialization (host boot, opencode config reload, or a first config build); on a long-lived shared host pool changes wait for that rebuild or a restart. The crew gate, the session-domain dispatch gate, and depth lookups resolve the pool files fresh regardless — a DELETED pool file un-materializes at that next resolve |
+| a NEW directory joining the host (the first session of another project on the shared host) | no restart — that first config build itself re-initializes the plugin and registers that workspace and its pool (existing pools never flip; the first-seen workspace keeps plain ids) |
 
 ### Dispatching
 
@@ -772,20 +781,23 @@ itself (a rootish guard keeps degenerate global-project worktrees from
 landing files on the drive root or the launch anchor). The anchor follows the
 session's workspace, never the objective's scope.
 
-**Not initialized?** `/crew` on a host with ZERO pools across its whole
-anchor set refuses with one-time setup guidance: the two file paths, a
-copy-paste template, and the choice of configuring it yourself OR having the
-session AI do it — the latter only on your explicit go-ahead in that
-conversation, through the normal visible write path (when the AI writes the
-file every agent gets an explicit `shape` — `readonly` for read-only roles,
-`write` for implementers — and for a
-sub-pool file it also proposes a short stable `pool` namespace so ids
-survive directory renames). This is the plugin's only configuration
-invitation. Saved files apply at the next real materialization — no
-restart needed; on a shared host, the first session in a NEW workspace adds
-that anchor and its pools automatically (a new session in an existing
-workspace does not re-read the files — see the apply-timing table
-above).
+**Not initialized?** `/crew` on a session whose roster is EMPTY (neither
+its workspace pool nor the global fallback materializes an agent) refuses
+with one-time setup guidance: the two file paths and their sole-ownership
+relationship (the workspace pool IS the whole roster; the global layer is
+fallback-only, never merged; nested forge.json files ignored), a
+copy-paste template, and the choice of configuring it yourself OR having
+the session AI do it — the latter only on your explicit go-ahead in that
+conversation, through the normal visible write path (when the AI writes
+the file every agent gets an explicit `shape` — `readonly` for read-only
+roles, `write` for implementers — and it also proposes a short stable
+`pool` namespace so ids survive directory renames). This is the plugin's
+only configuration invitation. Saved files apply at the next real
+materialization — no restart needed, and a deleted pool file
+un-materializes its agents; on a shared host, the first session in a NEW
+workspace registers that workspace and its pool automatically (a new
+session in an existing workspace does not re-read the files — see the
+apply-timing table above).
 
 ### Debris note
 

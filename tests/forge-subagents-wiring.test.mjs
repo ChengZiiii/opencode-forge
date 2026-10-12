@@ -618,7 +618,10 @@ test("crew_begin: HARD initialization gate — empty agent set refuses with guid
       assert.match(m, /CREW IS NOT INITIALIZED/)
       assert.match(m, /forge\.json/)
       assert.match(m, /restart/)
-      assert.match(m, /MERGED/, "the guidance states the merge semantics")
+      assert.match(m, /SOLE OWNERSHIP/, "the guidance states the sole-ownership semantics")
+      assert.match(m, /a fallback, NOT a merge/, "fallback-not-merge is explicit")
+      assert.match(m, /nested deeper in the workspace subtree are ignored/, "nested-ignore strictness disclosed")
+      assert.match(m, /DELETED pool file un-materializes/, "deletion semantics disclosed")
       assert.match(m, /"prompt"/, "the refusal template shows the prompt field")
       assert.match(m, /"shape": "readonly"/, "the refusal template shows the explicit shape field")
       assert.match(m, /absent shape defaults to WRITE/, "the refusal discloses the absent-shape default")
@@ -648,20 +651,29 @@ function workspaceWithForgeJson(t, json) {
 
 test("crew_begin: a workspace forge.json the host cannot see is DISCLOSED, not masked", async (t) => {
   // Host launched with its own pool; the session works in another directory
-  // whose forge.json defines an agent the host never materialized.
+  // whose forge.json the host never materialized. Sole ownership: that file
+  // IS the session's roster, so the gate refuses — naming the file and the
+  // remediation instead of claiming the feature is unconfigured.
   const hostDir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const ws = workspaceWithForgeJson(t, JSON.stringify({ agents: { localtool: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await startServer(input(hostDir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
-  const out = await h.tool.crew_begin.execute(
-    { objective: "o", subtasks: [{ title: "x", agent: "forge-research" }] },
-    { ...allowCtx("ses_ws1"), worktree: ws, directory: ws },
+  await assert.rejects(
+    () =>
+      h.tool.crew_begin.execute(
+        { objective: "o", subtasks: [{ title: "x", agent: "forge-research" }] },
+        { ...allowCtx("ses_ws1"), worktree: ws, directory: ws },
+      ),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /CREW IS NOT INITIALIZED/)
+      assert.match(m, /this session's workspace DOES have a forge\.json/)
+      assert.match(m, /this host has NOT materialized it/)
+      assert.match(m, /Re-initialize the host in that workspace, or move the agents into the global layer/)
+      return true
+    },
   )
-  const text = typeof out === "string" ? out : out.output
-  assert.match(text, /NOT dispatchable on this host/)
-  assert.match(text, /forge-<ns>-localtool/)
-  assert.match(text, /A host initialization in that workspace adds its pools/)
 })
 
 test("crew_begin: empty host set + usable workspace file → mismatch-explaining refusal", async (t) => {
@@ -681,7 +693,7 @@ test("crew_begin: empty host set + usable workspace file → mismatch-explaining
       const m = String(err)
       assert.match(m, /CREW IS NOT INITIALIZED/)
       assert.match(m, /this session's workspace DOES have a forge\.json/)
-      assert.match(m, /NO host anchor covers it/)
+      assert.match(m, /this host has NOT materialized it/)
       return true
     },
   )
@@ -822,8 +834,8 @@ test("crew lifecycle: registration PENDS — three-choice surface, dispatch belt
   assert.match(out.output, /convert to a goal contract/, "three-choice surface: goal")
   assert.match(out.output, /standby/, "three-choice surface: standby")
   assert.match(out.output, /END YOUR TURN/, "the stop mandate")
-  assert.match(out.output, /Dispatchable roster origin — 1 pool across the host anchor set/, "origin disclosure enumerates pools")
-  assert.match(out.output, /root pool \(PRIMARY, plain ids\)/, "the primary root pool is marked (D8)")
+  assert.match(out.output, /Session roster origins — sole ownership/, "the session-scoped roster disclosure")
+  assert.match(out.output, /DISPATCHABLE from this session — workspace pool: [^\n]*forge\.json/, "the session's own pool leads with its origin path")
   assert.doesNotMatch(out.output, /Proceed with the discipline/, "registration no longer orders immediate execution")
   assert.equal(h.__forgeSubagentsTest.crews().get("ses_lifecycle").mode, "pending")
 
@@ -903,8 +915,11 @@ test("crew record: registration writes it under the session anchor; arm/close ap
   const dir = projectWithForgeJson(t, poolJson)
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
-  await h.config(emptyCfg())
   const ws = workspaceWithForgeJson(t, poolJson)
+  // Sole ownership: a session anchored at ws needs ws's pool materialized —
+  // the shared host is initialized there too (namespaced family).
+  await server(input(ws), {})
+  await h.config(emptyCfg())
   const recCtx = (sid) => ({ ...allowCtx(sid), worktree: ws, directory: ws })
 
   await h.tool.crew_begin.execute({ objective: "keep records", subtasks: [{ title: "one" }] }, recCtx("ses_rec"))
@@ -921,8 +936,11 @@ test("crew record: registration writes it under the session anchor; arm/close ap
   assert.match(closed, /— closed/)
   assert.match(closed, /one: PASS/)
 
-  // Fail-soft: an anchor that cannot host the file degrades to a note; the crew still runs.
-  const asFile = join(tmpdir(), `forge-wiring-notdir-${Date.now()}.txt`)
+  // Fail-soft: an anchor that cannot host the file degrades to a note; the
+  // crew still runs. The file-anchor sits INSIDE the pooled workspace so its
+  // walk-up still resolves the owning pool (the gate passes; only the record
+  // write fails).
+  const asFile = join(ws, `notdir-${Date.now()}.txt`)
   writeFileSync(asFile, "i am a file, not a directory")
   const soft = await h.tool.crew_begin.execute({ objective: "no record", subtasks: [{ title: "x" }] }, { ...allowCtx("ses_soft"), worktree: asFile, directory: asFile })
   assert.match(soft.output, /could not be written \(fail-soft/, "unwritable anchor degrades to a note")
@@ -950,8 +968,8 @@ test("crew_begin origin disclosure: a global-layer host names the global path", 
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   const out = await h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, allowCtx("ses_origin"))
-  assert.match(out.output, /Dispatchable roster origin — 1 pool across the host anchor set/, "the global fallback pool is the origin")
-  assert.match(out.output, /root pool \(PRIMARY, plain ids\): [^\n]*\.config[\\/]opencode[\\/]forge\.json/, "the global path is spelled out as the plain-id family")
+  assert.match(out.output, /Session roster origins — sole ownership/, "the session-scoped roster header")
+  assert.match(out.output, /DISPATCHABLE from this session — global fallback: [^\n]*\.config[\\/]opencode[\\/]forge\.json/, "the global path is spelled out as the fallback roster origin")
   assert.doesNotMatch(out.output, /workspace has its own forge\.json/, "no mismatch disclosure without a session-side file")
 })
 
