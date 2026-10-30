@@ -10,5 +10,5 @@
 - [x] 3.1 Deep E2E script fixes (interrupted-worker draft, 4 bugs): afterAB snapshot freshness; path matcher lower-case-only (no slash folding) for substring containment; :313 `api`→`api1` crash; catch default route plain end_turn for warmups (no dispatch recursion)
 - [x] 3.2 Deep E2E new assertion (g): own-pool dispatch through the live belt SUCCEEDS (dispatch the session's own workspace-pool agent, expect completed not refusal)
 - [x] 4.1 Gate: `bun run typecheck`, `node --test tests/*.test.mjs` all green, `bun run bundle`, `npm pack --dry-run` whitelist check
-- [ ] 4.2 Deep E2E rerun: all verdicts PASS (a, f, c, d1, d2, e, g, b), exit 0; evidence JSON archived
-- [ ] 4.3 Version 0.18.1, npm publish, postpublish E2E, verify note in the change's verify/ dir
+- [x] 4.2 Deep E2E rerun: all verdicts PASS (a, f, c, d1, d2, e, g, b), exit 0; evidence JSON archived
+- [x] 4.3 Version 0.18.1, npm publish, postpublish E2E, verify note in the change's verify/ dir
