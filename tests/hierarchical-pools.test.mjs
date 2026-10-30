@@ -1,14 +1,16 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-// sole-pool-ownership — pool resolver core (spec: forge-subagents —
-// "Workspace pool ownership and global fallback") + the wiring-level
-// session-domain surfaces (dispatch gate matrix, roster templates).
+// sole-pool-ownership + pool-namespace-contract — pool resolver core (spec:
+// forge-subagents — "Workspace pool ownership and global fallback") + the
+// wiring-level session-domain surfaces (dispatch gate matrix, roster
+// templates). Every family materializes namespaced (forge-<ns>-<id>); the
+// global fallback family is forge-global-<id>; there are NO plain ids.
 
-import { createPoolResolver, sanitizeNamespace, validatePoolField } from "../src/forge-config.ts"
+import { createPoolResolver, sanitizeNamespace, validatePoolField, poolFileCompliance } from "../src/forge-config.ts"
 
 // ---------------------------------------------------------------------------
 // Fake fs: explicit file/dir maps with per-path mtimes (hot-apply tests bump
@@ -89,19 +91,41 @@ test("validatePoolField: [a-z0-9-] 1..24, trimmed; everything else invalid", () 
   assert.equal(validatePoolField("a".repeat(24)).ok, true)
 })
 
+test("poolFileCompliance: file-level predicate — valid declared pool iff compliant", () => {
+  // valid value → compliant, no violation text
+  const ok = poolFileCompliance({ pool: "aa", agents: { x: pinned } })
+  assert.equal(ok.compliant, true)
+  assert.equal(ok.violation, "")
+  // missing field (absent, null, non-object top, undefined) → missing-violation
+  for (const top of [undefined, null, {}, { agents: { x: pinned } }, "not an object", 7]) {
+    const v = poolFileCompliance(top)
+    assert.equal(v.compliant, false, `non-compliant for ${JSON.stringify(top)}`)
+    assert.match(v.violation, /missing top-level pool field/, "missing-vs-invalid distinction")
+  }
+  // invalid values → invalid-violation (charset, wrong type, over-length)
+  for (const bad of ["Aa Team!", 7, "a".repeat(25), true]) {
+    const v = poolFileCompliance({ pool: bad })
+    assert.equal(v.compliant, false, `non-compliant for pool=${JSON.stringify(bad)}`)
+    assert.match(v.violation, /invalid top-level pool field/, "missing-vs-invalid distinction")
+  }
+  // per-agent entries never affect the predicate (file-level scope)
+  assert.equal(poolFileCompliance({ pool: "aa", agents: "garbage-not-an-object" }).compliant, true)
+})
+
 // ---------------------------------------------------------------------------
 // Sole ownership: workspace pool = the whole roster; nested files ignored
 
-test("workspace pool keeps plain ids; nested forge.json files contribute NOTHING", () => {
+test("workspace pool materializes NAMESPACED (no plain ids); nested forge.json files contribute NOTHING", () => {
   const fs = fakeFs()
   temp1Layout(fs)
   const r = resolverOn(fs).resolve(["C:/Temp1"])
-  const primary = r.families.find((f) => f.primary)
-  assert.ok(primary, "a primary family exists")
-  assert.equal(primary.ns, null)
-  assert.equal(primary.file, "C:/Temp1/.opencode/forge.json")
-  assert.ok(r.agents.research && r.agents.plan, "plain ids — byte-compatible with a single-workspace host")
   assert.equal(r.families.length, 1, "exactly one family: the workspace pool")
+  const fam = r.families[0]
+  assert.equal(fam.file, "C:/Temp1/.opencode/forge.json")
+  assert.equal(fam.ns, "temp1", "no pool field → ns = sanitized pool-dir basename")
+  assert.equal(fam.primary, undefined, "the primary flag is gone from the family type")
+  assert.ok(r.agents["temp1-research"] && r.agents["temp1-plan"], "ids are namespaced forge-temp1-* — no plain ids anywhere")
+  assert.ok(!r.agents.research && !r.agents.plan, "no plain-id family exists")
   assert.ok(!r.agents["aa-shader"] && !r.agents.shader, "the NESTED devAa forge.json is ignored entirely (no subtree scan)")
   assert.ok(!r.agents.trap && !r.agents["pkg-trap"], "node_modules pools are never discovered either")
   assert.deepEqual(r.findings, [], "a clean layout resolves with no findings")
@@ -131,23 +155,24 @@ test("a session anchored deeper than a nested forge.json still resolves UP past 
   // C:/w the nested file never joins the materialization set.
   assert.equal(res.workspacePoolOf("C:/w/sub"), "C:/w/sub/.opencode/forge.json")
   const r = res.resolve(["C:/w"])
-  assert.ok(r.agents.root)
+  assert.ok(r.agents["w-root"], "the root pool's agent materializes namespaced (ns from dir basename)")
   assert.ok(!r.agents.deep && !r.agents["sub-deep"], "the host anchored at C:/w never materializes the nested pool")
 })
 
 // ---------------------------------------------------------------------------
 // Global fallback (fallback, NOT merge)
 
-test("poolless workspace: the global layer serves as the whole roster (plain ids, legacy byte-compat)", () => {
+test("poolless workspace: the global layer serves as the whole roster under the FIXED ns 'global'", () => {
   const fs = fakeFs()
   fs.setDir("C:/home/.config/opencode", [{ name: "forge.json", dir: false }])
   fs.writeFile("C:/home/.config/opencode/forge.json", json({ agents: { research: pinned, universal: pinned } }))
   fs.setDir("C:/empty", [])
   const r = resolverOn(fs).resolve(["C:/empty"])
-  assert.ok(r.agents.research && r.agents.universal, "the global fallback materializes as the plain-id family")
+  assert.ok(r.agents["global-research"] && r.agents["global-universal"], "the global fallback materializes as forge-global-* — even on a global-only host")
+  assert.ok(!r.agents.research && !r.agents.universal, "no plain ids for the global family (the legacy branch is dead)")
   assert.equal(r.families.length, 1)
   assert.equal(r.families[0].file, "C:/home/.config/opencode/forge.json")
-  assert.equal(r.families[0].primary, true)
+  assert.equal(r.families[0].ns, "global", "the global fallback family derives the FIXED ns 'global'")
 })
 
 test("fallback NOT merged: a workspace with a pool never sees global agents in its family", () => {
@@ -157,8 +182,8 @@ test("fallback NOT merged: a workspace with a pool never sees global agents in i
   temp1Layout(fs)
   fs.writeFile("C:/Temp1/.opencode/forge.json", json({ agents: { research: pinned } }))
   const r = resolverOn(fs).resolve(["C:/Temp1"])
-  assert.equal(r.agents.research.file, "C:/Temp1/.opencode/forge.json", "the workspace pool's own research stands — no per-id global override merge")
-  assert.equal(r.agents.research.def.model, "zai/glm")
+  assert.equal(r.agents["temp1-research"].file, "C:/Temp1/.opencode/forge.json", "the workspace pool's own research stands — no per-id global override merge")
+  assert.equal(r.agents["temp1-research"].def.model, "zai/glm")
   assert.ok(!r.agents.universal, "a global-only agent does NOT ride the workspace family (fallback, not merge)")
   const globalFamily = r.families.find((f) => f.file === "C:/home/.config/opencode/forge.json")
   assert.ok(globalFamily, "the global layer still materializes HOST-WIDE (fallback for poolless sessions)")
@@ -167,15 +192,17 @@ test("fallback NOT merged: a workspace with a pool never sees global agents in i
   assert.ok(r.agents["global-universal"], "global agents materialize namespaced under forge-global-*")
 })
 
-test("a declared pool field namespaces the global fallback family too", () => {
+test("a declared pool field on the global fallback file is IGNORED — the ns stays FIXED 'global' (design D2, zero exceptions)", () => {
   const fs = fakeFs()
   fs.setDir("C:/home/.config/opencode", [{ name: "forge.json", dir: false }])
   fs.writeFile("C:/home/.config/opencode/forge.json", json({ pool: "shared", agents: { research: pinned } }))
   temp1Layout(fs)
   const r = resolverOn(fs).resolve(["C:/Temp1"])
   const globalFamily = r.families.find((f) => f.file === "C:/home/.config/opencode/forge.json")
-  assert.equal(globalFamily.ns, "shared", "the pool field wins over the derived 'global' ns")
-  assert.ok(r.agents["shared-research"])
+  assert.equal(globalFamily.ns, "global", "the FIXED ns wins over any declared value (no rename, ever)")
+  assert.ok(r.agents["global-research"], "the agents materialize as forge-global-* despite the declared field")
+  assert.ok(!r.agents["shared-research"], "the declared value never leaks into ids")
+  assert.ok(r.findings.some((f) => f.code === "pool-field-ignored-global" && f.level === "warn" && /C:\/home\/\.config\/opencode\/forge\.json/.test(f.message) && /global fallback namespace is fixed/.test(f.message)), "the ignore is disclosed with a warn finding naming the file")
 })
 
 // ---------------------------------------------------------------------------
@@ -188,13 +215,14 @@ test("deleting the workspace pool file un-materializes it — the session falls 
   temp1Layout(fs)
   const res = resolverOn(fs)
   const r1 = res.resolve(["C:/Temp1"])
-  assert.ok(r1.agents.research, "the workspace pool materializes while the file exists")
+  assert.ok(r1.agents["temp1-research"], "the workspace pool materializes while the file exists")
   fs.deleteFile("C:/Temp1/.opencode/forge.json")
   const r2 = res.resolve(["C:/Temp1"])
-  assert.ok(!r2.agents.research && !r2.agents.plan, "deletion hot-applies — the pool's agents are gone (no zombie pool)")
-  assert.ok(r2.agents.fallback, "the now-poolless workspace falls back to the global layer as its plain-id family")
-  assert.equal(r2.families.filter((f) => f.primary).length, 1)
+  assert.ok(!r2.agents["temp1-research"] && !r2.agents["temp1-plan"], "deletion hot-applies — the pool's agents are gone (no zombie pool)")
+  assert.ok(r2.agents["global-fallback"], "the now-poolless workspace falls back to the global layer — namespaced forge-global-*")
+  assert.equal(r2.families.length, 1)
   assert.equal(r2.families[0].file, "C:/home/.config/opencode/forge.json")
+  assert.equal(r2.families[0].ns, "global")
   assert.ok(!r2.agents["aa-shader"], "nested files stay invisible after the flip")
 })
 
@@ -207,13 +235,13 @@ test("creation hot-applies: a workspace pool appearing on disk materializes with
   assert.deepEqual(res.resolve(["C:/Temp1", "C:/other"]).families, [], "unconfigured: inert and silent")
   fs.writeFile("C:/Temp1/.opencode/forge.json", json({ agents: { fresh: pinned } }))
   const r = res.resolve(["C:/Temp1", "C:/other"])
-  assert.ok(r.agents.fresh, "creation hot-applies — the new pool materializes with plain ids (primary anchor)")
+  assert.ok(r.agents["temp1-fresh"], "creation hot-applies — the new pool materializes NAMESPACED (dir-basename ns)")
 })
 
 // ---------------------------------------------------------------------------
 // Multi-workspace hosts: namespaces, collisions, deterministic order
 
-test("same-id agents across workspaces stay collision-free (primary plain, other namespaced)", () => {
+test("same-id agents across workspaces stay collision-free (each under its own namespace)", () => {
   const fs = fakeFs()
   fs.setDir("C:/a", [".opencode"])
   fs.setDir("C:/a/.opencode", [{ name: "forge.json", dir: false }])
@@ -222,13 +250,14 @@ test("same-id agents across workspaces stay collision-free (primary plain, other
   fs.setDir("D:/b/.opencode", [{ name: "forge.json", dir: false }])
   fs.writeFile("D:/b/.opencode/forge.json", json({ pool: "teamb", agents: { coder: pinned } }))
   const r = resolverOn(fs).resolve(["C:/a", "D:/b"])
-  assert.ok(r.agents.coder, "the primary workspace's coder materializes as forge-coder")
-  assert.equal(r.agents.coder.file, "C:/a/.opencode/forge.json")
-  assert.ok(r.agents["teamb-coder"], "the other workspace's coder materializes as forge-teamb-coder — no silent overwrite")
+  assert.ok(r.agents["a-coder"], "the undeclared pool's coder materializes as forge-a-coder (dir-basename ns)")
+  assert.equal(r.agents["a-coder"].file, "C:/a/.opencode/forge.json")
+  assert.ok(r.agents["teamb-coder"], "the other workspace's coder materializes as forge-teamb-coder — no silent overwrite, no plain-id privilege")
+  assert.ok(!r.agents.coder, "no plain-id family exists")
   assert.deepEqual(r.findings, [])
 })
 
-test("undeclared non-primary pool derives its namespace from the sanitized pool-directory basename", () => {
+test("an undeclared pool derives its namespace from the sanitized pool-directory basename", () => {
   const fs = fakeFs()
   fs.setDir("C:/a", [".opencode"])
   fs.setDir("C:/a/.opencode", [{ name: "forge.json", dir: false }])
@@ -265,12 +294,12 @@ test("namespace collision: deterministic order, incrementing suffix, finding nam
   fs.setDir("D:/c/.opencode", [{ name: "forge.json", dir: false }])
   fs.writeFile("D:/c/.opencode/forge.json", json({ pool: "dev", agents: { coder: pinned } }))
   const r = resolverOn(fs).resolve(["C:/a", "C:/b", "D:/c"])
-  assert.ok(r.agents["dev-coder"], "C:/b (first in lex order among non-primary) keeps the short ns")
+  assert.ok(r.agents["dev-coder"], "C:/b (first in lex order among the dev declarers) keeps the short ns")
   assert.ok(r.agents["dev-2-coder"], "D:/c gets the incrementing suffix")
   assert.ok(r.findings.some((f) => f.code === "pool-namespace-collision" && f.level === "error" && /C:\/b/.test(f.message) && /D:\/c/.test(f.message)))
 })
 
-test("deterministic order: primary first, then lexicographic by absolute file path", () => {
+test("deterministic order: PURELY lexicographic by absolute pool-file path (no primary-first anymore)", () => {
   const fs = fakeFs()
   for (const base of ["D:/z", "D:/b"]) {
     fs.setDir(base, [".opencode"])
@@ -280,32 +309,63 @@ test("deterministic order: primary first, then lexicographic by absolute file pa
   fs.setDir("C:/a", [".opencode"])
   fs.setDir("C:/a/.opencode", [{ name: "forge.json", dir: false }])
   fs.writeFile("C:/a/.opencode/forge.json", json({ agents: { research: pinned } }))
-  const r = resolverOn(fs).resolve(["C:/a", "D:/z", "D:/b"])
-  assert.deepEqual(
-    r.families.map((f) => f.file),
-    ["C:/a/.opencode/forge.json", "D:/b/.opencode/forge.json", "D:/z/.opencode/forge.json"],
-    "primary anchor's pool first, the rest sorted by path",
-  )
+  // The FIRST anchor is C:/a — under the old primary rule it would lead;
+  // pure lexicographic order puts it there anyway here, so ALSO probe the
+  // inverse: leading with D:/z must not promote it.
+  for (const anchors of [["C:/a", "D:/z", "D:/b"], ["D:/z", "D:/b", "C:/a"]]) {
+    const r = resolverOn(fs).resolve(anchors)
+    assert.deepEqual(
+      r.families.map((f) => f.file),
+      ["C:/a/.opencode/forge.json", "D:/b/.opencode/forge.json", "D:/z/.opencode/forge.json"],
+      "family order is the path sort, identical regardless of anchor order",
+    )
+  }
 })
 
-test("cross-family materialized-id collision: earlier pool wins, later skipped with a finding", () => {
+test("host-history independence: opposite anchor-initialization orders produce IDENTICAL materialized id sets", () => {
   const fs = fakeFs()
   fs.setDir("C:/a", [".opencode"])
   fs.setDir("C:/a/.opencode", [{ name: "forge.json", dir: false }])
-  fs.writeFile("C:/a/.opencode/forge.json", json({ agents: { research: pinned } }))
+  fs.writeFile("C:/a/.opencode/forge.json", json({ pool: "nsa", agents: { coder: pinned, research: pinned } }))
   fs.setDir("D:/b", [".opencode"])
   fs.setDir("D:/b/.opencode", [{ name: "forge.json", dir: false }])
-  // ns "aa" + id "shader" composes aa-shader…
-  fs.writeFile("D:/b/.opencode/forge.json", json({ pool: "aa", agents: { shader: pinned } }))
-  fs.setDir("E:/c", [".opencode"])
-  fs.setDir("E:/c/.opencode", [{ name: "forge.json", dir: false }])
-  // …which the primary pool also defines as a literal id.
-  fs.writeFile("E:/c/.opencode/forge.json", json({ agents: { research: pinned, "aa-shader": pinned } }))
-  const r = resolverOn(fs).resolve(["E:/c", "D:/b", "C:/a"])
-  assert.ok(r.agents["aa-shader"], "the earlier pool's id materializes")
-  assert.equal(r.agents["aa-shader"].file, "E:/c/.opencode/forge.json", "the pool earlier in resolution order wins")
-  assert.equal(r.families.find((f) => f.file === "D:/b/.opencode/forge.json").materializedIds.length, 0, "the colliding namespaced agent is skipped")
-  assert.ok(r.findings.some((f) => f.code === "materialized-id-collision" && f.level === "error"))
+  fs.writeFile("D:/b/.opencode/forge.json", json({ pool: "nsb", agents: { coder: pinned } }))
+  fs.setDir("C:/home/.config/opencode", [{ name: "forge.json", dir: false }])
+  fs.writeFile("C:/home/.config/opencode/forge.json", json({ agents: { universal: pinned } }))
+  // Two independent hosts (fresh resolvers) that saw the same two
+  // workspaces in OPPOSITE orders — ids must be byte-identical.
+  const host1 = resolverOn(fs).resolve(["C:/a", "D:/b"])
+  const host2 = resolverOn(fs).resolve(["D:/b", "C:/a"])
+  assert.deepEqual(Object.keys(host1.agents).sort(), Object.keys(host2.agents).sort())
+  assert.deepEqual(Object.keys(host1.agents).sort(), ["global-universal", "nsa-coder", "nsa-research", "nsb-coder"])
+  assert.deepEqual(
+    host1.families.map((f) => `${f.ns}:${f.file}`),
+    host2.families.map((f) => `${f.ns}:${f.file}`),
+    "family ns assignment is order-independent too",
+  )
+})
+
+test("cross-family materialized-id collision: earlier file in PATH order wins, later skipped with a finding — deterministically", () => {
+  const fs = fakeFs()
+  fs.setDir("C:/a", [".opencode"])
+  fs.setDir("C:/a/.opencode", [{ name: "forge.json", dir: false }])
+  // ns "aa" + id "b-shader" composes aa-b-shader…
+  fs.writeFile("C:/a/.opencode/forge.json", json({ pool: "aa", agents: { "b-shader": pinned } }))
+  fs.setDir("D:/b", [".opencode"])
+  fs.setDir("D:/b/.opencode", [{ name: "forge.json", dir: false }])
+  // …which D:/b ALSO produces: ns "aa-b" + id "shader". Distinct namespaces
+  // ("aa" vs "aa-b" — no ns collision), one composed materialized id.
+  fs.writeFile("D:/b/.opencode/forge.json", json({ pool: "aa-b", agents: { shader: pinned, research: pinned } }))
+  // Path order is C:/a < D:/b, so C:/a's composed id wins and D:/b's is
+  // skipped — regardless of anchor order.
+  for (const anchors of [["D:/b", "C:/a"], ["C:/a", "D:/b"]]) {
+    const r = resolverOn(fs).resolve(anchors)
+    assert.ok(r.agents["aa-b-shader"], "the materialized id exists exactly once")
+    assert.equal(r.agents["aa-b-shader"].file, "C:/a/.opencode/forge.json", "the pool earlier in LEXICOGRAPHIC PATH order wins (not anchor order)")
+    const dFam = r.families.find((f) => f.file === "D:/b/.opencode/forge.json")
+    assert.deepEqual(dFam.materializedIds, ["aa-b-research"], "the colliding agent is skipped; the family's sibling still applies")
+    assert.ok(r.findings.some((f) => f.code === "materialized-id-collision" && f.level === "error" && /C:\/a/.test(f.message) && /D:\/b/.test(f.message)), "the finding names both files")
+  }
 })
 
 test("broken pool file empties only its own family; parse location rides the finding", () => {
@@ -317,7 +377,7 @@ test("broken pool file empties only its own family; parse location rides the fin
   fs.setDir("D:/b/.opencode", [{ name: "forge.json", dir: false }])
   fs.writeFile("D:/b/.opencode/forge.json", "{ broken")
   const r = resolverOn(fs).resolve(["C:/a", "D:/b"])
-  assert.ok(r.agents.research, "the healthy pool still materializes")
+  assert.ok(r.agents["a-research"], "the healthy pool still materializes")
   const broken = r.families.find((f) => f.file === "D:/b/.opencode/forge.json")
   assert.deepEqual(broken.materializedIds, [], "the broken pool contributes no agents")
   assert.ok(r.findings.some((f) => f.code === "config-parse-error" && /line \d+/.test(f.message) && /D:\/b/.test(f.message)))
@@ -370,22 +430,23 @@ const taskArgs = (target) => ({ args: { subagent_type: target, prompt: "x" } })
 // paths may differ in case — compare folded.
 const foldP = (p) => p.replaceAll("/", "\\").toLowerCase()
 
-test("wiring shared host: both workspaces' pools materialize; session-domain gate matrix", async (t) => {
-  const dirA = dirWithForgeJson(t, "forge-pool-a-", { agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+test("wiring shared host: both workspaces' pools materialize NAMESPACED; session-domain gate matrix", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-a-", { pool: "teama", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
   const dirB = dirWithForgeJson(t, "forge-pool-b-", { pool: "teamb", agents: { shader: { model: "zai/glm", thoughtLevel: "low" } } })
   const hA = await startServer(input(dirA), {})
   t.after(() => hA.dispose?.())
   const cfgA = emptyCfg()
   await hA.config(cfgA)
-  assert.ok(cfgA.agent["forge-research"], "workspace A's pool materializes with plain ids (primary)")
+  assert.ok(cfgA.agent["forge-teama-research"], "workspace A's pool materializes NAMESPACED (forge-<ns>-<id>)")
+  assert.equal(cfgA.agent["forge-research"], undefined, "no plain-id agent is registered")
 
   // Shared host re-initializes in workspace B — its pool JOINS the
-  // materialization set (namespaced), A's survives.
+  // materialization set, A's survives with the SAME namespaced ids.
   const hB = await server(input(dirB), {})
   t.after(() => hB.dispose?.())
   const cfgB = emptyCfg()
   await hB.config(cfgB)
-  assert.ok(cfgB.agent["forge-research"], "workspace A's agents SURVIVE the flip")
+  assert.ok(cfgB.agent["forge-teama-research"], "workspace A's agents SURVIVE the flip with identical namespaced ids")
   assert.ok(cfgB.agent["forge-teamb-shader"], "workspace B's pool materializes NAMESPACED")
 
   // Dispatch gate matrix.
@@ -395,7 +456,7 @@ test("wiring shared host: both workspaces' pools materialize; session-domain gat
   const aJson = join(dirA, ".opencode", "forge.json")
 
   // own-pool dispatch passes both ways
-  await hB["tool.execute.before"]({ tool: "task", sessionID: "ses_a", callID: "g1" }, taskArgs("forge-research"))
+  await hB["tool.execute.before"]({ tool: "task", sessionID: "ses_a", callID: "g1" }, taskArgs("forge-teama-research"))
   await hB["tool.execute.before"]({ tool: "task", sessionID: "ses_b", callID: "g2" }, taskArgs("forge-teamb-shader"))
 
   // cross-workspace dispatch refuses with the verbatim anchor + origin path + exits
@@ -412,7 +473,7 @@ test("wiring shared host: both workspaces' pools materialize; session-domain gat
     },
   )
   await assert.rejects(
-    () => hB["tool.execute.before"]({ tool: "task", sessionID: "ses_b", callID: "g4" }, taskArgs("forge-research")),
+    () => hB["tool.execute.before"]({ tool: "task", sessionID: "ses_b", callID: "g4" }, taskArgs("forge-teama-research")),
     (err) => {
       const m = String(err)
       assert.match(m, /not dispatchable from this session/)
@@ -421,11 +482,24 @@ test("wiring shared host: both workspaces' pools materialize; session-domain gat
     },
   )
 
-  // Unknown session anchor (never observed): fail-open belt posture.
-  await hB["tool.execute.before"]({ tool: "task", sessionID: "ses_unbound", callID: "g5" }, taskArgs("forge-research"))
+  // Unknown session anchor (never observed): fail-open belt posture + the
+  // bounded disclosure (plugin.ts console.warn — the "could not be
+  // established" wording). Tight console.warn stub around the call.
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => warns.push(args.map(String).join(" "))
+  try {
+    await hB["tool.execute.before"]({ tool: "task", sessionID: "ses_unbound", callID: "g5" }, taskArgs("forge-teama-research"))
+  } finally {
+    console.warn = origWarn
+  }
+  assert.equal(warns.length, 1, "exactly one disclosure for the unknown anchor (bounded once-per-session)")
+  assert.match(warns[0], /\[forge:pool\] session ses_unbound/, "names the session")
+  assert.match(warns[0], /could not be established/, "the could-not-be-established wording")
+  assert.match(warns[0], /fail-open belt posture/, "the disclosed posture")
 })
 
-test("wiring gate: a poolless session falls back to the global layer — workspace pools stay gated", async (t) => {
+test("wiring gate: a poolless session falls back to the global layer (forge-global-*) — workspace pools stay gated", async (t) => {
   const home = process.env.FORGE_TEST_FORGE_HOME
   mkdirSync(join(home, ".config", "opencode"), { recursive: true })
   writeFileSync(join(home, ".config", "opencode", "forge.json"), JSON.stringify({ agents: { universal: { model: "zai/glm", thoughtLevel: "low" } } }))
@@ -434,7 +508,7 @@ test("wiring gate: a poolless session falls back to the global layer — workspa
       rmSync(join(home, ".config"), { recursive: true, force: true })
     } catch {}
   })
-  const dirA = dirWithForgeJson(t, "forge-pool-fb-", { agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const dirA = dirWithForgeJson(t, "forge-pool-fb-", { pool: "fba", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
   const poolless = mkdtempSync(join(tmpdir(), "forge-pool-none-"))
   t.after(() => {
     try {
@@ -443,20 +517,22 @@ test("wiring gate: a poolless session falls back to the global layer — workspa
   })
   const h = await startServer(input(dirA), {})
   t.after(() => h.dispose?.())
-  await h.config(emptyCfg())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  assert.ok(cfg.agent["forge-global-universal"], "the global fallback family materializes as forge-global-*")
   await bindSession(h, "ses_fb_none", poolless)
   // Global fallback dispatchable from the poolless session…
-  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_fb_none", callID: "fb1" }, taskArgs("forge-universal"))
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_fb_none", callID: "fb1" }, taskArgs("forge-global-universal"))
   // …but the workspace pool is NOT (fallback, not merge — the roster is the
-  // global layer, and forge-research belongs to another workspace).
+  // global layer, and forge-fba-research belongs to another workspace).
   await assert.rejects(
-    () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_fb_none", callID: "fb2" }, taskArgs("forge-research")),
+    () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_fb_none", callID: "fb2" }, taskArgs("forge-fba-research")),
     /not dispatchable from this session/,
   )
   // The workspace session can dispatch its own pool but not the global
   // fallback family (its workspace HAS a pool — global is not merged in).
   await bindSession(h, "ses_fb_a", dirA)
-  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_fb_a", callID: "fb3" }, taskArgs("forge-research"))
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_fb_a", callID: "fb3" }, taskArgs("forge-fba-research"))
   await assert.rejects(
     () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_fb_a", callID: "fb4" }, taskArgs("forge-global-universal")),
     /not dispatchable from this session/,
@@ -464,20 +540,20 @@ test("wiring gate: a poolless session falls back to the global layer — workspa
 })
 
 test("wiring deletion: removing a workspace pool file un-materializes it at the next config hook", async (t) => {
-  const dirA = dirWithForgeJson(t, "forge-pool-del-", { agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const dirA = dirWithForgeJson(t, "forge-pool-del-", { pool: "delpool", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
   const h = await startServer(input(dirA), {})
   t.after(() => h.dispose?.())
   const cfg1 = emptyCfg()
   await h.config(cfg1)
-  assert.ok(cfg1.agent["forge-research"])
+  assert.ok(cfg1.agent["forge-delpool-research"])
   rmSync(join(dirA, ".opencode", "forge.json"))
   const cfg2 = emptyCfg()
   await h.config(cfg2)
-  assert.equal(cfg2.agent["forge-research"], undefined, "a deleted pool file disappears from materialization (no zombie pool)")
+  assert.equal(cfg2.agent["forge-delpool-research"], undefined, "a deleted pool file disappears from materialization (no zombie pool)")
 })
 
 test("wiring roster: the /crew template session-scopes the roster (own pool via live injection; others NOT dispatchable)", async (t) => {
-  const dirA = dirWithForgeJson(t, "forge-pool-ro-", { agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const dirA = dirWithForgeJson(t, "forge-pool-ro-", { pool: "teama", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
   const dirB = dirWithForgeJson(t, "forge-pool-ro2-", { pool: "teamb", agents: { shader: { model: "zai/glm", thoughtLevel: "low" } } })
   const h = await startServer(input(dirA), {})
   t.after(() => h.dispose?.())
@@ -489,14 +565,16 @@ test("wiring roster: the /crew template session-scopes the roster (own pool via 
   assert.match(tpl, /nearest \.opencode\/forge\.json walking up from this session's worktree/, "the ownership rule")
   assert.match(tpl, /global fallback/, "the global fallback layer is named with its path")
   assert.match(tpl, /NOT dispatchable from this session/, "every other host pool is marked with the verbatim anchor")
+  assert.match(tpl, /pool teamb \(forge-teamb-\*\)/, "the family label renders the namespaced form (the primary-label branch is dead at runtime)")
+  assert.ok(!tpl.includes("primary pool"), "no primary-pool label remains")
   assert.ok(foldP(tpl).includes(foldP(join(dirB, ".opencode", "forge.json"))), "the other pool's origin path rides the mark")
-  assert.match(tpl, /forge-research/)
+  assert.match(tpl, /forge-teama-research/)
   assert.match(tpl, /forge-teamb-shader/)
   assert.match(tpl, /nested deeper in the workspace subtree are ignored/, "nested-ignore strictness disclosed")
 })
 
 test("wiring crew_begin: the registration output session-scopes the dispatchable roster", async (t) => {
-  const dirA = dirWithForgeJson(t, "forge-pool-cb-", { agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const dirA = dirWithForgeJson(t, "forge-pool-cb-", { pool: "teama", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
   const dirB = dirWithForgeJson(t, "forge-pool-cb2-", { pool: "teamb", agents: { shader: { model: "zai/glm", thoughtLevel: "low" } } })
   const h = await startServer(input(dirA), {})
   t.after(() => h.dispose?.())
@@ -506,7 +584,9 @@ test("wiring crew_begin: the registration output session-scopes the dispatchable
   assert.match(out.output, /Session roster origins — sole ownership/, "the session-scoped roster header")
   assert.match(out.output, /DISPATCHABLE from this session — workspace pool: [^\n]*forge\.json/, "the session's own pool leads, with origin path")
   assert.ok(foldP(out.output).includes(foldP(join(dirA, ".opencode", "forge.json"))))
-  assert.match(out.output, /NOT dispatchable from this session — pool teamb/, "other pools marked with the verbatim anchor")
+  assert.match(out.output, /forge-teama-research/, "own agents render with namespaced ids")
+  assert.match(out.output, /NOT dispatchable from this session — pool teamb/, "other pools marked with the verbatim anchor + namespaced label")
+  assert.ok(!out.output.includes("primary pool"), "no primary-pool label remains")
   assert.ok(foldP(out.output).includes(foldP(join(dirB, ".opencode", "forge.json"))), "the other pool's origin path rides the mark")
   await h.tool.crew_close.execute({ abandon: true, reason: "test" }, allowCtx("ses_cb"))
 })
@@ -522,4 +602,170 @@ test("wiring anchors(): normalized, deduped; resetAnchors simulates a host resta
   assert.equal(h.__forgeSubagentsTest.anchors().length, 1, "case/slash variants fold into one anchor")
   h.__forgeSubagentsTest.resetAnchors()
   assert.equal(h.__forgeSubagentsTest.anchors().length, 0, "reset = honest host restart")
+})
+
+// ---------------------------------------------------------------------------
+// Crew-governed dispatch pool-compliance gate (change pool-namespace-contract,
+// spec: crew-harness — "Crew-governed dispatch pool-compliance gate"): the 7
+// spec scenarios as a wiring matrix. crew_begin pre-flight + the
+// tool.execute.before belt share one predicate (poolFileCompliance) and one
+// refusal copy; global-fallback sessions are exempt; per-agent fail-soft
+// findings never block; the session-domain pool gate outranks the belt.
+
+const cmCtx = (sid, dir) => ({ ...allowCtx(sid), worktree: dir, directory: dir })
+const register = async (h, sid, dir, objective = "compliance matrix") =>
+  h.tool.crew_begin.execute({ objective, subtasks: [{ title: "one" }] }, cmCtx(sid, dir))
+const armWaves = (h, sid, dir) => h.tool.crew_begin.execute({ execution: "waves" }, cmCtx(sid, dir))
+
+test("compliance (a): crew_begin REFUSES a pool-less-declared forge.json — no record, no PENDING crew, fix copy names file + suggested ns + hot-apply", async (t) => {
+  const dir = dirWithForgeJson(t, "forge-pool-cm1-", { agents: { research: pinned } }) // NO pool field
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const poolFile = join(dir, ".opencode", "forge.json")
+  await assert.rejects(
+    () => register(h, "ses_cm1", dir),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /Pool compliance refused/, "the compliance refusal lead")
+      assert.ok(foldP(m).includes(foldP(poolFile)), "names the session's pool file path")
+      assert.match(m, /missing top-level pool field/, "the violation text (missing vs invalid)")
+      assert.match(m, /Minimal fix: add or repair the top-level "pool": "[a-z0-9-]+"/, "the minimal fix with a suggested namespace")
+      assert.match(m, /REQUIRED for crew-governed dispatch/, "the field's crew-gate role")
+      assert.match(m, /no host restart/, "the hot-apply lift")
+      return true
+    },
+  )
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_cm1"), undefined, "no PENDING crew exists")
+  assert.equal(existsSync(join(dir, ".opencode", "crew")), false, "no crew record was written")
+  // Hot-apply lift: repairing the file admits registration on the NEXT
+  // resolve — no restart, no re-init.
+  writeFileSync(poolFile, JSON.stringify({ pool: "cmone", agents: { research: pinned } }))
+  const out = await register(h, "ses_cm1", dir)
+  assert.match(out.output, /registered PENDING/, "repair admits registration hot-apply")
+})
+
+test("compliance (b): an INVALID pool value is refused identically (missing-vs-invalid distinction kept)", async (t) => {
+  const dir = dirWithForgeJson(t, "forge-pool-cm2-", { pool: "Aa Team!", agents: { research: pinned } })
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  // The family still materializes (warn finding + directory-name fallback)…
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  assert.ok(Object.keys(cfg.agent).some((id) => id.startsWith("forge-") && id.endsWith("-research")), "the family materializes under the fallback ns")
+  // …but crew registration waits for a valid declared value.
+  await assert.rejects(
+    () => register(h, "ses_cm2", dir),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /Pool compliance refused/)
+      assert.ok(foldP(m).includes(foldP(join(dir, ".opencode", "forge.json"))))
+      assert.match(m, /invalid top-level pool field "Aa Team!"/, "the violation text names the invalid value")
+      assert.match(m, /Minimal fix: add or repair the top-level "pool": "[a-z0-9-]+"/)
+      return true
+    },
+  )
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_cm2"), undefined, "no PENDING crew exists")
+})
+
+test("compliance (c): a compliant pool registers normally (the gate does not fire again)", async (t) => {
+  const dir = dirWithForgeJson(t, "forge-pool-cm3-", { pool: "plugindev", agents: { research: pinned } })
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await register(h, "ses_cm3", dir)
+  assert.match(out.output, /registered PENDING/)
+  const crew = h.__forgeSubagentsTest.crews().get("ses_cm3")
+  assert.ok(crew, "record written + PENDING crew per the execution-mode gate")
+  assert.equal(crew.mode, "pending")
+})
+
+test("compliance (d): mid-crew degradation blocks further crew dispatches; native tasks unaffected; repair lifts hot-apply", async (t) => {
+  const dir = dirWithForgeJson(t, "forge-pool-cm4-", { pool: "midcrew", agents: { research: pinned } })
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await register(h, "ses_cm4", dir)
+  await armWaves(h, "ses_cm4", dir)
+  assert.equal(h.__forgeSubagentsTest.crews().get("ses_cm4").mode, "executing")
+  const poolFile = join(dir, ".opencode", "forge.json")
+  // Degradation: the pool field is removed while the crew EXECUTES.
+  writeFileSync(poolFile, JSON.stringify({ agents: { research: pinned } }))
+  await assert.rejects(
+    () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_cm4", callID: "cm1" }, taskArgs("forge-midcrew-research")),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /Pool compliance refused/, "the belt re-runs the file-level check")
+      assert.match(m, /missing top-level pool field/)
+      assert.match(m, /no host restart/, "the hot-apply lift rides the belt copy")
+      return true
+    },
+  )
+  // Native (non-forge) task targets from the same session are unaffected.
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_cm4", callID: "cm2" }, taskArgs("general"))
+  // Repair: the next dispatch flows with no restart.
+  writeFileSync(poolFile, JSON.stringify({ pool: "midcrew", agents: { research: pinned } }))
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_cm4", callID: "cm3" }, taskArgs("forge-midcrew-research"))
+})
+
+test("compliance (e): a global-fallback session is EXEMPT — the gate never fires", async (t) => {
+  const home = process.env.FORGE_TEST_FORGE_HOME
+  mkdirSync(join(home, ".config", "opencode"), { recursive: true })
+  // The global layer deliberately declares NO pool field: the fixed `global`
+  // namespace carries no rename risk and needs no declared field.
+  writeFileSync(join(home, ".config", "opencode", "forge.json"), JSON.stringify({ agents: { universal: pinned } }))
+  t.after(() => {
+    try {
+      rmSync(join(home, ".config"), { recursive: true, force: true })
+    } catch {}
+  })
+  const poolless = mkdtempSync(join(tmpdir(), "forge-pool-cm5-"))
+  t.after(() => {
+    try {
+      rmSync(poolless, { recursive: true, force: true })
+    } catch {}
+  })
+  const h = await startServer(input(poolless), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await register(h, "ses_cm5", poolless)
+  assert.match(out.output, /registered PENDING/, "registration proceeds — no workspace pool, no compliance check")
+  await armWaves(h, "ses_cm5", poolless)
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_cm5", callID: "cm5" }, taskArgs("forge-global-universal"))
+})
+
+test("compliance (f): per-agent fail-soft findings never block — valid pool + one half-configured entry registers and dispatches", async (t) => {
+  const dir = dirWithForgeJson(t, "forge-pool-cm6-", { pool: "softfail", agents: { research: pinned, broken: { thoughtLevel: "low" } } })
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  assert.ok(cfg.agent["forge-softfail-research"], "the good entry materializes")
+  assert.equal(cfg.agent["forge-softfail-broken"], undefined, "the half-configured entry is skipped (existing fail-soft semantics)")
+  const out = await register(h, "ses_cm6", dir)
+  assert.match(out.output, /registered PENDING/, "the FILE is compliant — the crew proceeds")
+  await armWaves(h, "ses_cm6", dir)
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_cm6", callID: "cm6" }, taskArgs("forge-softfail-research"))
+})
+
+test("compliance (g): the session-domain pool gate outranks the compliance belt — cross-pool refusals keep their copy", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-cm7a-", { pool: "gatea", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-cm7b-", { pool: "gateb", agents: { shader: pinned } })
+  const h = await startServer(input(dirA), {})
+  t.after(() => h.dispose?.())
+  await server(input(dirB), {}) // shared host: both pools materialize
+  await h.config(emptyCfg())
+  await register(h, "ses_cm7", dirA) // dirA's pool is COMPLIANT
+  await armWaves(h, "ses_cm7", dirA)
+  await assert.rejects(
+    () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_cm7", callID: "cm7" }, taskArgs("forge-gateb-shader")),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /not dispatchable from this session/, "the pool-gate refusal copy")
+      assert.ok(foldP(m).includes(foldP(join(dirB, ".opencode", "forge.json"))), "the target's origin pool path")
+      assert.doesNotMatch(m, /Pool compliance refused/, "the compliance belt never rewrites or masks a cross-pool refusal")
+      return true
+    },
+  )
 })

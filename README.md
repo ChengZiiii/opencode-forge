@@ -189,7 +189,7 @@ What this plugin touches, exhaustively:
 | `<project>/.opencode/plan/*.md` | plan files | user data — kept forever, uninstall never deletes |
 | `<project>/.opencode/goal/*.md` | goal files (contract, Check Log, Turn Ledger) | user data — kept forever, uninstall never deletes |
 | `<project>/.opencode/crew/*.md` | crew records (declared plan + arm/convert/abandon/close history; written at `crew_begin` registration, appended at each transition; record-only — never a resume mechanism) | user data — kept forever, uninstall never deletes |
-| merged config object (RAM only) | forge agent, static `forge-<id>` subagents, tool-partition injections (forge family shell hide, non-forge forge-tool hide, native build/plan/general/explore minimal entries), `command.plan`, `command.goal`, `command.crew`, goal permission keys, `permission.forge_shell`, `permission.crew_close` | vanishes when the plugin is removed; nothing is written to disk |
+| merged config object (RAM only) | forge agent, static `forge-<ns>-<id>` subagents (every pool family namespaced; the global fallback family `forge-global-<id>`), tool-partition injections (forge family shell hide, non-forge forge-tool hide, native build/plan/general/explore minimal entries), `command.plan`, `command.goal`, `command.crew`, goal permission keys, `permission.forge_shell`, `permission.crew_close` | vanishes when the plugin is removed; nothing is written to disk |
 | `<tmp>/opencode-forge/jobs/<jobId>.log` | job output tee (full output; oldest rotated out above 50 files) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
@@ -417,8 +417,10 @@ complete.
 Forge subagents are **static, user-authored worker agents**: each forge.json
 entry is either **pinned** (a model + a reasoning depth, bound at
 materialization) or an **Auto worker** (no model — it inherits the parent
-session's model at dispatch), materializes as a native `forge-<id>`
-subagent, and is dispatched through the host's **native `task`
+session's model at dispatch), materializes as a native `forge-<ns>-<id>`
+subagent — EVERY pool family is namespaced, no exceptions (see
+*Pools on a shared host* below) — and is dispatched through the host's
+**native `task`
 tool** — which means every run is visible in the TUI, expandable and
 monitorable, exactly like any native subagent. There is no dispatch tool, no
 child-session engine, and no configuration invitation anywhere: the session
@@ -461,12 +463,23 @@ directory it was initialized in, and the **host-wide materialization set**
 is the global layer plus each seen workspace's pool (one pool per
 directory: its walk-up nearest file). Pool membership is re-derived from
 disk truth on every resolve — a deleted pool file disappears at the next
-config hook. The FIRST seen workspace's pool keeps **plain `forge-<id>`
-ids** (a single-project host is unchanged); every other pool materializes
-**namespaced** as `forge-<ns>-<id>` (`ns` = the file's optional `pool`
-field, else the sanitized pool-directory name; the global fallback family
-derives `global`). Namespace and materialized-id collisions resolve
-deterministically with an error finding, never by silent shadowing.
+config hook. EVERY pool family materializes **namespaced** as
+`forge-<ns>-<id>` (`ns` = the file's declared top-level `pool` field, else
+the sanitized pool-directory basename); the **global fallback layer
+materializes under the fixed namespace `global`** as `forge-global-<id>`.
+**No family gets plain ids anywhere** — a materialized id is identical on
+every host regardless of the order workspaces were initialized in, so crew
+plans, rosters, and muscle memory transfer between hosts. Pool resolution
+order is deterministic — families ordered lexicographically by absolute
+pool-file path — and that same order governs cross-family materialized-id
+collisions: the earlier pool's agent wins, the colliding later agent is
+skipped with an error finding naming both files. Every materialized agent's
+task-vocabulary **description carries its pool provenance**: its namespace,
+its origin forge.json path, and — for every family except the global
+fallback — that it is dispatchable only from sessions whose workspace pool
+is that file; the global family names the global fallback layer as its
+origin. The same static text ships to every session — the dispatch gate
+(below) is the dynamic authority, the description is the honest label.
 
 **Dispatch is gated to the session's own pool.** Materializing every pool
 host-wide is a vocabulary necessity (the task tool's agent list is
@@ -492,18 +505,23 @@ a host re-initialization in that workspace materializes it (or move the
 agents into the global layer).
 
 **Id naming**: use plain role words (`research`, `coder`, …) — the plugin
-materializes every id as `forge-<id>` itself (namespaced pools:
-`forge-<ns>-<id>`). A `forge-`-prefixed id in the file would double up
-(`forge-coder` → agent `forge-forge-coder`); the loader auto-strips the
+materializes every id as `forge-<ns>-<id>` under its family's namespace
+(never a plain `forge-<id>`; pool-less workspaces get the fixed `global`
+namespace). A `forge-`-prefixed id in the file would double up
+(`forge-coder` → agent `forge-<ns>-forge-coder`); the loader auto-strips the
 prefix (all repetitions) with a warning so existing files keep working, but
 rename the entries to silence it. The namespace infix is never parsed back
 out of a materialized id.
 
 ```jsonc
 {
-  // non-primary pool files: namespace for this pool's ids (forge-<ns>-<id>).
+  // namespace for this pool's ids (forge-<ns>-<id> — EVERY pool is
+  // namespaced; declare it instead of riding the directory name).
   // Short, stable, [a-z0-9-] up to 24 chars — ids survive directory renames.
-  // Invalid values degrade to a warning + the directory-derived namespace.
+  // REQUIRED for crew-governed dispatch (the /crew compliance gate: no
+  // valid declared `pool` → `crew_begin` refuses and crew `forge-*`
+  // dispatches are blocked until the field is added). Invalid values
+  // degrade to a warning + the directory-derived namespace.
   // "pool": "aa",
   "agents": {
     // PINNED worker: model + thoughtLevel form an ATOMIC PAIR — set BOTH
@@ -551,8 +569,11 @@ A rejected entry costs only itself — its siblings materialize normally.
   Findings surface in the plugin diagnostics log.
 - **`depths` is deprecated**: the array is ignored with a warning finding.
   Pin ONE `thoughtLevel` per agent instead.
-- Each agent materializes as `forge-<id>` — a subagent-mode agent visible in
-  the task tool's vocabulary (never hidden), carrying the pinned `model`
+- Each agent materializes as `forge-<ns>-<id>` — a subagent-mode agent
+   visible in the task tool's vocabulary (never hidden), whose description
+   names its **pool provenance** (namespace + origin forge.json path +
+   dispatchability scope; the global family names the global fallback
+   layer), carrying the pinned `model`
   (pinned workers) or NO model key at all (Auto workers — the description
   says "inherits the parent session's model" instead of naming a brain),
   the worker discipline (workspace-relative paths only, verbatim reporting
@@ -575,6 +596,28 @@ A rejected entry costs only itself — its siblings materialize normally.
 > error finding naming the missing half. Fix per entry: add the missing
 > `thoughtLevel`, or delete `model` to make it an Auto worker.
 
+> **BREAKING — every materialized id is now namespaced.** The
+> first-registered pool's plain-id privilege is gone: existing plain ids
+> (`forge-coder`) no longer exist, and there are **no compat aliases** —
+> deliberately, because an alias layer would resurrect the two-ids-one-agent
+> ambiguity this change kills (crew records and docs referencing old ids
+> are history artifacts). Migration:
+>
+> - **Single-pool workspaces**: add a short stable top-level `"pool"` field
+>   to your forge.json (`[a-z0-9-]`, 1–24 chars) and dispatch
+>   `forge-<pool>-<id>` from now on.
+> - **Pool-less workspaces** (global fallback roster): dispatch
+>   `forge-global-<id>` — the global layer materializes under the fixed
+>   namespace `global`.
+> - **New crew-governed pool-compliance gate**: `crew_begin` refuses to
+>   register, and every `task` dispatch of a `forge-*` worker from a
+>   crew-governed session is refused, while the workspace pool file lacks a
+>   valid declared top-level `pool` field. The fix is one line — add the
+>   field (the refusal suggests a namespace) — and the gate lifts
+>   hot-apply: the next resolve after the repair admits registration and
+>   dispatch with no host restart. Global-fallback sessions are exempt.
+>   Per-agent fail-soft findings never make the file non-compliant.
+
 **What applies when** — only a real materialization re-reads the pool
 files into the `forge-*` vocabulary. Materialization triggers (2026-10-01
 live finding): host boot (a freshly started CLI process reads the files as
@@ -586,7 +629,7 @@ opencode config file reloads. A NEW session on a long-lived shared host
 | --- | --- |
 | `thoughtLevel` on an existing agent | no (applies to NEW sessions of that agent; running sessions keep their frozen depth) — depth lookups resolve the pool files fresh at every dispatch, independent of materialization |
 | agent added / removed / edited, any pool file created or deleted | no restart — but not at the next session either: the materialized `forge-*` set rebuilds only at the next REAL materialization (host boot, opencode config reload, or a first config build); on a long-lived shared host pool changes wait for that rebuild or a restart. The crew gate, the session-domain dispatch gate, and depth lookups resolve the pool files fresh regardless — a DELETED pool file un-materializes at that next resolve |
-| a NEW directory joining the host (the first session of another project on the shared host) | no restart — that first config build itself re-initializes the plugin and registers that workspace and its pool (existing pools never flip; the first-seen workspace keeps plain ids) |
+| a NEW directory joining the host (the first session of another project on the shared host) | no restart — that first config build itself re-initializes the plugin and registers that workspace and its pool (existing pools never flip — every family namespaces by its own `pool` field or directory name, so ids never depend on arrival order) |
 
 ### Dispatching
 
@@ -725,10 +768,18 @@ requires a plan. The flow:
    alongside the choice — so you can verify the record really landed on
    disk (an earlier output order buried the path line, and the model
    reliably drops what it buries — leading with it is the fix). The
-   output then confirms the roster **grouped by pool with its origins**
-   (which forge.json families the dispatchable set materialized from, the
-   primary marked), presents the three execution-mode choices, and stops
-   the turn. Reconnaissance task calls are free BEFORE registration.
+    output then confirms the roster **grouped by pool with its origins**
+    (which forge.json families the dispatchable set materialized from —
+    every family rendered as `forge-<ns>-*`, no plain-id family),
+    presents the three execution-mode choices, and stops
+    the turn. Registration pre-flights **pool compliance**: the workspace
+    pool file must declare a valid top-level `pool` namespace — a
+    non-compliant file refuses the registration outright (see the BREAKING
+    note above; global-fallback sessions are exempt), and while a crew
+    governs the session every `forge-*` task dispatch re-checks the same
+    compliance (a file degraded mid-crew blocks further crew dispatches
+    until repaired — the fix is the one `"pool": "<suggested>"` line, and
+    it lifts hot-apply). Reconnaissance task calls are free BEFORE registration.
 2. **The pause is mechanical**: while the crew pends, every `task` dispatch is
    refused by an interception belt. The user chooses:
    - **supervised waves now** — `crew_begin {execution: "waves"}` lifts the

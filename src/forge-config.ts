@@ -594,28 +594,31 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
 // walk-up nearest file). Everything re-resolves per call through the mtime
 // caches — there is NO append-only anchor set: a pool file deleted from
 // disk disappears from materialization at the next resolve (deletion is
-// real, no zombie pools). The FIRST anchor's pool is the primary family
-// (plain ids); every other family materializes as <ns>-<id> where ns is
-// the file's `pool` field (fail-soft validated) else the sanitized pool
-// directory basename (the global fallback family derives "global").
-// Resolution order is deterministic: primary first, then lexicographic by
-// absolute file path — every collision rule keys off that order.
-// Everything here is data in, data out (fs injectable), same discipline
-// as the loader above.
+// real, no zombie pools). EVERY family materializes namespaced (change
+// pool-namespace-contract, design D1/D2): no plain-id privilege exists, so
+// a materialized id is identical on every host regardless of the order
+// workspaces were initialized in (host-history independence). Resolution
+// order is PURELY lexicographic by absolute pool-file path (codepoint
+// compare, global fallback file included in the sort) — anchor arrival
+// order influences neither ids nor collision winners. Each family's ns is
+// its declared `pool` field (fail-soft validated) else the sanitized pool
+// directory basename; the global fallback file's ns is the FIXED "global"
+// (design D2 — one rule, zero exceptions): a declared `pool` field on the
+// global file is IGNORED with a warn finding. Everything here is data in, data out (fs injectable), same
+// discipline as the loader above.
 // ---------------------------------------------------------------------------
 
 export type PoolFamilyOrigin = {
   // Absolute forge.json path — the pool's identity.
   file: string
-  // Null on the primary anchor's pool (plain ids); the namespace of every
-  // other family (declared `pool` field, else sanitized pool-dir basename —
-  // "global" for the global fallback file — disambiguated with an
-  // incrementing suffix on collision).
-  ns: string | null
+  // The family's namespace (declared `pool` field, else sanitized pool-dir
+  // basename; the global fallback file carries the FIXED "global" — its
+  // declared field, if any, is ignored) — disambiguated with
+  // an incrementing suffix on collision). Every family carries one; there
+  // is no plain-id family (change pool-namespace-contract D1/D2).
+  ns: string
   // The file's declared `pool` field as written (null when absent).
   declaredPool: string | null
-  // True only for the primary anchor's pool.
-  primary: boolean
   // Materialized ids (without the `forge-` prefix) this pool contributes
   // after cross-family collision resolution.
   materializedIds: string[]
@@ -625,7 +628,7 @@ export type MaterializedPoolAgent = {
   // Materialized id WITHOUT the `forge-` prefix (e.g. "aa-shader").
   materializedId: string
   def: ForgeAgentDef
-  ns: string | null
+  ns: string
   file: string
 }
 
@@ -658,6 +661,25 @@ export function validatePoolField(v: unknown): { ok: true; ns: string } | { ok: 
   const trimmed = v.trim()
   if (trimmed.length < 1 || trimmed.length > 24 || !/^[a-z0-9-]+$/.test(trimmed)) return { ok: false }
   return { ok: true, ns: trimmed }
+}
+
+// File-level pool compliance predicate (change pool-namespace-contract,
+// design D4): a pool file is COMPLIANT iff its parsed top-level object
+// declares a VALID `pool` field (the exact validatePoolField semantics:
+// string, [a-z0-9-], 1–24 chars after trim). This is a FILE contract, not
+// a per-agent one — agent-entry fail-soft findings never affect it (a
+// pool with a valid `pool` but half-broken agents is still compliant; the
+// per-agent findings ride their own channels). Pure data-in/data-out: the
+// caller feeds the PARSED top level (undefined/non-object ⇒ missing).
+export function poolFileCompliance(top: unknown): { compliant: boolean; violation: string } {
+  const pool = isRecord(top) ? top.pool : undefined
+  if (pool === undefined || pool === null) {
+    return { compliant: false, violation: 'missing top-level pool field — declare "pool": "<namespace>" ([a-z0-9-], 1-24 chars) to make this file crew-compliant' }
+  }
+  if (!validatePoolField(pool).ok) {
+    return { compliant: false, violation: `invalid top-level pool field ${JSON.stringify(String(pool))} — expected a string of [a-z0-9-], 1-24 chars after trim` }
+  }
+  return { compliant: true, violation: "" }
 }
 
 // Basename of a directory path, separator-style agnostic.
@@ -742,7 +764,8 @@ export function createPoolResolver(deps: PoolResolverDeps): {
 
     resolve(anchorsInput: string[]): PoolResolution {
       // Dedup preserving order (the caller normalizes, this is belt-and-
-      // braces); [0] is the primary anchor.
+      // braces). Order no longer matters for ids or collisions — family
+      // order is purely lexicographic below (host-history independence).
       const anchors: string[] = []
       for (const a of anchorsInput) {
         const t = (a ?? "").trim()
@@ -761,52 +784,63 @@ export function createPoolResolver(deps: PoolResolverDeps): {
         const f = workspacePoolOf(anchor)
         if (f) uniqueFiles.add(f)
       }
-      const anyWorkspacePool = uniqueFiles.size > 0
       if (globalPath && globalParsed) uniqueFiles.add(globalPath)
 
-      // ---- plain-id family: the primary anchor's pool; a host with NO
-      // workspace pool keeps the legacy global-only roster as plain ids.
-      const primaryFile = anchors.length > 0 ? workspacePoolOf(anchors[0]) : null
-      const plainPoolFile = primaryFile ?? (!anyWorkspacePool && globalParsed !== null && globalPath ? globalPath : null)
-      const orderedFiles = [plainPoolFile, ...[...uniqueFiles].filter((f) => f !== plainPoolFile).sort(codepointCompare)].filter((f): f is string => f !== null)
+      // ---- resolution order is PURELY lexicographic by absolute pool-file
+      // path (design D1): the global fallback file sorts alongside every
+      // workspace pool, and anchor ARRIVAL order influences nothing — ids
+      // and collision winners are identical on every host regardless of
+      // the order workspaces were initialized in (host-history
+      // independence). There is no primary/plain-id family anymore.
+      const orderedFiles = [...uniqueFiles].sort(codepointCompare)
 
-      // ---- parse every file once; validate its `pool` field fail-soft.
-      type Family = { file: string; parsed: ParsedPool | null; ns: string | null; declaredPool: string | null; primary: boolean }
+      // ---- parse every file once; validate its `pool` field fail-soft. The
+      // global fallback file is the ONE exception-free case (design D2): its
+      // ns is FIXED to "global", so a declared `pool` there is IGNORED with
+      // a warn finding naming the file — never a rename, never an error.
+      type Family = { file: string; parsed: ParsedPool | null; ns: string; declaredPool: string | null }
       const families: Family[] = []
       for (const file of orderedFiles) {
         const parsed = readPool(file)
         // The global fallback family's findings were already collected once
         // at the top — never double-report them.
         if (parsed && file !== globalPath) findings.push(...parsed.findings)
-        const isPrimary = plainPoolFile !== null && file === plainPoolFile
         let declaredPool: string | null = null
-        if (!isPrimary && parsed) {
-          const v = validatePoolField(parsed.declaredPool)
-          if (parsed.declaredPool !== undefined && parsed.declaredPool !== null) {
-            if (v.ok) {
-              declaredPool = v.ns
-            } else {
-              findings.push({ level: "warn", code: "pool-field-invalid", message: `${file}: invalid "pool" field ${JSON.stringify(String(parsed.declaredPool))} (expected [a-z0-9-], 1-24 chars) — falling back to the directory-derived namespace` })
+        if (parsed) {
+          if (file === globalPath) {
+            if (parsed.declaredPool !== undefined && parsed.declaredPool !== null) {
+              findings.push({ level: "warn", code: "pool-field-ignored-global", message: `${file}: the declared "pool" field ${JSON.stringify(String(parsed.declaredPool))} is ignored — the global fallback namespace is fixed to "global"` })
+            }
+          } else {
+            const v = validatePoolField(parsed.declaredPool)
+            if (parsed.declaredPool !== undefined && parsed.declaredPool !== null) {
+              if (v.ok) {
+                declaredPool = v.ns
+              } else {
+                findings.push({ level: "warn", code: "pool-field-invalid", message: `${file}: invalid "pool" field ${JSON.stringify(String(parsed.declaredPool))} (expected [a-z0-9-], 1-24 chars) — falling back to the directory-derived namespace` })
+              }
             }
           }
         }
-        families.push({ file, parsed, ns: null, declaredPool, primary: isPrimary })
+        families.push({ file, parsed, ns: "", declaredPool })
       }
 
       // ---- namespace assignment in resolution order: declared ?? sanitized
-      // pool-dir basename (the global file derives "global"); collisions
-      // get an incrementing -2/-3/... suffix unique across both derived and
-      // declared namespaces; error finding names both files.
+      // pool-dir basename — EXCEPT the global fallback file, whose ns is the
+      // FIXED "global" no matter what it declares (design D2: one rule, zero
+      // exceptions — the declared value is ignored upstream with a warn
+      // finding). Collisions get an incrementing -2/-3/... suffix unique
+      // across both derived and declared namespaces; error finding names
+      // both files.
       const allDeclared = new Set<string>()
       for (const f of families) if (f.declaredPool) allDeclared.add(f.declaredPool)
       const usedNs = new Map<string, string>() // ns -> owning file
       for (const f of families) {
-        if (f.primary) continue
         const base =
-          f.declaredPool ??
-          (f.file === globalPath
+          f.file === globalPath
             ? "global"
-            : sanitizeNamespace(dirBasename(parentDirLabel(parentDirLabel(f.file)))))
+            : (f.declaredPool ??
+              sanitizeNamespace(dirBasename(parentDirLabel(parentDirLabel(f.file)))))
         let ns = base
         let suffix = 2
         while ((usedNs.has(ns) || (ns !== base && allDeclared.has(ns))) && suffix < 100) {
@@ -822,16 +856,18 @@ export function createPoolResolver(deps: PoolResolverDeps): {
 
       // ---- materialize: each family contributes ONLY its own file's agents
       // (sole ownership — the global layer is a fallback family, NEVER a
-      // per-id merge base); namespaced ids <ns>-<id>; cross-family
-      // materialized-id collisions resolve in resolution order (earlier
-      // family wins, later agent skipped + error finding naming both files).
+      // per-id merge base); EVERY family namespaces (no plain ids — D1/D2):
+      // materialized id = <ns>-<id>. Cross-family materialized-id
+      // collisions resolve in the (purely lexicographic) resolution order:
+      // earlier file wins, later agent skipped + error finding naming both
+      // files — deterministically on every host.
       const agents: Record<string, MaterializedPoolAgent> = {}
       const origins: PoolFamilyOrigin[] = []
       for (const f of families) {
         const own = f.parsed?.agents ?? {}
         const ids: string[] = []
         for (const rawId of Object.keys(own)) {
-          const matId = f.ns === null ? rawId : `${f.ns}-${rawId}`
+          const matId = `${f.ns}-${rawId}`
           const existing = agents[matId]
           if (existing !== undefined) {
             findings.push({ level: "error", code: "materialized-id-collision", message: `materialized agent forge-${matId} from ${f.file} collides with the one from ${existing.file} — the earlier pool in resolution order wins, this agent is skipped` })
@@ -840,7 +876,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
           agents[matId] = { materializedId: matId, def: own[rawId], ns: f.ns, file: f.file }
           ids.push(matId)
         }
-        origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, primary: f.primary, materializedIds: ids })
+        origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, materializedIds: ids })
       }
       return { families: origins, agents, findings }
     },

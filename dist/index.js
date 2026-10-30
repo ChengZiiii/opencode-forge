@@ -12336,7 +12336,7 @@ tool.schema = exports_external;
 // plugin.ts
 import { execFileSync as execFileSync3 } from "node:child_process";
 import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync5, readdirSync as readdirSync4, readFileSync as readFileSync8, realpathSync, statSync as statSync5, writeFileSync as writeFileSync5 } from "node:fs";
-import { isAbsolute, join as join6, relative } from "node:path";
+import { basename as basename2, dirname as dirname4, isAbsolute, join as join6, relative } from "node:path";
 import { tmpdir as tmpdir3, homedir } from "node:os";
 
 // src/plan-file.ts
@@ -15052,12 +15052,19 @@ function rolePromptFor(agentId, def) {
     return def.prompt;
   return ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`;
 }
-function agentDescriptionFor(agentId, def) {
+function poolProvenanceLine(provenance) {
+  if ("global" in provenance) {
+    return `Pool 'global' — origin: the global fallback layer.`;
+  }
+  return `Pool '${provenance.ns}' — origin ${provenance.file}; dispatchable only from sessions whose workspace pool is this file.`;
+}
+function agentDescriptionFor(agentId, def, provenance) {
   const shape = def.shape === "readonly" ? "readonly" : "write";
   const brain = def.model !== undefined ? `pinned ${def.model}` : "auto — inherits the parent session's model at dispatch";
-  return `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`;
+  const base = `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`;
+  return provenance === undefined ? base : `${base} ${poolProvenanceLine(provenance)}`;
 }
-function forgeAgentDef(agentId, def) {
+function forgeAgentDef(agentId, def, provenance) {
   const permission = { task: "deny" };
   const shape = def.shape ?? "write";
   if (shape === "readonly") {
@@ -15067,7 +15074,7 @@ function forgeAgentDef(agentId, def) {
   Object.assign(permission, def.permission ?? {});
   permission.task = "deny";
   const entry = {
-    description: agentDescriptionFor(agentId, def),
+    description: agentDescriptionFor(agentId, def, provenance),
     mode: "subagent",
     prompt: materializeAgentPrompt({
       agent: agentId,
@@ -15801,6 +15808,16 @@ function validatePoolField(v) {
     return { ok: false };
   return { ok: true, ns: trimmed };
 }
+function poolFileCompliance(top) {
+  const pool = isRecord(top) ? top.pool : undefined;
+  if (pool === undefined || pool === null) {
+    return { compliant: false, violation: 'missing top-level pool field — declare "pool": "<namespace>" ([a-z0-9-], 1-24 chars) to make this file crew-compliant' };
+  }
+  if (!validatePoolField(pool).ok) {
+    return { compliant: false, violation: `invalid top-level pool field ${JSON.stringify(String(pool))} — expected a string of [a-z0-9-], 1-24 chars after trim` };
+  }
+  return { compliant: true, violation: "" };
+}
 function dirBasename(dir) {
   let s = dir;
   while (s.length > 1 && (s.endsWith("/") || s.endsWith("\\")))
@@ -15882,30 +15899,32 @@ function createPoolResolver(deps) {
         if (f)
           uniqueFiles.add(f);
       }
-      const anyWorkspacePool = uniqueFiles.size > 0;
       if (globalPath && globalParsed)
         uniqueFiles.add(globalPath);
-      const primaryFile = anchors.length > 0 ? workspacePoolOf(anchors[0]) : null;
-      const plainPoolFile = primaryFile ?? (!anyWorkspacePool && globalParsed !== null && globalPath ? globalPath : null);
-      const orderedFiles = [plainPoolFile, ...[...uniqueFiles].filter((f) => f !== plainPoolFile).sort(codepointCompare)].filter((f) => f !== null);
+      const orderedFiles = [...uniqueFiles].sort(codepointCompare);
       const families = [];
       for (const file2 of orderedFiles) {
         const parsed = readPool(file2);
         if (parsed && file2 !== globalPath)
           findings.push(...parsed.findings);
-        const isPrimary = plainPoolFile !== null && file2 === plainPoolFile;
         let declaredPool = null;
-        if (!isPrimary && parsed) {
-          const v = validatePoolField(parsed.declaredPool);
-          if (parsed.declaredPool !== undefined && parsed.declaredPool !== null) {
-            if (v.ok) {
-              declaredPool = v.ns;
-            } else {
-              findings.push({ level: "warn", code: "pool-field-invalid", message: `${file2}: invalid "pool" field ${JSON.stringify(String(parsed.declaredPool))} (expected [a-z0-9-], 1-24 chars) — falling back to the directory-derived namespace` });
+        if (parsed) {
+          if (file2 === globalPath) {
+            if (parsed.declaredPool !== undefined && parsed.declaredPool !== null) {
+              findings.push({ level: "warn", code: "pool-field-ignored-global", message: `${file2}: the declared "pool" field ${JSON.stringify(String(parsed.declaredPool))} is ignored — the global fallback namespace is fixed to "global"` });
+            }
+          } else {
+            const v = validatePoolField(parsed.declaredPool);
+            if (parsed.declaredPool !== undefined && parsed.declaredPool !== null) {
+              if (v.ok) {
+                declaredPool = v.ns;
+              } else {
+                findings.push({ level: "warn", code: "pool-field-invalid", message: `${file2}: invalid "pool" field ${JSON.stringify(String(parsed.declaredPool))} (expected [a-z0-9-], 1-24 chars) — falling back to the directory-derived namespace` });
+              }
             }
           }
         }
-        families.push({ file: file2, parsed, ns: null, declaredPool, primary: isPrimary });
+        families.push({ file: file2, parsed, ns: "", declaredPool });
       }
       const allDeclared = new Set;
       for (const f of families)
@@ -15913,9 +15932,7 @@ function createPoolResolver(deps) {
           allDeclared.add(f.declaredPool);
       const usedNs = new Map;
       for (const f of families) {
-        if (f.primary)
-          continue;
-        const base = f.declaredPool ?? (f.file === globalPath ? "global" : sanitizeNamespace(dirBasename(parentDirLabel(parentDirLabel(f.file)))));
+        const base = f.file === globalPath ? "global" : f.declaredPool ?? sanitizeNamespace(dirBasename(parentDirLabel(parentDirLabel(f.file))));
         let ns = base;
         let suffix = 2;
         while ((usedNs.has(ns) || ns !== base && allDeclared.has(ns)) && suffix < 100) {
@@ -15934,7 +15951,7 @@ function createPoolResolver(deps) {
         const own = f.parsed?.agents ?? {};
         const ids = [];
         for (const rawId of Object.keys(own)) {
-          const matId = f.ns === null ? rawId : `${f.ns}-${rawId}`;
+          const matId = `${f.ns}-${rawId}`;
           const existing = agents[matId];
           if (existing !== undefined) {
             findings.push({ level: "error", code: "materialized-id-collision", message: `materialized agent forge-${matId} from ${f.file} collides with the one from ${existing.file} — the earlier pool in resolution order wins, this agent is skipped` });
@@ -15943,7 +15960,7 @@ function createPoolResolver(deps) {
           agents[matId] = { materializedId: matId, def: own[rawId], ns: f.ns, file: f.file };
           ids.push(matId);
         }
-        origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, primary: f.primary, materializedIds: ids });
+        origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, materializedIds: ids });
       }
       return { families: origins, agents, findings };
     }
@@ -16125,6 +16142,28 @@ function sessionPoolFileOf(anchor) {
   if (poolResolver)
     return poolResolver.workspacePoolOf(anchor);
   return loaderForAnchor(anchor).load().projectPath;
+}
+function crewPoolComplianceRefusal(anchor) {
+  const poolFile = sessionPoolFileOf(anchor);
+  if (poolFile === null)
+    return null;
+  let text;
+  try {
+    text = readFileSync8(poolFile, "utf8");
+  } catch (err) {
+    const reason = err instanceof Error ? err.message : String(err);
+    return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) could not be read (${reason}). ` + `Repair the file so it is readable JSONC declaring a valid top-level "pool" namespace ([a-z0-9-], 1-24 chars) — REQUIRED for crew-governed dispatch. ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
+  }
+  const parsed = parseForgeJsonc(text);
+  if (!parsed.ok) {
+    return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) does not parse (${parsed.error.message} at line ${parsed.error.line}). ` + `Repair the file so it parses and declares a valid top-level "pool" namespace ([a-z0-9-], 1-24 chars) — REQUIRED for crew-governed dispatch. ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
+  }
+  const verdict = poolFileCompliance(parsed.config);
+  if (verdict.compliant)
+    return null;
+  const fam = resolvePools()?.families.find((f) => foldPath(f.file) === foldPath(poolFile));
+  const suggested = fam?.ns ?? sanitizeNamespace(basename2(dirname4(dirname4(poolFile))));
+  return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) is non-compliant — ${verdict.violation}. ` + `Minimal fix: add or repair the top-level "pool": "${suggested}" field (a [a-z0-9-] string, 1-24 chars — REQUIRED for crew-governed dispatch). ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
 }
 var crews = new Map;
 function crewRecordPathFor(worktree, objective) {
@@ -17038,9 +17077,9 @@ var CREW_INIT_TEMPLATE = [
   "",
   "Two axes, distinct: POOLS follow workspaces (sole ownership above — dispatch is gated to the session's own pool / the global fallback); SESSION ARTIFACTS (plan/goal/crew records) follow the session. A forge.json in another workspace is not dispatchable from this session.",
   "",
-  '2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: name ids as PLAIN role words WITHOUT the `forge-` prefix — the plugin materializes every id as `forge-<id>` automatically (a `forge-`-prefixed id doubles up as `forge-forge-coder` and is auto-stripped with a warning). Give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent. Give EVERY agent an EXPLICIT `shape`: `readonly` for read-only roles (reviewer/scout/planner — denies write/edit/bash and the patch family), `write` for implementers and build drivers. ALSO include a proposed short stable `pool` namespace (a [a-z0-9-] word up to 24 chars — e.g. "aa" for a specialist pool) so the materialized ids survive directory renames.',
+  '2. Or, ONLY if the user explicitly asks you to configure it in this conversation, you may write the file yourself through the normal write path. NEVER write forge.json without that explicit go-ahead. When you configure it: name ids as PLAIN role words WITHOUT the `forge-` prefix (a `forge-`-prefixed id doubles up and is auto-stripped with a warning) — every pool materializes as `forge-<ns>-<id>` under its `pool` namespace (the global fallback materializes as `forge-global-<id>`). Give EVERY agent a SHORT prompt derived from the role the user asked for — one or two sentences describing its job (the user trims or extends from there); write a long prompt ONLY when the user explicitly asks for that agent. Give EVERY agent an EXPLICIT `shape`: `readonly` for read-only roles (reviewer/scout/planner — denies write/edit/bash and the patch family), `write` for implementers and build drivers. ALWAYS include the top-level `pool` namespace (a [a-z0-9-] word up to 24 chars — e.g. "aa" for a specialist pool): it is REQUIRED for crew-governed dispatch (the compliance gate) and keeps the materialized ids stable across directory renames.',
   "",
-  "Template (JSONC — comments allowed): ids are plain role words (research, coder, ...) — the plugin adds the `forge-` prefix at materialization; `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session's model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job). Optional per agent: `shape` — an ABSENT shape defaults to WRITE (open permissions — the compatibility-preserving default for existing pools); `shape: \"readonly\"` is the explicit seal that denies the mutating-tool family (write/edit/bash + patch/applypatch/apply/multiedit) for read-only roles. Optional top level: `pool` — the file's namespace.",
+  'Template (JSONC — comments allowed): ids are plain role words (research, coder, ...) — every pool materializes as `forge-<ns>-<id>` (the global fallback materializes as `forge-global-<id>`); `model` + `thoughtLevel` are an ATOMIC PAIR — set BOTH to pin the brain and depth (model = exact provider/model identity; thoughtLevel = none/low/medium/high/max or a native level name), or NEITHER for an Auto worker that inherits the parent session\'s model; exactly one of the two is rejected. Optional per agent: `prompt` — a short role description; an explicit prompt FULLY overrides the built-in role (only the ids `research` and `review` carry built-ins; any other id without a prompt gets a generic one-liner and will not know its job). Optional per agent: `shape` — an ABSENT shape defaults to WRITE (open permissions — the compatibility-preserving default for existing pools); `shape: "readonly"` is the explicit seal that denies the mutating-tool family (write/edit/bash + patch/applypatch/apply/multiedit) for read-only roles. Top level: `pool` — the file\'s namespace, REQUIRED for crew-governed dispatch.',
   "{template}",
   "",
   "After the file is saved: file edits, creations, and deletions apply at the next config hook — NO host restart is needed, and a DELETED pool file un-materializes its agents (deletion is real — no zombie pools survive on disk truth)."
@@ -17050,7 +17089,7 @@ function crewOrchestrationTemplate(resolution) {
   const families = resolution?.families ?? [];
   const globalPath = forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global;
   const otherLines = families.map((f) => {
-    const label = f.primary ? "primary pool (plain forge-<id> ids)" : `pool ${f.ns} (forge-${f.ns}-*)`;
+    const label = `pool ${f.ns} (forge-${f.ns}-*)`;
     return `  - ${label} — origin ${f.file} — NOT dispatchable from this session (unless this session's worktree is owned by that pool / it is the global fallback): ${f.materializedIds.map((id) => `forge-${id}`).join(", ") || "no agents"}`;
   });
   return [
@@ -17077,7 +17116,7 @@ function crewOrchestrationTemplate(resolution) {
 `);
 }
 var crewBeginTool = tool({
-  description: `Register this session's crew (from /crew) with its DECLARED subtask plan — the crew starts PENDING: the execution-mode choice (waves / convert to goal / standby) is the user's. Dual-purpose: called with {execution} ONLY (no objective/subtasks) it ARMS the pending crew — "waves" lifts the dispatch belt, "goal" ends the crew as a conversion record (the following goal_write arm dialog is the user's gate). One-call register+arm ({objective, subtasks, execution:"waves"}) is legal ONLY while a live active goal governs the session (born armed, never pends). Refuses: active crew, plan draft, missing/duplicated subtasks. Crew state is in-memory: a host restart ends it honestly.`,
+  description: `Register this session's crew (from /crew) with its DECLARED subtask plan — the crew starts PENDING: the execution-mode choice (waves / convert to goal / standby) is the user's. Dual-purpose: called with {execution} ONLY (no objective/subtasks) it ARMS the pending crew — "waves" lifts the dispatch belt, "goal" ends the crew as a conversion record (the following goal_write arm dialog is the user's gate). One-call register+arm ({objective, subtasks, execution:"waves"}) is legal ONLY while a live active goal governs the session (born armed, never pends). Refuses: active crew, plan draft, missing/duplicated subtasks, a non-compliant workspace pool file (missing/invalid top-level "pool" namespace — required for crew-governed dispatch). Crew state is in-memory: a host restart ends it honestly.`,
   args: {
     objective: tool.schema.string().optional().describe("One-line crew objective (from /crew) — required on registration, ABSENT on the arm call"),
     execution: tool.schema.string().optional().describe('Arm action: "waves" (supervised waves — lifts the belt) or "goal" (convert to a goal contract). Alone = arm the pending crew; with objective+subtasks = one-call born-armed registration, legal only under a governing active goal.'),
@@ -17111,9 +17150,9 @@ var crewBeginTool = tool({
         `[forge:crew] CREW IS NOT INITIALIZED: no forge subagent is materialized for this session's roster (neither the workspace pool nor the global fallback yields an agent). Crew orchestration is unavailable until the user sets it up.`,
         `Two layers, SOLE OWNERSHIP: the workspace pool — the NEAREST .opencode/forge.json walking up from this session's worktree (${paths.project}) — IS the whole roster when it exists; the global layer (${paths.global}) serves only as the fallback when the workspace has none (a fallback, NOT a merge; forge.json files nested deeper in the workspace subtree are ignored — the same workspace-ownership strictness as opencode's native MCP config).`,
         "Two axes, distinct: POOLS follow workspaces (sole ownership above — dispatch is gated to the session's own pool / the global fallback); SESSION ARTIFACTS (plan/goal/crew records) follow the session. A forge.json in another workspace is not dispatchable from this session.",
-        `Template (JSONC): top-level optional "pool" names this file's namespace (short stable [a-z0-9-] up to 24 chars — non-primary pools materialize as forge-<ns>-<id>); {"agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "shape": "readonly", "prompt": "short role description"}}} — an absent shape defaults to WRITE (open permissions); "shape": "readonly" is the explicit seal denying write/edit/bash + the patch family for read-only roles.`,
-        "Agent ids are plain role words WITHOUT the `forge-` prefix — the plugin materializes each id as `forge-<id>` (namespaced pools: `forge-<ns>-<id>`); a prefixed id is auto-stripped with a warning.",
-        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it: give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request), give every agent an EXPLICIT shape (readonly for read-only roles like reviewer/scout/planner; write for implementers and build drivers), and INCLUDE a proposed short stable `pool` namespace so ids survive directory renames. File edits, creations, and deletions apply at the next config hook — no host restart needed, and a DELETED pool file un-materializes its agents (deletion is real)."
+        `Template (JSONC): the top-level "pool" field names this file's namespace (short stable [a-z0-9-] up to 24 chars — REQUIRED for crew-governed dispatch; every pool materializes as forge-<ns>-<id>, the global fallback materializes as forge-global-<id>); {"pool": "short-stable-namespace", "agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "shape": "readonly", "prompt": "short role description"}}} — an absent shape defaults to WRITE (open permissions); "shape": "readonly" is the explicit seal denying write/edit/bash + the patch family for read-only roles.`,
+        "Agent ids are plain role words WITHOUT the `forge-` prefix — every pool materializes as `forge-<ns>-<id>` under its `pool` namespace (the global fallback materializes as `forge-global-<id>`); a prefixed id is auto-stripped with a warning.",
+        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it: give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request), give every agent an EXPLICIT shape (readonly for read-only roles like reviewer/scout/planner; write for implementers and build drivers), and INCLUDE the top-level `pool` namespace — it is REQUIRED for crew-governed dispatch (the compliance gate refuses a missing or invalid field) and keeps ids stable across directory renames. File edits, creations, and deletions apply at the next config hook — no host restart needed, and a DELETED pool file un-materializes its agents (deletion is real)."
       ];
       if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject && !sessionCovered) {
         lines2.push(`NOTE: this session's workspace DOES have a forge.json (${sessionProject}) with usable agents — but this host has NOT materialized it (no initialization in that workspace). Re-initialize the host in that workspace, or move the agents into the global layer (${globalPoolPath}).`);
@@ -17195,6 +17234,11 @@ var crewBeginTool = tool({
     if (execution === "goal") {
       throw new Error('[forge:crew] execution:"goal" converts an already-registered PENDING crew — register the plan first (no execution), then convert. Under a governing goal, only "waves" one-call arming is legal (the loop already owns the goal).');
     }
+    if (anchor) {
+      const complianceRefusal = crewPoolComplianceRefusal(anchor);
+      if (complianceRefusal)
+        throw new Error(complianceRefusal);
+    }
     const governed = execution === "waves";
     const lineage = String(args.lineage ?? "").trim();
     const anchorDir = anchor || hostWorktree;
@@ -17228,7 +17272,7 @@ var crewBeginTool = tool({
     for (const f of families.slice(0, 8)) {
       if (f === sessionFamily)
         continue;
-      const label = f.primary ? "primary pool (plain forge-<id> ids)" : `pool ${f.ns} (forge-${f.ns}-*)`;
+      const label = `pool ${f.ns} (forge-${f.ns}-*)`;
       familyLines.push(`   - NOT dispatchable from this session — ${label}: ${f.file} — ${f.materializedIds.map((id) => `forge-${id}`).join(", ") || "no agents"}`);
     }
     if (families.length > 8)
@@ -17680,11 +17724,13 @@ var server = async (input, options) => {
         console.warn(`[forge:config] ${finding.level}: ${finding.message}`);
       }
       materializedSnapshot = {};
+      const globalMaterializationPath = globalPoolPathOf();
       for (const [matId, agent] of Object.entries(resolution?.agents ?? {})) {
         const id = `forge-${matId}`;
         if (agentSection[id] !== undefined)
           continue;
-        const entry = forgeAgentDef(matId, agent.def);
+        const provenance = foldPath(agent.file) === foldPath(globalMaterializationPath) ? { global: true } : { ns: agent.ns, file: agent.file };
+        const entry = forgeAgentDef(matId, agent.def, provenance);
         agentSection[id] = entry;
         materializedSnapshot[id] = entry;
       }
@@ -17732,7 +17778,7 @@ var server = async (input, options) => {
         const agentCount = Object.keys(resolution?.agents ?? {}).length;
         const primaryAnchorDir = hostAnchors[0] ?? undefined;
         const template = agentCount > 0 ? crewOrchestrationTemplate(resolution ?? null) : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}
-   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`).replaceAll("{template}", JSON.stringify({ pool: "short-stable-namespace (optional, [a-z0-9-] up to 24 chars — non-primary pools materialize as forge-<ns>-<id>)", agents: { research: { model: "provider/model", thoughtLevel: "low", shape: "readonly", prompt: "short role description — what this agent does" }, coder: { model: "provider/model", thoughtLevel: "low", shape: "write", prompt: "short role description — what this agent does" } } }, null, 2).split(`
+   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`).replaceAll("{template}", JSON.stringify({ pool: "namespace (REQUIRED for crew-governed dispatch, [a-z0-9-] up to 24 chars — every pool materializes as forge-<ns>-<id>; the global fallback materializes as forge-global-<id>)", agents: { research: { model: "provider/model", thoughtLevel: "low", shape: "readonly", prompt: "short role description — what this agent does" }, coder: { model: "provider/model", thoughtLevel: "low", shape: "write", prompt: "short role description — what this agent does" } } }, null, 2).split(`
 `).map((l) => "   " + l).join(`
 `));
         const description = agentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance";
@@ -17794,6 +17840,18 @@ var server = async (input, options) => {
         const pendingCrew = input2.sessionID ? crews.get(input2.sessionID) : undefined;
         if (pendingCrew && pendingCrew.mode === "pending") {
           throw new Error(`[forge:crew] Dispatch refused: the crew "${pendingCrew.objective}" is PENDING (registered, not armed). Present the execution-mode choice to the user — supervised waves now / convert to a goal contract / standby — then arm per their choice with crew_begin {execution: "waves" | "goal"}. Reconnaissance task calls are free only BEFORE registration.`);
+        }
+        if (target && target.toLowerCase().startsWith("forge-") && input2.sessionID) {
+          const crew = crews.get(input2.sessionID);
+          if (crew && (crew.mode === "pending" || crew.mode === "executing")) {
+            const bound = sessions.get(input2.sessionID);
+            const anchor = bound?.worktree ?? "";
+            if (anchor) {
+              const complianceRefusal = crewPoolComplianceRefusal(anchor);
+              if (complianceRefusal)
+                throw new Error(complianceRefusal);
+            }
+          }
         }
       }
       if ((input2.tool === "write" || input2.tool === "edit") && input2.sessionID) {
@@ -18129,11 +18187,13 @@ async function v2Setup(ctx) {
       try {
         const resolver = createPoolResolver({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
         const resolution = resolver.resolve([process.cwd()]);
+        const v2GlobalPath = forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global;
         for (const [matId, agent] of Object.entries(resolution.agents)) {
           const id = `forge-${matId}`;
           if (draft.get(id) !== undefined)
             continue;
-          const v1def = forgeAgentDef(matId, agent.def);
+          const provenance = foldPath(agent.file) === foldPath(v2GlobalPath) ? { global: true } : { ns: agent.ns, file: agent.file };
+          const v1def = forgeAgentDef(matId, agent.def, provenance);
           draft.update(id, (agentDraft) => {
             agentDraft.description = v1def.description;
             agentDraft.system = v1def.prompt;

@@ -8,7 +8,7 @@ import assert from "node:assert/strict"
 // description is the task-tool vocabulary entry.
 
 import { materializeAgentPrompt, WORKER_MANDATES } from "../src/dispatch-prompt.ts"
-import { rolePromptFor, forgeAgentDef, agentDescriptionFor, effectiveReadonlyShape } from "../src/dispatch-tiers.ts"
+import { rolePromptFor, forgeAgentDef, agentDescriptionFor, effectiveReadonlyShape, poolProvenanceLine } from "../src/dispatch-tiers.ts"
 
 test("role prompt layer 1: an explicit def.prompt overrides everything", () => {
   const role = rolePromptFor("auditor", { prompt: "You are a dependency auditor; check licenses.", model: "x/y" })
@@ -154,4 +154,66 @@ test("effectiveReadonlyShape: every patch-family member lifts effectiveness like
     assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { [tool]: "ask" } }), false, `${tool}: ask counts as lifted (fail closed)`)
     assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { [tool]: "deny" } }), true, `${tool}: explicit deny is confirmation, not a lift`)
   }
+})
+
+// pool-namespace-contract task 2.1 (spec scenario "The description carries
+// pool provenance"; design D3): the task-vocabulary description names the
+// family namespace, the ORIGIN forge.json path (verbatim), and — for every
+// family except the global fallback — the dispatchability restriction. The
+// provenance line is STATIC host-wide truth: identical in every session, no
+// per-session branching.
+test("description provenance: a workspace family names the namespace, origin file, and dispatchability clause", () => {
+  const file = "C:/work/repo/.opencode/forge.json"
+  const d = agentDescriptionFor("coder", { model: "prov/x" }, { ns: "plugindev", file })
+  assert.match(d, /Pool 'plugindev'/, "names the family namespace")
+  assert.match(d, new RegExp(file.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")), "carries the origin forge.json path verbatim")
+  assert.match(d, /dispatchable only from sessions whose workspace pool is this file/, "the dispatchability restriction is stated")
+  // The provenance sentence rides AFTER the base description (one appended
+  // sentence — compact per design D3's vocabulary-surface budget).
+  assert.ok(d.startsWith('forge subagent "coder"'), "the base description is untouched")
+})
+
+test("description provenance: the global fallback family names the global fallback layer as origin", () => {
+  const d = agentDescriptionFor("coder", {}, { global: true })
+  assert.match(d, /Pool 'global' — origin: the global fallback layer\./)
+  assert.doesNotMatch(d, /dispatchable only from sessions/, "the global family carries no workspace-restriction clause")
+})
+
+test("description provenance: ABSENT provenance leaves the description byte-identical (backward compat)", () => {
+  const def = { model: "prov/x", thoughtLevel: "low", shape: "readonly" }
+  assert.equal(
+    agentDescriptionFor("research", def),
+    agentDescriptionFor("research", def, undefined),
+    "explicit undefined is the same as omitted",
+  )
+  assert.equal(
+    agentDescriptionFor("research", def),
+    `forge subagent "research" (readonly, pinned prov/x) — dispatch via the task tool with subagent_type "forge-research".`,
+    "no provenance sentence is appended",
+  )
+  // The materialization path is equally inert without provenance.
+  assert.equal(
+    forgeAgentDef("research", def).description,
+    forgeAgentDef("research", def, undefined).description,
+  )
+})
+
+test("description provenance: forgeAgentDef bakes the provenance line into the materialized description", () => {
+  const def = forgeAgentDef("coder", { model: "prov/x" }, { ns: "aa", file: "F:/pools/aa/.opencode/forge.json" })
+  assert.match(def.description, /Pool 'aa'/)
+  assert.match(def.description, /F:\/pools\/aa\/\.opencode\/forge\.json/)
+  assert.match(def.description, /dispatchable only from sessions whose workspace pool is this file/)
+  const g = forgeAgentDef("scout", {}, { global: true })
+  assert.match(g.description, /origin: the global fallback layer/)
+})
+
+test("poolProvenanceLine: exact sentence formats for both variants", () => {
+  assert.equal(
+    poolProvenanceLine({ ns: "plugindev", file: "C:/x/.opencode/forge.json" }),
+    "Pool 'plugindev' — origin C:/x/.opencode/forge.json; dispatchable only from sessions whose workspace pool is this file.",
+  )
+  assert.equal(
+    poolProvenanceLine({ global: true }),
+    "Pool 'global' — origin: the global fallback layer.",
+  )
 })

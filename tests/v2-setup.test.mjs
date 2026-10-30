@@ -86,21 +86,28 @@ import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-test("v2 setup: registers forge subagents from the cwd forge.json (create-only)", async () => {
+test("v2 setup: registers forge subagents from the cwd forge.json (create-only, NAMESPACED with provenance)", async () => {
   const dir = mkdtempSync(join(tmpdir(), "forge-v2-"))
   const prevCwd = process.cwd()
   try {
     mkdirSync(join(dir, ".opencode"), { recursive: true })
-    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "v2pool", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
     process.chdir(dir)
     const { ctx, agents } = makeCtx()
     await v2Setup(ctx)
     assert.ok(agents.has("forge"), "the primary agent still registers")
-    assert.ok(agents.has("forge-research"), "the subagent registers")
-    const sub = agents.get("forge-research")
+    assert.ok(agents.has("forge-v2pool-research"), "the subagent registers NAMESPACED (forge-<ns>-<id>)")
+    assert.equal(agents.has("forge-research"), false, "no plain-id agent exists on the v2 path")
+    const sub = agents.get("forge-v2pool-research")
     assert.equal(sub.mode, "subagent")
     assert.equal(sub.model, "zai/glm")
     assert.equal(sub.permission.task, "deny")
+    // Provenance (pool-namespace-contract D3/D5): the description names the
+    // family namespace, the origin forge.json path, and the dispatchability
+    // restriction.
+    assert.match(sub.description, /Pool 'v2pool' — origin/)
+    assert.ok(sub.description.includes(join(dir, ".opencode", "forge.json")), "the origin path rides the description")
+    assert.match(sub.description, /dispatchable only from sessions whose workspace pool is this file/)
     // Partition boundary (task 3.2): v2 has no tool domain — the materialized
     // subagent carries NO tools injection on this path.
     assert.equal(sub.tools, undefined, "v2 performs no partition injection")
@@ -115,13 +122,13 @@ test("v2 setup: never clobbers a user-defined forge-* entry", async () => {
   const prevCwd = process.cwd()
   try {
     mkdirSync(join(dir, ".opencode"), { recursive: true })
-    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "v2pool", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
     process.chdir(dir)
     const { ctx, agents } = makeCtx()
     await v2Setup(ctx)
-    agents.get("forge-research").system = "USER OWNED"
+    agents.get("forge-v2pool-research").system = "USER OWNED"
     await v2Setup(ctx)
-    assert.equal(agents.get("forge-research").system, "USER OWNED")
+    assert.equal(agents.get("forge-v2pool-research").system, "USER OWNED")
   } finally {
     process.chdir(prevCwd)
     rmSync(dir, { recursive: true, force: true })
@@ -133,15 +140,16 @@ test("v2 setup: an Auto worker registers without a model key", async () => {
   const prevCwd = process.cwd()
   try {
     mkdirSync(join(dir, ".opencode"), { recursive: true })
-    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ agents: { scout: {} } }))
+    writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "v2pool", agents: { scout: {} } }))
     process.chdir(dir)
     const { ctx, agents } = makeCtx()
     await v2Setup(ctx)
-    const sub = agents.get("forge-scout")
-    assert.ok(sub, "the Auto worker registers")
+    const sub = agents.get("forge-v2pool-scout")
+    assert.ok(sub, "the Auto worker registers (namespaced)")
     assert.equal(false, "model" in sub, "no model key on the v2 path either")
     assert.equal(sub.mode, "subagent")
     assert.match(sub.description, /inherits the parent session's model/)
+    assert.match(sub.description, /Pool 'v2pool' — origin/, "Auto workers carry the provenance line too")
   } finally {
     process.chdir(prevCwd)
     rmSync(dir, { recursive: true, force: true })

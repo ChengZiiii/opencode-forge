@@ -1254,7 +1254,7 @@ function crewWorktree(t) {
     } catch {}
   })
   mkdirSync(join(wt, ".opencode"), { recursive: true })
-  writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "goalcrew", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   return wt
 }
 
@@ -1327,4 +1327,38 @@ test("goal delegation: outside a governing goal the one-call arm still refuses (
   await h1.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, toolCtx(sid1, wt1))
   assert.equal(h1.__forgeSubagentsTest.crews().get(sid1).mode, "pending")
   await h1.dispose?.()
+})
+
+// pool-namespace-contract (spec: crew-harness — "Crew-governed dispatch
+// pool-compliance gate"): the born-armed one-call registration runs the SAME
+// compliance pre-flight as plain registration — a NON-compliant workspace
+// pool (forge.json with agents, no `pool` field) refuses even under a
+// governing active goal: no record, no born-armed crew.
+test("goal delegation: born-armed one-call registration is REFUSED on a non-compliant workspace pool", async (t) => {
+  const wt = mkdtempSync(join(tmpdir(), "goal-crew-nc-"))
+  t.after(() => {
+    try {
+      rmSync(wt, { recursive: true, force: true })
+    } catch {}
+  })
+  mkdirSync(join(wt, ".opencode"), { recursive: true })
+  // NON-compliant fixture: agents present, NO top-level `pool` field.
+  writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  const { serverPromise } = makeHarness({ worktree: wt })
+  const hooks = await serverPromise
+  await hooks.config({ agent: {} })
+  const sid = await armGoal(hooks, wt)
+
+  await assert.rejects(
+    () => hooks.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }], execution: "waves" }, toolCtx(sid, wt)),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /Pool compliance refused/, "the same pre-flight refusal as plain registration")
+      assert.match(m, /missing top-level pool field/, "the missing-vs-invalid violation")
+      return true
+    },
+  )
+  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid), undefined, "no crew record — the refusal precedes any born-armed registration")
+  assert.equal(existsSync(join(wt, ".opencode", "crew")), false, "no crew record file was written")
+  await hooks.dispose?.()
 })

@@ -77,10 +77,11 @@ function projectWithForgeJson(t, json) {
 // Materialization (spec: forge-subagents — "Materialization as native
 // subagents with a pinned model")
 
-test("materialization: forge.json agents materialize WITH a model, not hidden, task denied", async (t) => {
+test("materialization: forge.json agents materialize NAMESPACED with a model, not hidden, task denied, provenance in the description", async (t) => {
   const dir = projectWithForgeJson(
     t,
     JSON.stringify({
+      pool: "wire",
       agents: {
         research: { model: "zai/glm-5.3", thoughtLevel: "low", shape: "readonly" },
         builder: { model: "x/y", thoughtLevel: "low", shape: "write", prompt: "You are a build worker." },
@@ -93,18 +94,24 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
   const cfg = emptyCfg()
   await h.config(cfg)
 
-  const research = cfg.agent["forge-research"]
-  assert.ok(research, "forge-research must be injected")
+  const research = cfg.agent["forge-wire-research"]
+  assert.ok(research, "forge-wire-research must be injected (namespaced forge-<ns>-<id>)")
+  assert.equal(cfg.agent["forge-research"], undefined, "no plain-id agent exists")
   assert.equal(research.model, "zai/glm-5.3", "the pinned model IS written into the agent")
   assert.equal(research.mode, "subagent")
   assert.equal(research.hidden, undefined, "agents stay in the task-tool vocabulary")
   assert.equal(research.permission.task, "deny")
   for (const tool of ["write", "edit", "bash"]) assert.equal(research.permission[tool], "deny", "explicit readonly denies mutating tools")
+  // Provenance (pool-namespace-contract D3): the description names the family
+  // namespace, the origin forge.json path, and the dispatchability restriction.
+  assert.match(research.description, /Pool 'wire' — origin/)
+  assert.ok(research.description.toLowerCase().includes(join(dir, ".opencode", "forge.json").toLowerCase()), "the origin forge.json path rides the description")
+  assert.match(research.description, /dispatchable only from sessions whose workspace pool is this file/)
 
   // shape-default-open: an absent shape materializes with OPEN write
   // permissions (readonly is never a surprise default); only task stays denied.
-  const ta = cfg.agent["forge-ta-tool"]
-  assert.ok(ta, "forge-ta-tool must be injected")
+  const ta = cfg.agent["forge-wire-ta-tool"]
+  assert.ok(ta, "forge-wire-ta-tool must be injected (namespaced)")
   assert.equal(ta.permission.task, "deny")
   for (const tool of ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"]) {
     assert.equal(ta.permission[tool], undefined, `absent shape leaves ${tool} open (write default)`)
@@ -115,7 +122,7 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
   assert.match(research.prompt, /report the refusal VERBATIM/, "verbatim-refusal mandate present")
   assert.match(research.prompt, /evidence references/, "evidence mandate present")
 
-  const builder = cfg.agent["forge-builder"]
+  const builder = cfg.agent["forge-wire-builder"]
   assert.equal(builder.model, "x/y")
   assert.equal(builder.permission.write, undefined, "write shape drops the mutating denies")
   assert.equal(builder.permission.task, "deny", "task ban survives the shape")
@@ -134,44 +141,45 @@ test("materialization: forge.json agents materialize WITH a model, not hidden, t
   assert.match(builder.prompt, /build worker/, "explicit prompt overrides the role default")
 })
 
-test("materialization: a user-defined forge-<id> entry is never clobbered", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+test("materialization: a user-defined forge-<ns>-<id> entry is never clobbered", async (t) => {
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
-  cfg.agent["forge-research"] = { description: "mine", mode: "subagent", prompt: "keep me" }
+  cfg.agent["forge-wire-research"] = { description: "mine", mode: "subagent", prompt: "keep me" }
   await h.config(cfg)
-  assert.equal(cfg.agent["forge-research"].prompt, "keep me")
-  assert.equal(cfg.agent["forge-research"].description, "mine")
-  assert.equal(cfg.agent["forge-research"].model, undefined)
+  assert.equal(cfg.agent["forge-wire-research"].prompt, "keep me")
+  assert.equal(cfg.agent["forge-wire-research"].description, "mine")
+  assert.equal(cfg.agent["forge-wire-research"].model, undefined)
 })
 
 test("materialization: fail-soft — one broken entry does not disable its siblings", async (t) => {
   const dir = projectWithForgeJson(
     t,
-    JSON.stringify({ agents: { good: { model: "p/good", thoughtLevel: "low" }, bad: { thoughtLevel: "low" } } }),
+    JSON.stringify({ pool: "wire", agents: { good: { model: "p/good", thoughtLevel: "low" }, bad: { thoughtLevel: "low" } } }),
   )
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
-  assert.ok(cfg.agent["forge-good"], "the valid agent still materializes")
-  assert.equal(cfg.agent["forge-bad"], undefined, "the half-configured entry is skipped")
+  assert.ok(cfg.agent["forge-wire-good"], "the valid agent still materializes (namespaced)")
+  assert.equal(cfg.agent["forge-wire-bad"], undefined, "the half-configured entry is skipped")
 })
 
 test("materialization: an Auto worker carries no model key and describes inheritance", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { scout: {} } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { scout: {} } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
-  const scout = cfg.agent["forge-scout"]
-  assert.ok(scout, "the Auto worker materializes")
+  const scout = cfg.agent["forge-wire-scout"]
+  assert.ok(scout, "the Auto worker materializes (namespaced)")
   assert.equal(false, "model" in scout, "no model key at all — the host inherits the parent's model")
   assert.equal(scout.mode, "subagent")
   assert.equal(scout.permission.task, "deny", "recursion ban intact")
   assert.match(scout.description, /auto — inherits the parent session's model at dispatch/, "the description names inheritance, not a pinned brain")
   assert.doesNotMatch(scout.description, /pinned/, "no pinned claim for an Auto worker")
+  assert.match(scout.description, /Pool 'wire' — origin/, "Auto workers carry the provenance line too")
   assert.equal(scout.tools.shell, false, "exec partition applies to Auto workers too")
   assert.match(scout.prompt, /workspace-relative paths ONLY/, "discipline mandate present")
 })
@@ -182,17 +190,17 @@ test("materialization: a broken forge.json empties the set (no seed resurrection
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
-  assert.equal(cfg.agent["forge-research"], undefined, "no seed exists to fall back to")
+  assert.equal(cfg.agent["forge-wire-research"], undefined, "no seed exists to fall back to")
 })
 
 test("materialization: agent.forge.disable registers nothing", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   cfg.agent.forge = { disable: true }
   await h.config(cfg)
-  assert.equal(cfg.agent["forge-research"], undefined, "no subagents when forge is disabled")
+  assert.equal(cfg.agent["forge-wire-research"], undefined, "no subagents when forge is disabled")
   assert.equal(h.tool.crew_begin, undefined, "no crew tools when forge is disabled")
   assert.equal(h.tool.plan_write, undefined, "no harness tools at all when disabled")
 })
@@ -218,33 +226,33 @@ test("native-task surface: no forge_dispatch family is registered anywhere", asy
 // keyed by agent name")
 
 test("depth: a forge agent session gets its pinned word on the wire, frozen for the session", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "openai/gpt", thoughtLevel: "low" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { research: { model: "openai/gpt", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
   const out1 = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_d1", agent: "forge-research", model: { providerID: "openai", modelID: "gpt" } }, out1)
+  await h["chat.params"]({ sessionID: "ses_d1", agent: "forge-wire-research", model: { providerID: "openai", modelID: "gpt" } }, out1)
   assert.equal(out1.options.reasoningEffort, "low", "the pinned word rides the wire")
 
   out1.options.reasoningEffort = "TAMPERED"
-  await h["chat.params"]({ sessionID: "ses_d1", agent: "forge-research", model: { providerID: "openai", modelID: "gpt" } }, out1)
+  await h["chat.params"]({ sessionID: "ses_d1", agent: "forge-wire-research", model: { providerID: "openai", modelID: "gpt" } }, out1)
   assert.equal(out1.options.reasoningEffort, "low", "the frozen value is re-applied verbatim each request")
 
   // A different session is a fresh freeze.
   const out2 = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_d2", agent: "forge-research", model: { providerID: "openai", modelID: "gpt" } }, out2)
+  await h["chat.params"]({ sessionID: "ses_d2", agent: "forge-wire-research", model: { providerID: "openai", modelID: "gpt" } }, out2)
   assert.equal(out2.options.reasoningEffort, "low")
 })
 
 test("depth: non-forge agents and agents without thoughtLevel get nothing", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { plain: {} } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { plain: {} } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
   const out = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_p", agent: "forge-plain", model: { providerID: "openai", modelID: "gpt" } }, out)
+  await h["chat.params"]({ sessionID: "ses_p", agent: "forge-wire-plain", model: { providerID: "openai", modelID: "gpt" } }, out)
   assert.equal(out.options.reasoningEffort, undefined, "no thoughtLevel -> nothing injected")
 
   const out2 = { options: {} }
@@ -253,18 +261,18 @@ test("depth: non-forge agents and agents without thoughtLevel get nothing", asyn
 })
 
 test("depth: unknown provider defaults to the effort word channel — pass-through, provider judges", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "weird/m", thoughtLevel: "low" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { research: { model: "weird/m", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   const out = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_u", agent: "forge-research", model: { providerID: "weird", modelID: "m" } }, out)
+  await h["chat.params"]({ sessionID: "ses_u", agent: "forge-wire-research", model: { providerID: "weird", modelID: "m" } }, out)
   assert.equal(out.options.reasoningEffort, "low", "dictionary-not-whitelist: unknown endpoints are word channels")
-  assert.equal(h.__forgeSubagentsTest.depthFinding("research"), null, "pass-through is not a failure")
+  assert.equal(h.__forgeSubagentsTest.depthFinding("wire-research"), null, "pass-through is not a failure")
 })
 
 test("depth: catalog shape drives the channel — effort ladder, unmatched words pass through", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { picky: { model: "openai/gpt", thoughtLevel: "xhigh" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { picky: { model: "openai/gpt", thoughtLevel: "xhigh" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
@@ -273,31 +281,31 @@ test("depth: catalog shape drives the channel — effort ladder, unmatched words
   h.__forgeSubagentsTest.setCatalog({ providers: { openai: { models: { gpt: { reasoningShape: "effort", reasoningOptions: ["low", "high", "max"] } } } } })
 
   const out = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_c1", agent: "forge-picky", model: { providerID: "openai", modelID: "gpt" } }, out)
+  await h["chat.params"]({ sessionID: "ses_c1", agent: "forge-wire-picky", model: { providerID: "openai", modelID: "gpt" } }, out)
   assert.equal(out.options.reasoningEffort, "xhigh", "unmatched word on a word channel passes through — the provider judges")
-  assert.equal(h.__forgeSubagentsTest.depthFinding("picky"), null)
+  assert.equal(h.__forgeSubagentsTest.depthFinding("wire-picky"), null)
 })
 
 test("depth: catalog toggle shape is a dead end for level words — finding, never collapsed to on", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { togs: { model: "openai/gpt", thoughtLevel: "high" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { togs: { model: "openai/gpt", thoughtLevel: "high" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   h.__forgeSubagentsTest.setCatalog({ providers: { openai: { models: { gpt: { reasoningShape: "toggle" } } } } })
 
   const out = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_t1", agent: "forge-togs", model: { providerID: "openai", modelID: "gpt" } }, out)
+  await h["chat.params"]({ sessionID: "ses_t1", agent: "forge-wire-togs", model: { providerID: "openai", modelID: "gpt" } }, out)
   assert.deepEqual(out.options, {}, "nothing injected — the session is never broken")
-  assert.match(h.__forgeSubagentsTest.depthFinding("togs") ?? "", /high/)
-  assert.match(h.__forgeSubagentsTest.depthFinding("togs") ?? "", /toggle/)
+  assert.match(h.__forgeSubagentsTest.depthFinding("wire-togs") ?? "", /high/)
+  assert.match(h.__forgeSubagentsTest.depthFinding("wire-togs") ?? "", /toggle/)
 
   // Bounded: a second session with the same agent does not duplicate it.
-  await h["chat.params"]({ sessionID: "ses_t2", agent: "forge-togs", model: { providerID: "openai", modelID: "gpt" } }, { options: {} })
-  assert.match(h.__forgeSubagentsTest.depthFinding("togs") ?? "", /high/)
+  await h["chat.params"]({ sessionID: "ses_t2", agent: "forge-wire-togs", model: { providerID: "openai", modelID: "gpt" } }, { options: {} })
+  assert.match(h.__forgeSubagentsTest.depthFinding("wire-togs") ?? "", /high/)
 })
 
 test("depth: catalog-silent zai falls back to the toggle family (GLM today) — level word is a dead-end finding", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { glm: { model: "zai/glm-5.3", thoughtLevel: "xhigh" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { glm: { model: "zai/glm-5.3", thoughtLevel: "xhigh" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
@@ -308,26 +316,26 @@ test("depth: catalog-silent zai falls back to the toggle family (GLM today) — 
   // provider-prefix toggle fallback (GLM family) is what fires.
   h.__forgeSubagentsTest.setCatalog({ providers: {} })
   const out = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_g1", agent: "forge-glm", model: { providerID: "zai", modelID: "glm-5.3" } }, out)
+  await h["chat.params"]({ sessionID: "ses_g1", agent: "forge-wire-glm", model: { providerID: "zai", modelID: "glm-5.3" } }, out)
   assert.deepEqual(out.options, {}, "prefix fallback lands on the toggle dead end")
-  assert.match(h.__forgeSubagentsTest.depthFinding("glm") ?? "", /xhigh/)
+  assert.match(h.__forgeSubagentsTest.depthFinding("wire-glm") ?? "", /xhigh/)
 })
 
 test("depth: XHigh in forge.json normalizes at the boundary and ladder-matches", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { mixed: { model: "openai/gpt", thoughtLevel: "XHigh" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { mixed: { model: "openai/gpt", thoughtLevel: "XHigh" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   h.__forgeSubagentsTest.setCatalog({ providers: { openai: { models: { gpt: { reasoningShape: "effort", reasoningOptions: ["low", "xhigh"] } } } } })
   const out = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_x1", agent: "forge-mixed", model: { providerID: "openai", modelID: "gpt" } }, out)
+  await h["chat.params"]({ sessionID: "ses_x1", agent: "forge-wire-mixed", model: { providerID: "openai", modelID: "gpt" } }, out)
   assert.equal(out.options.reasoningEffort, "xhigh")
 })
 
 test("depth: catalog-silent anthropic resolves adaptive vs budget by model id", async (t) => {
   const dir = projectWithForgeJson(
     t,
-    JSON.stringify({ agents: { "claude-old": { model: "anthropic/claude-4-6", thoughtLevel: "high" }, "claude-new": { model: "anthropic/claude-opus-4-7", thoughtLevel: "xhigh" } } }),
+    JSON.stringify({ pool: "wire", agents: { "claude-old": { model: "anthropic/claude-4-6", thoughtLevel: "high" }, "claude-new": { model: "anthropic/claude-opus-4-7", thoughtLevel: "xhigh" } } }),
   )
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
@@ -335,11 +343,11 @@ test("depth: catalog-silent anthropic resolves adaptive vs budget by model id", 
   h.__forgeSubagentsTest.setCatalog({ providers: {} })
 
   const old = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_a1", agent: "forge-claude-old", model: { providerID: "anthropic", modelID: "claude-4-6" } }, old)
+  await h["chat.params"]({ sessionID: "ses_a1", agent: "forge-wire-claude-old", model: { providerID: "anthropic", modelID: "claude-4-6" } }, old)
   assert.deepEqual(old.options, { thinking: { type: "enabled", budget_tokens: 24576 } }, "legacy budget tiers serve pre-adaptive models")
 
   const neo = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_a2", agent: "forge-claude-new", model: { providerID: "anthropic", modelID: "claude-opus-4-7" } }, neo)
+  await h["chat.params"]({ sessionID: "ses_a2", agent: "forge-wire-claude-new", model: { providerID: "anthropic", modelID: "claude-opus-4-7" } }, neo)
   // Empirically verified option key for the adaptive channel: the host maps
   // top-level options.effort to the native output_config:{effort} wire shape
   // and silently drops reasoningEffort on anthropic transports (the sandbox
@@ -351,11 +359,11 @@ test("depth: catalog-silent anthropic resolves adaptive vs budget by model id", 
   // carries the full ModelInfo with the model name under `id` — not `modelID`.
   // Reading modelID only silently degraded every real-host adaptive model to
   // the budget channel (caught by the postpublish behavioral E2E).
-  const hostShape = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_a3", agent: "forge-claude-new", model: { id: "claude-opus-4-7", providerID: "anthropic" } }, hostShape)
-  assert.equal(hostShape.options.effort, "xhigh", "the ModelInfo.id shape resolves the adaptive channel too")
-  const hostShapeEmpty = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_a4", agent: "forge-claude-old", model: { id: "claude-4-6", providerID: "anthropic" } }, hostShapeEmpty)
+      const hostShape = { options: {} }
+      await h["chat.params"]({ sessionID: "ses_a3", agent: "forge-wire-claude-new", model: { id: "claude-opus-4-7", providerID: "anthropic" } }, hostShape)
+      assert.equal(hostShape.options.effort, "xhigh", "the ModelInfo.id shape resolves the adaptive channel too")
+      const hostShapeEmpty = { options: {} }
+      await h["chat.params"]({ sessionID: "ses_a4", agent: "forge-wire-claude-old", model: { id: "claude-4-6", providerID: "anthropic" } }, hostShapeEmpty)
   assert.deepEqual(hostShapeEmpty.options, { thinking: { type: "enabled", budget_tokens: 24576 } }, "the ModelInfo.id shape resolves the budget channel for legacy models")
 })
 
@@ -390,6 +398,7 @@ test("depth: the production catalog's effort claims for anthropic never pick the
   const dir = projectWithForgeJson(
     t,
     JSON.stringify({
+      pool: "wire",
       agents: {
         "opus47": { model: "anthropic/claude-opus-4-7", thoughtLevel: "xhigh" },
         "opus48": { model: "anthropic/claude-opus-4-8", thoughtLevel: "xhigh" },
@@ -420,26 +429,26 @@ test("depth: the production catalog's effort claims for anthropic never pick the
   // Adaptive era (4-7 / 4-8): the effort word rides options.effort and the
   // dropped-by-transport key NEVER appears — deepEqual pins the options
   // object to EXACTLY that one key.
-  assert.deepEqual(await call("ses_p47x", "opus47", "anthropic", "claude-opus-4-7"), { effort: "xhigh" })
-  assert.deepEqual(await call("ses_p48x", "opus48", "anthropic", "claude-opus-4-8"), { effort: "xhigh" })
+  assert.deepEqual(await call("ses_p47x", "wire-opus47", "anthropic", "claude-opus-4-7"), { effort: "xhigh" })
+  assert.deepEqual(await call("ses_p48x", "wire-opus48", "anthropic", "claude-opus-4-8"), { effort: "xhigh" })
   // A ladder-MATCHED word bypasses the catalog too: had the catalog been
   // consulted, "high" would ride reasoningEffort (confirmed) — the key the
   // transport drops. This is the exact P0-1 production failure.
-  assert.deepEqual(await call("ses_p47h", "opus47high", "anthropic", "claude-opus-4-7"), { effort: "high" })
+  assert.deepEqual(await call("ses_p47h", "wire-opus47high", "anthropic", "claude-opus-4-7"), { effort: "high" })
   // Legacy era (4-6): the budget tier table — the catalog effort claim is
   // not consulted for shape selection.
-  assert.deepEqual(await call("ses_p46x", "opus46", "anthropic", "claude-opus-4-6"), { thinking: { type: "enabled", budget_tokens: 28672 } })
+  assert.deepEqual(await call("ses_p46x", "wire-opus46", "anthropic", "claude-opus-4-6"), { thinking: { type: "enabled", budget_tokens: 28672 } })
   // No minor version = legacy (matrix boundary preserved); the 1024
   // API-minimum tier serves `minimal`.
-  assert.deepEqual(await call("ses_p4m", "opus4", "anthropic", "claude-opus-4"), { thinking: { type: "enabled", budget_tokens: 1024 } })
+  assert.deepEqual(await call("ses_p4m", "wire-opus4", "anthropic", "claude-opus-4"), { thinking: { type: "enabled", budget_tokens: 1024 } })
   // Control (catalog authority intact everywhere else): a non-anthropic
   // catalog effort model still translates by its catalog ladder, matched
   // word confirmed.
-  assert.deepEqual(await call("ses_glmcat", "glmcat", "zai-coding-plan", "glm-5.3"), { reasoningEffort: "high" })
+  assert.deepEqual(await call("ses_glmcat", "wire-glmcat", "zai-coding-plan", "glm-5.3"), { reasoningEffort: "high" })
   // None of this matrix is a dead end: no findings.
-  assert.equal(h.__forgeSubagentsTest.depthFinding("opus47"), null)
-  assert.equal(h.__forgeSubagentsTest.depthFinding("opus46"), null)
-  assert.equal(h.__forgeSubagentsTest.depthFinding("glmcat"), null)
+  assert.equal(h.__forgeSubagentsTest.depthFinding("wire-opus47"), null)
+  assert.equal(h.__forgeSubagentsTest.depthFinding("wire-opus46"), null)
+  assert.equal(h.__forgeSubagentsTest.depthFinding("wire-glmcat"), null)
 })
 
 // ---------------------------------------------------------------------------
@@ -450,7 +459,7 @@ test("depth: the production catalog's effort claims for anthropic never pick the
 // only sessions created after the edit resolve fresh.
 
 test("depth freeze: a legacy-budget dead end freezes nothing-injected; a mid-session word fix reaches only fresh sessions", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { "legacy-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "ultra" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { "legacy-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "ultra" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
@@ -458,57 +467,57 @@ test("depth freeze: a legacy-budget dead end freezes nothing-injected; a mid-ses
 
   // First resolution: "ultra" has no budget tier -> nothing injected + one finding.
   const first = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_fz1", agent: "forge-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, first)
+  await h["chat.params"]({ sessionID: "ses_fz1", agent: "forge-wire-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, first)
   assert.deepEqual(first.options, {}, "a dead end injects nothing — the session is never broken")
-  assert.match(h.__forgeSubagentsTest.depthFinding("legacy-ultra") ?? "", /ultra/)
-  assert.match(h.__forgeSubagentsTest.depthFinding("legacy-ultra") ?? "", /budget/, "the finding names the shape")
+  assert.match(h.__forgeSubagentsTest.depthFinding("wire-legacy-ultra") ?? "", /ultra/)
+  assert.match(h.__forgeSubagentsTest.depthFinding("wire-legacy-ultra") ?? "", /budget/, "the finding names the shape")
   assert.equal(h.__forgeSubagentsTest.depthState("ses_fz1"), null, "the dead end froze as a null translation")
 
   // Mid-session hot edit: the pinned word becomes translatable (a tier word).
   writeFileSync(
     join(dir, ".opencode", "forge.json"),
-    JSON.stringify({ agents: { "legacy-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "high" } } }),
+    JSON.stringify({ pool: "wire", agents: { "legacy-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "high" } } }),
   )
   const second = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_fz1", agent: "forge-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, second)
+  await h["chat.params"]({ sessionID: "ses_fz1", agent: "forge-wire-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, second)
   assert.deepEqual(second.options, {}, "the frozen dead end holds: nothing is injected for the remainder of the session")
   assert.equal(h.__forgeSubagentsTest.depthState("ses_fz1"), null, "the frozen null is not re-resolved by the hot edit")
-  assert.match(h.__forgeSubagentsTest.depthFinding("legacy-ultra") ?? "", /ultra/, "the bounded finding is neither re-recorded nor replaced")
+  assert.match(h.__forgeSubagentsTest.depthFinding("wire-legacy-ultra") ?? "", /ultra/, "the bounded finding is neither re-recorded nor replaced")
 
   // A session created after the edit resolves fresh and injects.
   const fresh = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_fz2", agent: "forge-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, fresh)
+  await h["chat.params"]({ sessionID: "ses_fz2", agent: "forge-wire-legacy-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, fresh)
   assert.deepEqual(fresh.options, { thinking: { type: "enabled", budget_tokens: 24576 } }, "the new session resolves the fixed word on the budget tier table")
 })
 
 test("depth freeze: a dead end stays dead across a mid-session model swap to a word channel; fresh sessions ride the new channel", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { "swap-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "ultra" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { "swap-ultra": { model: "anthropic/claude-opus-4-6", thoughtLevel: "ultra" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   h.__forgeSubagentsTest.setCatalog({ providers: {} })
 
   const first = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_sw1", agent: "forge-swap-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, first)
+  await h["chat.params"]({ sessionID: "ses_sw1", agent: "forge-wire-swap-ultra", model: { providerID: "anthropic", modelID: "claude-opus-4-6" } }, first)
   assert.deepEqual(first.options, {}, "budget-era dead end: nothing injected")
   assert.equal(h.__forgeSubagentsTest.depthState("ses_sw1"), null)
-  assert.match(h.__forgeSubagentsTest.depthFinding("swap-ultra") ?? "", /budget/)
+  assert.match(h.__forgeSubagentsTest.depthFinding("wire-swap-ultra") ?? "", /budget/)
 
   // Mid-session swap: the same pinned word now sits on a WORD channel
   // (openai-family effort) where it would pass through verbatim.
   writeFileSync(
     join(dir, ".opencode", "forge.json"),
-    JSON.stringify({ agents: { "swap-ultra": { model: "openai/gpt", thoughtLevel: "ultra" } } }),
+    JSON.stringify({ pool: "wire", agents: { "swap-ultra": { model: "openai/gpt", thoughtLevel: "ultra" } } }),
   )
   const second = { options: {} }
   // The request itself now carries the effort-channel model — the freeze
   // binds the SESSION, so the resolution still does not flip.
-  await h["chat.params"]({ sessionID: "ses_sw1", agent: "forge-swap-ultra", model: { providerID: "openai", modelID: "gpt" } }, second)
+  await h["chat.params"]({ sessionID: "ses_sw1", agent: "forge-wire-swap-ultra", model: { providerID: "openai", modelID: "gpt" } }, second)
   assert.deepEqual(second.options, {}, "the frozen dead end survives the model swap for the running session")
   assert.equal(h.__forgeSubagentsTest.depthState("ses_sw1"), null)
 
   const fresh = { options: {} }
-  await h["chat.params"]({ sessionID: "ses_sw2", agent: "forge-swap-ultra", model: { providerID: "openai", modelID: "gpt" } }, fresh)
+  await h["chat.params"]({ sessionID: "ses_sw2", agent: "forge-wire-swap-ultra", model: { providerID: "openai", modelID: "gpt" } }, fresh)
   assert.deepEqual(fresh.options, { reasoningEffort: "ultra" }, "the fresh session resolves on the new word channel — pass-through, provider judges")
 })
 
@@ -517,7 +526,7 @@ test("depth freeze: a dead end stays dead across a mid-session model swap to a w
 // "Unconfigured crew initialization gate")
 
 test("crew command: with agents it carries the orchestration rulebook and the roster", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" }, review: { model: "zai/glm", thoughtLevel: "low" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { research: { model: "zai/glm", thoughtLevel: "low" }, review: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
@@ -525,11 +534,13 @@ test("crew command: with agents it carries the orchestration rulebook and the ro
   const cmd = cfg.command["crew"]
   assert.ok(cmd, "the /crew command is registered")
   assert.match(cmd.template, /CREW ORCHESTRATION discipline/)
-  assert.match(cmd.template, /forge-research/, "the live roster is listed")
+  assert.match(cmd.template, /forge-wire-research/, "the live roster is listed with NAMESPACED ids")
   assert.match(cmd.template, /crew_begin/, "the declared-plan registration step is present")
   assert.match(cmd.template, /native\s+`?task`?\s+calls/, "waves ride the native task channel")
   assert.match(cmd.template, /no configured forge-\* agent matches/, "missing-role fallback discipline present")
   assert.doesNotMatch(cmd.template, /forge_dispatch|background|\[forge:dispatch-complete\]/, "no dispatch-era vocabulary remains")
+  assert.ok(!cmd.template.includes("non-primary"), "no non-primary wording remains")
+  assert.ok(!cmd.template.includes("primary pool"), "no primary-pool wording remains")
 })
 
 test("crew command: unconfigured is a HARD gate with initialization guidance", async (t) => {
@@ -552,18 +563,25 @@ test("crew command: unconfigured is a HARD gate with initialization guidance", a
   assert.match(cmd.template, /WITHOUT the `forge-` prefix/, "the plain-role-word naming rule")
   assert.match(cmd.template, /research.*review.*built-in|built-in.*research/is, "discloses which ids carry built-in roles")
   assert.match(cmd.description, /NOT INITIALIZED/)
+  // pool-namespace-contract 3.4: the embedded template teaches the new id
+  // truth and the crew compliance requirement — no primary-era wording.
+  assert.match(cmd.template, /every pool materializes as forge-<ns>-<id>/, "the namespaced materialization truth")
+  assert.match(cmd.template, /the global fallback materializes as forge-global-<id>/, "the global fallback id shape")
+  assert.match(cmd.template, /REQUIRED for crew-governed dispatch/, "the pool field is stated as the crew compliance requirement")
+  assert.ok(!cmd.template.includes("non-primary"), "no non-primary wording remains")
+  assert.ok(!cmd.template.includes("primary pool"), "no primary-pool wording remains")
 })
 
 test("materialization: a forge--prefixed id self-heals — single-prefix agent, no doubling", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { "forge-coder": { model: "zai/glm", thoughtLevel: "low" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { "forge-coder": { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
-  assert.ok(cfg.agent["forge-coder"], "materialized under the single-prefix name")
-  assert.ok(!cfg.agent["forge-forge-coder"], "no doubled prefix")
-  assert.match(cfg.command["crew"].template, /forge-coder/, "the roster lists the healed name")
-  assert.doesNotMatch(cfg.command["crew"].template, /forge-forge-coder/)
+  assert.ok(cfg.agent["forge-wire-coder"], "materialized under the single-prefix namespaced name")
+  assert.ok(!cfg.agent["forge-wire-forge-coder"], "no doubled prefix")
+  assert.match(cfg.command["crew"].template, /forge-wire-coder/, "the roster lists the healed name")
+  assert.doesNotMatch(cfg.command["crew"].template, /forge-wire-forge-coder/)
 })
 
 test("crew command: a user-defined /crew command is never clobbered", async (t) => {
@@ -580,18 +598,18 @@ test("crew command: a user-defined /crew command is never clobbered", async (t) 
 // gate" + declared-plan registration)
 
 test("crew_begin: registers the declared plan; refuses duplicates within the plan", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
 
   await h.tool.crew_begin.execute(
-    { objective: "ship it", subtasks: [{ title: "alpha", agent: "forge-research" }, { title: "beta" }] },
+    { objective: "ship it", subtasks: [{ title: "alpha", agent: "forge-wire-research" }, { title: "beta" }] },
     allowCtx("ses_c1"),
   )
   const crew = h.__forgeSubagentsTest.crews().get("ses_c1")
   assert.ok(crew, "the crew is registered")
-  assert.deepEqual(crew.subtasks, [{ title: "alpha", agent: "forge-research" }, { title: "beta" }])
+  assert.deepEqual(crew.subtasks, [{ title: "alpha", agent: "forge-wire-research" }, { title: "beta" }])
 
   await assert.rejects(
     () => h.tool.crew_begin.execute({ objective: "another", subtasks: [{ title: "x" }] }, allowCtx("ses_c1")),
@@ -628,6 +646,8 @@ test("crew_begin: HARD initialization gate — empty agent set refuses with guid
       assert.match(m, /EXPLICIT shape/, "the refusal carries the explicit-shape mandate")
       assert.match(m, /SHORT prompt/, "the refusal carries the short-prompt mandate")
       assert.match(m, /WITHOUT the `forge-` prefix/, "the refusal carries the naming rule")
+      assert.match(m, /REQUIRED for crew-governed dispatch/, "the refusal states the pool-field compliance requirement")
+      assert.ok(!m.includes("non-primary"), "no non-primary wording in the refusal")
       return true
     },
   )
@@ -761,7 +781,7 @@ test("crew_begin: refuses during a plan draft", async (t) => {
 })
 
 test("crew_close: incomplete, renegade, and honest-FAIL reports behave per spec", async (t) => {
-  const dir = projectWithForgeJson(t, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  const dir = projectWithForgeJson(t, JSON.stringify({ pool: "wire", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
@@ -814,7 +834,7 @@ test("crew_close: no active crew refuses", async (t) => {
 // lifecycle (register PENDING -> arm), the pending dispatch belt, the goal
 // conversion path, the abandon path, origin disclosure, the crew record.
 
-const poolJson = JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+const poolJson = JSON.stringify({ pool: "wire", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
 const beltArgs = () => ({ args: { subagent_type: "general", prompt: "x" } })
 
 test("crew lifecycle: registration PENDS — three-choice surface, dispatch belt, arm call", async (t) => {

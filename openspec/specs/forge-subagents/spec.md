@@ -71,7 +71,7 @@ Subagents SHALL be configured in a dedicated `forge.json` (JSONC — comments al
 
 ### Requirement: Materialization as native subagents with a pinned model
 
-The config hook SHALL materialize each configured agent as a `mode: subagent` agent `forge-<id>` that is visible to the host's native `task` tool vocabulary (discoverable by the model, excluded from the Tab cycle by its subagent mode), a prompt composed of the worker discipline wrapped around the role prompt, and a deny-style permission: `shape: "readonly"` (the default) denies mutating tools, `shape: "write"` allows them, an explicit `permission` map overrides the shape-derived default — and every agent SHALL deny `task` regardless (recursive spawning stays physically impossible). A pinned entry's materialized agent SHALL carry the definition's pinned `model` (the brain is bound at materialization — there is no per-call model selection); an Auto entry's materialized agent SHALL carry no `model` key at all, deferring to the host's native spawn behavior — the parent session's current model binds at dispatch time (snapshot semantics: later primary model switches do not affect already-dispatched runs). The task-vocabulary description SHALL name the role and, for a pinned entry, the pinned brain; an Auto entry's description SHALL state that it inherits the parent session's model instead of claiming a pinned identity. The worker discipline embedded in the prompt SHALL mandate workspace-relative paths only (never absolute paths outside the workspace), verbatim reporting of tool refusals instead of improvising workarounds, and conclusions carrying evidence references; readonly agents are additionally told to report rather than work around restrictions. Materialization SHALL be create-only: a user-defined entry of the same id is never touched (identically under the v2 `setup` entry point, which registers the same agents on a create-only basis). When `agent["forge"].disable` is set no subagents SHALL be registered.
+The config hook SHALL materialize each configured agent as a `mode: subagent` agent `forge-<id>` that is visible to the host's native `task` tool vocabulary (discoverable by the model, excluded from the Tab cycle by its subagent mode), a prompt composed of the worker discipline wrapped around the role prompt, and a deny-style permission: `shape: "readonly"` — which MUST be explicit — denies the full mutating-tool family — `write`, `edit`, `bash`, and the host's patch-family tools (`patch`, `applypatch`, `apply`, `multiedit`); `shape: "write"` allows them, and an ABSENT `shape` field SHALL default to `write` (open permissions — readonly is a restriction the pool author must ask for explicitly, never a surprise default); an explicit `permission` map overrides the shape-derived default — and every agent SHALL deny `task` regardless (recursive spawning stays physically impossible). A pinned entry's materialized agent SHALL carry the definition's pinned `model` (the brain is bound at materialization — there is no per-call model selection); an Auto entry's materialized agent SHALL carry no `model` key at all, deferring to the host's native spawn behavior — the parent session's current model binds at dispatch time (snapshot semantics: later primary model switches do not affect already-dispatched runs). The task-vocabulary description SHALL name the role and, for a pinned entry, the pinned brain; an Auto entry's description SHALL state that it inherits the parent session's model instead of claiming a pinned identity. The worker discipline embedded in the prompt SHALL mandate workspace-relative paths only (never absolute paths outside the workspace), verbatim reporting of tool refusals instead of improvising workarounds, and conclusions carrying evidence references; readonly agents are additionally told to report rather than work around restrictions. Materialization SHALL be create-only: a user-defined entry of the same id is never touched (identically under the v2 `setup` entry point, which registers the same agents on a create-only basis). When `agent["forge"].disable` is set no subagents SHALL be registered.
 
 #### Scenario: Agent entries carry the pinned model
 
@@ -80,13 +80,23 @@ The config hook SHALL materialize each configured agent as a `mode: subagent` ag
 
 #### Scenario: An Auto worker materializes without a model key
 
-- **WHEN** the plugin loads with a forge.json defining `scout: {}` (no `model`, no `thoughtLevel`) and the injected agent set is inspected
-- **THEN** `forge-scout` is a subagent-mode agent with no `model` field, listed for the native task tool, with the same deny-style permission including `task: deny`, and a description that names inheritance rather than a pinned identity
+- **WHEN** the plugin loads with a forge.json defining `scout: {}` (no `model`, no `thoughtLevel`, no `shape`) and the injected agent set is inspected
+- **THEN** `forge-scout` is a subagent-mode agent with no `model` field, listed for the native task tool, with the same deny-style permission including `task: deny`, a description that names inheritance rather than a pinned identity — and, defining no `shape`, OPEN write permissions (the absent-shape default)
 
 #### Scenario: The materialized prompt embeds the discipline
 
 - **WHEN** the composed prompt of a materialized agent is inspected
 - **THEN** it contains the workspace-relative-path mandate and the verbatim-refusal-reporting mandate, wrapped around the agent's role prompt (explicit `prompt` overriding the built-in role default)
+
+#### Scenario: The readonly deny face covers the patch family
+
+- **WHEN** an agent with an EXPLICIT `shape: "readonly"` has its materialized permission enumerated
+- **THEN** `patch`, `applypatch`, `apply`, and `multiedit` are denied alongside `write`, `edit`, and `bash`, and `task` stays denied for every shape; the same family governs the draft-phase shape gate's lifting test (a permission override that lifts any of them out of `deny` disqualifies the readonly exemption)
+
+#### Scenario: An absent shape defaults to open permissions
+
+- **WHEN** a pool defines `ta-tool: {model: "prov/x"}` with NO `shape` field and the materialized permission is inspected
+- **THEN** the mutating-tool family is not denied (open write permissions), `task` stays denied — and the draft-phase recon exemption does NOT apply to this agent (the exemption keys on an explicitly readonly shape; a shape-less agent is not draft-exempt)
 
 #### Scenario: A permission override keeps the recursion ban
 
@@ -105,22 +115,47 @@ The config hook SHALL materialize each configured agent as a `mode: subagent` ag
 
 ### Requirement: Pinned thoughtLevel injection keyed by agent name
 
-For any session running a `forge-<id>` agent, the plugin SHALL translate that agent's pinned `thoughtLevel` to the provider's native parameter and stamp it onto the LLM request via the `chat.params` hook, keyed by the agent name (stable across sessions and spawn paths — no per-dispatch session table). Translation SHALL follow the family rules: effort-style families receive the effort word verbatim when natively valid; budget-style families receive the documented budget tier per meta word (`none` → thinking off); toggle-style families receive on/off; the verbatim-first and no-interpolation rules SHALL govern. An agent without `thoughtLevel`, a word with no native counterpart on the family, or a provider absent from the family map SHALL inject nothing — and in the no-counterpart case SHALL record a bounded finding naming both vocabularies (the worker session itself must never be broken by an untranslatable word). The injected value SHALL remain stable for the whole session (never rewritten mid-session).
+For any session running a `forge-<id>` agent, the plugin SHALL translate that agent's pinned `thoughtLevel` to the provider's native parameter and stamp it onto the LLM request via the `chat.params` hook, keyed by the agent name (stable across sessions and spawn paths — no per-dispatch session table). The meta vocabulary SHALL be the seven-word dictionary `none / minimal / low / medium / high / xhigh / max` — a translation dictionary, never a whitelist. The pinned word SHALL be normalized at the configuration boundary (trimmed and lowercased — `High` and `XHigh` behave exactly as `high` and `xhigh`) with a warn finding recorded when normalization changed the value. Wire-shape resolution SHALL be data-driven in a fallback chain: when the models.dev catalog carries `reasoning_options` for the model, the shape (effort word list / toggle / token budget) SHALL come from that data for every provider family EXCEPT anthropic, with the ladder matched case-insensitively and the catalog's native casing emitted on the wire; for the anthropic family the shape SHALL instead be resolved from the empirically verified transport matrix — adaptive-era models receive the adaptive effort channel, legacy-era models receive the budget tier table — regardless of what the catalog carries, because the current host generation's anthropic transport silently drops the effort-word key a catalog effort shape would select. A model the catalog is silent on SHALL fall back to the provider-prefix family map; a provider absent from both SHALL be treated as an effort-word channel by default. A word that matches neither the dictionary nor the model's ladder SHALL pass through VERBATIM on word-shaped channels, disclosed as unverified — the provider is the final judge, and a provider-side rejection surfaces as the request's own error, never swallowed by the plugin. Legacy budget-only models and toggle-only endpoints — the shapes with no word channel — are the only no-counterpart cases: there the plugin SHALL inject nothing and record a bounded finding naming both vocabularies (the worker session itself must never be broken by the plugin). Budget-tier translation on legacy budget models SHALL use the documented tier table per meta word (`none` → thinking off; the table carries tiers for `minimal` and `xhigh`). Adaptive-era Anthropic models SHALL receive the effort word on the empirically verified adaptive effort key; the plugin does not own transport-layer capability probing, so the patched-host presumption (a host generation whose anthropic transport maps the adaptive key onto the wire) is a documented limitation in the README, not a runtime-detectable condition. The verbatim-first and no-interpolation rules SHALL govern every translation (a word passes as-is or is refused with a finding — it is never remapped to a different level). An agent without `thoughtLevel` SHALL inject nothing. The session's first depth resolution — including a no-mapping (dead-end) resolution — SHALL be frozen for the whole session: neither the injected value nor the absence of injection is rewritten mid-session, and configuration edits affect only sessions created afterwards.
 
 #### Scenario: The pinned depth reaches the provider request
-
 - **WHEN** a session runs `forge-research` pinned `thoughtLevel: "low"` on an effort-style family provider
 - **THEN** that session's chat.params writes `options.reasoningEffort = "low"` and keeps it stable across turns
 
 #### Scenario: Absent thoughtLevel injects nothing
-
 - **WHEN** an agent defines no `thoughtLevel`
 - **THEN** the provider's default applies and no reasoning option is injected
 
 #### Scenario: An untranslatable word degrades to a finding, not a broken session
+- **WHEN** a pinned word has no counterpart on a shape with no word channel — a legacy budget-only model offered a word outside the tier table, or a toggle-only endpoint offered `xhigh`
+- **THEN** nothing is injected, the session runs at the provider default, and a bounded finding naming the shape's vocabulary and the meta dictionary is recorded once
 
-- **WHEN** an agent pins `thoughtLevel: "medium"` on a provider whose native vocabulary has no `medium`
-- **THEN** nothing is injected, the session runs at the provider default, and a finding naming the model's native levels and the meta words is recorded once
+#### Scenario: Case variants normalize at the boundary
+- **WHEN** forge.json pins `thoughtLevel: "High"` (or `"XHigh"`) and the entry loads
+- **THEN** the pinned word normalizes to `high` (or `xhigh`), injection behaves exactly as the lowercase word, and a warn finding records the normalization once
+
+#### Scenario: An unknown word passes through on word channels
+- **WHEN** an agent pins `thoughtLevel: "ultra"` on an effort-word channel and the model's ladder does not list it
+- **THEN** the word is injected verbatim with an unverified disclosure, and any provider-side rejection surfaces as the request's own error — the plugin neither swallows it nor breaks the session itself
+
+#### Scenario: The catalog decides the shape, with prefix fallback
+- **WHEN** the models.dev catalog carries `reasoning_options` for the model (effort values / toggle / budget), is silent for another model on a known provider, and absent for a custom provider
+- **THEN** the first model translates by its catalog shape (ladder matched case-insensitively, catalog casing emitted), the second falls back to the provider-prefix family, and the third defaults to effort-word pass-through
+
+#### Scenario: Catalog effort metadata does not override the verified anthropic matrix
+- **WHEN** the models.dev catalog carries `reasoning_options` of type effort for `anthropic/claude-opus-4-7` and `anthropic/claude-opus-4-6` (as the production catalog does) and agents pin `thoughtLevel: "xhigh"` on each
+- **THEN** the adaptive-era model translates on the empirically verified adaptive effort key (never the effort-word key the current host generation's anthropic transport silently drops), and the legacy-era model translates on the budget tier table — the catalog's effort claim for the anthropic family is not consulted for shape selection
+
+#### Scenario: Adaptive-era Anthropic models receive the effort word
+- **WHEN** an adaptive-era Anthropic model is pinned `thoughtLevel: "xhigh"` on a host whose anthropic transport maps the adaptive effort key onto the wire
+- **THEN** the effort word reaches the wire on that key as-is; the patched-host presumption is documented in the README (the plugin performs no transport-layer capability probing)
+
+#### Scenario: Budget tiers cover the seven-word dictionary
+- **WHEN** a legacy budget-tier model is pinned `minimal` or `xhigh`
+- **THEN** the documented tier table resolves them (the published floors/caps, including the 1024 API-minimum tier for `minimal`) and the README table remains the verbatim source
+
+#### Scenario: A dead-end resolution freezes like any other
+- **WHEN** a session's first depth resolution is a dead end (no-counterpart shape) and the user then edits forge.json mid-session in a way that would make the pinned word translatable
+- **THEN** nothing is injected for the remainder of that session and the bounded finding is not re-recorded; a session created after the edit resolves fresh and injects
 
 ### Requirement: Field-level fail-soft validation
 
@@ -143,7 +178,7 @@ forge.json parsing SHALL degrade semantically invalid content at the smallest en
 
 ### Requirement: Native-task dispatch surface
 
-The plugin SHALL NOT register any dispatch tool: no `forge_dispatch`, `forge_dispatch_config`, `forge_dispatch_list`, or `forge_dispatch_kill`. forge subagents are spawned through the host's native `task` tool, and their runs render in the host UI with the native subagent affordances (progress visibility, expandable transcript). Plan-draft interop SHALL be inherited from the plan harness's existing spawn-class deny (the `task` tool is already denied while a draft exists); the plugin adds no dispatch-specific refusal.
+The plugin SHALL NOT register any dispatch tool: no `forge_dispatch`, `forge_dispatch_config`, `forge_dispatch_list`, or `forge_dispatch_kill`. forge subagents are spawned through the host's native `task` tool, and their runs render in the host UI with the native subagent affordances (progress visibility, expandable transcript). Plan-draft interop SHALL be shape-gated inheritance from the plan harness's write ban: while a draft is active in the dispatching session, a task call to a forge subagent of effective readonly shape (definition `shape` not `"write"` and no permission override lifting `write`/`edit`/`bash` off `"deny"`) passes the ban as a reconnaissance dispatch, while a task call to any other target — write-shape workers included — is refused by the same write-class deny as any native task call. The plugin SHALL add no dispatch-specific refusal beyond the plan harness's shape gate: a readonly-shape dispatch during a draft creates no new refusal surface, and the recursion ban (`task: deny` forced on every worker regardless of shape and overrides) keeps a dispatched scout physically incapable of spawning further.
 
 #### Scenario: No dispatch tools are registered
 
@@ -158,58 +193,48 @@ The plugin SHALL NOT register any dispatch tool: no `forge_dispatch`, `forge_dis
 #### Scenario: Draft-plan interop is inherited
 
 - **WHEN** the session has an active draft plan and the model attempts a task call to a forge subagent
-- **THEN** the existing plan-harness write ban refuses it exactly as for any native task call — no plugin-side dispatch refusal exists to bypass or maintain
+- **THEN** the plan harness's own write ban decides it by target shape — the call passes as a reconnaissance dispatch when the target resolves to effective readonly shape, and is refused with roster guidance when the target is a write-shape worker or an unresolvable/native target; no plugin-side dispatch refusal exists beyond that gate
 
-### Requirement: Hierarchical pool materialization on shared hosts
+#### Scenario: A dispatched scout cannot recurse or write
 
-On a host whose plugin has been initialized with one or more directories (agent frontends routinely share one host process across projects), materialization SHALL resolve from an append-only **anchor set**: every initialization directory joins the set exactly once (normalized — resolved real path with case-folding on win32 — so the same directory cannot double-add) and the first entry is the primary anchor; no anchor SHALL be removed or replaced within the host's lifetime, and a re-initialization with a different directory SHALL NOT remove or replace any materialized agent (anchor flips never mutate the vocabulary; file truth always does). For each anchor the plugin SHALL resolve a pool family: the root pool (the nearest `.opencode/forge.json` walking up from the anchor, merged over the global layer per agent id) plus every sub-pool file at `<subdirectory>/.opencode/forge.json` within the anchor's subtree, discovered by a bounded **breadth-first descent in lexicographic sibling order** that skips dependency directories (`node_modules`, `.git`, `dist`, `build`, `out`, `target`, `.cache`, `venv`, `.venv`, `__pycache__`, `coverage`) and caps the scanned-directory count per anchor (default 2,000 — when the cap is reached no further directories are opened in that order), mtime-caching directories so unchanged subtrees are not rescanned; a sub-pool's own ancestor chain SHALL NOT be consulted (the root pool already carries it). A pool's identity SHALL be its absolute file path: the same file reached through two anchors' resolutions SHALL materialize exactly once. A pool file that fails JSONC parsing SHALL contribute no agents for that pool, with an error finding carrying the parse location, while every other pool and the global layer still materialize. Pool resolution order SHALL be deterministic: the primary anchor's root pool first, then the remaining pools ordered lexicographically by absolute file path. Materialized ids: the primary anchor's root pool SHALL keep plain `forge-<id>` ids (a single-anchor host is unchanged in behavior and roster); every other family SHALL materialize as `forge-<ns>-<id>`, where `ns` is the file's `pool` field when valid and otherwise the sanitized directory basename (lowercased; each run of characters outside `[a-z0-9-]` collapsed to a single `-`; leading and trailing `-` trimmed; an empty result falls back to the literal namespace `pool`). Namespace collisions across distinct files SHALL be disambiguated deterministically: in resolution order, the first file keeps the short namespace and later colliding files receive an incrementing hyphen suffix (`-2`, `-3`, …) until unique across both derived and declared namespaces, with an error finding naming both files. Where two distinct families would compose the same materialized agent id (a plain primary id matching a namespaced id, or two namespaced families composing to one), the same deterministic order decides: the earlier pool's agent materializes and the later pool's colliding agent SHALL be skipped with an error finding naming both files — no silent shadowing. Id normalization (including `forge-` prefix stripping) SHALL apply to the raw id BEFORE namespace composition, and the namespace infix SHALL never be parsed back out of a materialized id. Every materialized agent — plain or namespaced — SHALL carry identical per-agent semantics (pinned pair or Auto worker, shape-derived permission with the recursion ban, worker discipline, depth injection keyed by the materialized name). Presentation of the dispatchable roster grouped by pool with origins is governed by the crew-harness capability's `/crew` command discipline requirement.
+- **WHEN** a readonly forge subagent runs as a reconnaissance dispatch during a draft
+- **THEN** its own `task` calls are denied by the forced recursion ban and its write/edit/bash calls are denied by its materialized permission map — the carve-out transports no mutation path
 
-#### Scenario: Anchor re-initialization never flips the vocabulary
+### Requirement: Workspace pool ownership and global fallback
 
-- **WHEN** a shared host initializes the plugin with `C:/Temp1` and later re-initializes it with `D:/TempOpenUnity` (a session from another project appearing)
-- **THEN** the agents materialized from the `C:/Temp1` anchor set remain registered and dispatchable — the later initialization only ADDS the new anchor's pools; no template, gate, or vocabulary ever reverts to an earlier or different anchor's view
+A session's dispatchable pool set SHALL be exactly: the session's WORKSPACE pool — the nearest `.opencode/forge.json` discovered by walking up from the session's effective worktree — plus the global layer (`~/.config/opencode/forge.json`) as a FALLBACK ONLY: when the workspace has a pool file, the global layer is NOT consulted for that session's dispatch roster (the workspace pool is the whole roster — fallback, not merge); when the workspace has none, the global layer serves as the whole roster. `forge.json` files nested DEEPER in the workspace's subtree (any directory below the owning one) SHALL be ignored entirely — the same workspace-ownership strictness as the host's native MCP config; a git checkout or subfolder carrying its own forge.json does not split or extend the pool. On a host where multiple workspaces' pools have been materialized (host-wide vocabulary keeps them registered, non-primary namespaces `forge-<ns>-<id>` preventing id collisions — the `pool` field preferred as the stable namespace), the plugin's task-dispatch guard SHALL scope dispatch SESSION-LOCALLY: a task call targeting an agent whose pool belongs to ANOTHER workspace SHALL be refused with a finding that names the target's origin pool path, states it is not dispatchable from this session, and names the exits (open the session in that workspace, or configure the role into this workspace's pool or the global layer). The primary workspace pool materializes as plain ids; the host-wide materialization set is the union of the global layer and every workspace pool the host has seen (hot-applied per the existing mtime contract; there is no append-only anchor set — a pool file deleted from disk disappears from materialization). Sessions whose workspace cannot be observed (unknown anchor) keep the existing fail-open belt posture with a disclosure.
 
-#### Scenario: Sub-pools are discovered by the bounded subtree scan
+#### Scenario: The workspace pool is the whole roster
 
-- **WHEN** the anchor is `C:/Temp1` (root forge.json present) and `C:/Temp1/devAa/.opencode/forge.json` exists while `devAb` has no forge.json
-- **THEN** the anchor's family resolves as the root pool plus the `devAa` sub-pool; a session anchored at `C:/Temp1` can dispatch both the root pool's plain-id agents and the sub-pool's namespaced agents in the same crew
+- **WHEN** a session's worktree is `F:\unity_project\sorenunitylabs` (which carries `.opencode/forge.json`) and `~/.config/opencode/forge.json` also exists with different agents
+- **THEN** the session's dispatchable roster is exactly the workspace pool's agents — the global layer is not merged in, and its agents are not dispatchable from this session
 
-#### Scenario: The skip-list and budget bound the scan
+#### Scenario: A poolless workspace falls back to the global layer
 
-- **WHEN** the anchor's subtree contains `node_modules/pkg/.opencode/forge.json` or exceeds the scanned-directory budget
-- **THEN** the skipped or over-budget pool files contribute nothing (no agents, no findings about them), and the scan completes without traversing the skipped trees
+- **WHEN** a session's worktree has no `.opencode/forge.json` anywhere up its chain and the global layer exists
+- **THEN** the global layer serves as the session's whole dispatch roster
 
-#### Scenario: The same file via two anchors materializes once
+#### Scenario: Nested forge.json files are ignored
 
-- **WHEN** one host's anchor set contains both `C:/Temp1` and `C:/Temp1/devAc`, so the root anchor's subtree scan and the devAc anchor's walk-up both reach `C:/Temp1/devAc/.opencode/forge.json`
-- **THEN** that file's family materializes exactly once under a single namespace — the two discovery paths deduplicate by file identity
+- **WHEN** a workspace owns `.opencode/forge.json` at its root and a nested folder (e.g. a cloned repo with its own `.opencode/forge.json`) sits deeper in the subtree
+- **THEN** the nested file contributes nothing — no agents, no families — on this host's materialization and no session in the outer workspace can dispatch from it
 
-#### Scenario: The primary root pool keeps plain ids; other families are namespaced
+#### Scenario: Cross-workspace dispatch is refused with exits
 
-- **WHEN** the primary anchor's root pool defines `shader` and a second anchor's root pool also defines `shader`
-- **THEN** the primary's agent is `forge-shader` while the second's is `forge-<ns>-shader` — two distinct agents, no silent shadowing, and a single-anchor host's roster is byte-compatible with the pre-hierarchy behavior
+- **WHEN** a session in workspace A dispatches a task targeting `forge-<nsB>-coder`, whose pool origin is workspace B's forge.json
+- **THEN** the dispatch is refused; the finding names workspace B's forge.json path, states it is not dispatchable from this session, and lists the exits (open a session in workspace B, or configure the role into this workspace's pool / the global layer)
 
-#### Scenario: A namespace collision is disambiguated with a finding
+#### Scenario: Same-id agents across workspaces stay collision-free
 
-- **WHEN** two distinct pool files derive or declare the same namespace (both directory-named `dev`)
-- **THEN** in deterministic resolution order (primary root pool first, then lexicographic by file path) the first file keeps the short namespace, the later file's agents carry the incrementing suffix form (`-2`, `-3`, … unique across derived and declared namespaces), and an error finding names both files
+- **WHEN** two workspaces' pools both define a `coder` agent and both are materialized on one host
+- **THEN** the primary workspace's materializes as `forge-coder` (or namespaced by its `pool` field) and the other's as `forge-<nsB>-coder` — no silent overwrite; the session-local dispatch guard is the authority on which one a given session may call
 
-#### Scenario: A cross-family materialized-id collision is never silently shadowed
+#### Scenario: Pool deletion un-materializes
 
-- **WHEN** the primary root pool defines the id `aa-shader` (→ `forge-aa-shader`) and a sub-pool with `"pool": "aa"` defines `shader` (→ `forge-aa-shader`)
-- **THEN** the deterministic order decides — the primary root pool's agent materializes as `forge-aa-shader`, the sub-pool's colliding agent is skipped, and an error finding names both files; the namespace infix is never parsed back out of a materialized id
+- **WHEN** a workspace's forge.json is deleted from disk and the next config hook runs
+- **THEN** its agents disappear from the host's materialization set (no append-only residue) and sessions in that workspace fall back to the global layer if one exists
 
-#### Scenario: A broken pool file empties only its own family
+#### Scenario: Unknown session anchor keeps the fail-open belt
 
-- **WHEN** one sub-pool forge.json fails JSONC parsing while other pools and the global layer are loadable
-- **THEN** that pool contributes no agents with an error finding carrying the parse location, and every other pool plus the global layer still materialize
-
-#### Scenario: Namespaced agents carry identical per-agent semantics
-
-- **WHEN** a namespaced `forge-aa-shader` (pinned pair, `shape: "write"`) is dispatched through the native task tool
-- **THEN** it runs the pinned model with the write-shape permission minus the recursion ban, the worker discipline in its prompt, and its depth injected keyed by the materialized name — indistinguishable in semantics from any plain-id agent
-
-#### Scenario: A new pool file in a subtree hot-applies
-
-- **WHEN** the user creates `C:/Temp1/devAa/.opencode/forge.json` on a running host and the next config hook fires
-- **THEN** the sub-pool's agents appear in the vocabulary and roster without a host restart, and deleting the file removes the family again (file truth hot-applies in both directions)
+- **WHEN** a task-dispatching session's workspace cannot be observed
+- **THEN** the existing fail-open belt posture applies, with a disclosure that the session's pool ownership could not be established

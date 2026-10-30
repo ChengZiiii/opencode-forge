@@ -39,13 +39,38 @@ export function rolePromptFor(agentId: string, def?: { prompt?: string }): strin
   return ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`
 }
 
+// pool-namespace-contract D3: POOL PROVENANCE — static, per-family,
+// host-wide truth baked into the task-vocabulary description at
+// materialization. The v1 config hook cannot vary descriptions per session,
+// and static text is true in every session: the session-domain dispatch
+// gate stays the dynamic authority, the description is the honest label the
+// dispatching model reads when picking an agent id. A workspace family
+// names its namespace + origin forge.json path + the dispatchability
+// restriction; the global fallback family names the global layer as its
+// origin (spec: "origin: the global fallback layer"). ABSENT provenance
+// leaves the description byte-identical to the pre-provenance build —
+// existing call sites (pre-wiring) compile and behave identically.
+export type PoolProvenance = { ns: string; file: string } | { global: true }
+
+export function poolProvenanceLine(provenance: PoolProvenance): string {
+  if ("global" in provenance) {
+    // The global fallback layer serves pool-less workspaces everywhere —
+    // no single file is the origin, so no dispatchability restriction
+    // clause applies (the spec pins the wording verbatim).
+    return `Pool 'global' — origin: the global fallback layer.`
+  }
+  return `Pool '${provenance.ns}' — origin ${provenance.file}; dispatchable only from sessions whose workspace pool is this file.`
+}
+
 // Short task-tool description: this is what the dispatching model sees in
 // the task tool vocabulary, so it names the role and the brain — the pinned
-// identity for pinned workers, the inheritance semantics for Auto workers.
-export function agentDescriptionFor(agentId: string, def: ForgeAgentDef): string {
+// identity for pinned workers, the inheritance semantics for Auto workers —
+// plus, when provenance is supplied, the one-sentence pool provenance line.
+export function agentDescriptionFor(agentId: string, def: ForgeAgentDef, provenance?: PoolProvenance): string {
   const shape = def.shape === "readonly" ? "readonly" : "write"
   const brain = def.model !== undefined ? `pinned ${def.model}` : "auto — inherits the parent session's model at dispatch"
-  return `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`
+  const base = `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`
+  return provenance === undefined ? base : `${base} ${poolProvenanceLine(provenance)}`
 }
 
 // Materialize one forge.json agent as a config-agent entry. A pinned
@@ -57,7 +82,11 @@ export function agentDescriptionFor(agentId: string, def: ForgeAgentDef): string
 // surface (tool-partition spec): every worker — regardless of shape — runs
 // commands only through forge_shell, so the builtin shell/bash pair is
 // hidden at materialization.
-export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<string, unknown> {
+export function forgeAgentDef(
+  agentId: string,
+  def: ForgeAgentDef,
+  provenance?: PoolProvenance,
+): Record<string, unknown> {
   const permission: Record<string, string> = { task: "deny" }
   // shape-default-open: an ABSENT shape defaults to WRITE (open permissions
   // — readonly is a restriction the pool author must ask for explicitly,
@@ -70,7 +99,7 @@ export function forgeAgentDef(agentId: string, def: ForgeAgentDef): Record<strin
   Object.assign(permission, def.permission ?? {})
   permission.task = "deny" // an override never lifts the recursion ban
   const entry: Record<string, unknown> = {
-    description: agentDescriptionFor(agentId, def),
+    description: agentDescriptionFor(agentId, def, provenance),
     mode: "subagent",
     prompt: materializeAgentPrompt({
       agent: agentId,

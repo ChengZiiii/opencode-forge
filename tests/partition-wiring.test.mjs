@@ -93,11 +93,11 @@ test("partition config: forge-* workers lose harness state tools but keep the ex
   const wt = mkdtempSync(join(tmpdir(), "part-worker-"))
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { builder: { model: "x/y", thoughtLevel: "low", shape: "write" } } }))
+    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "part", agents: { builder: { model: "x/y", thoughtLevel: "low", shape: "write" } } }))
     const h = await startServer(inputFor(wt), {})
     const cfg = { agent: {} }
     await h.config(cfg)
-    const worker = cfg.agent["forge-builder"]
+    const worker = cfg.agent["forge-part-builder"]
     assert.ok(worker, "worker materialized")
     assert.equal(worker.tools.shell, false, "builtin shell hidden at materialization")
     assert.equal(worker.tools.bash, false)
@@ -314,7 +314,7 @@ test("recon gate: explicit-readonly dispatch passes during draft; every other ta
   const wt = mkdtempSync(join(tmpdir(), "part-recon-"))
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: RECON_ROSTER }))
+    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "part", agents: RECON_ROSTER }))
     const h = await startServer(inputFor(wt), {})
     const cfg = { agent: {} }
     await h.config(cfg)
@@ -325,15 +325,15 @@ test("recon gate: explicit-readonly dispatch passes during draft; every other ta
     )
 
     // 1. explicit-readonly target passes the write-class ban (no throw).
-    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1" }, { args: { subagent_type: "forge-scout", prompt: "x" } })
+    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1" }, { args: { subagent_type: "forge-part-scout", prompt: "x" } })
 
     // 1b. shape-default-open: an absent shape defaults to write — the scout
     //     is NOT draft-exempt (same refusal, roster unchanged).
     await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1b" }, { args: { subagent_type: "forge-bare", prompt: "x" } }),
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1b" }, { args: { subagent_type: "forge-part-bare", prompt: "x" } }),
       (err) => {
         assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
-        assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-scout\./, "roster carries exactly the explicit-readonly worker")
+        assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-part-scout\./, "roster carries exactly the explicit-readonly worker")
         assert.match(err.message, /plan_approve/)
         assert.match(err.message, /\/plan discard/)
         return true
@@ -342,11 +342,11 @@ test("recon gate: explicit-readonly dispatch passes during draft; every other ta
 
     // 2. write shape: denied, roster lists ONLY the effective-readonly worker.
     await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r2" }, { args: { subagent_type: "forge-coder", prompt: "x" } }),
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r2" }, { args: { subagent_type: "forge-part-coder", prompt: "x" } }),
       (err) => {
         assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
-        assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-scout\./, "roster carries exactly the effective-readonly worker")
-        assert.ok(!err.message.includes("forge-coder") || !/dispatchable during draft: [^.]*coder/.test(err.message))
+        assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-part-scout\./, "roster carries exactly the effective-readonly worker")
+        assert.ok(!err.message.includes("forge-part-coder") || !/dispatchable during draft: [^.]*coder/.test(err.message))
         assert.match(err.message, /plan_approve/)
         assert.match(err.message, /\/plan discard/)
         return true
@@ -355,11 +355,11 @@ test("recon gate: explicit-readonly dispatch passes during draft; every other ta
 
     // 3. permission override lifting write (or bash to ask) breaks effectiveness.
     await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r3" }, { args: { subagent_type: "forge-lifted", prompt: "x" } }),
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r3" }, { args: { subagent_type: "forge-part-lifted", prompt: "x" } }),
       /dispatch is denied for this target/,
     )
     await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r4" }, { args: { subagent_type: "forge-asking", prompt: "x" } }),
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r4" }, { args: { subagent_type: "forge-part-asking", prompt: "x" } }),
       /dispatch is denied for this target/,
     )
 
@@ -390,10 +390,10 @@ test("recon gate: explicit-readonly dispatch passes during draft; every other ta
     const wt2 = mkdtempSync(join(tmpdir(), "part-recon2-"))
     try {
       mkdirSync(join(wt2, ".opencode"), { recursive: true })
-      writeFileSync(join(wt2, ".opencode", "forge.json"), JSON.stringify({ agents: RECON_ROSTER }))
+      writeFileSync(join(wt2, ".opencode", "forge.json"), JSON.stringify({ pool: "part", agents: RECON_ROSTER }))
       const h2 = await startServer(inputFor(wt2), {})
       await h2.config({ agent: {} })
-      await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_free", callID: "f1" }, { args: { subagent_type: "forge-coder", prompt: "x" } })
+      await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_free", callID: "f1" }, { args: { subagent_type: "forge-part-coder", prompt: "x" } })
       await h2.dispose?.()
     } finally {
       rmSync(wt2, { recursive: true, force: true })
@@ -452,7 +452,7 @@ test("recon gate: a patch-family permission lift kills the readonly exemption wi
   const wt = mkdtempSync(join(tmpdir(), "part-patchlift-"))
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: PATCH_LIFT_ROSTER }))
+    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "part", agents: PATCH_LIFT_ROSTER }))
     const h = await startServer(inputFor(wt), {})
     await h.config({ agent: {} })
     const sid = "ses_patchlift"
@@ -462,19 +462,19 @@ test("recon gate: a patch-family permission lift kills the readonly exemption wi
     )
     // Every lifted member is refused like any write-class target, and the
     // roster still names exactly the effective-readonly worker.
-    for (const [callID, target] of [["p1", "forge-patched"], ["p2", "forge-applied"], ["p3", "forge-applypatched"], ["p4", "forge-multiedited"]]) {
+    for (const [callID, target] of [["p1", "forge-part-patched"], ["p2", "forge-part-applied"], ["p3", "forge-part-applypatched"], ["p4", "forge-part-multiedited"]]) {
       await assert.rejects(
         h["tool.execute.before"]({ tool: "task", sessionID: sid, callID }, { args: { subagent_type: target, prompt: "x" } }),
         (err) => {
           assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
-          assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-scout\./, "the roster carries exactly the untouched readonly worker")
+          assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-part-scout\./, "the roster carries exactly the untouched readonly worker")
           assert.match(err.message, /plan_approve/)
           return true
         },
       )
     }
     // ...while the untouched readonly scout keeps the exemption.
-    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "p5" }, { args: { subagent_type: "forge-scout", prompt: "x" } })
+    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "p5" }, { args: { subagent_type: "forge-part-scout", prompt: "x" } })
     await h.dispose?.()
   } finally {
     rmSync(wt, { recursive: true, force: true })
@@ -494,6 +494,7 @@ test("recon gate: a both-fields task call resolves through the subagent_type-fir
     writeFileSync(
       join(wt, ".opencode", "forge.json"),
       JSON.stringify({
+        pool: "part",
         agents: {
           scout: { model: "x/y", thoughtLevel: "low", shape: "readonly" },
           coder: { model: "x/y", thoughtLevel: "low", shape: "write" },
@@ -508,12 +509,12 @@ test("recon gate: a both-fields task call resolves through the subagent_type-fir
       ctx(sid, wt),
     )
     // Both fields agree on the readonly scout: the draft exemption holds.
-    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b1" }, { args: { subagent_type: "forge-scout", agent: "forge-scout", prompt: "x" } })
+    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b1" }, { args: { subagent_type: "forge-part-scout", agent: "forge-part-scout", prompt: "x" } })
     // subagent_type (readonly) wins over a write-shaped agent field: exempt.
-    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b2" }, { args: { subagent_type: "forge-scout", agent: "forge-coder", prompt: "x" } })
+    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b2" }, { args: { subagent_type: "forge-part-scout", agent: "forge-part-coder", prompt: "x" } })
     // Mirror: subagent_type (write) wins over a readonly agent field — refused.
     await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b3" }, { args: { subagent_type: "forge-coder", agent: "forge-scout", prompt: "x" } }),
+      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b3" }, { args: { subagent_type: "forge-part-coder", agent: "forge-part-scout", prompt: "x" } }),
       /A plan is in draft; dispatch is denied for this target/,
     )
     await h.dispose?.()

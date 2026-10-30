@@ -55,7 +55,10 @@ function projectWithForgeJson(t, json) {
 }
 
 // readonly / write / absent-shape roster + a namespaced readonly worker.
+// pool-namespace-contract: a declared `pool` makes materialized ids
+// deterministic (forge-seal-<id>) across mkdtemp runs.
 const ROSTER = JSON.stringify({
+  pool: "seal",
   agents: {
     reviewer: { model: "zai/glm", thoughtLevel: "low", shape: "readonly" },
     builder: { model: "zai/glm", thoughtLevel: "low", shape: "write" },
@@ -80,13 +83,13 @@ const shell = (command) => ({ tool: "forge_shell", sessionID: "ses_s", callID: "
 
 test("seal: an explicit readonly worker's WRITE-CLASS call is denied with the full finding shape", async (t) => {
   const h = await sealHost(t)
-  await seed(h, "ses_ro", "forge-reviewer")
+  await seed(h, "ses_ro", "forge-seal-reviewer")
 
   await assert.rejects(
     () => h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_ro", callID: "c1" }, { args: { command: "node build.js > out.txt" } }),
     (err) => {
       const m = String(err)
-      assert.match(m, /forge-reviewer/, "the worker is named")
+      assert.match(m, /forge-seal-reviewer/, "the worker is named")
       assert.match(m, /readonly/, "the readonly shape is named")
       assert.match(m, /redirect/, "the classified write indicator is named")
       assert.match(m, /"shape": "write"/, "the remedy points at shape: write")
@@ -106,7 +109,7 @@ test("seal: an explicit readonly worker's WRITE-CLASS call is denied with the fu
 
 test("seal: READ-CLASS commands flow for an explicit readonly worker — no finding", async (t) => {
   const h = await sealHost(t)
-  await seed(h, "ses_read", "forge-reviewer")
+  await seed(h, "ses_read", "forge-seal-reviewer")
   for (const command of ["rg TODO src/", "git log --oneline -10", "node -e \"console.log(1)\""]) {
     await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_read", callID: "c3" }, { args: { command } })
   }
@@ -115,8 +118,8 @@ test("seal: READ-CLASS commands flow for an explicit readonly worker — no find
 
 test("seal: write-shaped and absent-shaped workers are never sealed", async (t) => {
   const h = await sealHost(t)
-  await seed(h, "ses_w", "forge-builder")
-  await seed(h, "ses_abs", "forge-ta-tool")
+  await seed(h, "ses_w", "forge-seal-builder")
+  await seed(h, "ses_abs", "forge-seal-ta-tool")
   for (const sid of ["ses_w", "ses_abs"]) {
     await h["tool.execute.before"]({ tool: "forge_shell", sessionID: sid, callID: "c4" }, { args: { command: "node build.js > out.txt" } })
     await h["tool.execute.before"]({ tool: "forge_shell", sessionID: sid, callID: "c5" }, { args: { command: "git commit -m x" } })
@@ -140,7 +143,7 @@ test("seal: an unknown session fails open (WRITE-CLASS flows, disclosed once)", 
 
 test("seal: the finding is bounded per session per indicator — the denial itself never softens", async (t) => {
   const h = await sealHost(t)
-  await seed(h, "ses_bound", "forge-reviewer")
+  await seed(h, "ses_bound", "forge-seal-reviewer")
   for (const callID of ["b1", "b2", "b3"]) {
     await assert.rejects(
       () => h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_bound", callID }, { args: { command: "npm install" } }),
@@ -153,7 +156,7 @@ test("seal: the finding is bounded per session per indicator — the denial itse
 
 test("seal: session.deleted evicts the finding bound", async (t) => {
   const h = await sealHost(t)
-  await seed(h, "ses_gone", "forge-reviewer")
+  await seed(h, "ses_gone", "forge-seal-reviewer")
   await assert.rejects(
     () => h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_gone", callID: "g1" }, { args: { command: "git push" } }),
     /git-mutation/,
@@ -185,12 +188,12 @@ test("seal: composes with the draft posture — draft semantics unchanged, seal 
   // ...and forge_shell's own posture during draft is unchanged for a
   // write-shaped worker: the before-hook adds nothing (the channel's ask
   // gate lives in the tool execute, not here).
-  await seed(h, "ses_draft_w", "forge-builder")
+  await seed(h, "ses_draft_w", "forge-seal-builder")
   await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_draft_w", callID: "d2" }, { args: { command: "node build.js > out.txt" } })
 
   // The readonly seal still binds ON TOP of the draft posture — its message
   // is the seal's, and the draft neither weakens nor replaces it.
-  await seed(h, "ses_draft_ro", "forge-reviewer")
+  await seed(h, "ses_draft_ro", "forge-seal-reviewer")
   await assert.rejects(
     () => h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_draft_ro", callID: "d3" }, { args: { command: "node build.js > out.txt" } }),
     (err) => {
@@ -205,9 +208,9 @@ test("seal: a readonly shape with a lifted mutating permission is NOT effective-
   // lifts any mutating tool off deny disqualifies the explicit shape.
   const h = await sealHost(
     t,
-    JSON.stringify({ agents: { leaker: { model: "zai/glm", thoughtLevel: "low", shape: "readonly", permission: { bash: "allow" } } } }),
+    JSON.stringify({ pool: "seal", agents: { leaker: { model: "zai/glm", thoughtLevel: "low", shape: "readonly", permission: { bash: "allow" } } } }),
   )
-  await seed(h, "ses_leak", "forge-leaker")
+  await seed(h, "ses_leak", "forge-seal-leaker")
   await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_leak", callID: "c8" }, { args: { command: "node build.js > out.txt" } })
   assert.deepEqual(h.__forgeSubagentsTest.sealFindings("ses_leak"), [])
 })
