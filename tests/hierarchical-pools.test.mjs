@@ -769,3 +769,129 @@ test("compliance (g): the session-domain pool gate outranks the compliance belt 
     },
   )
 })
+
+// ---------------------------------------------------------------------------
+// pool-gate-authoritative-anchor (0.18.0 live incident): the dispatch belts
+// resolve the session anchor from the host's AUTHORITATIVE session record
+// first — the in-memory map has degenerate writers (resumed-after-restart
+// sessions never re-fire session.created; rootish tool contexts resolve to
+// the launch directory) and a session bound pool-less loses its OWN pool's
+// dispatch rights. The record is read-only input; the map is the fallback.
+
+const recordInput = (dir, records, getImpl) => ({
+  ...input(dir),
+  client: { session: { get: getImpl ?? (async ({ path: { id } }) => records[id]) } },
+})
+
+test("authoritative anchor (a): a resumed session with a DEGRADED in-memory binding dispatches its OWN pool", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-au-", { pool: "autha", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-au2-", { pool: "authb", agents: { shader: pinned } })
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-launch-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const h = await startServer(
+    recordInput(dirA, {
+      ses_resumed: { directory: dirA, worktree: dirA },
+      ses_fresh: { directory: dirA, worktree: dirA },
+    }),
+    {},
+  )
+  t.after(() => h.dispose?.())
+  await server(input(dirB), {}) // shared host: B joins the registry
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  assert.ok(cfg.agent["forge-autha-research"])
+  assert.ok(cfg.agent["forge-authb-shader"])
+  // The incident shape: the map degrades to a pool-less anchor (the host
+  // launch directory seeded a resumed-after-restart session).
+  await bindSession(h, "ses_resumed", launchDir)
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_resumed", callID: "au1" }, taskArgs("forge-autha-research"))
+  // The record-sourced anchor scopes correctly: cross-pool still refused,
+  // and the roster line now names the WORKSPACE pool (record-resolved) —
+  // the exact copy branch that read "the global fallback" in the incident.
+  await assert.rejects(
+    () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_resumed", callID: "au2" }, taskArgs("forge-authb-shader")),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /not dispatchable from this session/)
+      assert.match(m, /its workspace pool/, "the roster line names the workspace pool (record-resolved, not the global fallback)")
+      return true
+    },
+  )
+  // A never-bound session resolves via the record too (no fail-open needed).
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_fresh", callID: "au3" }, taskArgs("forge-autha-research"))
+})
+
+test("authoritative anchor (b): record unavailable → the in-memory binding decides; unknown-everything keeps fail-open", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-af-", { pool: "authf", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-af2-", { pool: "authg", agents: { shader: pinned } })
+  const boom = async () => {
+    throw new Error("record unavailable")
+  }
+  const h = await startServer(recordInput(dirA, {}, boom), {})
+  t.after(() => h.dispose?.())
+  await server(input(dirB), {})
+  await h.config(emptyCfg())
+  await bindSession(h, "ses_map_b", dirB)
+  // Map says dirB: own-pool passes…
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_map_b", callID: "af1" }, taskArgs("forge-authg-shader"))
+  // …cross-pool refuses with the verbatim copy (pre-change semantics intact).
+  await assert.rejects(
+    () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_map_b", callID: "af2" }, taskArgs("forge-authf-research")),
+    /not dispatchable from this session/,
+  )
+  // Unknown-everything (no record, no binding): fail-open + bounded disclosure.
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => warns.push(args.map(String).join(" "))
+  try {
+    await h["tool.execute.before"]({ tool: "task", sessionID: "ses_nowhere", callID: "af3" }, taskArgs("forge-authf-research"))
+  } finally {
+    console.warn = origWarn
+  }
+  assert.equal(warns.length, 1, "exactly one bounded disclosure")
+  assert.match(warns[0], /could not be established/)
+})
+
+test("authoritative anchor (c): a degenerate re-anchor never clobbers a good in-memory binding", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-dg-", { pool: "dgen", agents: { research: pinned } })
+  const h = await startServer(input(dirA), {}) // client without session.get → resolver is map-only
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await bindSession(h, "ses_dg", dirA)
+  // Degenerate replay (rootish worktree, no directory) must not poison the
+  // binding — the 0.18.0 clobber path.
+  await h.event({ event: { type: "session.created", properties: { info: { id: "ses_dg", worktree: "/" } } } })
+  await h["tool.execute.before"]({ tool: "task", sessionID: "ses_dg", callID: "dg1" }, taskArgs("forge-dgen-research"))
+})
+
+test("authoritative anchor (d): the crew compliance belt re-checks via the record (map says compliant, record does not)", async (t) => {
+  const dirNC = dirWithForgeJson(t, "forge-pool-nc-", { agents: { watcher: pinned } }) // NO pool field → non-compliant
+  const dirOK = dirWithForgeJson(t, "forge-pool-ok-", { pool: "okp", agents: { helper: pinned } })
+  const h = await startServer(recordInput(dirNC, { ses_mix: { directory: dirNC, worktree: dirNC } }), {})
+  t.after(() => h.dispose?.())
+  await server(input(dirOK), {})
+  await h.config(emptyCfg())
+  await bindSession(h, "ses_mix", dirOK) // the map lies: a compliant anchor
+  // Registration pre-flight uses the tool-context anchor (dirOK) — passes.
+  await register(h, "ses_mix", dirOK)
+  await armWaves(h, "ses_mix", dirOK)
+  const ns = dirNC.split(/[\\/]/).pop().toLowerCase() // the derived family ns
+  // Dispatching the nc agent: the POOL gate passes via the record anchor
+  // (dirNC owns the entry), then the COMPLIANCE belt refuses via the record —
+  // the map's compliant dirOK would have waved it through pre-change.
+  await assert.rejects(
+    () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_mix", callID: "ad1" }, taskArgs(`forge-${ns}-watcher`)),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /Pool compliance refused/)
+      assert.ok(foldP(m).includes(foldP(join(dirNC, ".opencode", "forge.json"))), "names the RECORD anchor's non-compliant file")
+      assert.match(m, /missing top-level pool field/)
+      return true
+    },
+  )
+  await h.tool.crew_close.execute({ abandon: true, reason: "test" }, allowCtx("ses_mix"))
+})

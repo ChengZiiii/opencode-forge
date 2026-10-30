@@ -760,7 +760,12 @@ function readPlanDir(worktree: string): Array<{ name: string; text: string }> {
 function ensureSession(sessionID: string, worktree: string): SessionState {
   const existing = sessions.get(sessionID)
   if (existing) {
-    existing.worktree = worktree
+    // pool-gate-authoritative-anchor: a degenerate anchor (empty or
+    // filesystem-root) never clobbers a good binding — resumed-after-restart
+    // sessions and rootish tool contexts were poisoning bindings, which
+    // stripped the session's own-pool dispatch rights in the belt.
+    // Non-degenerate refinement keeps today's overwrite semantics.
+    if (!isRootish(worktree)) existing.worktree = worktree
     return existing
   }
   const state: SessionState = { sessionID, worktree }
@@ -2268,6 +2273,25 @@ export const server: Plugin = async (input, options) => {
   // (deletions un-materialize) and dispatch is session-scoped.
   rememberHostAnchor(effectiveInitDir)
   const client = input.client as unknown as GoalClient
+  // pool-gate-authoritative-anchor (D1/D2): the dispatch belts resolve the
+  // session anchor AUTHORITATIVE-FIRST — the host's own session record
+  // carries the true { directory, worktree } even for resumed-after-restart
+  // sessions (which never re-fire session.created), while the in-memory map
+  // has degenerate writers (rootish tool contexts resolve to the launch
+  // directory). Read-only resolver: it never writes back into the map, so
+  // the map's other consumers keep their contracts. Both the task pool gate
+  // and the crew compliance belt go through this one seam.
+  const resolveSessionAnchorForPools = async (sessionID: string | undefined): Promise<string> => {
+    if (!sessionID) return ""
+    try {
+      const rec = client?.session?.get
+        ? ((await client.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined)
+        : undefined
+      const anchor = effectiveWorktree(rec?.worktree, rec?.directory)
+      if (anchor && !isRootish(anchor)) return anchor
+    } catch {}
+    return sessions.get(sessionID)?.worktree ?? ""
+  }
   jobClient = input.client as unknown as JobClient
   const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
@@ -2581,18 +2605,20 @@ export const server: Plugin = async (input, options) => {
         // a task targeting a forge-* worker whose pool belongs to ANOTHER
         // workspace is refused — the target's origin pool path is named,
         // with the three exits. The session's allowed roster is its
-        // workspace pool (nearest forge.json walking up from the bound
+        // workspace pool (nearest forge.json walking up from the resolved
         // anchor) or, when the workspace has none, the global fallback
-        // layer. Sessions whose workspace cannot be observed (not in the
-        // session map — no session.created/tool binding yet) keep the
-        // fail-open belt posture with a bounded disclosure.
+        // layer. pool-gate-authoritative-anchor: the anchor comes from the
+        // host's session record first (resumed-after-restart sessions never
+        // re-fire session.created, and some tool-context shapes degenerate
+        // to the launch directory); sessions whose workspace cannot be
+        // observed through ANY source keep the fail-open belt posture with
+        // a bounded disclosure.
         if (target && target.toLowerCase().startsWith("forge-") && input.sessionID) {
           const resolution = resolvePools()
           const agentId = target.slice("forge-".length)
           const entry = resolution?.agents[agentId]
           if (resolution && entry) {
-            const bound = sessions.get(input.sessionID)
-            const anchor = bound?.worktree ?? ""
+            const anchor = await resolveSessionAnchorForPools(input.sessionID)
             if (!anchor) {
               if (!poolGateUnknownNotes.has(input.sessionID)) {
                 poolGateUnknownNotes.add(input.sessionID)
@@ -2637,8 +2663,7 @@ export const server: Plugin = async (input, options) => {
         if (target && target.toLowerCase().startsWith("forge-") && input.sessionID) {
           const crew = crews.get(input.sessionID)
           if (crew && (crew.mode === "pending" || crew.mode === "executing")) {
-            const bound = sessions.get(input.sessionID)
-            const anchor = bound?.worktree ?? ""
+            const anchor = await resolveSessionAnchorForPools(input.sessionID)
             if (anchor) {
               const complianceRefusal = crewPoolComplianceRefusal(anchor)
               if (complianceRefusal) throw new Error(complianceRefusal)

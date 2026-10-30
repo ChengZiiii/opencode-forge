@@ -16391,7 +16391,8 @@ function readPlanDir(worktree) {
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
   if (existing) {
-    existing.worktree = worktree;
+    if (!isRootish(worktree))
+      existing.worktree = worktree;
     return existing;
   }
   const state = { sessionID, worktree };
@@ -17609,6 +17610,17 @@ var server = async (input, options) => {
   hostWorktree = effectiveInitDir;
   rememberHostAnchor(effectiveInitDir);
   const client = input.client;
+  const resolveSessionAnchorForPools = async (sessionID) => {
+    if (!sessionID)
+      return "";
+    try {
+      const rec = client?.session?.get ? await client.session.get({ path: { id: sessionID } }) : undefined;
+      const anchor = effectiveWorktree(rec?.worktree, rec?.directory);
+      if (anchor && !isRootish(anchor))
+        return anchor;
+    } catch {}
+    return sessions.get(sessionID)?.worktree ?? "";
+  };
   jobClient = input.client;
   const jobsOpts = options?.jobs;
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native")
@@ -17821,8 +17833,7 @@ var server = async (input, options) => {
           const agentId = target.slice("forge-".length);
           const entry = resolution?.agents[agentId];
           if (resolution && entry) {
-            const bound = sessions.get(input2.sessionID);
-            const anchor = bound?.worktree ?? "";
+            const anchor = await resolveSessionAnchorForPools(input2.sessionID);
             if (!anchor) {
               if (!poolGateUnknownNotes.has(input2.sessionID)) {
                 poolGateUnknownNotes.add(input2.sessionID);
@@ -17844,8 +17855,7 @@ var server = async (input, options) => {
         if (target && target.toLowerCase().startsWith("forge-") && input2.sessionID) {
           const crew = crews.get(input2.sessionID);
           if (crew && (crew.mode === "pending" || crew.mode === "executing")) {
-            const bound = sessions.get(input2.sessionID);
-            const anchor = bound?.worktree ?? "";
+            const anchor = await resolveSessionAnchorForPools(input2.sessionID);
             if (anchor) {
               const complianceRefusal = crewPoolComplianceRefusal(anchor);
               if (complianceRefusal)
