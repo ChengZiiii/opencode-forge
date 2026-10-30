@@ -51,6 +51,14 @@ const fold = (p) => p.replaceAll("\\", "/").toLowerCase()
 // descriptions/refusals carry BACKSLASH Windows paths, so slash-folding
 // (fold) must never be used to match them (0.18.0 first-run finding).
 const lc = (p) => p.toLowerCase()
+// Containment of a filesystem path inside a captured HTTP body: the body is
+// raw JSON, so the path may appear with JSON-escaped backslashes ("C:\\Users")
+// — match the plain OR the escaped variant, case-folded.
+const bodyHasPath = (body, p) => {
+  const h = body.toLowerCase()
+  const n = lc(p)
+  return h.includes(n) || h.includes(n.replaceAll("\\", "\\\\"))
+}
 const excerpt = (s, needle, pad = 220) => {
   const i = s.indexOf(needle)
   return i < 0 ? `(no occurrence of ${JSON.stringify(needle.slice(0, 40))})` : s.slice(Math.max(0, i - pad), i + needle.length + pad)
@@ -331,7 +339,10 @@ try {
   const cTurn = await drv1.runTurn(wsB, "CROSSPOOL_PROBE: dispatch the plugindev coder now.", 2)
   const cBody = cTurn.newCatches.map((c) => c.body).find((x) => x.includes('"tool_result"')) ?? ""
   const cRefusal = cBody.includes("not dispatchable from this session")
-  const cPath = cBody.toLowerCase().includes(lc(forgeJsonA))
+  // The catch body is RAW JSON — Windows backslashes arrive JSON-ESCAPED
+  // ("C:\\Users\\…"), so containment needs the escaped variant too (plain
+  // single-backslash needles never match; first two runs' c/d1 finding).
+  const cPath = bodyHasPath(cBody, forgeJsonA)
   evidence.excerpts.c = cBody ? excerpt(cBody, "not dispatchable from this session") : "(no tool_result body captured)"
   verdict("c", cRefusal && cPath, `refusal:${cRefusal} namesPlugindevPoolPath:${cPath} idle:${cTurn.idleSeen}`)
 
@@ -339,7 +350,7 @@ try {
   const d1Turn = await drv1.runTurn(wsC, "CREWPROBE_ONE: register the crew now.", 2)
   const d1Body = d1Turn.newCatches.map((c) => c.body).find((x) => x.includes('"tool_result"')) ?? ""
   const d1Lead = d1Body.includes("Pool compliance refused")
-  const d1Path = d1Body.toLowerCase().includes(lc(forgeJsonC))
+  const d1Path = bodyHasPath(d1Body, forgeJsonC)
   const d1Fix = d1Body.includes("Minimal fix")
   evidence.excerpts.d1 = d1Body ? excerpt(d1Body, "Pool compliance refused") : "(no tool_result body captured)"
   verdict("d1", d1Lead && d1Path && d1Fix, `refused:${d1Lead} namesWsCFile:${d1Path} minimalFix:${d1Fix}`)
@@ -365,9 +376,13 @@ try {
   evidence.excerpts.e = eDesc
   verdict("e", hasGlobal && eProv, `forge-global-reviewer:${hasGlobal} provenance:${eProv} keys=[${eKeys.join(", ")}]`)
 
-  // run-1 key set for (b): union view after ALL probes (end-state files).
-  const finalCfg = await api(`/config?directory=${encodeURIComponent(wsA.replaceAll("\\", "/"))}`)
-  run1Keys = forgeKeysOf(finalCfg)
+  // run-1 key set for (b): the PEAK-STATE view — all four workspaces have
+  // live sessions at this moment (the e-probe's wsD view, fetched while
+  // every anchor is fresh). The serve reaps stale sessions and the union
+  // follows, so a run-1 END query from the oldest workspace (wsA) compares
+  // a reaped state against run 2's fresh one — apples to oranges. Both runs
+  // now compare views taken with all anchors live.
+  run1Keys = eKeys
   evidence.keys.run1 = run1Keys
   drv1.close()
 } catch (err) {

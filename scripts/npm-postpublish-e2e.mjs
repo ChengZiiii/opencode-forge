@@ -30,7 +30,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 //   scout system     -> deterministic scout conclusion
 //   tool_result      -> closing text turn
 //   otherwise        -> scripted task tool_use dispatching forge-scout
-const SCOUT_MARKER = "You are forge-scout"
+const SCOUT_MARKER = "You are forge-postpub-scout"
 const SCOUT_TEXT = "Scout report (npm postpublish probe): the workspace root contains .opencode/ and README.md."
 const catches = []
 const http = await import("node:http")
@@ -74,7 +74,7 @@ const srv = http.createServer((req, res) => {
     sse([
       { type: "message_start", message: { id: "msg_tool", type: "message", role: "assistant", model: MODEL_ID, content: [], stop_reason: null, usage: { input_tokens: 3, output_tokens: 0 } } },
       { type: "content_block_start", index: 0, content_block: { type: "tool_use", id: "toolu_postpub", name: "task", input: {} } },
-      { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({ subagent_type: "forge-scout", description: "postpublish recon probe", prompt: "List the files in the workspace root and report." }) } },
+      { type: "content_block_delta", index: 0, delta: { type: "input_json_delta", partial_json: JSON.stringify({ subagent_type: "forge-postpub-scout", description: "postpublish recon probe", prompt: "List the files in the workspace root and report." }) } },
       { type: "content_block_stop", index: 0 },
       { type: "message_delta", delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 4 } },
       { type: "message_stop" },
@@ -126,7 +126,7 @@ writeFileSync(
 // XHigh (mixed case) on purpose: behavior A proves boundary normalization.
 writeFileSync(
   join(ws, ".opencode", "forge.json"),
-  JSON.stringify({ agents: { scout: { model: `anthropic/${MODEL_ID}`, thoughtLevel: "XHigh" } } }, null, 2),
+  JSON.stringify({ pool: "postpub", agents: { scout: { model: `anthropic/${MODEL_ID}`, thoughtLevel: "XHigh", shape: "readonly" } } }, null, 2),
 )
 log("sandbox:", root)
 
@@ -247,7 +247,7 @@ const eventsBefore = events.length
 const sid = await runTurn("forge", [{ type: "text", text: "Dispatch the scout now." }])
 const newCatches = catches.slice(catchCountBefore)
 const newEvents = events.slice(eventsBefore).join("\n")
-const scoutBodies = newCatches.filter((c) => c.body.includes("You are forge-scout"))
+const scoutBodies = newCatches.filter((c) => c.body.includes(SCOUT_MARKER))
 const scoutRan = scoutBodies.length > 0
 const refusal = newEvents.includes("dispatch is denied for this target") || newCatches.some((c) => c.body.includes("dispatch is denied"))
 const passB = scoutRan && !refusal
