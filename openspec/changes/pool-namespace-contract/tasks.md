@@ -27,4 +27,4 @@
 ## 5. Gate
 
 - [x] 5.1 Full gate green: `bun run typecheck`, `node --test tests/*.test.mjs` (all suites), `bun run bundle` (self-contained dist), `npm pack --dry-run` (files whitelist = dist + README.md + package.json)
-- [ ] 5.2 Official-install E2E per AGENTS.md: `opencode plugin "git+file:///<repo abs path>" --global`, then in an isolated workspace verify a namespaced roster + crew compliance refusal on a `pool`-less forge.json, then the README four-step uninstall; record results in the change's verify notes
+- [x] 5.2 Official-install E2E per AGENTS.md: `opencode plugin "git+file:///<repo abs path>" --global`, then in an isolated workspace verify a namespaced roster + crew compliance refusal on a `pool`-less forge.json, then the README four-step uninstall; record results in the change's verify notes
