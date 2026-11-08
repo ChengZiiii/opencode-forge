@@ -905,6 +905,53 @@ test("authoritative anchor (d): the crew compliance belt re-checks via the recor
   await h.tool.crew_close.execute({ abandon: true, reason: "test" }, allowCtx("ses_mix"))
 })
 
+test("anchor pool preference (e): a POOL-LESS resume-rebound record yields to the pooled in-memory binding", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-rb-", { pool: "resbo", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-rb2-", { pool: "resbt", agents: { shader: pinned } })
+  // The launch dir (record's rebound anchor) owns NO forge.json.
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-rblaunch-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  // The 0.20.0 evening incident shape: the RECORD carries the pool-less
+  // launch directory; the MAP holds the real pooled workspace (kept fresh by
+  // the session's own live activity).
+  const h = await startServer(recordInput(dirA, { ses_rebound: { directory: launchDir, worktree: launchDir } }), {})
+  t.after(() => h.dispose?.())
+  await server(input(dirB), {}) // shared host: B joins the registry
+  const cfgRB = emptyCfg()
+  await h.config(cfgRB)
+  assert.ok(cfgRB.agent["forge-resbo-research"], "resbo materializes")
+  assert.ok(cfgRB.agent["forge-resbt-shader"], "resbt materializes")
+  await bindSession(h, "ses_rebound", dirA)
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => warns.push(args.map(String).join(" "))
+  try {
+    // Own-pool dispatch FLOWS (was refused pre-fix with the global-fallback roster).
+    await h["tool.execute.before"]({ tool: "task", sessionID: "ses_rebound", callID: "rb1" }, taskArgs("forge-resbo-research"))
+    // Cross-pool target STILL refused — preference restores own-pool rights, never a leak.
+    await assert.rejects(
+      () => h["tool.execute.before"]({ tool: "task", sessionID: "ses_rebound", callID: "rb2" }, taskArgs("forge-resbt-shader")),
+      (err) => {
+        const m = String(err)
+        assert.match(m, /not dispatchable from this session/)
+        assert.match(m, /its workspace pool/, "the roster line names the WORKSPACE pool (pooled binding won)")
+        return true
+      },
+    )
+    // Second own-pool dispatch: the bounded disclosure fired EXACTLY once.
+    await h["tool.execute.before"]({ tool: "task", sessionID: "ses_rebound", callID: "rb3" }, taskArgs("forge-resbo-research"))
+  } finally {
+    console.warn = origWarn
+  }
+  const prefWarns = warns.filter((w) => w.includes("pooled binding wins"))
+  assert.equal(prefWarns.length, 1, "exactly one bounded anchor-preference disclosure")
+  assert.match(prefWarns[0], /POOL-LESS/, "the copy names the record's pool-less anchor")
+})
+
 // ---------------------------------------------------------------------------
 // forge-prompt-shared — pool-level shared prompt segment (spec:
 // forge-subagents "Pool-level shared prompt segment"; design D1-D5). One

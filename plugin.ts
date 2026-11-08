@@ -299,6 +299,10 @@ let poolResolution: PoolResolution | null = null
 // once-per-session note for the unknown-anchor fail-open posture. Evicted
 // on session.deleted.
 const poolGateUnknownNotes = new Set<string>()
+// anchor-pool-preference: bounded disclosure set for the pooled-preference
+// substitution (authoritative record rebound pool-less after a restart-resume
+// while the in-memory binding still owns a pool) — one note per session.
+const anchorPrefNotes = new Set<string>()
 
 // Win32 path fold for ownership comparisons (family files derive from the
 // normalized anchor, session discovery from the raw path).
@@ -2590,14 +2594,41 @@ export const server: Plugin = async (input, options) => {
   // and the crew compliance belt go through this one seam.
   const resolveSessionAnchorForPools = async (sessionID: string | undefined): Promise<string> => {
     if (!sessionID) return ""
+    let authoritative = ""
     try {
       const rec = client?.session?.get
         ? ((await client.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined)
         : undefined
       const anchor = effectiveWorktree(rec?.worktree, rec?.directory)
-      if (anchor && !isRootish(anchor)) return anchor
+      if (anchor && !isRootish(anchor)) authoritative = anchor
     } catch {}
-    return sessions.get(sessionID)?.worktree ?? ""
+    const mapped = sessions.get(sessionID)?.worktree ?? ""
+    if (authoritative === "") return mapped
+    // anchor-pool-preference (the 0.20.0 evening incident's mirror of the
+    // 0.18.0 one): a restart-RESUMED session's authoritative record can carry
+    // the NEW launch directory (pool-less) while the in-memory binding — kept
+    // fresh by the session's own live activity — still owns the real pooled
+    // worktree. Authoritative-first would strip the session's own-pool
+    // dispatch rights. Conflict rule: when the record anchor owns NO pool and
+    // the (different, non-degenerate) map binding owns one, the POOLED
+    // binding wins, with one bounded disclosure per session. Every other
+    // shape keeps the record's precedence (the 0.18.0 semantics).
+    if (
+      mapped &&
+      !isRootish(mapped) &&
+      foldPath(mapped) !== foldPath(authoritative) &&
+      sessionPoolFileOf(authoritative) === null &&
+      sessionPoolFileOf(mapped) !== null
+    ) {
+      if (!anchorPrefNotes.has(sessionID)) {
+        anchorPrefNotes.add(sessionID)
+        console.warn(
+          `[forge:pool] session ${sessionID}: the authoritative session record anchors to a POOL-LESS directory (${authoritative}) while the session's live binding owns a pool (${mapped}) — the pooled binding wins this resolution (restart-resume rebind shape).`,
+        )
+      }
+      return mapped
+    }
+    return authoritative
   }
   jobClient = input.client as unknown as JobClient
   const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
@@ -3350,6 +3381,8 @@ export const server: Plugin = async (input, options) => {
           sealUnknownNotes.delete(info.id)
           // Session-domain pool-gate disclosure bound (sole-pool-ownership).
           poolGateUnknownNotes.delete(info.id)
+          // Anchor-preference disclosure bound (anchor-pool-preference).
+          anchorPrefNotes.delete(info.id)
           // Crew hygiene (crew-autonomous-waves D4): the session's crew was
           // in-memory and session-bound — end it with the session, and evict
           // the crew continuation engine's maps alongside (mirrors the
