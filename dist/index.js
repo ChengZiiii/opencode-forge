@@ -16375,6 +16375,7 @@ var hostAnchors = [];
 var poolResolver = null;
 var poolResolution = null;
 var poolGateUnknownNotes = new Set;
+var anchorPrefNotes = new Set;
 var foldPath = (p) => process.platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p;
 function globalPoolPathOf() {
   return forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global;
@@ -18086,13 +18087,24 @@ var server = async (input, options) => {
   const resolveSessionAnchorForPools = async (sessionID) => {
     if (!sessionID)
       return "";
+    let authoritative = "";
     try {
       const rec = client?.session?.get ? await client.session.get({ path: { id: sessionID } }) : undefined;
       const anchor = effectiveWorktree(rec?.worktree, rec?.directory);
       if (anchor && !isRootish(anchor))
-        return anchor;
+        authoritative = anchor;
     } catch {}
-    return sessions.get(sessionID)?.worktree ?? "";
+    const mapped = sessions.get(sessionID)?.worktree ?? "";
+    if (authoritative === "")
+      return mapped;
+    if (mapped && !isRootish(mapped) && foldPath(mapped) !== foldPath(authoritative) && sessionPoolFileOf(authoritative) === null && sessionPoolFileOf(mapped) !== null) {
+      if (!anchorPrefNotes.has(sessionID)) {
+        anchorPrefNotes.add(sessionID);
+        console.warn(`[forge:pool] session ${sessionID}: the authoritative session record anchors to a POOL-LESS directory (${authoritative}) while the session's live binding owns a pool (${mapped}) — the pooled binding wins this resolution (restart-resume rebind shape).`);
+      }
+      return mapped;
+    }
+    return authoritative;
   };
   jobClient = input.client;
   const jobsOpts = options?.jobs;
@@ -18552,6 +18564,7 @@ var server = async (input, options) => {
           sealFindings.delete(info.id);
           sealUnknownNotes.delete(info.id);
           poolGateUnknownNotes.delete(info.id);
+          anchorPrefNotes.delete(info.id);
           crews.delete(info.id);
           crewEngineForgetSession(info.id);
         }
