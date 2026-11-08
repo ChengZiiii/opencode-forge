@@ -11,6 +11,8 @@ import { join } from "node:path"
 // global fallback family is forge-global-<id>; there are NO plain ids.
 
 import { createPoolResolver, sanitizeNamespace, validatePoolField, poolFileCompliance } from "../src/forge-config.ts"
+import { rolePromptFor, forgeAgentDef } from "../src/dispatch-tiers.ts"
+import { materializeAgentPrompt } from "../src/dispatch-prompt.ts"
 
 // ---------------------------------------------------------------------------
 // Fake fs: explicit file/dir maps with per-path mtimes (hot-apply tests bump
@@ -633,6 +635,9 @@ test("compliance (a): crew_begin REFUSES a pool-less-declared forge.json — no 
       assert.match(m, /Minimal fix: add or repair the top-level "pool": "[a-z0-9-]+"/, "the minimal fix with a suggested namespace")
       assert.match(m, /REQUIRED for crew-governed dispatch/, "the field's crew-gate role")
       assert.match(m, /no host restart/, "the hot-apply lift")
+      // crew-native-fallback D3: the REGISTRATION pre-flight copy carries NO
+      // native exit — the fallback is about DISPATCH, not registration.
+      assert.doesNotMatch(m, /Native exit/, "registration refusal keeps the bare fix copy")
       return true
     },
   )
@@ -699,6 +704,10 @@ test("compliance (d): mid-crew degradation blocks further crew dispatches; nativ
       assert.match(m, /Pool compliance refused/, "the belt re-runs the file-level check")
       assert.match(m, /missing top-level pool field/)
       assert.match(m, /no host restart/, "the hot-apply lift rides the belt copy")
+      // crew-native-fallback D1/D4: the MID-CREW belt refusal carries the
+      // native exit (fix copy intact, one sentence appended).
+      assert.match(m, /Native exit: while the pool is being repaired, the affected subtask may dispatch through the NATIVE task channel with the same relay contract/, "the native exit sentence rides the belt copy")
+      assert.match(m, /gates forge-\* dispatch only, never the crew's existence/, "the belt scopes itself to forge-* dispatch")
       return true
     },
   )
@@ -894,4 +903,152 @@ test("authoritative anchor (d): the crew compliance belt re-checks via the recor
     },
   )
   await h.tool.crew_close.execute({ abandon: true, reason: "test" }, allowCtx("ses_mix"))
+})
+
+// ---------------------------------------------------------------------------
+// forge-prompt-shared — pool-level shared prompt segment (spec:
+// forge-subagents "Pool-level shared prompt segment"; design D1-D5). One
+// write-point per pool file, inherited by EVERY agent that file
+// materializes; strict prepend BENEATH the unchanged three-layer chain;
+// fail-soft like every other field; per-FILE scope (no cross-pool bleed);
+// the global fallback file's shared INHERITS (content, not namespace).
+
+test("shared: valid top-level shared is captured trimmed on the family and every agent entry", () => {
+  const fs = fakeFs()
+  fs.setDir("C:/PoolA", [".opencode"])
+  fs.setDir("C:/PoolA/.opencode", [{ name: "forge.json", dir: false }])
+  fs.writeFile("C:/PoolA/.opencode/forge.json", json({ pool: "aa", shared: "  Project X conventions: use bun.  ", agents: { research: pinned } }))
+  const r = resolverOn(fs).resolve(["C:/PoolA"])
+  assert.equal(r.families.length, 1)
+  assert.equal(r.families[0].shared, "Project X conventions: use bun.", "captured TRIMMED on the family")
+  assert.equal(r.agents["aa-research"].shared, "Project X conventions: use bun.", "carried on the agent entry (per-file resolution basis)")
+  assert.deepEqual(r.findings, [], "a valid shared records no finding")
+})
+
+test("shared compositions: strict prepend beneath all three chain layers (D1)", () => {
+  const seg = "Project X conventions: relative paths, no absolute writes."
+  const def = { prompt: "You are a dependency auditor; check licenses.", model: "x/y" }
+  // (a) shared + explicit prompt — the explicit prompt keeps its identity,
+  // shared rides above it as the common base.
+  assert.equal(rolePromptFor("auditor", def, seg), `${seg}\n\nYou are a dependency auditor; check licenses.`)
+  // (b) shared + built-in role default (research without a prompt).
+  const researchRole = rolePromptFor("research", { model: "x/y" })
+  assert.equal(rolePromptFor("research", { model: "x/y" }, seg), `${seg}\n\n${researchRole}`, "the built-in chain is intact beneath the shared base")
+  // (c) shared + generic one-liner for a prompt-less non-role id.
+  const generic = rolePromptFor("summarizer", { model: "x/y" })
+  assert.equal(rolePromptFor("summarizer", { model: "x/y" }, seg), `${seg}\n\n${generic}`)
+  assert.match(generic, /summarizer worker/)
+  // undefined shared = byte-identical chain (purely additive).
+  assert.equal(rolePromptFor("auditor", def, undefined), rolePromptFor("auditor", def))
+})
+
+test("shared: materialized prompt carries shared in the ROLE slot, below the mandates", () => {
+  const seg = "Project X conventions: use bun; evidence or it did not happen."
+  const withShared = forgeAgentDef("auditor", { prompt: "Audit licenses.", model: "x/y" }, { ns: "aa", file: "C:/PoolA/.opencode/forge.json" }, seg)
+  const without = forgeAgentDef("auditor", { prompt: "Audit licenses.", model: "x/y" }, { ns: "aa", file: "C:/PoolA/.opencode/forge.json" })
+  assert.match(withShared.prompt, new RegExp(seg.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")))
+  // The role block (shared + explicit prompt, blank-line joined) sits above
+  // the mandate block; every mandate text is unchanged and present.
+  assert.ok(withShared.prompt.indexOf(`${seg}\n\nAudit licenses.`) < withShared.prompt.indexOf("Mandates"), "shared rides inside the role slot, below the mandates")
+  for (const m of ["workspace-relative paths ONLY", "report the refusal VERBATIM", "evidence references", "Run every shell command through the forge_shell tool"]) {
+    assert.ok(withShared.prompt.includes(m), `mandate intact: ${m}`)
+  }
+  // Description/provenance/permission/tools untouched by sharedSeg.
+  assert.equal(withShared.description, without.description)
+  assert.deepEqual(withShared.permission, without.permission)
+  assert.deepEqual(withShared.tools, without.tools)
+  assert.equal(withShared.model, without.model)
+})
+
+test("shared: invalid shared (number / array / whitespace-only) → exactly ONE warn finding naming the file, ignored, agents still materialize", () => {
+  for (const bad of [7, ["a", "b"], "   \t  "]) {
+    const fs = fakeFs()
+    fs.setDir("C:/PoolA", [".opencode"])
+    fs.setDir("C:/PoolA/.opencode", [{ name: "forge.json", dir: false }])
+    fs.writeFile("C:/PoolA/.opencode/forge.json", json({ pool: "aa", shared: bad, agents: { research: pinned, scout: {} } }))
+    const r = resolverOn(fs).resolve(["C:/PoolA"])
+    const warns = r.findings.filter((f) => f.code === "shared-invalid")
+    assert.equal(warns.length, 1, `exactly one shared-invalid finding for ${JSON.stringify(bad)}`)
+    assert.equal(warns[0].level, "warn")
+    assert.ok(warns[0].message.includes("C:/PoolA/.opencode/forge.json"), "the finding names the file")
+    assert.equal(r.findings.filter((f) => f.code !== "shared-invalid").length, 0, "no other findings — the pool stays fully usable")
+    assert.ok(r.agents["aa-research"] && r.agents["aa-scout"], "every agent still materializes")
+    assert.equal(r.agents["aa-research"].shared, null, "the invalid field is ignored (absent)")
+    assert.equal(r.families[0].shared, null)
+    // Agents materialize with the UNSHARED chain.
+    assert.equal(rolePromptFor("research", r.agents["aa-research"].def, r.agents["aa-research"].shared ?? undefined), rolePromptFor("research", r.agents["aa-research"].def))
+  }
+})
+
+test("shared: the GLOBAL fallback file's shared inherits to its family (D3 — pool-ignored does NOT extend to shared)", () => {
+  const fs = fakeFs()
+  fs.setDir("C:/empty", [])
+  fs.setDir("C:/home/.config/opencode", [{ name: "forge.json", dir: false }])
+  // The global file ALSO declares a pool field — ignored with a warn (fixed
+  // ns "global"), while its shared segment INHERITS: content, not namespace.
+  fs.writeFile("C:/home/.config/opencode/forge.json", json({ pool: "ignored", shared: "Global conventions: cite file:line.", agents: { research: pinned } }))
+  const r = resolverOn(fs).resolve(["C:/empty"])
+  const globalFamily = r.families.find((f) => f.file === "C:/home/.config/opencode/forge.json")
+  assert.equal(globalFamily.ns, "global")
+  assert.equal(globalFamily.shared, "Global conventions: cite file:line.")
+  assert.equal(r.agents["global-research"].shared, "Global conventions: cite file:line.", "the global family inherits the shared segment")
+  assert.ok(r.findings.some((f) => f.code === "pool-field-ignored-global"), "the namespace-ignored rule still fires for pool — the contrast is real")
+  assert.ok(!r.findings.some((f) => f.code === "shared-invalid"))
+})
+
+test("shared: TWO pools — per-FILE scoping, no cross-pool bleed (D2/D5)", () => {
+  const fs = fakeFs()
+  fs.setDir("C:/PoolA", [".opencode"])
+  fs.setDir("C:/PoolA/.opencode", [{ name: "forge.json", dir: false }])
+  fs.writeFile("C:/PoolA/.opencode/forge.json", json({ pool: "aa", shared: "Pool A base: frontend repo layout.", agents: { research: pinned } }))
+  fs.setDir("C:/PoolB", [".opencode"])
+  fs.setDir("C:/PoolB/.opencode", [{ name: "forge.json", dir: false }])
+  fs.writeFile("C:/PoolB/.opencode/forge.json", json({ pool: "bb", agents: { research: pinned } })) // NO shared
+  const r = resolverOn(fs).resolve(["C:/PoolA", "C:/PoolB"])
+  assert.equal(r.agents["aa-research"].shared, "Pool A base: frontend repo layout.", "agent A gets ITS file's shared")
+  assert.equal(r.agents["bb-research"].shared, null, "agent B from a shared-less pool gets NONE — no cross-pool bleed")
+  // Materialized prompts reflect the per-file truth (same raw def, different bases).
+  const pa = forgeAgentDef("aa-research", r.agents["aa-research"].def, undefined, r.agents["aa-research"].shared ?? undefined)
+  const pb = forgeAgentDef("bb-research", r.agents["bb-research"].def, undefined, r.agents["bb-research"].shared ?? undefined)
+  assert.ok(pa.prompt.includes("Pool A base: frontend repo layout."))
+  assert.ok(!pb.prompt.includes("Pool A base"), "pool B's prompt carries no foreign segment")
+  assert.ok(!pb.prompt.includes("Pool A base: frontend repo layout."))
+})
+
+test("shared: no shared anywhere → materialized prompts BYTE-IDENTICAL to the no-shared build", () => {
+  const fs = fakeFs()
+  fs.setDir("C:/PoolA", [".opencode"])
+  fs.setDir("C:/PoolA/.opencode", [{ name: "forge.json", dir: false }])
+  fs.writeFile("C:/PoolA/.opencode/forge.json", json({ pool: "aa", agents: { research: pinned, auditor: { prompt: "Audit.", model: "x/y", thoughtLevel: "low" } } }))
+  const r = resolverOn(fs).resolve(["C:/PoolA"])
+  assert.deepEqual(r.findings, [], "no finding is recorded")
+  for (const [id, agent] of Object.entries(r.agents)) {
+    assert.equal(agent.shared, null)
+    // Threading the resolver's null shared is byte-identical to not threading.
+    assert.equal(
+      forgeAgentDef(id, agent.def, undefined, agent.shared ?? undefined).prompt,
+      forgeAgentDef(id, agent.def, undefined).prompt,
+      `${id}: null shared = the pre-change prompt, byte-for-byte`,
+    )
+    // And the raw role chain equals the plain call.
+    assert.equal(rolePromptFor(id, agent.def, undefined), rolePromptFor(id, agent.def))
+  }
+})
+
+test("shared: hot-apply — editing shared re-materializes at the next resolve (mtime cache)", () => {
+  const fs = fakeFs()
+  fs.setDir("C:/PoolA", [".opencode"])
+  fs.setDir("C:/PoolA/.opencode", [{ name: "forge.json", dir: false }])
+  fs.writeFile("C:/PoolA/.opencode/forge.json", json({ pool: "aa", shared: "v1 base", agents: { research: pinned } }))
+  const res = resolverOn(fs)
+  assert.equal(res.resolve(["C:/PoolA"]).agents["aa-research"].shared, "v1 base")
+  fs.writeFile("C:/PoolA/.opencode/forge.json", json({ pool: "aa", shared: "v2 base", agents: { research: pinned } }))
+  assert.equal(res.resolve(["C:/PoolA"]).agents["aa-research"].shared, "v2 base", "the edit hot-applies like any pool edit")
+  fs.writeFile("C:/PoolA/.opencode/forge.json", json({ pool: "aa", agents: { research: pinned } })) // shared REMOVED
+  assert.equal(res.resolve(["C:/PoolA"]).agents["aa-research"].shared, null, "removal hot-applies too")
+  // Composition sanity at the wiring boundary: the composed role stays a
+  // strict prepend of the unchanged chain.
+  const agent = res.resolve(["C:/PoolA"]).agents["aa-research"]
+  const p = materializeAgentPrompt({ agent: "research", shape: "write", role: rolePromptFor("research", agent.def, agent.shared ?? undefined) })
+  assert.equal(p, materializeAgentPrompt({ agent: "research", shape: "write", role: rolePromptFor("research", agent.def) }))
 })

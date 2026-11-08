@@ -537,6 +537,9 @@ test("crew command: with agents it carries the orchestration rulebook and the ro
   assert.match(cmd.template, /forge-wire-research/, "the live roster is listed with NAMESPACED ids")
   assert.match(cmd.template, /crew_begin/, "the declared-plan registration step is present")
   assert.match(cmd.template, /native\s+`?task`?\s+calls/, "waves ride the native task channel")
+  // crew-native-fallback 1.3: the wave-discipline line carries the fallback rule.
+  assert.match(cmd.template, /Native fallback: when the pool offers no forge worker fitting a subtask/, "the wave-discipline line teaches the fallback lane")
+  assert.match(cmd.template, /close evidence says it ran native/, "the /crew template states the recording duty")
   assert.match(cmd.template, /no configured forge-\* agent matches/, "missing-role fallback discipline present")
   assert.doesNotMatch(cmd.template, /forge_dispatch|background|\[forge:dispatch-complete\]/, "no dispatch-era vocabulary remains")
   assert.ok(!cmd.template.includes("non-primary"), "no non-primary wording remains")
@@ -868,6 +871,9 @@ test("crew lifecycle: registration PENDS — three-choice surface, dispatch belt
   // Arm call (shape-disjoint: execution only, no plan payload).
   const armed = await h.tool.crew_begin.execute({ execution: "waves" }, allowCtx("ses_lifecycle"))
   assert.match(armed.output, /ARMED for supervised waves/)
+  // crew-native-fallback 1.2: the waves-arming output teaches the fallback lane.
+  assert.match(armed.output, /Native fallback: when the pool offers no forge worker fitting a subtask/, "the arming output carries the fallback rule")
+  assert.match(armed.output, /RECORD the fallback/, "the recording duty (wave notes + close evidence says it ran native)")
   assert.equal(h.__forgeSubagentsTest.crews().get("ses_lifecycle").mode, "executing")
   await h["tool.execute.before"]({ tool: "task", sessionID: "ses_lifecycle", callID: "cb2" }, beltArgs())
 
@@ -1168,4 +1174,62 @@ test("forge agent prompt carries the routing hint", async (t) => {
   await h.config(cfg)
   assert.match(cfg.agent.forge.prompt, /forge-\*.*subagent|subagent.*forge-\*/s)
   assert.match(cfg.agent.forge.prompt, /native task channel/)
+})
+
+// ---------------------------------------------------------------------------
+// forge-prompt-shared wiring (design D4): server()'s materialization loop
+// passes each agent's ORIGIN-file `shared` segment into forgeAgentDef — the
+// materialized prompt carries shared in the role slot beneath the mandates;
+// without shared the prompt is byte-identical to the legacy build.
+
+test("materialization: a pool's shared segment rides every materialized prompt beneath the mandates (fail-soft on invalid)", async (t) => {
+  const seg = "Project X conventions: use bun; cite file:line evidence."
+  const mk = (extra) => JSON.stringify({
+    pool: "wp",
+    ...extra,
+    agents: {
+      research: { model: "zai/glm", thoughtLevel: "low" },
+      auditor: { model: "x/y", thoughtLevel: "low", prompt: "Audit licenses." },
+    },
+  })
+  const dir = projectWithForgeJson(t, mk({ shared: seg }))
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = emptyCfg()
+  await h.config(cfg)
+  for (const [id, roleLine] of [
+    ["forge-wp-research", /research worker/i],
+    ["forge-wp-auditor", /Audit licenses\./],
+  ]) {
+    const entry = cfg.agent[id]
+    assert.ok(entry, `${id} materializes`)
+    assert.ok(entry.prompt.includes(seg), `${id}: the shared segment rides the prompt`)
+    // Strict prepend: shared + blank line + the chain layer (role default or
+    // explicit prompt), all still INSIDE the role slot above the mandates.
+    assert.ok(entry.prompt.indexOf(seg) < entry.prompt.indexOf("Mandates"), `${id}: shared sits below the mandates in composition order`)
+    assert.match(entry.prompt, roleLine)
+    assert.match(entry.prompt, /workspace-relative paths ONLY/, `${id}: mandate frame untouched`)
+  }
+
+  // Invalid shared (a number): ONE warn finding surfaces through the config
+  // diagnostics, the field is ignored, agents still materialize UNSHARED.
+  const dirBad = projectWithForgeJson(t, mk({ shared: 42 }))
+  const h2 = await startServer(input(dirBad), {})
+  t.after(() => h2.dispose?.())
+  const cfg2 = emptyCfg()
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => warns.push(args.map(String).join(" "))
+  try {
+    await h2.config(cfg2)
+  } finally {
+    console.warn = origWarn
+  }
+  const sharedWarns = warns.filter((w) => w.includes('the top-level "shared" field must be a non-empty string'))
+  assert.equal(sharedWarns.length, 1, "exactly one shared-invalid diagnostics line")
+  assert.ok(sharedWarns[0].toLowerCase().includes(join(dirBad, ".opencode", "forge.json").toLowerCase()), "the finding names the file")
+  const bad = cfg2.agent["forge-wp-research"]
+  assert.ok(bad, "agents materialize despite the invalid shared")
+  assert.ok(!bad.prompt.includes(seg), "the invalid field is ignored — no segment rides the prompt")
+  assert.match(bad.prompt, /research worker/i, "the unshared chain materializes normally")
 })
