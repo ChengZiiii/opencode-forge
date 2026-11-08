@@ -482,7 +482,13 @@ workspace-ownership strictness as opencode's native MCP config):
    from the session's worktree (session worktree → session directory → host
    launch directory as the anchor chain; first file found on the ancestor
    chain wins, nothing above it is consulted). When it exists, it **IS the
-   session's whole dispatch roster**.
+   session's whole dispatch roster**. For the dispatch gates the anchor is
+   resolved AUTHORITATIVE-FIRST (the host's session record) with one
+   conflict rule: a restart-RESUMED session whose record carries a pool-less
+   rebind directory while the session's live in-memory binding still owns a
+   pool resolves to the POOLED binding (one bounded console disclosure per
+   session names both paths) — own-pool dispatch rights survive both
+   degeneration directions (the degraded map, and the rebound record).
 2. the **global layer**: `~/.config/opencode/forge.json` — a **fallback
    ONLY**: when the workspace has no pool file, the global layer serves as
    the whole roster; when the workspace has one, the global layer is NOT
