@@ -34,9 +34,19 @@ const ROLE_PROMPTS: Record<string, string> = {
     "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict.",
 }
 
-export function rolePromptFor(agentId: string, def?: { prompt?: string }): string {
-  if (def?.prompt && def.prompt.trim().length > 0) return def.prompt
-  return ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`
+// forge-prompt-shared D1: the optional pool-level `shared` segment rides
+// BENEATH the unchanged three-layer chain as a STRICT PREPEND —
+// `shared + "\n\n" + chain`. `shared` is a common BASE, not a competing
+// layer: it can neither beat nor be beaten by any existing layer (an
+// explicit def.prompt still overrides role defaults; shared never
+// suppresses anything). Absent/undefined → the chain byte-identical to the
+// pre-shared build (purely additive).
+export function rolePromptFor(agentId: string, def?: { prompt?: string }, shared?: string): string {
+  const chain =
+    def?.prompt && def.prompt.trim().length > 0
+      ? def.prompt
+      : ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`
+  return shared === undefined ? chain : `${shared}\n\n${chain}`
 }
 
 // pool-namespace-contract D3: POOL PROVENANCE — static, per-family,
@@ -86,6 +96,7 @@ export function forgeAgentDef(
   agentId: string,
   def: ForgeAgentDef,
   provenance?: PoolProvenance,
+  sharedSeg?: string,
 ): Record<string, unknown> {
   const permission: Record<string, string> = { task: "deny" }
   // shape-default-open: an ABSENT shape defaults to WRITE (open permissions
@@ -101,10 +112,13 @@ export function forgeAgentDef(
   const entry: Record<string, unknown> = {
     description: agentDescriptionFor(agentId, def, provenance),
     mode: "subagent",
+    // forge-prompt-shared D4: sharedSeg (the agent's ORIGIN file's pool
+    // `shared` segment) threads into the ROLE slot — the mandate/shape
+    // frame around it and the description/provenance surface are untouched.
     prompt: materializeAgentPrompt({
       agent: agentId,
       shape,
-      role: rolePromptFor(agentId, def),
+      role: rolePromptFor(agentId, def, sharedSeg),
     }),
     permission,
     tools: { shell: false, bash: false },

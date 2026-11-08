@@ -619,6 +619,10 @@ export type PoolFamilyOrigin = {
   ns: string
   // The file's declared `pool` field as written (null when absent).
   declaredPool: string | null
+  // forge-prompt-shared D2: the file's validated top-level `shared` prompt
+  // segment (trimmed; null when absent or invalid-and-ignored). Per-FILE
+  // scope — every agent this file materializes inherits THIS value only.
+  shared: string | null
   // Materialized ids (without the `forge-` prefix) this pool contributes
   // after cross-family collision resolution.
   materializedIds: string[]
@@ -630,6 +634,9 @@ export type MaterializedPoolAgent = {
   def: ForgeAgentDef
   ns: string
   file: string
+  // forge-prompt-shared D2: this agent's ORIGIN file's `shared` segment —
+  // the materializer resolves it per file, never per session or per host.
+  shared: string | null
 }
 
 export type PoolResolution = {
@@ -716,7 +723,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
 
   // ---- mtime-cached parsed pool file (includes parse failures; the file
   // identity is the absolute path). `parsed: null` = no file at the path.
-  type ParsedPool = { agents: Record<string, ForgeAgentDef>; declaredPool: unknown; findings: ForgeConfigFinding[] }
+  type ParsedPool = { agents: Record<string, ForgeAgentDef>; declaredPool: unknown; shared: string | null; findings: ForgeConfigFinding[] }
   const fileCache = new Map<string, { mtimeMs: number; size: number; parsed: ParsedPool | null }>()
   const readPool = (path: string): ParsedPool | null => {
     const st = stat(path)
@@ -734,6 +741,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
       parsed = {
         agents: {},
         declaredPool: null,
+        shared: null,
         findings: [
           {
             level: "error",
@@ -743,11 +751,27 @@ export function createPoolResolver(deps: PoolResolverDeps): {
         ],
       }
     } else if (doc.config !== undefined && !isRecord(doc.config)) {
-      parsed = { agents: {}, declaredPool: null, findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this pool contributes no agents` }] }
+      parsed = { agents: {}, declaredPool: null, shared: null, findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this pool contributes no agents` }] }
     } else {
       const top = doc.config === undefined ? undefined : (doc.config as Record<string, unknown>)
       const validated = validateAgentSet(top === undefined ? undefined : top.agents)
-      parsed = { agents: validated.agents, declaredPool: top === undefined ? null : top.pool, findings: validated.findings }
+      // forge-prompt-shared D2: per-file top-level `shared` — field-level
+      // fail-soft exactly like `pool`. undefined/null → absent; a non-string
+      // or trim-empty value records exactly ONE warn finding naming the file
+      // and is ignored; a valid value is carried TRIMMED. The finding rides
+      // parsed.findings, so it surfaces once per resolve through the same
+      // channels as every other pool finding (global file included — its
+      // findings were pre-collected at the top of resolve).
+      const sharedRaw = top === undefined ? undefined : top.shared
+      let shared: string | null = null
+      if (sharedRaw !== undefined && sharedRaw !== null) {
+        if (typeof sharedRaw === "string" && sharedRaw.trim().length > 0) {
+          shared = sharedRaw.trim()
+        } else {
+          validated.findings.push({ level: "warn", code: "shared-invalid", message: `${path}: the top-level "shared" field must be a non-empty string — ignored` })
+        }
+      }
+      parsed = { agents: validated.agents, declaredPool: top === undefined ? null : top.pool, shared, findings: validated.findings }
     }
     fileCache.set(path, { mtimeMs: st.mtimeMs, size: st.size, parsed })
     return parsed
@@ -798,7 +822,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
       // global fallback file is the ONE exception-free case (design D2): its
       // ns is FIXED to "global", so a declared `pool` there is IGNORED with
       // a warn finding naming the file — never a rename, never an error.
-      type Family = { file: string; parsed: ParsedPool | null; ns: string; declaredPool: string | null }
+      type Family = { file: string; parsed: ParsedPool | null; ns: string; declaredPool: string | null; shared: string | null }
       const families: Family[] = []
       for (const file of orderedFiles) {
         const parsed = readPool(file)
@@ -822,7 +846,12 @@ export function createPoolResolver(deps: PoolResolverDeps): {
             }
           }
         }
-        families.push({ file, parsed, ns: "", declaredPool })
+        // forge-prompt-shared D3: `shared` is CONTENT, not namespace — the
+        // global fallback family INHERITS its file's shared segment even
+        // though the declared `pool` field above is ignored there. One rule,
+        // zero exceptions: whatever file an agent came from, that file's
+        // valid `shared` rides beneath its chain.
+        families.push({ file, parsed, ns: "", declaredPool, shared: parsed?.shared ?? null })
       }
 
       // ---- namespace assignment in resolution order: declared ?? sanitized
@@ -873,10 +902,13 @@ export function createPoolResolver(deps: PoolResolverDeps): {
             findings.push({ level: "error", code: "materialized-id-collision", message: `materialized agent forge-${matId} from ${f.file} collides with the one from ${existing.file} — the earlier pool in resolution order wins, this agent is skipped` })
             continue
           }
-          agents[matId] = { materializedId: matId, def: own[rawId], ns: f.ns, file: f.file }
+          // forge-prompt-shared D2: per-FILE scoping — the agent entry
+          // carries ITS OWN file's shared, so two pools never bleed segments
+          // into each other (sole-ownership mental model).
+          agents[matId] = { materializedId: matId, def: own[rawId], ns: f.ns, file: f.file, shared: f.shared }
           ids.push(matId)
         }
-        origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, materializedIds: ids })
+        origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, shared: f.shared, materializedIds: ids })
       }
       return { families: origins, agents, findings }
     },

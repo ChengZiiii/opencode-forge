@@ -224,3 +224,74 @@ test("poolProvenanceLine: exact sentence formats for both variants", () => {
     "Pool 'global' — origin: the global fallback layer.",
   )
 })
+
+// ---------------------------------------------------------------------------
+// forge-prompt-shared (spec: forge-subagents — "Pool-level shared prompt
+// segment"; design D1/D4): the pool's `shared` segment composes into the
+// ROLE slot as a strict prepend beneath the unchanged three-layer chain —
+// the mandate/shape frame wraps it exactly as it wraps any role text.
+
+test("rolePromptFor: shared is a strict prepend — shared + blank line + the unchanged chain", () => {
+  const seg = "Project X conventions: use bun; cite file:line."
+  // Layer 1 (explicit prompt) beneath shared.
+  assert.equal(
+    rolePromptFor("auditor", { prompt: "Audit licenses." }, seg),
+    `${seg}\n\nAudit licenses.`,
+  )
+  // Layer 2 (built-in research default) beneath shared, byte-stable.
+  const chain = rolePromptFor("research", { model: "x/y" })
+  assert.equal(rolePromptFor("research", { model: "x/y" }, seg), `${seg}\n\n${chain}`)
+  // Layer 3 (generic one-liner) beneath shared.
+  assert.equal(
+    rolePromptFor("summarizer", {}, seg),
+    `${seg}\n\nYou are a summarizer worker. Execute the assigned task exactly as scoped.`,
+  )
+  // An explicit prompt still overrides role defaults — shared suppresses
+  // nothing and never competes with any layer.
+  assert.ok(rolePromptFor("research", { prompt: "My own." }, seg).endsWith("\n\nMy own."))
+})
+
+test("rolePromptFor: undefined shared = the chain byte-identical (purely additive)", () => {
+  const def = { prompt: "Explicit.", model: "x/y" }
+  assert.equal(rolePromptFor("auditor", def, undefined), rolePromptFor("auditor", def))
+  assert.equal(rolePromptFor("research", { model: "x/y" }, undefined), rolePromptFor("research", { model: "x/y" }))
+})
+
+test("forgeAgentDef: sharedSeg enters the ROLE slot below the mandates; description/permission/tools untouched", () => {
+  const seg = "Project X conventions: use bun."
+  const def = { prompt: "Audit licenses.", model: "prov/x", thoughtLevel: "low" }
+  const withSeg = forgeAgentDef("auditor", def, { ns: "aa", file: "C:/PoolA/.opencode/forge.json" }, seg)
+  const noSeg = forgeAgentDef("auditor", def, { ns: "aa", file: "C:/PoolA/.opencode/forge.json" })
+  // The materialized prompt embeds the shared-then-role block, and the
+  // mandate block still wraps it unchanged (composition order: role slot
+  // above, mandates below — shared never touches mandate precedence).
+  assert.ok(withSeg.prompt.indexOf(`${seg}\n\nAudit licenses.`) >= 0, "shared + blank line + explicit prompt ride together in the role slot")
+  assert.ok(withSeg.prompt.indexOf(`${seg}\n\nAudit licenses.`) < withSeg.prompt.indexOf("Mandates"), "the role slot (shared included) sits below the mandates in reading order")
+  for (const m of [
+    "Use workspace-relative paths ONLY",
+    "Run every shell command through the forge_shell tool",
+    "report the refusal VERBATIM",
+    "evidence references",
+  ]) {
+    assert.ok(withSeg.prompt.includes(m), `mandate text verbatim: ${m}`)
+  }
+  // sharedSeg affects ONLY the prompt body.
+  assert.equal(withSeg.description, noSeg.description, "description untouched")
+  assert.deepEqual(withSeg.permission, noSeg.permission, "permission untouched")
+  assert.deepEqual(withSeg.tools, noSeg.tools, "tools untouched")
+  assert.equal(withSeg.model, noSeg.model, "model untouched")
+  // And the no-sharedSeg call is byte-identical to the legacy 3-arg call.
+  assert.equal(forgeAgentDef("auditor", def, { ns: "aa", file: "C:/PoolA/.opencode/forge.json" }, undefined).prompt, noSeg.prompt)
+})
+
+test("materializeAgentPrompt composition order: shared-primed role keeps mandate text precedence untouched", () => {
+  const seg = "Shared base."
+  const role = rolePromptFor("research", { model: "x/y" }, seg)
+  const p = materializeAgentPrompt({ agent: "research", shape: "readonly", role })
+  // The composed role (shared beneath the chain) rides inside the frame;
+  // every pre-existing assertion about the frame still holds verbatim.
+  assert.ok(p.indexOf(`${seg}\n\n`) < p.indexOf("Mandates"), "shared is innermost — the frame wraps it like any role text")
+  assert.match(p, /workspace-relative paths ONLY/)
+  assert.match(p, /Run every shell command through the forge_shell tool/)
+  assert.match(p, /readonly worker.*REPORT/s)
+})
