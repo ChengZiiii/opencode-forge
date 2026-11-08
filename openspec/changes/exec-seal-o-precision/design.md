@@ -52,7 +52,9 @@ cannot disambiguate across binaries.
 `O_FLAG_WRITER_BINARIES`. Head resolution rules (deterministic, string-only):
 
 - Tokenize quote-aware (D2); take the first token; skip a leading `&` (PowerShell call
-  operator) and `env VAR=...`-style prefixes if present.
+  operator). (`env VAR=...`-style prefixes are NOT skipped — an `env`-prefixed writer resolves head=`env`
+  and flows READ; accepted at review as the same disclosed fail-open class as `cmd /c` wrappers, with this
+  note as the record.)
 - If the head token is quoted, use its content. Take the basename (split on `/` and `\`),
   lowercase, strip a trailing `.exe`.
 - Membership is exact-match against the exported table.
