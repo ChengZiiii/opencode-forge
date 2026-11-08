@@ -8,6 +8,7 @@ import {
   GIT_MUTATING_SUBCOMMANDS,
   PKG_MUTATING_COMMANDS,
   WRITE_TARGET_FLAGS,
+  O_FLAG_WRITER_BINARIES,
 } from "../src/exec-classify.ts"
 
 // readonly-exec-seal — the pure classifier matrix (spec: tool-partition —
@@ -117,11 +118,16 @@ test("pkg-mutation: read-only package queries are READ-CLASS", () => {
 // only, zero fs)
 
 test("workspace-write: output flags with workspace-relative targets are WRITE-CLASS", () => {
-  for (const flag of WRITE_TARGET_FLAGS) {
+  // Long-form flags are binary-independent — any head (node here) catches.
+  for (const flag of WRITE_TARGET_FLAGS.filter((f) => f !== "-o")) {
     const v = W(`node tools/gen.mjs ${flag} src/generated.ts`)
     assert.equal(v.klass, "WRITE", `${flag} with a relative target must be WRITE-CLASS`)
     assert.equal(v.indicator, "workspace-write")
   }
+  // The short -o is gated on the writer-binary set (exec-seal-o-precision D1)
+  // — a writer head catches, a non-writer head flows.
+  assert.equal(W(`curl -o src/generated.ts https://example.com`).indicator, "workspace-write")
+  assert.equal(W(`node tools/gen.mjs -o src/generated.ts`).klass, "READ", "node is not a known -o writer")
   // attached --flag=value form
   const v = W("node tools/gen.mjs --out=src/generated.ts")
   assert.equal(v.klass, "WRITE")
@@ -140,6 +146,71 @@ test("workspace-write: absolute targets resolve against the injected workspaceRo
 test("workspace-write: -o followed by a non-path pattern stays READ-CLASS", () => {
   assert.equal(W("rg -o TODO src/").klass, "READ", "rg's -o takes no output path")
   assert.equal(W("node gen.mjs --out --verbose").klass, "READ", "a following flag is not a value")
+})
+
+// ---------------------------------------------------------------------------
+// exec-seal-o-precision: the short -o writer-binary gate + quote-aware
+// flag-value binding (D1 + D2)
+
+test("o-precision: both reproduced false positives are READ-CLASS with no indicator", () => {
+  // FP1 — quote-strip rebinding: the quoted pattern binds as -o's value and
+  // rg is not a writer binary; belt over belt.
+  const v1 = W(`rg -o "v1\\.2\\.3" package.json`)
+  assert.equal(v1.klass, "READ")
+  assert.equal(v1.indicator, undefined)
+  // FP2 — dotted unquoted pattern passes pathLike, but the writer gate stops it.
+  const v2 = W("rg -o needle.v2 src/")
+  assert.equal(v2.klass, "READ")
+  assert.equal(v2.indicator, undefined)
+  // The guarded bare-word shape stays READ too.
+  assert.equal(W("rg -o TODO src/").klass, "READ")
+})
+
+test("o-precision: writer-binary -o catches with the bound target in detail", () => {
+  for (const [cmd, target] of [
+    ["gcc -o out.exe main.c", "out.exe"],
+    ["go build -o bin/app ./cmd", "bin/app"],
+    ["curl -o out.txt https://example.com", "out.txt"],
+    ["psql -o query.out", "query.out"],
+  ]) {
+    const v = W(cmd)
+    assert.equal(v.klass, "WRITE", `${cmd} must be WRITE-CLASS`)
+    assert.equal(v.indicator, "workspace-write", `${cmd} names the workspace-write indicator`)
+    assert.ok(v.detail.includes(target), `${cmd} detail names the bound target (got: ${v.detail})`)
+  }
+})
+
+test("o-precision: quoted output target binds as the flag's value", () => {
+  const v = W(`curl -o "out.txt" https://example.com`)
+  assert.equal(v.klass, "WRITE")
+  assert.equal(v.indicator, "workspace-write")
+  assert.equal(v.detail, "-o out.txt", "the quoted token's content is the bound value")
+})
+
+test("o-precision: non-writer binaries and output-format -o flow READ-CLASS", () => {
+  for (const cmd of [
+    "kubectl get pods -o yaml", // -o is output FORMAT
+    `& "C:\\tools\\rg.exe" -o out.txt src/`, // quoted non-writer head with a path-like value
+  ]) {
+    assert.equal(W(cmd).klass, "READ", `${cmd} flows (fail-open outside the writer set)`)
+  }
+})
+
+test("o-precision: call-operator quoted writer head catches", () => {
+  const v = W(`& "C:\\path\\gcc.exe" -o out.exe x`)
+  assert.equal(v.klass, "WRITE")
+  assert.equal(v.indicator, "workspace-write")
+  assert.equal(v.detail, "-o out.exe")
+})
+
+test("o-precision: every O_FLAG_WRITER_BINARIES member's -o catches (no-drift over the exported table)", () => {
+  assert.ok(WRITE_TARGET_FLAGS.includes("-o"), "-o stays in the flag table")
+  for (const bin of O_FLAG_WRITER_BINARIES) {
+    const v = W(`${bin} -o out.bin`)
+    assert.equal(v.klass, "WRITE", `${bin} -o out.bin must be WRITE-CLASS`)
+    assert.equal(v.indicator, "workspace-write", `${bin} names the workspace-write indicator`)
+    assert.equal(v.detail, "-o out.bin")
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -176,4 +247,10 @@ test("indicator tables: the README cross-reference covers exactly the five delta
     ["redirect", "mutating-cmdlet", "git-mutation", "pkg-mutation", "workspace-write"],
   )
   for (const row of EXEC_SEAL_INDICATORS) assert.ok(row.covers.length > 0, `${row.id} carries its coverage text`)
+  // exec-seal-o-precision no-drift: the workspace-write row's covers text is
+  // rendered from the exported tables — it must name the writer-binary set.
+  const workspaceRow = EXEC_SEAL_INDICATORS.find((i) => i.id === "workspace-write")
+  for (const bin of O_FLAG_WRITER_BINARIES) {
+    assert.ok(workspaceRow.covers.includes(bin), `workspace-write covers text names ${bin}`)
+  }
 })

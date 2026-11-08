@@ -86,13 +86,35 @@ export const WRITE_TARGET_FLAGS = [
   "-o",
 ] as const
 
+/** exec-seal-o-precision D1: binaries whose short `-o` denotes an OUTPUT
+ * FILE. On every other binary (known readers like rg/grep/kubectl/gh/ssh,
+ * and unknown binaries) the short `-o` flows READ-CLASS — fail-open,
+ * disclosed verbatim in the README bypass surface. Long-form flags stay
+ * binary-independent. Exported beside the other tables so the test matrix
+ * and the README row iterate it (no-drift invariant). */
+export const O_FLAG_WRITER_BINARIES = [
+  "gcc",
+  "g++",
+  "cc",
+  "c++",
+  "clang",
+  "clang++",
+  "ld",
+  "rustc",
+  "go",
+  "curl",
+  "sort",
+  "psql",
+  "dotnet",
+] as const
+
 /** README cross-reference table (one row per covered WRITE-CLASS indicator). */
 export const EXEC_SEAL_INDICATORS: ReadonlyArray<{ id: string; covers: string }> = [
   { id: REDIRECT_INDICATOR, covers: "`>` `>>` and fd forms (`2>` `*>`) — bash and the PowerShell family share the operators" },
   { id: "mutating-cmdlet", covers: MUTATING_CMDLETS.join(", ") },
   { id: "git-mutation", covers: `git ${GIT_MUTATING_SUBCOMMANDS.join("/")}` },
   { id: "pkg-mutation", covers: PKG_MUTATING_COMMANDS.join(", ") + " (with common aliases: npm i/ci/add, bun install, pip3 install)" },
-  { id: "workspace-write", covers: `output-target flags ${WRITE_TARGET_FLAGS.join(" ")} whose parsed value is a workspace-relative path (or an absolute path under the provided workspaceRoot)` },
+  { id: "workspace-write", covers: `output-target flags ${WRITE_TARGET_FLAGS.join(" ")} whose parsed value is a workspace-relative path (or an absolute path under the provided workspaceRoot); the short -o counts only when the head binary is a known -o writer (${O_FLAG_WRITER_BINARIES.join(", ")})` },
 ]
 
 // ---------------------------------------------------------------------------
@@ -102,7 +124,9 @@ export const EXEC_SEAL_INDICATORS: ReadonlyArray<{ id: string; covers: string }>
 // Strip quoted spans ('...' / "...") so code literals like `node -e "x => y"`
 // or strings mentioning cmdlet names cannot trip the redirect scan. A
 // hand-rolled scanner (not regex-replace chains) so escapes inside quotes
-// stay simple and predictable.
+// stay simple and predictable. The four indicator scans (redirect, cmdlets,
+// git, pkg) run on this output — UNCHANGED by exec-seal-o-precision (D2 adds
+// a second track below; it does not modify this one).
 function stripQuoted(cmd: string): string {
   let out = ""
   let quote: '"' | "'" | null = null
@@ -118,6 +142,70 @@ function stripQuoted(cmd: string): string {
     out += ch
   }
   return out
+}
+
+// exec-seal-o-precision D2: quote-aware tokenizer for FLAG-VALUE BINDING.
+// Single scanner, same quote rules as stripQuoted (both ' and ", no escape
+// modeling inside quotes); emits tokens as {text, quoted} where text carries
+// the CONTENT without the quote characters and quoted marks that the token
+// (or part of it) was quoted. Only workspaceWriteMatch consumes this — the
+// other indicator scans keep running on stripQuoted output.
+export interface CommandToken {
+  text: string
+  quoted: boolean
+}
+
+export function tokenizeCommand(cmd: string): CommandToken[] {
+  const tokens: CommandToken[] = []
+  let text = ""
+  let quoted = false
+  let mode: '"' | "'" | null = null
+  let sawAny = false
+  const flush = () => {
+    if (sawAny) tokens.push({ text, quoted })
+    text = ""
+    quoted = false
+    sawAny = false
+  }
+  for (const ch of cmd) {
+    if (mode) {
+      if (ch === mode) {
+        mode = null
+        continue
+      }
+      text += ch
+      sawAny = true
+      continue
+    }
+    if (ch === '"' || ch === "'") {
+      mode = ch
+      quoted = true
+      sawAny = true
+      continue
+    }
+    if (ch === " " || ch === "\t" || ch === "\r" || ch === "\n") {
+      flush()
+      continue
+    }
+    text += ch
+    sawAny = true
+  }
+  flush()
+  return tokens
+}
+
+// exec-seal-o-precision D1: resolve the command's head binary for the
+// writer-set gate. Rules (deterministic, string-only): first token after
+// skipping a leading `&` (PowerShell call operator); a quoted head uses its
+// content; basename (split on / and \), lowercase, strip a trailing `.exe`.
+function resolveHeadBinary(tokens: CommandToken[]): string {
+  let i = tokens.length > 0 && !tokens[0].quoted && tokens[0].text === "&" ? 1 : 0
+  const head = tokens[i]
+  if (!head) return ""
+  const parts = head.text.split(/[\\/]/)
+  let bin = parts[parts.length - 1].toLowerCase()
+  if (bin.endsWith(".exe")) bin = bin.slice(0, -4)
+  return bin
 }
 
 // Detect `>` / `>>` outside quotes (fd-dup forms like `2>&1` excluded: a `>`
@@ -178,23 +266,36 @@ function insideWorkspace(value: string, workspaceRoot?: string): boolean {
 }
 
 function workspaceWriteMatch(cmd: string, workspaceRoot?: string): { detail: string } | null {
-  const tokens = stripQuoted(cmd).split(/\s+/).filter(Boolean)
+  const tokens = tokenizeCommand(cmd)
+  const headBinary = resolveHeadBinary(tokens)
+  const headIsWriter = (O_FLAG_WRITER_BINARIES as readonly string[]).includes(headBinary)
   for (let i = 0; i < tokens.length; i++) {
     const tok = tokens[i]
+    if (tok.quoted) continue // a quoted "-o"/"--out" is a string literal, not a flag
     let flag = ""
-    let value: string | undefined
-    const eq = tok.indexOf("=")
-    if (eq > 0 && tok.startsWith("--")) {
-      flag = tok.slice(0, eq)
-      value = tok.slice(eq + 1)
-    } else if ((WRITE_TARGET_FLAGS as readonly string[]).includes(tok)) {
-      flag = tok
-      value = tokens[i + 1]
+    let valueText: string | undefined
+    const text = tok.text
+    const eq = text.indexOf("=")
+    if (eq > 0 && text.startsWith("--")) {
+      flag = text.slice(0, eq)
+      valueText = text.slice(eq + 1)
+    } else if ((WRITE_TARGET_FLAGS as readonly string[]).includes(text)) {
+      // exec-seal-o-precision D1: the SHORT -o counts as an output-target
+      // flag only when the resolved head binary is a known -o writer; every
+      // other binary (known readers AND unknowns) flows READ (fail-open,
+      // README-disclosed). Long-form flags stay binary-independent.
+      if (text === "-o" && !headIsWriter) continue
+      flag = text
+      const next = tokens[i + 1]
+      // Quoted values are eligible flag values (D2: `curl -o "out.txt"`
+      // binds out.txt; `rg -o "v1\.2"` binds the pattern instead of
+      // rebinding the flag onto a later path token).
+      valueText = next?.text
     }
-    if (!flag || value === undefined) continue
-    if (value.startsWith("-")) continue // next flag, not a value
-    if (pathLike(value) && insideWorkspace(value, workspaceRoot)) {
-      return { detail: `${flag} ${value}` }
+    if (!flag || valueText === undefined) continue
+    if (valueText.startsWith("-")) continue // next flag, not a value
+    if (pathLike(valueText) && insideWorkspace(valueText, workspaceRoot)) {
+      return { detail: `${flag} ${valueText}` }
     }
   }
   return null
