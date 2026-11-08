@@ -1273,6 +1273,10 @@ test("goal delegation: one-call born-armed crew; crew gates stay internal to the
     toolCtx(sid, wt),
   )
   assert.match(out.output, /born armed/)
+  // crew-native-fallback 1.2: the born-armed (goal-delegated) arming output
+  // carries the same one-line fallback rule as the standalone arm.
+  assert.match(out.output, /Native fallback: when the pool offers no forge worker fitting a subtask/, "the born-armed arming output carries the fallback rule")
+  assert.match(out.output, /RECORD the fallback/, "the recording duty rides the born-armed output")
   assert.doesNotMatch(out.output, /PENDING for this session/)
   assert.equal(hooks.__forgeSubagentsTest.crews().get(sid).mode, "executing")
 

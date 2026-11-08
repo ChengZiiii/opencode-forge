@@ -126,3 +126,17 @@ test("gate: PASS/FAIL verdict vocabulary is enforced", () => {
   assert.equal(check.ok, false)
   assert.ok(check.gaps.some((g) => g.includes("DONE")))
 })
+
+// crew-native-fallback 2.3 (spec: crew-harness — "Native fallback dispatch in
+// crew waves"): a subtask dispatched through the NATIVE task channel records
+// the fallback in its evidence WORDING ("ran native") — titles, verdicts and
+// evidence statements govern exactly as before; no new field exists.
+test("gate: a report whose evidence says it ran native closes normally (no new field)", () => {
+  const report = [
+    { title: "alpha", verdict: "PASS", evidence: "ran native (no fitting forge worker): the native general subagent returned the auth flow summary against the relayed artifact path" },
+    { title: "beta", verdict: "PASS", evidence: "diff applied and tests output green" },
+  ]
+  const check = validateCrewReport(report, PLAN)
+  assert.equal(check.ok, true, "evidence wording mentioning 'ran native' is free text — the gate accepts it like any other verdict")
+  assert.equal(check.gaps.length, 0)
+})
