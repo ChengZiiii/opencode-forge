@@ -70,7 +70,7 @@ tool layer (verified against the host's `tools` filter):
 | | **forge family** — `forge` + your forge.json `forge-*` workers | **everyone else** — native `build` / `plan` / `general` / `explore` and your own agents |
 | --- | --- | --- |
 | exec surface | `forge_shell` / `forge_jobs` only; builtin `shell`/`bash` hidden (unconditional, probe-independent; covers user-defined `agent.forge` entries too) | builtin `shell`/`bash`, fully native |
-| forge tools (`plan_*`, `goal_*`, `crew_*`, `forge_shell`, `forge_jobs`) | `forge` sees all; `forge-*` workers only `forge_shell` + `forge_jobs` | none visible |
+| forge tools (`plan_*`, `goal_*`, `crew_*`, `forge_shell`, `forge_jobs`, `forge_grep`, `forge_glob`) | `forge` sees all; `forge-*` workers only `forge_shell` + `forge_jobs` + the search pair (`forge_grep`/`forge_glob`) | none visible |
 | dispatching `forge-*` via `task` | allowed | refused at the tool layer |
 | writing `.opencode/plan/` / `.opencode/goal/` | allowed (state machine governs) | refused at the tool layer (reads stay open) |
 | forge system prompts (job guidance, plan/goal notices) | injected | never injected — zero forge text |
@@ -152,6 +152,10 @@ the plugin never writes them):
       "watchdog": {
         "mode": "kill",              // "kill" (default) | "dry-run" | "off" — forge-family sessions only
         "stallMs": 600000            // stall threshold, min 60000
+      },
+      "search": {
+        "rgPath": ""                 // optional explicit ripgrep binary path for forge_grep/forge_glob;
+                                     // default resolution: this override (when it exists) → rg on PATH
       }
     }]
   ]
@@ -412,6 +416,45 @@ These are runtime debris, not data — with ONE caveat: **if you uninstall with
 /F /T`, or just reboot); deleting the directory afterwards is safe and
 complete.
 
+## Search tools (`forge_grep` / `forge_glob`)
+
+rg-backed search for the forge family — same interface and output format as
+the builtin `grep`/`glob` pair, but **`follow` and `hidden` default to TRUE**:
+workspace content behind symlinks/junctions and inside dot-directories (which
+the builtin pair silently misses) is in scope by default. `**/.git/**` is
+ always excluded. The builtin pair stays visible — the forge family is
+instructed to prefer `forge_grep`/`forge_glob` first and use builtin
+`grep`/`glob` as fallback only; the standing worker mandate reads:
+
+> Run every search through the forge_grep/forge_glob tools first — the
+> builtin grep/glob tools are fallback only. forge_grep/forge_glob see
+> through symlinks/junctions and dot-directories because follow and hidden
+> are on by default.
+
+- **Params**: `pattern` (required); `path` (optional — defaults to the session
+  worktree; a file path targets that file); `include` (forge_grep file
+  filter); `follow` / `hidden` (optional booleans, both default `true`).
+- **Output parity**: `Found N matches` with `path: Line n:` blocks
+  (forge_glob: a plain path list) — the same shapes as the builtin pair.
+  Results truncate at 100 with a truncation notice advising a narrower
+  path or pattern.
+- **Follow dedupe**: a file reachable through its real path AND a link path
+  reports ONCE (lexicographically first path kept); when any dedupe occurred
+  the output ends with a `+N duplicate paths merged` line.
+- **Outside-workspace links**: followed, with the resolved target disclosed
+  in the result.
+- **Readonly by construction**: ripgrep is spawned directly with a fixed
+  argument vector — no shell, no redirection surface. The tools carry no
+  permission ask-gate and are not subject to the readonly exec seal, so
+  explicit-readonly workers search without friction.
+
+**ripgrep dependency.** No binary is bundled. rg is resolved as:
+`search.rgPath` config override (when it exists on disk) → `rg` on PATH →
+fail-soft guidance error (never a crash):
+
+> install ripgrep (or set search.rgPath in forge config to an existing rg
+> binary), or fall back to the builtin grep/glob tools for this search
+
 ## Forge subagents (static worker agents in forge.json)
 
 Forge subagents are **static, user-authored worker agents**: each forge.json
@@ -576,8 +619,10 @@ A rejected entry costs only itself — its siblings materialize normally.
    layer), carrying the pinned `model`
   (pinned workers) or NO model key at all (Auto workers — the description
   says "inherits the parent session's model" instead of naming a brain),
-  the worker discipline (workspace-relative paths only, verbatim reporting
-  of tool refusals, evidence-bearing conclusions) around its role prompt,
+   the worker discipline (workspace-relative paths only, verbatim reporting
+   of tool refusals, evidence-bearing conclusions, search through
+   `forge_grep`/`forge_glob` first with builtin `grep`/`glob` as fallback
+   only) around its role prompt,
    and a deny-style permission: an ABSENT `shape` defaults to WRITE (open
    permissions — the compatibility-preserving default for existing pools);
    an explicit `shape: "readonly"` denies
