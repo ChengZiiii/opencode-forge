@@ -15048,10 +15048,11 @@ var ROLE_PROMPTS = {
   research: "You are a research worker: search, read, and run read-only checks to answer the assigned question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
   review: "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict."
 };
-function rolePromptFor(agentId, def) {
-  if (def?.prompt && def.prompt.trim().length > 0)
-    return def.prompt;
-  return ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`;
+function rolePromptFor(agentId, def, shared) {
+  const chain = def?.prompt && def.prompt.trim().length > 0 ? def.prompt : ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`;
+  return shared === undefined ? chain : `${shared}
+
+${chain}`;
 }
 function poolProvenanceLine(provenance) {
   if ("global" in provenance) {
@@ -15065,7 +15066,7 @@ function agentDescriptionFor(agentId, def, provenance) {
   const base = `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`;
   return provenance === undefined ? base : `${base} ${poolProvenanceLine(provenance)}`;
 }
-function forgeAgentDef(agentId, def, provenance) {
+function forgeAgentDef(agentId, def, provenance, sharedSeg) {
   const permission = { task: "deny" };
   const shape = def.shape ?? "write";
   if (shape === "readonly") {
@@ -15080,7 +15081,7 @@ function forgeAgentDef(agentId, def, provenance) {
     prompt: materializeAgentPrompt({
       agent: agentId,
       shape,
-      role: rolePromptFor(agentId, def)
+      role: rolePromptFor(agentId, def, sharedSeg)
     }),
     permission,
     tools: { shell: false, bash: false }
@@ -15142,12 +15143,27 @@ var WRITE_TARGET_FLAGS = [
   "--destination",
   "-o"
 ];
+var O_FLAG_WRITER_BINARIES = [
+  "gcc",
+  "g++",
+  "cc",
+  "c++",
+  "clang",
+  "clang++",
+  "ld",
+  "rustc",
+  "go",
+  "curl",
+  "sort",
+  "psql",
+  "dotnet"
+];
 var EXEC_SEAL_INDICATORS = [
   { id: REDIRECT_INDICATOR, covers: "`>` `>>` and fd forms (`2>` `*>`) — bash and the PowerShell family share the operators" },
   { id: "mutating-cmdlet", covers: MUTATING_CMDLETS.join(", ") },
   { id: "git-mutation", covers: `git ${GIT_MUTATING_SUBCOMMANDS.join("/")}` },
   { id: "pkg-mutation", covers: PKG_MUTATING_COMMANDS.join(", ") + " (with common aliases: npm i/ci/add, bun install, pip3 install)" },
-  { id: "workspace-write", covers: `output-target flags ${WRITE_TARGET_FLAGS.join(" ")} whose parsed value is a workspace-relative path (or an absolute path under the provided workspaceRoot)` }
+  { id: "workspace-write", covers: `output-target flags ${WRITE_TARGET_FLAGS.join(" ")} whose parsed value is a workspace-relative path (or an absolute path under the provided workspaceRoot); the short -o counts only when the head binary is a known -o writer (${O_FLAG_WRITER_BINARIES.join(", ")})` }
 ];
 function stripQuoted(cmd) {
   let out = "";
@@ -15165,6 +15181,57 @@ function stripQuoted(cmd) {
     out += ch;
   }
   return out;
+}
+function tokenizeCommand(cmd) {
+  const tokens = [];
+  let text = "";
+  let quoted = false;
+  let mode = null;
+  let sawAny = false;
+  const flush = () => {
+    if (sawAny)
+      tokens.push({ text, quoted });
+    text = "";
+    quoted = false;
+    sawAny = false;
+  };
+  for (const ch of cmd) {
+    if (mode) {
+      if (ch === mode) {
+        mode = null;
+        continue;
+      }
+      text += ch;
+      sawAny = true;
+      continue;
+    }
+    if (ch === '"' || ch === "'") {
+      mode = ch;
+      quoted = true;
+      sawAny = true;
+      continue;
+    }
+    if (ch === " " || ch === "\t" || ch === "\r" || ch === `
+`) {
+      flush();
+      continue;
+    }
+    text += ch;
+    sawAny = true;
+  }
+  flush();
+  return tokens;
+}
+function resolveHeadBinary(tokens) {
+  let i = tokens.length > 0 && !tokens[0].quoted && tokens[0].text === "&" ? 1 : 0;
+  const head = tokens[i];
+  if (!head)
+    return "";
+  const parts = head.text.split(/[\\/]/);
+  let bin = parts[parts.length - 1].toLowerCase();
+  if (bin.endsWith(".exe"))
+    bin = bin.slice(0, -4);
+  return bin;
 }
 function redirectMatch(cmd) {
   const bare = stripQuoted(cmd).replace(/\r?\n/g, " ");
@@ -15214,25 +15281,33 @@ function insideWorkspace(value, workspaceRoot) {
   return norm(value).startsWith(`${norm(workspaceRoot)}/`) || norm(value) === norm(workspaceRoot);
 }
 function workspaceWriteMatch(cmd, workspaceRoot) {
-  const tokens = stripQuoted(cmd).split(/\s+/).filter(Boolean);
+  const tokens = tokenizeCommand(cmd);
+  const headBinary = resolveHeadBinary(tokens);
+  const headIsWriter = O_FLAG_WRITER_BINARIES.includes(headBinary);
   for (let i = 0;i < tokens.length; i++) {
     const tok = tokens[i];
+    if (tok.quoted)
+      continue;
     let flag = "";
-    let value;
-    const eq = tok.indexOf("=");
-    if (eq > 0 && tok.startsWith("--")) {
-      flag = tok.slice(0, eq);
-      value = tok.slice(eq + 1);
-    } else if (WRITE_TARGET_FLAGS.includes(tok)) {
-      flag = tok;
-      value = tokens[i + 1];
+    let valueText;
+    const text = tok.text;
+    const eq = text.indexOf("=");
+    if (eq > 0 && text.startsWith("--")) {
+      flag = text.slice(0, eq);
+      valueText = text.slice(eq + 1);
+    } else if (WRITE_TARGET_FLAGS.includes(text)) {
+      if (text === "-o" && !headIsWriter)
+        continue;
+      flag = text;
+      const next = tokens[i + 1];
+      valueText = next?.text;
     }
-    if (!flag || value === undefined)
+    if (!flag || valueText === undefined)
       continue;
-    if (value.startsWith("-"))
+    if (valueText.startsWith("-"))
       continue;
-    if (pathLike(value) && insideWorkspace(value, workspaceRoot)) {
-      return { detail: `${flag} ${value}` };
+    if (pathLike(valueText) && insideWorkspace(valueText, workspaceRoot)) {
+      return { detail: `${flag} ${valueText}` };
     }
   }
   return null;
@@ -15857,6 +15932,7 @@ function createPoolResolver(deps) {
       parsed = {
         agents: {},
         declaredPool: null,
+        shared: null,
         findings: [
           {
             level: "error",
@@ -15866,11 +15942,20 @@ function createPoolResolver(deps) {
         ]
       };
     } else if (doc2.config !== undefined && !isRecord(doc2.config)) {
-      parsed = { agents: {}, declaredPool: null, findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this pool contributes no agents` }] };
+      parsed = { agents: {}, declaredPool: null, shared: null, findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this pool contributes no agents` }] };
     } else {
       const top = doc2.config === undefined ? undefined : doc2.config;
       const validated = validateAgentSet(top === undefined ? undefined : top.agents);
-      parsed = { agents: validated.agents, declaredPool: top === undefined ? null : top.pool, findings: validated.findings };
+      const sharedRaw = top === undefined ? undefined : top.shared;
+      let shared = null;
+      if (sharedRaw !== undefined && sharedRaw !== null) {
+        if (typeof sharedRaw === "string" && sharedRaw.trim().length > 0) {
+          shared = sharedRaw.trim();
+        } else {
+          validated.findings.push({ level: "warn", code: "shared-invalid", message: `${path}: the top-level "shared" field must be a non-empty string — ignored` });
+        }
+      }
+      parsed = { agents: validated.agents, declaredPool: top === undefined ? null : top.pool, shared, findings: validated.findings };
     }
     fileCache.set(path, { mtimeMs: st.mtimeMs, size: st.size, parsed });
     return parsed;
@@ -15925,7 +16010,7 @@ function createPoolResolver(deps) {
             }
           }
         }
-        families.push({ file: file2, parsed, ns: "", declaredPool });
+        families.push({ file: file2, parsed, ns: "", declaredPool, shared: parsed?.shared ?? null });
       }
       const allDeclared = new Set;
       for (const f of families)
@@ -15958,10 +16043,10 @@ function createPoolResolver(deps) {
             findings.push({ level: "error", code: "materialized-id-collision", message: `materialized agent forge-${matId} from ${f.file} collides with the one from ${existing.file} — the earlier pool in resolution order wins, this agent is skipped` });
             continue;
           }
-          agents[matId] = { materializedId: matId, def: own[rawId], ns: f.ns, file: f.file };
+          agents[matId] = { materializedId: matId, def: own[rawId], ns: f.ns, file: f.file, shared: f.shared };
           ids.push(matId);
         }
-        origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, materializedIds: ids });
+        origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, shared: f.shared, materializedIds: ids });
       }
       return { families: origins, agents, findings };
     }
@@ -16363,6 +16448,8 @@ function crewPoolComplianceRefusal(anchor) {
   const suggested = fam?.ns ?? sanitizeNamespace(basename2(dirname4(dirname4(poolFile))));
   return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) is non-compliant — ${verdict.violation}. ` + `Minimal fix: add or repair the top-level "pool": "${suggested}" field (a [a-z0-9-] string, 1-24 chars — REQUIRED for crew-governed dispatch). ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
 }
+var CREW_NATIVE_FALLBACK_RULE = "Native fallback: when the pool offers no forge worker fitting a subtask (or forge-* dispatch is blocked by a degraded pool), dispatch the native general subagent with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native).";
+var CREW_COMPLIANCE_NATIVE_EXIT = " Native exit: while the pool is being repaired, the affected subtask may dispatch through the NATIVE task channel with the same relay contract — this compliance belt gates forge-* dispatch only, never the crew's existence.";
 var crews = new Map;
 function crewRecordPathFor(worktree, objective) {
   const dir = join6(worktree, ".opencode", "crew");
@@ -16412,7 +16499,7 @@ function crewPendingChoiceLines() {
   return [
     "[forge:crew] The crew is PENDING — execution has NOT started. Present the execution-mode choice to the user and END YOUR TURN (every task dispatch is refused while the crew pends):",
     `RELAY FIRST: tell the user the crew record path (it leads this output) alongside this choice — the record is on disk from the registration moment, and the user must hear it.`,
-    `  1. supervised waves NOW — when the user says go, call crew_begin {execution: "waves"} and run the wave discipline;`,
+    `  1. supervised waves NOW — when the user says go, call crew_begin {execution: "waves"} and run the wave discipline; waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard);`,
     `  2. convert to a goal contract — call crew_begin {execution: "goal"} (the crew ends as a conversion record; no extra dialog here), then draft goal_write with arm=true folding the declared subtasks into criteria/checks — the arm dialog is the user's gate;`,
     `  3. standby — no call; the crew waits until armed or abandoned.`
   ];
@@ -17405,8 +17492,8 @@ function crewOrchestrationTemplate(resolution) {
     "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). The macro contract above the crew may come from an approved plan, a spec change, or inline text — the discipline is identical in all three cases and never requires a plan. Follow it exactly:",
     "",
     '1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). When the macro contract descends from a plan artifact, pass its path as the optional `lineage` argument (e.g. lineage: ".opencode/plan/2026-10-01-my-plan.md") — the descent is recorded as a first-class line in the crew record header; lineage is never inferred. Reconnaissance BEFORE registration is free (task calls included). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. A wrong plan is fixed by abandoning and re-crewing (crew_close {abandon: true, reason}), never by improvising outside the declared plan.',
-    `2. THE PAUSE: registration enters a PENDING crew — execution has NOT started. STOP and present the user the three execution-mode choices (supervised waves now / convert to a goal contract / standby), then END YOUR TURN. Arm per the user's choice: waves → crew_begin {execution: "waves"}; conversion → crew_begin {execution: "goal"} followed by goal_write (arm=true — its dialog is the user's gate) folding the declared subtasks into criteria/checks; standby → no call. EXCEPTION: while a live active goal governs this session, register with execution: "waves" in the SAME call — the crew is born armed (the goal contract already authorized orchestration) and crew_close / abandon stay ask-free under that goal.`,
-    "3. WAVES, NEVER FLOODS (armed crews only): execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in. GUI / computer-use subtasks are mutually exclusive within a wave (the desktop is a singleton resource — at most ONE in flight; non-GUI subtasks still parallelize freely), and GUI walkthroughs use the `computer` tool rather than DIY shell screenshot pipelines.",
+    `2. THE PAUSE: registration enters a PENDING crew — execution has NOT started. STOP and present the user the three execution-mode choices (supervised waves now / convert to a goal contract / standby), then END YOUR TURN. Arm per the user's choice: waves → crew_begin {execution: "waves"} (waves then auto-advance on session idle until crew_close — the engine stops after a stall, nudge or re-shard); conversion → crew_begin {execution: "goal"} followed by goal_write (arm=true — its dialog is the user's gate) folding the declared subtasks into criteria/checks; standby → no call. EXCEPTION: while a live active goal governs this session, register with execution: "waves" in the SAME call — the crew is born armed (the goal contract already authorized orchestration) and crew_close / abandon stay ask-free under that goal.`,
+    "3. WAVES, NEVER FLOODS (armed crews only): execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in. GUI / computer-use subtasks are mutually exclusive within a wave (the desktop is a singleton resource — at most ONE in flight; non-GUI subtasks still parallelize freely), and GUI walkthroughs use the `computer` tool rather than DIY shell screenshot pipelines. Native fallback: when the pool offers no forge worker fitting a subtask (or forge-* dispatch is blocked by a degraded pool), dispatch the native general subagent with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native).",
     "4. CONTRACT RELAY (lineage-descended crews): when the macro contract descends from an on-disk artifact (the lineage names a plan artifact, a spec change directory, or a goal contract), every subtask's dispatch prompt MUST explicitly carry that artifact's path — or the exact slice the subtask works from (a delta file path, a quoted criteria section) — so the dispatched worker reads the contract itself, never your paraphrase of it. A large artifact is relayed by its exact slice; it is NEVER dropped for being too long to inline. Every close-report evidence statement MUST name the contract (or slice) the subtask worked against.",
     "5. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, run that subtask through a native task call anyway AND tell the user about the gap — suggest configuring the missing role in forge.json.",
     "6. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the task result text. A result that does not meet the statement is a failure even if the worker sounded confident.",
@@ -17500,9 +17587,11 @@ var crewBeginTool = tool({
         title: `crew armed: ${crew.objective.slice(0, 60)}`,
         output: [
           `[forge:crew] Crew ARMED for supervised waves: ${crew.objective}`,
+          `Waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard).`,
           `Declared plan (${crew.subtasks.length}):`,
           ...crew.subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
-          "Proceed with the wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask."
+          "Proceed with the wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+          CREW_NATIVE_FALLBACK_RULE
         ].join(`
 `)
       };
@@ -17554,6 +17643,7 @@ var crewBeginTool = tool({
         recordNote = "Crew record could not be written (fail-soft; the crew still runs).";
       }
     }
+    crewEngineForgetSession(context.sessionID);
     crews.set(context.sessionID, { objective: objectiveText, startedAt: nowIso(), subtasks, mode: governed ? "executing" : "pending", recordPath });
     appendCrewRecord(recordPath, governed ? "registered (born armed under a governing goal)" : "registered (pending)", subtasks.map((s, i) => `${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`));
     let disclosure = "";
@@ -17591,7 +17681,7 @@ var crewBeginTool = tool({
       ...disclosure ? [disclosure] : []
     ];
     if (governed) {
-      lines.push("Goal-delegated orchestration: the governing goal contract already authorized this crew — run the wave discipline NOW (crew gates stay internal to the loop; crew_close and abandon are ask-free under this goal), and re-shard via crew_close {abandon: true, reason} + a fresh one-call crew_begin when the decomposition proves wrong.", "Wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.");
+      lines.push("Goal-delegated orchestration: the governing goal contract already authorized this crew — run the wave discipline NOW (crew gates stay internal to the loop; crew_close and abandon are ask-free under this goal), and re-shard via crew_close {abandon: true, reason} + a fresh one-call crew_begin when the decomposition proves wrong.", "This crew is driven by the goal engine's own continuations (no separate crew briefs); standalone waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard).", "Wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.", CREW_NATIVE_FALLBACK_RULE);
     } else {
       lines.push(...crewPendingChoiceLines());
     }
@@ -17731,6 +17821,91 @@ function engineForgetAll() {
   for (const id of [...idleTimers.keys()])
     engineForgetSession(id);
 }
+var CREW_NO_PROGRESS_LIMIT = 3;
+var crewPendingTurn = new Set;
+var crewTurnActivity = new Map;
+var crewNoProgress = new Map;
+var crewStalled = new Set;
+function crewEngineForgetSession(sessionID) {
+  crewPendingTurn.delete(sessionID);
+  crewTurnActivity.delete(sessionID);
+  crewNoProgress.delete(sessionID);
+  crewStalled.delete(sessionID);
+}
+function crewContinueBrief(crew) {
+  return [
+    `[forge:crew-continue] The crew "${crew.objective}" is armed (waves) — continue the wave discipline.`,
+    `Declared plan (every subtask needs a verdict at close):`,
+    ...crew.subtasks.map((s, i) => `${i + 1}. ${s.title}`),
+    `Next: dispatch the next wave (parallel task calls — forge-* workers from this session's pool, or the native general subagent when no forge worker fits), collect per-subtask evidence verdicts, at most one retry per subtask, then crew_close with the full report. Stalled or wrong decomposition? crew_close {abandon: true, reason} to re-shard.`
+  ].join(`
+`);
+}
+async function continueCrewIfEligible(client, state, sessionID) {
+  const crew = crews.get(sessionID);
+  if (!crew || crew.mode !== "executing") {
+    goalProbe(`crew skip: no executing crew session=${sessionID}`);
+    return;
+  }
+  if (crewStalled.has(sessionID)) {
+    goalProbe(`crew skip: stalled session=${sessionID}`);
+    return;
+  }
+  if (!sessionIsForgeFamily(sessionID)) {
+    goalProbe(`crew skip: agent switched to non-forge before send session=${sessionID}`);
+    return;
+  }
+  if (crewPendingTurn.has(sessionID)) {
+    crewPendingTurn.delete(sessionID);
+    const act = crewTurnActivity.get(sessionID);
+    if (act && (act.dispatches > 0 || act.writes > 0)) {
+      crewNoProgress.delete(sessionID);
+    } else {
+      const n = (crewNoProgress.get(sessionID) ?? 0) + 1;
+      crewNoProgress.set(sessionID, n);
+      goalProbe(`crew no-progress session=${sessionID} streak=${n}`);
+      if (n >= CREW_NO_PROGRESS_LIMIT) {
+        crewStalled.add(sessionID);
+        crewTurnActivity.delete(sessionID);
+        console.warn(`[forge:crew-continue] stalled: crew "${crew.objective.slice(0, 80)}" produced ${n} activity-free continuation turns — the engine stops continuing it (the crew stays registered; nudge the session, crew_close the report, or crew_close {abandon: true, reason} to re-shard).`);
+        return;
+      }
+    }
+  }
+  if (typeof client.session.status === "function") {
+    try {
+      const st = await client.session.status({ path: { id: sessionID } });
+      const t = st?.[sessionID]?.type;
+      if (t && t !== "idle") {
+        goalProbe(`crew skip: session busy again session=${sessionID} status=${t}`);
+        return;
+      }
+    } catch (err) {
+      goalProbe(`crew skip: status check failed session=${sessionID} err=${String(err)}`);
+      return;
+    }
+  }
+  try {
+    await client.session.prompt({
+      path: { id: sessionID },
+      body: { parts: [{ type: "text", text: crewContinueBrief(crew) }] }
+    });
+    transportFails.delete(sessionID);
+    crewPendingTurn.add(sessionID);
+    crewTurnActivity.set(sessionID, { dispatches: 0, writes: 0 });
+    goalProbe(`crew continued session=${sessionID} objective="${crew.objective.slice(0, 60)}"`);
+  } catch (err) {
+    const n = (transportFails.get(sessionID) ?? 0) + 1;
+    transportFails.set(sessionID, n);
+    goalProbe(`crew transport failure session=${sessionID} count=${n} err=${String(err)}`);
+    if (n >= TRANSPORT_FAILURE_LIMIT) {
+      crewStalled.add(sessionID);
+      crewPendingTurn.delete(sessionID);
+      crewTurnActivity.delete(sessionID);
+      console.warn(`[forge:crew-continue] stopped: ${n} consecutive delivery failures for crew "${crew.objective.slice(0, 80)}" — the engine stops continuing it (the crew stays registered; nudge the session or crew_close when back).`);
+    }
+  }
+}
 function goalBriefText(state, goal) {
   const d = goal.doc;
   return [
@@ -17743,7 +17918,7 @@ ${d.checks.map((c, i) => `${i + 1}. ${c.kind === "shell" ? `shell \`${c.cmd}\`` 
 `)}`,
     d.constraints.trim() ? `Constraints: ${d.constraints.trim()}` : "",
     `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. Work the criteria now; call goal_check when you believe they hold, then goal_complete (it re-runs every check itself and asks the user). If genuinely blocked, call goal_pause with the blocker — do not spin.`,
-    `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), dispatch forge-* waves, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Crew gates stay internal to this loop.`,
+    `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), dispatch forge-* waves, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Crew gates stay internal to this loop (your goal turns drive the crew — no separate crew idle briefs fire under this goal; standalone waves auto-advance on session idle until crew_close).`,
     `Goal file: ${relFrom(state.worktree, goal.path)}`
   ].filter((s) => s.length > 0).join(`
 `);
@@ -17817,12 +17992,9 @@ async function continueIfEligible(client, sessionID) {
       }
     }
     const goal = resolveLiveGoal(state);
-    if (!goal || goal.doc.status !== "active") {
-      goalProbe(`skip: no live active goal session=${sessionID}`);
-      return;
-    }
-    if (!goal.doc.session || goal.doc.session !== sessionID) {
-      goalProbe(`skip: not goal owner session=${sessionID} owner=${goal.doc.session || "(none)"}`);
+    if (!goal || goal.doc.status !== "active" || !goal.doc.session || goal.doc.session !== sessionID) {
+      goalProbe(`no live active goal owned by session=${sessionID} — crew branch`);
+      await continueCrewIfEligible(client, state, sessionID);
       return;
     }
     if (!sessionIsForgeFamily(sessionID)) {
@@ -18045,7 +18217,7 @@ var server = async (input, options) => {
         if (agentSection[id] !== undefined)
           continue;
         const provenance = foldPath(agent.file) === foldPath(globalMaterializationPath) ? { global: true } : { ns: agent.ns, file: agent.file };
-        const entry = forgeAgentDef(matId, agent.def, provenance);
+        const entry = forgeAgentDef(matId, agent.def, provenance, agent.shared ?? undefined);
         agentSection[id] = entry;
         materializedSnapshot[id] = entry;
       }
@@ -18162,7 +18334,7 @@ var server = async (input, options) => {
             if (anchor) {
               const complianceRefusal = crewPoolComplianceRefusal(anchor);
               if (complianceRefusal)
-                throw new Error(complianceRefusal);
+                throw new Error(complianceRefusal + CREW_COMPLIANCE_NATIVE_EXIT);
             }
           }
         }
@@ -18380,6 +18552,8 @@ var server = async (input, options) => {
           sealFindings.delete(info.id);
           sealUnknownNotes.delete(info.id);
           poolGateUnknownNotes.delete(info.id);
+          crews.delete(info.id);
+          crewEngineForgetSession(info.id);
         }
       }
     },
@@ -18412,12 +18586,19 @@ var server = async (input, options) => {
       if (typeof input2.tool !== "string")
         return;
       const act = turnActivity.get(input2.sessionID);
-      if (!act)
-        return;
-      if (isWriteTool(input2.tool) || input2.tool === "plan_tick")
-        act.writes++;
-      if (input2.tool === "goal_check")
-        act.checks++;
+      if (act) {
+        if (isWriteTool(input2.tool) || input2.tool === "plan_tick")
+          act.writes++;
+        if (input2.tool === "goal_check")
+          act.checks++;
+      }
+      const crewAct = crewTurnActivity.get(input2.sessionID);
+      if (crewAct) {
+        if (input2.tool === "task")
+          crewAct.dispatches++;
+        if (isWriteTool(input2.tool))
+          crewAct.writes++;
+      }
     },
     "experimental.chat.system.transform": async (input2, output) => {
       if (!input2.sessionID)
@@ -18506,7 +18687,7 @@ async function v2Setup(ctx) {
           if (draft.get(id) !== undefined)
             continue;
           const provenance = foldPath(agent.file) === foldPath(v2GlobalPath) ? { global: true } : { ns: agent.ns, file: agent.file };
-          const v1def = forgeAgentDef(matId, agent.def, provenance);
+          const v1def = forgeAgentDef(matId, agent.def, provenance, agent.shared ?? undefined);
           draft.update(id, (agentDraft) => {
             agentDraft.description = v1def.description;
             agentDraft.system = v1def.prompt;
