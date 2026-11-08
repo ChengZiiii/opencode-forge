@@ -41,9 +41,9 @@ const seed = (h, sid, agent) => h["chat.message"]({ sessionID: sid, agent }, { m
 const ALL_FORGE_TOOLS = [
   "plan_write", "plan_tick", "plan_approve", "plan_close", "plan_discard",
   "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard",
-  "crew_begin", "crew_close", "forge_shell", "forge_jobs",
+  "crew_begin", "crew_close", "forge_shell", "forge_jobs", "forge_grep", "forge_glob",
 ]
-const STATE_TOOLS = ALL_FORGE_TOOLS.filter((t) => t !== "forge_shell" && t !== "forge_jobs")
+const STATE_TOOLS = ALL_FORGE_TOOLS.filter((t) => !["forge_shell", "forge_jobs", "forge_grep", "forge_glob"].includes(t))
 
 // ---------------------------------------------------------------------------
 // config-side partition injections (task 3.1 / 2.4)
@@ -105,6 +105,9 @@ test("partition config: forge-* workers lose harness state tools but keep the ex
     for (const t of STATE_TOOLS) assert.equal(worker.tools[t], false, `worker hides state tool ${t}`)
     assert.equal(worker.tools.forge_shell, undefined, "worker keeps forge_shell")
     assert.equal(worker.tools.forge_jobs, undefined, "worker keeps forge_jobs")
+    // Search pair (forge-search-tools D6): workers keep both search tools too.
+    assert.equal(worker.tools.forge_grep, undefined, "worker keeps forge_grep")
+    assert.equal(worker.tools.forge_glob, undefined, "worker keeps forge_glob")
     // The primary is not reduced.
     assert.equal(cfg.agent.forge.tools.plan_write, undefined)
     await h.dispose?.()

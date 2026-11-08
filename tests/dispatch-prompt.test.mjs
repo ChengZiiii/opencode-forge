@@ -38,6 +38,13 @@ test("the materialized prompt embeds the mandates (never replaceable)", () => {
   assert.match(p, /Run every shell command through the forge_shell tool/, "exec-partition mandate present")
   assert.match(p, /builtin shell is not part of your toolset/, "the hide is stated as the design")
   assert.match(p, /ROLE TEXT/, "the role text rides inside the frame")
+  // Search preference mandate (forge-search-tools D7): additive — the two
+  // pre-existing mandates stay verbatim alongside the new line.
+  assert.match(p, /Run every search through the forge_grep\/forge_glob tools first — the builtin grep\/glob tools are fallback only/, "search preference mandate present")
+  assert.match(p, /follow and hidden are on by default/, "the preference line teaches the defaults divergence")
+  assert.ok(WORKER_MANDATES.includes("- Use workspace-relative paths ONLY. Never write to or read from absolute paths outside this workspace; the workspace root is where you were started, not the filesystem root."), "pre-existing mandate 1 verbatim")
+  assert.ok(WORKER_MANDATES.includes("- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial."), "pre-existing mandate 3 verbatim")
+  assert.ok(WORKER_MANDATES.includes("- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."), "pre-existing mandate 4 verbatim")
   // The mandates sit AFTER the role text (outermost discipline at the bottom).
   assert.ok(p.indexOf("ROLE TEXT") < p.indexOf("Mandates"))
 })
