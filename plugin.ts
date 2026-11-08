@@ -1,6 +1,6 @@
 import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { execFileSync } from "node:child_process"
+import { execFileSync, spawn } from "node:child_process"
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative } from "node:path"
 import { tmpdir, homedir } from "node:os"
@@ -74,6 +74,7 @@ import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
+import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type SearchToolKind } from "./src/search-core.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -96,7 +97,12 @@ const FORGE_STATE_TOOLS = [
   "crew_close",
 ] as const
 const FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"] as const
-const FORGE_ALL_TOOLS: readonly string[] = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS]
+// Search pair (change forge-search-tools, design D6): joins the same
+// partition constants — hidden from non-forge agents, available to the
+// primary AND every forge-* worker regardless of shape (NOT in
+// MUTATING_TOOLS, NOT ask-gated — readonly by construction).
+const FORGE_SEARCH_TOOLS = ["forge_grep", "forge_glob"] as const
+const FORGE_ALL_TOOLS: readonly string[] = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS, ...FORGE_SEARCH_TOOLS]
 const FORGE_TOOL_SET = new Set<string>(FORGE_ALL_TOOLS)
 const FORGE_STATE_TOOL_SET = new Set<string>(FORGE_STATE_TOOLS)
 // Native agents the partition must cover even when absent from the user's
@@ -1577,6 +1583,146 @@ const forgeJobsTool = tool({
 
 
 
+// ---------------------------------------------------------------------------
+// Search tools (change forge-search-tools, design D1-D7)
+// ---------------------------------------------------------------------------
+
+// Config override read at call time through the plugin-options surface (the
+// same surface jobs/watchdog ride). rg resolution itself re-runs PER CALL
+// (config override → PATH → fail-soft), so installing rg needs no restart.
+let searchRgPathOverride: string | undefined
+
+const FORGE_SEARCH_PREFERENCE_LINE =
+  "Prefer forge_grep/forge_glob over the builtin grep/glob — follow and hidden are on by default (symlinks/junctions and dot-directories are in scope; the builtin pair is blind to both)."
+
+const FORGE_GREP_DESCRIPTION = [
+  "Fast content search (rg --json under the hood) that sees through symlinks/junctions and dot-directories where the builtin pair is blind. Readonly by construction: the pattern and path are passed to ripgrep as single literal arguments — no shell exists, so shell metacharacters can neither redirect output nor alter execution.",
+  "Output matches the builtin grep's format: `Found N matches` header + `path: Line n: content` blocks, truncated at 100 results with a notice. With follow on (default), a file reachable through multiple paths reports once and the output ends with a `+N duplicate paths merged` line; links whose targets lie outside the workspace are followed and the resolved outside target is disclosed.",
+  FORGE_SEARCH_PREFERENCE_LINE,
+].join("\n")
+
+const FORGE_GLOB_DESCRIPTION = [
+  "Fast file-pattern search (rg --files under the hood, the file pattern rides rg's --glob filter) that lists matching paths — including EMPTY files — and paths behind symlinks/junctions and inside dot-directories where the builtin glob is blind. Readonly by construction — no shell ever exists.",
+  "Output matches the builtin glob's format: a plain unique path list (`No files found` when empty), truncated at 100 results with a notice. With follow on (default), duplicate link-path hits merge and the output ends with a `+N duplicate paths merged` line.",
+  FORGE_SEARCH_PREFERENCE_LINE,
+].join("\n")
+
+// Realpath seam for the dedupe post-pass: rg reports paths relative to its
+// cwd (the session worktree), so resolve against the worktree first, then
+// realpath. A resolution failure degrades to the reported path (fail-soft:
+// dedupe simply cannot merge what it cannot resolve).
+function reportedPathResolver(worktree: string): (p: string) => string {
+  return (p) => {
+    try {
+      return realpathSync.native(isAbsolute(p) ? p : join(worktree, p)).toString()
+    } catch {
+      return p
+    }
+  }
+}
+
+async function runRgSearch(
+  kind: SearchToolKind,
+  args: { pattern: string; path?: string; include?: string; follow?: boolean; hidden?: boolean },
+  context: { sessionID: string; worktree: string; directory?: string; agent?: unknown; metadata?: (input: { title?: string }) => void },
+): Promise<{ title: string; output: string }> {
+  // rg resolution is per call (D4): an install picked up mid-session works
+  // with no restart. Miss → fail-soft guidance, never a throw.
+  const resolution = resolveRgBinary(searchRgPathOverride !== undefined ? { rgPath: searchRgPathOverride } : undefined)
+  if (!resolution.ok) return { title: "ripgrep not found", output: resolution.error }
+  const state = ensureSession(context.sessionID, worktreeFor(context))
+  const follow = args.follow !== false
+  const hidden = args.hidden !== false
+  const targetPath = typeof args.path === "string" && args.path.length > 0 ? (isAbsolute(args.path) ? args.path : join(state.worktree, args.path)) : undefined
+  // A path arg is ALWAYS given: with no path and a piped stdin, rg reads
+  // STDIN and never exits (probe-verified). "." keeps output paths relative
+  // (builtin parity) and searches the session worktree.
+  const searchPath = targetPath ?? "."
+  // One fixed argv vector per kind (D1). grep: literal pattern after `--`.
+  // glob: the files-listing vector (D1b, rg --files semantics) — the file
+  // pattern rides `--glob=` and EMPTY files are listed too (zero lines → no
+  // match events → invisible to the content vector; builtin-glob parity).
+  const argv =
+    kind === "glob"
+      ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden })
+      : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden })
+  context.metadata?.({ title: `forge_${kind}: ${args.pattern.slice(0, 60)}` })
+  // Direct spawn, shell:false, fixed argv — no shell string ever exists
+  // (readonly by construction; the exec seal governs forge_shell only).
+  // stdin is ignored: rg must never mistake our pipe for search input.
+  const child = spawn(resolution.binary, argv, { cwd: state.worktree, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
+  let stdout = ""
+  let stderr = ""
+  let spawnError: Error | undefined
+  child.on("error", (err) => {
+    spawnError = err
+  })
+  child.stdout?.on("data", (d: Buffer) => {
+    stdout += d.toString("utf8")
+  })
+  child.stderr?.on("data", (d: Buffer) => {
+    stderr += d.toString("utf8")
+  })
+  const code = await new Promise<number | null>((resolve) => {
+    child.on("close", (c) => resolve(c))
+  })
+  if (spawnError !== undefined) {
+    return { title: "rg spawn failed", output: `[forge:search] Failed to run ripgrep (${resolution.binary}): ${spawnError.message}` }
+  }
+  // rg exit codes: 0 = matches, 1 = no matches (both parse), 2+ = error.
+  if (code !== null && code > 1) {
+    return { title: `rg exit ${code}`, output: [`[forge:search] ripgrep exited ${code}:`, stderr.trim() || "(no stderr)", "Narrow the path or fix the pattern (rg treats it as a regular expression)."].join("\n") }
+  }
+  // rg --files (glob) emits a plain path list; grep emits the --json stream.
+  // The default "." path arg makes rg prefix every path with .\ or ./ —
+  // strip it for builtin-pair output parity (they print bare relative paths).
+  const stripDotPrefix = (p: string): string => p.replace(/^\.(?:\\|\/)/, "")
+  const rawRecords = kind === "glob" ? parseRgFilesList(stdout) : parseRgJsonStream(stdout).records
+  const records = rawRecords.map((r) => ({ ...r, path: stripDotPrefix(r.path) }))
+  const deduped = dedupeFollowMatches(records, {
+    worktreeRoot: state.worktree,
+    resolvePath: reportedPathResolver(state.worktree),
+    follow,
+  })
+  return {
+    title: `${deduped.records.length} result${deduped.records.length === 1 ? "" : "s"}`,
+    output: formatSearchOutput(deduped.records, {
+      kind,
+      mergedDuplicates: deduped.mergedDuplicates,
+      outsideTargets: deduped.outsideTargets,
+    }),
+  }
+}
+
+const forgeGrepTool = tool({
+  description: FORGE_GREP_DESCRIPTION,
+  args: {
+    pattern: tool.schema.string().describe("The regular expression to search for (passed to ripgrep verbatim as a single literal argument)"),
+    path: tool.schema.string().optional().describe("Optional target file or directory (workspace-relative, or absolute). Defaults to the session worktree"),
+    include: tool.schema.string().optional().describe("File filter glob (e.g. \"*.ts\") — only matching files are searched"),
+    follow: tool.schema.boolean().optional().describe("Follow symlinks/junctions during traversal (default TRUE — diverges from the builtin pair by design)"),
+    hidden: tool.schema.boolean().optional().describe("Search dot-directories (default TRUE — diverges from the builtin pair by design)"),
+  },
+  execute: async (args, context) => {
+    noteToolAgent(context)
+    return runRgSearch("grep", { pattern: args.pattern, path: args.path, include: args.include, follow: args.follow, hidden: args.hidden }, context)
+  },
+})
+
+const forgeGlobTool = tool({
+  description: FORGE_GLOB_DESCRIPTION,
+  args: {
+    pattern: tool.schema.string().describe("The file-pattern glob to list (e.g. \"**/*.ts\") — rides ripgrep's --glob filter verbatim"),
+    path: tool.schema.string().optional().describe("Optional target directory (workspace-relative, or absolute). Defaults to the session worktree"),
+    follow: tool.schema.boolean().optional().describe("Follow symlinks/junctions during traversal (default TRUE — diverges from the builtin pair by design)"),
+    hidden: tool.schema.boolean().optional().describe("List dot-directories' files (default TRUE — diverges from the builtin pair by design)"),
+  },
+  execute: async (args, context) => {
+    noteToolAgent(context)
+    return runRgSearch("glob", { pattern: args.pattern, path: args.path, follow: args.follow, hidden: args.hidden }, context)
+  },
+})
+
 // /crew discipline (spec: crew-harness, change simplify-dispatch-to-static-agents):
 // a template rulebook + an in-memory registry. Waves are batches of parallel
 // native `task` calls (results return in-turn); the declared subtask plan
@@ -1964,6 +2110,10 @@ function forgeTools(): Record<string, ToolDefinition> {
     tools.forge_shell = forgeShellTool
     tools.forge_jobs = forgeJobsTool
   }
+  // Search pair (forge-search-tools D6): registered unconditionally — it is
+  // not part of the job supervisor (no retirement) and carries no ask-gate.
+  tools.forge_grep = forgeGrepTool
+  tools.forge_glob = forgeGlobTool
   if (!forgeDisabled) {
     tools.crew_begin = crewBeginTool
     tools.crew_close = crewCloseTool
@@ -2297,6 +2447,12 @@ export const server: Plugin = async (input, options) => {
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
   jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true
   if (jobsOpts?.survive === "never" || jobsOpts?.survive === "always" || jobsOpts?.survive === "deny") jobsSurviveMode = jobsOpts.survive
+  // Search pair (forge-search-tools D4): `search.rgPath` config override.
+  // Resolution re-runs per call against this value + PATH, so installing rg
+  // mid-session needs no restart; the override itself rides the same
+  // plugin-options surface as jobs/watchdog.
+  const searchOpts = (options as { search?: { rgPath?: unknown } } | undefined)?.search
+  searchRgPathOverride = typeof searchOpts?.rgPath === "string" && searchOpts.rgPath.trim().length > 0 ? searchOpts.rgPath : undefined
 
   // hang-watchdog: invalid option values fall back to defaults and the
   // fallback itself is ledgered (auditable misconfig, never a crash).
@@ -2493,7 +2649,9 @@ export const server: Plugin = async (input, options) => {
       // user-defined (family rules follow the name, not the author) — is
       // covered. Key-merge only: user-written fields and explicit `true`
       // entries outside the forge family stand.
-      // (a) forge-* workers: harness STATE tools are primary-only.
+      // (a) forge-* workers: harness STATE tools are primary-only. Workers
+      // keep the exec pair AND the search pair (forge_grep/forge_glob,
+      // forge-search-tools D6) — readonly-safe, shape-independent.
       for (const id of Object.keys(agentSection)) {
         if (!id.startsWith("forge-")) continue
         const entry = agentSection[id] as { tools?: Record<string, boolean> }
