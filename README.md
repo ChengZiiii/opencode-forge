@@ -566,6 +566,11 @@ out of a materialized id.
   // dispatches are blocked until the field is added). Invalid values
   // degrade to a warning + the directory-derived namespace.
   // "pool": "aa",
+  // OPTIONAL pool-level shared prompt segment — written ONCE at the top of
+  // the file, inherited by EVERY agent this file materializes (project
+  // conventions, repo layout, standing rules). A plain string, no
+  // interpolation. See "Pool-level shared prompt segment" below.
+  // "shared": "Project X conventions: use bun; cite file:line evidence.",
   "agents": {
     // PINNED worker: model + thoughtLevel form an ATOMIC PAIR — set BOTH
     "research": {
@@ -612,6 +617,26 @@ A rejected entry costs only itself — its siblings materialize normally.
   Findings surface in the plugin diagnostics log.
 - **`depths` is deprecated**: the array is ignored with a warning finding.
   Pin ONE `thoughtLevel` per agent instead.
+- **Pool-level `shared` prompt segment**: an optional top-level `"shared"`
+  string — the pool's common base, written once and inherited by EVERY agent
+  the file materializes (no per-agent opt-out; an agent that must escape it
+  gets its own pool file). The layering contract is a strict prepend: the
+  materialized role prompt = `shared` + a blank line + the EXISTING
+  three-layer chain (explicit `prompt` > built-in `research`/`review`
+  defaults > generic one-liner), byte-for-byte unchanged beneath it —
+  `shared` never suppresses and never overrides anything, and an explicit
+  per-agent prompt keeps its priority over role defaults. Validation is
+  field-level fail-soft: a non-string or whitespace-only `shared` records
+  exactly ONE warn finding (`shared-invalid`, naming the file) and is
+  ignored — every agent of the pool still materializes with the unshared
+  chain. Scope is PER FILE: agents from two different pool files each get
+  their OWN file's `shared` (no cross-pool bleed), and the GLOBAL fallback
+  file's `shared` inherits to its family normally — the rule that ignores
+  the global file's `pool` namespace field does not extend to `shared`
+  (content is not namespace). Hot-apply rides the existing mtime cache:
+  editing `shared` re-materializes at the next config hook exactly like any
+  pool edit. With no `shared` declared anywhere, materialized prompts are
+  byte-identical to the pre-`shared` build.
 - Each agent materializes as `forge-<ns>-<id>` — a subagent-mode agent
    visible in the task tool's vocabulary (never hidden), whose description
    names its **pool provenance** (namespace + origin forge.json path +
@@ -720,7 +745,7 @@ Covered WRITE-CLASS indicators:
 | `mutating-cmdlet` | `Set-Content`, `Out-File`, `New-Item`, `Remove-Item`, `Move-Item`, `Copy-Item`, `Add-Content`, `Clear-Content` |
 | `git-mutation` | `git add/commit/push/reset/checkout/rebase/merge/clean/rm` |
 | `pkg-mutation` | `npm publish`, `npm install` (incl. `npm i`/`ci`/`add`), `bun add`/`install`, `pip`/`pip3 install` |
-| `workspace-write` | output-target flags (`--out`, `--output`, `--out-file`/`--outfile`/`--outFile`, `--dest`, `--destination`, `-o`) whose parsed value is a workspace-relative path, or an absolute path under the session workspace |
+| `workspace-write` | output-target flags (`--out`, `--output`, `--out-file`/`--outfile`/`--outFile`, `--dest`, `--destination`, `-o`) whose parsed value is a workspace-relative path, or an absolute path under the session workspace — the short `-o` counts only when the head binary is a known `-o` writer (`gcc`, `g++`, `cc`, `c++`, `clang`, `clang++`, `ld`, `rustc`, `go`, `curl`, `sort`, `psql`, `dotnet`); on every other binary it flows |
 
 **Honest positioning — this is belt-in-depth, NOT a sandbox.** A command
 that fails to classify is treated as READ-CLASS (fail-open on the channel,
@@ -729,7 +754,9 @@ the same posture as every refusal belt). The known bypass surface, verbatim:
 no redirect is indirection the classifier does not model), **`Start-Process`
 writers** (spawning a writer process is explicitly out of scope), and
 **encoded payloads** (`powershell -EncodedPayload …`, base64 blobs) are NOT
-covered; they flow on the readonly channel. The seal narrows the exec hole
+covered; they flow on the readonly channel. The short `-o` on a writer
+binary outside the known set flows (fail-open, disclosed). The seal narrows
+the exec hole
 from "completely open" to "explicitly constructed indirection" — a true OS
 level seal (write-time redirection, shadow copies, containers, win32+POSIX
 dual implementations) was evaluated and rejected as a disproportionate
@@ -834,22 +861,52 @@ requires a plan. The flow:
      (arm=true) folding the declared subtasks into criteria/checks; the arm
      dialog is the user's gate;
    - **standby** — no call; the crew waits until armed or abandoned.
-3. **Execute in waves** (armed crews only) of parallel native `task` calls
-   (results return in-turn; the next wave launches only after the previous
-   wave's results). GUI / computer-use subtasks are mutually exclusive within
-   a wave (the desktop is a singleton; non-GUI subtasks still parallelize
-   freely), and GUI walkthroughs use the `computer` tool rather than DIY
-   shell screenshot pipelines.
-4. **Missing role?** Run the subtask through a native task call anyway and
-   tell the user — suggest configuring the missing role.
-5. **Verify** each subtask against its acceptance-evidence statement;
-   retry a failure at most once.
-6. **Close** with `crew_close` — a hard, ask-gated gate cross-checking the
-   report against the DECLARED plan: every declared subtask needs a
-   PASS/FAIL verdict with evidence; an undeclared subtask in the report
-   refuses the close (fold discoveries into an existing verdict, or discard
-   and re-crew); a FAIL needs both failure reports.
-7. **Re-shard exit**: `crew_close {abandon: true, reason}` abandons the crew
+ 3. **Execute in waves** (armed crews only) of parallel native `task` calls
+    (results return in-turn; the next wave launches only after the previous
+    wave's results). GUI / computer-use subtasks are mutually exclusive within
+    a wave (the desktop is a singleton; non-GUI subtasks still parallelize
+    freely), and GUI walkthroughs use the `computer` tool rather than DIY
+    shell screenshot pipelines.
+ 4. **Auto-advance on idle** (armed crews only): when the session goes idle
+    between waves and no live active goal governs it, the plugin's
+    idle-continuation engine sends a `[forge:crew-continue]` brief (objective
+    + declared subtask titles + wave discipline) after the shared debounce —
+    waves advance autonomously until `crew_close`. A PENDING crew is never
+    auto-continued (that pause is the user's decision seam), a goal-governed
+    session belongs to the goal engine exclusively, and a non-forge speaker is
+    never continued. The engine keeps its OWN activity counter (task
+    dispatches and write-family calls count); after 3 consecutive
+    activity-free continuation turns it STOPS with one bounded console
+    disclosure — the crew itself stays registered (no auto-abandon, no
+    auto-close; nudge, close, or re-shard), and repeated transport failures
+    stop it the same way. A fresh `crew_begin` clears the stall; no disk
+    state is added (the crew record is unchanged).
+ 5. **Missing role?** Run the subtask through a native task call anyway and
+    tell the user — suggest configuring the missing role.
+ 6. **Native fallback lane** (crew-native-fallback): when the pool offers no
+    forge worker fitting a subtask, or `forge-*` dispatch is blocked by a
+    degraded (non-compliant) pool file, the armed crew dispatches the subtask
+    through the NATIVE task channel (e.g. the `general` subagent) with the
+    SAME relay contract as a forge dispatch — the change/artifact path for
+    authoritative guides, the scoped task prompt, and the evidence demands.
+    The fallback is recorded, never silent: the crew record's wave notes name
+    it, and the subtask's `crew_close` evidence statement says it ran native
+    (free text — the close gate's cross-check is unchanged; titles, verdicts
+    and evidence statements govern exactly as before, no new field). The
+    mid-crew compliance refusal names this exit while the pool is repaired —
+    the belt gates `forge-*` dispatch only. No guard changed: the
+    registration pre-flight still refuses a non-compliant pool outright
+    (D3), cross-pool refusals keep their copy, the pending belt stands, and
+    native targets were never refused for forge-family sessions and still
+    are not.
+ 7. **Verify** each subtask against its acceptance-evidence statement;
+    retry a failure at most once.
+ 8. **Close** with `crew_close` — a hard, ask-gated gate cross-checking the
+    report against the DECLARED plan: every declared subtask needs a
+    PASS/FAIL verdict with evidence; an undeclared subtask in the report
+    refuses the close (fold discoveries into an existing verdict, or discard
+    and re-crew); a FAIL needs both failure reports.
+ 9. **Re-shard exit**: `crew_close {abandon: true, reason}` abandons the crew
    — ask-gated like the close, no verdict requirements, usable from PENDING
    (standby cancel) and EXECUTING (wrong decomposition) alike. The session is
    immediately free for a fresh `crew_begin` with the corrected plan.
