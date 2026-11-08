@@ -7,7 +7,7 @@ Hard-partition the tool surface and system injections by agent family: everythin
 
 ### Requirement: Forge family runs exclusively on the forge exec surface
 
-Every agent the plugin brings — the forge primary agent and every forge-* subagent regardless of shape — SHALL have the builtin shell tools (shell/bash) hidden via runtime config injection and SHALL execute commands only through forge_shell/forge_jobs. The hiding SHALL hold regardless of any host background capability, SHALL apply to a user-defined `forge` agent entry as a tools merge (builtin shell off, every other field of the entry untouched), and SHALL be withdrawn only by `jobs.keepBuiltinShell: true` or by supervisor retirement (`jobs.mode: "native"`). Harness state tools (the plan_*/goal_*/crew_* families) SHALL be primary-only: they SHALL be hidden from every forge-* subagent, whose forge toolset is limited to forge_shell and forge_jobs.
+Every agent the plugin brings — the forge primary agent and every forge-* subagent regardless of shape — SHALL have the builtin shell tools (shell/bash) hidden via runtime config injection and SHALL execute commands only through forge_shell/forge_jobs. The hiding SHALL hold regardless of any host background capability, SHALL apply to a user-defined `forge` agent entry as a tools merge (builtin shell off, every other field of the entry untouched), and SHALL be withdrawn only by `jobs.keepBuiltinShell: true` or by supervisor retirement (`jobs.mode: "native"`). Harness state tools (the plan_*/goal_*/crew_* families) SHALL be primary-only: they SHALL be hidden from every forge-* subagent, whose forge toolset is limited to the exec pair (forge_shell and forge_jobs) and the search pair (forge_grep and forge_glob).
 
 #### Scenario: A write-shape forge subagent has no builtin shell
 
@@ -17,7 +17,7 @@ Every agent the plugin brings — the forge primary agent and every forge-* suba
 #### Scenario: A forge worker carries only the exec toolset
 
 - **WHEN** a forge-* subagent session assembles its toolset
-- **THEN** the plan_*/goal_*/crew_* harness tools are absent; only forge_shell and forge_jobs are available alongside the shape's own tools
+- **THEN** the plan_*/goal_*/crew_* harness tools are absent; only forge_shell, forge_jobs, forge_grep, and forge_glob are available alongside the shape's own tools
 
 #### Scenario: A crew wave runs on the forge exec surface
 
@@ -31,7 +31,7 @@ Every agent the plugin brings — the forge primary agent and every forge-* suba
 
 ### Requirement: Non-forge agents are isolated from forge tooling
 
-Every agent other than the forge family — the native build, plan, general, and explore agents, and every user-defined agent — SHALL have all plugin-registered forge tools (forge_shell, forge_jobs, crew_begin, crew_close, and the plan_*/goal_* harness tools) hidden via runtime config injection, so no non-forge session can see or invoke forge tooling and the builtin shell remains its exec surface. Because the host's task-tool agent vocabulary is global (forge-* subagents cannot be made invisible to a specific parent agent), a non-forge agent's attempt to dispatch a forge-* subagent SHALL be refused at the tool layer with an explanatory error, and no subagent session SHALL be created. Forge state files are boundary-protected: a non-forge session's attempt to write into `.opencode/plan/` or `.opencode/goal/` SHALL be refused at the tool layer, while reading them stays unrestricted. A user's explicit `tools` entry enabling a forge tool on the user's own agent SHALL be respected and never overwritten. Native agents absent from the user's config SHALL receive the hiding through the same runtime materialization mechanism the plugin uses for its own agent entries.
+Every agent other than the forge family — the native build, plan, general, and explore agents, and every user-defined agent — SHALL have all plugin-registered forge tools (forge_shell, forge_jobs, forge_grep, forge_glob, crew_begin, crew_close, and the plan_*/goal_* harness tools) hidden via runtime config injection, so no non-forge session can see or invoke forge tooling and the builtin shell remains its exec surface. Because the host's task-tool agent vocabulary is global (forge-* subagents cannot be made invisible to a specific parent agent), a non-forge agent's attempt to dispatch a forge-* subagent SHALL be refused at the tool layer with an explanatory error, and no subagent session SHALL be created. Forge state files are boundary-protected: a non-forge session's attempt to write into `.opencode/plan/` or `.opencode/goal/` SHALL be refused at the tool layer, while reading them stays unrestricted. A user's explicit `tools` entry enabling a forge tool on the user's own agent SHALL be respected and never overwritten. Native agents absent from the user's config SHALL receive the hiding through the same runtime materialization mechanism the plugin uses for its own agent entries.
 
 #### Scenario: The native build agent sees no forge tools
 
@@ -174,7 +174,7 @@ When the goal continuation engine fires for a session whose current agent resolv
 
 ### Requirement: Readonly workers execute on a sealed supervised-exec channel
 
-For any session whose running `forge-*` agent has an effective readonly shape (an EXPLICIT `shape: "readonly"`; an absent shape defaults to write and is NOT sealed), the plugin SHALL gate the supervised exec channel (`forge_shell`) for that session: commands classified READ-CLASS (inspection and search — e.g. directory listings, file reads, `rg`/`grep`, `git log`/`git status`/`git diff`, version and help queries, read-only `node`/`python` evals) SHALL flow normally; commands classified WRITE-CLASS SHALL be denied with a bounded finding that names the readonly shape, names the classified write indicator, and points at the remedy (`shape: "write"` on that agent when its job legitimately mutates). Write-class indicators SHALL cover at minimum: output redirection to files (`>` `>>` and their PowerShell equivalents), the known mutating cmdlets and commands (`Set-Content`, `Out-File`, `New-Item` with a file/item type, `Remove-Item`, `Move-Item`, `Copy-Item` writing, `Add-Content`, `Clear-Content`, `Start-Process`-spawning-writers is NOT covered — indirection stays out of scope), `git` mutating subcommands (`add`, `commit`, `push`, `reset`, `checkout`, `rebase`, `merge`, `clean`, `rm`), package-manager publishes/installs mutating the tree (`npm publish`, `npm install`, `bun add`, `pip install`), and any command whose parsed targets write INSIDE the session workspace by explicit path argument. The classification SHALL be a pure, injectable function (unit-tested, no fs access at classify time) evaluated on the command string BEFORE spawn; a command that fails to classify SHALL be treated as READ-CLASS (fail-open on the channel — the seal is belt-in-depth on top of the tool-face deny, not a sandbox, and the README SHALL disclose the covered indicators and the known bypass surface verbatim). The seal SHALL compose with, not replace, the existing draft-phase write posture: draft-period ask/deny semantics on the channel are unchanged; a write-shaped worker is never sealed; the primary forge session is never sealed.
+For any session whose running `forge-*` agent has an effective readonly shape (an EXPLICIT `shape: "readonly"`; an absent shape defaults to write and is NOT sealed), the plugin SHALL gate the supervised exec channel (`forge_shell`) for that session: commands classified READ-CLASS (inspection and search — e.g. directory listings, file reads, `rg`/`grep`, `git log`/`git status`/`git diff`, version and help queries, read-only `node`/`python` evals) SHALL flow normally; commands classified WRITE-CLASS SHALL be denied with a bounded finding that names the readonly shape, names the classified write indicator, and points at the remedy (`shape: "write"` on that agent when its job legitimately mutates). Write-class indicators SHALL cover at minimum: output redirection to files (`>` `>>` and their PowerShell equivalents), the known mutating cmdlets and commands (`Set-Content`, `Out-File`, `New-Item` with a file/item type, `Remove-Item`, `Move-Item`, `Copy-Item` writing, `Add-Content`, `Clear-Content`, `Start-Process`-spawning-writers is NOT covered — indirection stays out of scope), `git` mutating subcommands (`add`, `commit`, `push`, `reset`, `checkout`, `rebase`, `merge`, `clean`, `rm`), package-manager publishes/installs mutating the tree (`npm publish`, `npm install`, `bun add`, `pip install`), and any command whose parsed targets write INSIDE the session workspace by explicit path argument. Precision on the short `-o` flag: `-o` SHALL count as an output-target flag ONLY when the command's head binary belongs to the known writer-binary set (binaries whose `-o` denotes an output file — the compiler/linker family, `curl`, `sort`, `psql`, `go`, `dotnet`); on every other binary the short `-o` SHALL flow READ-CLASS (fail-open, disclosed in the README bypass surface). Long-form output flags (`--out`, `--output`, `--out-file`/`--outfile`/`--outFile`, `--dest`, `--destination`) SHALL stay binary-independent. Flag-value binding SHALL be quote-aware — a quoted token immediately following a flag binds as that flag's value, and stripping quoted spans for the other indicator scans SHALL NOT rebind a flag onto a later bare token. The classification SHALL be a pure, injectable function (unit-tested, no fs access at classify time) evaluated on the command string BEFORE spawn; a command that fails to classify SHALL be treated as READ-CLASS (fail-open on the channel — the seal is belt-in-depth on top of the tool-face deny, not a sandbox, and the README SHALL disclose the covered indicators and the known bypass surface verbatim). The seal SHALL compose with, not replace, the existing draft-phase write posture: draft-period ask/deny semantics on the channel are unchanged; a write-shaped worker is never sealed; the primary forge session is never sealed.
 
 #### Scenario: Read-class commands flow for an explicit readonly worker
 
@@ -196,6 +196,21 @@ For any session whose running `forge-*` agent has an effective readonly shape (a
 - **WHEN** an explicit readonly worker's `forge_shell` call carries `node tools/gen.mjs --out src/generated.ts` where the parsed output target resolves inside the workspace
 - **THEN** the spawn is denied (workspace-write indicator) — parsing uses the command string only, at classify time, with no fs access
 
+#### Scenario: Short -o on a non-writer binary flows
+
+- **WHEN** an explicit readonly worker's `forge_shell` call carries `rg -o "v1\.2\.3" package.json` (only-matching with a quoted pattern) or `rg -o needle.v2 src/` (only-matching with a dotted unquoted pattern)
+- **THEN** the command executes normally and no seal finding is recorded — the short `-o` is not an output-target flag outside the writer-binary set, and the quoted pattern binds as the flag's value instead of rebinding the flag onto a later path token
+
+#### Scenario: Short -o on a writer binary is denied
+
+- **WHEN** an explicit readonly worker's `forge_shell` call carries `gcc -o out.exe main.c` or `go build -o bin/app ./cmd`
+- **THEN** the spawn is denied (workspace-write indicator) with the detail naming the bound output target
+
+#### Scenario: Quoted output targets bind correctly
+
+- **WHEN** an explicit readonly worker's `forge_shell` call carries `curl -o "out.txt" https://example.com`
+- **THEN** the spawn is denied (workspace-write indicator) — the quoted token immediately after the flag is bound as the flag's value
+
 #### Scenario: Write-shaped and absent-shaped workers are never sealed
 
 - **WHEN** a session runs a `shape: "write"` agent or an agent with NO shape field (the open default) and calls `forge_shell` with any command
@@ -203,7 +218,7 @@ For any session whose running `forge-*` agent has an effective readonly shape (a
 
 #### Scenario: Unclassifiable commands flow and the bypass surface is disclosed
 
-- **WHEN** a command's write intent hides behind indirection the classifier does not model (a script that writes internally, `Start-Process` writers, encoded payloads)
+- **WHEN** a command's write intent hides behind indirection the classifier does not model (a script that writes internally, `Start-Process` writers, encoded payloads, or the short `-o` on a writer binary outside the known set)
 - **THEN** the command flows (fail-open on the channel), and the README discloses this bypass surface verbatim alongside the covered indicator list — the seal is belt-in-depth, not a sandbox
 
 #### Scenario: The seal composes with the draft posture

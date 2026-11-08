@@ -173,7 +173,7 @@ The plugin SHALL hold every registered crew in a PENDING state until the user's 
 
 ### Requirement: Crew-governed dispatch pool-compliance gate
 
-While a crew governs a session (PENDING or EXECUTING, including a goal-delegated born-armed crew), the plugin SHALL enforce file-level POOL COMPLIANCE on the session's configuration before any crew work dispatches: the session's workspace pool file SHALL declare a valid top-level `pool` namespace (a `[a-z0-9-]` string, 1–24 characters after trim). `crew_begin` SHALL run the compliance check as a registration pre-flight — a non-compliant pool file refuses the registration outright (no crew record is written, no PENDING crew exists) — and the tool-execute interception belt SHALL re-run the same check on every `task` dispatch from a crew-governed session targeting a `forge-*` worker, so a pool file degraded mid-crew blocks further crew dispatches until repaired. A compliance refusal SHALL name the session's pool file path, the violation (missing or invalid `pool` field), and the minimal compliant fix — add or repair the top-level `"pool": "<suggested>"` field (the suggestion being the family's currently derived namespace or a sanitized short form of it) — and SHALL state that the gate lifts hot-apply: the next resolve after the file is repaired admits registration/dispatch with no host restart. The check is FILE-LEVEL only: per-agent fail-soft findings (half-pinned entries, mistyped optional fields, broken individual entries) keep their existing skip-with-finding semantics and NEVER make the file non-compliant. Sessions whose roster comes from the global fallback layer (workspace without a pool file) are EXEMPT — the global family's namespace is fixed (`global`) and carries no rename risk. Belt composition: the compliance check runs in the same interception belt as, and AFTER, the session-domain pool gate — a cross-pool target is refused by the pool gate regardless of the session's own compliance state — and composes with the pending-crew execution-mode belt without replacing it. Unknown session anchors keep the existing fail-open posture (belt disclosure unchanged).
+While a crew governs a session (PENDING or EXECUTING, including a goal-delegated born-armed crew), the plugin SHALL enforce file-level POOL COMPLIANCE on the session's configuration before any crew work dispatches: the session's workspace pool file SHALL declare a valid top-level `pool` namespace (a `[a-z0-9-]` string, 1–24 characters after trim). `crew_begin` SHALL run the compliance check as a registration pre-flight — a non-compliant pool file refuses the registration outright (no crew record is written, no PENDING crew exists) — and the tool-execute interception belt SHALL re-run the same check on every `task` dispatch from a crew-governed session targeting a `forge-*` worker, so a pool file degraded mid-crew blocks further crew dispatches until repaired. A compliance refusal SHALL name the session's pool file path, the violation (missing or invalid `pool` field), and the minimal compliant fix — add or repair the top-level `"pool": "<suggested>"` field (the suggestion being the family's currently derived namespace or a sanitized short form of it) — and SHALL state that the gate lifts hot-apply: the next resolve after the file is repaired admits registration/dispatch with no host restart. The MID-CREW belt refusal copy SHALL additionally name the NATIVE EXIT: while the pool is being repaired, the affected subtask may dispatch through the NATIVE task channel with the same relay contract — the compliance belt gates `forge-*` dispatch only, never the crew's existence. The check is FILE-LEVEL only: per-agent fail-soft findings (half-pinned entries, mistyped optional fields, broken individual entries) keep their existing skip-with-finding semantics and NEVER make the file non-compliant. Sessions whose roster comes from the global fallback layer (workspace without a pool file) are EXEMPT — the global family's namespace is fixed (`global`) and carries no rename risk. Belt composition: the compliance check runs in the same interception belt as, and AFTER, the session-domain pool gate — a cross-pool target is refused by the pool gate regardless of the session's own compliance state — and composes with the pending-crew execution-mode belt without replacing it. Unknown session anchors keep the existing fail-open posture (belt disclosure unchanged).
 
 #### Scenario: Registration refuses a non-compliant pool file
 
@@ -193,7 +193,7 @@ While a crew governs a session (PENDING or EXECUTING, including a goal-delegated
 #### Scenario: Mid-crew degradation blocks further crew dispatches
 
 - **WHEN** a crew is EXECUTING and the workspace pool's `pool` field is removed (or invalidated) before a later wave's `task` dispatch to a `forge-*` worker
-- **THEN** that dispatch is refused with the compliance fix copy; native (non-forge) task calls from the same session are unaffected; once the file is repaired, the next dispatch flows with no restart
+- **THEN** that dispatch is refused with the compliance fix copy PLUS the native exit (the affected subtask may run through the native task channel with the relay contract while the pool is repaired — the belt gates `forge-*` dispatch only); native (non-forge) task calls from the same session are unaffected; once the file is repaired, the next dispatch flows with no restart
 
 #### Scenario: Global-fallback sessions are exempt
 
@@ -209,3 +209,71 @@ While a crew governs a session (PENDING or EXECUTING, including a goal-delegated
 
 - **WHEN** a crew-governed session with a COMPLIANT pool dispatches a task targeting another workspace's `forge-<nsB>-coder`
 - **THEN** the session-domain pool gate refuses it (not-dispatchable-from-this-session copy with exits) — the compliance belt never rewrites or masks a cross-pool refusal
+
+### Requirement: Waves-armed crews auto-advance on session idle
+
+The plugin's idle-continuation engine SHALL extend to waves-armed crews: when a session goes idle, no live active goal governs it, and the session's registered crew is in the EXECUTING mode (armed for waves), the engine SHALL (after the shared debounce) send the session a `[forge:crew-continue]` continuation brief carrying the crew objective, the declared subtask titles, and the wave discipline (dispatch the next wave via parallel task calls, collect per-subtask evidence verdicts, at most one retry, then `crew_close` with the full report). The engine SHALL NOT continue a crew in any other state: a PENDING crew is the user's execution-mode decision seam and is never auto-continued; a crew governed by a live active goal is driven by the goal engine's turns (no second brief); an ended crew (closed, abandoned, or converted) never continues. The continuation SHALL pass the shared guard plumbing — plugin-disable knob, debounce, in-flight claim, forge-family gate at schedule AND send time (a session switched to a non-forge agent is never continued), and a busy-recheck immediately before send — and SHALL stop after repeated transport failures (bounded, disclosed). A crew continuation turn with ZERO dispatch/write activity increments a no-progress streak; at the streak limit the engine SHALL stop sending crew continuations for that crew and disclose once (bounded console note) that it stalled — the crew itself stays registered: no auto-abandon, no auto-close, the user stays in charge. Task dispatches during a crew continuation turn SHALL count as activity (the crew engine keeps its own activity counter; the goal engine's no-progress semantics are untouched). No disk state is added: the crew record on disk is unchanged and the engine state is in-memory.
+
+#### Scenario: Idle between waves sends the continue brief
+
+- **WHEN** a waves-armed crew is EXECUTING, the session has gone idle after a wave's results, and no live active goal governs the session
+- **THEN** after the debounce the engine sends one `[forge:crew-continue]` brief carrying the crew objective and the declared subtask titles, and the session proceeds with the next wave
+
+#### Scenario: A closed or abandoned crew never continues
+
+- **WHEN** the session's crew has ended (crew_close report or abandon, or goal conversion) and the session goes idle
+- **THEN** no crew continuation brief is sent — the engine's crew branch finds no EXECUTING crew
+
+#### Scenario: A pending crew is never auto-continued
+
+- **WHEN** the session's crew is PENDING (registered, not armed) and the session goes idle
+- **THEN** no crew continuation is sent — the execution-mode pause is the user's decision seam, and the pending dispatch belt still refuses task calls
+
+#### Scenario: A goal-governed session is owned by the goal engine
+
+- **WHEN** a live active goal governs the session (including a goal-delegated born-armed crew)
+- **THEN** idle continuation follows the goal engine exclusively — no `[forge:crew-continue]` brief is ever sent alongside or instead of the goal brief
+
+#### Scenario: A non-forge speaker is never continued
+
+- **WHEN** the session's running agent has switched away from the forge family (at schedule time or send time) while a crew is EXECUTING
+- **THEN** no crew continuation is sent — the family gate holds for the crew branch exactly as for the goal branch
+
+#### Scenario: A stalled crew stops the engine, not the crew
+
+- **WHEN** consecutive crew continuation turns produce zero dispatch/write activity up to the streak limit
+- **THEN** the engine stops sending crew continuations and discloses the stall once (bounded console note) — the crew stays registered (no auto-abandon, no auto-close), and the user may nudge, crew_close, or abandon
+
+#### Scenario: Task dispatches count as crew-turn activity
+
+- **WHEN** a crew continuation turn dispatches task calls (waves) but performs no writes or checks
+- **THEN** the turn counts as active — the no-progress streak resets and the engine keeps advancing the crew
+
+### Requirement: Native fallback dispatch in crew waves
+
+An armed crew's wave discipline SHALL treat the NATIVE task channel as a first-class fallback lane: when the session's pool offers no forge worker fitting a subtask's job, or `forge-*` dispatch is blocked by a degraded pool file, the session MAY dispatch the subtask through the native task channel (e.g. the `general` subagent) carrying the SAME relay contract as a forge dispatch — the change/artifact path for authoritative guides, the scoped task prompt, and the evidence demands. The fallback SHALL be disclosed, not silent: the `crew_begin` waves-arming output and the wave-discipline text SHALL carry the one-line fallback rule, and any natively-dispatched subtask SHALL be recorded — the crew record's wave notes name it, and its `crew_close` evidence statement SHALL say it ran native. The close gate's cross-check is UNCHANGED: declared titles, verdicts, and evidence statements govern exactly as before (a fallback subtask needs no new field). No guard semantics change: native targets remain ungated for forge-family sessions as they are today, and every `forge-*` gate (pool, compliance, pending belt, family belt) keeps its exact refusal conditions — the fallback is guidance and disclosure, never a bypass.
+
+#### Scenario: No fitting forge worker falls back natively and records it
+
+- **WHEN** an armed crew's subtask needs a role the session's pool does not define (e.g. an e2e-verifier subtask in a pool of coders) and the session dispatches the native `general` subagent with the relay contract
+- **THEN** the dispatch flows (no guard refuses a native target), the crew record's wave notes name the fallback, and the subtask's crew_close evidence says it ran native — the close gate accepts it like any other verdict
+
+#### Scenario: Degraded-pool crew keeps moving via native dispatch
+
+- **WHEN** a crew is EXECUTING and the workspace pool file is non-compliant, so `forge-*` dispatches are refused with the native exit in the copy
+- **THEN** the session dispatches the affected subtasks natively with the relay contract while repairing the pool — the crew continues instead of stalling, and the fallback is recorded
+
+#### Scenario: The arming output teaches the fallback lane
+
+- **WHEN** `crew_begin {execution: "waves"}` arms a crew (standalone or born-armed under a goal)
+- **THEN** the arming output carries the fallback rule: no fitting forge worker (or forge dispatch blocked) → dispatch the native subagent with the same relay contract and record the fallback in the wave notes and the close evidence
+
+#### Scenario: Normal all-forge waves are unchanged
+
+- **WHEN** the session's pool fits every subtask and is compliant
+- **THEN** waves dispatch `forge-*` workers exactly as before — the fallback rule is present in the guidance but changes no behavior
+
+#### Scenario: Fallback never weakens a forge gate
+
+- **WHEN** any crew session attempts a `forge-*` dispatch that a belt would refuse (cross-pool target, non-compliant pool, pending crew)
+- **THEN** the refusal fires exactly as before — the native fallback lane adds no exception to any `forge-*` gate
