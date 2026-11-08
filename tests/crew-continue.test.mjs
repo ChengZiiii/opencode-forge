@@ -88,7 +88,9 @@ const idle = (hooks, sid) => hooks.event({ event: { type: "session.idle", proper
 test("crew-continue: idle between waves sends exactly one brief with objective + every declared subtask title", async (t) => {
   const { wt, hooks, prompts } = await crewHarness(t)
   const sid = nextSid()
-  await armCrew(hooks, wt, sid, "overnight refactor", ["map the module", "migrate the tests", "update the docs"])
+  const armed = await armCrew(hooks, wt, sid, "overnight refactor", ["map the module", "migrate the tests", "update the docs"])
+  // review NIT-2: the auto-advance wording is pinned on the arming surface.
+  assert.match(String(armed?.output ?? armed), /auto-advance on session idle until crew_close/, "the arming output carries the auto-advance clause")
   await idle(hooks, sid)
   await sleep(60)
   assert.equal(prompts.length, 1, "exactly one brief per idle")
