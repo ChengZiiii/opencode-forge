@@ -12334,9 +12334,9 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // plugin.ts
-import { execFileSync as execFileSync3 } from "node:child_process";
+import { execFileSync as execFileSync3, spawn as spawn6 } from "node:child_process";
 import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync5, readdirSync as readdirSync4, readFileSync as readFileSync8, realpathSync, statSync as statSync5, writeFileSync as writeFileSync5 } from "node:fs";
-import { basename as basename2, dirname as dirname4, isAbsolute, join as join6, relative } from "node:path";
+import { basename as basename2, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, relative as relative2 } from "node:path";
 import { tmpdir as tmpdir3, homedir } from "node:os";
 
 // src/plan-file.ts
@@ -15029,6 +15029,7 @@ var WORKER_MANDATES = [
   "Mandates (non-negotiable):",
   "- Use workspace-relative paths ONLY. Never write to or read from absolute paths outside this workspace; the workspace root is where you were started, not the filesystem root.",
   "- Run every shell command through the forge_shell tool (the builtin shell is not part of your toolset by design). Long-running or non-exiting commands: forge_shell with run_in_background, then collect results via forge_jobs poll before yielding.",
+  "- Run every search through the forge_grep/forge_glob tools first — the builtin grep/glob tools are fallback only. forge_grep/forge_glob see through symlinks/junctions and dot-directories because follow and hidden are on by default.",
   "- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial.",
   "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."
 ].join(`
@@ -15974,6 +15975,202 @@ function parentDirLabel(filePath) {
   return i < 0 ? s : s.slice(0, i);
 }
 
+// src/search-core.ts
+import { join as winJoin } from "node:path";
+import { join as posixJoin } from "node:path/posix";
+import { relative, isAbsolute } from "node:path";
+import { existsSync as fsExistsSync } from "node:fs";
+var GIT_EXCLUSION_GLOB = "--glob=!**/.git/**";
+function buildRgArgv(params) {
+  const { kind, pattern, path, include } = params;
+  const follow = params.follow !== false;
+  const hidden = params.hidden !== false;
+  const argv = ["--no-config", "--json"];
+  if (hidden)
+    argv.push("--hidden");
+  if (follow)
+    argv.push("--follow");
+  argv.push(GIT_EXCLUSION_GLOB);
+  if (typeof include === "string" && include.length > 0) {
+    argv.push(`--glob=${include}`);
+  }
+  argv.push("--");
+  argv.push(pattern);
+  if (typeof path === "string" && path.length > 0)
+    argv.push(path);
+  return argv;
+}
+function buildRgFilesArgv(params) {
+  const follow = params.follow !== false;
+  const hidden = params.hidden !== false;
+  const argv = ["--no-config", "--files"];
+  if (hidden)
+    argv.push("--hidden");
+  if (follow)
+    argv.push("--follow");
+  argv.push(`--glob=${params.pattern}`);
+  argv.push(GIT_EXCLUSION_GLOB);
+  if (typeof params.path === "string" && params.path.length > 0)
+    argv.push(params.path);
+  return argv;
+}
+function parseRgFilesList(stdout) {
+  if (typeof stdout !== "string" || stdout.length === 0)
+    return [];
+  return stdout.split(/\r?\n/).filter((l) => l.length > 0).map((p) => ({ path: p, line: 0, text: "" }));
+}
+var MAX_STREAM_LINE_LENGTH = 1048576;
+function parseRgJsonStream(stdout) {
+  const out = { records: [], garbageLines: 0, oversizedLines: 0 };
+  if (typeof stdout !== "string" || stdout.length === 0)
+    return out;
+  const lines = stdout.split(/\r?\n/);
+  for (const raw of lines) {
+    if (raw.length === 0)
+      continue;
+    if (raw.length > MAX_STREAM_LINE_LENGTH) {
+      out.oversizedLines++;
+      continue;
+    }
+    let ev;
+    try {
+      ev = JSON.parse(raw);
+    } catch {
+      out.garbageLines++;
+      continue;
+    }
+    if (ev === null || typeof ev !== "object" || ev.type !== "match")
+      continue;
+    const data = ev.data;
+    if (data === null || typeof data !== "object")
+      continue;
+    const pathText = data?.path?.text;
+    const lineNumber = data?.line_number;
+    const lineText = data?.lines?.text;
+    if (typeof pathText !== "string" || typeof lineNumber !== "number" || typeof lineText !== "string")
+      continue;
+    out.records.push({ path: pathText, line: lineNumber, text: lineText });
+  }
+  return out;
+}
+function createMemoizedResolver(resolve2) {
+  const cache = new Map;
+  return (p) => {
+    const hit = cache.get(p);
+    if (hit !== undefined)
+      return hit;
+    const v = resolve2(p);
+    cache.set(p, v);
+    return v;
+  };
+}
+function isOutsideWorktree(resolved, root) {
+  const norm = (s) => s.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
+  const r = norm(root);
+  const v = norm(resolved);
+  if (v === r)
+    return false;
+  const rel = relative(r, v);
+  return rel.startsWith("..") || isAbsolute(rel);
+}
+function dedupeFollowMatches(records, opts) {
+  if (!opts.follow)
+    return { records: [...records], mergedDuplicates: 0, outsideTargets: [] };
+  const resolve2 = createMemoizedResolver(opts.resolvePath);
+  const seen = new Map;
+  const outside = new Set;
+  let merged = 0;
+  for (const rec of records) {
+    const real = resolve2(rec.path);
+    if (isOutsideWorktree(real, opts.worktreeRoot))
+      outside.add(real);
+    const bucket = seen.get(real);
+    if (bucket === undefined) {
+      seen.set(real, [rec]);
+      continue;
+    }
+    const sameLine = bucket.find((k) => k.line === rec.line);
+    if (sameLine !== undefined) {
+      merged++;
+      if (rec.path < sameLine.path)
+        sameLine.path = rec.path;
+      continue;
+    }
+    if (rec.path < bucket[0].path)
+      bucket[0].path = rec.path;
+    bucket.push(rec);
+  }
+  const kept = [];
+  for (const bucket of seen.values()) {
+    const firstPath = bucket.reduce((m, r) => r.path < m ? r.path : m, bucket[0].path);
+    for (const r of bucket)
+      kept.push({ ...r, path: firstPath });
+  }
+  kept.sort((a, b) => a.path === b.path ? a.line - b.line : a.path < b.path ? -1 : 1);
+  return { records: kept, mergedDuplicates: merged, outsideTargets: [...outside].sort() };
+}
+var RG_MISSING_REMEDIES = "install ripgrep (or set search.rgPath in forge config to an existing rg binary), or fall back to the builtin grep/glob tools for this search";
+function resolveRgBinary(config2, seams) {
+  const platform = seams?.platform ?? process.platform;
+  const sep2 = seams?.pathSep ?? (platform === "win32" ? ";" : ":");
+  const exists = seams?.existsSync ?? fsExistsSync;
+  const pathEnv = seams?.pathEnv ?? (process.env.PATH ?? "");
+  if (typeof config2?.rgPath === "string" && config2.rgPath.length > 0 && exists(config2.rgPath)) {
+    return { ok: true, binary: config2.rgPath, source: "config" };
+  }
+  const exe = platform === "win32" ? "rg.exe" : "rg";
+  const join6 = platform === "win32" ? winJoin : posixJoin;
+  for (const dir of pathEnv.split(sep2)) {
+    if (dir.length === 0)
+      continue;
+    const candidate = join6(dir, exe);
+    if (exists(candidate))
+      return { ok: true, binary: candidate, source: "path" };
+  }
+  return {
+    ok: false,
+    error: `ripgrep (rg) not found — ${RG_MISSING_REMEDIES}`
+  };
+}
+var MAX_RESULTS = 100;
+function formatSearchOutput(records, opts) {
+  const lines = [];
+  const total = records.length;
+  if (total === 0) {
+    lines.push("No files found");
+  } else if (opts.kind === "glob") {
+    const unique = [];
+    const seen = new Set;
+    for (const r of records) {
+      if (!seen.has(r.path)) {
+        seen.add(r.path);
+        unique.push(r.path);
+      }
+    }
+    for (const p of unique.slice(0, MAX_RESULTS))
+      lines.push(p);
+    if (unique.length > MAX_RESULTS) {
+      lines.push(`(truncated at ${MAX_RESULTS} results — narrow the path or pattern)`);
+    }
+  } else {
+    lines.push(`Found ${total} matches`);
+    const shown = records.slice(0, MAX_RESULTS);
+    for (const r of shown)
+      lines.push(`${r.path}: Line ${r.line}: ${r.text.replace(/\r?\n$/, "")}`);
+    if (total > MAX_RESULTS) {
+      lines.push(`(truncated at ${MAX_RESULTS} results of ${total} — narrow the path or pattern)`);
+    }
+  }
+  for (const t of opts.outsideTargets ?? []) {
+    lines.push(`outside-workspace target searched via link: ${t}`);
+  }
+  const merged = opts.mergedDuplicates ?? 0;
+  if (merged > 0)
+    lines.push(`+${merged} duplicate paths merged`);
+  return lines.join(`
+`);
+}
+
 // plugin.ts
 var FORGE_AGENT = "forge";
 var FORGE_STATE_TOOLS = [
@@ -15992,7 +16189,8 @@ var FORGE_STATE_TOOLS = [
   "crew_close"
 ];
 var FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"];
-var FORGE_ALL_TOOLS = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS];
+var FORGE_SEARCH_TOOLS = ["forge_grep", "forge_glob"];
+var FORGE_ALL_TOOLS = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS, ...FORGE_SEARCH_TOOLS];
 var FORGE_TOOL_SET = new Set(FORGE_ALL_TOOLS);
 var FORGE_STATE_TOOL_SET = new Set(FORGE_STATE_TOOLS);
 var NATIVE_PARTITION_FALLBACKS = ["build", "plan", "general", "explore"];
@@ -16424,7 +16622,7 @@ function resolveActivePlan(state) {
   return { path, doc: ranked[0].doc };
 }
 function relFrom(worktree, path) {
-  const rel = relative(worktree, path);
+  const rel = relative2(worktree, path);
   return rel && !rel.startsWith("..") ? rel.replaceAll("\\", "/") : path;
 }
 var planWriteTool = tool({
@@ -16912,7 +17110,7 @@ var forgeShellTool = tool({
       }
     }
     const { registry: registry2, fence } = ensureJobLifecycle();
-    const cwd = args.workdir ? isAbsolute(args.workdir) ? args.workdir : join6(state.worktree, args.workdir) : state.worktree;
+    const cwd = args.workdir ? isAbsolute2(args.workdir) ? args.workdir : join6(state.worktree, args.workdir) : state.worktree;
     const started = startJob(jobManager, {
       cmd: args.command,
       cwd,
@@ -17064,6 +17262,107 @@ ${p.newOutput || "(none in this window)"}`,
       title: `${job.id} handed off`,
       output: `[forge:job] ${job.id}: promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`
     };
+  }
+});
+var searchRgPathOverride;
+var FORGE_SEARCH_PREFERENCE_LINE = "Prefer forge_grep/forge_glob over the builtin grep/glob — follow and hidden are on by default (symlinks/junctions and dot-directories are in scope; the builtin pair is blind to both).";
+var FORGE_GREP_DESCRIPTION = [
+  "Fast content search (rg --json under the hood) that sees through symlinks/junctions and dot-directories where the builtin pair is blind. Readonly by construction: the pattern and path are passed to ripgrep as single literal arguments — no shell exists, so shell metacharacters can neither redirect output nor alter execution.",
+  "Output matches the builtin grep's format: `Found N matches` header + `path: Line n: content` blocks, truncated at 100 results with a notice. With follow on (default), a file reachable through multiple paths reports once and the output ends with a `+N duplicate paths merged` line; links whose targets lie outside the workspace are followed and the resolved outside target is disclosed.",
+  FORGE_SEARCH_PREFERENCE_LINE
+].join(`
+`);
+var FORGE_GLOB_DESCRIPTION = [
+  "Fast file-pattern search (rg --files under the hood, the file pattern rides rg's --glob filter) that lists matching paths — including EMPTY files — and paths behind symlinks/junctions and inside dot-directories where the builtin glob is blind. Readonly by construction — no shell ever exists.",
+  "Output matches the builtin glob's format: a plain unique path list (`No files found` when empty), truncated at 100 results with a notice. With follow on (default), duplicate link-path hits merge and the output ends with a `+N duplicate paths merged` line.",
+  FORGE_SEARCH_PREFERENCE_LINE
+].join(`
+`);
+function reportedPathResolver(worktree) {
+  return (p) => {
+    try {
+      return realpathSync.native(isAbsolute2(p) ? p : join6(worktree, p)).toString();
+    } catch {
+      return p;
+    }
+  };
+}
+async function runRgSearch(kind, args, context) {
+  const resolution = resolveRgBinary(searchRgPathOverride !== undefined ? { rgPath: searchRgPathOverride } : undefined);
+  if (!resolution.ok)
+    return { title: "ripgrep not found", output: resolution.error };
+  const state = ensureSession(context.sessionID, worktreeFor(context));
+  const follow = args.follow !== false;
+  const hidden = args.hidden !== false;
+  const targetPath = typeof args.path === "string" && args.path.length > 0 ? isAbsolute2(args.path) ? args.path : join6(state.worktree, args.path) : undefined;
+  const searchPath = targetPath ?? ".";
+  const argv = kind === "glob" ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden }) : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden });
+  context.metadata?.({ title: `forge_${kind}: ${args.pattern.slice(0, 60)}` });
+  const child = spawn6(resolution.binary, argv, { cwd: state.worktree, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  let spawnError;
+  child.on("error", (err) => {
+    spawnError = err;
+  });
+  child.stdout?.on("data", (d) => {
+    stdout += d.toString("utf8");
+  });
+  child.stderr?.on("data", (d) => {
+    stderr += d.toString("utf8");
+  });
+  const code = await new Promise((resolve2) => {
+    child.on("close", (c) => resolve2(c));
+  });
+  if (spawnError !== undefined) {
+    return { title: "rg spawn failed", output: `[forge:search] Failed to run ripgrep (${resolution.binary}): ${spawnError.message}` };
+  }
+  if (code !== null && code > 1) {
+    return { title: `rg exit ${code}`, output: [`[forge:search] ripgrep exited ${code}:`, stderr.trim() || "(no stderr)", "Narrow the path or fix the pattern (rg treats it as a regular expression)."].join(`
+`) };
+  }
+  const stripDotPrefix = (p) => p.replace(/^\.(?:\\|\/)/, "");
+  const rawRecords = kind === "glob" ? parseRgFilesList(stdout) : parseRgJsonStream(stdout).records;
+  const records = rawRecords.map((r) => ({ ...r, path: stripDotPrefix(r.path) }));
+  const deduped = dedupeFollowMatches(records, {
+    worktreeRoot: state.worktree,
+    resolvePath: reportedPathResolver(state.worktree),
+    follow
+  });
+  return {
+    title: `${deduped.records.length} result${deduped.records.length === 1 ? "" : "s"}`,
+    output: formatSearchOutput(deduped.records, {
+      kind,
+      mergedDuplicates: deduped.mergedDuplicates,
+      outsideTargets: deduped.outsideTargets
+    })
+  };
+}
+var forgeGrepTool = tool({
+  description: FORGE_GREP_DESCRIPTION,
+  args: {
+    pattern: tool.schema.string().describe("The regular expression to search for (passed to ripgrep verbatim as a single literal argument)"),
+    path: tool.schema.string().optional().describe("Optional target file or directory (workspace-relative, or absolute). Defaults to the session worktree"),
+    include: tool.schema.string().optional().describe('File filter glob (e.g. "*.ts") — only matching files are searched'),
+    follow: tool.schema.boolean().optional().describe("Follow symlinks/junctions during traversal (default TRUE — diverges from the builtin pair by design)"),
+    hidden: tool.schema.boolean().optional().describe("Search dot-directories (default TRUE — diverges from the builtin pair by design)")
+  },
+  execute: async (args, context) => {
+    noteToolAgent(context);
+    return runRgSearch("grep", { pattern: args.pattern, path: args.path, include: args.include, follow: args.follow, hidden: args.hidden }, context);
+  }
+});
+var forgeGlobTool = tool({
+  description: FORGE_GLOB_DESCRIPTION,
+  args: {
+    pattern: tool.schema.string().describe(`The file-pattern glob to list (e.g. "**/*.ts") — rides ripgrep's --glob filter verbatim`),
+    path: tool.schema.string().optional().describe("Optional target directory (workspace-relative, or absolute). Defaults to the session worktree"),
+    follow: tool.schema.boolean().optional().describe("Follow symlinks/junctions during traversal (default TRUE — diverges from the builtin pair by design)"),
+    hidden: tool.schema.boolean().optional().describe("List dot-directories' files (default TRUE — diverges from the builtin pair by design)")
+  },
+  execute: async (args, context) => {
+    noteToolAgent(context);
+    return runRgSearch("glob", { pattern: args.pattern, path: args.path, follow: args.follow, hidden: args.hidden }, context);
   }
 });
 var CREW_INIT_TEMPLATE = [
@@ -17383,6 +17682,8 @@ function forgeTools() {
     tools.forge_shell = forgeShellTool;
     tools.forge_jobs = forgeJobsTool;
   }
+  tools.forge_grep = forgeGrepTool;
+  tools.forge_glob = forgeGlobTool;
   if (!forgeDisabled) {
     tools.crew_begin = crewBeginTool;
     tools.crew_close = crewCloseTool;
@@ -17628,6 +17929,8 @@ var server = async (input, options) => {
   jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true;
   if (jobsOpts?.survive === "never" || jobsOpts?.survive === "always" || jobsOpts?.survive === "deny")
     jobsSurviveMode = jobsOpts.survive;
+  const searchOpts = options?.search;
+  searchRgPathOverride = typeof searchOpts?.rgPath === "string" && searchOpts.rgPath.trim().length > 0 ? searchOpts.rgPath : undefined;
   const wdOpts = options?.watchdog;
   const wdFallbacks = [];
   const wdMode = parseMode(wdOpts?.mode);
@@ -17872,7 +18175,7 @@ var server = async (input, options) => {
           if (raw) {
             const state = stateForBan(input2.sessionID);
             const base = state?.worktree ?? hostWorktree ?? "";
-            const abs = (isAbsolute(raw) ? raw : join6(base, raw)).replaceAll("\\", "/").toLowerCase();
+            const abs = (isAbsolute2(raw) ? raw : join6(base, raw)).replaceAll("\\", "/").toLowerCase();
             if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
               throw new Error(`[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`);
             }
