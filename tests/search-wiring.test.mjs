@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, writeFileSync, mkdirSync } from "node:fs"
+import { mkdtempSync, rmSync, writeFileSync, mkdirSync, symlinkSync, realpathSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { resolveRgBinary } from "../src/search-core.ts"
@@ -175,5 +175,142 @@ test("forge_glob regression: an EMPTY file appears in the results (rg --files se
     await h.dispose?.()
   } finally {
     rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// Engine-chain wiring (change search-js-fallback, tasks.md item 3): rg →
+// bundled JS engine dispatch, spawn fall-through, engine footnote.
+// ---------------------------------------------------------------------------
+
+const ENGINE_FOOTNOTE_MISS =
+  "(engine: builtin-js — ripgrep not found; install ripgrep or set search.rgPath for the faster engine)"
+
+function ctxFor(wt, sessionID) {
+  return { sessionID, worktree: wt, ask: async () => {}, metadata() {}, callID: "c", agent: "forge", messageID: "m" }
+}
+
+// 1. Scrubbed PATH (a temp dir with no rg): the JS engine serves BOTH tools
+// with real results + the miss footnote pinned verbatim (spec delta scenario
+// "A missing ripgrep serves through the JS engine").
+test("engine chain: scrubbed PATH → builtin-js serves forge_grep AND forge_glob with the miss footnote", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "search-js-grep-"))
+  const emptyBin = join(wt, "no-bin") // PATH target: exists, contains no rg
+  try {
+    mkdirSync(join(wt, "src"), { recursive: true })
+    mkdirSync(emptyBin, { recursive: true })
+    writeFileSync(join(wt, "src", "a.ts"), "forge-js-wire-needle alpha\n")
+    writeFileSync(join(wt, "src", "empty.ts"), "") // zero bytes — glob must list it
+    const h = await startServer(inputFor(wt), {})
+    const savedPath = process.env.PATH
+    process.env.PATH = emptyBin
+    let g, b
+    try {
+      g = await h.tool.forge_grep.execute({ pattern: "forge-js-wire-needle" }, ctxFor(wt, "ses_js_grep"))
+      b = await h.tool.forge_glob.execute({ pattern: "**/*.ts" }, ctxFor(wt, "ses_js_glob"))
+    } finally {
+      process.env.PATH = savedPath
+    }
+    // grep: first-line parity + real match + footnote pinned verbatim.
+    assert.equal(g.output.split("\n")[0], "Found 1 matches", `grep header (output: ${g.output})`)
+    assert.ok(g.output.includes(`${join("src", "a.ts")}: Line 1:`), `grep match present (output: ${g.output})`)
+    assert.ok(g.output.endsWith(ENGINE_FOOTNOTE_MISS), `miss footnote verbatim, last line (output: ${g.output})`)
+    // glob: fixture files listed INCLUDING the empty one + the same footnote.
+    assert.ok(b.output.split("\n").includes(join("src", "a.ts")), `glob lists a.ts (output: ${b.output})`)
+    assert.ok(b.output.split("\n").includes(join("src", "empty.ts")), `glob lists EMPTY file (output: ${b.output})`)
+    assert.ok(b.output.endsWith(ENGINE_FOOTNOTE_MISS), `glob miss footnote verbatim, last line (output: ${b.output})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// 2. Override wins (spec delta scenario "The config override wins when set"):
+// searchRgPathOverride at a WORKING rg (the real binary when this host has
+// one — the only honest working stand-in) → results served by rg, NO
+// footnote. Skips with an explicit reason on rg-less hosts (never fake-green).
+test("engine chain: searchRgPathOverride at a working rg → rg serves, no engine footnote", async (t) => {
+  const rg = resolveRgBinary()
+  if (!rg.ok) {
+    t.skip(`ripgrep not found on this host (${rg.error}) — override-wins test skipped`)
+    return
+  }
+  const wt = mkdtempSync(join(tmpdir(), "search-js-ovr-"))
+  try {
+    writeFileSync(join(wt, "a.ts"), "forge-ovr-needle alpha\n")
+    const h = await startServer(inputFor(wt), { search: { rgPath: rg.binary } })
+    const r = await h.tool.forge_grep.execute({ pattern: "forge-ovr-needle" }, ctxFor(wt, "ses_js_ovr"))
+    assert.equal(r.output.split("\n")[0], "Found 1 matches", `header (output: ${r.output})`)
+    assert.ok(r.output.includes("a.ts: Line 1:"), `rg-served match present (output: ${r.output})`)
+    assert.ok(!r.output.includes("(engine:"), `no engine footnote on an rg-served call (output: ${r.output})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// 3. Broken override (spec delta scenario "A broken override falls through"):
+// searchRgPathOverride at an EXISTING but broken stand-in — the host node
+// binary, which spawns fine but exits >1 on rg's argv (bad option) — must
+// fall through to the JS engine with the rg-failure footnote (reason
+// substring flexible; the `(engine: builtin-js — rg failed` prefix pinned).
+test("engine chain: broken override (exits >1) → JS engine serves with the rg-failure footnote", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "search-js-broken-"))
+  try {
+    writeFileSync(join(wt, "a.ts"), "forge-broken-ovr-needle alpha\n")
+    // process.execPath exists on disk (resolution ok via config source) and
+    // spawns, but node rejects rg's argv (`--no-config` etc.) → exit code 9.
+    const h = await startServer(inputFor(wt), { search: { rgPath: process.execPath } })
+    const r = await h.tool.forge_grep.execute({ pattern: "forge-broken-ovr-needle" }, ctxFor(wt, "ses_js_broken"))
+    assert.equal(r.output.split("\n")[0], "Found 1 matches", `header — JS engine served (output: ${r.output})`)
+    assert.ok(r.output.includes("a.ts: Line 1:"), `match present via builtin-js (output: ${r.output})`)
+    const last = r.output.split("\n").at(-1)
+    assert.ok(last.startsWith("(engine: builtin-js — rg failed to serve the call ("), `rg-failure footnote prefix (last line: ${last})`)
+    assert.ok(/; install ripgrep or set search\.rgPath\)$/.test(last), `footnote closes with the remedy (last line: ${last})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// 4. Junction through the JS engine — the field-parity scenario from the
+// spec delta ("The JS engine traverses a workspace junction"): a junction
+// whose target dir lies OUTSIDE the worktree, scrubbed PATH, forge_glob must
+// find the target files under the LINK-relative path AND disclose the outside
+// target AND carry the engine footnote. Same junction-fixture convention as
+// search-behavior.test.mjs (symlinkSync "junction" needs no admin on win32).
+test("engine chain: junction to an outside target through builtin-js — link paths + outside disclosure + footnote", async () => {
+  const root = mkdtempSync(join(tmpdir(), "forge-sjw-junc-"))
+  const outside = mkdtempSync(join(tmpdir(), "forge-sjw-outside-"))
+  const wt = join(root, "wt")
+  try {
+    mkdirSync(wt, { recursive: true })
+    writeFileSync(join(wt, "local.txt"), "local\n")
+    writeFileSync(join(outside, "external.txt"), "external\n")
+    symlinkSync(outside, join(wt, "out_link"), "junction")
+    const h = await startServer(inputFor(wt), {})
+    const savedPath = process.env.PATH
+    process.env.PATH = root // no rg anywhere in the scrubbed PATH
+    let r
+    try {
+      r = await h.tool.forge_glob.execute({ pattern: "**/*.txt" }, ctxFor(wt, "ses_js_junc"))
+    } finally {
+      process.env.PATH = savedPath
+    }
+    const lines = r.output.split("\n")
+    // (a) target files found under the LINK-relative path.
+    assert.ok(lines.includes(join("out_link", "external.txt")), `link-relative path listed (output: ${r.output})`)
+    assert.ok(lines.includes("local.txt"), `worktree file listed (output: ${r.output})`)
+    // (b) the output discloses the resolved outside target.
+    const resolved = realpathSync.native(join(outside, "external.txt")).toString()
+    const disclosures = lines.filter((l) => l.startsWith("outside-workspace target searched via link: "))
+    assert.equal(disclosures.length, 1, `exactly one disclosure line (output: ${r.output})`)
+    assert.ok(disclosures[0].toLowerCase().endsWith(resolved.toLowerCase()), `disclosure names the resolved outside target ${resolved} (output: ${r.output})`)
+    // (c) the engine footnote is present (last line).
+    assert.ok(r.output.endsWith(ENGINE_FOOTNOTE_MISS), `engine footnote last (output: ${r.output})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+    rmSync(outside, { recursive: true, force: true })
   }
 })

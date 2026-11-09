@@ -1,6 +1,7 @@
 import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { execFileSync, spawn } from "node:child_process"
+import { open as fsOpen, readdir as fsReaddir, stat as fsStat } from "node:fs/promises"
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative } from "node:path"
 import { tmpdir, homedir } from "node:os"
@@ -74,7 +75,8 @@ import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
-import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type SearchToolKind } from "./src/search-core.ts"
+import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
+import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -1602,25 +1604,27 @@ const forgeJobsTool = tool({
 
 
 // ---------------------------------------------------------------------------
-// Search tools (change forge-search-tools, design D1-D7)
+// Search tools (change forge-search-tools D1-D7; engine chain per change
+// search-js-fallback D1/D5/D6)
 // ---------------------------------------------------------------------------
 
 // Config override read at call time through the plugin-options surface (the
 // same surface jobs/watchdog ride). rg resolution itself re-runs PER CALL
-// (config override → PATH → fail-soft), so installing rg needs no restart.
+// (config override → PATH → bundled JS engine), so installing rg needs no
+// restart — and a machine with no rg at all still gets every call served.
 let searchRgPathOverride: string | undefined
 
 const FORGE_SEARCH_PREFERENCE_LINE =
   "Prefer forge_grep/forge_glob over the builtin grep/glob — follow and hidden are on by default (symlinks/junctions and dot-directories are in scope; the builtin pair is blind to both)."
 
 const FORGE_GREP_DESCRIPTION = [
-  "Fast content search (rg --json under the hood) that sees through symlinks/junctions and dot-directories where the builtin pair is blind. Readonly by construction: the pattern and path are passed to ripgrep as single literal arguments — no shell exists, so shell metacharacters can neither redirect output nor alter execution.",
+  "Fast content search (ripgrep when it resolves, the plugin's bundled JS engine otherwise — a trailing engine line discloses which) that sees through symlinks/junctions and dot-directories where the builtin pair is blind. Readonly by construction: the pattern and path reach the serving engine as single literal values — no shell exists, so shell metacharacters can neither redirect output nor alter execution.",
   "Output matches the builtin grep's format: `Found N matches` header + `path: Line n: content` blocks, truncated at 100 results with a notice. With follow on (default), a file reachable through multiple paths reports once and the output ends with a `+N duplicate paths merged` line; links whose targets lie outside the workspace are followed and the resolved outside target is disclosed.",
   FORGE_SEARCH_PREFERENCE_LINE,
 ].join("\n")
 
 const FORGE_GLOB_DESCRIPTION = [
-  "Fast file-pattern search (rg --files under the hood, the file pattern rides rg's --glob filter) that lists matching paths — including EMPTY files — and paths behind symlinks/junctions and inside dot-directories where the builtin glob is blind. Readonly by construction — no shell ever exists.",
+  "Fast file-pattern search (ripgrep when it resolves, the plugin's bundled JS engine otherwise — a trailing engine line discloses which) that lists matching paths — including EMPTY files — and paths behind symlinks/junctions and inside dot-directories where the builtin glob is blind. Readonly by construction — no shell ever exists.",
   "Output matches the builtin glob's format: a plain unique path list (`No files found` when empty), truncated at 100 results with a notice. With follow on (default), duplicate link-path hits merge and the output ends with a `+N duplicate paths merged` line.",
   FORGE_SEARCH_PREFERENCE_LINE,
 ].join("\n")
@@ -1639,76 +1643,161 @@ function reportedPathResolver(worktree: string): (p: string) => string {
   }
 }
 
-async function runRgSearch(
+// Real fs seams for the bundled JS engine (change search-js-fallback D6):
+// readdir(withFileTypes) mapped to the engine's JsDirent shape; stat follows
+// links (symlink/junction classification); readFilePrefix reads maxBytes + 1
+// so the engine can detect oversized files; realpath via realpathSync.native
+// with a fail-soft fallback to the path as-is (a broken resolution must not
+// kill the walk — the engine's cycle guard degrades, siblings still apply).
+const realJsSeams: JsSearchSeams = {
+  readdir: async (dir) => {
+    const entries = await fsReaddir(dir, { withFileTypes: true })
+    return entries.map((e) => ({
+      name: e.name,
+      isFile: e.isFile(),
+      isDirectory: e.isDirectory(),
+      isSymbolicLink: e.isSymbolicLink(),
+    }))
+  },
+  stat: (p) =>
+    fsStat(p).then((s) => ({ isFile: s.isFile(), isDirectory: s.isDirectory() })),
+  readFilePrefix: async (p, maxBytes) => {
+    const fh = await fsOpen(p, "r")
+    try {
+      const buf = Buffer.alloc(maxBytes + 1)
+      const { bytesRead } = await fh.read(buf, 0, maxBytes + 1, 0)
+      return buf.subarray(0, bytesRead)
+    } finally {
+      await fh.close()
+    }
+  },
+  realpath: (p) => {
+    try {
+      return realpathSync.native(p).toString()
+    } catch {
+      return p
+    }
+  },
+}
+
+// Engine-disclosure footnotes (design D5) — appended LAST, after the dedupe
+// footnotes, whenever the bundled JS engine served the call.
+const ENGINE_FOOTNOTE_MISS =
+  "(engine: builtin-js — ripgrep not found; install ripgrep or set search.rgPath for the faster engine)"
+const engineFootnoteFailure = (reason: string) =>
+  `(engine: builtin-js — rg failed to serve the call (${reason}); install ripgrep or set search.rgPath)`
+
+async function runSearch(
   kind: SearchToolKind,
   args: { pattern: string; path?: string; include?: string; follow?: boolean; hidden?: boolean },
   context: { sessionID: string; worktree: string; directory?: string; agent?: unknown; metadata?: (input: { title?: string }) => void },
 ): Promise<{ title: string; output: string }> {
-  // rg resolution is per call (D4): an install picked up mid-session works
-  // with no restart. Miss → fail-soft guidance, never a throw.
+  // Engine chain (search-js-fallback D1/D6): config override → PATH rg →
+  // bundled JS engine. Resolution re-runs per call, so an install picked up
+  // mid-session works with no restart — and a miss now SERVES the call
+  // through the JS engine instead of failing soft.
   const resolution = resolveRgBinary(searchRgPathOverride !== undefined ? { rgPath: searchRgPathOverride } : undefined)
-  if (!resolution.ok) return { title: "ripgrep not found", output: resolution.error }
   const state = ensureSession(context.sessionID, worktreeFor(context))
   const follow = args.follow !== false
   const hidden = args.hidden !== false
   const targetPath = typeof args.path === "string" && args.path.length > 0 ? (isAbsolute(args.path) ? args.path : join(state.worktree, args.path)) : undefined
-  // A path arg is ALWAYS given: with no path and a piped stdin, rg reads
-  // STDIN and never exits (probe-verified). "." keeps output paths relative
-  // (builtin parity) and searches the session worktree.
-  const searchPath = targetPath ?? "."
-  // One fixed argv vector per kind (D1). grep: literal pattern after `--`.
-  // glob: the files-listing vector (D1b, rg --files semantics) — the file
-  // pattern rides `--glob=` and EMPTY files are listed too (zero lines → no
-  // match events → invisible to the content vector; builtin-glob parity).
-  const argv =
-    kind === "glob"
-      ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden })
-      : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden })
   context.metadata?.({ title: `forge_${kind}: ${args.pattern.slice(0, 60)}` })
-  // Direct spawn, shell:false, fixed argv — no shell string ever exists
-  // (readonly by construction; the exec seal governs forge_shell only).
-  // stdin is ignored: rg must never mistake our pipe for search input.
-  const child = spawn(resolution.binary, argv, { cwd: state.worktree, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
-  let stdout = ""
-  let stderr = ""
-  let spawnError: Error | undefined
-  child.on("error", (err) => {
-    spawnError = err
-  })
-  child.stdout?.on("data", (d: Buffer) => {
-    stdout += d.toString("utf8")
-  })
-  child.stderr?.on("data", (d: Buffer) => {
-    stderr += d.toString("utf8")
-  })
-  const code = await new Promise<number | null>((resolve) => {
-    child.on("close", (c) => resolve(c))
-  })
-  if (spawnError !== undefined) {
-    return { title: "rg spawn failed", output: `[forge:search] Failed to run ripgrep (${resolution.binary}): ${spawnError.message}` }
+  let records: RgMatchRecord[] = []
+  let jsNotices: string[] = []
+  let engineFootnote: string | undefined
+  if (resolution.ok) {
+    // A path arg is ALWAYS given: with no path and a piped stdin, rg reads
+    // STDIN and never exits (probe-verified). "." keeps output paths relative
+    // (builtin parity) and searches the session worktree.
+    const searchPath = targetPath ?? "."
+    // One fixed argv vector per kind (D1). grep: literal pattern after `--`.
+    // glob: the files-listing vector (D1b, rg --files semantics) — the file
+    // pattern rides `--glob=` and EMPTY files are listed too (zero lines → no
+    // match events → invisible to the content vector; builtin-glob parity).
+    const argv =
+      kind === "glob"
+        ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden })
+        : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden })
+    // Direct spawn, shell:false, fixed argv — no shell string ever exists
+    // (readonly by construction; the exec seal governs forge_shell only).
+    // stdin is ignored: rg must never mistake our pipe for search input.
+    const child = spawn(resolution.binary, argv, { cwd: state.worktree, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
+    let stdout = ""
+    let stderr = ""
+    let spawnError: Error | undefined
+    child.on("error", (err) => {
+      spawnError = err
+    })
+    child.stdout?.on("data", (d: Buffer) => {
+      stdout += d.toString("utf8")
+    })
+    child.stderr?.on("data", (d: Buffer) => {
+      stderr += d.toString("utf8")
+    })
+    const code = await new Promise<number | null>((resolve) => {
+      child.on("close", (c) => resolve(c))
+    })
+    // rg exit codes: 0 = matches, 1 = no matches (both parse), 2+ = error.
+    // Spawn-stage failure (unspawnable binary) or exit > 1 falls THROUGH to
+    // the bundled JS engine (D1) — the old error objects die with the
+    // fail-soft contract; the footnote names the failure instead.
+    if (spawnError !== undefined) {
+      engineFootnote = engineFootnoteFailure(spawnError.message)
+    } else if (code !== null && code > 1) {
+      engineFootnote = engineFootnoteFailure(`exit ${code}`)
+    } else {
+      // rg --files (glob) emits a plain path list; grep emits the --json
+      // stream. The default "." path arg makes rg prefix every path with .\ or
+      // ./ — strip it for builtin-pair output parity (they print bare relative
+      // paths). stderr intentionally unused on clean exits (rg -h noise).
+      void stderr
+      const stripDotPrefix = (p: string): string => p.replace(/^\.(?:\\|\/)/, "")
+      const rawRecords = kind === "glob" ? parseRgFilesList(stdout) : parseRgJsonStream(stdout).records
+      records = rawRecords.map((r) => ({ ...r, path: stripDotPrefix(r.path) }))
+    }
+  } else {
+    // Resolution miss: the bundled JS engine serves the call directly (D6).
+    engineFootnote = ENGINE_FOOTNOTE_MISS
   }
-  // rg exit codes: 0 = matches, 1 = no matches (both parse), 2+ = error.
-  if (code !== null && code > 1) {
-    return { title: `rg exit ${code}`, output: [`[forge:search] ripgrep exited ${code}:`, stderr.trim() || "(no stderr)", "Narrow the path or fix the pattern (rg treats it as a regular expression)."].join("\n") }
+  if (engineFootnote !== undefined) {
+    // JS engine serves a call rg could not. Same absolute-path resolution as
+    // the rg path: the walk root is the resolved absolute target (or the
+    // session worktree), so an explicit target's records get the same abs
+    // prefix rg would print; a worktree-rooted walk stays stripped-relative
+    // (matches the "." form above). Errors (compile failure / inaccessible
+    // root) return verbatim — no partial results.
+    const root = targetPath ?? state.worktree
+    const js = await jsSearch(
+      { kind, root, pattern: args.pattern, include: args.include, follow, hidden, pathSeparator: process.platform === "win32" ? "\\" : "/" },
+      realJsSeams,
+    )
+    if (js.error !== undefined) {
+      return { title: "search engine error", output: js.error }
+    }
+    records =
+      targetPath === undefined
+        ? js.records
+        : js.records.map((r) => (isAbsolute(r.path) ? r : { ...r, path: join(root, r.path) }))
+    jsNotices = js.notices
   }
-  // rg --files (glob) emits a plain path list; grep emits the --json stream.
-  // The default "." path arg makes rg prefix every path with .\ or ./ —
-  // strip it for builtin-pair output parity (they print bare relative paths).
-  const stripDotPrefix = (p: string): string => p.replace(/^\.(?:\\|\/)/, "")
-  const rawRecords = kind === "glob" ? parseRgFilesList(stdout) : parseRgJsonStream(stdout).records
-  const records = rawRecords.map((r) => ({ ...r, path: stripDotPrefix(r.path) }))
+  // Shared post-pass, UNCHANGED for both engines (D2): records →
+  // dedupeFollowMatches (same reportedPathResolver seam) → formatSearchOutput,
+  // with the JS engine's bound notices and — LAST — the engine footnote
+  // appended on new lines. rg-served calls carry no footnote.
   const deduped = dedupeFollowMatches(records, {
     worktreeRoot: state.worktree,
     resolvePath: reportedPathResolver(state.worktree),
     follow,
   })
+  const body = formatSearchOutput(deduped.records, {
+    kind,
+    mergedDuplicates: deduped.mergedDuplicates,
+    outsideTargets: deduped.outsideTargets,
+  })
+  const output = [body, ...jsNotices, ...(engineFootnote !== undefined ? [engineFootnote] : [])].join("\n")
   return {
     title: `${deduped.records.length} result${deduped.records.length === 1 ? "" : "s"}`,
-    output: formatSearchOutput(deduped.records, {
-      kind,
-      mergedDuplicates: deduped.mergedDuplicates,
-      outsideTargets: deduped.outsideTargets,
-    }),
+    output,
   }
 }
 
@@ -1723,7 +1812,7 @@ const forgeGrepTool = tool({
   },
   execute: async (args, context) => {
     noteToolAgent(context)
-    return runRgSearch("grep", { pattern: args.pattern, path: args.path, include: args.include, follow: args.follow, hidden: args.hidden }, context)
+    return runSearch("grep", { pattern: args.pattern, path: args.path, include: args.include, follow: args.follow, hidden: args.hidden }, context)
   },
 })
 
@@ -1737,7 +1826,7 @@ const forgeGlobTool = tool({
   },
   execute: async (args, context) => {
     noteToolAgent(context)
-    return runRgSearch("glob", { pattern: args.pattern, path: args.path, follow: args.follow, hidden: args.hidden }, context)
+    return runSearch("glob", { pattern: args.pattern, path: args.path, follow: args.follow, hidden: args.hidden }, context)
   },
 })
 

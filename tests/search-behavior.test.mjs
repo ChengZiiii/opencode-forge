@@ -230,25 +230,33 @@ test("3.2 resolver fail-soft (fake seams): no override + PATH miss → exact gui
   assert.equal(empty.error, EXPECTED_RG_MISSING_ERROR, "exact contract text (empty PATH)")
 })
 
-// Wiring-level fail-soft: the tool surface itself returns the guidance
-// output — no throw, no crash — when the PATH scan misses at call time
-// (resolution runs per call, design D4; no spawn happens on a miss).
-test("3.2 wiring fail-soft: forge_grep execute returns guidance output when rg does not resolve", async () => {
+// Wiring-level engine chain (change search-js-fallback): the tool surface
+// itself now SERVES the call through the bundled JS engine — real results +
+// the miss footnote, no throw, no crash — when the PATH scan misses at call
+// time (resolution runs per call; no spawn happens on a miss). The old
+// fail-soft guidance output is dead contract, superseded by the spec delta's
+// "A missing ripgrep serves through the JS engine" scenario.
+test("3.2 wiring engine chain: forge_grep execute serves real results + miss footnote when rg does not resolve", async () => {
   const root = mkdtempSync(join(tmpdir(), "forge-sbh-miss-"))
   const wt = join(root, "wt")
-  mkdirSync(wt, { recursive: true })
   try {
+    mkdirSync(wt, { recursive: true })
+    writeFileSync(join(wt, "served.ts"), "forge-miss-served-needle alpha\n")
     const h = await startServer(inputFor(wt), {})
     const savedPath = process.env.PATH
     process.env.PATH = "" // PATH scan finds nothing; no rgPath override is configured
     let r
     try {
-      r = await h.tool.forge_grep.execute({ pattern: "anything" }, ctxFor(wt, "ses_e2e_miss"))
+      r = await h.tool.forge_grep.execute({ pattern: "forge-miss-served-needle" }, ctxFor(wt, "ses_e2e_miss"))
     } finally {
       process.env.PATH = savedPath
     }
-    assert.equal(r.title, "ripgrep not found", `fail-soft title (got: ${JSON.stringify(r)})`)
-    assert.equal(r.output, EXPECTED_RG_MISSING_ERROR, "tool output is the exact guidance contract text")
+    assert.equal(r.output.split("\n")[0], "Found 1 matches", `first-line parity — the JS engine served (output: ${r.output})`)
+    assert.ok(r.output.includes("served.ts: Line 1:"), `real match present (output: ${r.output})`)
+    assert.ok(
+      r.output.endsWith("(engine: builtin-js — ripgrep not found; install ripgrep or set search.rgPath for the faster engine)"),
+      `miss footnote verbatim, last line (output: ${r.output})`,
+    )
     await h.dispose?.()
   } finally {
     rmSync(root, { recursive: true, force: true })
