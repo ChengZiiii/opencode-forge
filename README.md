@@ -156,6 +156,7 @@ the plugin never writes them):
       "search": {
         "rgPath": ""                 // optional explicit ripgrep binary path for forge_grep/forge_glob;
                                      // default resolution: this override (when it exists) → rg on PATH
+                                     // → the plugin's bundled JS engine (disclosed by a trailing engine line)
       }
     }]
   ]

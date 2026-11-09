@@ -16285,13 +16285,42 @@ function translateGlob(pat) {
         negated = true;
         j++;
       }
-      const close = pat.indexOf("]", j);
+      let close = -1;
+      for (let k = j;k < pat.length; ) {
+        if (pat[k] === "\\") {
+          k += 2;
+          continue;
+        }
+        if (pat[k] === "]") {
+          close = k;
+          break;
+        }
+        k++;
+      }
       if (close === -1 || close === j) {
         out += "\\[";
         i++;
         continue;
       }
-      out += "[" + (negated ? "^" : "") + pat.slice(j, close) + "]";
+      let body = "";
+      for (let m = j;m < close; m++) {
+        const ch = pat[m];
+        if (ch === "\\") {
+          m++;
+          const escaped = pat[m];
+          if (escaped === undefined)
+            break;
+          body += escaped === "\\" || escaped === "]" ? "\\" + escaped : escaped;
+          continue;
+        }
+        body += ch === "]" || ch === "\\" ? "\\" + ch : ch;
+      }
+      if (body.length === 0) {
+        out += "\\[";
+        i++;
+        continue;
+      }
+      out += "[" + (negated ? "^" : "") + body + "]";
       i = close + 1;
     } else if (c === "{") {
       const close = pat.indexOf("}", i + 1);
@@ -16317,7 +16346,13 @@ function globToRegExp(pattern) {
     return cached2;
   const source = translateGlob(pattern);
   const anchored = pattern.includes("/");
-  const re = anchored ? new RegExp("^" + source + "$") : new RegExp("(?:^|/)" + source + "$");
+  const prefix = anchored ? "^" : "(?:^|/)";
+  let re;
+  try {
+    re = new RegExp(prefix + source + "$");
+  } catch {
+    re = /$^/;
+  }
   globRegexCache.set(pattern, re);
   return re;
 }
@@ -16470,6 +16505,19 @@ async function jsSearch(params, seams, maxWalkEntries = MAX_WALK_ENTRIES) {
     capped: false,
     maxWalkEntries
   };
+  const collectNotices = () => {
+    const out = [];
+    if (ctx.capped) {
+      out.push(`(js engine: walk capped at ${maxWalkEntries} entries — narrow the path)`);
+    }
+    if (ctx.aborted && ctx.records.length >= MAX_RECORDS) {
+      out.push(`(js engine: capped at ${MAX_RECORDS} recorded matches — narrow the pattern)`);
+    }
+    if (ctx.oversizedSkips > 0) {
+      out.push(`(js engine: skipped ${ctx.oversizedSkips} files over 8 MiB)`);
+    }
+    return out;
+  };
   if (rootSt.isFile) {
     const relFwd = params.root.split(params.pathSeparator).join("/");
     if (params.kind === "glob") {
@@ -16478,21 +16526,14 @@ async function jsSearch(params, seams, maxWalkEntries = MAX_WALK_ENTRIES) {
     } else {
       await scanFile(ctx, params.root, relFwd, params.root);
     }
-    return { records: ctx.records, notices: [] };
+    return { records: ctx.records, notices: collectNotices() };
   }
   if (!rootSt.isDirectory) {
     return { records: [], notices: [] };
   }
   ctx.seen.add(realOf(ctx, params.root));
   await walkDir(ctx, params.root, "");
-  const notices = [];
-  if (ctx.capped) {
-    notices.push(`(js engine: walk capped at ${maxWalkEntries} entries — narrow the path)`);
-  }
-  if (ctx.oversizedSkips > 0) {
-    notices.push(`(js engine: skipped ${ctx.oversizedSkips} files over 8 MiB)`);
-  }
-  return { records: ctx.records, notices };
+  return { records: ctx.records, notices: collectNotices() };
 }
 
 // plugin.ts
