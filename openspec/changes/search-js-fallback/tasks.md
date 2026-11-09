@@ -26,7 +26,7 @@
 
 ## 5. Release
 
-- [ ] README search section: engine chain, footnote, subset + caps documentation
-- [ ] `bun run bundle` (self-contained), `npm pack --dry-run` = 3 files
-- [ ] Version 0.21.0, publish, store update, push
-- [ ] **Field-parity acceptance**: rg-scrubbed serve sandbox (minimal PATH without rg) — forge_glob finds a junction target outside the workspace with disclosure footnote, forge_grep returns matches — the exact field-failure chain, replayed green
+- [x] README search section: engine chain, footnote, subset + caps documentation
+- [x] `bun run bundle` (self-contained), `npm pack --dry-run` = 3 files
+- [x] Version 0.21.0, publish, store update, push
+- [x] **Field-parity acceptance**: rg-scrubbed serve sandbox (minimal PATH without rg) — forge_glob finds a junction target outside the workspace with disclosure footnote, forge_grep returns matches — the exact field-failure chain, replayed green
