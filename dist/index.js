@@ -16267,13 +16267,21 @@ function translateGlob(pat) {
   while (i < pat.length) {
     const c = pat[i];
     if (c === "*") {
-      while (pat[i] === "*")
+      let stars = 0;
+      while (pat[i] === "*") {
+        stars++;
         i++;
-      if (pat[i] === "/") {
+      }
+      if (stars >= 2 && pat[i] === "/") {
         i++;
         out += "(?:[^/]*/)*";
-      } else {
+      } else if (stars >= 2) {
         out += ".*";
+      } else if (pat[i] === "/") {
+        i++;
+        out += "[^/]*/";
+      } else {
+        out += "[^/]*";
       }
     } else if (c === "?") {
       i++;
