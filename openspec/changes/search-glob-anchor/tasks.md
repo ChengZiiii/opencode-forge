@@ -21,5 +21,5 @@
 
 ## 4. Release
 
-- [ ] 0.21.2 (translator fix folded in), bundle, pack = 3 files, publish, store update, push
-- [ ] Live dual-leg spot check: `opencode run` same anchored query with normal PATH (rg leg) and scrubbed PATH (JS leg) — identical relative results, JS copy footnoted
+- [x] 0.21.2 (translator fix folded in), bundle, pack = 3 files, publish, store update, push
+- [x] Live dual-leg spot check: `opencode run` same anchored query with normal PATH (rg leg) and scrubbed PATH (JS leg) — identical relative results, JS copy footnoted
