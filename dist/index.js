@@ -17692,14 +17692,21 @@ async function runSearch(kind, args, context) {
   const follow = args.follow !== false;
   const hidden = args.hidden !== false;
   const targetPath = typeof args.path === "string" && args.path.length > 0 ? isAbsolute2(args.path) ? args.path : join6(state.worktree, args.path) : undefined;
+  let targetIsDir = false;
+  if (targetPath !== undefined) {
+    try {
+      targetIsDir = (await fsStat(targetPath)).isDirectory();
+    } catch {}
+  }
   context.metadata?.({ title: `forge_${kind}: ${args.pattern.slice(0, 60)}` });
   let records = [];
   let jsNotices = [];
   let engineFootnote;
   if (resolution.ok) {
-    const searchPath = targetPath ?? ".";
+    const rgCwd = targetIsDir && targetPath !== undefined ? targetPath : state.worktree;
+    const searchPath = targetIsDir ? "." : targetPath ?? ".";
     const argv = kind === "glob" ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden }) : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden });
-    const child = spawn6(resolution.binary, argv, { cwd: state.worktree, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn6(resolution.binary, argv, { cwd: rgCwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     let spawnError;
@@ -17733,12 +17740,13 @@ async function runSearch(kind, args, context) {
     if (js.error !== undefined) {
       return { title: "search engine error", output: js.error };
     }
-    records = targetPath === undefined ? js.records : js.records.map((r) => isAbsolute2(r.path) ? r : { ...r, path: join6(root, r.path) });
+    records = targetPath === undefined || targetIsDir ? js.records : js.records.map((r) => isAbsolute2(r.path) ? r : { ...r, path: join6(root, r.path) });
     jsNotices = js.notices;
   }
+  const effectiveRoot = targetIsDir && targetPath !== undefined ? targetPath : state.worktree;
   const deduped = dedupeFollowMatches(records, {
     worktreeRoot: state.worktree,
-    resolvePath: reportedPathResolver(state.worktree),
+    resolvePath: reportedPathResolver(effectiveRoot),
     follow
   });
   const body = formatSearchOutput(deduped.records, {
