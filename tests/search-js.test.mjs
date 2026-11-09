@@ -168,6 +168,23 @@ test("matchGlob: **/*.ts matches root-level files too (zero leading segments)", 
   assert.equal(matchGlob("**/*.ts", "x/a.js"), false)
 })
 
+test("matchGlob: a SINGLE star before a separator matches exactly one level (never inherits **/ semantics)", () => {
+  // Live-caught regression (0.21.0/0.21.1): `*/tasks.md` matched two-level
+  // paths because any star-run before `/` was translated as `**/`.
+  assert.equal(matchGlob("*/tasks.md", "alpha/tasks.md"), true)
+  assert.equal(matchGlob("*/tasks.md", "archive/old/tasks.md"), false, "two levels must NOT match")
+  assert.equal(matchGlob("*/tasks.md", "tasks.md"), false, "zero levels must not match either")
+  assert.equal(matchGlob("a/*/b.txt", "a/x/b.txt"), true)
+  assert.equal(matchGlob("a/*/b.txt", "a/x/y/b.txt"), false)
+})
+
+test("matchGlob: a mid-segment single star never crosses separators (src/*.ts)", () => {
+  assert.equal(matchGlob("src/*.ts", "src/a.ts"), true)
+  assert.equal(matchGlob("src/*.ts", "src/x/a.ts"), false, "single star stays within the segment")
+  assert.equal(matchGlob("src/*.ts", "src/a/b.ts"), false)
+  assert.equal(matchGlob("*.ts", "x/a.ts"), true, "no-slash basename rule unchanged")
+})
+
 test("matchGlob: ? / [a-c] / [!a] / {a,b} dialect subset", () => {
   assert.equal(matchGlob("a?c", "abc"), true)
   assert.equal(matchGlob("a?c", "abbc"), false)

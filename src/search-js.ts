@@ -31,7 +31,9 @@ function escapeReChar(c: string): string {
  * Translate one glob pattern (or one `{a,b}` alternative, recursively) to a
  * RegExp source fragment (no anchors — the caller anchors).
  *
- * Dialect subset (D3): `*` → `[^/]*` (within segment); a `**` followed by a
+ * Dialect subset (D3): `*` → `[^/]*` (within segment — a single star right
+ * before a separator matches exactly one path level); a `**` (two or more
+ * stars) followed by a
  * separator → a group matching zero or more whole leading segments; bare
  * `**` → `.*`; `?` → `[^/]`; `[class]` with leading `!` negation → `^` (ranges
  * kept); `{a,b}` → `(?:a|b)` single-level alternation (alternatives
@@ -45,12 +47,30 @@ function translateGlob(pat: string): string {
   while (i < pat.length) {
     const c = pat[i]!
     if (c === "*") {
-      while (pat[i] === "*") i++
-      if (pat[i] === "/") {
+      // Star-kind disambiguation (search-glob-anchor follow-up): a star RUN
+      // followed by `/` is `**/` ONLY when it is two or more stars — a
+      // SINGLE star before a separator is a within-segment star plus a
+      // literal separator (`*/tasks.md` matches exactly one level; it must
+      // not inherit `(?:[^/]*/)*` semantics). A single star NOT before a
+      // separator is likewise within-segment (`src/*.ts` never crosses into
+      // deeper directories). Only a genuine multi-star run gets the
+      // cross-segment translations (`**/` → zero-or-more whole segments;
+      // bare `**` → `.*`).
+      let stars = 0
+      while (pat[i] === "*") {
+        stars++
+        i++
+      }
+      if (stars >= 2 && pat[i] === "/") {
         i++
         out += "(?:[^/]*/)*"
-      } else {
+      } else if (stars >= 2) {
         out += ".*"
+      } else if (pat[i] === "/") {
+        i++
+        out += "[^/]*/"
+      } else {
+        out += "[^/]*"
       }
     } else if (c === "?") {
       i++

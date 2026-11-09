@@ -17,8 +17,9 @@
 - [x] Cross-engine consistency: identical fixture/pattern/path on rg leg and scrubbed-PATH JS leg → identical path sets (JS copy + footnote)
 - [x] grep-leg anchored `include` + explicit dir; file-root and default-root regressions unchanged
 - [x] Full suite + typecheck green (506/506, 0 errors)
+- [x] Live dual-leg spot check caught the JS translator conflating `*/` with `**/` (single-star-before-separator and mid-segment star runs); translateGlob star-kind disambiguation + two-level fixture rows + `src/*.ts` within-segment rows (508/508)
 
 ## 4. Release
 
-- [ ] 0.21.1, bundle, pack = 3 files, publish, store update, push
+- [ ] 0.21.2 (translator fix folded in), bundle, pack = 3 files, publish, store update, push
 - [ ] Live dual-leg spot check: `opencode run` same anchored query with normal PATH (rg leg) and scrubbed PATH (JS leg) — identical relative results, JS copy footnoted

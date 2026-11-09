@@ -420,6 +420,10 @@ test("anchor: cross-engine agreement — identical path sets for the same explic
       mkdirSync(join(wt, "changes", d), { recursive: true })
       writeFileSync(join(wt, "changes", d, "tasks.md"), "# x\n")
     }
+    // Two-level depth (live-caught blind spot): `*/tasks.md` must NOT reach
+    // into a second level on EITHER engine — the archived shape stays absent.
+    mkdirSync(join(wt, "changes", "archive", "old"), { recursive: true })
+    writeFileSync(join(wt, "changes", "archive", "old", "tasks.md"), "# deep\n")
     mkdirSync(emptyBin, { recursive: true })
     const h = await startServer(inputFor(wt), {})
     const viaRg = await h.tool.forge_glob.execute({ pattern: "*/tasks.md", path: "changes" }, ctxFor(wt, "ses_anchor_x_rg"))
@@ -433,6 +437,7 @@ test("anchor: cross-engine agreement — identical path sets for the same explic
     }
     const stripFootnotes = (o) => o.split("\n").filter((l) => !l.startsWith("(engine:"))
     assert.deepEqual(stripFootnotes(viaJs.output), stripFootnotes(viaRg.output), `identical path sets across engines (rg: ${viaRg.output} / js: ${viaJs.output})`)
+    assert.ok(!viaRg.output.includes("old") && !viaJs.output.includes("old"), `two-level depth NOT matched by */ on either leg (rg: ${viaRg.output} / js: ${viaJs.output})`)
     assert.ok(viaJs.output.endsWith(ENGINE_FOOTNOTE_MISS), `JS copy footnoted (output: ${viaJs.output})`)
     await h.dispose?.()
   } finally {

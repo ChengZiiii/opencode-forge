@@ -31,6 +31,8 @@ Same fixture tree + anchored pattern + explicit directory path, asserted twice: 
 
 The search section gains: explicit-directory `path` anchors both the pattern matching and the reported paths to that directory; default root stays worktree-relative.
 
+- **JS translator star-kind disambiguation (folded in, live-caught)**: the dual-leg spot check exposed `translateGlob` translating ANY star-run before `/` as `**/` — so `*/tasks.md` matched two-level paths (38 vs 3 live) — and any single star not before a separator as `.*` — so `src/*.ts` crossed segments. Fix: two-or-more stars before `/` → `(?:[^/]*/)*`; two-or-more stars bare → `.*`; single star (before a separator or within a segment) → `[^/]*`. Pinned by two-level fixture rows on both engines and within-segment unit rows.
+
 ## Risks / Trade-offs
 
 - **Output change for explicit-directory calls** (absolute → target-relative) on the rg leg: the 0.21.0 absolute form was itself the defect's shadow; the relative form is the builtin-intuitive contract being pinned. Disclosed in the proposal/release notes.
