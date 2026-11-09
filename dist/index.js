@@ -12335,6 +12335,7 @@ function tool(input) {
 tool.schema = exports_external;
 // plugin.ts
 import { execFileSync as execFileSync3, spawn as spawn6 } from "node:child_process";
+import { open as fsOpen, readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
 import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync5, readdirSync as readdirSync4, readFileSync as readFileSync8, realpathSync, statSync as statSync5, writeFileSync as writeFileSync5 } from "node:fs";
 import { basename as basename2, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, relative as relative2 } from "node:path";
 import { tmpdir as tmpdir3, homedir } from "node:os";
@@ -16256,6 +16257,244 @@ function formatSearchOutput(records, opts) {
 `);
 }
 
+// src/search-js.ts
+function escapeReChar(c) {
+  return /[.+^${}()|[\]\\]/.test(c) ? "\\" + c : c;
+}
+function translateGlob(pat) {
+  let out = "";
+  let i = 0;
+  while (i < pat.length) {
+    const c = pat[i];
+    if (c === "*") {
+      while (pat[i] === "*")
+        i++;
+      if (pat[i] === "/") {
+        i++;
+        out += "(?:[^/]*/)*";
+      } else {
+        out += ".*";
+      }
+    } else if (c === "?") {
+      i++;
+      out += "[^/]";
+    } else if (c === "[") {
+      let j = i + 1;
+      let negated = false;
+      if (pat[j] === "!" || pat[j] === "^") {
+        negated = true;
+        j++;
+      }
+      const close = pat.indexOf("]", j);
+      if (close === -1 || close === j) {
+        out += "\\[";
+        i++;
+        continue;
+      }
+      out += "[" + (negated ? "^" : "") + pat.slice(j, close) + "]";
+      i = close + 1;
+    } else if (c === "{") {
+      const close = pat.indexOf("}", i + 1);
+      if (close === -1) {
+        out += "\\{";
+        i++;
+        continue;
+      }
+      const alts = pat.slice(i + 1, close).split(",");
+      out += "(?:" + alts.map((a) => translateGlob(a)).join("|") + ")";
+      i = close + 1;
+    } else {
+      out += escapeReChar(c);
+      i++;
+    }
+  }
+  return out;
+}
+var globRegexCache = new Map;
+function globToRegExp(pattern) {
+  const cached2 = globRegexCache.get(pattern);
+  if (cached2 !== undefined)
+    return cached2;
+  const source = translateGlob(pattern);
+  const anchored = pattern.includes("/");
+  const re = anchored ? new RegExp("^" + source + "$") : new RegExp("(?:^|/)" + source + "$");
+  globRegexCache.set(pattern, re);
+  return re;
+}
+function matchGlob(pattern, relPathFwd) {
+  return globToRegExp(pattern).test(relPathFwd);
+}
+var MAX_WALK_ENTRIES = 200000;
+var MAX_FILE_BYTES = 8 * 1024 * 1024;
+var MAX_RECORDS = 1e4;
+var BINARY_SNIFF_BYTES = 8 * 1024;
+function realOf(ctx, p) {
+  const hit = ctx.realCache.get(p);
+  if (hit !== undefined)
+    return hit;
+  const v = ctx.seams.realpath(p);
+  ctx.realCache.set(p, v);
+  return v;
+}
+function pushRecord(ctx, path, line, text) {
+  ctx.records.push({ path, line, text });
+  if (ctx.records.length >= MAX_RECORDS)
+    ctx.aborted = true;
+}
+async function scanFile(ctx, full, relFwd, outPath) {
+  const include = ctx.params.include;
+  if (typeof include === "string" && include.length > 0 && !matchGlob(include, relFwd))
+    return;
+  let buf;
+  try {
+    buf = await ctx.seams.readFilePrefix(full, MAX_FILE_BYTES);
+  } catch {
+    return;
+  }
+  if (buf.length > MAX_FILE_BYTES) {
+    ctx.oversizedSkips++;
+    return;
+  }
+  if (buf.subarray(0, BINARY_SNIFF_BYTES).includes(0))
+    return;
+  const re = ctx.lineRe;
+  if (re === null)
+    return;
+  const lines = buf.toString("utf8").split(/\r?\n/);
+  for (let i = 0;i < lines.length; i++) {
+    if (ctx.aborted)
+      return;
+    if (re.test(lines[i]))
+      pushRecord(ctx, outPath, i + 1, lines[i]);
+  }
+}
+function listFile(ctx, relFwd, outPath) {
+  if (matchGlob(ctx.params.pattern, relFwd))
+    pushRecord(ctx, outPath, 0, "");
+}
+async function handleFile(ctx, full, relFwd) {
+  if (ctx.params.kind === "grep") {
+    await scanFile(ctx, full, relFwd, relFwd.split("/").join(ctx.params.pathSeparator));
+  } else {
+    listFile(ctx, relFwd, relFwd.split("/").join(ctx.params.pathSeparator));
+  }
+}
+async function walkDir(ctx, full, relFwd) {
+  let entries;
+  try {
+    entries = await ctx.seams.readdir(full);
+  } catch {
+    return;
+  }
+  entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+  for (const e of entries) {
+    if (ctx.aborted || ctx.capped)
+      return;
+    ctx.visited++;
+    if (ctx.visited > ctx.maxWalkEntries) {
+      ctx.capped = true;
+      return;
+    }
+    if (e.isDirectory && e.name === ".git")
+      continue;
+    if (!ctx.params.hidden && e.name.startsWith("."))
+      continue;
+    const childFull = full + ctx.params.pathSeparator + e.name;
+    const childRel = relFwd === "" ? e.name : relFwd + "/" + e.name;
+    if (e.isSymbolicLink) {
+      if (!ctx.params.follow)
+        continue;
+      let st;
+      try {
+        st = await ctx.seams.stat(childFull);
+      } catch {
+        continue;
+      }
+      if (st.isDirectory) {
+        const real = realOf(ctx, childFull);
+        if (ctx.seen.has(real))
+          continue;
+        ctx.seen.add(real);
+        await walkDir(ctx, childFull, childRel);
+      } else if (st.isFile) {
+        await handleFile(ctx, childFull, childRel);
+      }
+    } else if (e.isDirectory) {
+      const real = realOf(ctx, childFull);
+      if (ctx.seen.has(real))
+        continue;
+      ctx.seen.add(real);
+      await walkDir(ctx, childFull, childRel);
+    } else if (e.isFile) {
+      await handleFile(ctx, childFull, childRel);
+    }
+  }
+}
+async function jsSearch(params, seams, maxWalkEntries = MAX_WALK_ENTRIES) {
+  let lineRe = null;
+  if (params.kind === "grep") {
+    let firstError = null;
+    try {
+      lineRe = new RegExp(params.pattern);
+    } catch (err) {
+      firstError = err;
+    }
+    if (lineRe === null) {
+      try {
+        lineRe = new RegExp(params.pattern, "u");
+      } catch (err2) {
+        return {
+          records: [],
+          notices: [],
+          error: "[forge:search] pattern is not a valid regular expression in the builtin-js engine (dialect difference) — install ripgrep or set search.rgPath for full rg-pattern support: " + String(err2?.message ?? err2 ?? firstError)
+        };
+      }
+    }
+  }
+  let rootSt;
+  try {
+    rootSt = await seams.stat(params.root);
+  } catch {
+    return { records: [], notices: [], error: `[forge:search] root path is not accessible: ${params.root}` };
+  }
+  const ctx = {
+    params,
+    seams,
+    records: [],
+    lineRe,
+    seen: new Set,
+    realCache: new Map,
+    visited: 0,
+    oversizedSkips: 0,
+    aborted: false,
+    capped: false,
+    maxWalkEntries
+  };
+  if (rootSt.isFile) {
+    const relFwd = params.root.split(params.pathSeparator).join("/");
+    if (params.kind === "glob") {
+      if (matchGlob(params.pattern, relFwd))
+        pushRecord(ctx, params.root, 0, "");
+    } else {
+      await scanFile(ctx, params.root, relFwd, params.root);
+    }
+    return { records: ctx.records, notices: [] };
+  }
+  if (!rootSt.isDirectory) {
+    return { records: [], notices: [] };
+  }
+  ctx.seen.add(realOf(ctx, params.root));
+  await walkDir(ctx, params.root, "");
+  const notices = [];
+  if (ctx.capped) {
+    notices.push(`(js engine: walk capped at ${maxWalkEntries} entries — narrow the path)`);
+  }
+  if (ctx.oversizedSkips > 0) {
+    notices.push(`(js engine: skipped ${ctx.oversizedSkips} files over 8 MiB)`);
+  }
+  return { records: ctx.records, notices };
+}
+
 // plugin.ts
 var FORGE_AGENT = "forge";
 var FORGE_STATE_TOOLS = [
@@ -17355,13 +17594,13 @@ ${p.newOutput || "(none in this window)"}`,
 var searchRgPathOverride;
 var FORGE_SEARCH_PREFERENCE_LINE = "Prefer forge_grep/forge_glob over the builtin grep/glob — follow and hidden are on by default (symlinks/junctions and dot-directories are in scope; the builtin pair is blind to both).";
 var FORGE_GREP_DESCRIPTION = [
-  "Fast content search (rg --json under the hood) that sees through symlinks/junctions and dot-directories where the builtin pair is blind. Readonly by construction: the pattern and path are passed to ripgrep as single literal arguments — no shell exists, so shell metacharacters can neither redirect output nor alter execution.",
+  "Fast content search (ripgrep when it resolves, the plugin's bundled JS engine otherwise — a trailing engine line discloses which) that sees through symlinks/junctions and dot-directories where the builtin pair is blind. Readonly by construction: the pattern and path reach the serving engine as single literal values — no shell exists, so shell metacharacters can neither redirect output nor alter execution.",
   "Output matches the builtin grep's format: `Found N matches` header + `path: Line n: content` blocks, truncated at 100 results with a notice. With follow on (default), a file reachable through multiple paths reports once and the output ends with a `+N duplicate paths merged` line; links whose targets lie outside the workspace are followed and the resolved outside target is disclosed.",
   FORGE_SEARCH_PREFERENCE_LINE
 ].join(`
 `);
 var FORGE_GLOB_DESCRIPTION = [
-  "Fast file-pattern search (rg --files under the hood, the file pattern rides rg's --glob filter) that lists matching paths — including EMPTY files — and paths behind symlinks/junctions and inside dot-directories where the builtin glob is blind. Readonly by construction — no shell ever exists.",
+  "Fast file-pattern search (ripgrep when it resolves, the plugin's bundled JS engine otherwise — a trailing engine line discloses which) that lists matching paths — including EMPTY files — and paths behind symlinks/junctions and inside dot-directories where the builtin glob is blind. Readonly by construction — no shell ever exists.",
   "Output matches the builtin glob's format: a plain unique path list (`No files found` when empty), truncated at 100 results with a notice. With follow on (default), duplicate link-path hits merge and the output ends with a `+N duplicate paths merged` line.",
   FORGE_SEARCH_PREFERENCE_LINE
 ].join(`
@@ -17375,55 +17614,102 @@ function reportedPathResolver(worktree) {
     }
   };
 }
-async function runRgSearch(kind, args, context) {
+var realJsSeams = {
+  readdir: async (dir) => {
+    const entries = await fsReaddir(dir, { withFileTypes: true });
+    return entries.map((e) => ({
+      name: e.name,
+      isFile: e.isFile(),
+      isDirectory: e.isDirectory(),
+      isSymbolicLink: e.isSymbolicLink()
+    }));
+  },
+  stat: (p) => fsStat(p).then((s) => ({ isFile: s.isFile(), isDirectory: s.isDirectory() })),
+  readFilePrefix: async (p, maxBytes) => {
+    const fh = await fsOpen(p, "r");
+    try {
+      const buf = Buffer.alloc(maxBytes + 1);
+      const { bytesRead } = await fh.read(buf, 0, maxBytes + 1, 0);
+      return buf.subarray(0, bytesRead);
+    } finally {
+      await fh.close();
+    }
+  },
+  realpath: (p) => {
+    try {
+      return realpathSync.native(p).toString();
+    } catch {
+      return p;
+    }
+  }
+};
+var ENGINE_FOOTNOTE_MISS = "(engine: builtin-js — ripgrep not found; install ripgrep or set search.rgPath for the faster engine)";
+var engineFootnoteFailure = (reason) => `(engine: builtin-js — rg failed to serve the call (${reason}); install ripgrep or set search.rgPath)`;
+async function runSearch(kind, args, context) {
   const resolution = resolveRgBinary(searchRgPathOverride !== undefined ? { rgPath: searchRgPathOverride } : undefined);
-  if (!resolution.ok)
-    return { title: "ripgrep not found", output: resolution.error };
   const state = ensureSession(context.sessionID, worktreeFor(context));
   const follow = args.follow !== false;
   const hidden = args.hidden !== false;
   const targetPath = typeof args.path === "string" && args.path.length > 0 ? isAbsolute2(args.path) ? args.path : join6(state.worktree, args.path) : undefined;
-  const searchPath = targetPath ?? ".";
-  const argv = kind === "glob" ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden }) : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden });
   context.metadata?.({ title: `forge_${kind}: ${args.pattern.slice(0, 60)}` });
-  const child = spawn6(resolution.binary, argv, { cwd: state.worktree, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-  let stdout = "";
-  let stderr = "";
-  let spawnError;
-  child.on("error", (err) => {
-    spawnError = err;
-  });
-  child.stdout?.on("data", (d) => {
-    stdout += d.toString("utf8");
-  });
-  child.stderr?.on("data", (d) => {
-    stderr += d.toString("utf8");
-  });
-  const code = await new Promise((resolve2) => {
-    child.on("close", (c) => resolve2(c));
-  });
-  if (spawnError !== undefined) {
-    return { title: "rg spawn failed", output: `[forge:search] Failed to run ripgrep (${resolution.binary}): ${spawnError.message}` };
+  let records = [];
+  let jsNotices = [];
+  let engineFootnote;
+  if (resolution.ok) {
+    const searchPath = targetPath ?? ".";
+    const argv = kind === "glob" ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden }) : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden });
+    const child = spawn6(resolution.binary, argv, { cwd: state.worktree, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
+    let stdout = "";
+    let stderr = "";
+    let spawnError;
+    child.on("error", (err) => {
+      spawnError = err;
+    });
+    child.stdout?.on("data", (d) => {
+      stdout += d.toString("utf8");
+    });
+    child.stderr?.on("data", (d) => {
+      stderr += d.toString("utf8");
+    });
+    const code = await new Promise((resolve2) => {
+      child.on("close", (c) => resolve2(c));
+    });
+    if (spawnError !== undefined) {
+      engineFootnote = engineFootnoteFailure(spawnError.message);
+    } else if (code !== null && code > 1) {
+      engineFootnote = engineFootnoteFailure(`exit ${code}`);
+    } else {
+      const stripDotPrefix = (p) => p.replace(/^\.(?:\\|\/)/, "");
+      const rawRecords = kind === "glob" ? parseRgFilesList(stdout) : parseRgJsonStream(stdout).records;
+      records = rawRecords.map((r) => ({ ...r, path: stripDotPrefix(r.path) }));
+    }
+  } else {
+    engineFootnote = ENGINE_FOOTNOTE_MISS;
   }
-  if (code !== null && code > 1) {
-    return { title: `rg exit ${code}`, output: [`[forge:search] ripgrep exited ${code}:`, stderr.trim() || "(no stderr)", "Narrow the path or fix the pattern (rg treats it as a regular expression)."].join(`
-`) };
+  if (engineFootnote !== undefined) {
+    const root = targetPath ?? state.worktree;
+    const js = await jsSearch({ kind, root, pattern: args.pattern, include: args.include, follow, hidden, pathSeparator: process.platform === "win32" ? "\\" : "/" }, realJsSeams);
+    if (js.error !== undefined) {
+      return { title: "search engine error", output: js.error };
+    }
+    records = targetPath === undefined ? js.records : js.records.map((r) => isAbsolute2(r.path) ? r : { ...r, path: join6(root, r.path) });
+    jsNotices = js.notices;
   }
-  const stripDotPrefix = (p) => p.replace(/^\.(?:\\|\/)/, "");
-  const rawRecords = kind === "glob" ? parseRgFilesList(stdout) : parseRgJsonStream(stdout).records;
-  const records = rawRecords.map((r) => ({ ...r, path: stripDotPrefix(r.path) }));
   const deduped = dedupeFollowMatches(records, {
     worktreeRoot: state.worktree,
     resolvePath: reportedPathResolver(state.worktree),
     follow
   });
+  const body = formatSearchOutput(deduped.records, {
+    kind,
+    mergedDuplicates: deduped.mergedDuplicates,
+    outsideTargets: deduped.outsideTargets
+  });
+  const output = [body, ...jsNotices, ...engineFootnote !== undefined ? [engineFootnote] : []].join(`
+`);
   return {
     title: `${deduped.records.length} result${deduped.records.length === 1 ? "" : "s"}`,
-    output: formatSearchOutput(deduped.records, {
-      kind,
-      mergedDuplicates: deduped.mergedDuplicates,
-      outsideTargets: deduped.outsideTargets
-    })
+    output
   };
 }
 var forgeGrepTool = tool({
@@ -17437,7 +17723,7 @@ var forgeGrepTool = tool({
   },
   execute: async (args, context) => {
     noteToolAgent(context);
-    return runRgSearch("grep", { pattern: args.pattern, path: args.path, include: args.include, follow: args.follow, hidden: args.hidden }, context);
+    return runSearch("grep", { pattern: args.pattern, path: args.path, include: args.include, follow: args.follow, hidden: args.hidden }, context);
   }
 });
 var forgeGlobTool = tool({
@@ -17450,7 +17736,7 @@ var forgeGlobTool = tool({
   },
   execute: async (args, context) => {
     noteToolAgent(context);
-    return runRgSearch("glob", { pattern: args.pattern, path: args.path, follow: args.follow, hidden: args.hidden }, context);
+    return runSearch("glob", { pattern: args.pattern, path: args.path, follow: args.follow, hidden: args.hidden }, context);
   }
 });
 var CREW_INIT_TEMPLATE = [

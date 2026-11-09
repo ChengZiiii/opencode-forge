@@ -448,12 +448,33 @@ instructed to prefer `forge_grep`/`forge_glob` first and use builtin
   permission ask-gate and are not subject to the readonly exec seal, so
   explicit-readonly workers search without friction.
 
-**ripgrep dependency.** No binary is bundled. rg is resolved as:
-`search.rgPath` config override (when it exists on disk) → `rg` on PATH →
-fail-soft guidance error (never a crash):
+**Engine chain — never a dead tool.** No binary is bundled; instead the
+tools ship a **bundled pure-JS search engine** inside `dist/index.js`. The
+engine resolves as: `search.rgPath` config override (when it exists on
+disk) → `rg` on PATH → **bundled JS engine**. A configured-but-broken rg
+(spawn failure) also falls through to the JS engine. Every call is served
+on every machine — the missing-ripgrep case returns live results, never a
+guidance error. Whenever the JS engine serves a call, the output ends with
+an engine-disclosure footnote (after the dedupe footnotes):
 
-> install ripgrep (or set search.rgPath in forge config to an existing rg
-> binary), or fall back to the builtin grep/glob tools for this search
+> (engine: builtin-js — ripgrep not found; install ripgrep or set
+> search.rgPath for the faster engine)
+
+- **Glob dialect subset** (JS engine only): `*` (within segment), `**`
+  (crosses separators), `?`, `[class]` (with negation), `{a,b}` alternates.
+  Exotic rg-glob constructs simply fail to match (under-match, no error) —
+  this is the documented common subset, not parity.
+- **Bounded walk, disclosed**: the JS engine caps its walk at 200000
+  entries and per-file scanning at 8 MiB. Hitting a cap appends a
+  truncation-style notice — `(js engine: walk capped at 200000 entries —
+  narrow the path)` / `(js engine: skipped N files over 8 MiB)` — same
+  voice as the 100-result cap. The rg engine has no such caps and stays
+  preferred whenever it resolves.
+- **JS-regex dialect note** (JS engine only): `pattern` compiles as a
+  JavaScript `RegExp`. A pattern that fails to compile returns one honest
+  error line naming the dialect difference and the ripgrep remedy (install
+  ripgrep or set `search.rgPath` for full rg-pattern support) — no partial
+  results.
 
 ## Forge subagents (static worker agents in forge.json)
 
