@@ -1701,6 +1701,24 @@ async function runSearch(
   const follow = args.follow !== false
   const hidden = args.hidden !== false
   const targetPath = typeof args.path === "string" && args.path.length > 0 ? (isAbsolute(args.path) ? args.path : join(state.worktree, args.path)) : undefined
+  // search-glob-anchor D1: an explicit path resolving to a DIRECTORY changes
+  // the serving shape on BOTH legs — the pattern anchors and the output reads
+  // RELATIVE TO THAT DIRECTORY. Root cause on the rg leg: with --hidden or
+  // --follow present (our defaults) and an ABSOLUTE root argument, rg lifts
+  // glob anchoring to the whole path, so anchored patterns (`*/x`) can never
+  // span the `C:\…` prefix (rg 15.2.0, bisect-verified). The fix: spawn rg
+  // with cwd = target dir and the path argument "." — the exact shape the
+  // default-root path always used. FILE targets and the default root keep
+  // their pre-change shapes.
+  let targetIsDir = false
+  if (targetPath !== undefined) {
+    try {
+      targetIsDir = (await fsStat(targetPath)).isDirectory()
+    } catch {
+      // Unstattable target: keep the legacy absolute-argument shape; the JS
+      // leg's root-access error surfaces honestly if rg also cannot serve.
+    }
+  }
   context.metadata?.({ title: `forge_${kind}: ${args.pattern.slice(0, 60)}` })
   let records: RgMatchRecord[] = []
   let jsNotices: string[] = []
@@ -1708,8 +1726,13 @@ async function runSearch(
   if (resolution.ok) {
     // A path arg is ALWAYS given: with no path and a piped stdin, rg reads
     // STDIN and never exits (probe-verified). "." keeps output paths relative
-    // (builtin parity) and searches the session worktree.
-    const searchPath = targetPath ?? "."
+    // (builtin parity). search-glob-anchor D1: an explicit DIRECTORY target
+    // ALSO serves through "." — rg runs with cwd = the target dir so anchored
+    // globs bind target-relative and output paths arrive `.\`-prefixed (the
+    // shared strip below turns them target-relative). A FILE target keeps the
+    // absolute-argument shape (single-file scan, no traversal anchoring).
+    const rgCwd = targetIsDir && targetPath !== undefined ? targetPath : state.worktree
+    const searchPath = targetIsDir ? "." : (targetPath ?? ".")
     // One fixed argv vector per kind (D1). grep: literal pattern after `--`.
     // glob: the files-listing vector (D1b, rg --files semantics) — the file
     // pattern rides `--glob=` and EMPTY files are listed too (zero lines → no
@@ -1721,7 +1744,7 @@ async function runSearch(
     // Direct spawn, shell:false, fixed argv — no shell string ever exists
     // (readonly by construction; the exec seal governs forge_shell only).
     // stdin is ignored: rg must never mistake our pipe for search input.
-    const child = spawn(resolution.binary, argv, { cwd: state.worktree, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
+    const child = spawn(resolution.binary, argv, { cwd: rgCwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
     let stdout = ""
     let stderr = ""
     let spawnError: Error | undefined
@@ -1760,12 +1783,13 @@ async function runSearch(
     engineFootnote = ENGINE_FOOTNOTE_MISS
   }
   if (engineFootnote !== undefined) {
-    // JS engine serves a call rg could not. Same absolute-path resolution as
-    // the rg path: the walk root is the resolved absolute target (or the
-    // session worktree), so an explicit target's records get the same abs
-    // prefix rg would print; a worktree-rooted walk stays stripped-relative
-    // (matches the "." form above). Errors (compile failure / inaccessible
-    // root) return verbatim — no partial results.
+    // JS engine serves a call rg could not. The walk root is the resolved
+    // absolute target (or the session worktree). search-glob-anchor D2: a
+    // DIRECTORY target's records stay walk-relative VERBATIM — byte-identical
+    // to the rg leg's stripped `.`-form output for the same query (cross-
+    // engine consistency); only a FILE target carries the root join (its
+    // verbatim-abs records pass through). Errors (compile failure /
+    // inaccessible root) return verbatim — no partial results.
     const root = targetPath ?? state.worktree
     const js = await jsSearch(
       { kind, root, pattern: args.pattern, include: args.include, follow, hidden, pathSeparator: process.platform === "win32" ? "\\" : "/" },
@@ -1775,7 +1799,7 @@ async function runSearch(
       return { title: "search engine error", output: js.error }
     }
     records =
-      targetPath === undefined
+      targetPath === undefined || targetIsDir
         ? js.records
         : js.records.map((r) => (isAbsolute(r.path) ? r : { ...r, path: join(root, r.path) }))
     jsNotices = js.notices
@@ -1784,9 +1808,15 @@ async function runSearch(
   // dedupeFollowMatches (same reportedPathResolver seam) → formatSearchOutput,
   // with the JS engine's bound notices and — LAST — the engine footnote
   // appended on new lines. rg-served calls carry no footnote.
+  // search-glob-anchor D3: the realpath resolver keys to the call's
+  // EFFECTIVE root — an explicit directory target resolves its records
+  // against THAT directory (they are target-relative now), not the worktree;
+  // the outside-workspace disclosure keeps comparing against the worktree
+  // (disclosure semantics: what escapes the WORKSPACE).
+  const effectiveRoot = targetIsDir && targetPath !== undefined ? targetPath : state.worktree
   const deduped = dedupeFollowMatches(records, {
     worktreeRoot: state.worktree,
-    resolvePath: reportedPathResolver(state.worktree),
+    resolvePath: reportedPathResolver(effectiveRoot),
     follow,
   })
   const body = formatSearchOutput(deduped.records, {

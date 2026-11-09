@@ -363,3 +363,130 @@ test("engine chain: junction to an outside target through builtin-js — link pa
     rmSync(outside, { recursive: true, force: true })
   }
 })
+
+// ---------------------------------------------------------------------------
+// search-glob-anchor: explicit-directory path anchors pattern AND output on
+// BOTH engine legs (rg 15.2.0 lifts glob anchoring to the whole path when
+// --hidden/--follow meet an ABSOLUTE root — our defaults — so anchored
+// patterns silently matched nothing on the rg leg pre-fix; bisect-verified
+// 2026-11-09 live session).
+// ---------------------------------------------------------------------------
+
+// A. THE regression (fails on 0.21.0): anchored glob + explicit DIRECTORY
+// path must find one-level files and report them TARGET-relative. rg leg
+// (skip-guarded on rg-less hosts — never fake-green).
+test("anchor: explicit directory path — anchored */tasks.md finds one-level files, target-relative (rg leg)", async (t) => {
+  const rg = resolveRgBinary()
+  if (!rg.ok) {
+    t.skip(`ripgrep not found on this host (${rg.error}) — rg-leg anchor test skipped`)
+    return
+  }
+  const wt = mkdtempSync(join(tmpdir(), "search-anchor-rg-"))
+  try {
+    mkdirSync(join(wt, "changes", "alpha"), { recursive: true })
+    mkdirSync(join(wt, "changes", "beta"), { recursive: true })
+    writeFileSync(join(wt, "changes", "alpha", "tasks.md"), "# alpha\n")
+    writeFileSync(join(wt, "changes", "beta", "tasks.md"), "# beta\n")
+    writeFileSync(join(wt, "changes", "README.md"), "# not a tasks file\n")
+    const h = await startServer(inputFor(wt), {})
+    // Relative path arg — exercises the join(worktree, path) + stat chain.
+    const r = await h.tool.forge_glob.execute({ pattern: "*/tasks.md", path: "changes" }, ctxFor(wt, "ses_anchor_rg"))
+    const lines = r.output.split("\n")
+    assert.ok(lines.includes(join("alpha", "tasks.md")), `alpha listed TARGET-relative (output: ${r.output})`)
+    assert.ok(lines.includes(join("beta", "tasks.md")), `beta listed TARGET-relative (output: ${r.output})`)
+    assert.ok(!lines.some((l) => l.includes("README.md")), `non-matching file absent (output: ${r.output})`)
+    assert.ok(!lines.some((l) => l.includes(wt)), `no absolute-prefix paths (output: ${r.output})`)
+    assert.ok(!r.output.includes("(engine:"), `rg-served, no footnote (output: ${r.output})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// B. Cross-engine consistency (spec delta scenario "Cross-engine agreement"):
+// the SAME anchored query served by rg (when present) and by builtin-js
+// (scrubbed PATH) must yield IDENTICAL path sets — the JS copy additionally
+// carries the engine footnote.
+test("anchor: cross-engine agreement — identical path sets for the same explicit-path anchored query", async (t) => {
+  const rg = resolveRgBinary()
+  if (!rg.ok) {
+    t.skip(`ripgrep not found on this host (${rg.error}) — cross-engine test needs both legs`)
+    return
+  }
+  const wt = mkdtempSync(join(tmpdir(), "search-anchor-x-"))
+  const emptyBin = join(wt, "no-bin")
+  try {
+    for (const d of ["alpha", "beta", "gamma"]) {
+      mkdirSync(join(wt, "changes", d), { recursive: true })
+      writeFileSync(join(wt, "changes", d, "tasks.md"), "# x\n")
+    }
+    mkdirSync(emptyBin, { recursive: true })
+    const h = await startServer(inputFor(wt), {})
+    const viaRg = await h.tool.forge_glob.execute({ pattern: "*/tasks.md", path: "changes" }, ctxFor(wt, "ses_anchor_x_rg"))
+    const savedPath = process.env.PATH
+    process.env.PATH = emptyBin
+    let viaJs
+    try {
+      viaJs = await h.tool.forge_glob.execute({ pattern: "*/tasks.md", path: "changes" }, ctxFor(wt, "ses_anchor_x_js"))
+    } finally {
+      process.env.PATH = savedPath
+    }
+    const stripFootnotes = (o) => o.split("\n").filter((l) => !l.startsWith("(engine:"))
+    assert.deepEqual(stripFootnotes(viaJs.output), stripFootnotes(viaRg.output), `identical path sets across engines (rg: ${viaRg.output} / js: ${viaJs.output})`)
+    assert.ok(viaJs.output.endsWith(ENGINE_FOOTNOTE_MISS), `JS copy footnoted (output: ${viaJs.output})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// C. grep-leg anchored `include` + explicit directory: only files one level
+// under the target matching the anchored include are searched (the include
+// rides the same --glob and inherited the defect pre-fix). JS leg (works on
+// every host; the rg-leg shape is proven by A).
+test("anchor: grep include anchored to the explicit directory — only matching level searched", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "search-anchor-inc-"))
+  const emptyBin = join(wt, "no-bin")
+  try {
+    mkdirSync(join(wt, "sub", "one"), { recursive: true })
+    mkdirSync(join(wt, "sub", "two"), { recursive: true })
+    mkdirSync(emptyBin, { recursive: true })
+    writeFileSync(join(wt, "sub", "one", "x.txt"), "anchor-include-needle\n")
+    writeFileSync(join(wt, "sub", "two", "y.txt"), "anchor-include-needle\n")
+    writeFileSync(join(wt, "sub", "top.txt"), "anchor-include-needle\n")
+    const h = await startServer(inputFor(wt), {})
+    const savedPath = process.env.PATH
+    process.env.PATH = emptyBin
+    let r
+    try {
+      r = await h.tool.forge_grep.execute({ pattern: "anchor-include-needle", include: "*/x.txt", path: "sub" }, ctxFor(wt, "ses_anchor_inc"))
+    } finally {
+      process.env.PATH = savedPath
+    }
+    assert.equal(r.output.split("\n")[0], "Found 1 matches", `only the anchored include's file matched (output: ${r.output})`)
+    assert.ok(r.output.includes(`${join("one", "x.txt")}: Line 1:`), `match reported TARGET-relative (output: ${r.output})`)
+    assert.ok(!r.output.includes("y.txt") && !r.output.includes("top.txt"), `non-include files untouched (output: ${r.output})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// D. Unchanged shapes (spec delta scenario "default root and file roots are
+// unchanged"): default root stays worktree-relative; a FILE path root keeps
+// its absolute-argument shape.
+test("anchor: default root stays worktree-relative; file root keeps the absolute shape", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "search-anchor-def-"))
+  try {
+    writeFileSync(join(wt, "plain.ts"), "anchor-default-needle\n")
+    const h = await startServer(inputFor(wt), {})
+    const d = await h.tool.forge_grep.execute({ pattern: "anchor-default-needle" }, ctxFor(wt, "ses_anchor_def"))
+    assert.ok(d.output.includes("plain.ts: Line 1:"), `default root worktree-relative (output: ${d.output})`)
+    const absFile = join(wt, "plain.ts")
+    const f = await h.tool.forge_grep.execute({ pattern: "anchor-default-needle", path: absFile }, ctxFor(wt, "ses_anchor_file"))
+    assert.ok(f.output.includes("Line 1:"), `file root served (output: ${f.output})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})

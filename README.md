@@ -476,6 +476,14 @@ an engine-disclosure footnote (after the dedupe footnotes):
   error line naming the dialect difference and the ripgrep remedy (install
   ripgrep or set `search.rgPath` for full rg-pattern support) — no partial
   results.
+- **Explicit `path` anchors pattern and output** (both engines,
+  identically): when `path` points at a directory, glob patterns and grep
+  `include` filters match against paths relative to that directory and
+  results are reported relative to it. The default (no-`path`) root stays
+  worktree-relative; a file `path` keeps its given shape. (rg 15.2.0 lifts
+  glob anchoring to the whole path when hidden/follow meet an absolute root —
+  the tools serve directory targets through a `.`-rooted cwd so both engines
+  anchor identically.)
 
 ## Forge subagents (static worker agents in forge.json)
 
