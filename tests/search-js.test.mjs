@@ -197,6 +197,39 @@ test("matchGlob: exotic constructs under-match without throwing", () => {
   assert.equal(matchGlob("\\p{L}", "a"), false)
 })
 
+// Review B1: escaped class members (`\]`, `\\`) must translate as LITERAL
+// members — the old indexOf("]") slice emitted an unescaped `]` (or trailing
+// `\`) into the regex class, and `new RegExp("[\\]]")` THROWS "Unterminated
+// character class". Every matrix row is compiled AND matched inside a
+// no-throw loop; escaped-member rows additionally assert real matching.
+test("matchGlob: glob class escapes never throw (B1) — `\\]`/`\\\\` are literal members, trailing `\\` degrades", () => {
+  const matrix = [
+    "[\\]]", // escaped `]` member
+    "[a\\]b]", // escaped `]` among other members
+    "[\\\\]", // escaped backslash member
+    "[\\", // trailing lone `\` — unterminated
+    "x[\\]y].txt", // escaped member mid-pattern
+    "[!\\]]", // negated class with escaped `]`
+    "*+", // prior exotic rows stay in the no-throw loop
+    "\\p{L}",
+  ]
+  for (const pat of matrix) {
+    assert.doesNotThrow(() => globToRegExp(pat), `globToRegExp(${JSON.stringify(pat)}) must not throw`)
+    assert.doesNotThrow(() => matchGlob(pat, "a]b"), `matchGlob(${JSON.stringify(pat)}, "a]b") must not throw`)
+  }
+  // `\]` is an escaped MEMBER: `*[\]].txt` matches a basename whose `]`
+  // sits right before the extension; and mid-name via `*[\]]y.txt`.
+  assert.equal(matchGlob("*[\\]].txt", "x].txt"), true)
+  assert.equal(matchGlob("*[\\]]y.txt", "x]y.txt"), true)
+  assert.equal(matchGlob("*[\\]].txt", "xy.txt"), false)
+  assert.equal(matchGlob("[a\\]b]", "]"), true)
+  assert.equal(matchGlob("[a\\]b]", "a"), true)
+  assert.equal(matchGlob("[a\\]b]", "c"), false)
+  // Trailing lone `\` degrades to literal `[` — deterministic under-match.
+  assert.equal(matchGlob("[\\", "a"), false)
+  assert.equal(matchGlob("[\\", "["), false)
+})
+
 // ---------------------------------------------------------------------------
 // 2. Walk semantics (D2)
 // ---------------------------------------------------------------------------
@@ -250,6 +283,27 @@ test("walk: cycle guard — a link to an ancestor dir does not loop", async () =
     res.records.map((r) => r.path),
     ["a.ts", "other/d.ts", "src/b.ts"],
   )
+})
+
+// Review N5: two dirs mutually linked (dirA/linkB→dirB, dirB/linkA→dirA)
+// walked under follow — the memoized-realpath seen-set must terminate the
+// cycle: every file under both real dirs listed EXACTLY once, no hang.
+test("walk: mutual-link cycle (dirA/linkB→dirB, dirB/linkA→dirA) terminates with each file exactly once", async () => {
+  const fs = makeFs()
+  fs.addDir("R")
+  fs.addDir("R/dirA")
+  fs.addDir("R/dirB")
+  fs.addFile("R/dirA/a1.ts", "x")
+  fs.addFile("R/dirB/b1.ts", "x")
+  fs.addLink("R/dirA/linkB", "R/dirB")
+  fs.addLink("R/dirB/linkA", "R/dirA")
+  const res = await jsSearch(globParams({ pattern: "**/*.ts" }), fs.seams)
+  const paths = res.records.map((r) => r.path)
+  // Walk terminates and each real-dir file appears EXACTLY once (b1.ts via
+  // the linkB path — the real dirB is then caught by the seen-set).
+  assert.deepEqual(paths, ["dirA/a1.ts", "dirA/linkB/b1.ts"])
+  assert.equal(paths.filter((p) => p === "dirA/a1.ts").length, 1)
+  assert.equal(paths.filter((p) => p.endsWith("/b1.ts")).length, 1)
 })
 
 // ---------------------------------------------------------------------------
@@ -379,6 +433,30 @@ test("walk cap: exceeded entries abort the walk with the cap notice", async () =
 test("bounds: exported cap constants match the design values", () => {
   assert.equal(MAX_WALK_ENTRIES, 200_000)
   assert.equal(MAX_FILE_BYTES, 8 * 1024 * 1024)
+})
+
+// Review N4: the record-collection cap is no longer silent — the walk aborts
+// at 10000 recorded matches WITH the pinned notice (default text reads
+// exactly `10000`).
+test("record cap: collection aborts at 10000 recorded matches with the pinned notice (N4)", async () => {
+  const fs = makeFs()
+  fs.addDir("R")
+  fs.addFile("R/big.ts", Array.from({ length: 10_010 }, () => "needle").join("\n"))
+  const res = await jsSearch(
+    {
+      kind: "grep",
+      root: "R",
+      pattern: "needle",
+      follow: true,
+      hidden: false,
+      pathSeparator: "/",
+    },
+    fs.seams,
+  )
+  assert.equal(res.records.length, 10_000, "collection stops at the cap")
+  assert.deepEqual(res.notices, [
+    "(js engine: capped at 10000 recorded matches — narrow the pattern)",
+  ])
 })
 
 // ---------------------------------------------------------------------------

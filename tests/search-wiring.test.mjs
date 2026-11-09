@@ -201,13 +201,18 @@ test("engine chain: scrubbed PATH → builtin-js serves forge_grep AND forge_glo
     mkdirSync(emptyBin, { recursive: true })
     writeFileSync(join(wt, "src", "a.ts"), "forge-js-wire-needle alpha\n")
     writeFileSync(join(wt, "src", "empty.ts"), "") // zero bytes — glob must list it
+    // Review N1 — JS-engine metachar leg: NEEDLE content carrying shell
+    // metacharacters (`>`, `|`, quotes) must come back VERBATIM through the
+    // JS engine when the pattern itself carries regex metachars.
+    writeFileSync(join(wt, "src", "meta.txt"), 'echo "a|b" > out\nplain line\n')
     const h = await startServer(inputFor(wt), {})
     const savedPath = process.env.PATH
     process.env.PATH = emptyBin
-    let g, b
+    let g, b, m
     try {
       g = await h.tool.forge_grep.execute({ pattern: "forge-js-wire-needle" }, ctxFor(wt, "ses_js_grep"))
       b = await h.tool.forge_glob.execute({ pattern: "**/*.ts" }, ctxFor(wt, "ses_js_glob"))
+      m = await h.tool.forge_grep.execute({ pattern: '"a\\|b"' }, ctxFor(wt, "ses_js_meta"))
     } finally {
       process.env.PATH = savedPath
     }
@@ -219,6 +224,50 @@ test("engine chain: scrubbed PATH → builtin-js serves forge_grep AND forge_glo
     assert.ok(b.output.split("\n").includes(join("src", "a.ts")), `glob lists a.ts (output: ${b.output})`)
     assert.ok(b.output.split("\n").includes(join("src", "empty.ts")), `glob lists EMPTY file (output: ${b.output})`)
     assert.ok(b.output.endsWith(ENGINE_FOOTNOTE_MISS), `glob miss footnote verbatim, last line (output: ${b.output})`)
+    // N1: the metachar-bearing line comes back VERBATIM through the JS
+    // engine (pattern `"a\|b"` — regex-escaped `|` + literal quotes).
+    assert.equal(m.output.split("\n")[0], "Found 1 matches", `metachar header (output: ${m.output})`)
+    assert.ok(
+      m.output.includes(`${join("src", "meta.txt")}: Line 1: echo "a|b" > out`),
+      `metachar needle verbatim, | > quotes intact (output: ${m.output})`,
+    )
+    assert.ok(m.output.endsWith(ENGINE_FOOTNOTE_MISS), `metachar call served by builtin-js (output: ${m.output})`)
+    await h.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// 1b. Review N2 — readonly-worker direct execution: an EXPLICIT readonly
+// pool worker agent id in the tool context, scrubbed PATH, must get REAL
+// results through the JS engine AND collect ZERO exec-seal findings (the
+// seal governs forge_shell only — search is readonly by construction).
+test("engine chain: readonly pool worker executes forge_grep directly (scrubbed PATH) — real results, zero seal findings", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "search-js-ro-"))
+  const emptyBin = join(wt, "no-bin") // PATH target: exists, contains no rg
+  try {
+    mkdirSync(join(wt, ".opencode"), { recursive: true })
+    mkdirSync(join(wt, "src"), { recursive: true })
+    mkdirSync(emptyBin, { recursive: true })
+    writeFileSync(
+      join(wt, ".opencode", "forge.json"),
+      JSON.stringify({ pool: "sw", agents: { scout: { model: "x/y", thoughtLevel: "low", shape: "readonly" } } }),
+    )
+    writeFileSync(join(wt, "src", "a.ts"), "readonly-worker-needle alpha\n")
+    const h = await startServer(inputFor(wt), {})
+    const ctx = { sessionID: "ses_js_ro", worktree: wt, ask: async () => {}, metadata() {}, callID: "c", agent: "forge-sw-scout", messageID: "m" }
+    const savedPath = process.env.PATH
+    process.env.PATH = emptyBin
+    let r
+    try {
+      r = await h.tool.forge_grep.execute({ pattern: "readonly-worker-needle" }, ctx)
+    } finally {
+      process.env.PATH = savedPath
+    }
+    assert.equal(r.output.split("\n")[0], "Found 1 matches", `header — JS engine served the readonly worker (output: ${r.output})`)
+    assert.ok(r.output.includes(`${join("src", "a.ts")}: Line 1:`), `real match present (output: ${r.output})`)
+    assert.ok(r.output.endsWith(ENGINE_FOOTNOTE_MISS), `engine footnote last (output: ${r.output})`)
+    assert.deepEqual(h.__forgeSubagentsTest.sealFindings("ses_js_ro"), [], "search on the readonly worker collects no seal findings")
     await h.dispose?.()
   } finally {
     rmSync(wt, { recursive: true, force: true })

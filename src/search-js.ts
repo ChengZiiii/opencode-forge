@@ -62,14 +62,47 @@ function translateGlob(pat: string): string {
         negated = true
         j++
       }
-      const close = pat.indexOf("]", j)
+      // Review B1 layer 1 — class-body hardening: find the closing `]` while
+      // CONSUMING backslash escape pairs (`\]` and `\\` are escaped MEMBERS,
+      // never the terminator); emit the body with `\` and `]` re-escaped for
+      // the regex class so no unescaped `]` or trailing `\` can leak out.
+      let close = -1
+      for (let k = j; k < pat.length; ) {
+        if (pat[k] === "\\") {
+          k += 2 // escaped member — skip its char
+          continue
+        }
+        if (pat[k] === "]") {
+          close = k
+          break
+        }
+        k++
+      }
       if (close === -1 || close === j) {
         // Unclosed or empty class → literal `[` (exotic under-match).
         out += "\\["
         i++
         continue
       }
-      out += "[" + (negated ? "^" : "") + pat.slice(j, close) + "]"
+      let body = ""
+      for (let m = j; m < close; m++) {
+        const ch = pat[m]!
+        if (ch === "\\") {
+          m++
+          const escaped = pat[m]
+          if (escaped === undefined) break // trailing lone `\` — dropped
+          body += escaped === "\\" || escaped === "]" ? "\\" + escaped : escaped
+          continue
+        }
+        body += ch === "]" || ch === "\\" ? "\\" + ch : ch
+      }
+      if (body.length === 0) {
+        // Body collapsed to nothing (e.g. `[\`) → literal `[` under-match.
+        out += "\\["
+        i++
+        continue
+      }
+      out += "[" + (negated ? "^" : "") + body + "]"
       i = close + 1
     } else if (c === "{") {
       const close = pat.indexOf("}", i + 1)
@@ -101,7 +134,16 @@ export function globToRegExp(pattern: string): RegExp {
   if (cached !== undefined) return cached
   const source = translateGlob(pattern)
   const anchored = pattern.includes("/")
-  const re = anchored ? new RegExp("^" + source + "$") : new RegExp("(?:^|/)" + source + "$")
+  const prefix = anchored ? "^" : "(?:^|/)"
+  // Review B1 layer 2 — compile guard: even a pathological translation must
+  // under-match, never throw (design D2/D3) — fall back to a NEVER-matching
+  // RegExp, the documented under-match posture.
+  let re: RegExp
+  try {
+    re = new RegExp(prefix + source + "$")
+  } catch {
+    re = /$^/
+  }
   globRegexCache.set(pattern, re)
   return re
 }
@@ -180,7 +222,7 @@ interface WalkContext {
   realCache: Map<string, string>
   visited: number
   oversizedSkips: number
-  aborted: boolean // record cap hit — stop walking silently
+  aborted: boolean // record cap hit — stop walking (notice emitted, review N4)
   capped: boolean // walk entry cap hit — stop walking, notice emitted later
   maxWalkEntries: number
 }
@@ -355,6 +397,22 @@ export async function jsSearch(
     maxWalkEntries,
   }
 
+  // D4 notices — shared by the file-root and directory-root exits (review
+  // N4: the record cap is no longer silent).
+  const collectNotices = (): string[] => {
+    const out: string[] = []
+    if (ctx.capped) {
+      out.push(`(js engine: walk capped at ${maxWalkEntries} entries — narrow the path)`)
+    }
+    if (ctx.aborted && ctx.records.length >= MAX_RECORDS) {
+      out.push(`(js engine: capped at ${MAX_RECORDS} recorded matches — narrow the pattern)`)
+    }
+    if (ctx.oversizedSkips > 0) {
+      out.push(`(js engine: skipped ${ctx.oversizedSkips} files over 8 MiB)`)
+    }
+    return out
+  }
+
   if (rootSt.isFile) {
     // File root: single file only; record path is the root VERBATIM (not
     // dirname-relative). Matching uses the forward-slash form of the root.
@@ -364,7 +422,7 @@ export async function jsSearch(
     } else {
       await scanFile(ctx, params.root, relFwd, params.root)
     }
-    return { records: ctx.records, notices: [] }
+    return { records: ctx.records, notices: collectNotices() }
   }
   if (!rootSt.isDirectory) {
     return { records: [], notices: [] }
@@ -376,12 +434,5 @@ export async function jsSearch(
   ctx.seen.add(realOf(ctx, params.root))
   await walkDir(ctx, params.root, "")
 
-  const notices: string[] = []
-  if (ctx.capped) {
-    notices.push(`(js engine: walk capped at ${maxWalkEntries} entries — narrow the path)`)
-  }
-  if (ctx.oversizedSkips > 0) {
-    notices.push(`(js engine: skipped ${ctx.oversizedSkips} files over 8 MiB)`)
-  }
-  return { records: ctx.records, notices }
+  return { records: ctx.records, notices: collectNotices() }
 }
