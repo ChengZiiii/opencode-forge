@@ -30,7 +30,10 @@ agent id, the parent's session directory, and the native-parity title):
 forge-* targets pass the forge dispatch gates (session-domain pool gate
 with the `not dispatchable from this session` finding, crew pending and
 pool-compliance belts); non-forge host targets dispatch through the same
-engine without the forge pool gate. Child sessions carry tool-part
+engine without the forge pool gate — the crew pending belt stays
+SESSION-keyed (it refuses ANY `task` call per the crew-harness pause
+semantics, target class notwithstanding) while the pool-compliance belt
+stays forge-*-keyed. Child sessions carry tool-part
 metadata mirroring the native shape (`agent`, `sessionId`, `taskId`,
 `run_in_background`, `description`, `prompt`). Question policy is
 mode-keyed: sync dispatches keep questions available (native parity);

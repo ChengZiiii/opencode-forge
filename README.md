@@ -199,7 +199,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
-| `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (the dispatch engine was removed); only present as inert debris from older versions | runtime debris — delete freely |
+| `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (dispatch records — including async orphans — live in the jobs ledger; this separate file dates from the retired `forge_dispatch` tool) | runtime debris — delete freely |
 | `.opencode/forge.json` (the NEAREST one walking up from the session's worktree — sole ownership) and `~/.config/opencode/forge.json` (global FALLBACK only, never merged) | your static subagent definitions (JSONC) — the workspace pool IS the session's whole roster; nested forge.json files are ignored. **User data — the plugin only reads them, never writes or migrates them** | yours — version the project ones, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
