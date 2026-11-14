@@ -181,30 +181,6 @@ forge.json parsing SHALL degrade semantically invalid content at the smallest en
 - **WHEN** an agent pins `model: "prov/x"` but defines `thoughtLevel: 3` (a number)
 - **THEN** the mistyped field counts as absent for the atomic-pair check, so the entry is skipped with an error finding — the cost is confined to that entry, and its siblings still materialize
 
-### Requirement: Native-task dispatch surface
-
-The plugin SHALL NOT register any dispatch tool: no `forge_dispatch`, `forge_dispatch_config`, `forge_dispatch_list`, or `forge_dispatch_kill`. forge subagents are spawned through the host's native `task` tool, and their runs render in the host UI with the native subagent affordances (progress visibility, expandable transcript). Plan-draft interop SHALL be shape-gated inheritance from the plan harness's write ban: while a draft is active in the dispatching session, a task call to a forge subagent of effective readonly shape (definition `shape` not `"write"` and no permission override lifting `write`/`edit`/`bash` off `"deny"`) passes the ban as a reconnaissance dispatch, while a task call to any other target — write-shape workers included — is refused by the same write-class deny as any native task call. The plugin SHALL add no dispatch-specific refusal beyond the plan harness's shape gate: a readonly-shape dispatch during a draft creates no new refusal surface, and the recursion ban (`task: deny` forced on every worker regardless of shape and overrides) keeps a dispatched scout physically incapable of spawning further.
-
-#### Scenario: No dispatch tools are registered
-
-- **WHEN** the plugin's tool registrations are enumerated on a v1 host
-- **THEN** none of the forge_dispatch family appears; the subagent vocabulary is reachable only through the native task tool
-
-#### Scenario: A task call runs the pinned brain
-
-- **WHEN** the model dispatches `task {subagent_type: "forge-research", prompt: ...}` on a host where `prov/x` is configured
-- **THEN** the subagent session runs on the pinned `prov/x` identity with the materialized permission and discipline
-
-#### Scenario: Draft-plan interop is inherited
-
-- **WHEN** the session has an active draft plan and the model attempts a task call to a forge subagent
-- **THEN** the plan harness's own write ban decides it by target shape — the call passes as a reconnaissance dispatch when the target resolves to effective readonly shape, and is refused with roster guidance when the target is a write-shape worker or an unresolvable/native target; no plugin-side dispatch refusal exists beyond that gate
-
-#### Scenario: A dispatched scout cannot recurse or write
-
-- **WHEN** a readonly forge subagent runs as a reconnaissance dispatch during a draft
-- **THEN** its own `task` calls are denied by the forced recursion ban and its write/edit/bash calls are denied by its materialized permission map — the carve-out transports no mutation path
-
 ### Requirement: Workspace pool ownership and global fallback
 
 WORKSPACE pool — the nearest `.opencode/forge.json` discovered by walking up from the session's effective worktree — plus the global layer (`~/.config/opencode/forge.json`) as a FALLBACK ONLY: when the workspace has a pool file, the global layer is NOT consulted for that session's dispatch roster (the workspace pool is the whole roster — fallback, not merge); when the workspace has none, the global layer serves as the whole roster. `forge.json` files nested DEEPER in the workspace's subtree (any directory below the owning one) SHALL be ignored entirely — the same workspace-ownership strictness as the host's native MCP config; a git checkout or subfolder carrying its own forge.json does not split or extend the pool. On a host where multiple workspaces' pools have been materialized, the plugin's task-dispatch guard SHALL scope dispatch SESSION-LOCALLY: a task call targeting an agent whose pool belongs to ANOTHER workspace SHALL be refused with a finding that names the target's origin pool path, states it is not dispatchable from this session, and names the exits (open a session in that workspace, or configure the role into this workspace's pool or the global layer). For that guard the session's workspace anchor SHALL be resolved from the host's AUTHORITATIVE session record (`client.session.get`, `effectiveWorktree(worktree, directory)`) whenever the record can be fetched — the plugin's in-memory session map serves as the anchor source ONLY when that fetch fails or is unavailable (no client, API error, or missing record); this ordering exists because the in-memory map has degenerate writers (resumed-after-restart sessions never re-fire `session.created`; some tool-context shapes degenerate to the host launch directory), and a session bound to a pool-less anchor by such a writer would otherwise lose its OWN pool's dispatch rights. The MIRROR degeneration is resolved symmetrically: when the authoritative record yields a valid but POOL-LESS anchor (a resumed-after-restart session re-bound to a new launch directory) while the in-memory binding — kept fresh by the session's own live activity — is a DIFFERENT non-degenerate worktree that OWNS a pool file, the POOLED in-memory binding SHALL win that resolution, with ONE bounded disclosure per session recording the substitution; in every other shape the authoritative record keeps its precedence. In that in-memory map, a degenerate anchor (empty or filesystem-root) SHALL never overwrite an existing non-degenerate binding; non-degenerate refinement (session.created seed corrected by a later tool-context binding) keeps today's overwrite semantics. The crew compliance gate resolves its session anchor through the same authoritative-first chain (pooled preference included). EVERY family materializes namespaced: each workspace pool under its declared `pool` namespace (failing that, the sanitized pool-directory basename), and the global fallback layer under the fixed namespace `global` (`forge-global-<id>`) — NO family receives plain ids, so a materialized id is identical on every host regardless of the order workspaces were initialized in. Pool resolution order SHALL be deterministic — families ordered lexicographically by absolute pool-file path — and a cross-family materialized-id collision SHALL resolve in that order: the earlier pool's agent wins, the colliding later agent is skipped with an error finding naming both files. The host-wide materialization set is the union of the global layer and every workspace pool the host has seen (hot-applied per the existing mtime contract; there is no append-only anchor set — a pool file deleted from disk disappears from materialization). Sessions whose workspace cannot be observed (unknown anchor — no in-memory binding AND no authoritative record) keep the existing fail-open belt posture with a disclosure.
@@ -307,3 +283,96 @@ A pool's forge.json MAY declare an optional top-level `shared` field — a strin
 
 - **WHEN** no pool file (workspace or global) declares `shared`
 - **THEN** every materialized prompt is byte-identical to the pre-change build, and no finding is recorded
+
+### Requirement: forge_dispatch surface (SDK child sessions)
+
+The plugin SHALL register a `forge_dispatch` tool on v1 hosts (removed
+with all forge tools under the agent disable knob) that dispatches a
+materialized forge subagent by creating a REAL child session on the SAME
+host server via the SDK (`client.session.create` with `parentID` set to
+the dispatching session, the materialized agent id, the session directory
+of the parent, and the question tool denied session-wide — a child can
+never block on human input), so the child renders in the host UI with
+native subagent affordances (session tree, progress, user abort). The
+tool SHALL take `mode: "wait" | "async"` decided by the calling model at
+dispatch time; BOTH modes accept every materialized shape (write workers
+included — write authority is the materialized permission map, not a
+mode gate). A pending permission ask that no one answers degrades to the
+honest poll-timeout finding. `wait` mode SHALL poll the child session to
+a terminal state and return the child's final assistant message (plus
+agent identity and session id). Dispatch gates SHALL match the
+native-task surface exactly: the session-domain pool gate (cross-pool
+target refused with the `not dispatchable from this session` finding and
+its exits), the crew pending belt and pool-compliance gates, the
+primary-only rule (a forge-* worker calling forge_dispatch is refused as
+a STATE tool call), and the plan-draft interop exemption (during an
+active draft, a dispatch to an effective-readonly target passes as a
+reconnaissance dispatch in either mode; any write-shape target is
+refused by the same write-class deny as native task, in either mode).
+
+#### Scenario: wait dispatch returns the child's final message
+
+- **WHEN** the model calls `forge_dispatch {subagent_type: "forge-plugindev-spec-reviewer", prompt: ..., mode: "wait"}`
+- **THEN** a child session is created on the host server with `parentID` linking it to the dispatching session (visible in the host session tree), the child runs the materialized agent, and the tool returns after the child's turn reaches a terminal state with the child's final assistant message, the agent identity, and the child session id
+
+#### Scenario: async dispatch accepts every shape and never blocks on questions
+
+- **WHEN** the model calls `forge_dispatch` with `mode: "async"` targeting a write-shape agent
+- **THEN** the call returns a task handle immediately — write authority is the target's materialized permission map — and the child session is created with the question tool denied session-wide, so an in-flight child that needs human input proceeds without asking and reports honestly rather than blocking
+
+#### Scenario: Cross-pool target refused identically to native task
+
+- **WHEN** a forge_dispatch targets an agent whose pool belongs to another workspace
+- **THEN** the call is refused with the same finding as the native-task path — target origin pool path, `not dispatchable from this session`, and the three exits
+
+#### Scenario: Workers cannot dispatch
+
+- **WHEN** a forge-* worker session calls forge_dispatch
+- **THEN** the call is refused under the same primary-only rule as STATE tools
+
+#### Scenario: Draft-plan interop is shape-gated as on native task
+
+- **WHEN** the dispatching session has an active draft plan
+- **THEN** a dispatch to an effective-readonly target passes as a reconnaissance dispatch in either mode, and a write-shape target is refused with roster guidance in either mode — identical outcomes to the native-task path
+
+#### Scenario: Disable knob removes the tool
+
+- **WHEN** `agent["forge"].disable` is set
+- **THEN** forge_dispatch is not registered, alongside all other forge tools
+
+### Requirement: Async dispatch lifecycle
+
+An async dispatch SHALL return a task handle immediately (task id, agent
+identity, child session id once known) and SHALL deliver at most ONE
+completion wake into the dispatching session carrying the child's final
+assistant message, following the job-supervisor completion-wake
+discipline (idle-only injection, delivery window with ledger overflow,
+no duplicate wake after a read). The plugin SHALL cap concurrent running
+async dispatches PER SESSION (default 3): a dispatch beyond the cap SHALL
+be refused with in-flight task ids and guidance. When a dispatching
+session ends, its live async dispatches SHALL be aborted (child session
+abort via the SDK) and recorded in the diagnostics ledger. A `wait`
+dispatch whose child never reaches a terminal state within the poll
+timeout SHALL return an honest timeout finding naming the child session
+id (the child remains a real session the user can inspect or abort
+natively in the TUI).
+
+#### Scenario: Async handle and single completion wake
+
+- **WHEN** the model calls forge_dispatch with `mode: "async"` on a readonly target and the owning session later idles
+- **THEN** the call returns a handle immediately (task id, agent, child session id), the child completes in the background, and exactly one wake message containing the child's final assistant message is injected into the session
+
+#### Scenario: Concurrency cap
+
+- **WHEN** a session already has the cap of async dispatches in flight and calls forge_dispatch `mode: "async"` again
+- **THEN** the call is refused with the in-flight task ids and guidance to wait or use `mode: "wait"`
+
+#### Scenario: Owner death harvests children
+
+- **WHEN** a session with live async dispatches is deleted
+- **THEN** each child session is aborted via the SDK and the orphan is recorded in the diagnostics ledger
+
+#### Scenario: Wait-mode timeout is honest
+
+- **WHEN** a `wait` dispatch's child session does not reach a terminal state within the poll timeout
+- **THEN** the tool returns a timeout finding naming the child session id rather than hanging, and the child session remains inspectable and abortable in the host UI
