@@ -89,8 +89,9 @@ const assistantMsg = (over = {}) => ({
 
 // ---------------------------------------------------------------------------
 
-test("createChildSession: parentID + question-deny permission + native title + parent directory", async () => {
+test("createChildSession: parentID + native title + parent directory; question-deny is MODE-KEYED (task-shadow)", async () => {
   const { client, calls } = fakeClient()
+  // Sync dispatch (native parity): NO question-deny seal in the create body.
   const result = await createChildSession(client, {
     parentSessionID: "ses_parent",
     parentDirectory: "C:/repo",
@@ -101,9 +102,21 @@ test("createChildSession: parentID + question-deny permission + native title + p
   assert.equal(result.sessionID, "ses_child_1")
   const create = calls.create[0]
   assert.equal(create.body.parentID, "ses_parent")
-  assert.deepEqual(create.body.permission, [{ permission: "question", action: "deny", pattern: "*" }])
+  assert.equal(create.body.permission, undefined, "sync create body carries no permission seal (questions available)")
   assert.equal(create.body.title, "audit the docs (@forge-wiki-reviewer subagent)")
   assert.deepEqual(create.query, { directory: "C:/repo" })
+
+  // Async dispatch: the session-wide question-deny seal rides the body.
+  const { client: c2, calls: calls2 } = fakeClient()
+  const r2 = await createChildSession(c2, {
+    parentSessionID: "ses_parent",
+    parentDirectory: "C:/repo",
+    agentID: "forge-wiki-reviewer",
+    description: "audit the docs",
+    questionDeny: true,
+  })
+  assert.equal(r2.ok, true)
+  assert.deepEqual(calls2.create[0].body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "async create body carries the question-deny seal")
   assert.equal(QUESTION_DENY_PERMISSION.length, 1)
 })
 
@@ -271,4 +284,50 @@ test("abortChild: calls session.abort with the child id; failure is honest", asy
   const rb = await abortChild(bad.client, "s")
   assert.equal(rb.ok, false)
   assert.match(rb.error, /threw/)
+})
+
+// ---------------------------------------------------------------------------
+// Sync abort parity (task-shadow design D4): pollChild watches the
+// dispatching turn's abort signal and returns `aborted` — the caller aborts
+// the child via the SDK and discloses.
+
+test("pollChild: a signal already aborted before the first poll returns aborted immediately", async () => {
+  const { client } = fakeClient({
+    status: () => ({ data: { s: { type: "busy" } } }),
+    messages: () => [],
+  })
+  const controller = new AbortController()
+  controller.abort()
+  const poll = await pollChild(client, { sessionID: "ses_c", intervalMs: 1, timeoutMs: 1000, signal: controller.signal }, fakeTime().seams)
+  assert.equal(poll.status, "aborted")
+  assert.equal(poll.sessionID, "ses_c")
+  assert.equal(poll.polls, 1, "the abort was observed on the first poll slice")
+})
+
+test("pollChild: abort fired MID-POLL stops the loop with aborted (busy child never completes)", async () => {
+  const controller = new AbortController()
+  let round = 0
+  const { client, calls } = fakeClient({
+    status: () => ({ data: { s: { type: "busy" } } }),
+    messages: () => [],
+  })
+  client.session.status = async () => {
+    calls.status.push({})
+    round++
+    if (round === 2) controller.abort()
+    return { data: { s: { type: "busy" } } }
+  }
+  const poll = await pollChild(client, { sessionID: "ses_mid", intervalMs: 5, timeoutMs: 10_000, signal: controller.signal }, fakeTime().seams)
+  assert.equal(poll.status, "aborted")
+  assert.equal(poll.sessionID, "ses_mid")
+  assert.equal(poll.polls, 3, "aborted at the slice boundary after the signal fired, not after the timeout")
+})
+
+test("pollChild: no signal keeps the previous semantics (timeout stays honest)", async () => {
+  const { client } = fakeClient({
+    status: () => ({ data: { s: { type: "busy" } } }),
+    messages: () => [],
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 20 }, fakeTime().seams)
+  assert.equal(poll.status, "timeout")
 })

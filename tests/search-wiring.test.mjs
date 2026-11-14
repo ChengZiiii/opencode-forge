@@ -37,14 +37,19 @@ function inputFor(wt) {
   }
 }
 
-test("registration: both search tools are registered — plugin tool count is 18", async () => {
+test("registration: both search tools are registered — plugin tool count is 18 (17 forge-family tools + the `task` shadow)", async () => {
   const wt = mkdtempSync(join(tmpdir(), "search-reg-"))
   try {
     const h = await startServer(inputFor(wt), {})
     assert.equal(typeof h.tool.forge_grep.execute, "function", "forge_grep registered")
     assert.equal(typeof h.tool.forge_glob.execute, "function", "forge_glob registered")
-    // 15 prior + search pair (17) + forge_dispatch (change async-dispatch) = 18
-    assert.equal(Object.keys(h.tool).length, 18, "15 prior tools + the search pair + forge_dispatch")
+    // task-shadow: forge_dispatch is retired and the SDK dispatch engine
+    // takes over the native NAME `task` — the plugin registry stays at 18
+    // keys (swap, not add), while the forge-family partition vocabulary
+    // (FORGE_ALL_TOOLS) drops 18 → 17 (asserted in the partition test below).
+    assert.equal(h.tool.forge_dispatch, undefined, "forge_dispatch is retired")
+    assert.equal(typeof h.tool.task?.execute, "function", "task is our dispatch implementation")
+    assert.equal(Object.keys(h.tool).length, 18, "15 prior tools + the search pair + the task shadow (forge_dispatch swapped out)")
     // Descriptions carry the preference line (D7 — teaches the primary,
     // which has no materialized mandate).
     for (const name of ["forge_grep", "forge_glob"]) {
@@ -100,6 +105,13 @@ test("partition: non-forge fallback entries hide both search tools", async () =>
         assert.equal(cfg.agent[native].tools[t], false, `${native} fallback hides ${t}`)
       }
     }
+    // task-shadow: the forge-family partition vocabulary (FORGE_ALL_TOOLS)
+    // drops 18 → 17 with forge_dispatch's retirement — `mine` (no explicit
+    // opt-ins) hides EXACTLY the 17 forge-family tools, and `task` is NOT
+    // among them (non-forge agents keep the shadowed native surface).
+    assert.equal(Object.keys(cfg.agent.mine.tools).length, 17, "partition vocabulary: 17 forge-family tools after forge_dispatch retirement")
+    assert.equal(cfg.agent.mine.tools.forge_dispatch, undefined, "forge_dispatch left the vocabulary")
+    assert.equal(cfg.agent.mine.tools.task, undefined, "task is not hidden from non-forge agents")
     await h.dispose?.()
   } finally {
     rmSync(wt, { recursive: true, force: true })

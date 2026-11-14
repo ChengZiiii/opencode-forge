@@ -4,18 +4,21 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-// Async-dispatch wiring (change async-dispatch, tasks 6.2/6.3): the
-// forge_dispatch tool against a fake structural SDK client — registration +
-// disable knob + partition injection, the gate matrix (cross-pool / crew
-// pending / crew compliance / primary-only / per-session cap / plan-draft
-// shape parity in both modes / write-target async accepted), the wait path
-// (question-deny create body + final message), the async handle + single
+// Task-shadow wiring (change task-shadow, tasks group 3/4): the `task` tool
+// (the 0.22.0 SDK dispatch engine shadowing the native name) against a fake
+// structural SDK client — registration + disable knob + partition posture +
+// forge_dispatch retirement, the gate matrix (cross-pool / crew pending /
+// crew compliance / primary-only / per-session cap / plan-draft shape parity
+// in both modes / write-target async accepted), the sync path (native-parity
+// create body WITHOUT question-deny + final message + metadata keys), the
+// non-forge target parity path (no pool gate, question policy mode-keyed,
+// honest Agent-not-found), sync abort parity, the async handle + single
 // idle wake carrying the child's final report, and owner-death harvest
 // (SDK abort + diagnostics ledger).
 
 process.env.FORGE_TEST_NO_FENCE = "1"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
-// Fast polls: the wait path and the async poller slices run in milliseconds.
+// Fast polls: the sync path and the async poller slices run in milliseconds.
 process.env.FORGE_DISPATCH_POLL_INTERVAL_MS = "10"
 process.env.FORGE_DISPATCH_POLL_SLICE_MS = "20"
 process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "forge-disp-home-"))
@@ -95,14 +98,23 @@ const input = (dir, client) => ({
   $: () => {},
 })
 
-const allowCtx = (sessionID, dir) => ({
-  sessionID,
-  worktree: dir,
-  directory: dir,
-  ask: async () => ({ status: "allow" }),
-  metadata: () => {},
-  message: async () => {},
-})
+// Tool context seam: metadata calls are recorded so the native/OMO metadata
+// contract (agent/sessionId/taskId/run_in_background/description/prompt)
+// can be asserted. abort is an AbortController signal when the test wants
+// abort parity.
+const allowCtx = (sessionID, dir, opts = {}) => {
+  const metadataCalls = []
+  return {
+    sessionID,
+    worktree: dir,
+    directory: dir,
+    ask: async () => ({ status: "allow" }),
+    metadata: (m) => metadataCalls.push(m),
+    message: async () => {},
+    abort: opts.abortController ? opts.abortController.signal : undefined,
+    _metadataCalls: metadataCalls,
+  }
+}
 
 const emptyCfg = () => ({ agent: {}, command: {}, permission: {} })
 
@@ -137,68 +149,86 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
 const readonlyPool = JSON.stringify({ pool: "dp", agents: { research: { model: "zai/glm", thoughtLevel: "low", shape: "readonly" }, builder: { model: "zai/glm", thoughtLevel: "low", shape: "write" } } })
 
 // ---------------------------------------------------------------------------
-// Registration + tool-face partition + disable knob
+// Registration + retirement + tool-face posture + disable knob
 
-test("registration: forge_dispatch registers with decision guidance and anti-polling discipline", async (t) => {
+test("registration: task is OUR dispatch surface with decision guidance and anti-polling discipline; forge_dispatch is retired", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
-  const tool = h.tool.forge_dispatch
-  assert.ok(tool, "forge_dispatch is registered")
-  assert.match(tool.description, /"async" when the result does NOT block your next steps/, "dispatch-time decision guidance: async")
-  assert.match(tool.description, /next step depends on the result/, "dispatch-time decision guidance: wait")
+  const tool = h.tool.task
+  assert.ok(tool, "task is registered (the shadow)")
+  assert.match(tool.description, /run_in_background: true \(async\)/, "run_in_background semantics: async")
+  assert.match(tool.description, /omit it \(sync\)/, "run_in_background semantics: sync default")
   assert.match(tool.description, /\[forge:dispatch-complete\]/, "the wake channel is named")
   assert.match(tool.description, /BLOCKING anti-pattern/, "the no-pre-wake-polling rule")
-  assert.match(tool.description, /question tool is denied session-wide/, "unattended-safety disclosure")
-  // Partition: primary-only (STATE-class) + hidden from non-forge agents.
-  assert.equal(cfg.agent["forge-dp-research"].tools.forge_dispatch, false, "workers do not see forge_dispatch (primary-only)")
-  assert.equal(cfg.agent.build.tools.forge_dispatch, false, "non-forge agents do not see forge_dispatch")
-  assert.equal(cfg.agent.forge.tools?.forge_dispatch, undefined, "the primary keeps it")
+  assert.match(tool.description, /the child MAY ask the user questions/, "sync question parity disclosed")
+  assert.match(tool.description, /question tool denied session-wide/, "async question-deny disclosed")
+  assert.match(tool.description, /forge-\*`? subagent/, "forge roster guidance")
+  // Retirement (spec scenario "forge_dispatch is retired").
+  assert.equal(h.tool.forge_dispatch, undefined, "no forge_dispatch tool exists")
+  // Partition posture: `task` is NOT a hidden forge-family tool — non-forge
+  // agents keep the (shadowed) task surface for their own parity dispatches;
+  // workers are banned via their materialized permission task deny.
+  assert.equal(cfg.agent.build.tools.task, undefined, "non-forge agents see task (shadow parity)")
+  assert.equal(cfg.agent["forge-dp-research"].tools.task, undefined, "workers keep task visible in the tools map (the ban is the permission deny)")
+  assert.equal(cfg.agent["forge-dp-research"].tools.forge_dispatch, undefined, "forge_dispatch is gone from the partition vocabulary")
+  assert.equal(cfg.agent["forge-dp-research"].permission.task, "deny", "worker recursion ban intact (task: deny)")
+  assert.equal(cfg.agent.forge.tools?.task, undefined, "the primary keeps task")
 })
 
-test("disable knob: forge.dispatch removes forge_dispatch with the whole family", async (t) => {
+test("disable knob: forge.disable removes the shadow with the whole family (native task returns)", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const h = await startServer(input(dir), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   cfg.agent.forge = { disable: true }
   await h.config(cfg)
-  assert.equal(h.tool.forge_dispatch, undefined, "getter removes forge_dispatch under the disable knob")
+  assert.equal(h.tool.task, undefined, "getter removes the task shadow under the disable knob")
   assert.equal(h.tool.plan_write, undefined, "the whole family is gone")
 })
 
 // ---------------------------------------------------------------------------
-// wait mode: SDK child session + final message
+// Sync mode: SDK child session + final message + native-parity create body + metadata
 
-test("wait dispatch: parentID + question-deny create body, agent identity + child session id + final message", async (t) => {
+test("sync dispatch: parentID + NO question-deny create body, agent identity + child session id + final message + metadata keys", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const { client, calls } = makeClient({ record: { directory: dir, worktree: dir } })
   const h = await startServer(input(dir, client), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
-  const r = await h.tool.forge_dispatch.execute(
-    { subagent_type: "forge-dp-research", prompt: "audit the repo", mode: "wait", description: "repo audit" },
-    allowCtx("ses_wait1", dir),
+  const ctx = allowCtx("ses_wait1", dir)
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "audit the repo", description: "repo audit" },
+    ctx,
   )
   assert.match(r.output, /forge-dp-research finished/, "agent identity in the result")
   assert.match(r.output, /ses_child_1/, "child session id in the result")
   assert.match(r.output, /report from ses_child_1/, "the child's final assistant message rides the result")
   const create = calls.create[0]
   assert.equal(create.body.parentID, "ses_wait1", "parentID links the child to the dispatching session")
-  assert.deepEqual(create.body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "question-deny seal session-wide")
+  assert.equal(create.body.permission, undefined, "sync create body carries NO question-deny (native parity — the child may ask)")
   assert.equal(create.body.title, "repo audit (@forge-dp-research subagent)", "native child title format")
   assert.deepEqual(create.query, { directory: dir }, "the child is anchored to the parent's directory")
   const send = calls.promptAsync[0]
   assert.equal(send.path.id, "ses_child_1")
   assert.equal(send.body.agent, "forge-dp-research", "the materialized agent id rides the prompt body")
+  // Metadata mirrors the native/OMO task contract (design D3).
+  const meta = ctx._metadataCalls.at(-1)?.metadata ?? {}
+  assert.equal(meta.agent, "forge-dp-research")
+  assert.equal(meta.sessionId, "ses_child_1")
+  assert.ok(typeof meta.taskId === "string" && meta.taskId.length > 0, "taskId present")
+  assert.equal(meta.run_in_background, false)
+  assert.equal(meta.description, "repo audit")
+  assert.equal(meta.prompt, "audit the repo")
+  assert.deepEqual(Object.keys(meta).sort(), ["agent", "description", "prompt", "run_in_background", "sessionId", "taskId"], "exactly the native/OMO keys")
 })
 
 // ---------------------------------------------------------------------------
-// Gate matrix (spec: forge_dispatch surface — gate parity with native task)
+// Gate matrix (spec: Task shadow surface — the forge gate chain)
 
-test("gate: cross-pool target refused with the native-task copy", async (t) => {
+test("gate: cross-pool target refused with the task belt copy", async (t) => {
   const dirA = projectWithForgeJson(t, JSON.stringify({ pool: "pa", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const dirB = projectWithForgeJson(t, JSON.stringify({ pool: "pb", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const { client } = makeClient({ record: { directory: dirA, worktree: dirA } })
@@ -207,7 +237,7 @@ test("gate: cross-pool target refused with the native-task copy", async (t) => {
   await server(input(dirB, client), {}) // register the second workspace anchor
   await h.config(emptyCfg())
   await assert.rejects(
-    () => h.tool.forge_dispatch.execute({ subagent_type: "forge-pb-research", prompt: "x", mode: "wait" }, allowCtx("ses_pool", dirA)),
+    () => h.tool.task.execute({ subagent_type: "forge-pb-research", prompt: "x" }, allowCtx("ses_pool", dirA)),
     (err) => {
       const m = String(err)
       assert.match(m, /not dispatchable from this session/, "the spec-mandated finding")
@@ -226,7 +256,7 @@ test("gate: crew pending belt refuses dispatch until armed", async (t) => {
   await h.config(emptyCfg())
   await h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, allowCtx("ses_cp", dir))
   await assert.rejects(
-    () => h.tool.forge_dispatch.execute({ subagent_type: "forge-dp-research", prompt: "x", mode: "async" }, allowCtx("ses_cp", dir)),
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "x", run_in_background: true }, allowCtx("ses_cp", dir)),
     /PENDING/,
   )
 })
@@ -248,7 +278,7 @@ test("gate: crew pool-compliance belt refuses mid-crew dispatch on a degraded po
   const liveId = Object.keys(h.__forgeSubagentsTest.resolveNow().agents).find((id) => id.endsWith("research"))
   assert.ok(liveId, "the degraded pool still materializes its agent (renamed)")
   await assert.rejects(
-    () => h.tool.forge_dispatch.execute({ subagent_type: `forge-${liveId}`, prompt: "x", mode: "wait" }, allowCtx("ses_cc", dir)),
+    () => h.tool.task.execute({ subagent_type: `forge-${liveId}`, prompt: "x" }, allowCtx("ses_cc", dir)),
     (err) => {
       const m = String(err)
       assert.match(m, /Pool compliance refused/)
@@ -259,7 +289,7 @@ test("gate: crew pool-compliance belt refuses mid-crew dispatch on a degraded po
   )
 })
 
-test("gate: primary-only — workers and non-forge agents cannot dispatch", async (t) => {
+test("gate: primary-only — workers and non-forge-agents-to-forge-targets are refused", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const { client } = makeClient({ record: { directory: dir, worktree: dir } })
   const h = await startServer(input(dir, client), {})
@@ -267,24 +297,28 @@ test("gate: primary-only — workers and non-forge agents cannot dispatch", asyn
   await h.config(emptyCfg())
   await h["chat.message"]({ sessionID: "ses_worker", agent: "forge-dp-research" })
   await assert.rejects(
-    () => h.tool.forge_dispatch.execute({ subagent_type: "forge-dp-research", prompt: "x", mode: "wait" }, allowCtx("ses_worker", dir)),
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "x" }, allowCtx("ses_worker", dir)),
     /reserved for the primary forge agent/,
   )
   await h["chat.message"]({ sessionID: "ses_out", agent: "build" })
   await assert.rejects(
-    () => h.tool.forge_dispatch.execute({ subagent_type: "forge-dp-research", prompt: "x", mode: "wait" }, allowCtx("ses_out", dir)),
-    /outside it/,
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "x" }, allowCtx("ses_out", dir)),
+    (err) => {
+      assert.match(String(err), /outside the forge family/)
+      assert.match(String(err), /forge-family worker/)
+      return true
+    },
   )
 })
 
-test("gate: unknown target refused with roster guidance", async (t) => {
+test("gate: unknown forge target refused with roster guidance", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const { client } = makeClient({ record: { directory: dir, worktree: dir } })
   const h = await startServer(input(dir, client), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   await assert.rejects(
-    () => h.tool.forge_dispatch.execute({ subagent_type: "forge-dp-ghost", prompt: "x", mode: "wait" }, allowCtx("ses_unk", dir)),
+    () => h.tool.task.execute({ subagent_type: "forge-dp-ghost", prompt: "x" }, allowCtx("ses_unk", dir)),
     /not a materialized forge subagent/,
   )
 })
@@ -299,15 +333,15 @@ test("gate: plan-draft shape parity — readonly passes BOTH modes, write refuse
     { goal: "drafting", context: "c", approach: "a", tasks: ["t1"], risks: "r", acceptance: ["a1"] },
     allowCtx("ses_draft2", dir),
   )
-  // Readonly target: reconnaissance dispatch passes in wait AND async.
-  const wait = await h.tool.forge_dispatch.execute({ subagent_type: "forge-dp-research", prompt: "recon", mode: "wait" }, allowCtx("ses_draft2", dir))
-  assert.match(wait.output, /report from /)
-  const asyncR = await h.tool.forge_dispatch.execute({ subagent_type: "forge-dp-research", prompt: "recon 2", mode: "async" }, allowCtx("ses_draft2", dir))
+  // Readonly target: reconnaissance dispatch passes sync AND async.
+  const sync = await h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "recon" }, allowCtx("ses_draft2", dir))
+  assert.match(sync.output, /report from /)
+  const asyncR = await h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "recon 2", run_in_background: true }, allowCtx("ses_draft2", dir))
   assert.match(asyncR.output, /task id: /)
-  // Write target: refused in BOTH modes with the native-task draft copy.
-  for (const mode of ["wait", "async"]) {
+  // Write target: refused in BOTH modes with the draft gate copy.
+  for (const bg of [false, true]) {
     await assert.rejects(
-      () => h.tool.forge_dispatch.execute({ subagent_type: "forge-dp-builder", prompt: "build", mode }, allowCtx("ses_draft2", dir)),
+      () => h.tool.task.execute({ subagent_type: "forge-dp-builder", prompt: "build", run_in_background: bg }, allowCtx("ses_draft2", dir)),
       (err) => {
         const m = String(err)
         assert.match(m, /plan is in draft/)
@@ -324,20 +358,97 @@ test("gate: write-target async accepted outside a draft (all-shapes async)", asy
   const h = await startServer(input(dir, client), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
-  const r = await h.tool.forge_dispatch.execute(
-    { subagent_type: "forge-dp-builder", prompt: "implement it", mode: "async", description: "build wave" },
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-builder", prompt: "implement it", run_in_background: true, description: "build wave" },
     allowCtx("ses_write", dir),
   )
   assert.match(r.output, /in async mode/, "write shape is dispatchable in async mode")
   assert.match(r.output, /task id: /)
   assert.match(r.output, /child session: ses_child_\d+/)
-  assert.deepEqual(calls.create[0].body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "question-deny seal on the write child too")
+  assert.deepEqual(calls.create[0].body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "question-deny seal on the async child")
   // Clean up: end the owner session (harvests the child).
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_write" } } } })
 })
 
 // ---------------------------------------------------------------------------
-// Async lifecycle (spec: Async dispatch lifecycle)
+// Non-forge targets: native dispatch parity (spec scenario)
+
+test("parity: non-forge host target — sync dispatch, same engine, no forge gates, NO question-deny", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir } })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute({ subagent_type: "build", prompt: "run the build", description: "native build" }, allowCtx("ses_nf1", dir))
+  assert.match(r.output, /build finished/, "the child runs the target host agent and the result returns")
+  assert.match(r.output, /report from ses_child_1/)
+  const create = calls.create[0]
+  assert.equal(create.body.parentID, "ses_nf1")
+  assert.equal(create.body.title, "native build (@build subagent)", "native title format for the host agent target")
+  assert.equal(create.body.permission, undefined, "sync parity: no question-deny on non-forge targets either")
+  assert.equal(calls.promptAsync[0].body.agent, "build", "the host agent id rides the prompt body")
+})
+
+test("parity: non-forge host target — async dispatch carries the question-deny seal", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute({ subagent_type: "general", prompt: "bg job", run_in_background: true }, allowCtx("ses_nf2", dir))
+  assert.match(r.output, /task id: /)
+  assert.deepEqual(calls.create[0].body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "async question policy is mode-keyed for non-forge targets too")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_nf2" } } } })
+})
+
+test("parity: a NON-FORGE speaker dispatching a non-forge target succeeds (native caller parity)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client } = makeClient({ record: { directory: dir, worktree: dir } })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h["chat.message"]({ sessionID: "ses_native_speaker", agent: "build" })
+  const r = await h.tool.task.execute({ subagent_type: "general", prompt: "help me" }, allowCtx("ses_native_speaker", dir))
+  assert.match(r.output, /general finished/, "non-forge speaker → non-forge target flows through the same engine")
+})
+
+test("parity: unknown non-forge target is an honest Agent-not-found refusal", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client } = makeClient({ record: { directory: dir, worktree: dir } })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await assert.rejects(
+    () => h.tool.task.execute({ subagent_type: "ghost-agent", prompt: "x" }, allowCtx("ses_ghost", dir)),
+    (err) => {
+      assert.match(String(err), /Agent not found: "ghost-agent"/)
+      assert.match(String(err), /neither a materialized forge-\* subagent nor a configured host agent/)
+      return true
+    },
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Sync abort parity (spec scenario "Sync abort parity")
+
+test("abort parity: a sync dispatch aborted mid-flight aborts the child via the SDK and resolves with the disclosure", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const abortController = new AbortController()
+  const exec = h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "long audit", description: "abort me" }, allowCtx("ses_abort", dir, { abortController }))
+  // Let the poll loop take at least one slice, then abort the turn.
+  setTimeout(() => abortController.abort(), 50)
+  const r = await exec
+  assert.match(r.output, /dispatching turn was aborted/, "the abort is disclosed in the resolution")
+  assert.match(r.output, /child session ses_child_1 was aborted via the SDK/, "the child session id is named")
+  assert.ok(calls.abort.some((a) => a.path.id === "ses_child_1"), "session.abort was called on the child")
+})
+
+// ---------------------------------------------------------------------------
+// Async lifecycle (spec: Dispatch lifecycle)
 
 test("cap: per-session concurrent async cap 3 — 4th refused with in-flight ids + guidance", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
@@ -346,7 +457,7 @@ test("cap: per-session concurrent async cap 3 — 4th refused with in-flight ids
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
   const dispatch = async (i) =>
-    h.tool.forge_dispatch.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, mode: "async" }, allowCtx("ses_cap", dir))
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true }, allowCtx("ses_cap", dir))
   const handles = []
   for (let i = 0; i < 3; i++) handles.push(await dispatch(i))
   const ids = handles.map((x) => x.output.match(/task id: (\S+)/)[1])
@@ -356,7 +467,7 @@ test("cap: per-session concurrent async cap 3 — 4th refused with in-flight ids
       const m = String(err)
       assert.match(m, /cap 3/, "the cap value is named")
       for (const id of ids) assert.ok(m.includes(id), `in-flight task id ${id} listed`)
-      assert.match(m, /mode: "wait"/, "guidance to wait or use wait mode")
+      assert.match(m, /without run_in_background/, "guidance to wait or go sync")
       return true
     },
   )
@@ -376,12 +487,19 @@ test("wake: async completion delivers ONE idle wake carrying the child's final m
   const h = await startServer(input(dir, client), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
-  const r = await h.tool.forge_dispatch.execute(
-    { subagent_type: "forge-dp-research", prompt: "go", mode: "async", description: "wake test" },
-    allowCtx("ses_wake", dir),
+  const ctx = allowCtx("ses_wake", dir)
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "go", run_in_background: true, description: "wake test" },
+    ctx,
   )
   assert.match(r.output, /END YOUR TURN/, "the handle mandates ending the turn")
   const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  // Async metadata contract mirrors the native keys too.
+  const meta = ctx._metadataCalls.at(-1)?.metadata ?? {}
+  assert.equal(meta.agent, "forge-dp-research")
+  assert.equal(meta.sessionId, childID)
+  assert.equal(meta.run_in_background, true)
+  assert.ok(typeof meta.taskId === "string" && meta.taskId.length > 0)
   // The poller settles in the background; the wake waits for idle.
   await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().length === 0, "poller settles")
   const wakesTo = (sid) => calls.promptAsync.filter((a) => a.path?.id === sid && String(JSON.stringify(a.body)).includes("dispatch-complete"))

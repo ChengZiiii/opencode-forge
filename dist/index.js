@@ -16559,7 +16559,7 @@ async function createChildSession(client, input) {
       body: {
         parentID: input.parentSessionID,
         title: childSessionTitle(input.description, input.agentID),
-        permission: QUESTION_DENY_PERMISSION
+        ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {}
       },
       query: { directory: input.parentDirectory }
     });
@@ -16637,6 +16637,9 @@ async function pollChild(client, input, seams = {}) {
   for (;; ) {
     await sleep(intervalMs);
     polls++;
+    if (input.signal?.aborted) {
+      return { status: "aborted", sessionID: input.sessionID, polls };
+    }
     let statusMap;
     try {
       const statusResult = await client.session.status();
@@ -16717,8 +16720,7 @@ var FORGE_STATE_TOOLS = [
   "goal_resume",
   "goal_discard",
   "crew_begin",
-  "crew_close",
-  "forge_dispatch"
+  "crew_close"
 ];
 var FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"];
 var FORGE_SEARCH_TOOLS = ["forge_grep", "forge_glob"];
@@ -16730,7 +16732,7 @@ var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. Y
 
 Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.
 
-Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch through the native task channel instead.`;
+Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch a host agent through the task tool instead.`;
 function forgePromptText(opts) {
   const mandate = opts.hardRefusal ? "Exec surface: every shell command — quick ones included — runs through the forge_shell tool. The builtin shell/bash tools are refused on this agent; never try them first, not even for trivial commands." : "Exec surface: prefer the forge_shell tool for every shell command — quick ones included; it is this agent's exec surface, and the builtin shell exists only as an explicit escape hatch.";
   return `${FORGE_PROMPT}
@@ -17069,7 +17071,7 @@ function jobWakeText(job) {
   const dispatch = job.dispatch;
   if (dispatch) {
     return [
-      `[forge:dispatch-complete] forge_dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
+      `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
       `Final report:
 ${job.tail.slice(-2500) || "(no output)"}`,
       "The dispatch is complete — read the report above; no polling, no re-dispatch needed."
@@ -17891,6 +17893,7 @@ ${p.newOutput || "(none in this window)"}`,
     };
   }
 });
+var knownHostAgents = new Set(["general", ...NATIVE_PARTITION_FALLBACKS]);
 var ASYNC_DISPATCH_CAP = 3;
 var dispatchTasks = new Map;
 function inFlightAsyncDispatches(sessionID) {
@@ -17942,63 +17945,64 @@ async function runAsyncDispatchPoller(client, job, childSessionID) {
   jobManager.markTerminal(job, "exited", exitCode);
   dispatchTasks.delete(job.id);
 }
-var FORGE_DISPATCH_DESCRIPTION = [
-  "Dispatch a materialized forge-* subagent as a REAL child session on this host (SDK session.create with parentID): it renders in the host session tree with native subagent affordances — progress, expandable transcript, user abort — and runs the materialized agent with its own permission map.",
-  'mode is YOUR dispatch-time decision: "async" when the result does NOT block your next steps (fire it and continue other work or end the turn); "wait" when your very next step depends on the result (blocking parity with the native task tool).',
+var TASK_DESCRIPTION = [
+  "Dispatch a subagent as a REAL child session on this host (SDK session.create with parentID): the call renders in the host session tree with native subagent affordances — the live task panel, progress, expandable transcript, user abort — and runs the target agent with its own permission map. This is the single dispatch surface: ANY materialized target dispatches through here — configured `forge-*` subagents AND every other host agent.",
+  "run_in_background is YOUR dispatch-time decision: omit it (sync) when your very next step depends on the result — the call blocks until the child finishes and returns its final report (native parity: the child MAY ask the user questions; the user is present at the panel). Set run_in_background: true (async) when the result does NOT block your next steps — the call returns a task handle immediately and the child is created with the question tool denied session-wide (unattended: it never blocks on human input; an unanswered permission ask degrades to the honest poll-timeout finding naming the child session id, which stays inspectable and natively abortable in the TUI).",
   `async discipline: after an async dispatch, END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report is injected when it finishes (idle-only, at-most-once, delivery window). NEVER poll, re-dispatch, or "check on" an async dispatch before that wake arrives — pre-wake polling is a BLOCKING anti-pattern.`,
-  "Every materialized shape is dispatchable in BOTH modes (write workers included): write authority is the target's materialized permission map, not a mode gate. Child sessions never block on human input (the question tool is denied session-wide); a permission ask nobody answers degrades to the honest poll-timeout finding naming the child session id (the child stays inspectable and natively abortable in the TUI).",
-  "Gates match the native task surface exactly: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance gates, the plan-draft readonly-recon exemption (readonly targets pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch). The native task tool keeps working unchanged for forge-* targets — prefer forge_dispatch when you want async execution or an SDK-visible child session."
+  "Sync dispatches carry abort parity: aborting the dispatching turn aborts the child session via the SDK. Async children intentionally SURVIVE turn aborts (session-scoped; they die at owner-session death, orphan-recorded).",
+  "Forge roster guidance: prefer a configured `forge-*` subagent whose description matches the job (each materialized description carries its pool provenance; .opencode/forge.json is the source). Gates on forge-* targets: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance belts, the plan-draft readonly-recon exemption (readonly scouts pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch — recursion is banned at their permission map). Non-forge host targets dispatch with native parity (no forge gates). Cap: 3 concurrent async dispatches per session."
 ].join(`
 `);
-var forgeDispatchTool = tool({
-  description: FORGE_DISPATCH_DESCRIPTION,
+var taskDispatchTool = tool({
+  description: TASK_DESCRIPTION,
   args: {
-    subagent_type: tool.schema.string().describe('Materialized forge-* agent id (e.g. "forge-plugindev-spec-reviewer") — use native task for other subagents'),
+    subagent_type: tool.schema.string().describe('Target agent id — a materialized forge-* subagent (e.g. "forge-plugindev-spec-reviewer") or any other configured host agent id'),
     prompt: tool.schema.string().describe("The complete task prompt for the worker (self-contained: it carries the artifact paths/slices and the evidence demands)"),
-    mode: tool.schema.string().describe('Dispatch-time decision: "wait" (block this call until the child finishes and return its final report — use when the next step depends on the result) or "async" (return a task handle immediately; a single [forge:dispatch-complete] wake carries the final report later — use when the result does not block your next steps)'),
-    description: tool.schema.string().optional().describe("Short task description used as the child session's title in the host UI (defaults to the prompt's first words)")
+    description: tool.schema.string().optional().describe("Short task description used as the child session's title in the host UI (defaults to the prompt's first words)"),
+    run_in_background: tool.schema.boolean().optional().describe("Dispatch-time decision: omit for sync (block this call until the child finishes and return its final report — the child may ask questions, native parity) or true for async (return a task handle immediately; a single [forge:dispatch-complete] wake carries the final report later — the child is sealed against human input)")
   },
   execute: async (args, context) => {
     noteToolAgent(context);
-    const mode = String(args.mode ?? "").trim().toLowerCase();
-    if (mode !== "wait" && mode !== "async") {
-      throw new Error(`[forge:dispatch] mode must be "wait" or "async" (got ${JSON.stringify(mode || "(missing)")}).`);
-    }
     const target = String(args.subagent_type ?? "").trim();
     const prompt = String(args.prompt ?? "");
+    const runInBackground = args.run_in_background === true;
     if (!target || !prompt)
       throw new Error("[forge:dispatch] subagent_type and prompt are both required.");
-    if (!target.toLowerCase().startsWith("forge-")) {
-      throw new Error(`[forge:dispatch] "${target}" is not a forge-family worker — forge_dispatch dispatches materialized forge-* subagents only. Use the native task tool for other subagents.`);
-    }
+    const forgeTarget = target.toLowerCase().startsWith("forge-");
     const speaker = sessionAgents.get(context.sessionID);
-    if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
-      throw new Error(`[forge:partition] Tool refused: "forge_dispatch" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`);
-    }
     if (speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT) {
-      throw new Error(`[forge:partition] Tool refused: "forge_dispatch" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls forge_dispatch at the gate.`);
+      throw new Error(`[forge:partition] Tool refused: "task" dispatch is reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent dispatches at the gate.`);
     }
-    const agentId = target.slice("forge-".length);
-    const resolution = resolvePools();
-    if (!resolution || !resolution.agents[agentId]) {
-      throw new Error(`[forge:dispatch] "${target}" is not a materialized forge subagent on this host. Check the roster in the agent descriptions (or .opencode/forge.json), or dispatch the native general subagent instead.`);
+    if (speaker !== undefined && !isForgeFamilyAgent(speaker) && forgeTarget) {
+      throw new Error(`[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use non-forge host subagents, or switch to the forge agent to dispatch forge-* workers.`);
     }
-    const poolRefusal = await poolGateRefusal(jobClient, context.sessionID, target);
-    if (poolRefusal)
-      throw new Error(poolRefusal);
     const pendingRefusal = crewPendingRefusal(context.sessionID);
     if (pendingRefusal)
       throw new Error(pendingRefusal);
-    const complianceRefusal = await crewComplianceRefusalFor(jobClient, context.sessionID, target);
-    if (complianceRefusal)
-      throw new Error(complianceRefusal);
+    if (forgeTarget) {
+      const agentId = target.slice("forge-".length);
+      const resolution = resolvePools();
+      if (!resolution || !resolution.agents[agentId]) {
+        throw new Error(`[forge:dispatch] "${target}" is not a materialized forge subagent on this host. Check the roster in the agent descriptions (or .opencode/forge.json), or dispatch a host agent instead.`);
+      }
+      const poolRefusal = await poolGateRefusal(jobClient, context.sessionID, target);
+      if (poolRefusal)
+        throw new Error(poolRefusal);
+      const complianceRefusal = await crewComplianceRefusalFor(jobClient, context.sessionID, target);
+      if (complianceRefusal)
+        throw new Error(complianceRefusal);
+    } else {
+      if (!knownHostAgents.has(target)) {
+        throw new Error(`Agent not found: "${target}" is neither a materialized forge-* subagent nor a configured host agent. Check the agent id against the TUI agent list (or the forge roster in the agent descriptions) and retry.`);
+      }
+    }
     const draftRefusal = draftDispatchRefusal(context.sessionID, target);
     if (draftRefusal)
       throw new Error(draftRefusal);
-    if (mode === "async") {
+    if (runInBackground) {
       const inFlight = inFlightAsyncDispatches(context.sessionID);
       if (inFlight.length >= ASYNC_DISPATCH_CAP) {
-        throw new Error(`[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")}. ` + `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one with mode: "wait".`);
+        throw new Error(`[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")}. ` + `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one without run_in_background.`);
       }
     }
     const client = dispatchClient();
@@ -18010,7 +18014,8 @@ var forgeDispatchTool = tool({
       parentSessionID: context.sessionID,
       parentDirectory: state.worktree,
       agentID: target,
-      description
+      description,
+      questionDeny: runInBackground
     });
     if (!created.ok)
       throw new Error(`[forge:dispatch] child session creation failed: ${created.error}`);
@@ -18018,11 +18023,34 @@ var forgeDispatchTool = tool({
     if (!sent.ok) {
       throw new Error(`[forge:dispatch] prompt send to child session ${created.sessionID} failed: ${sent.error} — the child exists and is natively abortable in the TUI.`);
     }
-    if (mode === "wait") {
+    const taskMetadata = {
+      agent: target,
+      sessionId: created.sessionID,
+      taskId: "",
+      run_in_background: runInBackground,
+      description,
+      prompt
+    };
+    if (!runInBackground) {
+      taskMetadata.taskId = newJobId();
       const poll = await pollChild(client, {
         sessionID: created.sessionID,
-        intervalMs: Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
+        intervalMs: Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS),
+        signal: context.abort
       });
+      if (poll.status === "aborted") {
+        const ab = await abortChild(client, created.sessionID);
+        context.metadata({ title: `${target}: dispatch aborted`, metadata: { ...taskMetadata } });
+        return {
+          title: `${target}: dispatch aborted`,
+          metadata: { ...taskMetadata },
+          output: [
+            `[forge:dispatch] The dispatching turn was aborted — child session ${created.sessionID} was aborted via the SDK${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`}.`,
+            `task id: ${taskMetadata.taskId}`
+          ].join(`
+`)
+        };
+      }
       if (poll.status === "timeout") {
         throw new Error(`[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` + `It remains a real session: inspect or abort it natively in the host TUI. No auto-convert to async happened (the dependency structure did not change).`);
       }
@@ -18032,15 +18060,17 @@ var forgeDispatchTool = tool({
       const fin = await fetchFinalMessage(client, created.sessionID);
       if (!fin.ok)
         throw new Error(`[forge:dispatch] ${fin.error}`);
-      context.metadata({ title: `${target}: dispatch complete` });
+      context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } });
       return {
         title: `${target}: dispatch complete`,
+        metadata: { ...taskMetadata },
         output: [`[forge:dispatch] ${target} finished (child session ${created.sessionID}).`, `Final report:
 ${fin.text}`].join(`
 `)
       };
     }
     const jobId = newJobId();
+    taskMetadata.taskId = jobId;
     const job = jobManager.create({
       id: jobId,
       cmd: `dispatch ${target}: ${description}`,
@@ -18055,9 +18085,10 @@ ${fin.text}`].join(`
     job.dispatch = { agentID: target, childSessionID: created.sessionID, description };
     dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description });
     runAsyncDispatchPoller(client, job, created.sessionID);
-    context.metadata({ title: `${target}: dispatch async` });
+    context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
     return {
       title: `${target}: dispatch async (${jobId})`,
+      metadata: { ...taskMetadata },
       output: [
         `[forge:dispatch] Dispatched ${target} in async mode — the child session runs in the background.`,
         `task id: ${jobId}`,
@@ -18550,7 +18581,7 @@ function forgeTools() {
   if (!forgeDisabled) {
     tools.crew_begin = crewBeginTool;
     tools.crew_close = crewCloseTool;
-    tools.forge_dispatch = forgeDispatchTool;
+    tools.task = taskDispatchTool;
   }
   return tools;
 }
@@ -19012,6 +19043,11 @@ var server = async (input, options) => {
           tools[t] = false;
         agentSection[native] = { tools };
       }
+      knownHostAgents.clear();
+      for (const native of NATIVE_PARTITION_FALLBACKS)
+        knownHostAgents.add(native);
+      for (const id of Object.keys(agentSection))
+        knownHostAgents.add(id);
       if (process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1") {
         modelsDevCatalog = null;
       } else {

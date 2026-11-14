@@ -1,4 +1,5 @@
-// Async dispatch core: SDK child-session lifecycle for forge_dispatch.
+// Async dispatch core: SDK child-session lifecycle for the task-shadow
+// dispatch surface (the `task` tool; formerly forge_dispatch).
 //
 // Pure logic, no @opencode-ai imports — the client is a structural
 // (duck-typed) seam shaped after the pinned @opencode-ai/sdk 1.18.33
@@ -93,6 +94,13 @@ export type CreateChildInput = {
   parentDirectory: string
   agentID: string
   description: string
+  /**
+   * Question policy (task-shadow, mode-keyed): async dispatches seal the
+   * child with the session-wide question deny (unattended safety, 0.22.0
+   * semantics); sync dispatches omit the seal entirely — native parity, the
+   * user is present at the panel and the child may ask.
+   */
+  questionDeny?: boolean
 }
 
 export type CreateChildResult =
@@ -109,7 +117,7 @@ export async function createChildSession(
       body: {
         parentID: input.parentSessionID,
         title: childSessionTitle(input.description, input.agentID),
-        permission: QUESTION_DENY_PERMISSION,
+        ...(input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {}),
       },
       query: { directory: input.parentDirectory },
     })
@@ -175,12 +183,20 @@ export type PollInput = {
   intervalMs?: number
   /** Wait-mode timeout in ms — the honest ceiling before giving up (default 600000). */
   timeoutMs?: number
+  /**
+   * Sync abort parity (task-shadow design D4): the dispatching turn's abort
+   * signal. When it fires mid-poll the loop returns `aborted` — the CALLER
+   * then aborts the child via the SDK and discloses. Checked every poll
+   * iteration (belt, not a listener: poll slices are short).
+   */
+  signal?: AbortSignal
 }
 
 export type PollResult =
   | { status: "completed"; polls: number }
   | { status: "error"; error: string; polls: number }
   | { status: "timeout"; sessionID: string; timeoutMs: number; polls: number }
+  | { status: "aborted"; sessionID: string; polls: number }
 
 export const DEFAULT_POLL_INTERVAL_MS = 1000
 export const DEFAULT_POLL_TIMEOUT_MS = 600000
@@ -235,6 +251,12 @@ export async function pollChild(
   for (;;) {
     await sleep(intervalMs)
     polls++
+
+    // Sync abort parity: the dispatching turn was aborted — hand the abort
+    // back to the caller (which aborts the child via the SDK and discloses).
+    if (input.signal?.aborted) {
+      return { status: "aborted", sessionID: input.sessionID, polls }
+    }
 
     // Status fetch failure is transient (server hiccup) — keep polling
     // until the deadline; only timeout is terminal here.

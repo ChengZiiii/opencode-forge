@@ -11,7 +11,8 @@ import { reduceModelsDev } from "../src/models-dev.ts"
 // crew-harness delta; change simplify-dispatch-to-static-agents). Covers:
 //   - materialization WITH a pinned model, NOT hidden, task denied (3.1)
 //   - no-clobber of user-defined forge-<id> entries; disable knob silence
-//   - the native-task surface: no forge_dispatch tools registered
+//   - the task surface (task-shadow): task is our implementation, no
+//     forge_dispatch tool registered
 //   - chat.params keyed by agent name: injection, freeze, no-mapping finding
 //   - production-catalog P0-1 regression: catalog effort claims never pick
 //     the anthropic channel; dead-end freeze survives mid-session config
@@ -205,16 +206,18 @@ test("materialization: agent.forge.disable registers nothing", async (t) => {
   assert.equal(h.tool.plan_write, undefined, "no harness tools at all when disabled")
 })
 
-test("dispatch surface: forge_dispatch registers under the forge family; the old dispatch-suite family stays gone", async (t) => {
+test("dispatch surface: task is OUR implementation (task-shadow) and forge_dispatch is retired; the old dispatch-suite family stays gone", async (t) => {
   const h = await startServer(input(), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
   const tools = h.tool
-  // change async-dispatch: the native-task-only prohibition is REPLACED by
-  // the forge_dispatch surface requirement — the tool registers; the old
-  // dispatch-suite auxiliary tools stay retired.
-  assert.ok(tools.forge_dispatch, "forge_dispatch is registered")
+  // change task-shadow: the SDK dispatch engine shadows the native name —
+  // `task` is ours, forge_dispatch does not exist; the old dispatch-suite
+  // auxiliary tools stay retired.
+  assert.ok(tools.task, "task is our dispatch implementation")
+  assert.match(tools.task.description, /single dispatch surface/, "the tool description declares the shadow")
+  assert.equal(tools.forge_dispatch, undefined, "forge_dispatch does not exist")
   assert.equal(tools.forge_dispatch_config, undefined)
   assert.equal(tools.forge_dispatch_list, undefined)
   assert.equal(tools.forge_dispatch_kill, undefined)
@@ -1176,7 +1179,7 @@ test("forge agent prompt carries the routing hint", async (t) => {
   const cfg = emptyCfg()
   await h.config(cfg)
   assert.match(cfg.agent.forge.prompt, /forge-\*.*subagent|subagent.*forge-\*/s)
-  assert.match(cfg.agent.forge.prompt, /native task channel/)
+  assert.match(cfg.agent.forge.prompt, /task tool/)
 })
 
 // ---------------------------------------------------------------------------
