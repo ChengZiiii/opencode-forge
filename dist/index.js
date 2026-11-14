@@ -16544,6 +16544,164 @@ async function jsSearch(params, seams, maxWalkEntries = MAX_WALK_ENTRIES) {
   return { records: ctx.records, notices: collectNotices() };
 }
 
+// src/dispatch-async.ts
+var QUESTION_DENY_PERMISSION = [{ permission: "question", action: "deny", pattern: "*" }];
+var ACTIVE_STATUS_TYPES = new Set(["busy", "retry", "running"]);
+var defaultNow = () => Date.now();
+var defaultSleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
+function childSessionTitle(description, agentID) {
+  return `${description} (@${agentID} subagent)`;
+}
+async function createChildSession(client, input) {
+  let result;
+  try {
+    result = await client.session.create({
+      body: {
+        parentID: input.parentSessionID,
+        title: childSessionTitle(input.description, input.agentID),
+        permission: QUESTION_DENY_PERMISSION
+      },
+      query: { directory: input.parentDirectory }
+    });
+  } catch (e) {
+    return { ok: false, error: `session.create threw: ${String(e)}` };
+  }
+  if (result.error !== undefined) {
+    return { ok: false, error: `session.create failed: ${String(result.error)}` };
+  }
+  const id = result.data?.id;
+  if (typeof id !== "string" || id === "") {
+    return { ok: false, error: "session.create returned no session id" };
+  }
+  return { ok: true, sessionID: id };
+}
+function buildPromptArgs(input) {
+  return {
+    path: { id: input.sessionID },
+    body: {
+      agent: input.agentID,
+      parts: [{ type: "text", text: input.prompt }]
+    },
+    ...input.directory !== undefined ? { query: { directory: input.directory } } : {}
+  };
+}
+async function sendPrompt(client, input) {
+  const args = buildPromptArgs(input);
+  try {
+    if (typeof client.session.promptAsync === "function") {
+      await client.session.promptAsync(args);
+    } else if (typeof client.session.prompt === "function") {
+      await client.session.prompt(args);
+    } else {
+      return { ok: false, error: "client has no session.promptAsync or session.prompt endpoint" };
+    }
+  } catch (e) {
+    return { ok: false, error: `prompt send threw: ${String(e)}` };
+  }
+  return { ok: true };
+}
+var DEFAULT_POLL_INTERVAL_MS = 1000;
+var DEFAULT_POLL_TIMEOUT_MS = 600000;
+function isActiveStatus(status) {
+  return status !== undefined && status.type !== undefined && ACTIVE_STATUS_TYPES.has(status.type);
+}
+function latestAssistant(messages) {
+  let best;
+  let bestCreated = -Infinity;
+  for (const m of messages) {
+    if (m.info?.role !== "assistant")
+      continue;
+    const created = m.info.time?.created ?? 0;
+    if (created >= bestCreated) {
+      best = m;
+      bestCreated = created;
+    }
+  }
+  return best;
+}
+function describeError(error45) {
+  if (error45 && typeof error45 === "object" && "name" in error45) {
+    const named = error45;
+    const detail = named.data?.message ?? "";
+    return `${String(named.name)}${detail ? `: ${String(detail)}` : ""}`;
+  }
+  return String(error45);
+}
+async function pollChild(client, input, seams = {}) {
+  const now = seams.now ?? defaultNow;
+  const sleep = seams.sleep ?? defaultSleep;
+  const intervalMs = input.intervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+  const timeoutMs = input.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
+  const deadline = now() + timeoutMs;
+  let polls = 0;
+  for (;; ) {
+    await sleep(intervalMs);
+    polls++;
+    let statusMap;
+    try {
+      const statusResult = await client.session.status();
+      if (statusResult.error === undefined && statusResult.data && typeof statusResult.data === "object") {
+        statusMap = statusResult.data;
+      }
+    } catch {
+      statusMap = undefined;
+    }
+    const active = statusMap !== undefined && isActiveStatus(statusMap[input.sessionID]);
+    let messages = [];
+    try {
+      const msgResult = await client.session.messages({
+        path: { id: input.sessionID },
+        query: { limit: 100 }
+      });
+      if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
+        messages = msgResult.data;
+      }
+    } catch {
+      messages = [];
+    }
+    const last = latestAssistant(messages);
+    if (last?.info?.error != null) {
+      return { status: "error", error: describeError(last.info.error), polls };
+    }
+    if (!active && last?.info?.finish !== undefined) {
+      return { status: "completed", polls };
+    }
+    if (now() >= deadline) {
+      return { status: "timeout", sessionID: input.sessionID, timeoutMs, polls };
+    }
+  }
+}
+async function fetchFinalMessage(client, sessionID) {
+  let messages;
+  try {
+    const result = await client.session.messages({ path: { id: sessionID } });
+    if (result.error !== undefined) {
+      return { ok: false, error: `session.messages failed: ${String(result.error)}` };
+    }
+    messages = Array.isArray(result.data) ? result.data : [];
+  } catch (e) {
+    return { ok: false, error: `session.messages threw: ${String(e)}` };
+  }
+  const last = latestAssistant(messages);
+  if (last === undefined) {
+    return { ok: false, error: `no assistant response found in child session ${sessionID}` };
+  }
+  const text = (last.parts ?? []).filter((p) => p.type === "text").map((p) => p.text ?? "").filter(Boolean).join(`
+`);
+  if (text === "") {
+    return { ok: false, error: `no assistant text output found in child session ${sessionID}` };
+  }
+  return { ok: true, text };
+}
+async function abortChild(client, sessionID) {
+  try {
+    await client.session.abort({ path: { id: sessionID } });
+  } catch (e) {
+    return { ok: false, error: `session.abort threw: ${String(e)}` };
+  }
+  return { ok: true };
+}
+
 // plugin.ts
 var FORGE_AGENT = "forge";
 var FORGE_STATE_TOOLS = [
@@ -16559,7 +16717,8 @@ var FORGE_STATE_TOOLS = [
   "goal_resume",
   "goal_discard",
   "crew_begin",
-  "crew_close"
+  "crew_close",
+  "forge_dispatch"
 ];
 var FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"];
 var FORGE_SEARCH_TOOLS = ["forge_grep", "forge_glob"];
@@ -16907,6 +17066,16 @@ var jobManager = createJobManager({
 var jobClient = null;
 var idleJobSessions = new Set;
 function jobWakeText(job) {
+  const dispatch = job.dispatch;
+  if (dispatch) {
+    return [
+      `[forge:dispatch-complete] forge_dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
+      `Final report:
+${job.tail.slice(-2500) || "(no output)"}`,
+      "The dispatch is complete — read the report above; no polling, no re-dispatch needed."
+    ].join(`
+`);
+  }
   return [
     `[forge:job-complete] Background job ${job.id} finished (${job.state}${job.exitCode !== null ? `, exit ${job.exitCode}` : ""}).`,
     `Command: ${job.cmd}`,
@@ -16917,7 +17086,7 @@ ${job.tail.slice(-1500) || "(none)"}`,
 `);
 }
 async function deliverJobWakes(sessionID) {
-  if (forgeDisabled || jobStage() >= 2)
+  if (forgeDisabled)
     return;
   if (!jobClient || typeof jobClient.session.promptAsync !== "function")
     return;
@@ -16944,6 +17113,88 @@ async function handoffTarget(sessionID) {
     }
   }
   return current === sessionID ? undefined : current;
+}
+async function resolveSessionAnchorForPools(anchorClient, sessionID) {
+  if (!sessionID)
+    return "";
+  let authoritative = "";
+  try {
+    const rec = anchorClient?.session?.get ? await anchorClient.session.get({ path: { id: sessionID } }) : undefined;
+    const anchor = effectiveWorktree(rec?.worktree, rec?.directory);
+    if (anchor && !isRootish(anchor))
+      authoritative = anchor;
+  } catch {}
+  const mapped = sessions.get(sessionID)?.worktree ?? "";
+  if (authoritative === "")
+    return mapped;
+  if (mapped && !isRootish(mapped) && foldPath(mapped) !== foldPath(authoritative) && sessionPoolFileOf(authoritative) === null && sessionPoolFileOf(mapped) !== null) {
+    if (!anchorPrefNotes.has(sessionID)) {
+      anchorPrefNotes.add(sessionID);
+      console.warn(`[forge:pool] session ${sessionID}: the authoritative session record anchors to a POOL-LESS directory (${authoritative}) while the session's live binding owns a pool (${mapped}) — the pooled binding wins this resolution (restart-resume rebind shape).`);
+    }
+    return mapped;
+  }
+  return authoritative;
+}
+async function poolGateRefusal(anchorClient, sessionID, target) {
+  const resolution = resolvePools();
+  const agentId = target.slice("forge-".length);
+  const entry = resolution?.agents[agentId];
+  if (!(resolution && entry))
+    return null;
+  const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID);
+  if (!anchor) {
+    if (!poolGateUnknownNotes.has(sessionID)) {
+      poolGateUnknownNotes.add(sessionID);
+      console.warn(`[forge:pool] session ${sessionID}: task dispatch to ${target} passed an UNGATED pool check — the session's workspace could not be established (fail-open belt posture; pool ownership unscoped).`);
+    }
+    return null;
+  }
+  const sessionPool = sessionPoolFileOf(anchor);
+  const allowed = sessionPool ?? globalPoolPathOf();
+  if (allowed === null || foldPath(entry.file) !== foldPath(allowed)) {
+    return `[forge:pool] Dispatch refused: "${target}" belongs to the pool ${entry.file} — not dispatchable from this session. ` + `This session's dispatchable roster is ${sessionPool ? `its workspace pool (${sessionPool})` : `the global fallback (${globalPoolPathOf()})`}. ` + `Exits: open a session in that pool's workspace, or configure the role into this workspace's pool (its .opencode/forge.json), or into the global layer (${globalPoolPathOf()}).`;
+  }
+  return null;
+}
+function crewPendingRefusal(sessionID) {
+  const pendingCrew = sessionID ? crews.get(sessionID) : undefined;
+  if (pendingCrew && pendingCrew.mode === "pending") {
+    return `[forge:crew] Dispatch refused: the crew "${pendingCrew.objective}" is PENDING (registered, not armed). Present the execution-mode choice to the user — supervised waves now / convert to a goal contract / standby — then arm per their choice with crew_begin {execution: "waves" | "goal"}. Reconnaissance task calls are free only BEFORE registration.`;
+  }
+  return null;
+}
+async function crewComplianceRefusalFor(anchorClient, sessionID, target) {
+  if (!(target && target.toLowerCase().startsWith("forge-")))
+    return null;
+  const crew = crews.get(sessionID);
+  if (!(crew && (crew.mode === "pending" || crew.mode === "executing")))
+    return null;
+  const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID);
+  if (!anchor)
+    return null;
+  const complianceRefusal = crewPoolComplianceRefusal(anchor);
+  return complianceRefusal ? complianceRefusal + CREW_COMPLIANCE_NATIVE_EXIT : null;
+}
+function draftDispatchRefusal(sessionID, target) {
+  const state = stateForBan(sessionID);
+  const active = state ? resolveActivePlan(state) : null;
+  if (!(active && active.doc.status === "draft"))
+    return null;
+  const agentId = target !== undefined && target.toLowerCase().startsWith("forge-") ? target.slice("forge-".length) : undefined;
+  const def = agentId !== undefined ? resolvePools()?.agents[agentId]?.def : undefined;
+  if (def !== undefined && effectiveReadonlyShape(def)) {
+    return null;
+  }
+  const roster = [];
+  const pools = resolvePools();
+  if (pools) {
+    for (const [id, entry] of Object.entries(pools.agents))
+      if (effectiveReadonlyShape(entry.def))
+        roster.push(`forge-${id}`);
+  }
+  roster.sort();
+  return `[forge] A plan is in draft; dispatch is denied for this target. ` + (roster.length > 0 ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. ` : `No readonly worker is configured — define one in forge.json with an explicit "shape": "readonly" to enable draft-phase reconnaissance. `) + `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`;
 }
 var WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"]);
 function isWriteTool(name) {
@@ -17640,6 +17891,184 @@ ${p.newOutput || "(none in this window)"}`,
     };
   }
 });
+var ASYNC_DISPATCH_CAP = 3;
+var dispatchTasks = new Map;
+function inFlightAsyncDispatches(sessionID) {
+  const ids = [];
+  for (const [id, handle] of dispatchTasks) {
+    if (handle.ownerSession !== sessionID)
+      continue;
+    const job = jobManager.get(id);
+    if (job) {
+      if (job.state === "running")
+        ids.push(id);
+    } else {
+      dispatchTasks.delete(id);
+    }
+  }
+  return ids;
+}
+function dispatchClient() {
+  return jobClient;
+}
+async function runAsyncDispatchPoller(client, job, childSessionID) {
+  const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
+  const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5000));
+  const deadline = Date.now() + DEFAULT_POLL_TIMEOUT_MS;
+  let text = "";
+  let exitCode = 0;
+  for (;; ) {
+    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs });
+    if (poll.status === "completed") {
+      const fin = await fetchFinalMessage(client, childSessionID);
+      text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`;
+      break;
+    }
+    if (poll.status === "error") {
+      text = `(child session ended in error: ${poll.error})`;
+      exitCode = 1;
+      break;
+    }
+    if (job.state !== "running") {
+      dispatchTasks.delete(job.id);
+      return;
+    }
+    if (Date.now() >= deadline) {
+      text = `(poll timeout after ${DEFAULT_POLL_TIMEOUT_MS}ms — child session ${childSessionID} is still running and inspectable/abortable in the host TUI)`;
+      break;
+    }
+  }
+  jobManager.appendOutput(job, text);
+  jobManager.markTerminal(job, "exited", exitCode);
+  dispatchTasks.delete(job.id);
+}
+var FORGE_DISPATCH_DESCRIPTION = [
+  "Dispatch a materialized forge-* subagent as a REAL child session on this host (SDK session.create with parentID): it renders in the host session tree with native subagent affordances — progress, expandable transcript, user abort — and runs the materialized agent with its own permission map.",
+  'mode is YOUR dispatch-time decision: "async" when the result does NOT block your next steps (fire it and continue other work or end the turn); "wait" when your very next step depends on the result (blocking parity with the native task tool).',
+  `async discipline: after an async dispatch, END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report is injected when it finishes (idle-only, at-most-once, delivery window). NEVER poll, re-dispatch, or "check on" an async dispatch before that wake arrives — pre-wake polling is a BLOCKING anti-pattern.`,
+  "Every materialized shape is dispatchable in BOTH modes (write workers included): write authority is the target's materialized permission map, not a mode gate. Child sessions never block on human input (the question tool is denied session-wide); a permission ask nobody answers degrades to the honest poll-timeout finding naming the child session id (the child stays inspectable and natively abortable in the TUI).",
+  "Gates match the native task surface exactly: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance gates, the plan-draft readonly-recon exemption (readonly targets pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch). The native task tool keeps working unchanged for forge-* targets — prefer forge_dispatch when you want async execution or an SDK-visible child session."
+].join(`
+`);
+var forgeDispatchTool = tool({
+  description: FORGE_DISPATCH_DESCRIPTION,
+  args: {
+    subagent_type: tool.schema.string().describe('Materialized forge-* agent id (e.g. "forge-plugindev-spec-reviewer") — use native task for other subagents'),
+    prompt: tool.schema.string().describe("The complete task prompt for the worker (self-contained: it carries the artifact paths/slices and the evidence demands)"),
+    mode: tool.schema.string().describe('Dispatch-time decision: "wait" (block this call until the child finishes and return its final report — use when the next step depends on the result) or "async" (return a task handle immediately; a single [forge:dispatch-complete] wake carries the final report later — use when the result does not block your next steps)'),
+    description: tool.schema.string().optional().describe("Short task description used as the child session's title in the host UI (defaults to the prompt's first words)")
+  },
+  execute: async (args, context) => {
+    noteToolAgent(context);
+    const mode = String(args.mode ?? "").trim().toLowerCase();
+    if (mode !== "wait" && mode !== "async") {
+      throw new Error(`[forge:dispatch] mode must be "wait" or "async" (got ${JSON.stringify(mode || "(missing)")}).`);
+    }
+    const target = String(args.subagent_type ?? "").trim();
+    const prompt = String(args.prompt ?? "");
+    if (!target || !prompt)
+      throw new Error("[forge:dispatch] subagent_type and prompt are both required.");
+    if (!target.toLowerCase().startsWith("forge-")) {
+      throw new Error(`[forge:dispatch] "${target}" is not a forge-family worker — forge_dispatch dispatches materialized forge-* subagents only. Use the native task tool for other subagents.`);
+    }
+    const speaker = sessionAgents.get(context.sessionID);
+    if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+      throw new Error(`[forge:partition] Tool refused: "forge_dispatch" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`);
+    }
+    if (speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT) {
+      throw new Error(`[forge:partition] Tool refused: "forge_dispatch" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls forge_dispatch at the gate.`);
+    }
+    const agentId = target.slice("forge-".length);
+    const resolution = resolvePools();
+    if (!resolution || !resolution.agents[agentId]) {
+      throw new Error(`[forge:dispatch] "${target}" is not a materialized forge subagent on this host. Check the roster in the agent descriptions (or .opencode/forge.json), or dispatch the native general subagent instead.`);
+    }
+    const poolRefusal = await poolGateRefusal(jobClient, context.sessionID, target);
+    if (poolRefusal)
+      throw new Error(poolRefusal);
+    const pendingRefusal = crewPendingRefusal(context.sessionID);
+    if (pendingRefusal)
+      throw new Error(pendingRefusal);
+    const complianceRefusal = await crewComplianceRefusalFor(jobClient, context.sessionID, target);
+    if (complianceRefusal)
+      throw new Error(complianceRefusal);
+    const draftRefusal = draftDispatchRefusal(context.sessionID, target);
+    if (draftRefusal)
+      throw new Error(draftRefusal);
+    if (mode === "async") {
+      const inFlight = inFlightAsyncDispatches(context.sessionID);
+      if (inFlight.length >= ASYNC_DISPATCH_CAP) {
+        throw new Error(`[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")}. ` + `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one with mode: "wait".`);
+      }
+    }
+    const client = dispatchClient();
+    if (!client)
+      throw new Error("[forge:dispatch] no host client available — dispatch cannot create a child session.");
+    const state = ensureSession(context.sessionID, worktreeFor(context));
+    const description = typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60);
+    const created = await createChildSession(client, {
+      parentSessionID: context.sessionID,
+      parentDirectory: state.worktree,
+      agentID: target,
+      description
+    });
+    if (!created.ok)
+      throw new Error(`[forge:dispatch] child session creation failed: ${created.error}`);
+    const sent = await sendPrompt(client, { sessionID: created.sessionID, agentID: target, prompt, directory: state.worktree });
+    if (!sent.ok) {
+      throw new Error(`[forge:dispatch] prompt send to child session ${created.sessionID} failed: ${sent.error} — the child exists and is natively abortable in the TUI.`);
+    }
+    if (mode === "wait") {
+      const poll = await pollChild(client, {
+        sessionID: created.sessionID,
+        intervalMs: Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
+      });
+      if (poll.status === "timeout") {
+        throw new Error(`[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` + `It remains a real session: inspect or abort it natively in the host TUI. No auto-convert to async happened (the dependency structure did not change).`);
+      }
+      if (poll.status === "error") {
+        throw new Error(`[forge:dispatch] child session ${created.sessionID} ended in error: ${poll.error}`);
+      }
+      const fin = await fetchFinalMessage(client, created.sessionID);
+      if (!fin.ok)
+        throw new Error(`[forge:dispatch] ${fin.error}`);
+      context.metadata({ title: `${target}: dispatch complete` });
+      return {
+        title: `${target}: dispatch complete`,
+        output: [`[forge:dispatch] ${target} finished (child session ${created.sessionID}).`, `Final report:
+${fin.text}`].join(`
+`)
+      };
+    }
+    const jobId = newJobId();
+    const job = jobManager.create({
+      id: jobId,
+      cmd: `dispatch ${target}: ${description}`,
+      worktree: state.worktree,
+      ownerSession: context.sessionID,
+      logPath: join6(jobLogDir, "dispatch", `${jobId}.txt`),
+      notify: true,
+      killTree: () => {
+        abortChild(client, created.sessionID);
+      }
+    });
+    job.dispatch = { agentID: target, childSessionID: created.sessionID, description };
+    dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description });
+    runAsyncDispatchPoller(client, job, created.sessionID);
+    context.metadata({ title: `${target}: dispatch async` });
+    return {
+      title: `${target}: dispatch async (${jobId})`,
+      output: [
+        `[forge:dispatch] Dispatched ${target} in async mode — the child session runs in the background.`,
+        `task id: ${jobId}`,
+        `agent: ${target}`,
+        `child session: ${created.sessionID} (visible in the host session tree; natively abortable)`,
+        `Next: END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when it finishes — never poll or re-dispatch to check on it. Cap: ${ASYNC_DISPATCH_CAP} concurrent async dispatches per session.`
+      ].join(`
+`)
+    };
+  }
+});
 var searchRgPathOverride;
 var FORGE_SEARCH_PREFERENCE_LINE = "Prefer forge_grep/forge_glob over the builtin grep/glob — follow and hidden are on by default (symlinks/junctions and dot-directories are in scope; the builtin pair is blind to both).";
 var FORGE_GREP_DESCRIPTION = [
@@ -18121,6 +18550,7 @@ function forgeTools() {
   if (!forgeDisabled) {
     tools.crew_begin = crewBeginTool;
     tools.crew_close = crewCloseTool;
+    tools.forge_dispatch = forgeDispatchTool;
   }
   return tools;
 }
@@ -18427,28 +18857,6 @@ var server = async (input, options) => {
   hostWorktree = effectiveInitDir;
   rememberHostAnchor(effectiveInitDir);
   const client = input.client;
-  const resolveSessionAnchorForPools = async (sessionID) => {
-    if (!sessionID)
-      return "";
-    let authoritative = "";
-    try {
-      const rec = client?.session?.get ? await client.session.get({ path: { id: sessionID } }) : undefined;
-      const anchor = effectiveWorktree(rec?.worktree, rec?.directory);
-      if (anchor && !isRootish(anchor))
-        authoritative = anchor;
-    } catch {}
-    const mapped = sessions.get(sessionID)?.worktree ?? "";
-    if (authoritative === "")
-      return mapped;
-    if (mapped && !isRootish(mapped) && foldPath(mapped) !== foldPath(authoritative) && sessionPoolFileOf(authoritative) === null && sessionPoolFileOf(mapped) !== null) {
-      if (!anchorPrefNotes.has(sessionID)) {
-        anchorPrefNotes.add(sessionID);
-        console.warn(`[forge:pool] session ${sessionID}: the authoritative session record anchors to a POOL-LESS directory (${authoritative}) while the session's live binding owns a pool (${mapped}) — the pooled binding wins this resolution (restart-resume rebind shape).`);
-      }
-      return mapped;
-    }
-    return authoritative;
-  };
   jobClient = input.client;
   const jobsOpts = options?.jobs;
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native")
@@ -18659,39 +19067,17 @@ var server = async (input, options) => {
           }
         }
         if (target && target.toLowerCase().startsWith("forge-") && input2.sessionID) {
-          const resolution = resolvePools();
-          const agentId = target.slice("forge-".length);
-          const entry = resolution?.agents[agentId];
-          if (resolution && entry) {
-            const anchor = await resolveSessionAnchorForPools(input2.sessionID);
-            if (!anchor) {
-              if (!poolGateUnknownNotes.has(input2.sessionID)) {
-                poolGateUnknownNotes.add(input2.sessionID);
-                console.warn(`[forge:pool] session ${input2.sessionID}: task dispatch to ${target} passed an UNGATED pool check — the session's workspace could not be established (fail-open belt posture; pool ownership unscoped).`);
-              }
-            } else {
-              const sessionPool = sessionPoolFileOf(anchor);
-              const allowed = sessionPool ?? globalPoolPathOf();
-              if (allowed === null || foldPath(entry.file) !== foldPath(allowed)) {
-                throw new Error(`[forge:pool] Dispatch refused: "${target}" belongs to the pool ${entry.file} — not dispatchable from this session. ` + `This session's dispatchable roster is ${sessionPool ? `its workspace pool (${sessionPool})` : `the global fallback (${globalPoolPathOf()})`}. ` + `Exits: open a session in that pool's workspace, or configure the role into this workspace's pool (its .opencode/forge.json), or into the global layer (${globalPoolPathOf()}).`);
-              }
-            }
-          }
+          const poolRefusal = await poolGateRefusal(client, input2.sessionID, target);
+          if (poolRefusal)
+            throw new Error(poolRefusal);
         }
-        const pendingCrew = input2.sessionID ? crews.get(input2.sessionID) : undefined;
-        if (pendingCrew && pendingCrew.mode === "pending") {
-          throw new Error(`[forge:crew] Dispatch refused: the crew "${pendingCrew.objective}" is PENDING (registered, not armed). Present the execution-mode choice to the user — supervised waves now / convert to a goal contract / standby — then arm per their choice with crew_begin {execution: "waves" | "goal"}. Reconnaissance task calls are free only BEFORE registration.`);
-        }
+        const pendingRefusal = crewPendingRefusal(input2.sessionID);
+        if (pendingRefusal)
+          throw new Error(pendingRefusal);
         if (target && target.toLowerCase().startsWith("forge-") && input2.sessionID) {
-          const crew = crews.get(input2.sessionID);
-          if (crew && (crew.mode === "pending" || crew.mode === "executing")) {
-            const anchor = await resolveSessionAnchorForPools(input2.sessionID);
-            if (anchor) {
-              const complianceRefusal = crewPoolComplianceRefusal(anchor);
-              if (complianceRefusal)
-                throw new Error(complianceRefusal + CREW_COMPLIANCE_NATIVE_EXIT);
-            }
-          }
+          const complianceRefusal = await crewComplianceRefusalFor(client, input2.sessionID, target);
+          if (complianceRefusal)
+            throw new Error(complianceRefusal);
         }
       }
       if ((input2.tool === "write" || input2.tool === "edit") && input2.sessionID) {
@@ -18716,19 +19102,9 @@ var server = async (input, options) => {
           if (input2.tool === "task") {
             const a = output?.args ?? {};
             const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined;
-            const agentId = target !== undefined && target.toLowerCase().startsWith("forge-") ? target.slice("forge-".length) : undefined;
-            const def = agentId !== undefined ? resolvePools()?.agents[agentId]?.def : undefined;
-            if (def !== undefined && effectiveReadonlyShape(def)) {} else {
-              const roster = [];
-              const pools = resolvePools();
-              if (pools) {
-                for (const [id, entry] of Object.entries(pools.agents))
-                  if (effectiveReadonlyShape(entry.def))
-                    roster.push(`forge-${id}`);
-              }
-              roster.sort();
-              throw new Error(`[forge] A plan is in draft; dispatch is denied for this target. ` + (roster.length > 0 ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. ` : `No readonly worker is configured — define one in forge.json with an explicit "shape": "readonly" to enable draft-phase reconnaissance. `) + `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`);
-            }
+            const refusal = draftDispatchRefusal(input2.sessionID, target);
+            if (refusal)
+              throw new Error(refusal);
           } else {
             throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`);
           }
@@ -18856,7 +19232,9 @@ var server = async (input, options) => {
       },
       anchors: () => [...hostAnchors],
       resolveNow: () => resolvePools(),
-      workspacePoolOf: (anchor) => sessionPoolFileOf(anchor)
+      workspacePoolOf: (anchor) => sessionPoolFileOf(anchor),
+      dispatchTasks: () => [...dispatchTasks.values()],
+      jobLedger: () => jobManager.ledgerEntries()
     },
     "permission.ask": async (input2, output) => {
       const meta = input2.metadata ?? {};
@@ -18902,6 +19280,10 @@ var server = async (input, options) => {
         const info = event.properties.info;
         if (typeof info?.id === "string" && info.id) {
           jobManager.onSessionEnd(info.id);
+          for (const [id, handle] of [...dispatchTasks]) {
+            if (handle.ownerSession === info.id)
+              dispatchTasks.delete(id);
+          }
           sessionDepths.delete(info.id);
           sessionAgents.delete(info.id);
           sealFindings.delete(info.id);
@@ -19064,5 +19446,6 @@ export {
   isRootish,
   effectiveWorktree,
   effectiveSurvive,
-  plugin_default as default
+  plugin_default as default,
+  ASYNC_DISPATCH_CAP
 };
