@@ -205,13 +205,16 @@ test("materialization: agent.forge.disable registers nothing", async (t) => {
   assert.equal(h.tool.plan_write, undefined, "no harness tools at all when disabled")
 })
 
-test("native-task surface: no forge_dispatch family is registered anywhere", async (t) => {
+test("dispatch surface: forge_dispatch registers under the forge family; the old dispatch-suite family stays gone", async (t) => {
   const h = await startServer(input(), {})
   t.after(() => h.dispose?.())
   const cfg = emptyCfg()
   await h.config(cfg)
   const tools = h.tool
-  assert.equal(tools.forge_dispatch, undefined)
+  // change async-dispatch: the native-task-only prohibition is REPLACED by
+  // the forge_dispatch surface requirement — the tool registers; the old
+  // dispatch-suite auxiliary tools stay retired.
+  assert.ok(tools.forge_dispatch, "forge_dispatch is registered")
   assert.equal(tools.forge_dispatch_config, undefined)
   assert.equal(tools.forge_dispatch_list, undefined)
   assert.equal(tools.forge_dispatch_kill, undefined)

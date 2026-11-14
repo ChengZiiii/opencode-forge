@@ -492,12 +492,13 @@ entry is either **pinned** (a model + a reasoning depth, bound at
 materialization) or an **Auto worker** (no model — it inherits the parent
 session's model at dispatch), materializes as a native `forge-<ns>-<id>`
 subagent — EVERY pool family is namespaced, no exceptions (see
-*Pools on a shared host* below) — and is dispatched through the host's
-**native `task`
-tool** — which means every run is visible in the TUI, expandable and
-monitorable, exactly like any native subagent. There is no dispatch tool, no
-child-session engine, and no configuration invitation anywhere: the session
-AI never writes your config.
+*Pools on a shared host* below) — and is dispatched through **two coexisting
+surfaces**: the host's **native `task` tool** (unchanged; every run visible
+in the TUI, expandable and monitorable) and the plugin's **`forge_dispatch`
+tool** (below), which drives a REAL SDK child session on the same host —
+same native TUI visibility, plus an async mode the native tool does not
+have. There is still no configuration invitation anywhere: the session AI
+never writes your config.
 
 No forge.json? Nothing happens — the plugin registers nothing and the native
 subagent behavior is untouched. Onboarding is this README, for you the human.
@@ -571,7 +572,62 @@ workspace's pool / the global layer. The `/crew` roster and the
 `crew_begin` registration output lead with the session's dispatchable pool
 (its forge.json origin — workspace pool, or the global layer marked as
 fallback) and list every other host pool as NOT dispatchable with its
-origin path.
+ origin path.
+
+### forge_dispatch — the plugin dispatch surface (wait / async)
+
+`forge_dispatch` (a forge-family tool, primary-only; removed with the whole
+family under `agent["forge"].disable`) dispatches a materialized `forge-*`
+subagent by creating a **real child session on the same host server** via the
+SDK (`session.create` with `parentID` linking, the session directory of the
+parent, and the materialized agent id): the child renders in the host session
+tree exactly like a native task child — progress, expandable transcript,
+**user abort in the TUI**.
+
+- **`mode: "wait"`** — blocking parity with native task: the call polls the
+  child to a terminal state and returns the child's final assistant message
+  plus the agent identity and child session id. A child that never reaches
+  terminal within the poll timeout (default 10 minutes) returns an **honest
+  timeout finding naming the child session id** — the child stays a real
+  session the user can inspect or abort natively; there is no auto-convert to
+  async (the dependency structure did not change).
+- **`mode: "async"`** — the call returns a task handle immediately (task id,
+  agent, child session id); when the child finishes, **exactly one
+  `[forge:dispatch-complete]` message carrying the child's final report**
+  (bounded to the final 2500 characters — the full transcript lives in the
+  child session, natively inspectable) is
+  injected into the dispatching session through the same job-supervisor
+  completion-wake discipline as `[forge:job-complete]` (idle-only injection,
+  at-most-once, delivery window with ledger overflow). The tool description
+  teaches the model to END ITS TURN after an async dispatch and never poll —
+  and the per-session concurrent async cap is **3** (a fourth is refused with
+  the in-flight task ids and wait-mode guidance). When the dispatching
+  session ends, its live children are aborted via the SDK and recorded as
+  orphans in the diagnostics ledger.
+
+**All shapes, both modes.** Write workers are dispatchable in async mode from
+day one — deliberately (OMO-proven in production): write authority is the
+target's **materialized permission map** (readonly shapes keep their full
+deny + exec seal), not a mode gate. Unattended safety comes from the
+**question-deny seal**: every child session in BOTH modes is created with
+`permission: [{permission: "question", action: "deny", pattern: "*"}]` — a
+child can never block on human input; it proceeds and reports honestly. A
+**permission ask nobody answers degrades to the honest poll-timeout finding**
+(child session id disclosed, natively abortable) — that is the accepted
+fail-closed posture for unattended write dispatches, contained by the
+permission map, the seal, the concurrency cap, and owner-death harvest.
+
+**Gate parity with native task.** The session-domain pool gate (cross-pool
+targets refused with the `not dispatchable from this session` finding and its
+exits), the crew pending/compliance gates, the plan-draft interop (readonly
+targets pass as reconnaissance in BOTH modes during a draft; write targets
+are refused in BOTH modes until approval), and the primary-only rule
+(forge-* workers cannot dispatch — same refusal as STATE tools) all apply to
+`forge_dispatch` through the SAME predicates as the native-task interception
+belt. The two surfaces coexist: native task keeps working unchanged for
+forge-* targets (and remains the only lane for non-forge subagents);
+`forge_dispatch` is the lane for async execution and SDK-visible child
+sessions.
 
 | axis | follows | survives restart? |
 | --- | --- | --- |
@@ -742,8 +798,11 @@ opencode config file reloads. A NEW session on a long-lived shared host
 Say "dispatch a subagent..." in a forge session and the model picks from the
 task tool vocabulary: a configured `forge-*` agent whose description matches
 runs on its pinned brain; if none matches, forge is instructed to say so
-plainly and fall back to the native task channel. During a plan draft the
-`task` tool is gated by the dispatch target's effective readonly shape:
+plainly and fall back to the native task channel. Blocking dispatch rides
+either surface (native `task` or `forge_dispatch` with `mode: "wait"` — the
+tool descriptions steer); async dispatch is `forge_dispatch` with
+`mode: "async"`. During a plan draft BOTH surfaces are gated by the dispatch
+target's effective readonly shape:
 readonly scout dispatch passes as reconnaissance (breadth evidence without
 burning the planning session's context), write-shaped workers and native
 agents are denied with the dispatchable roster and the two exits.
@@ -1065,7 +1124,8 @@ approve the plan first (revising after approval is allowed via a new `/plan`).
 The escape hatches are `plan_approve` and `/plan discard`, by design.
 
 One carve-out, keyed on the target rather than the tool: during a draft the
-`task` tool is gated by the dispatch target's **effective readonly shape**. A
+`task` tool — and `forge_dispatch`, in BOTH modes, through the same
+predicate — is gated by the dispatch target's **effective readonly shape**. A
 dispatch to a forge worker whose shape is EXPLICITLY `readonly` AND whose
 permission
 overrides do not lift `write`/`edit`/`bash` — nor any host patch-family tool

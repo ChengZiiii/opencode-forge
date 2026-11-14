@@ -37,13 +37,14 @@ function inputFor(wt) {
   }
 }
 
-test("registration: both search tools are registered — plugin tool count is 17", async () => {
+test("registration: both search tools are registered — plugin tool count is 18", async () => {
   const wt = mkdtempSync(join(tmpdir(), "search-reg-"))
   try {
     const h = await startServer(inputFor(wt), {})
     assert.equal(typeof h.tool.forge_grep.execute, "function", "forge_grep registered")
     assert.equal(typeof h.tool.forge_glob.execute, "function", "forge_glob registered")
-    assert.equal(Object.keys(h.tool).length, 17, "15 prior tools + the search pair")
+    // 15 prior + search pair (17) + forge_dispatch (change async-dispatch) = 18
+    assert.equal(Object.keys(h.tool).length, 18, "15 prior tools + the search pair + forge_dispatch")
     // Descriptions carry the preference line (D7 — teaches the primary,
     // which has no materialized mandate).
     for (const name of ["forge_grep", "forge_glob"]) {

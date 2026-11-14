@@ -53,7 +53,7 @@ import {
 import { formatOutcomes, outcomesAllOk, runChecks } from "./src/run-check.ts"
 import { killTree, pidAlive } from "./src/proc.ts"
 import { setHostShell } from "./src/shell-select.ts"
-import { createJobManager, type Job } from "./src/job-manager.ts"
+import { createJobManager, newJobId, type Job } from "./src/job-manager.ts"
 import { HARD_MAX_WAIT_MS, POLL_WAIT_MAX_MS, adoptSurvivor, jobsLogDir, pollJob, readJobLog, startJob } from "./src/job-runner.ts"
 import { createJobFence, type JobFence } from "./src/job-fence.ts"
 import { createJobRegistry, registryPathFor, structuralRelocate, structuralRelocateAsync, type JobRegistry } from "./src/job-registry.ts"
@@ -77,6 +77,7 @@ import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type Dept
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
+import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS, abortChild, createChildSession, fetchFinalMessage, pollChild, sendPrompt, type DispatchClient } from "./src/dispatch-async.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -97,6 +98,9 @@ const FORGE_STATE_TOOLS = [
   "goal_discard",
   "crew_begin",
   "crew_close",
+  // Dispatch is a coordinator move (async-dispatch design D5): a forge-*
+  // worker calling forge_dispatch hits the same primary-only refusal.
+  "forge_dispatch",
 ] as const
 const FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"] as const
 // Search pair (change forge-search-tools, design D6): joins the same
@@ -719,7 +723,20 @@ let jobClient: JobClient | null = null
 // treated as busy — they keep the conservative idle-edge delivery path.
 const idleJobSessions = new Set<string>()
 
+// Dispatch marker riding async-dispatch registry entries (kind=dispatch,
+// async-dispatch design D3): the entry is a job-manager registry row, not a
+// process — the wake text carries the child's final assistant message inline.
+type DispatchJobMeta = { agentID: string; childSessionID: string; description: string }
+
 function jobWakeText(job: Job): string {
+  const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
+  if (dispatch) {
+    return [
+      `[forge:dispatch-complete] forge_dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
+      `Final report:\n${job.tail.slice(-2500) || "(no output)"}`,
+      "The dispatch is complete — read the report above; no polling, no re-dispatch needed.",
+    ].join("\n")
+  }
   return [
     `[forge:job-complete] Background job ${job.id} finished (${job.state}${job.exitCode !== null ? `, exit ${job.exitCode}` : ""}).`,
     `Command: ${job.cmd}`,
@@ -730,9 +747,11 @@ function jobWakeText(job: Job): string {
 
 // Deliver queued completion wakes to a session that just went idle. A send
 // failure re-queues the wake (bounded by the manager's delivery window,
-// which abandons it to the ledger instead of looping forever).
+// which abandons it to the ledger instead of looping forever). No jobStage
+// guard: async-dispatch registry entries (kind=dispatch) ride this same
+// path and their wakes must deliver even under supervisor retirement.
 async function deliverJobWakes(sessionID: string): Promise<void> {
-  if (forgeDisabled || jobStage() >= 2) return
+  if (forgeDisabled) return
   if (!jobClient || typeof jobClient.session.promptAsync !== "function") return
   for (const job of jobManager.deliverWakesFor(sessionID)) {
     try {
@@ -758,6 +777,150 @@ async function handoffTarget(sessionID: string): Promise<string | undefined> {
     }
   }
   return current === sessionID ? undefined : current
+}
+
+// ---------------------------------------------------------------------------
+// Dispatch gates (change async-dispatch, spec: forge-subagents —
+// "forge_dispatch surface"): ONE set of predicates serves BOTH dispatch
+// surfaces — the native-task interception belt (tool.execute.before) and the
+// forge_dispatch tool execute — so the two paths can never drift. Each
+// returns the refusal string or null (pass).
+// ---------------------------------------------------------------------------
+
+// pool-gate-authoritative-anchor (D1/D2): the dispatch belts resolve the
+// session anchor AUTHORITATIVE-FIRST — the host's own session record
+// carries the true { directory, worktree } even for resumed-after-restart
+// sessions (which never re-fire session.created), while the in-memory map
+// has degenerate writers (rootish tool contexts resolve to the launch
+// directory). Read-only resolver: it never writes back into the map, so
+// the map's other consumers keep their contracts.
+async function resolveSessionAnchorForPools(anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null | undefined, sessionID: string | undefined): Promise<string> {
+  if (!sessionID) return ""
+  let authoritative = ""
+  try {
+    const rec = anchorClient?.session?.get
+      ? ((await anchorClient.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined)
+      : undefined
+    const anchor = effectiveWorktree(rec?.worktree, rec?.directory)
+    if (anchor && !isRootish(anchor)) authoritative = anchor
+  } catch {}
+  const mapped = sessions.get(sessionID)?.worktree ?? ""
+  if (authoritative === "") return mapped
+  // anchor-pool-preference (the 0.20.0 evening incident's mirror of the
+  // 0.18.0 one): a restart-RESUMED session's authoritative record can carry
+  // the NEW launch directory (pool-less) while the in-memory binding — kept
+  // fresh by the session's own live activity — still owns the real pooled
+  // worktree. Authoritative-first would strip the session's own-pool
+  // dispatch rights. Conflict rule: when the record anchor owns NO pool and
+  // the (different, non-degenerate) map binding owns one, the POOLED
+  // binding wins, with one bounded disclosure per session. Every other
+  // shape keeps the record's precedence (the 0.18.0 semantics).
+  if (
+    mapped &&
+    !isRootish(mapped) &&
+    foldPath(mapped) !== foldPath(authoritative) &&
+    sessionPoolFileOf(authoritative) === null &&
+    sessionPoolFileOf(mapped) !== null
+  ) {
+    if (!anchorPrefNotes.has(sessionID)) {
+      anchorPrefNotes.add(sessionID)
+      console.warn(
+        `[forge:pool] session ${sessionID}: the authoritative session record anchors to a POOL-LESS directory (${authoritative}) while the session's live binding owns a pool (${mapped}) — the pooled binding wins this resolution (restart-resume rebind shape).`,
+      )
+    }
+    return mapped
+  }
+  return authoritative
+}
+
+// Session-domain pool gate (sole-pool-ownership): a dispatch targeting a
+// forge-* worker whose pool belongs to ANOTHER workspace is refused — the
+// target's origin pool path is named, with the three exits. Unknown session
+// anchors keep the fail-open belt posture with a bounded disclosure.
+async function poolGateRefusal(anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null | undefined, sessionID: string, target: string): Promise<string | null> {
+  const resolution = resolvePools()
+  const agentId = target.slice("forge-".length)
+  const entry = resolution?.agents[agentId]
+  if (!(resolution && entry)) return null
+  const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID)
+  if (!anchor) {
+    if (!poolGateUnknownNotes.has(sessionID)) {
+      poolGateUnknownNotes.add(sessionID)
+      console.warn(
+        `[forge:pool] session ${sessionID}: task dispatch to ${target} passed an UNGATED pool check — the session's workspace could not be established (fail-open belt posture; pool ownership unscoped).`,
+      )
+    }
+    return null
+  }
+  const sessionPool = sessionPoolFileOf(anchor)
+  const allowed = sessionPool ?? globalPoolPathOf()
+  if (allowed === null || foldPath(entry.file) !== foldPath(allowed)) {
+    return (
+      `[forge:pool] Dispatch refused: "${target}" belongs to the pool ${entry.file} — not dispatchable from this session. ` +
+      `This session's dispatchable roster is ${sessionPool ? `its workspace pool (${sessionPool})` : `the global fallback (${globalPoolPathOf()})`}. ` +
+      `Exits: open a session in that pool's workspace, or configure the role into this workspace's pool (its .opencode/forge.json), or into the global layer (${globalPoolPathOf()}).`
+    )
+  }
+  return null
+}
+
+// Crew pending belt (crew-harness): a registered-but-unarmed crew refuses
+// EVERY dispatch — the registration→execution seam is a user decision point.
+function crewPendingRefusal(sessionID: string | undefined): string | null {
+  const pendingCrew = sessionID ? crews.get(sessionID) : undefined
+  if (pendingCrew && pendingCrew.mode === "pending") {
+    return (
+      `[forge:crew] Dispatch refused: the crew "${pendingCrew.objective}" is PENDING (registered, not armed). Present the execution-mode choice to the user — supervised waves now / convert to a goal contract / standby — then arm per their choice with crew_begin {execution: "waves" | "goal"}. Reconnaissance task calls are free only BEFORE registration.`
+    )
+  }
+  return null
+}
+
+// Crew compliance belt (pool-namespace-contract): for dispatches to forge-*
+// targets FROM a crew-governed session, re-run the file-level pool
+// compliance check. Runs AFTER the session-domain pool gate (a cross-pool
+// target keeps its not-dispatchable copy — compliance never masks it).
+// Global-fallback sessions are exempt; unknown anchors stay fail-open.
+async function crewComplianceRefusalFor(anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null | undefined, sessionID: string, target: string): Promise<string | null> {
+  if (!(target && target.toLowerCase().startsWith("forge-"))) return null
+  const crew = crews.get(sessionID)
+  if (!(crew && (crew.mode === "pending" || crew.mode === "executing"))) return null
+  const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID)
+  if (!anchor) return null
+  const complianceRefusal = crewPoolComplianceRefusal(anchor)
+  // crew-native-fallback: the MID-CREW refusal gains the native exit
+  // sentence; the refusal CONDITION is untouched.
+  return complianceRefusal ? complianceRefusal + CREW_COMPLIANCE_NATIVE_EXIT : null
+}
+
+// Plan-draft shape gate (allow-readonly-recon): during an active draft a
+// dispatch to an effective-readonly forge target passes as reconnaissance
+// (BOTH dispatch modes, both surfaces); every other target — write-shape
+// workers, native agents, absent/unresolvable targets — is denied with the
+// dispatchable readonly roster and the exits.
+function draftDispatchRefusal(sessionID: string | undefined, target: string | undefined): string | null {
+  const state = stateForBan(sessionID)
+  const active = state ? resolveActivePlan(state) : null
+  if (!(active && active.doc.status === "draft")) return null
+  const agentId = target !== undefined && target.toLowerCase().startsWith("forge-") ? target.slice("forge-".length) : undefined
+  const def = agentId !== undefined ? resolvePools()?.agents[agentId]?.def : undefined
+  if (def !== undefined && effectiveReadonlyShape(def)) {
+    // Reconnaissance dispatch: passes the write-class ban. The worker's own
+    // materialized permission denies write/edit/bash (and task, always) —
+    // no mutation path is transported.
+    return null
+  }
+  const roster: string[] = []
+  const pools = resolvePools()
+  if (pools) for (const [id, entry] of Object.entries(pools.agents)) if (effectiveReadonlyShape(entry.def)) roster.push(`forge-${id}`)
+  roster.sort()
+  return (
+    `[forge] A plan is in draft; dispatch is denied for this target. ` +
+    (roster.length > 0
+      ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. `
+      : `No readonly worker is configured — define one in forge.json with an explicit "shape": "readonly" to enable draft-phase reconnaissance. `) +
+    `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`
+  )
 }
 
 const WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"])
@@ -1600,6 +1763,225 @@ const forgeJobsTool = tool({
   },
 })
 
+// ---------------------------------------------------------------------------
+// forge_dispatch (change async-dispatch, spec: forge-subagents —
+// "forge_dispatch surface" + "Async dispatch lifecycle"): dispatch a
+// materialized forge-* subagent as a REAL child session on the same host
+// (SDK session.create with parentID — native TUI visibility, native abort),
+// mode "wait" (blocking parity) or "async" (handle + single completion wake
+// through the job-wake path). The child-session lifecycle core is
+// src/dispatch-async.ts (structural client seam, no @opencode-ai imports).
+// ---------------------------------------------------------------------------
+
+// Per-session concurrent async cap (spec: Async dispatch lifecycle).
+export const ASYNC_DISPATCH_CAP = 3
+
+type DispatchHandle = { jobId: string; childSessionID: string; agentID: string; ownerSession: string; description: string }
+// jobId -> handle. Entries are pruned when the poller settles or the owner
+// session ends; the cap counts entries whose registry job is still running.
+const dispatchTasks = new Map<string, DispatchHandle>()
+
+function inFlightAsyncDispatches(sessionID: string): string[] {
+  const ids: string[] = []
+  for (const [id, handle] of dispatchTasks) {
+    if (handle.ownerSession !== sessionID) continue
+    const job = jobManager.get(id)
+    if (job) {
+      if (job.state === "running") ids.push(id)
+    } else {
+      dispatchTasks.delete(id)
+    }
+  }
+  return ids
+}
+
+function dispatchClient(): DispatchClient | null {
+  return jobClient as unknown as DispatchClient | null
+}
+
+// Async poller (design D3): an in-plugin loop watching the child session —
+// NOT a job-runner child process. The watch runs in slices so a registry
+// kill (owner death, dispose) stops the loop at the next slice boundary; on
+// terminal it fetches the final message, parks it on the registry row's
+// tail (the wake text reads it inline), and marks the job terminal — the
+// manager's wake queue does the rest (idle-only injection, at-most-once,
+// delivery window, ledger overflow).
+async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSessionID: string): Promise<void> {
+  const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
+  const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000))
+  const deadline = Date.now() + DEFAULT_POLL_TIMEOUT_MS
+  let text = ""
+  let exitCode = 0
+  for (;;) {
+    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs })
+    if (poll.status === "completed") {
+      const fin = await fetchFinalMessage(client, childSessionID)
+      text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`
+      break
+    }
+    if (poll.status === "error") {
+      text = `(child session ended in error: ${poll.error})`
+      exitCode = 1
+      break
+    }
+    // slice timeout: a registry kill (owner session ended / dispose) stops
+    // the watch — no wake fires for a killed row (markTerminal first-wins).
+    if (job.state !== "running") {
+      dispatchTasks.delete(job.id)
+      return
+    }
+    if (Date.now() >= deadline) {
+      text = `(poll timeout after ${DEFAULT_POLL_TIMEOUT_MS}ms — child session ${childSessionID} is still running and inspectable/abortable in the host TUI)`
+      break
+    }
+  }
+  jobManager.appendOutput(job, text)
+  jobManager.markTerminal(job, "exited", exitCode)
+  dispatchTasks.delete(job.id)
+}
+
+const FORGE_DISPATCH_DESCRIPTION = [
+  "Dispatch a materialized forge-* subagent as a REAL child session on this host (SDK session.create with parentID): it renders in the host session tree with native subagent affordances — progress, expandable transcript, user abort — and runs the materialized agent with its own permission map.",
+  'mode is YOUR dispatch-time decision: "async" when the result does NOT block your next steps (fire it and continue other work or end the turn); "wait" when your very next step depends on the result (blocking parity with the native task tool).',
+  'async discipline: after an async dispatch, END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker\'s final report is injected when it finishes (idle-only, at-most-once, delivery window). NEVER poll, re-dispatch, or "check on" an async dispatch before that wake arrives — pre-wake polling is a BLOCKING anti-pattern.',
+  "Every materialized shape is dispatchable in BOTH modes (write workers included): write authority is the target's materialized permission map, not a mode gate. Child sessions never block on human input (the question tool is denied session-wide); a permission ask nobody answers degrades to the honest poll-timeout finding naming the child session id (the child stays inspectable and natively abortable in the TUI).",
+  "Gates match the native task surface exactly: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance gates, the plan-draft readonly-recon exemption (readonly targets pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch). The native task tool keeps working unchanged for forge-* targets — prefer forge_dispatch when you want async execution or an SDK-visible child session.",
+].join("\n")
+
+const forgeDispatchTool = tool({
+  description: FORGE_DISPATCH_DESCRIPTION,
+  args: {
+    subagent_type: tool.schema.string().describe('Materialized forge-* agent id (e.g. "forge-plugindev-spec-reviewer") — use native task for other subagents'),
+    prompt: tool.schema.string().describe("The complete task prompt for the worker (self-contained: it carries the artifact paths/slices and the evidence demands)"),
+    mode: tool.schema.string().describe('Dispatch-time decision: "wait" (block this call until the child finishes and return its final report — use when the next step depends on the result) or "async" (return a task handle immediately; a single [forge:dispatch-complete] wake carries the final report later — use when the result does not block your next steps)'),
+    description: tool.schema.string().optional().describe("Short task description used as the child session's title in the host UI (defaults to the prompt's first words)"),
+  },
+  execute: async (args, context) => {
+    noteToolAgent(context)
+    const mode = String(args.mode ?? "").trim().toLowerCase()
+    if (mode !== "wait" && mode !== "async") {
+      throw new Error(`[forge:dispatch] mode must be "wait" or "async" (got ${JSON.stringify(mode || "(missing)")}).`)
+    }
+    const target = String(args.subagent_type ?? "").trim()
+    const prompt = String(args.prompt ?? "")
+    if (!target || !prompt) throw new Error("[forge:dispatch] subagent_type and prompt are both required.")
+    if (!target.toLowerCase().startsWith("forge-")) {
+      throw new Error(
+        `[forge:dispatch] "${target}" is not a forge-family worker — forge_dispatch dispatches materialized forge-* subagents only. Use the native task tool for other subagents.`,
+      )
+    }
+    // Tool-partition family gates, enforced in-execute (belt parity with
+    // tool.execute.before): non-forge speakers never reach forge tooling;
+    // forge-* workers hit the primary-only STATE refusal (design D5).
+    const speaker = sessionAgents.get(context.sessionID)
+    if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+      throw new Error(
+        `[forge:partition] Tool refused: "forge_dispatch" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`,
+      )
+    }
+    if (speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT) {
+      throw new Error(
+        `[forge:partition] Tool refused: "forge_dispatch" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls forge_dispatch at the gate.`,
+      )
+    }
+    // Target must be a materialized pool agent (hot-apply resolve).
+    const agentId = target.slice("forge-".length)
+    const resolution = resolvePools()
+    if (!resolution || !resolution.agents[agentId]) {
+      throw new Error(
+        `[forge:dispatch] "${target}" is not a materialized forge subagent on this host. Check the roster in the agent descriptions (or .opencode/forge.json), or dispatch the native general subagent instead.`,
+      )
+    }
+    // Gate parity with the native-task belt: the SAME predicates, same copy.
+    // The anchor resolution uses this host's client (jobClient — the client
+    // of the server() initialization that registered this tool's host).
+    const poolRefusal = await poolGateRefusal(jobClient, context.sessionID, target)
+    if (poolRefusal) throw new Error(poolRefusal)
+    const pendingRefusal = crewPendingRefusal(context.sessionID)
+    if (pendingRefusal) throw new Error(pendingRefusal)
+    const complianceRefusal = await crewComplianceRefusalFor(jobClient, context.sessionID, target)
+    if (complianceRefusal) throw new Error(complianceRefusal)
+    const draftRefusal = draftDispatchRefusal(context.sessionID, target)
+    if (draftRefusal) throw new Error(draftRefusal)
+    if (mode === "async") {
+      const inFlight = inFlightAsyncDispatches(context.sessionID)
+      if (inFlight.length >= ASYNC_DISPATCH_CAP) {
+        throw new Error(
+          `[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")}. ` +
+            `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one with mode: "wait".`,
+        )
+      }
+    }
+    const client = dispatchClient()
+    if (!client) throw new Error("[forge:dispatch] no host client available — dispatch cannot create a child session.")
+    const state = ensureSession(context.sessionID, worktreeFor(context))
+    const description =
+      typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60)
+    const created = await createChildSession(client, {
+      parentSessionID: context.sessionID,
+      parentDirectory: state.worktree,
+      agentID: target,
+      description,
+    })
+    if (!created.ok) throw new Error(`[forge:dispatch] child session creation failed: ${created.error}`)
+    const sent = await sendPrompt(client, { sessionID: created.sessionID, agentID: target, prompt, directory: state.worktree })
+    if (!sent.ok) {
+      throw new Error(`[forge:dispatch] prompt send to child session ${created.sessionID} failed: ${sent.error} — the child exists and is natively abortable in the TUI.`)
+    }
+    if (mode === "wait") {
+      const poll = await pollChild(client, {
+        sessionID: created.sessionID,
+        intervalMs: Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS),
+      })
+      if (poll.status === "timeout") {
+        throw new Error(
+          `[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` +
+            `It remains a real session: inspect or abort it natively in the host TUI. No auto-convert to async happened (the dependency structure did not change).`,
+        )
+      }
+      if (poll.status === "error") {
+        throw new Error(`[forge:dispatch] child session ${created.sessionID} ended in error: ${poll.error}`)
+      }
+      const fin = await fetchFinalMessage(client, created.sessionID)
+      if (!fin.ok) throw new Error(`[forge:dispatch] ${fin.error}`)
+      context.metadata({ title: `${target}: dispatch complete` })
+      return {
+        title: `${target}: dispatch complete`,
+        output: [`[forge:dispatch] ${target} finished (child session ${created.sessionID}).`, `Final report:\n${fin.text}`].join("\n"),
+      }
+    }
+    // async: registry entry (kind=dispatch) + poller; the handle returns now.
+    const jobId = newJobId()
+    const job = jobManager.create({
+      id: jobId,
+      cmd: `dispatch ${target}: ${description}`,
+      worktree: state.worktree,
+      ownerSession: context.sessionID,
+      logPath: join(jobLogDir, "dispatch", `${jobId}.txt`),
+      notify: true,
+      // Owner-death harvest: the manager's kill() on session end calls this —
+      // the child session is aborted via the SDK and the orphan is ledgered.
+      killTree: () => {
+        void abortChild(client, created.sessionID)
+      },
+    })
+    ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
+    dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description })
+    void runAsyncDispatchPoller(client, job, created.sessionID)
+    context.metadata({ title: `${target}: dispatch async` })
+    return {
+      title: `${target}: dispatch async (${jobId})`,
+      output: [
+        `[forge:dispatch] Dispatched ${target} in async mode — the child session runs in the background.`,
+        `task id: ${jobId}`,
+        `agent: ${target}`,
+        `child session: ${created.sessionID} (visible in the host session tree; natively abortable)`,
+        `Next: END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when it finishes — never poll or re-dispatch to check on it. Cap: ${ASYNC_DISPATCH_CAP} concurrent async dispatches per session.`,
+      ].join("\n"),
+    }
+  },
+})
+
 
 
 
@@ -2262,6 +2644,10 @@ function forgeTools(): Record<string, ToolDefinition> {
   if (!forgeDisabled) {
     tools.crew_begin = crewBeginTool
     tools.crew_close = crewCloseTool
+    // forge_dispatch (change async-dispatch): forge tool family — hidden from
+    // non-forge agents and workers by the partition injections; removed with
+    // the whole family under the disable knob (the getter returns {}).
+    tools.forge_dispatch = forgeDispatchTool
   }
   return tools
 }
@@ -2703,52 +3089,10 @@ export const server: Plugin = async (input, options) => {
   // (deletions un-materialize) and dispatch is session-scoped.
   rememberHostAnchor(effectiveInitDir)
   const client = input.client as unknown as GoalClient
-  // pool-gate-authoritative-anchor (D1/D2): the dispatch belts resolve the
-  // session anchor AUTHORITATIVE-FIRST — the host's own session record
-  // carries the true { directory, worktree } even for resumed-after-restart
-  // sessions (which never re-fire session.created), while the in-memory map
-  // has degenerate writers (rootish tool contexts resolve to the launch
-  // directory). Read-only resolver: it never writes back into the map, so
-  // the map's other consumers keep their contracts. Both the task pool gate
-  // and the crew compliance belt go through this one seam.
-  const resolveSessionAnchorForPools = async (sessionID: string | undefined): Promise<string> => {
-    if (!sessionID) return ""
-    let authoritative = ""
-    try {
-      const rec = client?.session?.get
-        ? ((await client.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined)
-        : undefined
-      const anchor = effectiveWorktree(rec?.worktree, rec?.directory)
-      if (anchor && !isRootish(anchor)) authoritative = anchor
-    } catch {}
-    const mapped = sessions.get(sessionID)?.worktree ?? ""
-    if (authoritative === "") return mapped
-    // anchor-pool-preference (the 0.20.0 evening incident's mirror of the
-    // 0.18.0 one): a restart-RESUMED session's authoritative record can carry
-    // the NEW launch directory (pool-less) while the in-memory binding — kept
-    // fresh by the session's own live activity — still owns the real pooled
-    // worktree. Authoritative-first would strip the session's own-pool
-    // dispatch rights. Conflict rule: when the record anchor owns NO pool and
-    // the (different, non-degenerate) map binding owns one, the POOLED
-    // binding wins, with one bounded disclosure per session. Every other
-    // shape keeps the record's precedence (the 0.18.0 semantics).
-    if (
-      mapped &&
-      !isRootish(mapped) &&
-      foldPath(mapped) !== foldPath(authoritative) &&
-      sessionPoolFileOf(authoritative) === null &&
-      sessionPoolFileOf(mapped) !== null
-    ) {
-      if (!anchorPrefNotes.has(sessionID)) {
-        anchorPrefNotes.add(sessionID)
-        console.warn(
-          `[forge:pool] session ${sessionID}: the authoritative session record anchors to a POOL-LESS directory (${authoritative}) while the session's live binding owns a pool (${mapped}) — the pooled binding wins this resolution (restart-resume rebind shape).`,
-        )
-      }
-      return mapped
-    }
-    return authoritative
-  }
+  // pool-gate-authoritative-anchor (D1/D2): the session anchor resolution the
+  // dispatch belts use lives at MODULE level (resolveSessionAnchorForPools)
+  // so the native-task interception belt and the forge_dispatch tool execute
+  // share one seam over the same client.
   jobClient = input.client as unknown as JobClient
   const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
@@ -3072,51 +3416,18 @@ export const server: Plugin = async (input, options) => {
         // forge-subagents — "Workspace pool ownership and global fallback"):
         // a task targeting a forge-* worker whose pool belongs to ANOTHER
         // workspace is refused — the target's origin pool path is named,
-        // with the three exits. The session's allowed roster is its
-        // workspace pool (nearest forge.json walking up from the resolved
-        // anchor) or, when the workspace has none, the global fallback
-        // layer. pool-gate-authoritative-anchor: the anchor comes from the
-        // host's session record first (resumed-after-restart sessions never
-        // re-fire session.created, and some tool-context shapes degenerate
-        // to the launch directory); sessions whose workspace cannot be
-        // observed through ANY source keep the fail-open belt posture with
-        // a bounded disclosure.
+        // with the three exits. Shared predicate with forge_dispatch
+        // (poolGateRefusal — same source, same copy).
         if (target && target.toLowerCase().startsWith("forge-") && input.sessionID) {
-          const resolution = resolvePools()
-          const agentId = target.slice("forge-".length)
-          const entry = resolution?.agents[agentId]
-          if (resolution && entry) {
-            const anchor = await resolveSessionAnchorForPools(input.sessionID)
-            if (!anchor) {
-              if (!poolGateUnknownNotes.has(input.sessionID)) {
-                poolGateUnknownNotes.add(input.sessionID)
-                console.warn(
-                  `[forge:pool] session ${input.sessionID}: task dispatch to ${target} passed an UNGATED pool check — the session's workspace could not be established (fail-open belt posture; pool ownership unscoped).`,
-                )
-              }
-            } else {
-              const sessionPool = sessionPoolFileOf(anchor)
-              const allowed = sessionPool ?? globalPoolPathOf()
-              if (allowed === null || foldPath(entry.file) !== foldPath(allowed)) {
-                throw new Error(
-                  `[forge:pool] Dispatch refused: "${target}" belongs to the pool ${entry.file} — not dispatchable from this session. ` +
-                    `This session's dispatchable roster is ${sessionPool ? `its workspace pool (${sessionPool})` : `the global fallback (${globalPoolPathOf()})`}. ` +
-                    `Exits: open a session in that pool's workspace, or configure the role into this workspace's pool (its .opencode/forge.json), or into the global layer (${globalPoolPathOf()}).`,
-                )
-              }
-            }
-          }
+          const poolRefusal = await poolGateRefusal(client, input.sessionID, target)
+          if (poolRefusal) throw new Error(poolRefusal)
         }
         // Crew pending belt (crew-harness, change add-crew-execution-mode-gate):
         // a registered-but-unarmed crew refuses EVERY task dispatch — the
         // registration→execution seam is a user decision point. Pre-registration
         // recon dispatches freely; armed and ended crews never pend here.
-        const pendingCrew = input.sessionID ? crews.get(input.sessionID) : undefined
-        if (pendingCrew && pendingCrew.mode === "pending") {
-          throw new Error(
-            `[forge:crew] Dispatch refused: the crew "${pendingCrew.objective}" is PENDING (registered, not armed). Present the execution-mode choice to the user — supervised waves now / convert to a goal contract / standby — then arm per their choice with crew_begin {execution: "waves" | "goal"}. Reconnaissance task calls are free only BEFORE registration.`,
-          )
-        }
+        const pendingRefusal = crewPendingRefusal(input.sessionID)
+        if (pendingRefusal) throw new Error(pendingRefusal)
         // Crew compliance belt (change pool-namespace-contract, spec:
         // crew-harness — "Crew-governed dispatch pool-compliance gate"):
         // for task dispatches to forge-* targets FROM a crew-governed
@@ -3129,18 +3440,8 @@ export const server: Plugin = async (input, options) => {
         // (non-forge) targets are unaffected; global-fallback sessions are
         // exempt; an unknown session anchor keeps the fail-open posture.
         if (target && target.toLowerCase().startsWith("forge-") && input.sessionID) {
-          const crew = crews.get(input.sessionID)
-          if (crew && (crew.mode === "pending" || crew.mode === "executing")) {
-            const anchor = await resolveSessionAnchorForPools(input.sessionID)
-            if (anchor) {
-              const complianceRefusal = crewPoolComplianceRefusal(anchor)
-              // crew-native-fallback: the MID-CREW refusal gains the native
-              // exit sentence (the registration pre-flight copy above keeps
-              // the bare refusal — D3); the belt's refusal CONDITION is
-              // untouched.
-              if (complianceRefusal) throw new Error(complianceRefusal + CREW_COMPLIANCE_NATIVE_EXIT)
-            }
-          }
+          const complianceRefusal = await crewComplianceRefusalFor(client, input.sessionID, target)
+          if (complianceRefusal) throw new Error(complianceRefusal)
         }
       }
       // State-file boundary (tool-partition): non-forge sessions must not
@@ -3175,34 +3476,12 @@ export const server: Plugin = async (input, options) => {
           if (input.tool === "task") {
             // allow-readonly-recon-during-plan-draft: the spawn carve-out is
             // keyed on the TARGET's effective readonly shape, not a wholesale
-            // deny. A dispatch to a provably non-mutating forge worker passes
-            // as reconnaissance (breadth evidence without spending the
-            // planning session's context); every other target — write-shape
-            // workers, native agents, absent/unresolvable targets — is denied
-            // with the dispatchable readonly roster and the exits. Speaker-
-            // agnostic like the ban itself; the family dispatch guard above
-            // has already refused non-forge speakers dispatching forge-*.
+            // deny. Shared predicate with forge_dispatch
+            // (draftDispatchRefusal — same source, same copy, both modes).
             const a = (output?.args ?? {}) as { subagent_type?: unknown; agent?: unknown }
             const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined
-            const agentId = target !== undefined && target.toLowerCase().startsWith("forge-") ? target.slice("forge-".length) : undefined
-            const def = agentId !== undefined ? resolvePools()?.agents[agentId]?.def : undefined
-            if (def !== undefined && effectiveReadonlyShape(def)) {
-              // Reconnaissance dispatch: passes the write-class ban. The
-              // worker's own materialized permission denies write/edit/bash
-              // (and task, always) — no mutation path is transported.
-            } else {
-              const roster: string[] = []
-              const pools = resolvePools()
-              if (pools) for (const [id, entry] of Object.entries(pools.agents)) if (effectiveReadonlyShape(entry.def)) roster.push(`forge-${id}`)
-              roster.sort()
-              throw new Error(
-                `[forge] A plan is in draft; dispatch is denied for this target. ` +
-                  (roster.length > 0
-                    ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. `
-                    : `No readonly worker is configured — define one in forge.json with an explicit "shape": "readonly" to enable draft-phase reconnaissance. `) +
-                  `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`,
-              )
-            }
+            const refusal = draftDispatchRefusal(input.sessionID, target)
+            if (refusal) throw new Error(refusal)
           } else {
             throw new Error(
               `[forge] A plan is in draft; write operations are denied (${input.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`,
@@ -3424,6 +3703,9 @@ export const server: Plugin = async (input, options) => {
       anchors: () => [...hostAnchors],
       resolveNow: () => resolvePools(),
       workspacePoolOf: (anchor: string) => sessionPoolFileOf(anchor),
+      // Async-dispatch seams (change async-dispatch wiring tests).
+      dispatchTasks: () => [...dispatchTasks.values()],
+      jobLedger: () => jobManager.ledgerEntries(),
     },
 
     // permission.ask belt: on hosts/sessions where permission requests ARE
@@ -3491,6 +3773,14 @@ export const server: Plugin = async (input, options) => {
           // Owner session ended: live session-scoped jobs are killed,
           // unread completions ledgered (job-supervisor spec).
           jobManager.onSessionEnd(info.id)
+          // Async-dispatch harvest (spec: Async dispatch lifecycle —
+          // "Owner death harvests children"): onSessionEnd above killed the
+          // session's live dispatch registry rows — each killTree aborted the
+          // child session via the SDK and the orphan landed in the
+          // diagnostics ledger. The handle map follows.
+          for (const [id, handle] of [...dispatchTasks]) {
+            if (handle.ownerSession === info.id) dispatchTasks.delete(id)
+          }
           // The frozen depth translation dies with its session (bounded table).
           sessionDepths.delete(info.id)
           // Same for the agent-family map (tool-partition).
