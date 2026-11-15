@@ -302,11 +302,15 @@ export async function pollChild(
       return { status: "aborted", sessionID: input.sessionID, polls }
     }
 
-    // Status fetch failure is transient (server hiccup) — keep polling
-    // until the deadline; only timeout is terminal here. Soundness
-    // (sync-timeout-notify): an UNREADABLE status (fetch failed/threw) or a
-    // session MISSING from a fetched map is treated as ACTIVE — never a
-    // terminal verdict. Only a fetched map entry may prove not-active.
+    // Soundness (sync-timeout-notify), empirically corrected on host 1.19.5:
+    // GET /session/status returns ONLY currently-active (busy/retry) sessions
+    // — a COMPLETED session is REMOVED from the map. So:
+    //   • an UNREADABLE status (fetch failed/threw) is treated as ACTIVE —
+    //     keep polling, never a verdict on a signal we could not read;
+    //   • a session MISSING from a successfully fetched map is the host's
+    //     IDLE signal — not-active (the stability window below is what
+    //     guards against transient flakes where a running child blinks out
+    //     of the map for a tick or two; it re-appears and resets the run).
     let statusMap: StatusMapLike | undefined
     try {
       const statusResult = await client.session.status()
@@ -321,7 +325,7 @@ export async function pollChild(
       active = true
     } else {
       const entry = statusMap[input.sessionID]
-      active = entry === undefined ? true : isActiveStatus(entry)
+      active = entry === undefined ? false : isActiveStatus(entry)
     }
 
     let messages: SessionMessageLike[] = []

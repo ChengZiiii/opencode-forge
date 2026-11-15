@@ -77,7 +77,7 @@ import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type Dept
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, abortChild, createChildSession, fetchFinalMessage, pollChild, resolvePollTimeoutMs, sendPrompt, type DispatchClient } from "./src/dispatch-async.ts"
+import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS, abortChild, createChildSession, fetchFinalMessage, pollChild, resolvePollTimeoutMs, sendPrompt, type DispatchClient } from "./src/dispatch-async.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -1824,7 +1824,11 @@ function dispatchClient(): DispatchClient | null {
 async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSessionID: string): Promise<void> {
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
   const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000))
-  const timeoutMs = resolvePollTimeoutMs()
+  // The tracker's window is ALWAYS the full default (600s), never the sync
+  // knob: FORGE_DISPATCH_POLL_TIMEOUT_MS scopes the SYNC WAIT only, so a
+  // short-knob repro (or any deployment tuning the wait) cannot starve the
+  // armed tracker of a child that legitimately needs longer.
+  const timeoutMs = DEFAULT_POLL_TIMEOUT_MS
   const deadline = Date.now() + timeoutMs
   let text = ""
   let exitCode = 0

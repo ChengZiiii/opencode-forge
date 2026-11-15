@@ -16602,9 +16602,20 @@ async function sendPrompt(client, input) {
 }
 var DEFAULT_POLL_INTERVAL_MS = 1000;
 var DEFAULT_POLL_TIMEOUT_MS = 600000;
+var MAX_POLL_TIMEOUT_MS = 3600000;
+function resolvePollTimeoutMs(env = process.env) {
+  const raw = env.FORGE_DISPATCH_POLL_TIMEOUT_MS;
+  if (raw === undefined || raw === "")
+    return DEFAULT_POLL_TIMEOUT_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1)
+    return DEFAULT_POLL_TIMEOUT_MS;
+  return Math.min(Math.round(parsed), MAX_POLL_TIMEOUT_MS);
+}
 function isActiveStatus(status) {
   return status !== undefined && status.type !== undefined && ACTIVE_STATUS_TYPES.has(status.type);
 }
+var TERMINAL_STABILITY_TICKS = 3;
 function latestAssistant(messages) {
   let best;
   let bestCreated = -Infinity;
@@ -16633,6 +16644,7 @@ async function pollChild(client, input, seams = {}) {
   const intervalMs = input.intervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const timeoutMs = input.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
   const deadline = now() + timeoutMs;
+  const stability = input.stability ?? { stableTicks: 0 };
   let polls = 0;
   for (;; ) {
     await sleep(intervalMs);
@@ -16649,7 +16661,13 @@ async function pollChild(client, input, seams = {}) {
     } catch {
       statusMap = undefined;
     }
-    const active = statusMap !== undefined && isActiveStatus(statusMap[input.sessionID]);
+    let active;
+    if (statusMap === undefined) {
+      active = true;
+    } else {
+      const entry = statusMap[input.sessionID];
+      active = entry === undefined ? false : isActiveStatus(entry);
+    }
     let messages = [];
     try {
       const msgResult = await client.session.messages({
@@ -16666,8 +16684,15 @@ async function pollChild(client, input, seams = {}) {
     if (last?.info?.error != null) {
       return { status: "error", error: describeError(last.info.error), polls };
     }
-    if (!active && last?.info?.finish !== undefined) {
-      return { status: "completed", polls };
+    const finished = Boolean(last?.info?.finish);
+    const textful = last !== undefined && (last.parts ?? []).some((p) => p.type === "text" && typeof p.text === "string" && p.text !== "");
+    if (!active && finished && textful) {
+      stability.stableTicks++;
+      if (stability.stableTicks >= TERMINAL_STABILITY_TICKS) {
+        return { status: "completed", polls };
+      }
+    } else {
+      stability.stableTicks = 0;
     }
     if (now() >= deadline) {
       return { status: "timeout", sessionID: input.sessionID, timeoutMs, polls };
@@ -17917,11 +17942,13 @@ function dispatchClient() {
 async function runAsyncDispatchPoller(client, job, childSessionID) {
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
   const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5000));
-  const deadline = Date.now() + DEFAULT_POLL_TIMEOUT_MS;
+  const timeoutMs = DEFAULT_POLL_TIMEOUT_MS;
+  const deadline = Date.now() + timeoutMs;
   let text = "";
   let exitCode = 0;
+  const stability = { stableTicks: 0 };
   for (;; ) {
-    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs });
+    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability });
     if (poll.status === "completed") {
       const fin = await fetchFinalMessage(client, childSessionID);
       text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`;
@@ -17937,7 +17964,7 @@ async function runAsyncDispatchPoller(client, job, childSessionID) {
       return;
     }
     if (Date.now() >= deadline) {
-      text = `(poll timeout after ${DEFAULT_POLL_TIMEOUT_MS}ms — child session ${childSessionID} is still running and inspectable/abortable in the host TUI)`;
+      text = `(poll timeout after ${timeoutMs}ms — child session ${childSessionID} is still running and inspectable/abortable in the host TUI)`;
       break;
     }
   }
@@ -18036,6 +18063,7 @@ var taskDispatchTool = tool({
       const poll = await pollChild(client, {
         sessionID: created.sessionID,
         intervalMs: Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS),
+        timeoutMs: resolvePollTimeoutMs(),
         signal: context.abort
       });
       if (poll.status === "aborted") {
@@ -18052,7 +18080,24 @@ var taskDispatchTool = tool({
         };
       }
       if (poll.status === "timeout") {
-        throw new Error(`[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` + `It remains a real session: inspect or abort it natively in the host TUI. No auto-convert to async happened (the dependency structure did not change).`);
+        const jobId2 = newJobId();
+        taskMetadata.taskId = jobId2;
+        const job2 = jobManager.create({
+          id: jobId2,
+          cmd: `dispatch ${target}: ${description} (sync timeout, armed)`,
+          worktree: state.worktree,
+          ownerSession: context.sessionID,
+          logPath: join6(jobLogDir, "dispatch", `${jobId2}.txt`),
+          notify: true,
+          killTree: () => {
+            abortChild(client, created.sessionID);
+          }
+        });
+        job2.dispatch = { agentID: target, childSessionID: created.sessionID, description };
+        dispatchTasks.set(jobId2, { jobId: jobId2, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description });
+        runAsyncDispatchPoller(client, job2, created.sessionID);
+        context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
+        throw new Error(`[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` + `It remains a real session: inspect or abort it natively in the host TUI. ` + `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes; do not poll or re-dispatch in the meantime.`);
       }
       if (poll.status === "error") {
         throw new Error(`[forge:dispatch] child session ${created.sessionID} ended in error: ${poll.error}`);

@@ -25,12 +25,17 @@ the async concurrency cap (the cap governs new async dispatch decisions,
 not an already-running child), and the timeout finding SHALL disclose
 the armed wake. The poll timeout SHALL default to 600000 ms and SHALL be
 tunable via the `FORGE_DISPATCH_POLL_TIMEOUT_MS` environment variable.
-Terminal inference SHALL be sound against transient readings: a status
-fetch failure or a session missing from a fetched status map SHALL be
-treated as active (keep polling — never a terminal verdict); a completed
+Terminal inference SHALL be sound against unreadable readings: a status
+fetch failure SHALL be treated as active (keep polling — never a
+terminal verdict on a signal that could not be read); a session MISSING
+from a successfully fetched status map is the host's idle signal (the
+map lists only currently-active sessions — a completed session is
+removed) and counts as not-active; a completed
 verdict SHALL require the not-active + finished-latest-assistant
 condition to hold stable across consecutive poll ticks (resetting when
-the session turns busy again), and the finished message SHALL carry a
+the session turns busy again — which also self-heals transient flakes
+where a running child blinks out of the map for a tick or two), and the
+finished message SHALL carry a
 truthy `finish` and non-empty text parts, otherwise the poller SHALL
 keep polling (such a child ends as the honest timeout, covered by the
 armed wake); the async wake path shares the poller and inherits the same
@@ -60,10 +65,15 @@ write-class deny as before, in either mode.
 - **WHEN** a sync dispatch's child does not reach a terminal state within the poll timeout
 - **THEN** the tool returns a timeout finding naming the child session id rather than hanging, the finding discloses the armed wake, the child is registered for completion tracking bypassing the async cap, and exactly one `[forge:dispatch-complete]` wake carrying the child's final report arrives when the child later completes
 
-#### Scenario: Transient status failure never terminates
+#### Scenario: Status fetch failure never terminates
 
-- **WHEN** a status fetch fails (or the session is missing from a fetched status map) while the child has a finished assistant message
-- **THEN** the poller keeps polling (treated as active) and does not declare completion or error on that observation
+- **WHEN** a status fetch fails (unreadable) while the child has a finished assistant message
+- **THEN** the poller treats the reading as active, keeps polling, and does not declare completion or error on that observation
+
+#### Scenario: Missing-from-map is the idle signal, flakes self-heal
+
+- **WHEN** a session is missing from a successfully fetched status map (the host lists only currently-active sessions, so missing = not-active) — either because it completed or because a running child transiently blinked out during a server flake
+- **THEN** the reading counts toward the stability run; if the child re-appears busy within the window the run resets (a flake can never reach depth on a stale receipt), and a genuinely completed child reaches the depth stably and completes
 
 #### Scenario: Receipt-only messages are not final reports
 

@@ -610,12 +610,12 @@ test("sync timeout arming BYPASSES the async cap (design D3: the cap governs new
   assert.equal(syncWakes.length, 1, "exactly one wake carries the timed-out child's report")
 })
 
-// ---------------------------------------------------------------------------
 // Terminal-inference soundness at the wiring layer (sync-timeout-notify):
 // the sync dispatch reuses pollChild, so a receipt-style finished message
-// observed while the status reading is unreadable (missing from the map) or
-// flapping back to busy must NOT resolve the call early with the receipt —
-// completion lands only after the stability depth, on the real report.
+// observed while the child blinks out of the status map (the host's idle
+// signal — map lists only active sessions) or flapping back to busy must
+// NOT resolve the call early with the receipt — completion lands only
+// after the stability depth, on the real report.
 
 test("soundness (wiring): sync dispatch does not return a receipt on a missing/flapping status — completed only after stability depth, on the real report", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)

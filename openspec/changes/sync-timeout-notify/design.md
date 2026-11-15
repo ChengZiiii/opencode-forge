@@ -40,22 +40,26 @@ sync under 10 min returns normally; sync over 10 min loses the callback.
 4. **Env knob `FORGE_DISPATCH_POLL_TIMEOUT_MS`** — parity with the
    existing `FORGE_DISPATCH_POLL_INTERVAL_MS`; also enables a fast
    minimal repro (short timeout + sleeper child) for acceptance.
-5. **Soundness: fail toward waiting** (folded, production-observed) —
-   the poller's fatal line was `active = statusMap !== undefined &&
-   isActiveStatus(...)`: any status fetch failure counted as "not
-   active", and one observation terminated the poll. Fix: (a) a failed
-   status fetch or a session missing from a valid map is treated as
-   ACTIVE; (b) terminal completion requires the not-active + finished
-   condition stable across consecutive ticks (any busy reading resets
-   the stability counter); (c) the finished message must carry a truthy
-   `finish` AND non-empty text parts — a receipt/acknowledgement that
-   turns busy again is just an interim message; a genuinely idle child
-   with no usable final message ends as the honest timeout (armed wake
-   covers it). The async wake path shares the poller and inherits the
-   fix. Stability depth: 3 consecutive ticks (at the default 1s interval
-   ≈ 3s of stable non-activity) — long enough to cover step boundaries
-   and status hiccups, short enough not to lag real completions
-   noticeably.
+5. **Soundness: fail toward waiting on unreadable signals** (folded,
+   production-observed, then empirically corrected): the poller's fatal
+   line was `active = statusMap !== undefined && isActiveStatus(...)`:
+   any status fetch failure counted as "not active", and one observation
+   terminated the poll. Fix: (a) a fetch FAILURE is treated as ACTIVE;
+   (b) a session MISSING from a successfully fetched map is the host's
+   idle signal — LIVE-PROBED on host 1.19.5 mid-change: `GET
+   /session/status` returns only currently-active sessions and a
+   completed session is REMOVED, so missing = not-active (the contract's
+   first guess, "missing = active", would have made completions
+   undetectable — the live repro caught it before release); (c) terminal
+   completion requires the not-active + finished condition stable across
+   TERMINAL_STABILITY_TICKS = 3 consecutive ticks (any active reading
+   resets the run) — this is what kills the texture-forge receipt bug: a
+   running child that blinks out of the map for a tick or two looks like
+   a candidate, but it re-appears busy and resets before a stale receipt
+   could reach depth; (d) the finished message must carry a truthy
+   `finish` AND non-empty text parts. A genuinely idle child with no
+   usable final message ends as the honest timeout (armed wake covers
+   it). The async wake path shares the poller and inherits the fix.
 
 ## Risks / Trade-offs
 

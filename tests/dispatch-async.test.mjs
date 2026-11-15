@@ -387,13 +387,33 @@ test("soundness: status fetch FAILING every tick (throw + error envelope) never 
   assert.equal(pe.status, "timeout")
 })
 
-test("soundness: session MISSING from a fetched status map never terminates despite a finished message — honest timeout", async () => {
+test("soundness: session MISSING from a fetched status map is the host's IDLE signal — completes at stability depth (host 1.19.5 empirics: the map lists only active sessions; a completed session is removed)", async () => {
   const { client } = fakeClient({
-    status: () => ({ data: { some_other_session: { type: "idle" } } }),
+    status: () => ({ data: { some_other_session: { type: "busy" } } }),
     messages: () => [assistantMsg()],
   })
-  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
-  assert.equal(poll.status, "timeout", "missing-from-map is treated as ACTIVE — never a terminal verdict")
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 1000 }, fakeTime().seams)
+  assert.equal(poll.status, "completed", "missing-from-map = not-active (idle signal) — the stability depth makes it safe")
+  assert.equal(poll.polls, TERMINAL_STABILITY_TICKS)
+})
+
+test("soundness: transient MISSING flake on a running child resets the run when it re-appears busy (texture-forge receipt-bug shape)", async () => {
+  // Host 1.19.5 semantics: the map holds only active sessions. A running
+  // child that blinks OUT of the map for a tick or two (server flake) looks
+  // like a candidate (missing = idle signal) — but the stability run resets
+  // the moment it re-appears busy, so the receipt observed during the flake
+  // can never reach depth 3. Completed lands only on the stable tail.
+  const seq = [{ s: { type: "busy" } }, {}, { s: { type: "busy" } }, { s: { type: "idle" } }, { s: { type: "idle" } }, { s: { type: "idle" } }]
+  let tick = 0
+  const { client, calls } = fakeClient({ messages: () => [assistantMsg()] })
+  client.session.status = async () => {
+    calls.status.push({})
+    const entry = seq[Math.min(tick++, seq.length - 1)]
+    return { data: Object.keys(entry).length ? entry : { other: { type: "busy" } } }
+  }
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 1000 }, fakeTime().seams)
+  assert.equal(poll.status, "completed", "the flake resets the run; completion only on the stable tail")
+  assert.equal(poll.polls, 6, "tick1 busy → tick2 flake-candidate(run=1) → tick3 busy RESET → ticks 4-6 rebuild to depth 3")
 })
 
 test("soundness: receipt-then-busy resets the stability run — completed lands exactly at depth 3 after the reset", async () => {

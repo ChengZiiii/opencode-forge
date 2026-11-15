@@ -40,16 +40,22 @@ that never learns the outcome — crew waves stall on idle nudges alone.
   one evening: receipt-only completions (a finished acknowledgement
   message mistaken for the final report while the child kept running),
   and "no assistant text output found" errors on children that were
-  alive and working. The poller SHALL fail toward "keep waiting": a
-  status fetch failure or a session missing from a fetched status map
-  SHALL be treated as ACTIVE; a terminal completed verdict SHALL require
-  the non-active + finished-latest-assistant condition to hold stable
-  across consecutive poll ticks (resetting if the session turns busy
-  again); the finished message SHALL carry a truthy `finish` and non-empty
-  text parts, otherwise the poller SHALL keep polling (an idle child
-  with no usable final message ends as the honest timeout, which the
-  armed wake then covers). The async wake path shares the poller and
-  inherits the same soundness.
+  alive and working. The poller SHALL fail toward "keep waiting" on
+  unreadable signals: a status FETCH failure SHALL be treated as ACTIVE.
+  Empirically corrected during this change (live probe on host 1.19.5):
+  the status map lists ONLY currently-active sessions — a session MISSING
+  from a successfully fetched map is the host's IDLE signal (a completed
+  session is removed), so missing counts as not-active, and the original
+  guess ("missing = active") would have made completions undetectable.
+  Transient flakes where a RUNNING child blinks out of the map for a tick
+  or two are guarded by the stability window: a terminal completed
+  verdict SHALL require the non-active + finished-latest-assistant
+  condition to hold stable across consecutive poll ticks (resetting if
+  the session turns busy again); the finished message SHALL carry a
+  truthy `finish` and non-empty text parts, otherwise the poller SHALL
+  keep polling (an idle child with no usable final message ends as the
+  honest timeout, which the armed wake then covers). The async wake path
+  shares the poller and inherits the same soundness.
 
 ## Impact
 
