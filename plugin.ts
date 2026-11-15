@@ -77,7 +77,7 @@ import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type Dept
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS, abortChild, createChildSession, fetchFinalMessage, pollChild, sendPrompt, type DispatchClient } from "./src/dispatch-async.ts"
+import { DEFAULT_POLL_INTERVAL_MS, abortChild, createChildSession, fetchFinalMessage, pollChild, resolvePollTimeoutMs, sendPrompt, type DispatchClient } from "./src/dispatch-async.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -1824,11 +1824,17 @@ function dispatchClient(): DispatchClient | null {
 async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSessionID: string): Promise<void> {
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
   const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000))
-  const deadline = Date.now() + DEFAULT_POLL_TIMEOUT_MS
+  const timeoutMs = resolvePollTimeoutMs()
+  const deadline = Date.now() + timeoutMs
   let text = ""
   let exitCode = 0
+  // Terminal-inference soundness is owned by pollChild; the stability
+  // counter lives HERE so it survives poll-slice boundaries (the async path
+  // inherits the same soundness — a slice timeout must not reset the
+  // consecutive-tick run).
+  const stability = { stableTicks: 0 }
   for (;;) {
-    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs })
+    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability })
     if (poll.status === "completed") {
       const fin = await fetchFinalMessage(client, childSessionID)
       text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`
@@ -1846,7 +1852,7 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
       return
     }
     if (Date.now() >= deadline) {
-      text = `(poll timeout after ${DEFAULT_POLL_TIMEOUT_MS}ms — child session ${childSessionID} is still running and inspectable/abortable in the host TUI)`
+      text = `(poll timeout after ${timeoutMs}ms — child session ${childSessionID} is still running and inspectable/abortable in the host TUI)`
       break
     }
   }
@@ -1968,6 +1974,7 @@ const taskDispatchTool = tool({
       const poll = await pollChild(client, {
         sessionID: created.sessionID,
         intervalMs: Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS),
+        timeoutMs: resolvePollTimeoutMs(),
         signal: context.abort,
       })
       if (poll.status === "aborted") {
@@ -1985,9 +1992,37 @@ const taskDispatchTool = tool({
         }
       }
       if (poll.status === "timeout") {
+        // sync-timeout-notify: arm, don't abandon (design D1). The child is
+        // already running; before the honest throw we register it in the
+        // dispatch registry and start the standard completion poller so
+        // exactly one [forge:dispatch-complete] wake carries the final
+        // report when it eventually finishes. Arming is UNCONDITIONAL
+        // (design D3): the async cap governs new async dispatch DECISIONS,
+        // not the reality of an already-running child — refusing to track
+        // it would change nothing except guaranteeing the result is lost.
+        const jobId = newJobId()
+        taskMetadata.taskId = jobId
+        const job = jobManager.create({
+          id: jobId,
+          cmd: `dispatch ${target}: ${description} (sync timeout, armed)`,
+          worktree: state.worktree,
+          ownerSession: context.sessionID,
+          logPath: join(jobLogDir, "dispatch", `${jobId}.txt`),
+          notify: true,
+          // Owner-death harvest parity: the manager's kill() on session end
+          // aborts the child via the SDK and ledgers the orphan.
+          killTree: () => {
+            void abortChild(client, created.sessionID)
+          },
+        })
+        ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
+        dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description })
+        void runAsyncDispatchPoller(client, job, created.sessionID)
+        context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
         throw new Error(
           `[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` +
-            `It remains a real session: inspect or abort it natively in the host TUI. No auto-convert to async happened (the dependency structure did not change).`,
+            `It remains a real session: inspect or abort it natively in the host TUI. ` +
+            `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes; do not poll or re-dispatch in the meantime.`,
         )
       }
       if (poll.status === "error") {

@@ -67,7 +67,10 @@ function makeClient(opts = {}) {
       status: async () => {
         calls.status.push({})
         const map = {}
-        for (const [id, st] of childState) if (st === "busy") map[id] = { type: "busy" }
+        // Every child is listed (busy stays busy; done/error surface as
+        // idle) — the poller's soundness rule treats MISSING entries as
+        // active, so a map that omits finished children would never settle.
+        for (const [id, st] of childState) map[id] = { type: st === "busy" ? "busy" : "idle" }
         return { data: map }
       },
       messages: async (args) => {
@@ -86,7 +89,7 @@ function makeClient(opts = {}) {
       },
     },
   }
-  return { client, calls }
+  return { client, calls, setChildState: (id, st) => childState.set(id, st) }
 }
 
 const input = (dir, client) => ({
@@ -514,4 +517,171 @@ test("wake: async completion delivers ONE idle wake carrying the child's final m
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_wake" } } })
   await new Promise((res) => setTimeout(res, 100))
   assert.equal(wakesTo("ses_wake").length, 1, "no duplicate wake after delivery")
+})
+
+// ---------------------------------------------------------------------------
+// Sync timeout arms completion tracking (change sync-timeout-notify; spec
+// scenario "Sync timeout is honest"): a sync dispatch whose child outlives
+// the poll window throws the honest finding — and the already-running child
+// is registered for the standard completion wake BEFORE the throw, so
+// exactly one [forge:dispatch-complete] wake carries the final report when
+// it later completes. Arming bypasses the async cap (design D3). The window
+// rides the FORGE_DISPATCH_POLL_TIMEOUT_MS env knob (read at call time).
+
+test("sync timeout: honest throw disclosing the ARMED wake, then exactly one [forge:dispatch-complete] with the final report", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS = "250"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS
+  })
+  const ctx = allowCtx("ses_to", dir)
+  await assert.rejects(
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "long audit", description: "timeout test" }, ctx),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /Poll timeout after 250ms/, "the resolved env-knob window is named (the knob flows through)")
+      assert.match(m, /child session ses_child_1 never reached a terminal state/, "the child session id is named")
+      assert.match(m, /It remains a real session: inspect or abort it natively in the host TUI/, "the native-inspectability disclosure stays")
+      assert.match(m, /Completion tracking is ARMED/, "the armed wake is disclosed")
+      assert.match(m, /exactly one \[forge:dispatch-complete\] wake carrying the final report/, "the wake contract is disclosed")
+      assert.match(m, /do not poll or re-dispatch in the meantime/, "the no-polling discipline is disclosed")
+      assert.ok(!m.includes("No auto-convert"), "the retired No-auto-convert line is gone")
+      return true
+    },
+  )
+  // Arming happened: the registry holds the entry and the metadata publish
+  // mirrors the async path (taskId = the armed job id).
+  const armed = h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_to")
+  assert.equal(armed.length, 1, "the timed-out child is registered for completion tracking")
+  assert.equal(armed[0].childSessionID, "ses_child_1")
+  const meta = ctx._metadataCalls.at(-1)?.metadata ?? {}
+  assert.equal(ctx._metadataCalls.at(-1)?.title, "forge-dp-research: dispatch async", "metadata published like the async path")
+  assert.equal(meta.taskId, armed[0].jobId, "the metadata taskId is the ARMED job id")
+  assert.equal(meta.sessionId, "ses_child_1")
+  assert.equal(meta.run_in_background, false, "the call itself stayed a sync dispatch")
+  // The child completes later — the armed poller fetches the report and the
+  // wake queue delivers it on idle (exactly once).
+  const wakesTo = (sid) => calls.promptAsync.filter((a) => a.path?.id === sid && String(JSON.stringify(a.body)).includes("dispatch-complete"))
+  assert.equal(wakesTo("ses_to").length, 0, "no wake before the session idles")
+  setChildState("ses_child_1", "done")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_to").length === 0, "armed poller settles")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_to" } } })
+  await waitFor(() => wakesTo("ses_to").length === 1, "one wake delivered on idle")
+  assert.ok(String(JSON.stringify(wakesTo("ses_to")[0].body)).includes("report from ses_child_1"), "the child's final report rides the wake")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_to" } } })
+  await new Promise((res) => setTimeout(res, 100))
+  assert.equal(wakesTo("ses_to").length, 1, "at-most-once: no duplicate wake")
+})
+
+test("sync timeout arming BYPASSES the async cap (design D3: the cap governs new dispatch decisions, not an already-running child)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS = "250"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS
+  })
+  // Fill the per-session cap: 3 async dispatches in flight.
+  const dispatch = async (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true }, allowCtx("ses_caparm", dir))
+  for (let i = 0; i < 3; i++) await dispatch(i)
+  // A SYNC dispatch in the same at-cap session times out — arming must still
+  // happen (the child is already running regardless of the cap).
+  await assert.rejects(
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "over the window", description: "cap bypass" }, allowCtx("ses_caparm", dir)),
+    (err) => {
+      assert.match(String(err), /Completion tracking is ARMED/)
+      return true
+    },
+  )
+  const armed = h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_caparm" && x.childSessionID === "ses_child_4")
+  assert.equal(armed.length, 1, "the timed-out sync child is armed despite the session being at the async cap")
+  setChildState("ses_child_4", "done")
+  const wakesTo = (sid) => calls.promptAsync.filter((a) => a.path?.id === sid && String(JSON.stringify(a.body)).includes("dispatch-complete"))
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_caparm" } } })
+  await waitFor(() => wakesTo("ses_caparm").some((a) => String(JSON.stringify(a.body)).includes("report from ses_child_4")), "the armed wake arrives with the final report")
+  const syncWakes = wakesTo("ses_caparm").filter((a) => String(JSON.stringify(a.body)).includes("report from ses_child_4"))
+  assert.equal(syncWakes.length, 1, "exactly one wake carries the timed-out child's report")
+})
+
+// ---------------------------------------------------------------------------
+// Terminal-inference soundness at the wiring layer (sync-timeout-notify):
+// the sync dispatch reuses pollChild, so a receipt-style finished message
+// observed while the status reading is unreadable (missing from the map) or
+// flapping back to busy must NOT resolve the call early with the receipt —
+// completion lands only after the stability depth, on the real report.
+
+test("soundness (wiring): sync dispatch does not return a receipt on a missing/flapping status — completed only after stability depth, on the real report", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const calls = { get: [], create: [], promptAsync: [], prompt: [], status: [], messages: [], abort: [] }
+  let n = 0
+  const client = {
+    session: {
+      get: async (a) => { calls.get.push(a); return { directory: dir, worktree: dir } },
+      create: async (a) => { calls.create.push(a); return { data: { id: "ses_child_1" } } },
+      promptAsync: async (a) => { calls.promptAsync.push(a); return {} },
+      prompt: async (a) => { calls.prompt.push(a); return {} },
+      // Flap script: tick1 the child is MISSING from the fetched map
+      // (unreadable), tick2 it is busy again, tick3+ it is truly idle.
+      status: async () => {
+        calls.status.push({})
+        n++
+        if (n === 1) return { data: {} }
+        if (n === 2) return { data: { ses_child_1: { type: "busy" } } }
+        return { data: { ses_child_1: { type: "idle" } } }
+      },
+      messages: async (a) => {
+        calls.messages.push(a)
+        // During the flap window the child emits a finished RECEIPT message
+        // (truthy finish + text) — under the old single-observation logic
+        // this falsely completed the dispatch at tick 1.
+        if (n <= 2) {
+          return { data: [{ info: { id: "r", role: "assistant", finish: "stop", time: { created: 1 } }, parts: [{ type: "text", text: "receipt: acknowledged" }] }] }
+        }
+        return { data: [{ info: { id: "f", role: "assistant", finish: "stop", time: { created: 2 } }, parts: [{ type: "text", text: "REAL final report" }] }] }
+      },
+      abort: async (a) => { calls.abort.push(a); return true },
+    },
+  }
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "flap audit", description: "flap test" },
+    allowCtx("ses_flap", dir),
+  )
+  assert.ok(!/receipt: acknowledged/.test(r.output), "the receipt never resolves the sync dispatch")
+  assert.match(r.output, /REAL final report/, "the completed verdict carries the real final report (latest assistant message)")
+  assert.equal(calls.status.length, 5, "exactly 5 status readings: missing → busy → 3 stable idle ticks (depth 3 after the reset)")
+})
+
+test("soundness (wiring): the async wake path inherits pollChild soundness (completion only after stability)", async (t) => {
+  // The async poller slices pollChild with a SHARED stability state — a
+  // slice boundary must not reset the run. mode "done" (idle + finished
+  // textful message from the first tick) completes only after 3 stable
+  // observations, then delivers exactly one wake.
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir } })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "inherit check", run_in_background: true },
+    allowCtx("ses_inherit", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const statusReads = () => calls.status.length
+  const readsAtDispatch = statusReads()
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_inherit").length === 0, "poller settles (stability reached across slices)")
+  assert.ok(statusReads() - readsAtDispatch >= 3, "completion required at least the 3-tick stability depth (not the first observation)")
+  const wakesTo = (sid) => calls.promptAsync.filter((a) => a.path?.id === sid && String(JSON.stringify(a.body)).includes("dispatch-complete"))
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_inherit" } } })
+  await waitFor(() => wakesTo("ses_inherit").length === 1, "one wake delivered on idle")
+  assert.ok(String(JSON.stringify(wakesTo("ses_inherit")[0].body)).includes(`report from ${childID}`), "the final report rides the wake")
 })

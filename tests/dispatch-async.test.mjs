@@ -16,6 +16,10 @@ import {
   pollChild,
   fetchFinalMessage,
   abortChild,
+  resolvePollTimeoutMs,
+  DEFAULT_POLL_TIMEOUT_MS,
+  MAX_POLL_TIMEOUT_MS,
+  TERMINAL_STABILITY_TICKS,
 } from "../src/dispatch-async.ts"
 
 // ---------------------------------------------------------------------------
@@ -194,8 +198,11 @@ test("pollChild: busy → completed, then fetchFinalMessage returns the assistan
   const time = fakeTime()
   const poll = await pollChild(client, { sessionID: "ses_child_1", intervalMs: 10, timeoutMs: 1000 }, time.seams)
   assert.equal(poll.status, "completed")
-  assert.equal(poll.polls, 3)
-  assert.deepEqual(time.slept, [10, 10, 10])
+  // Soundness depth 3: the candidate (idle + finished textful message)
+  // first holds at tick 3 and must stay stable through ticks 4-5 — the
+  // verdict lands exactly on the 3rd consecutive candidate tick, not the 1st.
+  assert.equal(poll.polls, 5)
+  assert.deepEqual(time.slept, [10, 10, 10, 10, 10])
   // every poll round fetched messages with limit
   assert.ok(calls.messages.every((m) => m.path.id === "ses_child_1" && m.query.limit === 100))
 
@@ -330,4 +337,138 @@ test("pollChild: no signal keeps the previous semantics (timeout stays honest)",
   })
   const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 20 }, fakeTime().seams)
   assert.equal(poll.status, "timeout")
+})
+
+// ---------------------------------------------------------------------------
+// resolvePollTimeoutMs: the FORGE_DISPATCH_POLL_TIMEOUT_MS env knob
+// (sync-timeout-notify tasks group 2) — default 600000 unchanged, honest
+// fallback on junk (interval-knob tolerance posture), ceiling clamp.
+
+test("resolvePollTimeoutMs: unset / empty env → default 600000", () => {
+  assert.equal(resolvePollTimeoutMs({}), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: undefined }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "" }), DEFAULT_POLL_TIMEOUT_MS)
+})
+
+test("resolvePollTimeoutMs: a valid value takes effect", () => {
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "5000" }), 5000)
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "123456.7" }), 123457, "fractional values round")
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "1" }), 1)
+})
+
+test("resolvePollTimeoutMs: junk / non-positive values fall back to the default", () => {
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "abc" }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "10min" }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "0" }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "-5000" }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "Infinity" }), DEFAULT_POLL_TIMEOUT_MS)
+})
+
+test("resolvePollTimeoutMs: oversized values clamp to the 1h ceiling", () => {
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "999999999999" }), MAX_POLL_TIMEOUT_MS)
+  assert.equal(MAX_POLL_TIMEOUT_MS, 3_600_000)
+})
+
+// ---------------------------------------------------------------------------
+// Terminal-inference soundness matrix (sync-timeout-notify tasks group 4):
+// transient/unreadable status readings never terminate; completed needs the
+// candidate stable across TERMINAL_STABILITY_TICKS consecutive ticks with a
+// truthy finish AND non-empty text parts; busy flaps reset the run.
+
+test("soundness: status fetch FAILING every tick (throw + error envelope) never terminates despite a finished message — honest timeout", async () => {
+  // (a) throw branch
+  const thr = fakeClient({ status: () => { throw new Error("endpoint down") }, messages: () => [assistantMsg()] })
+  const pt = await pollChild(thr.client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
+  assert.equal(pt.status, "timeout", "status failure is treated as ACTIVE — no completion, no error verdict")
+
+  // (a') {error} envelope branch (statusMap stays undefined)
+  const env = fakeClient({ status: () => ({ error: "boom" }), messages: () => [assistantMsg()] })
+  const pe = await pollChild(env.client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
+  assert.equal(pe.status, "timeout")
+})
+
+test("soundness: session MISSING from a fetched status map never terminates despite a finished message — honest timeout", async () => {
+  const { client } = fakeClient({
+    status: () => ({ data: { some_other_session: { type: "idle" } } }),
+    messages: () => [assistantMsg()],
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
+  assert.equal(poll.status, "timeout", "missing-from-map is treated as ACTIVE — never a terminal verdict")
+})
+
+test("soundness: receipt-then-busy resets the stability run — completed lands exactly at depth 3 after the reset", async () => {
+  const statusSeq = ["idle", "busy", "idle", "idle", "idle"]
+  let tick = 0
+  const { client, calls } = fakeClient({ messages: () => [assistantMsg()] })
+  client.session.status = async () => {
+    calls.status.push({})
+    return { data: { s: { type: statusSeq[Math.min(tick++, statusSeq.length - 1)] } } }
+  }
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 1000 }, fakeTime().seams)
+  assert.equal(poll.status, "completed")
+  // tick1 candidate (run=1) → tick2 busy RESETS → ticks 3,4,5 rebuild the run
+  // to depth 3 → the verdict lands exactly on tick 5 (not tick 3, not tick 4).
+  assert.equal(poll.polls, 5, `completed exactly at the ${TERMINAL_STABILITY_TICKS}rd stable tick after the reset`)
+  assert.equal(TERMINAL_STABILITY_TICKS, 3)
+})
+
+test("soundness: stable idle + finished textful message completes at EXACTLY tick 3 (regression: not tick 1)", async () => {
+  const { client } = fakeClient({
+    status: () => ({ data: { s: { type: "idle" } } }),
+    messages: () => [assistantMsg()],
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 1000 }, fakeTime().seams)
+  assert.equal(poll.status, "completed")
+  assert.equal(poll.polls, TERMINAL_STABILITY_TICKS, "a clean run needs the full stability depth — the 1st observation is never a verdict")
+})
+
+test("soundness: idle + finished but TEXTLESS message polls to the honest timeout (a receipt is not a final report)", async () => {
+  // (e) finish truthy, but the only text part is empty.
+  const { client } = fakeClient({
+    status: () => ({ data: { s: { type: "idle" } } }),
+    messages: () => [{ info: { id: "m", role: "assistant", finish: "stop", time: { created: 1 } }, parts: [{ type: "text", text: "" }] }],
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
+  assert.equal(poll.status, "timeout", "finished-but-textless keeps polling — covered upstream by the armed wake")
+
+  // (e') FALSY finish ("") with text — not a finished message either.
+  const falsy = fakeClient({
+    status: () => ({ data: { s: { type: "idle" } } }),
+    messages: () => [assistantMsg({ info: { finish: "" } })],
+  })
+  const pf = await pollChild(falsy.client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
+  assert.equal(pf.status, "timeout", 'finish must be TRUTHY — "" no longer passes (was `!== undefined` before)')
+})
+
+test("soundness: caller-owned stability state survives across pollChild calls (the async poll-slice seam)", async () => {
+  // The async wiring runs pollChild in slices; sharing one stability object
+  // keeps the consecutive run alive across slice timeouts.
+  const stability = { stableTicks: 0 }
+  let tick = 0
+  const mk = () =>
+    fakeClient({
+      status: () => ({ data: { s: { type: "idle" } } }),
+      messages: () => [assistantMsg()],
+    })
+  // Force re-read of tick via a shared counter across both clients.
+  const first = mk()
+  first.client.session.status = async () => {
+    first.calls.status.push({})
+    tick++
+    return { data: { s: { type: "idle" } } }
+  }
+  const second = mk()
+  second.client.session.status = async () => {
+    second.calls.status.push({})
+    tick++
+    return { data: { s: { type: "idle" } } }
+  }
+  // Slice 1: timeout budget covers exactly ONE candidate observation.
+  const p1 = await pollChild(first.client, { sessionID: "s", intervalMs: 5, timeoutMs: 5, stability }, fakeTime().seams)
+  assert.equal(p1.status, "timeout", "slice 1 expires after one candidate tick")
+  assert.equal(stability.stableTicks, 1, "the candidate observation survived the slice boundary in the shared state")
+  // Slice 2: two more candidate ticks reach depth 3.
+  const p2 = await pollChild(second.client, { sessionID: "s", intervalMs: 5, timeoutMs: 1000, stability }, fakeTime().seams)
+  assert.equal(p2.status, "completed")
+  assert.equal(p2.polls, 2, "only the two remaining stable ticks were needed — the run was NOT reset by the slice timeout")
 })

@@ -599,10 +599,17 @@ recursion policy of a non-forge child is that target's own config business).
   (native parity — the user is present at the panel, the child may ask).
   **Abort parity**: aborting the dispatching turn aborts the child via the
   SDK and the call resolves with the abort disclosed. A child that never
-  reaches terminal within the poll timeout (default 10 minutes) returns an
-  **honest timeout finding naming the child session id** — the child stays a
-  real session the user can inspect or abort natively; there is no
-  auto-convert to async (the dependency structure did not change).
+  reaches terminal within the poll timeout (default 10 minutes, tunable —
+  see the env knobs below) returns an **honest timeout finding naming the
+  child session id** — the child stays a real session the user can inspect
+  or abort natively. There is no auto-convert of the call (the finding
+  stays a throw — the dependency structure did not change), but before the
+  finding is returned the plugin **arms completion tracking** for the
+  already-running child: exactly one `[forge:dispatch-complete]` wake
+  carrying the final report arrives when the child eventually finishes
+  (self-healing — the result is never orphaned; do not poll or re-dispatch
+  in the meantime). The arming is unconditional: the async concurrency cap
+  governs new dispatch decisions, not an already-running child.
 - **`run_in_background: true` (async)** — the call returns a task handle
   immediately (task id, agent, child session id); when the child finishes,
   **exactly one `[forge:dispatch-complete]` message carrying the child's
@@ -617,6 +624,15 @@ recursion policy of a non-forge child is that target's own config business).
   aborts** by design (session-scoped); when the dispatching session ends,
   its live children are aborted via the SDK and recorded as orphans in the
   diagnostics ledger.
+
+**Dispatch poll env knobs** (read at call time; invalid values fall back to
+the default):
+
+| Knob | Default | Effect |
+| ---- | ------- | ------ |
+| `FORGE_DISPATCH_POLL_TIMEOUT_MS` | `600000` | The sync-dispatch poll window (and the async poller's overall watch deadline) in ms. A sync child that outlives it gets the honest timeout finding with the armed completion wake. Clamped to `3600000` (1 h). |
+| `FORGE_DISPATCH_POLL_INTERVAL_MS` | `1000` | Poll interval for the sync loop and the async completion poller's slices, in ms. |
+| `FORGE_DISPATCH_POLL_SLICE_MS` | `5000` | Length of one async poller watch slice, in ms (registry kills take effect at slice boundaries). |
 
 **Question policy is mode-keyed.** Sync dispatches keep questions available
 (native parity — the user is watching the panel). Async dispatches create
