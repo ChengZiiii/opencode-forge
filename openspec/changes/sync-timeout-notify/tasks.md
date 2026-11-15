@@ -40,5 +40,5 @@
 
 - [x] Version 0.23.1, typecheck, full suite, bundle, pack = 3 files, publish, store update (dual-layer + marker), push
 - [x] Live minimal repro (the E plan): sandbox serve with `FORGE_DISPATCH_POLL_TIMEOUT_MS=5000` + a child that sleeps ~15s → timeout finding at ~5s naming the child session, `[forge:dispatch-complete]` wake with the final report at ~15s — markers recorded in verify/acceptance-0-23-1.md
-- [ ] Version 0.23.3, typecheck, full suite, bundle, pack = 3 files, publish, store update (dual-layer + markers), push
-- [ ] Live repro (fold #2): sandbox serve with `FORGE_DISPATCH_NOTIFY_INTERVAL_MS` small + a child that runs past it → progress notice(s) observed while running, then the `[forge:dispatch-complete]` wake with the final report at completion — markers recorded in verify/
+- [x] Version 0.23.3, typecheck, full suite, bundle, pack = 3 files, publish, store update (dual-layer + markers), push
+- [x] Live repro (fold #2): sandbox serve with `FORGE_DISPATCH_NOTIFY_INTERVAL_MS` small + a child that runs past it → progress notice(s) observed while running, then the `[forge:dispatch-complete]` wake with the final report at completion — markers recorded in verify/acceptance-0-23-3.md (REP-A/B: 5 and 8 notices + late report wakes; REP-C control zero notices; REP-D receipt-rejection; REP-E honest abort terminal)
