@@ -56,6 +56,34 @@ that never learns the outcome — crew waves stall on idle nudges alone.
   keep polling (an idle child with no usable final message ends as the
   honest timeout, which the armed wake then covers). The async wake path
   shares the poller and inherits the same soundness.
+- **Async tracking never dies on a wall-clock deadline** (production-
+  observed 2026-11-16, texture-forge 补完轮 W1, folded into this change):
+  the ASYNC dispatch poller terminates at its 600s deadline and emits
+  the timeout text AS the terminal wake — consuming the at-most-once
+  completion budget. Evidence, DB- and status-probe-verified on host
+  0.23.2: K3 finished ~21 min after its deadline — poller already
+  exited, zero report; K2 same shape; K1b finished within a stability
+  window of its deadline and lost the race (its full final report sits
+  in the child session — retrievable but never delivered); K1a (finished
+  inside the window) proves the short path sound. The tracker SHALL NOT
+  terminate on any wall-clock deadline measured from dispatch: the loop
+  ends only at a true terminal state (textful completion, error,
+  registry kill, owner death, or the bounded textless-idle floor). While
+  the child is still running past the notification interval (default
+  600000 ms, tunable via `FORGE_DISPATCH_NOTIFY_INTERVAL_MS`), the
+  poller SHALL emit non-terminal `[forge:dispatch-progress]` notices —
+  informational, idle-only, never consuming the completion wake budget.
+  The single `[forge:dispatch-complete]` wake carrying the final report
+  remains guaranteed at true terminal, however long the child runs. The
+  sync-armed poller shares the tracker and inherits never-die tracking.
+  Study reference: oh-my-openagent's background-agent solves the same
+  family with dual-signal completion (idle event + stability), NO
+  deadline-terminate, FINAL/PROGRESS notification separation, and
+  activity-based stale abort. Adopted here: never-die tracking + FINAL/
+  PROGRESS separation. Rejected: event-driven completion (poll tick
+  latency is already seconds), stale auto-abort (destructive — the
+  owner decides via visible notices), merge-queue machinery (separate
+  channels make it unnecessary).
 
 ## Impact
 

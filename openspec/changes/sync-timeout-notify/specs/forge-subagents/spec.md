@@ -10,7 +10,9 @@ return a task handle immediately (task id, agent identity, child session
 id) and deliver at most ONE completion wake carrying the child's final
 assistant message (bounded 2500-character tail) following the
 job-supervisor completion-wake discipline (idle-only injection,
-at-most-once, delivery window with ledger overflow). The plugin SHALL
+at-most-once, delivery window with ledger overflow). Interim
+`[forge:dispatch-progress]` notices are informational, delivered
+idle-only, and never consume that budget. The plugin SHALL
 cap concurrent running async dispatches per session (default 3) and
 refuse beyond the cap with in-flight task ids and guidance. When a
 dispatching session ends, its live async dispatches SHALL be aborted and
@@ -23,9 +25,27 @@ returning, so exactly one `[forge:dispatch-complete]` wake carries the
 child's final report when it eventually completes; the arming bypasses
 the async concurrency cap (the cap governs new async dispatch decisions,
 not an already-running child), and the timeout finding SHALL disclose
-the armed wake. The poll timeout SHALL default to 600000 ms and SHALL be
-tunable via the `FORGE_DISPATCH_POLL_TIMEOUT_MS` environment variable.
-Terminal inference SHALL be sound against unreadable readings: a status
+the armed wake. The poll timeout SHALL default to 600000 ms and SHALL
+be tunable via the `FORGE_DISPATCH_POLL_TIMEOUT_MS` environment
+variable; it scopes the SYNC WAIT only. The completion tracker SHALL
+NOT terminate on any wall-clock deadline measured from dispatch:
+while the child is running (active in the status map) the poller SHALL
+keep polling indefinitely, and past the notification interval (default
+600000 ms, tunable via `FORGE_DISPATCH_NOTIFY_INTERVAL_MS`) it SHALL
+emit non-terminal `[forge:dispatch-progress]` notices — informational
+only, delivered idle-only, never consuming the completion wake budget;
+the single `[forge:dispatch-complete]` wake carrying the final report
+SHALL arrive at true terminal regardless of duration or how close
+completion falls to an interval boundary. A child that stays
+continuously not-active (missing from the map) across a full
+notification interval while its latest finished assistant message
+lacks a truthy `finish` or non-empty text SHALL terminate honestly as
+a no-reportable-final-message finding naming the child session id; any
+busy reading resets that streak, so a running child is never
+terminated by it; the registry kill (owner death, dispose) stops the
+watch at a slice boundary as before. The sync-armed poller shares the
+tracker and inherits never-die tracking. Terminal
+inference SHALL be sound against unreadable readings: a status
 fetch failure SHALL be treated as active (keep polling — never a
 terminal verdict on a signal that could not be read); a session MISSING
 from a successfully fetched status map is the host's idle signal (the
@@ -37,8 +57,7 @@ the session turns busy again — which also self-heals transient flakes
 where a running child blinks out of the map for a tick or two), and the
 finished message SHALL carry a
 truthy `finish` and non-empty text parts, otherwise the poller SHALL
-keep polling (such a child ends as the honest timeout, covered by the
-armed wake); the async wake path shares the poller and inherits the same
+keep polling; the async wake path shares the poller and inherits the same
 soundness.
 The plan-draft interop is unchanged: during an active draft, a dispatch
 to an effective-readonly forge target passes as a reconnaissance
@@ -48,7 +67,17 @@ write-class deny as before, in either mode.
 #### Scenario: Async handle and single completion wake
 
 - **WHEN** the model dispatches `task` with `run_in_background: true` and the owning session later idles
-- **THEN** the call returns a handle immediately and exactly one wake message with the child's final message is injected into the session
+- **THEN** the call returns a handle immediately and exactly one wake message with the child's final message is injected into the session (interim `[forge:dispatch-progress]` notices may precede it; they are informational and never replace it)
+
+#### Scenario: Long child keeps tracking past the notification interval
+
+- **WHEN** an async child runs past the notification interval and reaches a textful terminal state later
+- **THEN** non-terminal `[forge:dispatch-progress]` notices arrive while it runs, and the single `[forge:dispatch-complete]` wake carrying the final report still arrives when it completes — however long it runs or how close completion falls to an interval boundary
+
+#### Scenario: Textless idle child terminates honestly
+
+- **WHEN** a child stays continuously not-active (missing from the status map) across a full notification interval while its latest finished assistant message lacks a truthy `finish` or non-empty text
+- **THEN** the tracker terminates with an honest no-reportable-final-message finding naming the child session id, and a busy reading within the window resets the streak so a running child is never terminated
 
 #### Scenario: Concurrency cap
 

@@ -625,12 +625,24 @@ recursion policy of a non-forge child is that target's own config business).
   its live children are aborted via the SDK and recorded as orphans in the
   diagnostics ledger.
 
+**Long children are never dropped.** The completion tracker (async and
+sync-armed alike) has no wall-clock deadline: however long the child runs,
+the single `[forge:dispatch-complete]` wake with the final report arrives at
+true terminal. While the child runs past each notification interval
+(default 10 minutes, tunable — see the env knobs below), a non-terminal
+`[forge:dispatch-progress]` notice keeps the owner informed — informational
+and idle-only, it never replaces or consumes the completion wake. A child
+that stays continuously idle with no reportable final message across a full
+notification interval ends honestly as a no-reportable-final-message finding
+naming the child session id.
+
 **Dispatch poll env knobs** (read at call time; invalid values fall back to
 the default):
 
 | Knob | Default | Effect |
 | ---- | ------- | ------ |
-| `FORGE_DISPATCH_POLL_TIMEOUT_MS` | `600000` | The sync-dispatch poll window (and the async poller's overall watch deadline) in ms. A sync child that outlives it gets the honest timeout finding with the armed completion wake. Clamped to `3600000` (1 h). |
+| `FORGE_DISPATCH_POLL_TIMEOUT_MS` | `600000` | The SYNC WAIT window in ms — a sync dispatch whose child does not finish within it gets the honest timeout finding with the armed completion wake. It does NOT bound the async/armed completion tracker (never-die tracking — see below). Clamped to `3600000` (1 h). |
+| `FORGE_DISPATCH_NOTIFY_INTERVAL_MS` | `600000` | The `[forge:dispatch-progress]` notification interval for the async/armed completion tracker, in ms — one informational notice per interval while the child runs; also the textless-idle floor window. Clamped to `3600000` (1 h). |
 | `FORGE_DISPATCH_POLL_INTERVAL_MS` | `1000` | Poll interval for the sync loop and the async completion poller's slices, in ms. |
 | `FORGE_DISPATCH_POLL_SLICE_MS` | `5000` | Length of one async poller watch slice, in ms (registry kills take effect at slice boundaries). |
 

@@ -77,7 +77,7 @@ import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type Dept
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, DEFAULT_POLL_TIMEOUT_MS, abortChild, createChildSession, fetchFinalMessage, pollChild, resolvePollTimeoutMs, sendPrompt, type DispatchClient } from "./src/dispatch-async.ts"
+import { DEFAULT_POLL_INTERVAL_MS, abortChild, createChildSession, fetchFinalMessage, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, sendPrompt, type DispatchClient, type TerminalStabilityState } from "./src/dispatch-async.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -706,9 +706,43 @@ const jobManager = createJobManager({
   // until the delivery window abandoned it. When the session is known-idle,
   // deliver now; busy sessions stay on the idle-edge path.
   onWakeQueued: (job) => {
-    if (idleJobSessions.has(job.ownerSession)) void deliverJobWakes(job.ownerSession)
+    if (idleJobSessions.has(job.ownerSession)) {
+      // Progress flushes BEFORE terminal wakes (design D6 FINAL/PROGRESS
+      // separation): older information lands first on the same idle edge.
+      void deliverDispatchProgress(job.ownerSession).then(() => deliverJobWakes(job.ownerSession))
+    }
   },
 })
+
+// Pending [forge:dispatch-progress] notices (sync-timeout-notify fold #2,
+// design D6): parked per owner session at the notify-interval cadence and
+// flushed through the SAME idle-edge mechanism as job wakes. Delivery is
+// LOSSY by design — a failed send drops the notice (no requeue, no budget
+// interaction): progress is informational; the terminal
+// [forge:dispatch-complete] wake is the guarantee and never shares this
+// queue or the wake budget.
+const dispatchProgressQueue = new Map<string, string[]>()
+
+function queueDispatchProgress(sessionID: string, text: string): void {
+  const queued = dispatchProgressQueue.get(sessionID)
+  if (queued) queued.push(text)
+  else dispatchProgressQueue.set(sessionID, [text])
+}
+
+async function deliverDispatchProgress(sessionID: string): Promise<void> {
+  if (forgeDisabled) return
+  const pending = dispatchProgressQueue.get(sessionID)
+  if (!pending || pending.length === 0) return
+  dispatchProgressQueue.delete(sessionID)
+  if (!jobClient || typeof jobClient.session.promptAsync !== "function") return
+  for (const text of pending) {
+    try {
+      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } })
+    } catch {
+      // Lossy: the notice is dropped — never requeued, never retried.
+    }
+  }
+}
 
 // Message-send client for completion wakes (promptAsync: fire-and-forget,
 // does not block the plugin fiber) and session lookups for handoff roots.
@@ -1814,29 +1848,38 @@ function dispatchClient(): DispatchClient | null {
   return jobClient as unknown as DispatchClient | null
 }
 
-// Async poller (design D3): an in-plugin loop watching the child session —
-// NOT a job-runner child process. The watch runs in slices so a registry
-// kill (owner death, dispose) stops the loop at the next slice boundary; on
-// terminal it fetches the final message, parks it on the registry row's
-// tail (the wake text reads it inline), and marks the job terminal — the
-// manager's wake queue does the rest (idle-only injection, at-most-once,
-// delivery window, ledger overflow).
+// Async poller (design D3 + sync-timeout-notify fold #2 never-die tracking):
+// an in-plugin loop watching the child session — NOT a job-runner child
+// process. The watch runs in slices so a registry kill (owner death,
+// dispose) stops the loop at the next slice boundary. There is NO
+// wall-clock deadline: the loop ends only at a textful completion, an
+// explicit child error, a registry kill, or the textless-idle floor. Past
+// each notification interval it emits a non-terminal [forge:dispatch-progress]
+// notice (job tail + pending queue — never markTerminal/wakeState, so the
+// at-most-once completion budget stays intact). On terminal it fetches the
+// final message, parks it on the registry row's tail (the wake text reads
+// it inline), and marks the job terminal — the manager's wake queue does
+// the rest (idle-only injection, at-most-once, delivery window, ledger
+// overflow).
 async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSessionID: string): Promise<void> {
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
+  // sliceMs is the SLICE boundary, not a deadline — a slice timeout just
+  // returns control here for the kill/floor/notify checks below.
   const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000))
-  // The tracker's window is ALWAYS the full default (600s), never the sync
-  // knob: FORGE_DISPATCH_POLL_TIMEOUT_MS scopes the SYNC WAIT only, so a
-  // short-knob repro (or any deployment tuning the wait) cannot starve the
-  // armed tracker of a child that legitimately needs longer.
-  const timeoutMs = DEFAULT_POLL_TIMEOUT_MS
-  const deadline = Date.now() + timeoutMs
+  // Notify cadence (design D6): FORGE_DISPATCH_NOTIFY_INTERVAL_MS is
+  // independent of FORGE_DISPATCH_POLL_TIMEOUT_MS — that knob scopes the
+  // SYNC WAIT only and must never kill this tracker.
+  const notifyIntervalMs = resolveNotifyIntervalMs()
+  const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
+  const startedAt = Date.now()
+  let lastNotifiedMultiple = 0
   let text = ""
   let exitCode = 0
   // Terminal-inference soundness is owned by pollChild; the stability
-  // counter lives HERE so it survives poll-slice boundaries (the async path
-  // inherits the same soundness — a slice timeout must not reset the
-  // consecutive-tick run).
-  const stability = { stableTicks: 0 }
+  // counter (and the textless-idle floor streak) live HERE so they survive
+  // poll-slice boundaries (the async path inherits the same soundness — a
+  // slice timeout must not reset the consecutive-tick run).
+  const stability: TerminalStabilityState = { stableTicks: 0 }
   for (;;) {
     const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability })
     if (poll.status === "completed") {
@@ -1855,9 +1898,33 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
       dispatchTasks.delete(job.id)
       return
     }
-    if (Date.now() >= deadline) {
-      text = `(poll timeout after ${timeoutMs}ms — child session ${childSessionID} is still running and inspectable/abortable in the host TUI)`
+    // Textless-idle floor (design D6): a child continuously not-active for a
+    // full notification interval whose latest finished assistant message
+    // still lacks a truthy finish or non-empty text ends honestly — the
+    // bounded exit for truly-gone children, NOT a dispatch-anchored clock.
+    // Any busy reading resets the streak inside pollChild, so a RUNNING
+    // child can never reach this.
+    if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
+      text = `(child session ${childSessionID} ended without a reportable final message — inspectable/abortable in the host TUI)`
+      exitCode = 1
       break
+    }
+    // Progress cadence: one informational notice per notification interval
+    // WHILE THE CHILD RUNS (a textless-idle streak is not "running"). Never
+    // touches markTerminal/wakeState — the completion budget stays intact.
+    const multiple = Math.floor((Date.now() - startedAt) / notifyIntervalMs)
+    if (stability.textlessIdleSince === undefined && multiple > lastNotifiedMultiple) {
+      lastNotifiedMultiple = multiple
+      const minutes = Math.max(1, Math.round((Date.now() - startedAt) / 60000))
+      const notice =
+        `[forge:dispatch-progress] task dispatch to ${dispatch?.agentID ?? "unknown"} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` +
+        `tracking continues; the final [forge:dispatch-complete] wake with the report arrives when it finishes. ` +
+        `Inspect/abort in the host TUI if this looks stuck.`
+      jobManager.appendOutput(job, notice)
+      queueDispatchProgress(job.ownerSession, notice)
+      // D6 parity (enqueue-while-idle): a notice parked while the owner is
+      // already idle has no future idle edge to ride — deliver now (lossy).
+      if (idleJobSessions.has(job.ownerSession)) void deliverDispatchProgress(job.ownerSession)
     }
   }
   jobManager.appendOutput(job, text)
@@ -1868,7 +1935,7 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
 const TASK_DESCRIPTION = [
   "Dispatch a subagent as a REAL child session on this host (SDK session.create with parentID): the call renders in the host session tree with native subagent affordances — the live task panel, progress, expandable transcript, user abort — and runs the target agent with its own permission map. This is the single dispatch surface: ANY materialized target dispatches through here — configured `forge-*` subagents AND every other host agent.",
   'run_in_background is YOUR dispatch-time decision: omit it (sync) when your very next step depends on the result — the call blocks until the child finishes and returns its final report (native parity: the child MAY ask the user questions; the user is present at the panel). Set run_in_background: true (async) when the result does NOT block your next steps — the call returns a task handle immediately and the child is created with the question tool denied session-wide (unattended: it never blocks on human input; an unanswered permission ask degrades to the honest poll-timeout finding naming the child session id, which stays inspectable and natively abortable in the TUI).',
-  'async discipline: after an async dispatch, END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker\'s final report is injected when it finishes (idle-only, at-most-once, delivery window). NEVER poll, re-dispatch, or "check on" an async dispatch before that wake arrives — pre-wake polling is a BLOCKING anti-pattern.',
+  'async discipline: after an async dispatch, END YOUR TURN. Interim [forge:dispatch-progress] notices may arrive while the child runs (informational only); the single [forge:dispatch-complete] message carrying the worker\'s final report is injected when it finishes — however long it takes (idle-only, at-most-once, delivery window). NEVER poll, re-dispatch, or "check on" an async dispatch before that wake arrives — pre-wake polling is a BLOCKING anti-pattern.',
   "Sync dispatches carry abort parity: aborting the dispatching turn aborts the child session via the SDK. Async children intentionally SURVIVE turn aborts (session-scoped; they die at owner-session death, orphan-recorded).",
   "Forge roster guidance: prefer a configured `forge-*` subagent whose description matches the job (each materialized description carries its pool provenance; .opencode/forge.json is the source). Gates on forge-* targets: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance belts, the plan-draft readonly-recon exemption (readonly scouts pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch — recursion is banned at their permission map). Non-forge host targets dispatch with native parity (no forge pool gate; the session-keyed crew pending belt and the plan-draft write-class deny still apply, exactly as for the native task tool). Cap: 3 concurrent async dispatches per session.",
 ].join("\n")
@@ -1879,7 +1946,7 @@ const taskDispatchTool = tool({
     subagent_type: tool.schema.string().describe('Target agent id — a materialized forge-* subagent (e.g. "forge-plugindev-spec-reviewer") or any other configured host agent id'),
     prompt: tool.schema.string().describe("The complete task prompt for the worker (self-contained: it carries the artifact paths/slices and the evidence demands)"),
     description: tool.schema.string().optional().describe("Short task description used as the child session's title in the host UI (defaults to the prompt's first words)"),
-    run_in_background: tool.schema.boolean().optional().describe('Dispatch-time decision: omit for sync (block this call until the child finishes and return its final report — the child may ask questions, native parity) or true for async (return a task handle immediately; a single [forge:dispatch-complete] wake carries the final report later — the child is sealed against human input)'),
+    run_in_background: tool.schema.boolean().optional().describe('Dispatch-time decision: omit for sync (block this call until the child finishes and return its final report — the child may ask questions, native parity) or true for async (return a task handle immediately; interim [forge:dispatch-progress] notices may arrive while the child runs, and a single [forge:dispatch-complete] wake with the final report is guaranteed when it finishes, however long it takes — the child is sealed against human input)'),
   },
   execute: async (args, context) => {
     noteToolAgent(context)
@@ -2026,7 +2093,7 @@ const taskDispatchTool = tool({
         throw new Error(
           `[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` +
             `It remains a real session: inspect or abort it natively in the host TUI. ` +
-            `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes; do not poll or re-dispatch in the meantime.`,
+            `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes, however long it takes (interim [forge:dispatch-progress] notices may arrive meanwhile); do not poll or re-dispatch in the meantime.`,
         )
       }
       if (poll.status === "error") {
@@ -2069,7 +2136,7 @@ const taskDispatchTool = tool({
         `task id: ${jobId}`,
         `agent: ${target}`,
         `child session: ${created.sessionID} (visible in the host session tree; natively abortable)`,
-        `Next: END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when it finishes — never poll or re-dispatch to check on it. Cap: ${ASYNC_DISPATCH_CAP} concurrent async dispatches per session.`,
+        `Next: END YOUR TURN. Interim [forge:dispatch-progress] notices may arrive while the child runs (informational only); exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when it finishes — however long it takes. Never poll or re-dispatch to check on it. Cap: ${ASYNC_DISPATCH_CAP} concurrent async dispatches per session.`,
       ].join("\n"),
     }
   },
@@ -3808,6 +3875,9 @@ export const server: Plugin = async (input, options) => {
       workspacePoolOf: (anchor: string) => sessionPoolFileOf(anchor),
       // Async-dispatch seams (change async-dispatch wiring tests).
       dispatchTasks: () => [...dispatchTasks.values()],
+      // Pending [forge:dispatch-progress] notices for a session (fold #2
+      // wiring tests observe the enqueue side of the lossy queue).
+      dispatchProgress: (sessionID: string) => [...(dispatchProgressQueue.get(sessionID) ?? [])],
       jobLedger: () => jobManager.ledgerEntries(),
     },
 
@@ -3867,7 +3937,9 @@ export const server: Plugin = async (input, options) => {
           goalProbe(`idle event session=${sessionID}`)
           idleJobSessions.add(sessionID)
           scheduleIdleContinuation(client, sessionID)
-          void deliverJobWakes(sessionID)
+          // Progress flushes BEFORE terminal wakes (design D6): older
+          // information lands first on the same idle edge.
+          void deliverDispatchProgress(sessionID).then(() => deliverJobWakes(sessionID))
         }
       }
       if (event.type === "session.deleted") {
@@ -3886,6 +3958,9 @@ export const server: Plugin = async (input, options) => {
           }
           // The frozen depth translation dies with its session (bounded table).
           sessionDepths.delete(info.id)
+          // Undelivered progress notices die with their audience (lossy by
+          // design — the terminal-wake guarantee never rode this queue).
+          dispatchProgressQueue.delete(info.id)
           // Same for the agent-family map (tool-partition).
           sessionAgents.delete(info.id)
           // And the exec-seal finding bounds (readonly-exec-seal).

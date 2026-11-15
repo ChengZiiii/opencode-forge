@@ -78,6 +78,12 @@ function makeClient(opts = {}) {
         const id = args.path.id
         const st = childState.get(id)
         if (st === "busy") return { data: [] }
+        // Textless-idle floor shape (fold #2): not-active + a finished
+        // assistant message whose only text part is EMPTY — not a
+        // reportable final message.
+        if (st === "textless") {
+          return { data: [{ info: { id: "m1", role: "assistant", finish: "stop", time: { created: 1 } }, parts: [{ type: "text", text: "" }] }] }
+        }
         const info = { id: "m1", role: "assistant", finish: "stop", time: { created: 1 } }
         if (st === "error") info.error = { name: "ProviderError", data: { message: "kaput" } }
         return { data: [{ info, parts: [{ type: "text", text: `report from ${id}` }] }] }
@@ -684,4 +690,193 @@ test("soundness (wiring): the async wake path inherits pollChild soundness (comp
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_inherit" } } })
   await waitFor(() => wakesTo("ses_inherit").length === 1, "one wake delivered on idle")
   assert.ok(String(JSON.stringify(wakesTo("ses_inherit")[0].body)).includes(`report from ${childID}`), "the final report rides the wake")
+})
+
+// ---------------------------------------------------------------------------
+// Never-die tracking + progress notices + textless-idle floor
+// (sync-timeout-notify fold #2, design D6; spec scenarios "Long child keeps
+// tracking past the notification interval" and "Textless idle child
+// terminates honestly"). The async poller has NO wall-clock deadline: the
+// loop ends only at completion / error / registry kill / the floor, and
+// past each notification interval it parks a non-terminal
+// [forge:dispatch-progress] notice that flushes on the owner idle edge
+// BEFORE the terminal wake.
+
+test("never-die (K3 shape): child busy past a notify boundary → progress notices, then exactly ONE report wake with the REAL final report", async (t) => {
+  process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS = "80"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "long run", run_in_background: true, description: "k3 long" },
+    allowCtx("ses_k3", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  // The child stays busy across ≥1 notify-interval boundary: notices park.
+  await waitFor(() => h.__forgeSubagentsTest.dispatchProgress("ses_k3").length >= 1, "progress notices enqueue past the interval")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_k3").length, 1, "tracking continues past the notify boundary (never dies)")
+  // Nothing delivered while the owner is not idle (idle-only injection).
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_k3")
+  assert.equal(toOwner().length, 0, "no sends before the owner idles")
+  // The child completes LATE — the tracker is still alive to see it.
+  setChildState(childID, "done")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_k3").length === 0, "poller settles on real completion")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_k3" } } })
+  // Classify sends by their TEXT PREFIX, not substring: the progress notice
+  // names [forge:dispatch-complete] in its body, and the terminal wake's
+  // tail slice embeds the parked notice text.
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the terminal wake is delivered")
+  const sends = toOwner().map(textOf)
+  const progress = sends.filter((s) => s.startsWith("[forge:dispatch-progress]"))
+  assert.ok(progress.length >= 1, "at least one progress notice was delivered")
+  assert.match(progress[0], new RegExp(`\\[forge:dispatch-progress\\] task dispatch to forge-dp-research \\(task ${jobId}, child session ${childID}\\) is still running after \\d+ min`), "the exact notice shape (agent, task id, child session, minutes)")
+  for (const p of progress) assert.ok(!p.includes("report from"), "progress notices carry no report content")
+  const wakes = sends.filter((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.equal(wakes.length, 1, "exactly ONE terminal wake")
+  assert.ok(wakes[0].includes(`report from ${childID}`), "the terminal wake carries the REAL final report (not a timeout string)")
+  assert.ok(sends.findIndex((s) => s.startsWith("[forge:dispatch-progress]")) < sends.findIndex((s) => s.startsWith("[forge:dispatch-complete]")), "progress flushes BEFORE the terminal wake")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_k3" } } } })
+})
+
+test("never-die (K1b shape + knob isolation): completion inside a notify boundary still wakes; FORGE_DISPATCH_POLL_TIMEOUT_MS never kills the tracker", async (t) => {
+  // A tiny SYNC-WAIT knob (150ms) plus a notify interval of 600ms: the
+  // child finishes at ~250ms — past the sync knob, inside the notify
+  // boundary. Under the old deadline break this is exactly the K1b race
+  // (completion near the boundary loses); now there is no deadline to lose
+  // against, and the sync knob scopes only the sync wait.
+  process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS = "150"
+  process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS = "600"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS
+    delete process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "near boundary", run_in_background: true },
+    allowCtx("ses_k1b", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  await new Promise((res) => setTimeout(res, 250))
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_k1b").length, 1, "the tracker is alive past FORGE_DISPATCH_POLL_TIMEOUT_MS (the knob scopes the SYNC WAIT only)")
+  assert.equal(h.__forgeSubagentsTest.dispatchProgress("ses_k1b").length, 0, "no progress notice yet (completion falls inside the notify interval)")
+  setChildState(childID, "done")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_k1b").length === 0, "poller settles")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_k1b" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_k1b")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the report wake arrives (no deadline break to lose the race against)")
+  const sends = toOwner().map(textOf)
+  assert.equal(sends.filter((s) => s.startsWith("[forge:dispatch-complete]")).length, 1, "exactly one terminal wake")
+  assert.ok(sends.filter((s) => s.startsWith("[forge:dispatch-complete]"))[0].includes(`report from ${childID}`), "the real final report rides the wake")
+  assert.equal(sends.filter((s) => s.startsWith("[forge:dispatch-progress]")).length, 0, "no progress notices — completed before the first boundary")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_k1b" } } } })
+})
+
+test("textless-idle floor: idle child with a finished-but-textless message ends honestly after one notify interval (finding names the child)", async (t) => {
+  process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS = "120"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "textless" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "go silent", run_in_background: true },
+    allowCtx("ses_floor", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_floor").length === 0, "the floor terminates the tracker honestly")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_floor" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_floor")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the finding arrives as the terminal wake")
+  const sends = toOwner().map(textOf)
+  const wakes = sends.filter((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.equal(wakes.length, 1, "exactly one terminal wake")
+  assert.match(wakes[0], new RegExp(`child session ${childID} ended without a reportable final message`), "the honest no-reportable-final-message finding names the child session id")
+  assert.equal(sends.filter((s) => s.startsWith("[forge:dispatch-progress]")).length, 0, "no progress notices — a textless-idle child is not 'running'")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_floor" } } } })
+})
+
+test("textless-idle floor: a busy re-appearance resets the streak — no finding while the child runs", async (t) => {
+  process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS = "150"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "textless" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "flap then finish", run_in_background: true },
+    allowCtx("ses_reset", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  // Textless-idle for a while (inside the interval), then BUSY again — the
+  // streak must reset, so the tracker cannot floor a running child.
+  await new Promise((res) => setTimeout(res, 60))
+  setChildState(childID, "busy")
+  await new Promise((res) => setTimeout(res, 250))
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_reset").length, 1, "no floor finding while the child runs — the streak reset on the busy reading")
+  // It then completes textful: the normal report wake lands.
+  setChildState(childID, "done")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_reset").length === 0, "poller settles on completion")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_reset" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_reset")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the report wake arrives")
+  const wake = toOwner().map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.ok(wake.includes(`report from ${childID}`), "the real final report rides the wake (the floor never fired)")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_reset" } } } })
+})
+
+test("copy: async discipline, handle text, and the ARMED finding disclose progress notices + the guaranteed final wake however long it takes", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  assert.match(h.tool.task.description, /\[forge:dispatch-progress\]/, "the tool description discloses interim progress notices")
+  assert.match(h.tool.task.description, /however long it takes/, "the guaranteed-final-wake wording")
+  assert.match(h.tool.task.description, /BLOCKING anti-pattern/, "the no-pre-wake-polling rule stays")
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "copy check", run_in_background: true },
+    allowCtx("ses_copy", dir),
+  )
+  assert.match(r.output, /END YOUR TURN/, "the stop mandate stays")
+  assert.match(r.output, /\[forge:dispatch-progress\] notices may arrive while the child runs/, "the handle mentions interim notices")
+  assert.match(r.output, /however long it takes/, "the handle guarantees the final wake regardless of duration")
+  // The ARMED sync-timeout finding carries the same disclosure.
+  process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS = "150"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS
+  })
+  await assert.rejects(
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "over the window", description: "copy armed" }, allowCtx("ses_copy2", dir)),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /Completion tracking is ARMED/)
+      assert.match(m, /exactly one \[forge:dispatch-complete\] wake carrying the final report/, "at-most-one terminal wake stays TRUE")
+      assert.match(m, /however long it takes/)
+      assert.match(m, /\[forge:dispatch-progress\] notices may arrive meanwhile/)
+      return true
+    },
+  )
+  // Harvest both sessions (aborts the still-busy children, drains state).
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_copy" } } } })
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_copy2" } } } })
 })

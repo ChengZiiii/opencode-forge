@@ -17,6 +17,7 @@ import {
   fetchFinalMessage,
   abortChild,
   resolvePollTimeoutMs,
+  resolveNotifyIntervalMs,
   DEFAULT_POLL_TIMEOUT_MS,
   MAX_POLL_TIMEOUT_MS,
   TERMINAL_STABILITY_TICKS,
@@ -367,6 +368,42 @@ test("resolvePollTimeoutMs: junk / non-positive values fall back to the default"
 test("resolvePollTimeoutMs: oversized values clamp to the 1h ceiling", () => {
   assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "999999999999" }), MAX_POLL_TIMEOUT_MS)
   assert.equal(MAX_POLL_TIMEOUT_MS, 3_600_000)
+})
+
+// ---------------------------------------------------------------------------
+// resolveNotifyIntervalMs: the FORGE_DISPATCH_NOTIFY_INTERVAL_MS knob
+// (sync-timeout-notify fold #2, design D6) — the [forge:dispatch-progress]
+// cadence + textless-idle floor window. Independent of the sync-wait knob.
+
+test("resolveNotifyIntervalMs: unset / empty env → default 600000", () => {
+  assert.equal(resolveNotifyIntervalMs({}), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: undefined }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "" }), DEFAULT_POLL_TIMEOUT_MS)
+})
+
+test("resolveNotifyIntervalMs: a valid value takes effect (test-friendly minimum)", () => {
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "50" }), 50)
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "5000" }), 5000)
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "123456.7" }), 123457, "fractional values round")
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "1" }), 1)
+})
+
+test("resolveNotifyIntervalMs: junk / non-positive values fall back to the default", () => {
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "abc" }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "10min" }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "0" }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "-5000" }), DEFAULT_POLL_TIMEOUT_MS)
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "Infinity" }), DEFAULT_POLL_TIMEOUT_MS)
+})
+
+test("resolveNotifyIntervalMs: oversized values clamp to the 1h ceiling", () => {
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "999999999999" }), MAX_POLL_TIMEOUT_MS)
+})
+
+test("resolveNotifyIntervalMs: independent of FORGE_DISPATCH_POLL_TIMEOUT_MS (each knob reads its own key)", () => {
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_POLL_TIMEOUT_MS: "123" }), DEFAULT_POLL_TIMEOUT_MS, "the sync-wait knob does not feed the notify interval")
+  assert.equal(resolvePollTimeoutMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "456" }), DEFAULT_POLL_TIMEOUT_MS, "the notify knob does not feed the sync wait")
+  assert.equal(resolveNotifyIntervalMs({ FORGE_DISPATCH_NOTIFY_INTERVAL_MS: "70", FORGE_DISPATCH_POLL_TIMEOUT_MS: "9" }), 70)
 })
 
 // ---------------------------------------------------------------------------

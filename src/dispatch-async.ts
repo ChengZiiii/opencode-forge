@@ -229,6 +229,23 @@ export function resolvePollTimeoutMs(env: { [key: string]: string | undefined } 
   return Math.min(Math.round(parsed), MAX_POLL_TIMEOUT_MS)
 }
 
+/**
+ * Resolve the [forge:dispatch-progress] notification interval from the
+ * environment knob `FORGE_DISPATCH_NOTIFY_INTERVAL_MS` (sync-timeout-notify
+ * fold #2, design D6). Default 600000 — the same wall clock the sync wait
+ * uses BY DEFAULT, but tuned independently: FORGE_DISPATCH_POLL_TIMEOUT_MS
+ * scopes the SYNC WAIT only and must never feed the never-die tracker.
+ * Same tolerance posture and ceiling clamp as resolvePollTimeoutMs; the
+ * env is a parameter so tests drive it deterministically.
+ */
+export function resolveNotifyIntervalMs(env: { [key: string]: string | undefined } = process.env): number {
+  const raw = env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS
+  if (raw === undefined || raw === "") return DEFAULT_POLL_TIMEOUT_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_POLL_TIMEOUT_MS
+  return Math.min(Math.round(parsed), MAX_POLL_TIMEOUT_MS)
+}
+
 function isActiveStatus(status: { type?: string } | undefined): boolean {
   return status !== undefined && status.type !== undefined && ACTIVE_STATUS_TYPES.has(status.type)
 }
@@ -242,8 +259,17 @@ function isActiveStatus(status: { type?: string } | undefined): boolean {
  */
 export const TERMINAL_STABILITY_TICKS = 3
 
-/** Caller-shareable stability counter (see PollInput.stability). */
-export type TerminalStabilityState = { stableTicks: number }
+/**
+ * Caller-shareable stability counter (see PollInput.stability). The optional
+ * `textlessIdleSince` is the textless-idle floor streak (sync-timeout-notify
+ * fold #2): pollChild stamps it when a NOT-ACTIVE child's latest assistant
+ * message is not a reportable final message and clears it on any active
+ * reading or textful candidate; the ASYNC wiring reads it to terminate
+ * honestly once the streak spans a full notification interval. Sync callers
+ * ignore it (their own wait window applies), so pollChild's return contract
+ * is unchanged.
+ */
+export type TerminalStabilityState = { stableTicks: number; textlessIdleSince?: number }
 
 function latestAssistant(messages: SessionMessageLike[]): SessionMessageLike | undefined {
   let best: SessionMessageLike | undefined
@@ -364,6 +390,16 @@ export async function pollChild(
       // Any busy/active reading or a failed candidate observation breaks the
       // consecutive run (spec: "resetting when the session turns busy again").
       stability.stableTicks = 0
+    }
+    // Textless-idle floor streak: a NOT-ACTIVE child whose latest assistant
+    // message is not a reportable final message (no message, falsy finish,
+    // or no non-empty text) starts/holds the streak; any ACTIVE reading
+    // (a status fetch failure counts as active) or a textful candidate
+    // clears it — so a RUNNING child can never accumulate floor time.
+    if (active || (finished && textful)) {
+      stability.textlessIdleSince = undefined
+    } else if (stability.textlessIdleSince === undefined) {
+      stability.textlessIdleSince = now()
     }
 
     if (now() >= deadline) {
