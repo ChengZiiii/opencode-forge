@@ -199,6 +199,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
 | `<tmp>/opencode-forge/watchdog/log.jsonl` | watchdog interventions ledger (bounded: 200 entries, oldest rotated) | runtime debris — delete freely, also after uninstall |
+| `<tmp>/opencode-forge/session-anchors.jsonl` | session-anchor ledger — persisted evidence of the pooled worktrees where live activity bound sessions (pooled binds only, FIFO-capped to 200, fail-soft IO); a restart-resumed session whose record is pool-less and whose in-memory map is empty re-binds its OWN pool from here, only while the recorded pool file still exists on disk | runtime debris — delete freely; losing it only costs the restart-resume own-pool re-bind (sessions re-learn their pool from live activity) |
 | `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (dispatch records — including async orphans — live in the jobs ledger; this separate file dates from the retired `forge_dispatch` tool) | runtime debris — delete freely |
 | `<project>/.opencode/forge/dispatch-log.jsonl` | dispatch journal (fold E) — append-only per-workspace record of every async dispatch state transition (`dispatched` / `queued` / `started` / `retry-pending` / `terminal`); bounded by `FORGE_DISPATCH_JOURNAL_MAX` (default 200, terminal-first rotation); prompt text retained while a record is non-terminal, redacted on terminal; corrupt lines skipped. This is what restart recovery replays — a live child re-arms, a finished-while-down child wakes its owner exactly once, queued wishes re-enter the queue, retry chains resume | runtime data — deleting it only loses cross-restart recovery for in-flight dispatches; uninstall leaves it behind (add `.opencode/forge/` to your ignore file if you don't want it versioned) |
 | `.opencode/forge.json` (the NEAREST one walking up from the session's worktree — sole ownership) and `~/.config/opencode/forge.json` (global FALLBACK only, never merged) | your static subagent definitions (JSONC) — the workspace pool IS the session's whole roster; nested forge.json files are ignored. **User data — the plugin only reads them, never writes or migrates them** | yours — version the project ones, keep the global one out of sync tools if it holds machine-specific models |
@@ -523,6 +524,14 @@ workspace-ownership strictness as opencode's native MCP config):
    pool resolves to the POOLED binding (one bounded console disclosure per
    session names both paths) — own-pool dispatch rights survive both
    degeneration directions (the degraded map, and the rebound record).
+   When BOTH degenerate at once — the map empty (no live activity yet after
+   a host restart) and the record rebound pool-less — the plugin consults
+   its **persisted session-anchor ledger** (a bounded plugin-namespaced
+   JSONL in the OS temp dir recording ONLY pooled binds — FIFO-capped,
+   fail-soft IO) and re-binds the session from that recorded evidence, but
+   only while the recorded worktree still owns its pool file on disk (a
+   deleted pool stays deleted); one bounded console disclosure per session
+   names the re-bind.
 2. the **global layer**: `~/.config/opencode/forge.json` — a **fallback
    ONLY**: when the workspace has no pool file, the global layer serves as
    the whole roster; when the workspace has one, the global layer is NOT

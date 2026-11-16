@@ -824,6 +824,118 @@ async function handoffTarget(sessionID: string): Promise<string | undefined> {
 }
 
 // ---------------------------------------------------------------------------
+// Session-anchor ledger (change pool-rebind-on-resume): persisted, bounded
+// JSONL evidence of the pooled worktrees where live activity bound sessions.
+// One global plugin-namespaced file (`<os-tmp>/opencode-forge/…` — the
+// sanctioned runtime-artifact home); pooled non-degenerate binds write only
+// (positive evidence); every read/write failure is fail-soft. The
+// both-degenerate shape (an EMPTY in-memory map after a host restart plus a
+// pool-less resume-rebound authoritative record) consults it to re-bind the
+// session's own pool; cross-pool isolation and fail-open stay untouched.
+// ---------------------------------------------------------------------------
+type SessionAnchorLedgerFs = { read: () => string; write: (text: string) => void; append: (text: string) => void }
+// Prod: `<os-tmp>/opencode-forge/…` (the sanctioned runtime-artifact home).
+// Tests redirect the whole namespace into the sandboxed FORGE_TEST_FORGE_HOME
+// (set before the module import) so suite binds never touch the real ledger.
+const sessionAnchorLedgerPath = join(process.env.FORGE_TEST_FORGE_HOME ?? tmpdir(), "opencode-forge", "session-anchors.jsonl")
+let sessionAnchorLedgerFsFactory: ((filePath: string) => SessionAnchorLedgerFs) | null = null
+let sessionAnchorLedgerWarned = false
+let sessionAnchorLedgerAppends = 0
+const SESSION_ANCHOR_LEDGER_CAP = 200
+const poolGateLedgerNotes = new Set<string>()
+// Per-host-life dedup memo: sessions already ledger-bound to this folded
+// worktree — one append per (session, worktree) pair per host life.
+const sessionAnchorLedgerMemo = new Map<string, string>()
+
+function sessionAnchorLedgerFs(): SessionAnchorLedgerFs {
+  if (sessionAnchorLedgerFsFactory) return sessionAnchorLedgerFsFactory(sessionAnchorLedgerPath)
+  return {
+    read: () => {
+      try {
+        return readFileSync(sessionAnchorLedgerPath, "utf8")
+      } catch {
+        return "" // missing file = no entries; real errors surface at callers
+      }
+    },
+    write: (text) => {
+      mkdirSync(dirname(sessionAnchorLedgerPath), { recursive: true })
+      writeFileSync(sessionAnchorLedgerPath, text, "utf8")
+    },
+    append: (text) => {
+      mkdirSync(dirname(sessionAnchorLedgerPath), { recursive: true })
+      appendFileSync(sessionAnchorLedgerPath, text, "utf8")
+    },
+  }
+}
+
+function sessionAnchorLedgerWarnOnce(scope: string, err: unknown): void {
+  if (sessionAnchorLedgerWarned) return
+  sessionAnchorLedgerWarned = true
+  console.warn(
+    `[forge:pool] session-anchor ledger ${scope} failed (fail-soft; resolution degrades to the live chain): ${err instanceof Error ? err.message : String(err)}`,
+  )
+}
+
+function ledgerParseEntries(text: string): Map<string, string> {
+  const latest = new Map<string, string>()
+  if (!text) return latest
+  for (const line of text.split(/\r?\n/)) {
+    const s = line.trim()
+    if (!s) continue
+    try {
+      const e = JSON.parse(s) as { sessionID?: unknown; worktree?: unknown }
+      if (typeof e.sessionID === "string" && e.sessionID && typeof e.worktree === "string" && e.worktree) latest.set(e.sessionID, e.worktree)
+    } catch {}
+  }
+  return latest
+}
+
+// The last ledger entry's worktree for a session, or "" (fail-soft read).
+function sessionAnchorLedgerLookup(sessionID: string): string {
+  try {
+    return ledgerParseEntries(sessionAnchorLedgerFs().read()).get(sessionID) ?? ""
+  } catch (err) {
+    sessionAnchorLedgerWarnOnce("read", err)
+    return ""
+  }
+}
+
+// Record a pooled bind (positive evidence). Guards: non-degenerate worktree,
+// the worktree OWNS a pool file at write time, one append per (session,
+// worktree) pair per host life. FIFO cap: on overflow the file is compacted
+// to the latest entry per session. All failures are fail-soft — binding
+// never breaks session flow.
+function noteSessionAnchorLedgerBinding(sessionID: string, worktree: string): void {
+  try {
+    if (!sessionID || !worktree || isRootish(worktree)) return
+    if (sessionPoolFileOf(worktree) === null) return
+    const folded = foldPath(worktree)
+    if (sessionAnchorLedgerMemo.get(sessionID) === folded) return
+    const fsx = sessionAnchorLedgerFs()
+    fsx.append(JSON.stringify({ sessionID, worktree, ts: nowIso() }) + "\n")
+    sessionAnchorLedgerMemo.set(sessionID, folded)
+    sessionAnchorLedgerAppends++
+    if (sessionAnchorLedgerAppends > SESSION_ANCHOR_LEDGER_CAP) {
+      const latest = ledgerParseEntries(fsx.read())
+      // FIFO among DISTINCT sessions (Map iteration = insertion order —
+      // oldest first appearance drops first) until the rewrite fits the cap.
+      while (latest.size > SESSION_ANCHOR_LEDGER_CAP) {
+        const oldest = latest.keys().next().value
+        if (oldest === undefined) break
+        latest.delete(oldest)
+      }
+      const rewritten = [...latest.entries()]
+        .map(([sid, wt]) => JSON.stringify({ sessionID: sid, worktree: wt, ts: nowIso() }))
+        .join("\n")
+      fsx.write(rewritten ? rewritten + "\n" : "")
+      sessionAnchorLedgerAppends = latest.size
+    }
+  } catch (err) {
+    sessionAnchorLedgerWarnOnce("write", err)
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Dispatch gates (change task-shadow, spec: forge-subagents — "Task shadow
 // surface"): ONE set of predicates serves BOTH dispatch paths — the
 // task interception belt (tool.execute.before) and the task tool execute —
@@ -836,8 +948,11 @@ async function handoffTarget(sessionID: string): Promise<string | undefined> {
 // carries the true { directory, worktree } even for resumed-after-restart
 // sessions (which never re-fire session.created), while the in-memory map
 // has degenerate writers (rootish tool contexts resolve to the launch
-// directory). Read-only resolver: it never writes back into the map, so
-// the map's other consumers keep their contracts.
+// directory). pool-rebind-on-resume: when the live chain resolves an anchor
+// that owns NO pool, the persisted session-anchor ledger may re-bind the
+// session's own pool — the both-degenerate shape the live sources cannot
+// resolve. The re-bind path is the resolver's ONLY map write (a seed under
+// the non-degenerate-refinement rule); every other consumer is untouched.
 async function resolveSessionAnchorForPools(anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null | undefined, sessionID: string | undefined): Promise<string> {
   if (!sessionID) return ""
   let authoritative = ""
@@ -849,7 +964,7 @@ async function resolveSessionAnchorForPools(anchorClient: { session?: { get?: (o
     if (anchor && !isRootish(anchor)) authoritative = anchor
   } catch {}
   const mapped = sessions.get(sessionID)?.worktree ?? ""
-  if (authoritative === "") return mapped
+  if (authoritative === "") return resolveAnchorViaLedger(sessionID, mapped)
   // anchor-pool-preference (the 0.20.0 evening incident's mirror of the
   // 0.18.0 one): a restart-RESUMED session's authoritative record can carry
   // the NEW launch directory (pool-less) while the in-memory binding — kept
@@ -874,7 +989,35 @@ async function resolveSessionAnchorForPools(anchorClient: { session?: { get?: (o
     }
     return mapped
   }
-  return authoritative
+  return resolveAnchorViaLedger(sessionID, authoritative)
+}
+
+// The ledger consult (pool-rebind-on-resume): when the live chain resolved
+// an anchor that owns NO pool (empty, degenerate, or genuinely pool-less),
+// the persisted session-anchor ledger may re-bind the session's own pool —
+// the restart-resume shape (empty map + pool-less record) the live sources
+// cannot resolve. The hit is disk-truth re-checked at resolution time (a
+// deleted pool file keeps the disappears-from-materialization semantics), a
+// hit seeds the in-memory map under the non-degenerate-refinement rule, and
+// the substitution discloses once per session. A miss (no entry, dead pool
+// file, IO failure) keeps today's resolution EXACTLY.
+function resolveAnchorViaLedger(sessionID: string, resolved: string): string {
+  if (resolved && !isRootish(resolved) && sessionPoolFileOf(resolved) !== null) return resolved
+  const hit = sessionAnchorLedgerLookup(sessionID)
+  if (!hit || isRootish(hit) || sessionPoolFileOf(hit) === null) return resolved
+  const existing = sessions.get(sessionID)
+  if (existing) {
+    if (!isRootish(hit)) existing.worktree = hit
+  } else {
+    sessions.set(sessionID, { sessionID, worktree: hit })
+  }
+  if (!poolGateLedgerNotes.has(sessionID)) {
+    poolGateLedgerNotes.add(sessionID)
+    console.warn(
+      `[forge:pool] session ${sessionID}: dispatch anchor re-bound from the persisted session-anchor ledger (${hit}) — the resumed session's authoritative record is pool-less and the in-memory map was empty (restart-resume rebind shape).`,
+    )
+  }
+  return hit
 }
 
 // Session-domain pool gate (sole-pool-ownership): a dispatch targeting a
@@ -998,11 +1141,17 @@ function ensureSession(sessionID: string, worktree: string): SessionState {
     // sessions and rootish tool contexts were poisoning bindings, which
     // stripped the session's own-pool dispatch rights in the belt.
     // Non-degenerate refinement keeps today's overwrite semantics.
-    if (!isRootish(worktree)) existing.worktree = worktree
+    if (!isRootish(worktree)) {
+      existing.worktree = worktree
+      // pool-rebind-on-resume: pooled non-degenerate binds persist as
+      // ledger evidence (fail-soft, deduped, capped).
+      noteSessionAnchorLedgerBinding(sessionID, worktree)
+    }
     return existing
   }
   const state: SessionState = { sessionID, worktree }
   sessions.set(sessionID, state)
+  if (!isRootish(worktree)) noteSessionAnchorLedgerBinding(sessionID, worktree)
   return state
 }
 
@@ -5030,6 +5179,35 @@ export const server: Plugin = async (input, options) => {
           return null
         }
       },
+      // Session-anchor ledger seams (pool-rebind-on-resume): inject the fs
+      // BEFORE binding sessions; the factory clears the disclosure bounds
+      // and the dedup memo (the LEDGER FILE itself survives — it is exactly
+      // what a host restart keeps).
+      setSessionAnchorLedgerFs: (factory: ((filePath: string) => SessionAnchorLedgerFs) | null) => {
+        sessionAnchorLedgerFsFactory = factory
+        poolGateLedgerNotes.clear()
+        sessionAnchorLedgerMemo.clear()
+        sessionAnchorLedgerAppends = 0
+      },
+      // Simulate a NEW PROCESS for the same session id (the restart-resume
+      // shape): the in-memory session table and the disclosure bounds all
+      // reset — only the LEDGER (injected fs) survives, which is exactly
+      // what a host restart keeps.
+      resetSessionBindings: () => {
+        sessions.clear()
+        anchorPrefNotes.clear()
+        poolGateUnknownNotes.clear()
+        poolGateLedgerNotes.clear()
+        sessionAnchorLedgerMemo.clear()
+        sessionAnchorLedgerAppends = 0
+      },
+      sessionAnchorLedgerText: (): string | null => {
+        try {
+          return sessionAnchorLedgerFs().read()
+        } catch {
+          return null
+        }
+      },
       // Pending [forge:dispatch-progress] notices for a session (fold #2
       // wiring tests observe the enqueue side of the lossy queue).
       dispatchProgress: (sessionID: string) => [...(dispatchProgressQueue.get(sessionID) ?? [])],
@@ -5143,6 +5321,10 @@ export const server: Plugin = async (input, options) => {
           poolGateUnknownNotes.delete(info.id)
           // Anchor-preference disclosure bound (anchor-pool-preference).
           anchorPrefNotes.delete(info.id)
+          // Ledger-rebind disclosure bound + dedup memo (pool-rebind-on-resume;
+          // the LEDGER file itself is persistent evidence and survives).
+          poolGateLedgerNotes.delete(info.id)
+          sessionAnchorLedgerMemo.delete(info.id)
           // Crew hygiene (crew-autonomous-waves D4): the session's crew was
           // in-memory and session-bound — end it with the session, and evict
           // the crew continuation engine's maps alongside (mirrors the

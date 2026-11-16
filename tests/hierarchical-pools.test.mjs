@@ -953,6 +953,292 @@ test("anchor pool preference (e): a POOL-LESS resume-rebound record yields to th
 })
 
 // ---------------------------------------------------------------------------
+// pool-rebind-on-resume (change pool-rebind-on-resume): the BOTH-degenerate
+// shape — an EMPTY in-memory map (no live activity after a host restart)
+// plus a pool-less resume-rebound authoritative record — falls through the
+// live chain to the global-fallback gate and locks the session out of its
+// OWN pool. The persisted session-anchor ledger (pooled binds only, one
+// global namespaced JSONL, fail-soft IO) is the re-bind source; disk truth
+// re-checks the pool file at resolution time (deletion semantics kept);
+// cross-pool isolation and fail-open are untouched.
+
+const makeLedgerFs = (initial = "") => {
+  let text = initial
+  const fsx = {
+    read: () => text,
+    write: (x) => {
+      text = x
+    },
+    append: (x) => {
+      text += x
+    },
+  }
+  return [fsx, () => (text = initial)]
+}
+
+test("pool-rebind (f): EMPTY map + pool-less resume record re-binds from the persisted ledger — own-pool ALLOWED, disclosure once", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-lf-", { pool: "ldga", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-lf2-", { pool: "ldgb", agents: { shader: pinned } })
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-lflaunch-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const [ledgerFs] = makeLedgerFs()
+  // Host life 1: the session binds to its pooled workspace — the ledger
+  // persists the positive evidence.
+  const h1 = await startServer(input(dirA), {})
+  t.after(() => h1.dispose?.())
+  h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(() => ledgerFs)
+  t.after(() => h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(null))
+  await bindSession(h1, "ses_ledger", dirA)
+  const entry = ledgerFs.read().trim().split("\n").map((l) => JSON.parse(l)).find((e) => e.sessionID === "ses_ledger")
+  assert.ok(entry, "the pooled bind persisted as ledger evidence")
+  assert.equal(foldP(entry.worktree), foldP(dirA), "the ledger entry names the pooled worktree")
+  // Host life 2 (restart): the host re-opens the SAME workspace (the pool
+  // materializes), the resumed session's record carries the POOL-LESS launch
+  // dir, and the in-memory map is WIPED (fresh process, no live activity).
+  const h2 = await startServer(recordInput(dirA, { ses_ledger: { directory: launchDir, worktree: launchDir } }), {})
+  t.after(() => h2.dispose?.())
+  await server(input(dirB), {}) // shared host: dirB joins for the cross-pool leg
+  h2.__forgeSubagentsTest.resetSessionBindings()
+  await h2.config(emptyCfg())
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => warns.push(args.map(String).join(" "))
+  try {
+    // Own-pool dispatch FLOWS (was refused pre-fix with the global-fallback roster).
+    await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_ledger", callID: "lf1" }, taskArgs("forge-ldga-research"))
+    // The re-bind seeded the map — the second dispatch flows without a new disclosure.
+    await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_ledger", callID: "lf2" }, taskArgs("forge-ldga-research"))
+    // Cross-pool STILL refused — the ledger restores own-pool rights, never a leak.
+    await assert.rejects(
+      () => h2["tool.execute.before"]({ tool: "task", sessionID: "ses_ledger", callID: "lf3" }, taskArgs("forge-ldgb-shader")),
+      (err) => {
+        const m = String(err)
+        assert.match(m, /not dispatchable from this session/)
+        assert.match(m, /its workspace pool/, "the roster line names the ledger-rebound workspace pool")
+        return true
+      },
+    )
+  } finally {
+    console.warn = origWarn
+  }
+  const ledgerWarns = warns.filter((w) => w.includes("session-anchor ledger"))
+  assert.equal(ledgerWarns.length, 1, "exactly one bounded ledger-rebind disclosure")
+  assert.match(ledgerWarns[0], /re-bound from the persisted session-anchor ledger/)
+  assert.match(ledgerWarns[0], /restart-resume rebind shape/)
+})
+
+test("pool-rebind (g): the ledger re-bind is workspace-EXACT — a dirB-bound session regains dirB, not dirA", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-lh-", { pool: "ldha", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-lh2-", { pool: "ldhb", agents: { shader: pinned } })
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-lhlaunch-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const [ledgerFs] = makeLedgerFs()
+  const h1 = await startServer(input(dirB), {}) // life 1 in workspace B
+  t.after(() => h1.dispose?.())
+  h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(() => ledgerFs)
+  t.after(() => h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(null))
+  await bindSession(h1, "ses_ledger_b", dirB)
+  // Restart: host re-opens workspace B; the record carries the pool-less
+  // launch dir; the map is wiped.
+  const h2 = await startServer(recordInput(dirB, { ses_ledger_b: { directory: launchDir, worktree: launchDir } }), {})
+  t.after(() => h2.dispose?.())
+  await server(input(dirA), {})
+  h2.__forgeSubagentsTest.resetSessionBindings()
+  await h2.config(emptyCfg())
+  await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_ledger_b", callID: "lh1" }, taskArgs("forge-ldhb-shader"))
+  await assert.rejects(
+    () => h2["tool.execute.before"]({ tool: "task", sessionID: "ses_ledger_b", callID: "lh2" }, taskArgs("forge-ldha-research")),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /not dispatchable from this session/)
+      assert.match(m, /its workspace pool/, "the roster names dirB's pool (the ledger bind), not the global fallback")
+      return true
+    },
+  )
+})
+
+test("pool-rebind (h): a ledger hit whose pool file was DELETED is discarded — the global-fallback gate keeps the deletion semantics", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-lk-", { pool: "ldkk", agents: { gone: pinned } })
+  const home = process.env.FORGE_TEST_FORGE_HOME
+  const globalJson = join(home, ".config", "opencode", "forge.json")
+  mkdirSync(join(home, ".config", "opencode"), { recursive: true })
+  writeFileSync(globalJson, JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  t.after(() => {
+    try {
+      rmSync(globalJson, { force: true })
+    } catch {}
+  })
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-lklaun-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const [ledgerFs] = makeLedgerFs()
+  const h1 = await startServer(input(dirA), {})
+  t.after(() => h1.dispose?.())
+  h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(() => ledgerFs)
+  t.after(() => h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(null))
+  await bindSession(h1, "ses_gone", dirA)
+  // The pool file dies BEFORE the restart — 删池文件即失池, the ledger's
+  // evidence must not resurrect it.
+  rmSync(join(dirA, ".opencode", "forge.json"))
+  const h2 = await startServer(recordInput(dirA, { ses_gone: { directory: launchDir, worktree: launchDir } }), {})
+  t.after(() => h2.dispose?.())
+  h2.__forgeSubagentsTest.resetSessionBindings()
+  await h2.config(emptyCfg())
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => warns.push(args.map(String).join(" "))
+  try {
+    // The dead hit is discarded → the session stays pool-less → the GLOBAL
+    // fallback roster applies: the global-layer agent is dispatchable.
+    await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_gone", callID: "hk1" }, taskArgs("forge-global-research"))
+  } finally {
+    console.warn = origWarn
+  }
+  assert.ok(!warns.some((w) => w.includes("session-anchor ledger")), "no ledger re-bind fired — the dead pool's evidence is discarded")
+})
+
+test("pool-rebind (i): ledger IO failures are FAIL-SOFT — binds and the gate proceed on the live chain", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-li-", { pool: "ldia", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-li2-", { pool: "ldib", agents: { shader: pinned } })
+  const boom = () => ({
+    read: () => {
+      throw new Error("ledger disk gone")
+    },
+    write: () => {
+      throw new Error("ledger disk gone")
+    },
+    append: () => {
+      throw new Error("ledger disk gone")
+    },
+  })
+  const h1 = await startServer(input(dirA), {})
+  t.after(() => h1.dispose?.())
+  h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(() => boom)
+  t.after(() => h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(null))
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => warns.push(args.map(String).join(" "))
+  try {
+    await bindSession(h1, "ses_ledger_io", dirA) // append throws → fail-soft, the bind proceeds
+  } finally {
+    console.warn = origWarn
+  }
+  const ledgerWarns = warns.filter((w) => w.includes("session-anchor ledger"))
+  assert.equal(ledgerWarns.length, 1, "exactly ONE bounded fail-soft warn")
+  assert.match(ledgerWarns[0], /fail-soft/)
+  assert.equal(h1.__forgeSubagentsTest.sessionAnchorLedgerText(), null, "the read seam reports the failure as null")
+  // The gate with a throwing ledger: lookup degrades to "" → the live chain
+  // decides EXACTLY as before the change (today's global-fallback refusal).
+  const h2 = await startServer(recordInput(dirA, { ses_ledger_io: { directory: tmpdir(), worktree: tmpdir() } }), {})
+  t.after(() => h2.dispose?.())
+  await server(input(dirB), {})
+  h2.__forgeSubagentsTest.resetSessionBindings()
+  await h2.config(emptyCfg())
+  await assert.rejects(
+    () => h2["tool.execute.before"]({ tool: "task", sessionID: "ses_ledger_io", callID: "ii1" }, taskArgs("forge-ldib-shader")),
+    /not dispatchable from this session/,
+  )
+})
+
+test("pool-rebind (j): the ledger stays BOUNDED (FIFO cap compaction) and the LAST entry per session wins", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-lj-", { pool: "ldja", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-lj2-", { pool: "ldjb", agents: { shader: pinned } })
+  const [ledgerFs] = makeLedgerFs()
+  const h1 = await startServer(input(dirA), {})
+  t.after(() => h1.dispose?.())
+  h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(() => ledgerFs)
+  t.after(() => h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(null))
+  // Last-entry-wins: a session that MOVES between pooled worktrees re-appends.
+  await bindSession(h1, "ses_mover", dirA)
+  await bindSession(h1, "ses_mover", dirB)
+  const early = ledgerFs.read().trim().split("\n").map((l) => JSON.parse(l))
+  const mover = early.filter((e) => e.sessionID === "ses_mover")
+  assert.equal(mover.length, 2, "both pooled binds appended (dedup is per worktree)")
+  assert.equal(foldP(mover.at(-1).worktree), foldP(dirB), "the LAST entry names the newest pooled worktree")
+  // FIFO cap: 220 distinct pooled binds → the file compacts under the cap.
+  for (let i = 0; i < 220; i++) await bindSession(h1, `ses_bulk_${i}`, dirA)
+  const lines = ledgerFs.read().trim().split("\n").filter(Boolean)
+  assert.ok(lines.length <= 205, `the ledger compacted under the cap (${lines.length} lines)`)
+  assert.ok(lines.some((l) => l.includes("ses_bulk_219")), "the newest session survived")
+  assert.ok(!lines.some((l) => l.includes("ses_bulk_0")), "the oldest session dropped (FIFO)")
+  for (const l of lines) JSON.parse(l) // every surviving line stays machine-readable
+})
+
+test("pool-rebind (k): the live chain OUTRANKS a stale ledger — preference and authoritative precedence intact", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-ll-", { pool: "ldla", agents: { research: pinned } })
+  const dirB = dirWithForgeJson(t, "forge-pool-ll2-", { pool: "ldlb", agents: { shader: pinned } })
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-lllaun-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const [ledgerFs] = makeLedgerFs()
+  const h1 = await startServer(recordInput(dirB, { ses_stale: { directory: launchDir, worktree: launchDir } }), {})
+  t.after(() => h1.dispose?.())
+  h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(() => ledgerFs)
+  t.after(() => h1.__forgeSubagentsTest.setSessionAnchorLedgerFs(null))
+  await server(input(dirA), {}) // both pools materialize
+  await h1.config(emptyCfg())
+  // Shape 1 (the 0.20.0 preference): the LIVE pooled map binding (dirB)
+  // beats the STALE ledger claim (dirA).
+  await bindSession(h1, "ses_stale", dirB)
+  ledgerFs.write(JSON.stringify({ sessionID: "ses_stale", worktree: dirA, ts: "2020-01-01T00:00:00.000Z" }) + "\n") // re-stale
+  const warns = []
+  const origWarn = console.warn
+  console.warn = (...args) => warns.push(args.map(String).join(" "))
+  try {
+    await h1["tool.execute.before"]({ tool: "task", sessionID: "ses_stale", callID: "ll1" }, taskArgs("forge-ldlb-shader"))
+    await assert.rejects(
+      () => h1["tool.execute.before"]({ tool: "task", sessionID: "ses_stale", callID: "ll2" }, taskArgs("forge-ldla-research")),
+      (err) => {
+        const m = String(err)
+        assert.match(m, /not dispatchable from this session/)
+        assert.match(m, /its workspace pool/, "the roster names the LIVE pooled binding (dirB)")
+        return true
+      },
+    )
+  } finally {
+    console.warn = origWarn
+  }
+  assert.ok(!warns.some((w) => w.includes("session-anchor ledger")), "the ledger never hijacked a live pooled binding")
+  assert.ok(warns.some((w) => w.includes("pooled binding wins")), "the anchor-preference disclosure fired instead")
+  // Shape 2 (authoritative precedence): a POOLED record (dirA) beats the
+  // ledger claim (dirB) — no ledger consult at all.
+  ledgerFs.write(
+    [JSON.stringify({ sessionID: "ses_stale", worktree: dirA, ts: "2020-01-01T00:00:00.000Z" }), JSON.stringify({ sessionID: "ses_rec", worktree: dirB, ts: "2020-01-01T00:00:00.000Z" })].join("\n") + "\n",
+  )
+  const h2 = await startServer(recordInput(dirA, { ses_rec: { directory: dirA, worktree: dirA } }), {})
+  t.after(() => h2.dispose?.())
+  await server(input(dirB), {})
+  h2.__forgeSubagentsTest.resetSessionBindings()
+  await h2.config(emptyCfg())
+  const warns2 = []
+  console.warn = (...args) => warns2.push(args.map(String).join(" "))
+  try {
+    await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_rec", callID: "ll3" }, taskArgs("forge-ldla-research"))
+    await assert.rejects(
+      () => h2["tool.execute.before"]({ tool: "task", sessionID: "ses_rec", callID: "ll4" }, taskArgs("forge-ldlb-shader")),
+      /not dispatchable from this session/,
+    )
+  } finally {
+    console.warn = origWarn
+  }
+  assert.ok(!warns2.some((w) => w.includes("session-anchor ledger")), "a pooled record needs no ledger consult")
+})
+
+// ---------------------------------------------------------------------------
 // forge-prompt-shared — pool-level shared prompt segment (spec:
 // forge-subagents "Pool-level shared prompt segment"; design D1-D5). One
 // write-point per pool file, inherited by EVERY agent that file
