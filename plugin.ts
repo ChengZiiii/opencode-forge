@@ -80,6 +80,13 @@ import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput,
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
 import { DEFAULT_POLL_INTERVAL_MS, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
 import { buildRetryPrompt, classifyDispatchError, resolveMaxAttempts, resolveRetryBackoffMs } from "./src/dispatch-retry.ts"
+import {
+  createDispatchJournal,
+  resolveJournalMax,
+  type DispatchJournal,
+  type DispatchJournalRecord,
+  type JournalFs,
+} from "./src/dispatch-journal.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -1931,6 +1938,475 @@ function inFlightAsyncDispatches(sessionID: string): string[] {
   return ids
 }
 
+// ---------------------------------------------------------------------------
+// dispatch-resilience fold D — per-session FIFO queue: the 4th+ async wish
+// from one session QUEUES (bounded FORGE_DISPATCH_QUEUE_MAX, default 10)
+// instead of being refused; a pump spawns the queue head on every slot
+// release (any terminal transition of that session's dispatches). Belts
+// evaluate at CALL time (unchanged); the pump re-checks the target roster,
+// the draft gate, and the crew belt at SPAWN time — a tightening between
+// call and spawn fails the wish as an honest error wake, never silently.
+// Owner death flushes queued wishes WITHOUT spawning and terminalizes their
+// journal records (fold E).
+// ---------------------------------------------------------------------------
+
+/** Default queue bound per session (FORGE_DISPATCH_QUEUE_MAX). */
+export const DEFAULT_DISPATCH_QUEUE_MAX = 10
+
+/** Resolve FORGE_DISPATCH_QUEUE_MAX (default 10; invalid → default). */
+export function resolveDispatchQueueMax(env: { [key: string]: string | undefined } = process.env): number {
+  const raw = env.FORGE_DISPATCH_QUEUE_MAX
+  if (raw === undefined || raw === "") return DEFAULT_DISPATCH_QUEUE_MAX
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_DISPATCH_QUEUE_MAX
+  return Math.round(parsed)
+}
+
+type QueuedDispatchWish = {
+  jobId: string
+  agentID: string
+  ownerSession: string
+  description: string
+  prompt: string
+  directory: string
+  questionDeny: boolean
+  enqueuedAt: number
+}
+
+// ownerSession → FIFO wishes (queue order = enqueue order).
+const dispatchQueues = new Map<string, QueuedDispatchWish[]>()
+
+function queuedAsyncDispatchIds(sessionID: string): string[] {
+  return (dispatchQueues.get(sessionID) ?? []).map((w) => w.jobId)
+}
+
+/** The queued-start progress notice (spec: "a progress notice announcing the queued wish's start"). */
+function announceQueuedStart(ownerSession: string, notice: string): void {
+  queueDispatchProgress(ownerSession, notice)
+  if (idleJobSessions.has(ownerSession)) void deliverDispatchProgress(ownerSession)
+}
+
+/**
+ * Fail a queued wish as an honest ERROR WAKE at spawn time (roster vanished,
+ * draft tightened, crew belt) — the wish never spawns, and the single
+ * terminal wake carries the reason (never silent).
+ */
+function failQueuedWishHonestly(wish: QueuedDispatchWish, reason: string): void {
+  const job = jobManager.create({
+    id: wish.jobId,
+    cmd: `dispatch ${wish.agentID}: ${wish.description} (queued, refused at spawn)`,
+    worktree: wish.directory,
+    ownerSession: wish.ownerSession,
+    logPath: join(jobLogDir, "dispatch", `${wish.jobId}.txt`),
+    notify: true,
+    killTree: () => {},
+  })
+  ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = {
+    agentID: wish.agentID,
+    childSessionID: "",
+    description: wish.description,
+  }
+  const text = `(spawn refused at queue pump: ${reason} — the queued wish never spawned)`
+  jobManager.appendOutput(job, text)
+  jobManager.markTerminal(job, "exited", 1)
+  journalTerminalRecord(
+    { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory },
+    "error",
+    text,
+  )
+}
+
+/**
+ * The queue pump (fold D): spawn queued wishes FIFO while the session has
+ * free async slots. Spawn-time re-checks (design D4): the target roster,
+ * the draft gate, and the crew belt — a tightening fails the wish as an
+ * honest error wake instead of spawning. Retry interplay: a retrying
+ * dispatch keeps its registry slot (its job row stays "running"), so the
+ * pump sees no free slot until the retry chain settles — queued wishes
+ * never jump a retry.
+ */
+async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Promise<void> {
+  for (;;) {
+    const queue = dispatchQueues.get(sessionID)
+    if (!queue || queue.length === 0) return
+    if (inFlightAsyncDispatches(sessionID).length >= ASYNC_DISPATCH_CAP) return
+    const wish = queue.shift()
+    if (queue.length === 0) dispatchQueues.delete(sessionID)
+    if (!wish) return
+    // --- spawn-time re-checks (belts evaluated at CALL time; these are the
+    // tightening guards). A refusal = honest error wake, never a spawn.
+    if (wish.agentID.toLowerCase().startsWith("forge-")) {
+      const agentId = wish.agentID.slice("forge-".length)
+      const resolution = resolvePools()
+      if (!resolution || !resolution.agents[agentId]) {
+        failQueuedWishHonestly(
+          wish,
+          `"${wish.agentID}" is no longer a materialized forge subagent on this host (the roster changed while the wish was queued)`,
+        )
+        continue
+      }
+    }
+    const crewRefusal = crewPendingRefusal(sessionID) ?? (await crewComplianceRefusalFor(jobClient, sessionID, wish.agentID))
+    if (crewRefusal) {
+      failQueuedWishHonestly(wish, crewRefusal)
+      continue
+    }
+    const draftRefusal = draftDispatchRefusal(sessionID, wish.agentID)
+    if (draftRefusal) {
+      failQueuedWishHonestly(wish, draftRefusal)
+      continue
+    }
+    // --- spawn: same engine as the direct async path.
+    const created = await createChildSession(client, {
+      parentSessionID: wish.ownerSession,
+      parentDirectory: wish.directory,
+      agentID: wish.agentID,
+      description: wish.description,
+      questionDeny: wish.questionDeny,
+    })
+    if (!created.ok) {
+      failQueuedWishHonestly(wish, `child session creation failed: ${created.error}`)
+      continue
+    }
+    const sent = await sendPrompt(client, {
+      sessionID: created.sessionID,
+      agentID: wish.agentID,
+      prompt: wish.prompt,
+      directory: wish.directory,
+    })
+    if (!sent.ok) {
+      failQueuedWishHonestly(wish, `prompt send to child session ${created.sessionID} failed: ${sent.error}`)
+      continue
+    }
+    const job = jobManager.create({
+      id: wish.jobId,
+      cmd: `dispatch ${wish.agentID}: ${wish.description}`,
+      worktree: wish.directory,
+      ownerSession: wish.ownerSession,
+      logPath: join(jobLogDir, "dispatch", `${wish.jobId}.txt`),
+      notify: true,
+      killTree: () => {
+        void abortChild(client, created.sessionID)
+      },
+    })
+    ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description }
+    dispatchTasks.set(wish.jobId, { jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description })
+    journalTransition(
+      wish.directory,
+      journalRecord(
+        { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, questionDeny: wish.questionDeny, description: wish.description, prompt: wish.prompt },
+        "started",
+        { childSessionId: created.sessionID },
+      ),
+    )
+    announceQueuedStart(
+      wish.ownerSession,
+      `[forge:dispatch-progress] wish ${wish.jobId} spawned from the queue (agent ${wish.agentID}, child session ${created.sessionID}) — tracking as a normal async dispatch; the single [forge:dispatch-complete] wake reports when it finishes.`,
+    )
+    void runAsyncDispatchPoller(client, job, created.sessionID, {
+      prompt: wish.prompt,
+      directory: wish.directory,
+      questionDeny: wish.questionDeny,
+    })
+  }
+}
+
+/**
+ * Owner death (fold D 4.3): queued wishes flush WITHOUT spawning — nothing
+ * to abort (no child exists) — and their journal records terminalize.
+ */
+function flushDispatchQueue(sessionID: string): void {
+  const queue = dispatchQueues.get(sessionID)
+  if (!queue) return
+  dispatchQueues.delete(sessionID)
+  for (const wish of queue) {
+    journalTerminalRecord(
+      { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory },
+      "aborted",
+      `owner session ${sessionID} ended before the queued wish spawned — flushed without spawning`,
+    )
+  }
+}
+
+// ---------------------------------------------------------------------------
+// dispatch-resilience fold E — persisted journal + restart recovery. The
+// journal is the memory; init is the resurrection. One journal instance per
+// workspace (lazy), fs injectable for tests, every operation fail-soft.
+// ---------------------------------------------------------------------------
+
+const dispatchJournals = new Map<string, DispatchJournal>()
+let dispatchJournalFsFactory: ((filePath: string) => JournalFs) | null = null
+
+function journalFor(worktree: string): DispatchJournal {
+  let j = dispatchJournals.get(worktree)
+  if (!j) {
+    const filePath = join(worktree, ".opencode", "forge", "dispatch-log.jsonl")
+    const fs = dispatchJournalFsFactory ? dispatchJournalFsFactory(filePath) : undefined
+    j = createDispatchJournal(filePath, { fs, maxRecords: resolveJournalMax() })
+    dispatchJournals.set(worktree, j)
+  }
+  return j
+}
+
+/** Journal base fields shared by every transition of one dispatch. */
+type JournalBase = {
+  id: string
+  agent: string
+  ownerSession: string
+  workspace: string
+  prompt?: string
+  description?: string
+  questionDeny?: boolean
+}
+
+function journalRecord(base: JournalBase, state: DispatchJournalRecord["state"], extra: Partial<DispatchJournalRecord> = {}): DispatchJournalRecord {
+  const now = Date.now()
+  return {
+    id: base.id,
+    agent: base.agent,
+    ownerSession: base.ownerSession,
+    workspace: base.workspace,
+    state,
+    attempts: 1,
+    createdAt: now,
+    updatedAt: now,
+    ...(base.description !== undefined ? { description: base.description } : {}),
+    ...(base.questionDeny !== undefined ? { questionDeny: base.questionDeny } : {}),
+    // The prompt rides every NON-TERMINAL transition (the journal is the
+    // only prompt source after a restart); journalTerminalRecord redacts it
+    // by overriding to undefined after this spread.
+    ...(base.prompt !== undefined ? { prompt: base.prompt } : {}),
+    ...extra,
+  }
+}
+
+/** Append one transition (fail-soft: a journal failure never breaks a dispatch). */
+function journalTransition(worktree: string, record: DispatchJournalRecord): void {
+  try {
+    journalFor(worktree).append(record)
+  } catch {
+    // Fail-soft by contract.
+  }
+}
+
+/** Terminal transition: the prompt is REDACTED (dropped) on terminal records. */
+function journalTerminalRecord(base: JournalBase, outcome: string, reason: string): void {
+  journalTransition(base.workspace, { ...journalRecord(base, "terminal"), prompt: undefined, outcome, reason })
+}
+
+// Workspaces whose journals have been recovered this process (idempotence:
+// recovery runs at most once per workspace — launch anchor at init, every
+// other workspace lazily on its FIRST session).
+const recoveredDispatchWorkspaces = new Set<string>()
+
+/**
+ * Restart recovery (fold E 5.3), scoped per workspace. Per non-terminal
+ * record: running (alive → re-arm the poller; finished-while-down → fetch
+ * the final message and deliver the wake; gone → honest terminal, no wake
+ * fabrication), queued/dispatched (owner resolves → re-enter the queue;
+ * else honest terminal), retry-pending (attempts remain → respawn with the
+ * resume preamble; else honest terminal). Bounded: at most one wake per
+ * recovered record, delivered via the standard wake queue.
+ */
+async function recoverWorkspaceDispatches(client: DispatchClient | null, workspace: string): Promise<void> {
+  if (!client || !workspace) return
+  if (recoveredDispatchWorkspaces.has(workspace)) return
+  recoveredDispatchWorkspaces.add(workspace)
+  let records: DispatchJournalRecord[]
+  try {
+    records = journalFor(workspace).nonTerminal()
+  } catch {
+    return
+  }
+  for (const rec of records) {
+    try {
+      await recoverOneDispatchRecord(client, workspace, rec)
+    } catch {
+      // Fail-soft per record: siblings still recover.
+    }
+  }
+}
+
+async function recoverOneDispatchRecord(client: DispatchClient, workspace: string, rec: DispatchJournalRecord): Promise<void> {
+  // Idempotence: an id already tracked in this process is never re-armed.
+  if (dispatchTasks.has(rec.id) || jobManager.get(rec.id)) return
+  const base: JournalBase = {
+    id: rec.id,
+    agent: rec.agent,
+    ownerSession: rec.ownerSession,
+    workspace,
+    prompt: rec.prompt,
+    description: rec.description,
+    questionDeny: rec.questionDeny ?? true,
+  }
+  const prompt = typeof rec.prompt === "string" ? rec.prompt : ""
+  const attempts = typeof rec.attempts === "number" && rec.attempts >= 1 ? rec.attempts : 1
+
+  if (rec.state === "started" && typeof rec.childSessionId === "string" && rec.childSessionId !== "") {
+    const childId = rec.childSessionId
+    const probe = await sessionGet(client, childId)
+    if (probe.exists === false) {
+      // Child gone: honest terminal + ledger note, no wake fabrication.
+      journalTerminalRecord(base, "error", `child session ${childId} no longer exists at recovery — dispatch finalized honestly (no report fabricated)`)
+      console.warn(`[forge:dispatch] recovery: task ${rec.id} (child session ${childId}) is gone — journal terminalized honestly.`)
+      return
+    }
+    // Alive (or probe-unresolved — never a verdict): decide running vs
+    // finished via the status map; a not-active child with a fetchable
+    // final message finished while the host was down → deliver the wake.
+    let active = true
+    try {
+      const st = await client.session.status()
+      if (st.error === undefined && st.data && typeof st.data === "object") {
+        const entry = (st.data as { [sid: string]: { type?: string } | undefined })[childId]
+        active = entry !== undefined && ["busy", "retry", "running"].includes(entry?.type ?? "")
+      }
+    } catch {
+      active = true // unreadable status = active (soundness posture)
+    }
+    if (!active) {
+      const fin = await fetchFinalMessage(client, childId)
+      if (fin.ok) {
+        const job = jobManager.create({
+          id: rec.id,
+          cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered)`,
+          worktree: workspace,
+          ownerSession: rec.ownerSession,
+          logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
+          notify: true,
+          killTree: () => {
+            void abortChild(client, childId)
+          },
+        })
+        ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" }
+        jobManager.appendOutput(job, fin.text)
+        jobManager.markTerminal(job, "exited", 0) // exactly one wake, via the standard queue
+        journalTerminalRecord(base, "completed", `final report recovered after host restart (child session ${childId})`)
+        return
+      }
+      // Not reportably done → re-arm; the poller's floor resolves honestly.
+    }
+    // Re-arm the standard completion poller (registry row + tracker).
+    const job = jobManager.create({
+      id: rec.id,
+      cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered, re-armed)`,
+      worktree: workspace,
+      ownerSession: rec.ownerSession,
+      logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
+      notify: true,
+      killTree: () => {
+        void abortChild(client, childId)
+      },
+    })
+    ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" }
+    dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" })
+    journalTransition(workspace, journalRecord(base, "started", { childSessionId: childId, attempts, prompt }))
+    void runAsyncDispatchPoller(client, job, childId, {
+      prompt,
+      directory: workspace,
+      questionDeny: base.questionDeny ?? true,
+      attemptOffset: attempts - 1,
+    })
+    return
+  }
+
+  if (rec.state === "queued" || rec.state === "dispatched") {
+    // Queued semantics (a dispatched-but-never-started crash window rides
+    // the same branch): owner resolves → re-enter the queue; else honest
+    // terminal + ledger note — never spawn for a dead owner.
+    const owner = await sessionGet(client, rec.ownerSession)
+    if (owner.exists === true) {
+      const queue = dispatchQueues.get(rec.ownerSession) ?? []
+      queue.push({
+        jobId: rec.id,
+        agentID: rec.agent,
+        ownerSession: rec.ownerSession,
+        description: rec.description ?? "",
+        prompt,
+        directory: workspace,
+        questionDeny: true,
+        enqueuedAt: Date.now(),
+      })
+      dispatchQueues.set(rec.ownerSession, queue)
+      announceQueuedStart(
+        rec.ownerSession,
+        `[forge:dispatch-progress] queued wish ${rec.id} (agent ${rec.agent}) re-entered the queue after host restart — it spawns when a slot frees.`,
+      )
+      await pumpDispatchQueue(client, rec.ownerSession)
+    } else {
+      journalTerminalRecord(base, "aborted", `owner session ${rec.ownerSession} no longer resolves at recovery — queued wish terminalized without spawning`)
+      console.warn(`[forge:dispatch] recovery: queued wish ${rec.id} owner ${rec.ownerSession} unresolvable — journal terminalized honestly.`)
+    }
+    return
+  }
+
+  if (rec.state === "retry-pending") {
+    const maxAttempts = resolveMaxAttempts()
+    // The record's `attempts` is the attempt number that was SCHEDULED but
+    // never confirmed started (the started transition overwrites it once the
+    // respawn child takes the prompt) — recovery resumes THAT attempt.
+    if (attempts <= maxAttempts && prompt !== "") {
+      // Attempts remain: respawn the child (same agent, prompt from the
+      // journal — its ONLY source after a restart — plus the preamble).
+      const refusal = crewPendingRefusal(rec.ownerSession) ?? draftDispatchRefusal(rec.ownerSession, rec.agent)
+      if (refusal) {
+        journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`)
+        return
+      }
+      const respawn = await createChildSession(client, {
+        parentSessionID: rec.ownerSession,
+        parentDirectory: workspace,
+        agentID: rec.agent,
+        description: rec.description ?? "",
+        questionDeny: base.questionDeny ?? true,
+      })
+      if (!respawn.ok) {
+        journalTerminalRecord(base, "error", `retry spawn failed at recovery: ${respawn.error}`)
+        return
+      }
+      const sent = await sendPrompt(client, {
+        sessionID: respawn.sessionID,
+        agentID: rec.agent,
+        prompt: buildRetryPrompt(prompt),
+        directory: workspace,
+      })
+      if (!sent.ok) {
+        journalTerminalRecord(base, "error", `retry prompt send failed at recovery: ${sent.error}`)
+        return
+      }
+      const job = jobManager.create({
+        id: rec.id,
+        cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered retry)`,
+        worktree: workspace,
+        ownerSession: rec.ownerSession,
+        logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
+        notify: true,
+        killTree: () => {
+          void abortChild(client, respawn.sessionID)
+        },
+      })
+      ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: respawn.sessionID, description: rec.description ?? "" }
+      dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" })
+      const nextAttempt = attempts
+      journalTransition(workspace, journalRecord(base, "started", { childSessionId: respawn.sessionID, attempts: nextAttempt, prompt }))
+      announceQueuedStart(
+        rec.ownerSession,
+        `[forge:dispatch-progress] task ${rec.id} retry attempt ${nextAttempt}/${maxAttempts} resumed after host restart — child session ${respawn.sessionID}.`,
+      )
+      void runAsyncDispatchPoller(client, job, respawn.sessionID, {
+        prompt,
+        directory: workspace,
+        questionDeny: base.questionDeny ?? true,
+        attemptOffset: attempts - 1,
+      })
+    } else {
+      journalTerminalRecord(base, "error", `attempts exhausted at recovery (${attempts}/${maxAttempts}) — no respawn`)
+    }
+    return
+  }
+  // "terminal" records never reach here (nonTerminal() filters them).
+}
+
 function dispatchClient(): DispatchClient | null {
   return jobClient as unknown as DispatchClient | null
 }
@@ -1976,6 +2452,12 @@ type DispatchRetryContext = {
   directory: string
   /** Mode-keyed question policy (task-shadow) — re-applied on the fresh child. */
   questionDeny: boolean
+  /**
+   * Fold E recovery offset: the journal's attempt count at re-arm — the
+   * poller's attempt counter starts at 1 + offset so a recovered chain keeps
+   * its true attempt accounting (and the attempt cap).
+   */
+  attemptOffset?: number
 }
 
 async function runAsyncDispatchPoller(
@@ -2002,7 +2484,7 @@ async function runAsyncDispatchPoller(
   const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
   const agentID = dispatch?.agentID ?? "unknown"
   let childSessionID = initialChildSessionID
-  let attempt = 1
+  let attempt = 1 + (retryCtx.attemptOffset ?? 0)
   let startedAt = Date.now()
   let lastNotifiedMultiple = 0
   let text = ""
@@ -2037,6 +2519,23 @@ async function runAsyncDispatchPoller(
       if (attempt < maxAttempts && job.state === "running" && classifyDispatchError(poll.error) === "retryable") {
         const errorHead = poll.error.split("\n")[0].slice(0, 160)
         attempt++
+        // Fold E: the retry scheduling is a journaled transition
+        // (retry-pending) — after a restart this record is what resumes
+        // the chain (prompt retained: the journal is its only source).
+        journalTransition(retryCtx.directory, {
+          id: job.id,
+          agent: agentID,
+          ownerSession: job.ownerSession,
+          workspace: retryCtx.directory,
+          state: "retry-pending",
+          childSessionId: undefined,
+          attempts: attempt,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          prompt: retryCtx.prompt,
+          questionDeny: retryCtx.questionDeny,
+          description: dispatch?.description ?? "",
+        })
         flushProgress(
           `[forge:dispatch-progress] attempt ${attempt}/${maxAttempts} starting after ${errorHead}… — ` +
             `respawning ${agentID} (task ${job.id}, previous child session ${childSessionID}) with the resume preamble; ` +
@@ -2045,6 +2544,11 @@ async function runAsyncDispatchPoller(
         await new Promise((resolve) => setTimeout(resolve, retryBackoffMs))
         if (job.state !== "running") {
           dispatchTasks.delete(job.id)
+          journalTerminalRecord(
+            { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
+            "aborted",
+            "registry kill during retry backoff (owner session ended / dispose) — user abort, never retried",
+          )
           return
         }
         // Dispatch-time policies are re-applied on the fresh child the same
@@ -2085,6 +2589,22 @@ async function runAsyncDispatchPoller(
         childSessionID = respawn.sessionID
         ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" }
         dispatchTasks.set(job.id, { jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" })
+        // Fold E: the respawn is a journaled started transition (prompt
+        // retained — a crash now recovers as a live running record).
+        journalTransition(retryCtx.directory, {
+          id: job.id,
+          agent: agentID,
+          ownerSession: job.ownerSession,
+          workspace: retryCtx.directory,
+          state: "started",
+          childSessionId: childSessionID,
+          attempts: attempt,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          prompt: retryCtx.prompt,
+          questionDeny: retryCtx.questionDeny,
+          description: dispatch?.description ?? "",
+        })
         // Owner-death harvest must abort the LIVE child — rebind the kill hook.
         job.killTree = () => {
           void abortChild(client, childSessionID)
@@ -2107,6 +2627,11 @@ async function runAsyncDispatchPoller(
     // the watch — no wake fires for a killed row (markTerminal first-wins).
     if (job.state !== "running") {
       dispatchTasks.delete(job.id)
+      journalTerminalRecord(
+        { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
+        "aborted",
+        "registry kill (owner session ended / dispose) — user abort",
+      )
       return
     }
     // Textless-idle floor (design D6): a child continuously not-active for a
@@ -2184,6 +2709,21 @@ async function runAsyncDispatchPoller(
   jobManager.appendOutput(job, text)
   jobManager.markTerminal(job, "exited", exitCode)
   dispatchTasks.delete(job.id)
+  // Fold D: the terminal transition releases the session's async slot —
+  // pump the queue head (if any). Fold E: terminalize the journal record
+  // (prompt REDACTED on terminal).
+  journalTerminalRecord(
+    {
+      id: job.id,
+      agent: agentID,
+      ownerSession: job.ownerSession,
+      workspace: retryCtx.directory,
+      description: dispatch?.description ?? "",
+    },
+    exitCode === 0 ? "completed" : "error",
+    text.split("\n")[0].slice(0, 200),
+  )
+  void pumpDispatchQueue(client, job.ownerSession)
 }
 
 const TASK_DESCRIPTION = [
@@ -2256,13 +2796,23 @@ const taskDispatchTool = tool({
     }
     const draftRefusal = draftDispatchRefusal(context.sessionID, target)
     if (draftRefusal) throw new Error(draftRefusal)
+    // Fold D (cap queueing): at the cap of 3 RUNNING dispatches the wish no
+    // longer refuses — it QUEUES (per-session FIFO, bounded
+    // FORGE_DISPATCH_QUEUE_MAX default 10). Only a wish beyond the queue
+    // bound is refused, with the in-flight AND queued task ids.
+    let queueAfterCap = false
     if (runInBackground) {
       const inFlight = inFlightAsyncDispatches(context.sessionID)
       if (inFlight.length >= ASYNC_DISPATCH_CAP) {
-        throw new Error(
-          `[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")}. ` +
-            `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one without run_in_background.`,
-        )
+        const queuedIds = queuedAsyncDispatchIds(context.sessionID)
+        const queueMax = resolveDispatchQueueMax()
+        if (queuedIds.length >= queueMax) {
+          throw new Error(
+            `[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")} — and the dispatch queue is full (bound ${queueMax}): ${queuedIds.join(", ")}. ` +
+              `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one without run_in_background.`,
+          )
+        }
+        queueAfterCap = true
       }
     }
     const client = dispatchClient()
@@ -2270,6 +2820,69 @@ const taskDispatchTool = tool({
     const state = ensureSession(context.sessionID, worktreeFor(context))
     const description =
       typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60)
+    if (queueAfterCap) {
+      // Fold D: the queued handle returns immediately (like an async
+      // handle) with queued: true panel metadata and a queue position note;
+      // the pump spawns it when a slot frees.
+      const jobId = newJobId()
+      const queue = dispatchQueues.get(context.sessionID) ?? []
+      const position = queue.length + 1
+      queue.push({ jobId, agentID: target, ownerSession: context.sessionID, description, prompt, directory: state.worktree, questionDeny: true, enqueuedAt: Date.now() })
+      dispatchQueues.set(context.sessionID, queue)
+      journalTransition(state.worktree, {
+        id: jobId,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        state: "queued",
+        attempts: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        prompt,
+        questionDeny: true,
+        description,
+      })
+      const queuedMeta = {
+        agent: target,
+        sessionId: "",
+        taskId: jobId,
+        run_in_background: true,
+        description,
+        prompt,
+        queued: true,
+      }
+      context.metadata({ title: `${target}: dispatch queued (${jobId})`, metadata: { ...queuedMeta } })
+      return {
+        title: `${target}: dispatch queued (${jobId})`,
+        metadata: { ...queuedMeta },
+        output: [
+          `[forge:dispatch] Dispatched ${target} in async mode — the session is at the async dispatch cap (${ASYNC_DISPATCH_CAP} running), so this wish is QUEUED (queue position ${position}).`,
+          `task id: ${jobId}`,
+          `agent: ${target}`,
+          `queued: position ${position} — the wish spawns automatically when a slot frees (a [forge:dispatch-progress] notice announces its start; the roster, draft gate, and crew belt are re-checked at spawn time).`,
+          `Next: END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when the spawned child finishes — however long it takes. Never poll or re-dispatch to check on it.`,
+        ].join("\n"),
+      }
+    }
+    // Fold E: journal the dispatch-time transition BEFORE the child exists —
+    // a crash between create and spawn leaves this non-terminal record, which
+    // recovery treats with queued semantics.
+    const asyncJobId = runInBackground ? newJobId() : ""
+    if (asyncJobId) {
+      journalTransition(state.worktree, {
+        id: asyncJobId,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        state: "dispatched",
+        attempts: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        prompt,
+        questionDeny: true,
+        description,
+      })
+    }
     const created = await createChildSession(client, {
       parentSessionID: context.sessionID,
       parentDirectory: state.worktree,
@@ -2311,6 +2924,37 @@ const taskDispatchTool = tool({
       const syncStale: StaleSweepState = { lastActivity: null, staleNotified: false }
       taskMetadata.taskId = newJobId()
       const syncJobId = taskMetadata.taskId
+      // Fold E: the sync path journals the same transitions (dispatched →
+      // started here; terminal at each return below; retry-pending/started
+      // in the retry branch; the armed tracker terminalizes at its settle).
+      const syncJournalBase = { id: syncJobId, agent: target, ownerSession: context.sessionID, workspace: state.worktree, prompt, description, questionDeny: false }
+      journalTransition(state.worktree, {
+        id: syncJobId,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        state: "dispatched",
+        attempts: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        prompt,
+        questionDeny: false,
+        description,
+      })
+      journalTransition(state.worktree, {
+        id: syncJobId,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        state: "started",
+        childSessionId: created.sessionID,
+        attempts: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        prompt,
+        questionDeny: false,
+        description,
+      })
       let childSessionID = created.sessionID
       let attemptSync = 1
       let syncStartedAt = Date.now()
@@ -2331,6 +2975,7 @@ const taskDispatchTool = tool({
           // Sync abort parity (design D4): abort the child via the SDK and
           // resolve with the abort disclosed.
           const ab = await abortChild(client, childSessionID)
+          journalTerminalRecord(syncJournalBase, "aborted", `dispatching turn aborted — child session ${childSessionID} aborted via the SDK`)
           context.metadata({ title: `${target}: dispatch aborted`, metadata: { ...taskMetadata } })
           return {
             title: `${target}: dispatch aborted`,
@@ -2349,6 +2994,19 @@ const taskDispatchTool = tool({
           if (attemptSync < maxAttemptsSync && classifyDispatchError(poll.error) === "retryable") {
             const errorHead = poll.error.split("\n")[0].slice(0, 160)
             attemptSync++
+            journalTransition(state.worktree, {
+              id: syncJobId,
+              agent: target,
+              ownerSession: context.sessionID,
+              workspace: state.worktree,
+              state: "retry-pending",
+              attempts: attemptSync,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              prompt,
+              questionDeny: false,
+              description,
+            })
             queueDispatchProgress(
               context.sessionID,
               `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`,
@@ -2356,6 +3014,7 @@ const taskDispatchTool = tool({
             await new Promise((resolve) => setTimeout(resolve, retryBackoffSync))
             const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusal(context.sessionID, target)
             if (refusal) {
+              journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`)
               throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
             }
             const respawn = await createChildSession(client, {
@@ -2366,6 +3025,7 @@ const taskDispatchTool = tool({
               questionDeny: false,
             })
             if (!respawn.ok) {
+              journalTerminalRecord(syncJournalBase, "error", `retry spawn failed: ${respawn.error}`)
               throw new Error(`[forge:dispatch] retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
             }
             const sent = await sendPrompt(client, {
@@ -2375,12 +3035,27 @@ const taskDispatchTool = tool({
               directory: state.worktree,
             })
             if (!sent.ok) {
+              journalTerminalRecord(syncJournalBase, "error", `retry prompt send failed: ${sent.error}`)
               throw new Error(`[forge:dispatch] retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
             }
             // Slot inheritance: fresh child, same sync call. Stale, stability,
             // and the clock restart for the fresh child.
             childSessionID = respawn.sessionID
             taskMetadata.sessionId = childSessionID
+            journalTransition(state.worktree, {
+              id: syncJobId,
+              agent: target,
+              ownerSession: context.sessionID,
+              workspace: state.worktree,
+              state: "started",
+              childSessionId: childSessionID,
+              attempts: attemptSync,
+              createdAt: Date.now(),
+              updatedAt: Date.now(),
+              prompt,
+              questionDeny: false,
+              description,
+            })
             syncStartedAt = Date.now()
             syncStale.lastActivity = null
             syncStale.staleNotified = false
@@ -2416,6 +3091,7 @@ const taskDispatchTool = tool({
             if (staleThresholdCrossed(syncStale, Date.now(), syncStartedAt, staleMsSync, staleFloorSync)) {
               const decision = decideStaleSweep(probe, syncStale, staleModeSync)
               if (decision.action === "gone") {
+                journalTerminalRecord(syncJournalBase, "stale", `child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly`)
                 context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } })
                 return {
                   title: `${target}: dispatch stale-finalized`,
@@ -2429,6 +3105,7 @@ const taskDispatchTool = tool({
               if (decision.action === "kill") {
                 const ab = await abortChild(client, childSessionID)
                 if (ab.ok) {
+                  journalTerminalRecord(syncJournalBase, "stale", `aborted after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — child session ${childSessionID} killed by the stale reap`)
                   context.metadata({ title: `${target}: dispatch stale-reaped`, metadata: { ...taskMetadata } })
                   return {
                     title: `${target}: dispatch stale-reaped`,
@@ -2443,6 +3120,7 @@ const taskDispatchTool = tool({
                 // otherwise skip this sweep and re-arm (next slice retries).
                 const reprobe = await sessionGet(client, childSessionID)
                 if (reprobe.exists === false) {
+                  journalTerminalRecord(syncJournalBase, "stale", `child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly`)
                   context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } })
                   return {
                     title: `${target}: dispatch stale-finalized`,
@@ -2465,7 +3143,11 @@ const taskDispatchTool = tool({
       }
       if (syncCompleted) {
         const fin = await fetchFinalMessage(client, childSessionID)
-        if (!fin.ok) throw new Error(`[forge:dispatch] ${fin.error}`)
+        if (!fin.ok) {
+          journalTerminalRecord(syncJournalBase, "error", fin.error)
+          throw new Error(`[forge:dispatch] ${fin.error}`)
+        }
+        journalTerminalRecord(syncJournalBase, "completed", `${target} finished (child session ${childSessionID})`)
         context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } })
         const recoveredNote = attemptSync > 1 ? ` — recovered on attempt ${attemptSync}/${maxAttemptsSync} (previous child session(s) died with transient errors and were respawned; the [forge:dispatch-progress] notice lands in this transcript when the session idles)` : ""
         return {
@@ -2475,6 +3157,7 @@ const taskDispatchTool = tool({
         }
       }
       if (syncError !== null) {
+        journalTerminalRecord(syncJournalBase, "error", `child session ${childSessionID} ended in error: ${syncError}`.slice(0, 200))
         throw new Error(`[forge:dispatch] child session ${childSessionID} ended in error: ${syncError}`)
       }
       // sync-timeout-notify: arm, don't abandon (design D1). The child is
@@ -2510,7 +3193,7 @@ const taskDispatchTool = tool({
       )
     }
     // async: registry entry (kind=dispatch) + poller; the handle returns now.
-    const jobId = newJobId()
+    const jobId = asyncJobId || newJobId()
     taskMetadata.taskId = jobId
     const job = jobManager.create({
       id: jobId,
@@ -2527,6 +3210,22 @@ const taskDispatchTool = tool({
     })
     ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
     dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description })
+    // Fold E: the started transition (prompt retained — the journal is the
+    // only prompt source after a restart).
+    journalTransition(state.worktree, {
+      id: jobId,
+      agent: target,
+      ownerSession: context.sessionID,
+      workspace: state.worktree,
+      state: "started",
+      childSessionId: created.sessionID,
+      attempts: 1,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      prompt,
+      questionDeny: true,
+      description,
+    })
     void runAsyncDispatchPoller(client, job, created.sessionID, { prompt, directory: state.worktree, questionDeny: true })
     context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
     return {
@@ -3657,6 +4356,12 @@ export const server: Plugin = async (input, options) => {
   // so the task interception belt and the task tool execute
   // share one seam over the same client.
   jobClient = input.client as unknown as JobClient
+  // Fold E (restart recovery): the LAUNCH-ANCHOR workspace's journal recovers
+  // at init; every other workspace recovers lazily on its first session
+  // (event handler). Fail-soft by construction.
+  if (effectiveInitDir && !isRootish(effectiveInitDir)) {
+    void recoverWorkspaceDispatches(input.client as unknown as DispatchClient, effectiveInitDir)
+  }
   const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
   jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true
@@ -4300,6 +5005,23 @@ export const server: Plugin = async (input, options) => {
       workspacePoolOf: (anchor: string) => sessionPoolFileOf(anchor),
       // Async-dispatch seams (change async-dispatch wiring tests).
       dispatchTasks: () => [...dispatchTasks.values()],
+      // Fold D seams: the per-session FIFO queues and the journal/recovery
+      // surfaces (tests inject an in-memory journal fs BEFORE dispatching).
+      dispatchQueues: () =>
+        [...dispatchQueues.entries()].flatMap(([owner, wishes]) => wishes.map((w) => ({ ownerSession: owner, jobId: w.jobId, agentID: w.agentID }))),
+      setDispatchJournalFs: (factory: ((filePath: string) => JournalFs) | null) => {
+        dispatchJournalFsFactory = factory
+        dispatchJournals.clear()
+        recoveredDispatchWorkspaces.clear()
+      },
+      dispatchRecoveredWorkspaces: () => [...recoveredDispatchWorkspaces],
+      dispatchJournalText: (worktree: string): string | null => {
+        try {
+          return journalFor(worktree).fs.read()
+        } catch {
+          return null
+        }
+      },
       // Pending [forge:dispatch-progress] notices for a session (fold #2
       // wiring tests observe the enqueue side of the lossy queue).
       dispatchProgress: (sessionID: string) => [...(dispatchProgressQueue.get(sessionID) ?? [])],
@@ -4369,6 +5091,9 @@ export const server: Plugin = async (input, options) => {
         const worktree = effectiveWorktree(info.worktree, info.directory)
         if (typeof worktree === "string" && worktree) {
           ensureSession(info.id, worktree)
+          // Fold E (lazy per-workspace recovery scope): workspaces beyond
+          // the launch anchor recover on their FIRST session.
+          if (!isRootish(worktree)) void recoverWorkspaceDispatches(jobClient as unknown as DispatchClient | null, worktree)
         }
       }
       if (event.type === "session.idle") {
@@ -4396,6 +5121,10 @@ export const server: Plugin = async (input, options) => {
           for (const [id, handle] of [...dispatchTasks]) {
             if (handle.ownerSession === info.id) dispatchTasks.delete(id)
           }
+          // Fold D (owner-death queue flush): queued wishes flush WITHOUT
+          // spawning (no child exists) and their journal records
+          // terminalize (fold E pairing).
+          flushDispatchQueue(info.id)
           // The frozen depth translation dies with its session (bounded table).
           sessionDepths.delete(info.id)
           // Undelivered progress notices die with their audience (lossy by

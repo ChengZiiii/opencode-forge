@@ -469,7 +469,11 @@ test("abort parity: a sync dispatch aborted mid-flight aborts the child via the 
 // ---------------------------------------------------------------------------
 // Async lifecycle (spec: Dispatch lifecycle)
 
-test("cap: per-session concurrent async cap 3 — 4th refused with in-flight ids + guidance", async (t) => {
+test("cap (fold D): 4th+ wish QUEUES — only beyond the queue bound is the call refused with in-flight AND queued ids", async (t) => {
+  process.env.FORGE_DISPATCH_QUEUE_MAX = "1"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_QUEUE_MAX
+  })
   const dir = projectWithForgeJson(t, readonlyPool)
   const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
   const h = await startServer(input(dir, client), {})
@@ -480,24 +484,37 @@ test("cap: per-session concurrent async cap 3 — 4th refused with in-flight ids
   const handles = []
   for (let i = 0; i < 3; i++) handles.push(await dispatch(i))
   const ids = handles.map((x) => x.output.match(/task id: (\S+)/)[1])
+  // Cap number unchanged: 3 RUNNING; the 4th wish QUEUES instead of refusing.
+  const queued = await dispatch(3)
+  assert.match(queued.output, /QUEUED \(queue position 1\)/, "the 4th wish queues with a position note")
+  const queuedId = queued.output.match(/task id: (\S+)/)[1]
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_cap").length, 1, "the wish sits in the per-session queue")
+  assert.equal(calls.create.length, 3, "no child spawned for the queued wish yet")
+  // Beyond the queue bound (FORGE_DISPATCH_QUEUE_MAX=1): refused listing the
+  // in-flight AND queued task ids.
   await assert.rejects(
-    () => dispatch(3),
+    () => dispatch(4),
     (err) => {
       const m = String(err)
       assert.match(m, /cap 3/, "the cap value is named")
       for (const id of ids) assert.ok(m.includes(id), `in-flight task id ${id} listed`)
+      assert.ok(m.includes(queuedId), "queued task id listed")
+      assert.match(m, /queue is full \(bound 1\)/, "the queue bound is named")
       assert.match(m, /without run_in_background/, "guidance to wait or go sync")
       return true
     },
   )
-  // Owner death harvest (spec scenario): each child aborted via the SDK +
-  // orphan ledgered; the handle map drains.
+  // Owner death harvest (spec scenario): each running child aborted via the
+  // SDK + orphan ledgered; the handle map drains; the queued wish flushes
+  // WITHOUT spawning.
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_cap" } } } })
   await waitFor(() => calls.abort.length >= 3, "3 child aborts")
   // (dispatchTasks is module state across tests — scope to this session.)
   assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_cap").length, 0, "handle map drained for the dead session")
   const orphans = h.__forgeSubagentsTest.jobLedger().filter((e) => e.kind === "orphan-job" && ids.includes(e.jobId))
   assert.equal(orphans.length, 3, "every orphan is recorded in the diagnostics ledger")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_cap").length, 0, "the queued wish flushed without spawning")
+  assert.equal(calls.create.length, 3, "the flushed wish never spawned a child")
 })
 
 test("wake: async completion delivers ONE idle wake carrying the child's final message", async (t) => {
