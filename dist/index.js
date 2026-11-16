@@ -12336,8 +12336,8 @@ tool.schema = exports_external;
 // plugin.ts
 import { execFileSync as execFileSync3, spawn as spawn6 } from "node:child_process";
 import { open as fsOpen, readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
-import { appendFileSync, existsSync as existsSync3, mkdirSync as mkdirSync5, readdirSync as readdirSync4, readFileSync as readFileSync8, realpathSync, statSync as statSync5, writeFileSync as writeFileSync5 } from "node:fs";
-import { basename as basename2, dirname as dirname4, isAbsolute as isAbsolute2, join as join6, relative as relative2 } from "node:path";
+import { appendFileSync as appendFileSync2, existsSync as existsSync3, mkdirSync as mkdirSync6, readdirSync as readdirSync4, readFileSync as readFileSync9, realpathSync, statSync as statSync5, writeFileSync as writeFileSync6 } from "node:fs";
+import { basename as basename2, dirname as dirname5, isAbsolute as isAbsolute2, join as join6, relative as relative2 } from "node:path";
 import { tmpdir as tmpdir3, homedir } from "node:os";
 
 // src/plan-file.ts
@@ -17004,6 +17004,107 @@ function resolveRetryBackoffMs(env = process.env) {
   return Math.round(parsed);
 }
 
+// src/dispatch-journal.ts
+import { appendFileSync, mkdirSync as mkdirSync5, readFileSync as readFileSync8, writeFileSync as writeFileSync5 } from "node:fs";
+import { dirname as dirname4 } from "node:path";
+var DEFAULT_JOURNAL_MAX = 200;
+function resolveJournalMax(env = process.env) {
+  const raw = env.FORGE_DISPATCH_JOURNAL_MAX;
+  if (raw === undefined || raw === "")
+    return DEFAULT_JOURNAL_MAX;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1)
+    return DEFAULT_JOURNAL_MAX;
+  return Math.round(parsed);
+}
+function defaultJournalFs(filePath) {
+  return {
+    read: () => {
+      try {
+        return readFileSync8(filePath, "utf8");
+      } catch {
+        return null;
+      }
+    },
+    append: (line) => {
+      try {
+        mkdirSync5(dirname4(filePath), { recursive: true });
+        appendFileSync(filePath, line + `
+`);
+      } catch {}
+    },
+    rewrite: (lines) => {
+      try {
+        mkdirSync5(dirname4(filePath), { recursive: true });
+        writeFileSync5(filePath, lines.length === 0 ? "" : lines.map((l) => l + `
+`).join(""));
+      } catch {}
+    }
+  };
+}
+function parseJournalLines(text) {
+  if (!text)
+    return [];
+  const byId = new Map;
+  for (const line of text.split(`
+`)) {
+    const trimmed = line.trim();
+    if (trimmed === "")
+      continue;
+    let parsed;
+    try {
+      parsed = JSON.parse(trimmed);
+    } catch {
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object")
+      continue;
+    const rec = parsed;
+    if (typeof rec.id !== "string" || rec.id === "")
+      continue;
+    if (rec.state !== "dispatched" && rec.state !== "queued" && rec.state !== "started" && rec.state !== "retry-pending" && rec.state !== "terminal") {
+      continue;
+    }
+    byId.set(rec.id, rec);
+  }
+  return [...byId.values()];
+}
+function compactJournalRecords(records, max) {
+  if (records.length <= max)
+    return records;
+  const kept = [...records];
+  const terminals = kept.filter((r) => r.state === "terminal").sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0));
+  let drop = kept.length - max;
+  const dropped = new Set;
+  for (const t of terminals) {
+    if (drop <= 0)
+      break;
+    dropped.add(t.id);
+    drop--;
+  }
+  return kept.filter((r) => !dropped.has(r.id));
+}
+function createDispatchJournal(filePath, opts = {}) {
+  const fs = opts.fs ?? defaultJournalFs(filePath);
+  const max = opts.maxRecords ?? DEFAULT_JOURNAL_MAX;
+  const load = () => parseJournalLines(fs.read());
+  return {
+    fs,
+    append: (record2) => {
+      fs.append(JSON.stringify(record2));
+      const records = load();
+      if (records.length > max) {
+        const kept = compactJournalRecords(records, max);
+        if (kept.length < records.length) {
+          fs.rewrite(kept.map((r) => JSON.stringify(r)));
+        }
+      }
+    },
+    load,
+    nonTerminal: () => load().filter((r) => r.state !== "terminal")
+  };
+}
+
 // plugin.ts
 var FORGE_AGENT = "forge";
 var FORGE_STATE_TOOLS = [
@@ -17181,7 +17282,7 @@ function crewPoolComplianceRefusal(anchor) {
     return null;
   let text;
   try {
-    text = readFileSync8(poolFile, "utf8");
+    text = readFileSync9(poolFile, "utf8");
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) could not be read (${reason}). ` + `Repair the file so it is readable JSONC declaring a valid top-level "pool" namespace ([a-z0-9-], 1-24 chars) — REQUIRED for crew-governed dispatch. ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
@@ -17194,7 +17295,7 @@ function crewPoolComplianceRefusal(anchor) {
   if (verdict.compliant)
     return null;
   const fam = resolvePools()?.families.find((f) => foldPath(f.file) === foldPath(poolFile));
-  const suggested = fam?.ns ?? sanitizeNamespace(basename2(dirname4(dirname4(poolFile))));
+  const suggested = fam?.ns ?? sanitizeNamespace(basename2(dirname5(dirname5(poolFile))));
   return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) is non-compliant — ${verdict.violation}. ` + `Minimal fix: add or repair the top-level "pool": "${suggested}" field (a [a-z0-9-] string, 1-24 chars — REQUIRED for crew-governed dispatch). ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
 }
 var CREW_NATIVE_FALLBACK_RULE = "Native fallback: when the pool offers no forge worker fitting a subtask (or forge-* dispatch is blocked by a degraded pool), dispatch the native general subagent with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native).";
@@ -17211,8 +17312,8 @@ function crewRecordPathFor(worktree, objective) {
   return join6(dir, name);
 }
 function writeCrewRecord(path, objective, anchor, subtasks, lineage) {
-  mkdirSync5(join6(path, ".."), { recursive: true });
-  writeFileSync5(path, [
+  mkdirSync6(join6(path, ".."), { recursive: true });
+  writeFileSync6(path, [
     `# Crew Record: ${objective}`,
     "",
     `- registered: ${nowIso()}`,
@@ -17230,7 +17331,7 @@ function appendCrewRecord(path, heading, lines) {
   if (!path)
     return;
   try {
-    appendFileSync(path, [`## ${nowIso()} — ${heading}`, ...lines, ""].join(`
+    appendFileSync2(path, [`## ${nowIso()} — ${heading}`, ...lines, ""].join(`
 `) + `
 `, "utf8");
   } catch {}
@@ -17350,10 +17451,10 @@ var jobLogDir = jobsLogDir();
 var jobLedgerPath = join6(jobLogDir, "ledger.jsonl");
 function jobLedgerSink(entry) {
   try {
-    mkdirSync5(jobLogDir, { recursive: true });
+    mkdirSync6(jobLogDir, { recursive: true });
     if (existsSync3(jobLedgerPath) && statSync5(jobLedgerPath).size > 1e6)
-      writeFileSync5(jobLedgerPath, "");
-    appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}
+      writeFileSync6(jobLedgerPath, "");
+    appendFileSync2(jobLedgerPath, `${JSON.stringify(entry)}
 `);
   } catch {}
 }
@@ -17536,7 +17637,7 @@ function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join6(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync9(join6(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -17561,7 +17662,7 @@ function worktreeFor(context) {
 }
 function resolveActivePlan(state) {
   if (state.planPath && existsSync3(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync8(state.planPath, "utf8"));
+    const doc2 = parsePlanLoose(readFileSync9(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -17603,12 +17704,12 @@ var planWriteTool = tool({
       throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
       const dir = planDirOf(state.worktree);
-      mkdirSync5(dir, { recursive: true });
+      mkdirSync6(dir, { recursive: true });
       path = join6(dir, planFileName(localDate(), slugify(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
     const text = renderPlan(args, now, created);
-    writeFileSync5(path, text);
+    writeFileSync6(path, text);
     state.planPath = path;
     const doc2 = parsePlan(text);
     context.metadata({ title: `${mode === "created" ? "Create" : "Revise"} plan: ${doc2.goal}` });
@@ -17636,8 +17737,8 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync8(active.path, "utf8"), args.n, nowIso());
-    writeFileSync5(active.path, next);
+    const next = tickTask(readFileSync9(active.path, "utf8"), args.n, nowIso());
+    writeFileSync6(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` });
@@ -17696,7 +17797,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    writeFileSync5(active.path, transitionStatus(readFileSync8(active.path, "utf8"), "approved", nowIso()));
+    writeFileSync6(active.path, transitionStatus(readFileSync9(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -17730,8 +17831,8 @@ Fix the implementation and retry, or revise the plan first.`);
     }
     await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`);
     const closedAt = nowIso();
-    const closed = appendTerminalSection(transitionStatus(readFileSync8(active.path, "utf8"), "done", closedAt), "closed", { reason: "completion gate passed (user confirmed)", checks: args.checks }, closedAt);
-    writeFileSync5(active.path, closed);
+    const closed = appendTerminalSection(transitionStatus(readFileSync9(active.path, "utf8"), "done", closedAt), "closed", { reason: "completion gate passed (user confirmed)", checks: args.checks }, closedAt);
+    writeFileSync6(active.path, closed);
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
       title: "plan done",
@@ -17754,8 +17855,8 @@ var planDiscardTool = tool({
     const superseding = successor.length > 0;
     const target = superseding ? "superseded" : "abandoned";
     const exitedAt = nowIso();
-    const next = appendTerminalSection(transitionStatus(readFileSync8(active.path, "utf8"), target, exitedAt), superseding ? "superseded" : "abandoned", { reason: args.reason, ...superseding ? { successor } : {} }, exitedAt);
-    writeFileSync5(active.path, next);
+    const next = appendTerminalSection(transitionStatus(readFileSync9(active.path, "utf8"), target, exitedAt), superseding ? "superseded" : "abandoned", { reason: args.reason, ...superseding ? { successor } : {} }, exitedAt);
+    writeFileSync6(active.path, next);
     state.planPath = undefined;
     const section = `## ${exitedAt} — ${target}`;
     context.metadata({ title: superseding ? `Plan superseded: ${active.doc.goal}` : `Plan abandoned: ${active.doc.goal}` });
@@ -17772,11 +17873,11 @@ function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
   if (!existsSync3(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync8(join6(dir, name), "utf8") }));
+  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync9(join6(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
   if (state.goalPath && existsSync3(state.goalPath)) {
-    const doc2 = parseGoalLoose(readFileSync8(state.goalPath, "utf8"));
+    const doc2 = parseGoalLoose(readFileSync9(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
@@ -17880,7 +17981,7 @@ var goalWriteTool = tool({
       await gate(context.ask, "goal_write", `Arm goal: ${args.goal}`);
     }
     const dir = goalDirOf(state.worktree);
-    mkdirSync5(dir, { recursive: true });
+    mkdirSync6(dir, { recursive: true });
     const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md")));
     const path = join6(dir, name);
     const text = renderGoal(input, {
@@ -17922,7 +18023,7 @@ var goalCheckTool = tool({
       o.index = selected[i].n;
     });
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = appendCheckLog(readFileSync8(goal.path, "utf8"), runId, outcomes, nowIso());
+    const next = appendCheckLog(readFileSync9(goal.path, "utf8"), runId, outcomes, nowIso());
     atomicWrite(goal.path, next);
     const ok = outcomesAllOk(outcomes);
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
@@ -17956,7 +18057,7 @@ var goalCompleteTool = tool({
     const failures = outcomes.filter((o) => !o.ok);
     if (failures.length > 0) {
       const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-      atomicWrite(goal.path, appendCheckLog(readFileSync8(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      atomicWrite(goal.path, appendCheckLog(readFileSync9(goal.path, "utf8"), runId2, outcomes, nowIso()));
       throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
 ${formatOutcomes(failures)}
 Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
@@ -17969,7 +18070,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
     }
     await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    let text = appendCheckLog(readFileSync8(goal.path, "utf8"), runId, outcomes, nowIso());
+    let text = appendCheckLog(readFileSync9(goal.path, "utf8"), runId, outcomes, nowIso());
     text = transitionGoal(text, "completed", nowIso());
     atomicWrite(goal.path, text);
     context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
@@ -17991,7 +18092,7 @@ var goalPauseTool = tool({
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
     }
     const stopReason = args.blocker ? "blocker" : "user";
-    atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
+    atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` });
     return {
@@ -18021,7 +18122,7 @@ var goalResumeTool = tool({
     }
     const promoting = goal.doc.status === "queued";
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
-    let text = readFileSync8(goal.path, "utf8");
+    let text = readFileSync9(goal.path, "utf8");
     if (args.addTurns)
       text = bumpBudget(text, args.addTurns, nowIso());
     text = transitionGoal(text, "active", nowIso(), { session: context.sessionID });
@@ -18047,7 +18148,7 @@ var goalDiscardTool = tool({
     if (!goal)
       throw new GoalError("No goal to discard in this workspace.");
     await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
-    atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "abandoned", nowIso()));
+    atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "abandoned", nowIso()));
     state.goalPath = undefined;
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
@@ -18266,6 +18367,338 @@ function inFlightAsyncDispatches(sessionID) {
   }
   return ids;
 }
+var DEFAULT_DISPATCH_QUEUE_MAX = 10;
+function resolveDispatchQueueMax(env = process.env) {
+  const raw = env.FORGE_DISPATCH_QUEUE_MAX;
+  if (raw === undefined || raw === "")
+    return DEFAULT_DISPATCH_QUEUE_MAX;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1)
+    return DEFAULT_DISPATCH_QUEUE_MAX;
+  return Math.round(parsed);
+}
+var dispatchQueues = new Map;
+function queuedAsyncDispatchIds(sessionID) {
+  return (dispatchQueues.get(sessionID) ?? []).map((w) => w.jobId);
+}
+function announceQueuedStart(ownerSession, notice) {
+  queueDispatchProgress(ownerSession, notice);
+  if (idleJobSessions.has(ownerSession))
+    deliverDispatchProgress(ownerSession);
+}
+function failQueuedWishHonestly(wish, reason) {
+  const job = jobManager.create({
+    id: wish.jobId,
+    cmd: `dispatch ${wish.agentID}: ${wish.description} (queued, refused at spawn)`,
+    worktree: wish.directory,
+    ownerSession: wish.ownerSession,
+    logPath: join6(jobLogDir, "dispatch", `${wish.jobId}.txt`),
+    notify: true,
+    killTree: () => {}
+  });
+  job.dispatch = {
+    agentID: wish.agentID,
+    childSessionID: "",
+    description: wish.description
+  };
+  const text = `(spawn refused at queue pump: ${reason} — the queued wish never spawned)`;
+  jobManager.appendOutput(job, text);
+  jobManager.markTerminal(job, "exited", 1);
+  journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory }, "error", text);
+}
+async function pumpDispatchQueue(client, sessionID) {
+  for (;; ) {
+    const queue = dispatchQueues.get(sessionID);
+    if (!queue || queue.length === 0)
+      return;
+    if (inFlightAsyncDispatches(sessionID).length >= ASYNC_DISPATCH_CAP)
+      return;
+    const wish = queue.shift();
+    if (queue.length === 0)
+      dispatchQueues.delete(sessionID);
+    if (!wish)
+      return;
+    if (wish.agentID.toLowerCase().startsWith("forge-")) {
+      const agentId = wish.agentID.slice("forge-".length);
+      const resolution = resolvePools();
+      if (!resolution || !resolution.agents[agentId]) {
+        failQueuedWishHonestly(wish, `"${wish.agentID}" is no longer a materialized forge subagent on this host (the roster changed while the wish was queued)`);
+        continue;
+      }
+    }
+    const crewRefusal = crewPendingRefusal(sessionID) ?? await crewComplianceRefusalFor(jobClient, sessionID, wish.agentID);
+    if (crewRefusal) {
+      failQueuedWishHonestly(wish, crewRefusal);
+      continue;
+    }
+    const draftRefusal = draftDispatchRefusal(sessionID, wish.agentID);
+    if (draftRefusal) {
+      failQueuedWishHonestly(wish, draftRefusal);
+      continue;
+    }
+    const created = await createChildSession(client, {
+      parentSessionID: wish.ownerSession,
+      parentDirectory: wish.directory,
+      agentID: wish.agentID,
+      description: wish.description,
+      questionDeny: wish.questionDeny
+    });
+    if (!created.ok) {
+      failQueuedWishHonestly(wish, `child session creation failed: ${created.error}`);
+      continue;
+    }
+    const sent = await sendPrompt(client, {
+      sessionID: created.sessionID,
+      agentID: wish.agentID,
+      prompt: wish.prompt,
+      directory: wish.directory
+    });
+    if (!sent.ok) {
+      failQueuedWishHonestly(wish, `prompt send to child session ${created.sessionID} failed: ${sent.error}`);
+      continue;
+    }
+    const job = jobManager.create({
+      id: wish.jobId,
+      cmd: `dispatch ${wish.agentID}: ${wish.description}`,
+      worktree: wish.directory,
+      ownerSession: wish.ownerSession,
+      logPath: join6(jobLogDir, "dispatch", `${wish.jobId}.txt`),
+      notify: true,
+      killTree: () => {
+        abortChild(client, created.sessionID);
+      }
+    });
+    job.dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description };
+    dispatchTasks.set(wish.jobId, { jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description });
+    journalTransition(wish.directory, journalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, questionDeny: wish.questionDeny, description: wish.description, prompt: wish.prompt }, "started", { childSessionId: created.sessionID }));
+    announceQueuedStart(wish.ownerSession, `[forge:dispatch-progress] wish ${wish.jobId} spawned from the queue (agent ${wish.agentID}, child session ${created.sessionID}) — tracking as a normal async dispatch; the single [forge:dispatch-complete] wake reports when it finishes.`);
+    runAsyncDispatchPoller(client, job, created.sessionID, {
+      prompt: wish.prompt,
+      directory: wish.directory,
+      questionDeny: wish.questionDeny
+    });
+  }
+}
+function flushDispatchQueue(sessionID) {
+  const queue = dispatchQueues.get(sessionID);
+  if (!queue)
+    return;
+  dispatchQueues.delete(sessionID);
+  for (const wish of queue) {
+    journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory }, "aborted", `owner session ${sessionID} ended before the queued wish spawned — flushed without spawning`);
+  }
+}
+var dispatchJournals = new Map;
+var dispatchJournalFsFactory = null;
+function journalFor(worktree) {
+  let j = dispatchJournals.get(worktree);
+  if (!j) {
+    const filePath = join6(worktree, ".opencode", "forge", "dispatch-log.jsonl");
+    const fs = dispatchJournalFsFactory ? dispatchJournalFsFactory(filePath) : undefined;
+    j = createDispatchJournal(filePath, { fs, maxRecords: resolveJournalMax() });
+    dispatchJournals.set(worktree, j);
+  }
+  return j;
+}
+function journalRecord(base, state, extra = {}) {
+  const now = Date.now();
+  return {
+    id: base.id,
+    agent: base.agent,
+    ownerSession: base.ownerSession,
+    workspace: base.workspace,
+    state,
+    attempts: 1,
+    createdAt: now,
+    updatedAt: now,
+    ...base.description !== undefined ? { description: base.description } : {},
+    ...base.questionDeny !== undefined ? { questionDeny: base.questionDeny } : {},
+    ...base.prompt !== undefined ? { prompt: base.prompt } : {},
+    ...extra
+  };
+}
+function journalTransition(worktree, record2) {
+  try {
+    journalFor(worktree).append(record2);
+  } catch {}
+}
+function journalTerminalRecord(base, outcome, reason) {
+  journalTransition(base.workspace, { ...journalRecord(base, "terminal"), prompt: undefined, outcome, reason });
+}
+var recoveredDispatchWorkspaces = new Set;
+async function recoverWorkspaceDispatches(client, workspace) {
+  if (!client || !workspace)
+    return;
+  if (recoveredDispatchWorkspaces.has(workspace))
+    return;
+  recoveredDispatchWorkspaces.add(workspace);
+  let records;
+  try {
+    records = journalFor(workspace).nonTerminal();
+  } catch {
+    return;
+  }
+  for (const rec of records) {
+    try {
+      await recoverOneDispatchRecord(client, workspace, rec);
+    } catch {}
+  }
+}
+async function recoverOneDispatchRecord(client, workspace, rec) {
+  if (dispatchTasks.has(rec.id) || jobManager.get(rec.id))
+    return;
+  const base = {
+    id: rec.id,
+    agent: rec.agent,
+    ownerSession: rec.ownerSession,
+    workspace,
+    prompt: rec.prompt,
+    description: rec.description,
+    questionDeny: rec.questionDeny ?? true
+  };
+  const prompt = typeof rec.prompt === "string" ? rec.prompt : "";
+  const attempts = typeof rec.attempts === "number" && rec.attempts >= 1 ? rec.attempts : 1;
+  if (rec.state === "started" && typeof rec.childSessionId === "string" && rec.childSessionId !== "") {
+    const childId = rec.childSessionId;
+    const probe = await sessionGet(client, childId);
+    if (probe.exists === false) {
+      journalTerminalRecord(base, "error", `child session ${childId} no longer exists at recovery — dispatch finalized honestly (no report fabricated)`);
+      console.warn(`[forge:dispatch] recovery: task ${rec.id} (child session ${childId}) is gone — journal terminalized honestly.`);
+      return;
+    }
+    let active = true;
+    try {
+      const st = await client.session.status();
+      if (st.error === undefined && st.data && typeof st.data === "object") {
+        const entry = st.data[childId];
+        active = entry !== undefined && ["busy", "retry", "running"].includes(entry?.type ?? "");
+      }
+    } catch {
+      active = true;
+    }
+    if (!active) {
+      const fin = await fetchFinalMessage(client, childId);
+      if (fin.ok) {
+        const job2 = jobManager.create({
+          id: rec.id,
+          cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered)`,
+          worktree: workspace,
+          ownerSession: rec.ownerSession,
+          logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
+          notify: true,
+          killTree: () => {
+            abortChild(client, childId);
+          }
+        });
+        job2.dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" };
+        jobManager.appendOutput(job2, fin.text);
+        jobManager.markTerminal(job2, "exited", 0);
+        journalTerminalRecord(base, "completed", `final report recovered after host restart (child session ${childId})`);
+        return;
+      }
+    }
+    const job = jobManager.create({
+      id: rec.id,
+      cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered, re-armed)`,
+      worktree: workspace,
+      ownerSession: rec.ownerSession,
+      logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
+      notify: true,
+      killTree: () => {
+        abortChild(client, childId);
+      }
+    });
+    job.dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" };
+    dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" });
+    journalTransition(workspace, journalRecord(base, "started", { childSessionId: childId, attempts, prompt }));
+    runAsyncDispatchPoller(client, job, childId, {
+      prompt,
+      directory: workspace,
+      questionDeny: base.questionDeny ?? true,
+      attemptOffset: attempts - 1
+    });
+    return;
+  }
+  if (rec.state === "queued" || rec.state === "dispatched") {
+    const owner = await sessionGet(client, rec.ownerSession);
+    if (owner.exists === true) {
+      const queue = dispatchQueues.get(rec.ownerSession) ?? [];
+      queue.push({
+        jobId: rec.id,
+        agentID: rec.agent,
+        ownerSession: rec.ownerSession,
+        description: rec.description ?? "",
+        prompt,
+        directory: workspace,
+        questionDeny: true,
+        enqueuedAt: Date.now()
+      });
+      dispatchQueues.set(rec.ownerSession, queue);
+      announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] queued wish ${rec.id} (agent ${rec.agent}) re-entered the queue after host restart — it spawns when a slot frees.`);
+      await pumpDispatchQueue(client, rec.ownerSession);
+    } else {
+      journalTerminalRecord(base, "aborted", `owner session ${rec.ownerSession} no longer resolves at recovery — queued wish terminalized without spawning`);
+      console.warn(`[forge:dispatch] recovery: queued wish ${rec.id} owner ${rec.ownerSession} unresolvable — journal terminalized honestly.`);
+    }
+    return;
+  }
+  if (rec.state === "retry-pending") {
+    const maxAttempts = resolveMaxAttempts();
+    if (attempts <= maxAttempts && prompt !== "") {
+      const refusal = crewPendingRefusal(rec.ownerSession) ?? draftDispatchRefusal(rec.ownerSession, rec.agent);
+      if (refusal) {
+        journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`);
+        return;
+      }
+      const respawn = await createChildSession(client, {
+        parentSessionID: rec.ownerSession,
+        parentDirectory: workspace,
+        agentID: rec.agent,
+        description: rec.description ?? "",
+        questionDeny: base.questionDeny ?? true
+      });
+      if (!respawn.ok) {
+        journalTerminalRecord(base, "error", `retry spawn failed at recovery: ${respawn.error}`);
+        return;
+      }
+      const sent = await sendPrompt(client, {
+        sessionID: respawn.sessionID,
+        agentID: rec.agent,
+        prompt: buildRetryPrompt(prompt),
+        directory: workspace
+      });
+      if (!sent.ok) {
+        journalTerminalRecord(base, "error", `retry prompt send failed at recovery: ${sent.error}`);
+        return;
+      }
+      const job = jobManager.create({
+        id: rec.id,
+        cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered retry)`,
+        worktree: workspace,
+        ownerSession: rec.ownerSession,
+        logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
+        notify: true,
+        killTree: () => {
+          abortChild(client, respawn.sessionID);
+        }
+      });
+      job.dispatch = { agentID: rec.agent, childSessionID: respawn.sessionID, description: rec.description ?? "" };
+      dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" });
+      const nextAttempt = attempts;
+      journalTransition(workspace, journalRecord(base, "started", { childSessionId: respawn.sessionID, attempts: nextAttempt, prompt }));
+      announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] task ${rec.id} retry attempt ${nextAttempt}/${maxAttempts} resumed after host restart — child session ${respawn.sessionID}.`);
+      runAsyncDispatchPoller(client, job, respawn.sessionID, {
+        prompt,
+        directory: workspace,
+        questionDeny: base.questionDeny ?? true,
+        attemptOffset: attempts - 1
+      });
+    } else {
+      journalTerminalRecord(base, "error", `attempts exhausted at recovery (${attempts}/${maxAttempts}) — no respawn`);
+    }
+    return;
+  }
+}
 function dispatchClient() {
   return jobClient;
 }
@@ -18281,7 +18714,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
   const dispatch = job.dispatch;
   const agentID = dispatch?.agentID ?? "unknown";
   let childSessionID = initialChildSessionID;
-  let attempt = 1;
+  let attempt = 1 + (retryCtx.attemptOffset ?? 0);
   let startedAt = Date.now();
   let lastNotifiedMultiple = 0;
   let text = "";
@@ -18306,10 +18739,25 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
         const errorHead = poll.error.split(`
 `)[0].slice(0, 160);
         attempt++;
+        journalTransition(retryCtx.directory, {
+          id: job.id,
+          agent: agentID,
+          ownerSession: job.ownerSession,
+          workspace: retryCtx.directory,
+          state: "retry-pending",
+          childSessionId: undefined,
+          attempts: attempt,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          prompt: retryCtx.prompt,
+          questionDeny: retryCtx.questionDeny,
+          description: dispatch?.description ?? ""
+        });
         flushProgress(`[forge:dispatch-progress] attempt ${attempt}/${maxAttempts} starting after ${errorHead}… — ` + `respawning ${agentID} (task ${job.id}, previous child session ${childSessionID}) with the resume preamble; ` + `the single [forge:dispatch-complete] wake reports when the last attempt settles.`);
         await new Promise((resolve2) => setTimeout(resolve2, retryBackoffMs));
         if (job.state !== "running") {
           dispatchTasks.delete(job.id);
+          journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", "registry kill during retry backoff (owner session ended / dispose) — user abort, never retried");
           return;
         }
         const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID);
@@ -18344,6 +18792,20 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
         childSessionID = respawn.sessionID;
         job.dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" };
         dispatchTasks.set(job.id, { jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" });
+        journalTransition(retryCtx.directory, {
+          id: job.id,
+          agent: agentID,
+          ownerSession: job.ownerSession,
+          workspace: retryCtx.directory,
+          state: "started",
+          childSessionId: childSessionID,
+          attempts: attempt,
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          prompt: retryCtx.prompt,
+          questionDeny: retryCtx.questionDeny,
+          description: dispatch?.description ?? ""
+        });
         job.killTree = () => {
           abortChild(client, childSessionID);
         };
@@ -18361,6 +18823,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
     }
     if (job.state !== "running") {
       dispatchTasks.delete(job.id);
+      journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", "registry kill (owner session ended / dispose) — user abort");
       return;
     }
     if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
@@ -18416,6 +18879,15 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
   jobManager.appendOutput(job, text);
   jobManager.markTerminal(job, "exited", exitCode);
   dispatchTasks.delete(job.id);
+  journalTerminalRecord({
+    id: job.id,
+    agent: agentID,
+    ownerSession: job.ownerSession,
+    workspace: retryCtx.directory,
+    description: dispatch?.description ?? ""
+  }, exitCode === 0 ? "completed" : "error", text.split(`
+`)[0].slice(0, 200));
+  pumpDispatchQueue(client, job.ownerSession);
 }
 var TASK_DESCRIPTION = [
   "Dispatch a subagent as a REAL child session on this host (SDK session.create with parentID): the call renders in the host session tree with native subagent affordances — the live task panel, progress, expandable transcript, user abort — and runs the target agent with its own permission map. This is the single dispatch surface: ANY materialized target dispatches through here — configured `forge-*` subagents AND every other host agent.",
@@ -18471,10 +18943,16 @@ var taskDispatchTool = tool({
     const draftRefusal = draftDispatchRefusal(context.sessionID, target);
     if (draftRefusal)
       throw new Error(draftRefusal);
+    let queueAfterCap = false;
     if (runInBackground) {
       const inFlight = inFlightAsyncDispatches(context.sessionID);
       if (inFlight.length >= ASYNC_DISPATCH_CAP) {
-        throw new Error(`[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")}. ` + `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one without run_in_background.`);
+        const queuedIds = queuedAsyncDispatchIds(context.sessionID);
+        const queueMax = resolveDispatchQueueMax();
+        if (queuedIds.length >= queueMax) {
+          throw new Error(`[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")} — and the dispatch queue is full (bound ${queueMax}): ${queuedIds.join(", ")}. ` + `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one without run_in_background.`);
+        }
+        queueAfterCap = true;
       }
     }
     const client = dispatchClient();
@@ -18482,6 +18960,64 @@ var taskDispatchTool = tool({
       throw new Error("[forge:dispatch] no host client available — dispatch cannot create a child session.");
     const state = ensureSession(context.sessionID, worktreeFor(context));
     const description = typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60);
+    if (queueAfterCap) {
+      const jobId2 = newJobId();
+      const queue = dispatchQueues.get(context.sessionID) ?? [];
+      const position = queue.length + 1;
+      queue.push({ jobId: jobId2, agentID: target, ownerSession: context.sessionID, description, prompt, directory: state.worktree, questionDeny: true, enqueuedAt: Date.now() });
+      dispatchQueues.set(context.sessionID, queue);
+      journalTransition(state.worktree, {
+        id: jobId2,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        state: "queued",
+        attempts: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        prompt,
+        questionDeny: true,
+        description
+      });
+      const queuedMeta = {
+        agent: target,
+        sessionId: "",
+        taskId: jobId2,
+        run_in_background: true,
+        description,
+        prompt,
+        queued: true
+      };
+      context.metadata({ title: `${target}: dispatch queued (${jobId2})`, metadata: { ...queuedMeta } });
+      return {
+        title: `${target}: dispatch queued (${jobId2})`,
+        metadata: { ...queuedMeta },
+        output: [
+          `[forge:dispatch] Dispatched ${target} in async mode — the session is at the async dispatch cap (${ASYNC_DISPATCH_CAP} running), so this wish is QUEUED (queue position ${position}).`,
+          `task id: ${jobId2}`,
+          `agent: ${target}`,
+          `queued: position ${position} — the wish spawns automatically when a slot frees (a [forge:dispatch-progress] notice announces its start; the roster, draft gate, and crew belt are re-checked at spawn time).`,
+          `Next: END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when the spawned child finishes — however long it takes. Never poll or re-dispatch to check on it.`
+        ].join(`
+`)
+      };
+    }
+    const asyncJobId = runInBackground ? newJobId() : "";
+    if (asyncJobId) {
+      journalTransition(state.worktree, {
+        id: asyncJobId,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        state: "dispatched",
+        attempts: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        prompt,
+        questionDeny: true,
+        description
+      });
+    }
     const created = await createChildSession(client, {
       parentSessionID: context.sessionID,
       parentDirectory: state.worktree,
@@ -18516,6 +19052,34 @@ var taskDispatchTool = tool({
       const syncStale = { lastActivity: null, staleNotified: false };
       taskMetadata.taskId = newJobId();
       const syncJobId = taskMetadata.taskId;
+      const syncJournalBase = { id: syncJobId, agent: target, ownerSession: context.sessionID, workspace: state.worktree, prompt, description, questionDeny: false };
+      journalTransition(state.worktree, {
+        id: syncJobId,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        state: "dispatched",
+        attempts: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        prompt,
+        questionDeny: false,
+        description
+      });
+      journalTransition(state.worktree, {
+        id: syncJobId,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        state: "started",
+        childSessionId: created.sessionID,
+        attempts: 1,
+        createdAt: Date.now(),
+        updatedAt: Date.now(),
+        prompt,
+        questionDeny: false,
+        description
+      });
       let childSessionID = created.sessionID;
       let attemptSync = 1;
       let syncStartedAt = Date.now();
@@ -18535,6 +19099,7 @@ var taskDispatchTool = tool({
           });
           if (poll.status === "aborted") {
             const ab = await abortChild(client, childSessionID);
+            journalTerminalRecord(syncJournalBase, "aborted", `dispatching turn aborted — child session ${childSessionID} aborted via the SDK`);
             context.metadata({ title: `${target}: dispatch aborted`, metadata: { ...taskMetadata } });
             return {
               title: `${target}: dispatch aborted`,
@@ -18551,10 +19116,24 @@ var taskDispatchTool = tool({
               const errorHead = poll.error.split(`
 `)[0].slice(0, 160);
               attemptSync++;
+              journalTransition(state.worktree, {
+                id: syncJobId,
+                agent: target,
+                ownerSession: context.sessionID,
+                workspace: state.worktree,
+                state: "retry-pending",
+                attempts: attemptSync,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                prompt,
+                questionDeny: false,
+                description
+              });
               queueDispatchProgress(context.sessionID, `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`);
               await new Promise((resolve2) => setTimeout(resolve2, retryBackoffSync));
               const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusal(context.sessionID, target);
               if (refusal) {
+                journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`);
                 throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
               }
               const respawn = await createChildSession(client, {
@@ -18565,6 +19144,7 @@ var taskDispatchTool = tool({
                 questionDeny: false
               });
               if (!respawn.ok) {
+                journalTerminalRecord(syncJournalBase, "error", `retry spawn failed: ${respawn.error}`);
                 throw new Error(`[forge:dispatch] retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
               }
               const sent2 = await sendPrompt(client, {
@@ -18574,10 +19154,25 @@ var taskDispatchTool = tool({
                 directory: state.worktree
               });
               if (!sent2.ok) {
+                journalTerminalRecord(syncJournalBase, "error", `retry prompt send failed: ${sent2.error}`);
                 throw new Error(`[forge:dispatch] retry prompt send failed: ${sent2.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
               }
               childSessionID = respawn.sessionID;
               taskMetadata.sessionId = childSessionID;
+              journalTransition(state.worktree, {
+                id: syncJobId,
+                agent: target,
+                ownerSession: context.sessionID,
+                workspace: state.worktree,
+                state: "started",
+                childSessionId: childSessionID,
+                attempts: attemptSync,
+                createdAt: Date.now(),
+                updatedAt: Date.now(),
+                prompt,
+                questionDeny: false,
+                description
+              });
               syncStartedAt = Date.now();
               syncStale.lastActivity = null;
               syncStale.staleNotified = false;
@@ -18612,6 +19207,7 @@ var taskDispatchTool = tool({
               if (staleThresholdCrossed(syncStale, Date.now(), syncStartedAt, staleMsSync, staleFloorSync)) {
                 const decision = decideStaleSweep(probe, syncStale, staleModeSync);
                 if (decision.action === "gone") {
+                  journalTerminalRecord(syncJournalBase, "stale", `child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly`);
                   context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } });
                   return {
                     title: `${target}: dispatch stale-finalized`,
@@ -18626,6 +19222,7 @@ var taskDispatchTool = tool({
                 if (decision.action === "kill") {
                   const ab = await abortChild(client, childSessionID);
                   if (ab.ok) {
+                    journalTerminalRecord(syncJournalBase, "stale", `aborted after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — child session ${childSessionID} killed by the stale reap`);
                     context.metadata({ title: `${target}: dispatch stale-reaped`, metadata: { ...taskMetadata } });
                     return {
                       title: `${target}: dispatch stale-reaped`,
@@ -18639,6 +19236,7 @@ var taskDispatchTool = tool({
                   }
                   const reprobe = await sessionGet(client, childSessionID);
                   if (reprobe.exists === false) {
+                    journalTerminalRecord(syncJournalBase, "stale", `child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly`);
                     context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } });
                     return {
                       title: `${target}: dispatch stale-finalized`,
@@ -18660,8 +19258,11 @@ var taskDispatchTool = tool({
         }
       if (syncCompleted) {
         const fin = await fetchFinalMessage(client, childSessionID);
-        if (!fin.ok)
+        if (!fin.ok) {
+          journalTerminalRecord(syncJournalBase, "error", fin.error);
           throw new Error(`[forge:dispatch] ${fin.error}`);
+        }
+        journalTerminalRecord(syncJournalBase, "completed", `${target} finished (child session ${childSessionID})`);
         context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } });
         const recoveredNote = attemptSync > 1 ? ` — recovered on attempt ${attemptSync}/${maxAttemptsSync} (previous child session(s) died with transient errors and were respawned; the [forge:dispatch-progress] notice lands in this transcript when the session idles)` : "";
         return {
@@ -18673,6 +19274,7 @@ ${fin.text}`].join(`
         };
       }
       if (syncError !== null) {
+        journalTerminalRecord(syncJournalBase, "error", `child session ${childSessionID} ended in error: ${syncError}`.slice(0, 200));
         throw new Error(`[forge:dispatch] child session ${childSessionID} ended in error: ${syncError}`);
       }
       const job2 = jobManager.create({
@@ -18693,7 +19295,7 @@ ${fin.text}`].join(`
       const attemptNote = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; retries continue in the armed tracker.` : "";
       throw new Error(`[forge:dispatch] Poll timeout after ${syncTimeoutMs}ms — child session ${childSessionID} never reached a terminal state.${attemptNote} ` + `It remains a real session: inspect or abort it natively in the host TUI. ` + `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes, however long it takes (interim [forge:dispatch-progress] notices may arrive meanwhile); do not poll or re-dispatch in the meantime.`);
     }
-    const jobId = newJobId();
+    const jobId = asyncJobId || newJobId();
     taskMetadata.taskId = jobId;
     const job = jobManager.create({
       id: jobId,
@@ -18708,6 +19310,20 @@ ${fin.text}`].join(`
     });
     job.dispatch = { agentID: target, childSessionID: created.sessionID, description };
     dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description });
+    journalTransition(state.worktree, {
+      id: jobId,
+      agent: target,
+      ownerSession: context.sessionID,
+      workspace: state.worktree,
+      state: "started",
+      childSessionId: created.sessionID,
+      attempts: 1,
+      createdAt: Date.now(),
+      updatedAt: Date.now(),
+      prompt,
+      questionDeny: true,
+      description
+    });
     runAsyncDispatchPoller(client, job, created.sessionID, { prompt, directory: state.worktree, questionDeny: true });
     context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
     return {
@@ -19230,7 +19846,7 @@ var pendingContinuationTurn = new Set;
 function goalProbe(line) {
   if (process.env.FORGE_GOAL_PROBE) {
     try {
-      appendFileSync(join6(tmpdir3(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
+      appendFileSync2(join6(tmpdir3(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
 `);
     } catch {}
   }
@@ -19362,7 +19978,7 @@ function wrapupBriefText(goal, reason) {
 }
 async function autoPauseGoal(client, state, goal, reason, wrapup) {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
-  atomicWrite(goal.path, transitionGoal(readFileSync8(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
   engineForgetSession(state.sessionID);
   if (wrapup && goal.doc.session) {
     try {
@@ -19411,9 +20027,9 @@ async function continueIfEligible(client, sessionID) {
       const ledgerPath = state.goalPath;
       if (ledgerPath && existsSync3(ledgerPath)) {
         try {
-          const fresh = parseGoalLoose(readFileSync8(ledgerPath, "utf8"));
+          const fresh = parseGoalLoose(readFileSync9(ledgerPath, "utf8"));
           if (fresh && fresh.turnsUsed > 0) {
-            atomicWrite(ledgerPath, appendLedger(readFileSync8(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
+            atomicWrite(ledgerPath, appendLedger(readFileSync9(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
           }
         } catch (err) {
           goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
@@ -19476,7 +20092,7 @@ async function continueIfEligible(client, sessionID) {
       pendingContinuationTurn.add(sessionID);
       turnActivity.set(sessionID, { writes: 0, checks: 0 });
       state.goalPath = goal.path;
-      atomicWrite(goal.path, incTurns(readFileSync8(goal.path, "utf8"), nowIso()));
+      atomicWrite(goal.path, incTurns(readFileSync9(goal.path, "utf8"), nowIso()));
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
       const n = (transportFails.get(sessionID) ?? 0) + 1;
@@ -19513,6 +20129,9 @@ var server = async (input, options) => {
   rememberHostAnchor(effectiveInitDir);
   const client = input.client;
   jobClient = input.client;
+  if (effectiveInitDir && !isRootish(effectiveInitDir)) {
+    recoverWorkspaceDispatches(input.client, effectiveInitDir);
+  }
   const jobsOpts = options?.jobs;
   if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native")
     jobsMode = jobsOpts.mode;
@@ -19539,7 +20158,7 @@ var server = async (input, options) => {
     if (!probing())
       return;
     try {
-      appendFileSync(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
+      appendFileSync2(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
 `);
     } catch {}
   };
@@ -19712,7 +20331,7 @@ var server = async (input, options) => {
     "tool.execute.before": async (input2, output) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
+          appendFileSync2(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
 `);
         } catch {}
       }
@@ -19722,7 +20341,7 @@ var server = async (input, options) => {
         watchdog.track(input2.callID, input2.sessionID, input2.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
+            appendFileSync2(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
 `);
           } catch {}
         }
@@ -19851,7 +20470,7 @@ var server = async (input, options) => {
       if (frozen) {
         if (process.env.FORGE_DEPTH_PROBE) {
           try {
-            appendFileSync(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}
+            appendFileSync2(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}
 `);
           } catch {}
         }
@@ -19877,7 +20496,7 @@ var server = async (input, options) => {
       }
       if (process.env.FORGE_DEPTH_PROBE) {
         try {
-          appendFileSync(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}
+          appendFileSync2(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}
 ` + `    input=${JSON.stringify(raw).slice(0, 600)}
 ` + `    optionsAfter=${JSON.stringify(output.options ?? {})}
 `);
@@ -19904,6 +20523,20 @@ var server = async (input, options) => {
       resolveNow: () => resolvePools(),
       workspacePoolOf: (anchor) => sessionPoolFileOf(anchor),
       dispatchTasks: () => [...dispatchTasks.values()],
+      dispatchQueues: () => [...dispatchQueues.entries()].flatMap(([owner, wishes]) => wishes.map((w) => ({ ownerSession: owner, jobId: w.jobId, agentID: w.agentID }))),
+      setDispatchJournalFs: (factory) => {
+        dispatchJournalFsFactory = factory;
+        dispatchJournals.clear();
+        recoveredDispatchWorkspaces.clear();
+      },
+      dispatchRecoveredWorkspaces: () => [...recoveredDispatchWorkspaces],
+      dispatchJournalText: (worktree) => {
+        try {
+          return journalFor(worktree).fs.read();
+        } catch {
+          return null;
+        }
+      },
       dispatchProgress: (sessionID) => [...dispatchProgressQueue.get(sessionID) ?? []],
       jobLedger: () => jobManager.ledgerEntries(),
       gateSnapshot: () => Object.fromEntries(gatePermissionSnapshot),
@@ -19918,7 +20551,7 @@ var server = async (input, options) => {
       const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
+          appendFileSync2(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
 `);
         } catch {}
       }
@@ -19945,6 +20578,8 @@ var server = async (input, options) => {
         const worktree = effectiveWorktree(info.worktree, info.directory);
         if (typeof worktree === "string" && worktree) {
           ensureSession(info.id, worktree);
+          if (!isRootish(worktree))
+            recoverWorkspaceDispatches(jobClient, worktree);
         }
       }
       if (event.type === "session.idle") {
@@ -19964,6 +20599,7 @@ var server = async (input, options) => {
             if (handle.ownerSession === info.id)
               dispatchTasks.delete(id);
           }
+          flushDispatchQueue(info.id);
           sessionDepths.delete(info.id);
           dispatchProgressQueue.delete(info.id);
           sessionAgents.delete(info.id);
@@ -19987,7 +20623,7 @@ var server = async (input, options) => {
       watchdog.markSeen(input2.callID);
       if (process.env.FORGE_WATCHDOG_PROBE) {
         try {
-          appendFileSync(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
+          appendFileSync2(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
 `);
         } catch {}
       }
@@ -19997,7 +20633,7 @@ var server = async (input, options) => {
         watchdog.untrack(input2.callID);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
+            appendFileSync2(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
 `);
           } catch {}
         }
@@ -20124,9 +20760,11 @@ var plugin_default = { id: "forge", server, setup: v2Setup };
 export {
   v2Setup,
   server,
+  resolveDispatchQueueMax,
   isRootish,
   effectiveWorktree,
   effectiveSurvive,
   plugin_default as default,
+  DEFAULT_DISPATCH_QUEUE_MAX,
   ASYNC_DISPATCH_CAP
 };
