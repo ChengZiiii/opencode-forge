@@ -6,6 +6,9 @@ import { join } from "node:path"
 
 // Debounce must be tiny BEFORE plugin.ts is imported (module-level const).
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
+// Sandbox the plugin's runtime-artifact home (session-anchor ledger etc.) —
+// this suite binds POOLED workspaces and must never write the real ledger.
+process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "goal-mode-home-"))
 const { server } = await import("../plugin.ts")
 import { appendLedger, parseGoal } from "../src/goal-file.ts"
 import { appendTerminalSection, parsePlan, rankActivePlans, transitionStatus } from "../src/plan-file.ts"

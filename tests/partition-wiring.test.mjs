@@ -7,6 +7,9 @@ import { join } from "node:path"
 // Debounce must be tiny BEFORE plugin.ts is imported (module-level const).
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 process.env.FORGE_TEST_NO_FENCE = "1"
+// Sandbox the plugin's runtime-artifact home (session-anchor ledger etc.) —
+// this suite binds POOLED workspaces and must never write the real ledger.
+process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "part-wiring-home-"))
 const { server } = await import("../plugin.ts")
 
 // Host-lifetime simulation (hierarchical-pool-materialization): reset the
