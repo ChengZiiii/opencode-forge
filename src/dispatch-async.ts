@@ -363,12 +363,14 @@ function readTimeUpdated(record: unknown): number | null {
  * endpoint reports unresolved.
  */
 export async function sessionGet(client: DispatchClient, sessionID: string): Promise<SessionGetResult> {
-  const get = client.session.get
-  if (typeof get !== "function") return { exists: null, timeUpdated: null }
+  // Invoke as a BOUND method - destructuring (`const get = client.session.get`)
+  // loses `this` and the SDK instance method throws (`this._client` undefined).
+  if (typeof client.session.get !== "function") return { exists: null, timeUpdated: null }
   let result: unknown
   try {
-    result = await get({ path: { id: sessionID } })
+    result = await client.session.get({ path: { id: sessionID } })
   } catch (e) {
+    if (process.env.FORGE_DISPATCH_DEBUG === "1") console.error(`[forge-dbg] sessionGet threw: ${String(e).slice(0, 300)}`)
     return sessionNotFoundSignal(e) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null }
   }
   if (
@@ -378,6 +380,7 @@ export async function sessionGet(client: DispatchClient, sessionID: string): Pro
   ) {
     const env = result as { data?: unknown; error?: unknown }
     if (env.error !== undefined && env.error !== null) {
+      if (process.env.FORGE_DISPATCH_DEBUG === "1") console.error(`[forge-dbg] sessionGet error envelope: ${JSON.stringify(env.error).slice(0, 300)}`)
       return sessionNotFoundSignal(env.error) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null }
     }
     if (env.data == null) return { exists: false, timeUpdated: null }

@@ -2317,6 +2317,8 @@ const taskDispatchTool = tool({
       const waitStartedAt = Date.now()
       let syncCompleted = false
       let syncError: string | null = null
+      const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1"
+      let syncSliceCount = 0
       syncWait: for (;;) {
         const poll = await pollChild(client, {
           sessionID: childSessionID,
@@ -2394,9 +2396,23 @@ const taskDispatchTool = tool({
           // Activity-stale reap (fold B) on the running axis — same helpers
           // as the async poller; the probe doubles as the pre-kill re-read
           // and the refresh rail.
+          if (syncDbg) {
+            syncSliceCount++
+            if (syncSliceCount === 1) {
+              const names: string[] = []
+              let cur = (client as unknown as { session?: object }).session
+              while (cur && cur !== Object.prototype) {
+                names.push(...Object.getOwnPropertyNames(cur))
+                cur = Object.getPrototypeOf(cur)
+              }
+              console.error(`[forge-dbg] client.session methods: ${[...new Set(names)].filter((n) => n !== "constructor").join(",")}`)
+            }
+            console.error(`[forge-dbg] slice ${syncSliceCount}: status=timeout idle=${syncStability.textlessIdleSince === undefined ? "undef" : "set"} staleMs=${staleMsSync} floor=${staleFloorSync} mode=${staleModeSync} elapsed=${Math.round((Date.now() - syncStartedAt) / 1000)}s`)
+          }
           if (syncStability.textlessIdleSince === undefined) {
             const probe = await sessionGet(client, childSessionID)
             applyStaleProbe(syncStale, probe)
+            if (syncDbg) console.error(`[forge-dbg] probe: exists=${probe.exists} timeUpdated=${probe.timeUpdated} anchor=${syncStale.lastActivity}`)
             if (staleThresholdCrossed(syncStale, Date.now(), syncStartedAt, staleMsSync, staleFloorSync)) {
               const decision = decideStaleSweep(probe, syncStale, staleModeSync)
               if (decision.action === "gone") {
@@ -2451,10 +2467,11 @@ const taskDispatchTool = tool({
         const fin = await fetchFinalMessage(client, childSessionID)
         if (!fin.ok) throw new Error(`[forge:dispatch] ${fin.error}`)
         context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } })
+        const recoveredNote = attemptSync > 1 ? ` — recovered on attempt ${attemptSync}/${maxAttemptsSync} (previous child session(s) died with transient errors and were respawned; the [forge:dispatch-progress] notice lands in this transcript when the session idles)` : ""
         return {
           title: `${target}: dispatch complete`,
           metadata: { ...taskMetadata },
-          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID}).`, `Final report:\n${fin.text}`].join("\n"),
+          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID})${recoveredNote}.`, `Final report:\n${fin.text}`].join("\n"),
         }
       }
       if (syncError !== null) {
