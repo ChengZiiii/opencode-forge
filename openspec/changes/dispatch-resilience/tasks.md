@@ -40,25 +40,25 @@
 
 ## 4. Fold D — cap queueing (forge-subagents / Dispatch lifecycle)
 
-- [ ] 4.1 Implement the per-session FIFO queue (bound `FORGE_DISPATCH_QUEUE_MAX` default 10), queued handles carrying `queued: true` panel metadata until spawn, and the pump (spawns on slot release)
-- [ ] 4.2 Gate semantics: belts evaluate at CALL time; spawn-time re-checks = target roster + draft gate + crew belt (tightening → honest error wake, never silent)
-- [ ] 4.3 Owner death flushes queued wishes without spawning and terminalizes their journal records
-- [ ] 4.4 Tests: 4th+ wish queues and spawns on slot release; bound refusal lists in-flight AND queued ids; roster-vanish honest wake; draft-tighten and crew-belt block at spawn; owner flush; queued-start emits a progress notice; cap number unchanged (3 running); retry×queue interplay (retry keeps its slot; queued wishes stay behind)
-- [ ] 4.5 Full suite + typecheck green
-- [ ] 4.6 Live replay: dispatch 5 essay sleepers from one session → 3 run + 2 queue → all 5 deliver their reports without human pacing
-- [ ] 4.7 Docs + copy: TASK_DESCRIPTION and async-handle text rewritten (the hard-coded cap-3 refusal copy goes); README `FORGE_DISPATCH_QUEUE_MAX` row
-- [ ] 4.8 Release the fold
+- [x] 4.1 DONE — per-session FIFO queue (`dispatchQueues`, bound `FORGE_DISPATCH_QUEUE_MAX` default 10, invalid → default), queued handles carrying `queued: true` panel metadata + `QUEUED (queue position N)` note until spawn, pump on slot release (`pumpDispatchQueue`, wired at terminal settle + recovery + owner flush)
+- [x] 4.2 DONE — belts at call time as before; spawn-time re-checks = target roster (`failQueuedWishHonestly` on roster vanish) + draft gate + crew belt (each → honest error wake, never silent)
+- [x] 4.3 DONE — owner death flushes queued wishes without spawning and terminalizes their journal records (`flushDispatchQueue` in the session.deleted harvest)
+- [x] 4.4 DONE — 20 queue tests in `tests/dispatch-queue.test.mjs` + the cap/queue wiring test in `tests/dispatch-wiring.test.mjs` (4th wish queues with position note; beyond-bound refusal lists in-flight AND queued ids; owner flush without spawn; retry×queue interplay)
+- [x] 4.5 DONE — 630/630 suite + tsc exit 0 (with fold E tests in the same run)
+- [x] 4.6 DONE — live replay on 0.25.3 (f26 sandbox, FORGE_DISPATCH_QUEUE_MAX=1, real glm children): one session issued 4 near-simultaneous dispatches → 3 ran (cap 3), the 4th got the verbatim `QUEUED (queue position 1)` handle and its journal record went queued→started→terminal (spawned by the pump when a slot freed; all five reports delivered by wake without human pacing); a 5th call inside the pressure window received the verbatim bound refusal listing all 3 in-flight ids + the queued id + `queue is full (bound 1)`, then re-issued later and spawned directly (REST/DB-verified tool outputs ses_e1c64100cffenliY32l7ItDSSD + the f26 journal)
+- [x] 4.7 DONE — TASK_DESCRIPTION rewritten (beyond-cap wishes QUEUE FIFO with a position note; only a full queue refuses, listing in-flight + queued ids); queued-handle + refusal copy ship in the enqueue path; README `FORGE_DISPATCH_QUEUE_MAX` row added
+- [x] 4.8 DONE — release 0.25.3 (folds D+E on one train: commit 16db1f3 + c6e0929, push, publish, store install with pin bump + cache clean; flip verified by the live replays above — the serve loaded 0.25.3 from the store)
 
 ## 5. Fold E — persisted journal + restart recovery (forge-subagents / Dispatch resilience)
 
-- [ ] 5.1 Implement `src/dispatch-journal.ts`: append-only JSONL at workspace `.opencode/forge/dispatch-log.jsonl`, bounded at `FORGE_DISPATCH_JOURNAL_MAX` (default 200); rotation compacts TERMINAL records only and never removes a non-terminal record; per-state record fields; prompt retained while a record is non-terminal (journal = only prompt source after restart), redacted on terminal; corrupt lines tolerated (skip + continue)
-- [ ] 5.2 Emit journal entries on every state transition (dispatched, queued, started, retry-pending, terminal); owner-death queue flush terminalizes queued records
-- [ ] 5.3 Implement per-state init recovery, scoped to the launch-anchor workspace at init + lazy per-workspace on first session: running (alive → re-arm; done → fetch + wake; gone → honest terminal), queued (owner resolves → re-enter queue; else terminal + ledger), retry-pending (attempts remain → respawn; else terminal); corrupt JSONL line tolerated (skip + continue)
-- [ ] 5.4 Tests: transitions journaled; the three running branches; queued branch both ways; retry-pending branch both ways; rotation keeps non-terminal records; corrupt line tolerated; owner flush terminalizes queued records; lazy per-workspace recovery scope (non-anchor workspace recovers on its first session)
-- [ ] 5.5 Full suite + typecheck green
-- [ ] 5.6 Live replay: dispatch a long sleeper, kill the serve process mid-flight, restart with the same workspace config → the report arrives on the new host without re-dispatch
-- [ ] 5.7 Docs: README fixes the "dispatch ledger — no longer written" row, adds the journal ledger entry + uninstall-residue note + `FORGE_DISPATCH_JOURNAL_MAX` knob row
-- [ ] 5.8 Release the fold
+- [x] 5.1 DONE — `src/dispatch-journal.ts`: append-only JSONL at workspace `.opencode/forge/dispatch-log.jsonl`, `FORGE_DISPATCH_JOURNAL_MAX` default 200; rotation compacts TERMINAL records oldest-first, non-terminal NEVER dropped (all-live overflow beats the bound); corrupt lines skipped; prompt retained non-terminal, redacted on terminal
+- [x] 5.2 DONE — journal transitions emitted at dispatched/queued/started/retry-pending/terminal (live proof: the first 0.25.3 replay leg wrote dispatched→started→terminal for all five serial dispatches); owner-death queue flush terminalizes queued records
+- [x] 5.3 DONE — per-state init recovery at the launch anchor + lazy per-workspace on first session (`recoverWorkspaceDispatches` / `recoverOneDispatchRecord`): running alive → re-arm (existing child tracked, no respawn), done → fetch + exactly-one wake, gone → honest terminal; queued → owner resolves → re-enter queue + pump, else terminal; retry-pending → attempts remain → respawn with the resume preamble (prompt from the journal — its only source), else exhausted terminal
+- [x] 5.4 DONE — `tests/dispatch-journal.test.mjs` (11 tests): pure core (parse/dedupe/corrupt-skip, rotation keeps non-terminal, knob matrix) + wiring through real server() boots with the journal seeded on the real disk (running re-arm + late-finish wake; finished-while-down exactly-one wake; gone honest terminal; queued both ways; retry-pending both ways incl. the resume preamble; live-dispatch transitions + terminal prompt redaction; lazy per-workspace scope)
+- [x] 5.5 DONE — 630/630 suite + tsc exit 0
+- [x] 5.6 DONE — live replay on 0.25.3 (f26 sandbox): a background dispatch's serve process was killed mid-flight and restarted on the same workspace — the journal record survived, init recovery re-armed the running child, and the report (`JOURNAL-RECOVERY-REPORT`) arrived on the new host EXACTLY ONCE by wake without re-dispatch (driver f26-journal.txt, wake at +55s post-restart). The instant-fetch branch (`final report recovered after host restart` reason) stayed unit-covered — its live trigger needs the kill to land in the sub-poll-window after child completion (not reachable with real-model latency); a follow-up hardening (0.25.4) added the recovery-path D6 parity belt so the recovered wake delivers even when the fresh host has no idle-edge memory for the owner
+- [x] 5.7 DONE — README: the `dispatch-log.jsonl` file-ledger row added (lifetime + uninstall residue), the retired-ledger row kept, `FORGE_DISPATCH_JOURNAL_MAX` knob row added
+- [x] 5.8 DONE — release 0.25.3 (same train as 4.8) + patch 0.25.4 (recovery-path D6 parity wake delivery + the TASK_DESCRIPTION queue copy that landed post-0.25.3)
 
 ## 6. Umbrella close
 

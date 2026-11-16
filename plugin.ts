@@ -2282,6 +2282,19 @@ async function recoverOneDispatchRecord(client: DispatchClient, workspace: strin
         jobManager.appendOutput(job, fin.text)
         jobManager.markTerminal(job, "exited", 0) // exactly one wake, via the standard queue
         journalTerminalRecord(base, "completed", `final report recovered after host restart (child session ${childId})`)
+        // D6 parity (fold E recovery): a fresh host has no idle-edge memory
+        // for this owner — its next idle edge may never come. Deliver now
+        // when the owner exists and is not mid-turn (lossy single attempt:
+        // a failed send re-queues to the standard idle-edge/window path).
+        try {
+          const st2 = await client.session.status()
+          const ownerEntry = (st2.data as { [sid: string]: { type?: string } | undefined } | undefined)?.[rec.ownerSession]
+          if (!ownerEntry || !["busy", "retry", "running"].includes(ownerEntry?.type ?? "")) {
+            await deliverJobWakes(rec.ownerSession)
+          }
+        } catch {
+          // Soundness: undeliverable now → the standard window/idle path resumes.
+        }
         return
       }
       // Not reportably done → re-arm; the poller's floor resolves honestly.
@@ -2731,7 +2744,7 @@ const TASK_DESCRIPTION = [
   'run_in_background is YOUR dispatch-time decision: omit it (sync) when your very next step depends on the result — the call blocks until the child finishes and returns its final report (native parity: the child MAY ask the user questions; the user is present at the panel). Set run_in_background: true (async) when the result does NOT block your next steps — the call returns a task handle immediately and the child is created with the question tool denied session-wide (unattended: it never blocks on human input; an unanswered permission ask degrades to the honest poll-timeout finding naming the child session id, which stays inspectable and natively abortable in the TUI).',
   'async discipline: after an async dispatch, END YOUR TURN. Interim [forge:dispatch-progress] notices may arrive while the child runs (informational only); the single [forge:dispatch-complete] message carrying the worker\'s final report is injected when it finishes — however long it takes (idle-only, at-most-once, delivery window). NEVER poll, re-dispatch, or "check on" an async dispatch before that wake arrives — pre-wake polling is a BLOCKING anti-pattern.',
   "Sync dispatches carry abort parity: aborting the dispatching turn aborts the child session via the SDK. Async children intentionally SURVIVE turn aborts (session-scoped; they die at owner-session death, orphan-recorded).",
-  "Forge roster guidance: prefer a configured `forge-*` subagent whose description matches the job (each materialized description carries its pool provenance; .opencode/forge.json is the source). Gates on forge-* targets: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance belts, the plan-draft readonly-recon exemption (readonly scouts pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch — recursion is banned at their permission map). Non-forge host targets dispatch with native parity (no forge pool gate; the session-keyed crew pending belt and the plan-draft write-class deny still apply, exactly as for the native task tool). Cap: 3 concurrent async dispatches per session.",
+   "Forge roster guidance: prefer a configured `forge-*` subagent whose description matches the job (each materialized description carries its pool provenance; .opencode/forge.json is the source). Gates on forge-* targets: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance belts, the plan-draft readonly-recon exemption (readonly scouts pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch — recursion is banned at their permission map). Non-forge host targets dispatch with native parity (no forge pool gate; the session-keyed crew pending belt and the plan-draft write-class deny still apply, exactly as for the native task tool). Cap: 3 concurrent async dispatches per session; a wish arriving beyond the cap QUEUES FIFO instead of refusing (per-session bound FORGE_DISPATCH_QUEUE_MAX, default 10) and spawns automatically when a slot frees — its handle reads QUEUED (queue position N) until spawn, and only a full queue refuses the call (listing every in-flight and queued task id).",
 ].join("\n")
 
 const taskDispatchTool = tool({

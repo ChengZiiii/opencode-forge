@@ -279,9 +279,11 @@ test("recovery: a child that finished WHILE THE HOST WAS DOWN delivers exactly o
   assert.equal(terminal.outcome, "completed", "completed outcome")
   assert.ok(terminal.reason.includes("recovered after host restart"), "the reason names the restart recovery")
   assert.equal(calls.create.length, 0, "no respawn — the report was fetched, not re-run")
-  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_owner2" } } })
+  // D6 parity (recovery): the wake delivers WITHOUT any idle edge — a fresh
+  // host has no idle-edge memory, so the recovery delivers immediately when
+  // the owner is not mid-turn.
   const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_owner2")
-  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "one wake delivered on idle")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "one wake delivered without an idle edge")
   const wakes = toOwner().map(textOf).filter((s) => s.startsWith("[forge:dispatch-complete]"))
   assert.equal(wakes.length, 1, "exactly ONE recovered wake")
   assert.ok(wakes[0].includes("report from ses_rec_b"), "the fetched final report rides the wake")
