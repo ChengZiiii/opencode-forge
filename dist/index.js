@@ -15336,6 +15336,16 @@ function classifyExecCommand(cmd, opts) {
   return { klass: READ_CLASS };
 }
 
+// src/headless.ts
+function resolveHeadlessMode(env, argv) {
+  const raw = env.FORGE_HEADLESS;
+  if (raw === "1" || raw === "true")
+    return true;
+  if (raw === "0" || raw === "false")
+    return false;
+  return argv.slice(1).some((tok) => tok === "serve");
+}
+
 // src/dispatch-depth.ts
 var META_DEPTHS = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
 var BUDGET_TIERS = {
@@ -17390,6 +17400,38 @@ var planTickTool = tool({
 async function gate(ask, permission, title) {
   await ask({ permission, patterns: ["*"], always: [], metadata: { title } });
 }
+var GATE_PERMISSION_KEYS = [
+  "plan_approve",
+  "plan_close",
+  "goal_write",
+  "goal_complete",
+  "goal_resume",
+  "goal_discard",
+  "forge_shell",
+  "crew_close"
+];
+var gatePermissionSnapshot = new Map;
+function isHeadlessHost() {
+  return resolveHeadlessMode(process.env, process.argv);
+}
+async function forgeShellGate(ask, command) {
+  const explicit = gatePermissionSnapshot.get("forge_shell");
+  if (explicit === "deny") {
+    throw new Error(`[forge] forge_shell is explicitly denied by user configuration (permission forge_shell: "deny"). Nothing was executed. Remove or change the deny rule to re-enable the exec surface.`);
+  }
+  if (explicit === "allow") {
+    return;
+  }
+  if (!isHeadlessHost()) {
+    await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`);
+    return;
+  }
+  const verdict = classifyExecCommand(command);
+  if (verdict.klass === WRITE_CLASS) {
+    const head = command.trim().split(/\s+/)[0]?.slice(0, 48) ?? "";
+    throw new Error(`[forge:headless-denied] Exec refused: this opencode host runs headless (serve mode) and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. Command head: ${head}. In headless mode READ-CLASS commands run and WRITE-CLASS commands are refused so the caller gets a real answer instead of hanging on an unanswered dialog. To let this command run, set permission forge_shell "allow" in your opencode config, or run the host with a TUI (or FORGE_HEADLESS=0). Report this refusal VERBATIM — do not work around it.`);
+  }
+}
 var planApproveTool = tool({
   description: "Approve the session's draft plan (draft -> approved). Call it ONLY after presenting the plan and receiving the user's explicit go-ahead in chat — never in the same turn that presents the draft. The permission layer pins this call to a confirmation dialog — the user's Allow is the final hard gate and lifts the draft-phase write ban. Optionally pass a one-line summary of what changed since the last revision.",
   args: {
@@ -17791,7 +17833,7 @@ var forgeShellTool = tool({
       throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.");
     }
     const state = ensureSession(context.sessionID, worktreeFor(context));
-    await gate(context.ask, "forge_shell", `forge_shell: ${args.command.slice(0, 100)}`);
+    await forgeShellGate(context.ask, args.command);
     const survive = effectiveSurvive(jobsSurviveMode, args.survive);
     let successPattern = null;
     if (args.success_pattern) {
@@ -19091,9 +19133,19 @@ var server = async (input, options) => {
       };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
-      for (const gateKey of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell", "crew_close"]) {
-        if (permSection[gateKey] !== "deny")
+      for (const gateKey of GATE_PERMISSION_KEYS) {
+        const incoming = permSection[gateKey];
+        if (incoming === "allow" || incoming === "deny")
+          gatePermissionSnapshot.set(gateKey, incoming);
+      }
+      for (const gateKey of GATE_PERMISSION_KEYS) {
+        const v = permSection[gateKey];
+        if (gateKey === "forge_shell") {
+          if (v !== "deny" && v !== "allow")
+            permSection[gateKey] = "ask";
+        } else if (v !== "deny") {
           permSection[gateKey] = "ask";
+        }
       }
       const resolution = resolvePools();
       poolResolution = resolution;
@@ -19367,7 +19419,12 @@ var server = async (input, options) => {
       workspacePoolOf: (anchor) => sessionPoolFileOf(anchor),
       dispatchTasks: () => [...dispatchTasks.values()],
       dispatchProgress: (sessionID) => [...dispatchProgressQueue.get(sessionID) ?? []],
-      jobLedger: () => jobManager.ledgerEntries()
+      jobLedger: () => jobManager.ledgerEntries(),
+      gateSnapshot: () => Object.fromEntries(gatePermissionSnapshot),
+      resetGateSnapshot: () => {
+        gatePermissionSnapshot.clear();
+      },
+      headless: () => isHeadlessHost()
     },
     "permission.ask": async (input2, output) => {
       const meta = input2.metadata ?? {};
@@ -19380,6 +19437,10 @@ var server = async (input, options) => {
         } catch {}
       }
       if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard" || name === "forge_shell") {
+        if (name === "forge_shell" && gatePermissionSnapshot.get("forge_shell") === "allow") {
+          output.status = "allow";
+          return;
+        }
         if (output.status !== "deny")
           output.status = "ask";
         return;
