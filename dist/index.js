@@ -17595,6 +17595,96 @@ async function handoffTarget(sessionID) {
   }
   return current === sessionID ? undefined : current;
 }
+var sessionAnchorLedgerPath = join6(process.env.FORGE_TEST_FORGE_HOME ?? tmpdir3(), "opencode-forge", "session-anchors.jsonl");
+var sessionAnchorLedgerFsFactory = null;
+var sessionAnchorLedgerWarned = false;
+var sessionAnchorLedgerAppends = 0;
+var SESSION_ANCHOR_LEDGER_CAP = 200;
+var poolGateLedgerNotes = new Set;
+var sessionAnchorLedgerMemo = new Map;
+function sessionAnchorLedgerFs() {
+  if (sessionAnchorLedgerFsFactory)
+    return sessionAnchorLedgerFsFactory(sessionAnchorLedgerPath);
+  return {
+    read: () => {
+      try {
+        return readFileSync9(sessionAnchorLedgerPath, "utf8");
+      } catch {
+        return "";
+      }
+    },
+    write: (text) => {
+      mkdirSync6(dirname5(sessionAnchorLedgerPath), { recursive: true });
+      writeFileSync6(sessionAnchorLedgerPath, text, "utf8");
+    },
+    append: (text) => {
+      mkdirSync6(dirname5(sessionAnchorLedgerPath), { recursive: true });
+      appendFileSync2(sessionAnchorLedgerPath, text, "utf8");
+    }
+  };
+}
+function sessionAnchorLedgerWarnOnce(scope, err) {
+  if (sessionAnchorLedgerWarned)
+    return;
+  sessionAnchorLedgerWarned = true;
+  console.warn(`[forge:pool] session-anchor ledger ${scope} failed (fail-soft; resolution degrades to the live chain): ${err instanceof Error ? err.message : String(err)}`);
+}
+function ledgerParseEntries(text) {
+  const latest = new Map;
+  if (!text)
+    return latest;
+  for (const line of text.split(/\r?\n/)) {
+    const s = line.trim();
+    if (!s)
+      continue;
+    try {
+      const e = JSON.parse(s);
+      if (typeof e.sessionID === "string" && e.sessionID && typeof e.worktree === "string" && e.worktree)
+        latest.set(e.sessionID, e.worktree);
+    } catch {}
+  }
+  return latest;
+}
+function sessionAnchorLedgerLookup(sessionID) {
+  try {
+    return ledgerParseEntries(sessionAnchorLedgerFs().read()).get(sessionID) ?? "";
+  } catch (err) {
+    sessionAnchorLedgerWarnOnce("read", err);
+    return "";
+  }
+}
+function noteSessionAnchorLedgerBinding(sessionID, worktree) {
+  try {
+    if (!sessionID || !worktree || isRootish(worktree))
+      return;
+    if (sessionPoolFileOf(worktree) === null)
+      return;
+    const folded = foldPath(worktree);
+    if (sessionAnchorLedgerMemo.get(sessionID) === folded)
+      return;
+    const fsx = sessionAnchorLedgerFs();
+    fsx.append(JSON.stringify({ sessionID, worktree, ts: nowIso() }) + `
+`);
+    sessionAnchorLedgerMemo.set(sessionID, folded);
+    sessionAnchorLedgerAppends++;
+    if (sessionAnchorLedgerAppends > SESSION_ANCHOR_LEDGER_CAP) {
+      const latest = ledgerParseEntries(fsx.read());
+      while (latest.size > SESSION_ANCHOR_LEDGER_CAP) {
+        const oldest = latest.keys().next().value;
+        if (oldest === undefined)
+          break;
+        latest.delete(oldest);
+      }
+      const rewritten = [...latest.entries()].map(([sid, wt]) => JSON.stringify({ sessionID: sid, worktree: wt, ts: nowIso() })).join(`
+`);
+      fsx.write(rewritten ? rewritten + `
+` : "");
+      sessionAnchorLedgerAppends = latest.size;
+    }
+  } catch (err) {
+    sessionAnchorLedgerWarnOnce("write", err);
+  }
+}
 async function resolveSessionAnchorForPools(anchorClient, sessionID) {
   if (!sessionID)
     return "";
@@ -17607,7 +17697,7 @@ async function resolveSessionAnchorForPools(anchorClient, sessionID) {
   } catch {}
   const mapped = sessions.get(sessionID)?.worktree ?? "";
   if (authoritative === "")
-    return mapped;
+    return resolveAnchorViaLedger(sessionID, mapped);
   if (mapped && !isRootish(mapped) && foldPath(mapped) !== foldPath(authoritative) && sessionPoolFileOf(authoritative) === null && sessionPoolFileOf(mapped) !== null) {
     if (!anchorPrefNotes.has(sessionID)) {
       anchorPrefNotes.add(sessionID);
@@ -17615,7 +17705,26 @@ async function resolveSessionAnchorForPools(anchorClient, sessionID) {
     }
     return mapped;
   }
-  return authoritative;
+  return resolveAnchorViaLedger(sessionID, authoritative);
+}
+function resolveAnchorViaLedger(sessionID, resolved) {
+  if (resolved && !isRootish(resolved) && sessionPoolFileOf(resolved) !== null)
+    return resolved;
+  const hit = sessionAnchorLedgerLookup(sessionID);
+  if (!hit || isRootish(hit) || sessionPoolFileOf(hit) === null)
+    return resolved;
+  const existing = sessions.get(sessionID);
+  if (existing) {
+    if (!isRootish(hit))
+      existing.worktree = hit;
+  } else {
+    sessions.set(sessionID, { sessionID, worktree: hit });
+  }
+  if (!poolGateLedgerNotes.has(sessionID)) {
+    poolGateLedgerNotes.add(sessionID);
+    console.warn(`[forge:pool] session ${sessionID}: dispatch anchor re-bound from the persisted session-anchor ledger (${hit}) — the resumed session's authoritative record is pool-less and the in-memory map was empty (restart-resume rebind shape).`);
+  }
+  return hit;
 }
 async function poolGateRefusal(anchorClient, sessionID, target) {
   const resolution = resolvePools();
@@ -17697,12 +17806,16 @@ function readPlanDir(worktree) {
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
   if (existing) {
-    if (!isRootish(worktree))
+    if (!isRootish(worktree)) {
       existing.worktree = worktree;
+      noteSessionAnchorLedgerBinding(sessionID, worktree);
+    }
     return existing;
   }
   const state = { sessionID, worktree };
   sessions.set(sessionID, state);
+  if (!isRootish(worktree))
+    noteSessionAnchorLedgerBinding(sessionID, worktree);
   return state;
 }
 function sessionAnchor(context) {
@@ -20592,6 +20705,27 @@ var server = async (input, options) => {
           return null;
         }
       },
+      setSessionAnchorLedgerFs: (factory) => {
+        sessionAnchorLedgerFsFactory = factory;
+        poolGateLedgerNotes.clear();
+        sessionAnchorLedgerMemo.clear();
+        sessionAnchorLedgerAppends = 0;
+      },
+      resetSessionBindings: () => {
+        sessions.clear();
+        anchorPrefNotes.clear();
+        poolGateUnknownNotes.clear();
+        poolGateLedgerNotes.clear();
+        sessionAnchorLedgerMemo.clear();
+        sessionAnchorLedgerAppends = 0;
+      },
+      sessionAnchorLedgerText: () => {
+        try {
+          return sessionAnchorLedgerFs().read();
+        } catch {
+          return null;
+        }
+      },
       dispatchProgress: (sessionID) => [...dispatchProgressQueue.get(sessionID) ?? []],
       jobLedger: () => jobManager.ledgerEntries(),
       gateSnapshot: () => Object.fromEntries(gatePermissionSnapshot),
@@ -20657,6 +20791,8 @@ var server = async (input, options) => {
           sealUnknownNotes.delete(info.id);
           poolGateUnknownNotes.delete(info.id);
           anchorPrefNotes.delete(info.id);
+          poolGateLedgerNotes.delete(info.id);
+          sessionAnchorLedgerMemo.delete(info.id);
           crews.delete(info.id);
           crewEngineForgetSession(info.id);
         }
