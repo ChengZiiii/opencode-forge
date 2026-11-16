@@ -529,9 +529,9 @@ test("recon gate: a both-fields task call resolves through the subagent_type-fir
 // Belt 3.1 (task 3.1): a task-spawned CHILD session is an independent
 // sessionID, but the launch-worktree seeding + resolveActivePlan directory
 // fallback re-binds it to the same draft — the session-level write ban is
-// ambient for the child. The scout's forge_shell stays ask-gated, not
-// denied: same posture as the primary agent.
-test("recon gate ambient belt: a child session inherits the draft write ban; forge_shell keeps its ask posture", async () => {
+// ambient for the child. The scout's forge_shell passes through untouched
+// (posture pass-through): no plugin-side rewrite, whatever the host resolved.
+test("recon gate ambient belt: a child session inherits the draft write ban; forge_shell passes through untouched", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-ambient-"))
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
@@ -554,11 +554,15 @@ test("recon gate ambient belt: a child session inherits the draft write ban; for
       /A plan is in draft; write operations are denied \(bash\)/,
     )
     // forge_shell is not in the write class: it passes tool.execute.before
-    // (no throw) and the permission.ask belt holds it at ask, not deny.
+    // (no throw) and the permission.ask belt leaves it EXACTLY as the host
+    // resolved it — pass-through, no plugin-side rewrite in any direction.
     await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_child", callID: "a3" }, { args: { command: "ls" } })
     const askOut = { status: "allow" }
     await h["permission.ask"]({ sessionID: "ses_child", id: "forge_shell", metadata: { tool: "forge_shell" } }, askOut)
-    assert.equal(askOut.status, "ask", "forge_shell degrades to ask (its confirmation gate), never a silent deny")
+    assert.equal(askOut.status, "allow", "forge_shell passes through — the plugin never rewrites the host's resolution")
+    const askOut2 = { status: "ask" }
+    await h["permission.ask"]({ sessionID: "ses_child", id: "forge_shell", metadata: { tool: "forge_shell" } }, askOut2)
+    assert.equal(askOut2.status, "ask", "an explicit-ask resolution also passes through untouched")
     await h.dispose?.()
   } finally {
     rmSync(wt, { recursive: true, force: true })

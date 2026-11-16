@@ -78,29 +78,35 @@ test("4.2 config: keepBuiltinShell and stage 2 both retain the builtin shell", a
   assert.equal(cfg2.agent.forge.tools, undefined)
 })
 
-test("4.1 config: forge_shell permission rule injected as ask, explicit deny wins", async () => {
+test("4.1 config: forge_shell injects NOTHING (pass-through); explicit deny stands verbatim", async () => {
   const h = await hooks({ jobs: { mode: "forge" } })
   const cfg = freshCfg()
   await h.config(cfg)
-  assert.equal(cfg.permission.forge_shell, "ask")
+  assert.equal(cfg.permission.forge_shell, undefined, "no plugin-injected posture — the host default applies")
   const cfg2 = freshCfg()
   cfg2.permission = { forge_shell: "deny" }
   await h.config(cfg2)
-  assert.equal(cfg2.permission.forge_shell, "deny")
-  // Fold A snapshot isolation: the deny above is the USER'S explicit value in
+  assert.equal(cfg2.permission.forge_shell, "deny", "an explicit user value is never overridden")
+  // Snapshot isolation: the deny above is the USER'S explicit value in
   // this scenario; later default-posture tests in this file must not inherit
-  // it from the module-level pre-rewrite snapshot.
+  // it from the module-level snapshot.
   h.__forgeSubagentsTest.resetGateSnapshot()
 })
 
-test("4.1 permission.ask belt: forge_shell stays a real ask unless explicitly denied", async () => {
+test("4.1 permission.ask belt: forge_shell passes through untouched; doors still forced to ask", async () => {
   const h = await hooks({ jobs: { mode: "forge" } })
   const out1 = { status: "allow" }
   await h["permission.ask"]({ id: "forge_shell" }, out1)
-  assert.equal(out1.status, "ask")
+  assert.equal(out1.status, "allow", "pass-through: an allow resolution is never rewritten")
   const out2 = { status: "deny" }
   await h["permission.ask"]({ id: "forge_shell" }, out2)
-  assert.equal(out2.status, "deny")
+  assert.equal(out2.status, "deny", "pass-through: a deny resolution is never rewritten")
+  const out3 = { status: "ask" }
+  await h["permission.ask"]({ id: "forge_shell" }, out3)
+  assert.equal(out3.status, "ask", "pass-through: an ask resolution is never rewritten")
+  const out4 = { status: "allow" }
+  await h["permission.ask"]({ id: "plan_approve" }, out4)
+  assert.equal(out4.status, "ask", "doors are different: still forced to a real ask")
 })
 
 test("partition: system.transform job guidance reaches forge-family sessions, never unknown ones", async () => {

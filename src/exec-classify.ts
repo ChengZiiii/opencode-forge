@@ -329,3 +329,88 @@ export function classifyExecCommand(cmd: string, opts?: { workspaceRoot?: string
   if (w) return { klass: WRITE_CLASS, indicator: "workspace-write", detail: w.detail }
   return { klass: READ_CLASS }
 }
+
+// ---------------------------------------------------------------------------
+// Known-interactive banner (shell-defang-default-open — exec hygiene).
+// NOT a refuser: informational only. The permission posture and the seal are
+// the only exec refusers; this banner merely names a matched pattern in the
+// tool result so the caller knows the command may sit on an interactive
+// prompt no one can answer.
+// ---------------------------------------------------------------------------
+
+/** Commands KNOWN to prompt interactively: credential logins, password /
+ * identity prompts, and primary full-screen programs. Exported for README
+ * cross-reference and test-matrix reuse (tests iterate this table). */
+export const KNOWN_INTERACTIVE_COMMANDS = [
+  // Package / platform logins (credential prompts).
+  "npm login",
+  "npm adduser",
+  "pnpm login",
+  "yarn login",
+  "bun login",
+  "cargo login",
+  "docker login",
+  "podman login",
+  "gh auth login",
+  "az login",
+  "gcloud auth login",
+  "aws sso login",
+  "heroku login",
+  "netlify login",
+  "vercel login",
+  "supabase login",
+  // Identity / remote-session prompts.
+  "sudo",
+  "su",
+  "passwd",
+  "ssh",
+  "sftp",
+  "ftp",
+  "telnet",
+  // Full-screen interactive programs (an agent cannot drive them).
+  "vim",
+  "vi",
+  "nano",
+  "emacs",
+  "top",
+  "htop",
+  "less",
+  "more",
+  "man",
+] as const
+
+/**
+ * Match a forge_shell command against the known-interactive list. Pure: the
+ * command is split into pipeline/command segments (`|`, `;`, `&&`, `&`), and
+ * each segment's HEAD is checked after env-prefix skipping (FOO=bar cmd) —
+ * an entry matches when its words are the segment's first tokens (so
+ * "npm install" never trips "npm login", "echo vim" never trips "vim", and
+ * a piped primary like `git log | less` heads its own segment and trips
+ * "less"). Returns the banner line or null. The banner is attached to the
+ * tool result and never blocks, retries, or mutates the command.
+ */
+export function interactiveBanner(cmd: string): string | null {
+  if (typeof cmd !== "string" || cmd.length === 0) return null
+  const segments = cmd
+    .split(/\|\|?|&&|;|&/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0)
+  for (const seg of segments) {
+    const tokens = seg.split(/\s+/).filter((t) => t.length > 0 && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t))
+    for (const entry of KNOWN_INTERACTIVE_COMMANDS) {
+      const words = entry.split(" ")
+      if (words.length > tokens.length) continue
+      let ok = true
+      for (let j = 0; j < words.length; j++) {
+        if (tokens[j] !== words[j]) {
+          ok = false
+          break
+        }
+      }
+      if (ok) {
+        return `[forge:interactive] "${entry}" is known to prompt interactively (credential / password / full-screen UI). It still runs — the spawn env already carries the non-interactive fallbacks (EDITOR=: GIT_PAGER=cat GIT_MERGE_AUTOEDIT=no) — but an interactive prompt cannot be answered here: prefer non-interactive flags (--yes / --non-interactive / token env vars) or the call may sit waiting until its wait budget expires.`
+      }
+    }
+  }
+  return null
+}

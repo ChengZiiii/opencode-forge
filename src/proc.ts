@@ -24,6 +24,21 @@ export type ShellSpawnOptions = {
   shell?: ResolvedShell
 }
 
+// Non-interactive exec hygiene (shell-defang-default-open, spec
+// tool-partition — "Non-interactive exec hygiene on the forge_shell
+// surface"): every spawn merges this set into the child env so no command
+// can hang on an editor or pager prompt — git or not. Precedence: parent
+// env < this set < the caller's opts.env (a caller-passed value always
+// wins; the set always beats the inherited environment). Injected at SPAWN
+// time — the command string is never rewritten.
+export const NON_INTERACTIVE_ENV: Record<string, string> = {
+  GIT_EDITOR: ":",
+  EDITOR: ":",
+  GIT_PAGER: "cat",
+  PAGER: "cat",
+  GIT_MERGE_AUTOEDIT: "no",
+}
+
 // Spawn `cmd` through the host-aligned interpreter (spec: job-supervisor —
 // "Host-aligned shell interpreter selection"): PowerShell-family shells are
 // invoked DIRECTLY as `<shell> -NoProfile -Command <command>` with an
@@ -48,7 +63,7 @@ export function shellSpawn(spawnFn: SpawnFn, cmd: string, opts: ShellSpawnOption
           : ["-c", cmd]
   return spawnFn(shell.bin, argv, {
     ...(opts.cwd !== undefined ? { cwd: opts.cwd } : {}),
-    env: opts.env ? { ...process.env, ...opts.env } : process.env,
+    env: { ...process.env, ...NON_INTERACTIVE_ENV, ...opts.env },
     windowsHide: opts.windowsHide ?? true,
     detached: opts.detached ?? process.platform !== "win32",
     ...(opts.stdio !== undefined ? { stdio: opts.stdio } : {}),

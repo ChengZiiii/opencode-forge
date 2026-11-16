@@ -118,14 +118,15 @@ test("partition: non-forge fallback entries hide both search tools", async () =>
   }
 })
 
-test("ask-gate: the config hook's permission section gains no forge_grep/forge_glob keys", async () => {
+test("ask-gate: the config hook's permission section rewrites the doors only — forge_shell stays untouched", async () => {
   const wt = mkdtempSync(join(tmpdir(), "search-perm-"))
   try {
     const h = await startServer(inputFor(wt), {})
     const cfg = { agent: {} }
     await h.config(cfg)
-    const gates = ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "forge_shell", "crew_close"]
-    for (const g of gates) assert.equal(cfg.permission[g], "ask", `gate key ${g} stands`)
+    const doors = ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "crew_close"]
+    for (const g of doors) assert.equal(cfg.permission[g], "ask", `door key ${g} stands`)
+    assert.equal(cfg.permission.forge_shell, undefined, "forge_shell is pass-through — no injected posture (shell-defang-default-open)")
     assert.equal(cfg.permission.forge_grep, undefined, "no ask-gate on forge_grep")
     assert.equal(cfg.permission.forge_glob, undefined, "no ask-gate on forge_glob")
     await h.dispose?.()

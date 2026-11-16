@@ -72,8 +72,7 @@ import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./
 import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, type CatalogSnapshot } from "./src/models-dev.ts"
 import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
-import { classifyExecCommand, WRITE_CLASS } from "./src/exec-classify.ts"
-import { resolveHeadlessMode } from "./src/headless.ts"
+import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
@@ -1136,13 +1135,13 @@ const planTickTool = tool({
 // while context.ask() creates a real user confirmation (TUI dialog; run mode
 // auto-rejects; --auto approves). The user's answer IS the gate.
 //
-// INVARIANT (dispatch-resilience fold A): the gate() helper itself NEVER
-// auto-resolves. Headless resolution (READ-CLASS proceeds / WRITE-CLASS
-// refused with [forge:headless-denied]) lives ONLY in forge_shell's execute
-// path, which is not a user-confirmation door. The 7 doors — plan_approve,
+// INVARIANT: the gate() helper itself NEVER auto-resolves. forge_shell is
+// NOT a user-confirmation door — its gate ask is resolved by the HOST
+// against the permission rules (posture pass-through: no plugin-injected
+// rule, no plugin-side classification). The 7 doors — plan_approve,
 // plan_close, goal_write (arm), goal_complete, goal_resume, goal_discard,
 // crew_close; exactly the non-exec gate() permission keys — are never
-// auto-resolved headlessly in any mode; they remain real dialogs.
+// auto-resolved in any mode; they remain real dialogs.
 type AskFn = (input: {
   permission: string
   patterns: string[]
@@ -1155,12 +1154,16 @@ async function gate(ask: AskFn, permission: string, title: string): Promise<void
 }
 
 // ---------------------------------------------------------------------------
-// Headless ask liveness (dispatch-resilience fold A, spec tool-partition —
-// "Headless ask liveness on the exec surface")
+// Exec posture pass-through (shell-defang-default-open, spec tool-partition —
+// "Exec posture pass-through on the exec surface"). Supersedes dispatch-
+// resilience fold A's headless ask liveness: the plugin performs NO command
+// classification on the posture path and injects NO default permission rule.
 // ---------------------------------------------------------------------------
 
 // The gate permission keys — the exact set the config hook posture-rewrites
-// (single constant so the snapshot capture and the rewrite can never drift).
+// for the DOORS (single constant so the snapshot capture and the rewrite can
+// never drift). forge_shell is snapshot-captured but never rewritten: its
+// posture passes through untouched.
 const GATE_PERMISSION_KEYS = [
   "plan_approve",
   "plan_close",
@@ -1173,32 +1176,26 @@ const GATE_PERMISSION_KEYS = [
 ] as const
 
 // The USER'S OWN explicit permission values for the gate keys, captured in
-// the config hook BEFORE posture rewriting. The config hook mutates a MERGED
-// config object that the host may RE-PRESENT on later passes, already
-// carrying the plugin's own injected "ask" — the anti-recapture rule is:
-// only "allow"/"deny" are ever captured ("ask" never is — an injected "ask"
-// cannot be recaptured as explicit, and a user's own explicit "ask" is
-// behaviorally the default posture: dialog / run-mode auto-reject). Only
-// forge_shell's entry is CONSUMED (the explicit-allow carve-out,
-// job-supervisor "Permission posture preserved"); the doors never read it.
+// the config hook. The config hook mutates a MERGED config object that the
+// host may RE-PRESENT on later passes — the anti-recapture rule is: only
+// "allow"/"deny" are ever captured ("ask" never is). Only forge_shell's
+// entry is CONSUMED (belt-in-depth enforcement of the user's own explicit
+// rule — the rule itself now stands verbatim in the config; the snapshot is
+// defense if a host ever fails to resolve plugin-tool asks); the doors
+// never read it.
 const gatePermissionSnapshot = new Map<string, "allow" | "deny">()
 
-// Headless is a static HOST property (serve mode from the host process argv;
-// the plugin runs in-process). Resolved from the injected env+argv per call —
-// deterministic per process, no host-side state.
-function isHeadlessHost(): boolean {
-  return resolveHeadlessMode(process.env, process.argv)
-}
-
-// The headless forge_shell posture resolution. Order (law):
-// (1) explicit user config wins verbatim in ALL modes — allow skips the ask
-//     and runs, deny refuses (the caller handles deny before this helper:
-//     deny always wins); (2) interactive (TUI and `opencode run`, which is
-//     NOT headless — its ask auto-reject semantics are untouched) keeps the
-//     two-piece ask dialog byte-identical; (3) headless resolves a would-ask
-//     posture with the exec classifier — READ-CLASS proceeds without any
-//     dialog, WRITE-CLASS refuses with an honest [forge:headless-denied]
-//     error naming the command head.
+// The forge_shell posture resolution — PASS-THROUGH, no plugin-side
+// resolution of any kind: (1) an explicit user "deny" refuses (the user's
+// own rule, enforced belt-in-depth before any ask); (2) an explicit user
+// "allow" skips the ask (again the user's own rule — the ask would resolve
+// allow anyway, skipping it just avoids the round-trip); (3) otherwise the
+// ask reaches the host UNMODIFIED and the host resolves it against the
+// permission rules — unconfigured inherits the host default (in practice
+// allow everywhere), an explicit user "ask" behaves exactly like the native
+// shell tool's ask in the current mode (TUI dialog / run-mode auto-reject /
+// serve pending ask). No headless branch, no classifier: the plugin is not
+// smarter than the host (omo parity, product decision 2026-11-16).
 async function forgeShellGate(ask: AskFn, command: string): Promise<void> {
   const explicit = gatePermissionSnapshot.get("forge_shell")
   if (explicit === "deny") {
@@ -1207,23 +1204,9 @@ async function forgeShellGate(ask: AskFn, command: string): Promise<void> {
     )
   }
   if (explicit === "allow") {
-    return // the documented single ask-skipping posture, honored in all modes
+    return // the user's own rule — skip the ask round-trip, run
   }
-  if (!isHeadlessHost()) {
-    // Default posture, interactive: the existing two-piece ask, unchanged
-    // (TUI dialog / run-mode auto-reject / --auto approve).
-    await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`)
-    return
-  }
-  // Headless: classify instead of hanging on a dialog nobody can answer.
-  const verdict = classifyExecCommand(command)
-  if (verdict.klass === WRITE_CLASS) {
-    const head = command.trim().split(/\s+/)[0]?.slice(0, 48) ?? ""
-    throw new Error(
-      `[forge:headless-denied] Exec refused: this opencode host runs headless (serve mode) and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. Command head: ${head}. In headless mode READ-CLASS commands run and WRITE-CLASS commands are refused so the caller gets a real answer instead of hanging on an unanswered dialog. To let this command run, set permission forge_shell "allow" in your opencode config, or run the host with a TUI (or FORGE_HEADLESS=0). Report this refusal VERBATIM — do not work around it.`,
-    )
-  }
-  // READ-CLASS: proceeds — no dialog is awaited.
+  await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`)
 }
 
 const planApproveTool = tool({
@@ -1704,34 +1687,29 @@ const FORGE_SHELL_DESCRIPTION = [
   "Interpreter: commands run under the host-preferred shell — the PowerShell family on Windows (git-bash only on machines without PowerShell), the login shell with bash preferred on POSIX — the same interpreter the host's builtin shell tool uses.",
 ].join("\n")
 
-const forgeShellTool = tool({
-  description: FORGE_SHELL_DESCRIPTION,
-  args: {
-    command: tool.schema.string().describe("The shell command to run"),
-    workdir: tool.schema.string().optional().describe("Working directory (workspace-relative, or absolute)"),
-    run_in_background: tool.schema.boolean().optional().describe("Return {jobId, logPath} immediately, without waiting for any output or exit"),
-    idle_ms: tool.schema.number().int().nonnegative().optional().describe("No-new-output early-return threshold in ms (default 60000)"),
-    max_wait_ms: tool.schema.number().int().nonnegative().optional().describe("Hard cap on this call's wait in ms (default 120000, clamped to 600000); returns still-running, never kills"),
-    success_pattern: tool.schema.string().optional().describe("Regex; a match against new output completes the call as success immediately"),
-    keep_alive: tool.schema.boolean().optional().describe("After a success match: keep the process alive (default) or kill its tree (false)"),
-    notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)"),
-    survive: tool.schema.boolean().optional().describe("Opt this job OUT of dying with the host: it keeps running after opencode exits, recorded in the persistent registry so the next run can poll/kill it (config jobs.survive sets the default; an explicit config deny cannot be overridden)"),
-  },
-  execute: async (args, context) => {
-    if (jobStage() >= 2) {
-      throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.")
-    }
-    const state = ensureSession(context.sessionID, worktreeFor(context))
-    // Permission two-piece (pitfalls §4.5): plugin tools bypass permission
-    // evaluation, so context.ask() IS the posture; the config hook injects
-    // the matching "ask" rule so the request resolves to a real dialog. An
-    // explicit user deny always wins. Headless ask liveness (fold A): this
-    // site is NOT a user-confirmation door — forgeShellGate resolves the
-    // default posture headlessly (READ-CLASS runs, WRITE-CLASS refuses with
-    // [forge:headless-denied]) and honors an explicit allow/deny snapshot in
-    // every mode. The readonly-exec-seal in tool.execute.before fires
-    // structurally BEFORE this execute, so a seal refusal always lands first.
-    await forgeShellGate(context.ask, args.command)
+const forgeShellExecute = async (args: {
+  command: string
+  workdir?: string
+  run_in_background?: boolean
+  idle_ms?: number
+  max_wait_ms?: number
+  success_pattern?: string
+  keep_alive?: boolean
+  notify?: boolean
+  survive?: boolean
+}, context: { sessionID: string; worktree: string; ask: AskFn; metadata: (input: { title?: string; metadata?: Record<string, unknown> }) => void }) => {
+  if (jobStage() >= 2) {
+    throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.")
+  }
+  const state = ensureSession(context.sessionID, worktreeFor(context))
+  // Permission posture (shell-defang-default-open): pass-through — the ask
+  // reaches the host unmodified and the host resolves it against the
+  // permission rules (no plugin-injected rule, no plugin-side
+  // classification; unconfigured inherits the host default). An explicit
+  // user deny always wins (snapshot-enforced). The readonly-exec-seal in
+  // tool.execute.before fires structurally BEFORE this execute, so a seal
+  // refusal always lands first.
+  await forgeShellGate(context.ask, args.command)
     const survive = effectiveSurvive(jobsSurviveMode, args.survive)
     let successPattern: RegExp | null = null
     if (args.success_pattern) {
@@ -1812,6 +1790,30 @@ const forgeShellTool = tool({
         "Next: forge_jobs poll to keep waiting, forge_jobs log for history, forge_jobs kill to stop.",
       ].join("\n"),
     }
+}
+
+// The registered tool: a thin wrapper over forgeShellExecute that prepends
+// the non-blocking known-interactive warning (exec hygiene,
+// shell-defang-default-open) to whatever result the run produced. The
+// warning NEVER blocks, retries, or mutates the command — the permission
+// posture and the seal are the only refusers.
+const forgeShellTool = tool({
+  description: FORGE_SHELL_DESCRIPTION,
+  args: {
+    command: tool.schema.string().describe("The shell command to run"),
+    workdir: tool.schema.string().optional().describe("Working directory (workspace-relative, or absolute)"),
+    run_in_background: tool.schema.boolean().optional().describe("Return {jobId, logPath} immediately, without waiting for any output or exit"),
+    idle_ms: tool.schema.number().int().nonnegative().optional().describe("No-new-output early-return threshold in ms (default 60000)"),
+    max_wait_ms: tool.schema.number().int().nonnegative().optional().describe("Hard cap on this call's wait in ms (default 120000, clamped to 600000); returns still-running, never kills"),
+    success_pattern: tool.schema.string().optional().describe("Regex; a match against new output completes the call as success immediately"),
+    keep_alive: tool.schema.boolean().optional().describe("After a success match: keep the process alive (default) or kill its tree (false)"),
+    notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)"),
+    survive: tool.schema.boolean().optional().describe("Opt this job OUT of dying with the host: it keeps running after opencode exits, recorded in the persistent registry so the next run can poll/kill it (config jobs.survive sets the default; an explicit config deny cannot be overridden)"),
+  },
+  execute: async (args, context) => {
+    const res = await forgeShellExecute(args, context)
+    const banner = interactiveBanner(args.command)
+    return banner ? { ...res, output: `${banner}\n${res.output}` } : res
   },
 })
 
@@ -4531,43 +4533,36 @@ export const server: Plugin = async (input, options) => {
           "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)",
       }
 
-      // Gate permission rules: plugin-registered tools bypass automatic
-      // permission evaluation (verified 1.18.32), but the context.ask()
-      // requests the gate tools create ARE resolved against these rules —
-      // with no explicit rule a broad "*": allow default would resolve the
-      // gate ask to allow. "ask" makes the gate a real user confirmation
-      // (TUI dialog / run-mode reject / --auto approve). An explicit user
-      // "deny" is respected. No other permission key is touched: the draft
+      // Gate permission rules (shell-defang-default-open): the 7 doors keep
+      // the full "ask" rewrite — they stay real user confirmations (an
+      // explicit allow on a door is still rewritten to ask). forge_shell is
+      // NEVER rewritten: its posture passes through untouched — unconfigured
+      // inherits the host default (in practice allow everywhere, so the exec
+      // surface behaves exactly like the native shell tool in every mode),
+      // and an explicit user allow/deny/ask stands verbatim for the host to
+      // resolve (TUI dialog / run auto-reject / serve pending ask). No
+      // plugin-side classification anywhere on the posture path. The draft
       // write-ban lives in tool.execute.before (phase-aware, no global
       // tightening), so stock behavior outside planning is unchanged.
       const perm = (cfg as { permission?: Record<string, unknown> }).permission
       const permSection = perm ?? ((cfg as { permission?: Record<string, unknown> }).permission = {})
-      // Fold A snapshot — BEFORE any posture rewriting: capture the user's
-      // OWN explicit values for the gate keys. Anti-recapture guard: only
-      // "allow"/"deny" are captured, "ask" never is — after this pass the
-      // merged config object carries the plugin's injected "ask" and may be
-      // re-presented verbatim on later passes; an injected "ask" can never
-      // be recaptured as explicit (and a user's own explicit "ask" IS the
-      // default posture behaviorally). A later genuine user allow/deny
-      // simply overwrites (last explicit wins). Only forge_shell's entry is
-      // consumed (the explicit-allow carve-out); the doors never read it.
+      // Snapshot — capture the user's OWN explicit values for the gate keys.
+      // Anti-recapture guard: only "allow"/"deny" are captured, "ask" never
+      // is — the merged config object may be re-presented on later passes
+      // carrying the plugin's DOOR rewrites. Only forge_shell's entry is
+      // consumed (belt-in-depth enforcement of its explicit rule); the doors
+      // never read it.
       for (const gateKey of GATE_PERMISSION_KEYS) {
         const incoming = permSection[gateKey]
         if (incoming === "allow" || incoming === "deny") gatePermissionSnapshot.set(gateKey, incoming)
       }
-      // Posture rewrite. The 7 user-confirmation doors keep the full
-      // original rule (everything except deny becomes ask — an explicit
-      // allow on a door is still rewritten to ask: doors stay real dialogs).
-      // forge_shell gets the dispatch-resilience carve-out: an explicit user
-      // "allow" stands in the rule too (job-supervisor "Permission posture
-      // preserved" — allow skips the execute-time ask in every mode).
+      // Door posture rewrite. forge_shell is deliberately absent: no
+      // injection, no rewrite — pass-through (spec: "Exec posture
+      // pass-through on the exec surface").
       for (const gateKey of GATE_PERMISSION_KEYS) {
+        if (gateKey === "forge_shell") continue
         const v = permSection[gateKey]
-        if (gateKey === "forge_shell") {
-          if (v !== "deny" && v !== "allow") permSection[gateKey] = "ask"
-        } else if (v !== "deny") {
-          permSection[gateKey] = "ask"
-        }
+        if (v !== "deny") permSection[gateKey] = "ask"
       }
 
       // forge subagents: load forge.json (hot-apply), materialize the static
@@ -5039,14 +5034,13 @@ export const server: Plugin = async (input, options) => {
       // wiring tests observe the enqueue side of the lossy queue).
       dispatchProgress: (sessionID: string) => [...(dispatchProgressQueue.get(sessionID) ?? [])],
       jobLedger: () => jobManager.ledgerEntries(),
-      // Fold A seams (headless ask liveness): the pre-rewrite permission
+      // Posture seams (shell-defang-default-open): the pre-rewrite permission
       // snapshot and a reset for test isolation (module state is shared
       // across server() calls in one test process).
       gateSnapshot: () => Object.fromEntries(gatePermissionSnapshot),
       resetGateSnapshot: () => {
         gatePermissionSnapshot.clear()
       },
-      headless: () => isHeadlessHost(),
     },
 
     // permission.ask belt: on hosts/sessions where permission requests ARE
@@ -5071,17 +5065,14 @@ export const server: Plugin = async (input, options) => {
           )
         } catch {}
       }
-      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard" || name === "forge_shell") {
-        // Belt for the gates: if a permission request ever surfaces for them
-        // (host starts evaluating plugin tools), keep it a real ask unless
-        // explicitly denied. Fold A carve-out: an explicit user "allow" for
-        // forge_shell (pre-rewrite snapshot) resolves allow — the single
-        // documented ask-skipping posture. The 7 user-confirmation doors are
-        // NEVER auto-resolved here in any mode; they stay real asks.
-        if (name === "forge_shell" && gatePermissionSnapshot.get("forge_shell") === "allow") {
-          output.status = "allow"
-          return
-        }
+      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
+        // Belt for the DOORS only: if a permission request ever surfaces for
+        // them (host starts evaluating plugin tools), keep it a real ask
+        // unless explicitly denied — the 7 user-confirmation doors are never
+        // auto-resolved in any mode. forge_shell is deliberately ABSENT
+        // (pass-through): its request carries whatever the host resolved
+        // from the user's verbatim rules — the plugin never rewrites,
+        // classifies, or forces it.
         if (output.status !== "deny") output.status = "ask"
         return
       }
