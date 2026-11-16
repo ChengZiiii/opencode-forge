@@ -122,22 +122,40 @@ Each job SHALL be owned by the session that created it. When an owning session e
 
 ### Requirement: Permission posture preserved
 
-`forge_shell` SHALL preserve the shell permission posture of the host: each execution SHALL pass through an execute-time confirmation request evaluated against an injected permission rule defaulting to `ask` — subject to the explicit-allow carve-out below — and explicit user `deny` SHALL always win. In non-interactive run mode the gate SHALL follow the host's ask semantics (auto-reject without the auto-approve flag), matching the native shell tool's posture rather than bypassing it. One carve-out is introduced by dispatch-resilience: an explicit user-configured `allow` for `forge_shell` — as captured by the plugin's config snapshot taken BEFORE posture rewriting (the snapshot records the user's own value, never the plugin's injected `ask`) — SHALL skip the execute-time ask and run, in interactive, headless, and run modes alike; this is the only posture that bypasses the ask, the default remains `ask`, and `deny` still always wins.
+`forge_shell` SHALL preserve the shell permission posture of the host: the
+plugin SHALL NOT inject any default permission rule — an unconfigured tool
+inherits the host's own default (in practice the `"*": allow` fallback), so
+the command runs without a plugin-added confirmation ask, exactly like the
+native shell tool. When the user's config carries an explicit value for the
+tool — captured by the plugin's config snapshot — that value SHALL be honored
+verbatim in every mode with no plugin-side resolution: `allow` runs without
+any ask in interactive, headless, and run modes alike; `deny` always refuses;
+`ask` requests confirmation and reaches the host unmodified — a real dialog
+in interactive mode, the host's ask auto-reject semantics in run mode, and a
+pending ask on a serve host exactly like the native shell tool's ask there
+(the plugin classifies nothing and never refuses on the posture path). In no
+case SHALL the plugin's injected posture override an explicit user value, and
+in no case SHALL a default posture block or refuse an execution on its own.
 
 #### Scenario: Default posture asks before executing
 
-- **WHEN** `forge_shell` executes with default configuration in an interactive session
-- **THEN** the user is asked for confirmation before the command runs
+- **WHEN** `forge_shell` executes with default configuration (no explicit user permission) in an interactive session — the legacy behavior this scenario title named under the pre-inversion spec
+- **THEN** (inverted by this change) the command runs WITHOUT a confirmation ask — the plugin injects no default and the host's own permission default applies; the title remains as the archive matching key
 
 #### Scenario: Explicit deny is never overridden
 
 - **WHEN** the user's config denies the tool
-- **THEN** `forge_shell` refuses to execute regardless of the injected default
+- **THEN** `forge_shell` refuses to execute regardless of mode
 
 #### Scenario: Explicit allow skips the ask
 
-- **WHEN** the user's config explicitly allows `forge_shell` (captured by the pre-rewrite snapshot) in any session mode — interactive, headless, or run
-- **THEN** the command runs without the confirmation ask — the documented single exception to the default ask posture
+- **WHEN** the user's config explicitly allows `forge_shell` in any session mode — interactive, headless, or run
+- **THEN** the command runs without the confirmation ask
+
+#### Scenario: Explicit ask reaches the host unmodified
+
+- **WHEN** the user's config explicitly sets `forge_shell: "ask"`
+- **THEN** interactive mode shows the confirmation dialog, run mode follows the host's ask auto-reject semantics, and serve mode leaves the ask pending exactly like the native shell tool's ask — the plugin adds no resolution of its own
 
 ### Requirement: Output retention and truncation
 
