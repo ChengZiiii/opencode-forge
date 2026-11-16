@@ -16631,6 +16631,113 @@ function resolveNotifyIntervalMs(env = process.env) {
     return DEFAULT_POLL_TIMEOUT_MS;
   return Math.min(Math.round(parsed), MAX_POLL_TIMEOUT_MS);
 }
+var DEFAULT_STALE_MS = 2700000;
+var MIN_STALE_RUNTIME_MS = 60000;
+function resolveStaleMs(env = process.env) {
+  const raw = env.FORGE_DISPATCH_STALE_MS;
+  if (raw === undefined || raw === "")
+    return DEFAULT_STALE_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1)
+    return DEFAULT_STALE_MS;
+  return Math.max(Math.round(parsed), MIN_STALE_RUNTIME_MS);
+}
+function resolveStaleMode(env = process.env) {
+  const raw = (env.FORGE_DISPATCH_STALE_MODE ?? "").trim().toLowerCase();
+  return raw === "observe" ? "observe" : "kill";
+}
+function resolveStaleFloorMs(env = process.env) {
+  const raw = env.FORGE_DISPATCH_STALE_FLOOR_MS;
+  if (raw === undefined || raw === "")
+    return MIN_STALE_RUNTIME_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0)
+    return MIN_STALE_RUNTIME_MS;
+  return Math.round(parsed);
+}
+function sessionNotFoundSignal(error45) {
+  let text = "";
+  let status;
+  if (typeof error45 === "string") {
+    text = error45;
+  } else if (error45 && typeof error45 === "object") {
+    const rec = error45;
+    for (const key of ["statusCode", "status", "code"]) {
+      const val = rec[key];
+      if (typeof val === "number" && val >= 100 && val < 600)
+        status = val;
+      if (typeof val === "string" && /^\d{3}$/.test(val))
+        status = Number(val);
+    }
+    text = [String(rec.name ?? ""), String(rec.message ?? "")].join(" ");
+  }
+  if (status === 404)
+    return true;
+  return /not found|missing/i.test(text);
+}
+function readTimeUpdated(record2) {
+  if (!record2 || typeof record2 !== "object")
+    return null;
+  const rec = record2;
+  const time3 = rec.time && typeof rec.time === "object" ? rec.time : undefined;
+  for (const candidate of [time3?.updated, rec.time_updated]) {
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0)
+      return candidate;
+  }
+  return null;
+}
+async function sessionGet(client, sessionID) {
+  const get = client.session.get;
+  if (typeof get !== "function")
+    return { exists: null, timeUpdated: null };
+  let result;
+  try {
+    result = await get({ path: { id: sessionID } });
+  } catch (e) {
+    return sessionNotFoundSignal(e) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null };
+  }
+  if (result !== null && typeof result === "object" && (("error" in result) || ("data" in result))) {
+    const env = result;
+    if (env.error !== undefined && env.error !== null) {
+      return sessionNotFoundSignal(env.error) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null };
+    }
+    if (env.data == null)
+      return { exists: false, timeUpdated: null };
+    return { exists: true, timeUpdated: readTimeUpdated(env.data) };
+  }
+  if (result == null)
+    return { exists: false, timeUpdated: null };
+  return { exists: true, timeUpdated: readTimeUpdated(result) };
+}
+function staleAnchor(state, startedAt) {
+  return state.lastActivity ?? startedAt;
+}
+function staleThresholdCrossed(state, now, startedAt, staleMs, floorMs) {
+  return now - startedAt >= floorMs && now - staleAnchor(state, startedAt) >= staleMs;
+}
+function applyStaleProbe(state, probe) {
+  if (probe.exists !== true)
+    return;
+  const t = probe.timeUpdated;
+  if (t === null)
+    return;
+  if (state.lastActivity === null || t > state.lastActivity) {
+    state.lastActivity = t;
+    state.staleNotified = false;
+  }
+}
+function decideStaleSweep(probe, state, mode) {
+  if (probe.exists === null)
+    return { action: "skip" };
+  if (probe.exists === false)
+    return { action: "gone" };
+  if (mode === "observe")
+    return state.staleNotified ? { action: "quiet" } : { action: "notify" };
+  return { action: "kill" };
+}
+function staleSilentMinutes(state, now, startedAt) {
+  return Math.max(1, Math.round((now - staleAnchor(state, startedAt)) / 60000));
+}
 function isActiveStatus(status) {
   return status !== undefined && status.type !== undefined && ACTIVE_STATUS_TYPES.has(status.type);
 }
@@ -16752,6 +16859,146 @@ async function abortChild(client, sessionID) {
     return { ok: false, error: `session.abort threw: ${String(e)}` };
   }
   return { ok: true };
+}
+
+// src/dispatch-retry.ts
+var RETRYABLE_ERROR_PATTERNS = [
+  /unable to connect/i,
+  /econnrefused/i,
+  /econnreset/i,
+  /enotfound/i,
+  /socket hang up/i,
+  /fetch failed/i,
+  /network(?:\s|_)?error/i,
+  /not connected/i,
+  /connection (?:closed|refused|reset)/i,
+  /etimedout/i,
+  /timed?\s?-?out/i,
+  /timeout/i,
+  /overloaded/i,
+  /rate[\s_-]?limit/i,
+  /too many requests/i,
+  /internal server error/i,
+  /bad gateway/i,
+  /service unavailable/i,
+  /gateway timeout/i,
+  /\b(?:429|500|502|503|504)\b/
+];
+var RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
+var DETERMINISTIC_ERROR_PATTERNS = [
+  /no provider available/i,
+  /provider not (?:available|found|configured)/i,
+  /provider is forbidden/i,
+  /selected provider is forbidden/i,
+  /unknown provider/i,
+  /model not supported/i,
+  /model_not_supported/i,
+  /model[_\s-]*not[_\s-]*found/i,
+  /(?:no|missing)[_\s-]*(?:api|auth(?:entication)?)[_\s-]*key/i,
+  /(?:api|auth(?:entication)?)[_\s-]*key(?:[_\s-]+is)?[_\s-]*(?:missing|not[_\s-]*(?:found|configured)|required)/i,
+  /no models available/i,
+  /no connected providers/i,
+  /all providers (?:are )?(?:unavailable|disconnected|exhausted)/i,
+  /unauthorized/i,
+  /forbidden/i,
+  /invalid[\s_-]*(?:request|argument|parameter)/i,
+  /bad request/i,
+  /\b(?:400|401|403)\b/
+];
+var DETERMINISTIC_STATUS_CODES = new Set([400, 401, 403, 404, 405, 409, 422]);
+function classifyText(error45) {
+  if (typeof error45 === "string")
+    return error45;
+  if (!error45)
+    return "";
+  if (error45 instanceof Error)
+    return `${error45.name}: ${error45.message}`;
+  if (typeof error45 === "object") {
+    const rec = error45;
+    const parts = [];
+    if (typeof rec.name === "string")
+      parts.push(rec.name);
+    const data = rec.data;
+    if (data && typeof data === "object") {
+      const d = data;
+      if (typeof d.message === "string")
+        parts.push(d.message);
+      if (typeof d.error === "string")
+        parts.push(d.error);
+    }
+    if (typeof rec.message === "string")
+      parts.push(rec.message);
+    if (parts.length > 0)
+      return parts.join(": ");
+    try {
+      return JSON.stringify(error45);
+    } catch {
+      return String(error45);
+    }
+  }
+  return String(error45);
+}
+function extractStatusCode(error45) {
+  if (!error45 || typeof error45 !== "object")
+    return;
+  const rec = error45;
+  for (const key of ["statusCode", "status", "code"]) {
+    const val = rec[key];
+    if (typeof val === "number" && val >= 100 && val < 600)
+      return val;
+    if (typeof val === "string" && /^\d{3}$/.test(val))
+      return Number(val);
+  }
+  const response = rec.response;
+  if (response && typeof response === "object") {
+    const respStatus = response.status;
+    if (typeof respStatus === "number" && respStatus >= 100 && respStatus < 600)
+      return respStatus;
+    if (typeof respStatus === "string" && /^\d{3}$/.test(respStatus))
+      return Number(respStatus);
+  }
+  return;
+}
+function classifyDispatchError(err) {
+  const text = classifyText(err);
+  if (DETERMINISTIC_ERROR_PATTERNS.some((p) => p.test(text)))
+    return "deterministic";
+  const status = extractStatusCode(err);
+  if (status !== undefined && DETERMINISTIC_STATUS_CODES.has(status))
+    return "deterministic";
+  if (RETRYABLE_ERROR_PATTERNS.some((p) => p.test(text)))
+    return "retryable";
+  if (status !== undefined && RETRYABLE_STATUS_CODES.has(status))
+    return "retryable";
+  return "deterministic";
+}
+var RESUME_PREAMBLE = "Note: a previous attempt at this task may have partially completed the work. Before acting, inspect the current workspace state (files, git status) to see what is already done, then CONTINUE the work — do not redo what is already done.";
+function buildRetryPrompt(originalPrompt) {
+  return `${RESUME_PREAMBLE}
+
+--- Original task ---
+${originalPrompt}`;
+}
+var DEFAULT_MAX_ATTEMPTS = 2;
+var MAX_ATTEMPTS_CEILING = 10;
+function resolveMaxAttempts(env = process.env) {
+  const raw = env.FORGE_DISPATCH_MAX_ATTEMPTS;
+  if (raw === undefined || raw === "")
+    return DEFAULT_MAX_ATTEMPTS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 1)
+    return DEFAULT_MAX_ATTEMPTS;
+  return Math.min(Math.round(parsed), MAX_ATTEMPTS_CEILING);
+}
+var RETRY_BACKOFF_MS = 1e4;
+function resolveRetryBackoffMs(env = process.env) {
+  const raw = env.FORGE_DISPATCH_RETRY_BACKOFF_MS;
+  if (raw === undefined || raw === "")
+    return RETRY_BACKOFF_MS;
+  const parsed = Number(raw);
+  if (!Number.isFinite(parsed) || parsed < 0)
+    return RETRY_BACKOFF_MS;
+  return Math.round(parsed);
 }
 
 // plugin.ts
@@ -18019,16 +18266,31 @@ function inFlightAsyncDispatches(sessionID) {
 function dispatchClient() {
   return jobClient;
 }
-async function runAsyncDispatchPoller(client, job, childSessionID) {
+async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryCtx) {
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
   const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5000));
   const notifyIntervalMs = resolveNotifyIntervalMs();
+  const staleMs = resolveStaleMs();
+  const staleMode = resolveStaleMode();
+  const staleFloorMs = resolveStaleFloorMs();
+  const maxAttempts = resolveMaxAttempts();
+  const retryBackoffMs = resolveRetryBackoffMs();
   const dispatch = job.dispatch;
-  const startedAt = Date.now();
+  const agentID = dispatch?.agentID ?? "unknown";
+  let childSessionID = initialChildSessionID;
+  let attempt = 1;
+  let startedAt = Date.now();
   let lastNotifiedMultiple = 0;
   let text = "";
   let exitCode = 0;
   const stability = { stableTicks: 0 };
+  const stale = { lastActivity: null, staleNotified: false };
+  const flushProgress = (notice) => {
+    jobManager.appendOutput(job, notice);
+    queueDispatchProgress(job.ownerSession, notice);
+    if (idleJobSessions.has(job.ownerSession))
+      deliverDispatchProgress(job.ownerSession);
+  };
   for (;; ) {
     const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability });
     if (poll.status === "completed") {
@@ -18037,6 +18299,59 @@ async function runAsyncDispatchPoller(client, job, childSessionID) {
       break;
     }
     if (poll.status === "error") {
+      if (attempt < maxAttempts && job.state === "running" && classifyDispatchError(poll.error) === "retryable") {
+        const errorHead = poll.error.split(`
+`)[0].slice(0, 160);
+        attempt++;
+        flushProgress(`[forge:dispatch-progress] attempt ${attempt}/${maxAttempts} starting after ${errorHead}… — ` + `respawning ${agentID} (task ${job.id}, previous child session ${childSessionID}) with the resume preamble; ` + `the single [forge:dispatch-complete] wake reports when the last attempt settles.`);
+        await new Promise((resolve2) => setTimeout(resolve2, retryBackoffMs));
+        if (job.state !== "running") {
+          dispatchTasks.delete(job.id);
+          return;
+        }
+        const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID);
+        if (refusal) {
+          text = `(retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
+          exitCode = 1;
+          break;
+        }
+        const respawn = await createChildSession(client, {
+          parentSessionID: job.ownerSession,
+          parentDirectory: retryCtx.directory,
+          agentID,
+          description: dispatch?.description ?? "",
+          questionDeny: retryCtx.questionDeny
+        });
+        if (!respawn.ok) {
+          text = `(retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
+          exitCode = 1;
+          break;
+        }
+        const sent = await sendPrompt(client, {
+          sessionID: respawn.sessionID,
+          agentID,
+          prompt: buildRetryPrompt(retryCtx.prompt),
+          directory: retryCtx.directory
+        });
+        if (!sent.ok) {
+          text = `(retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
+          exitCode = 1;
+          break;
+        }
+        childSessionID = respawn.sessionID;
+        job.dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" };
+        dispatchTasks.set(job.id, { jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" });
+        job.killTree = () => {
+          abortChild(client, childSessionID);
+        };
+        stability.stableTicks = 0;
+        stability.textlessIdleSince = undefined;
+        startedAt = Date.now();
+        lastNotifiedMultiple = 0;
+        stale.lastActivity = null;
+        stale.staleNotified = false;
+        continue;
+      }
       text = `(child session ended in error: ${poll.error})`;
       exitCode = 1;
       break;
@@ -18050,17 +18365,51 @@ async function runAsyncDispatchPoller(client, job, childSessionID) {
       exitCode = 1;
       break;
     }
+    if (stability.textlessIdleSince === undefined) {
+      const probe = await sessionGet(client, childSessionID);
+      applyStaleProbe(stale, probe);
+      if (staleThresholdCrossed(stale, Date.now(), startedAt, staleMs, staleFloorMs)) {
+        const decision = decideStaleSweep(probe, stale, staleMode);
+        if (decision.action === "gone") {
+          text = `(stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(stale, Date.now(), startedAt)} min without activity — dispatch finalized honestly)`;
+          exitCode = 1;
+          break;
+        }
+        if (decision.action === "notify") {
+          stale.staleNotified = true;
+          flushProgress(`[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) shows no activity for ` + `${staleSilentMinutes(stale, Date.now(), startedAt)} min (stale threshold crossed; FORGE_DISPATCH_STALE_MODE=observe — not killing).`);
+        } else if (decision.action === "kill") {
+          const minutes = staleSilentMinutes(stale, Date.now(), startedAt);
+          const ab = await abortChild(client, childSessionID);
+          if (!ab.ok) {
+            const reprobe = await sessionGet(client, childSessionID);
+            if (reprobe.exists === false) {
+              text = `(stale: child session ${childSessionID} no longer exists after ${minutes} min without activity — dispatch finalized honestly)`;
+              exitCode = 1;
+              break;
+            }
+          } else {
+            text = `(stale: aborted after ${minutes} min without activity — child session ${childSessionID} was killed by the stale reap (FORGE_DISPATCH_STALE_MS=${staleMs}); inspect its transcript in the host TUI)`;
+            exitCode = 1;
+            break;
+          }
+        }
+      }
+    }
     const multiple = Math.floor((Date.now() - startedAt) / notifyIntervalMs);
     if (stability.textlessIdleSince === undefined && multiple > lastNotifiedMultiple) {
       lastNotifiedMultiple = multiple;
       const minutes = Math.max(1, Math.round((Date.now() - startedAt) / 60000));
-      const notice = `[forge:dispatch-progress] task dispatch to ${dispatch?.agentID ?? "unknown"} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` + `tracking continues; the final [forge:dispatch-complete] wake with the report arrives when it finishes. ` + `Inspect/abort in the host TUI if this looks stuck.`;
+      const notice = `[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` + `tracking continues; the final [forge:dispatch-complete] wake with the report arrives when it finishes. ` + `Inspect/abort in the host TUI if this looks stuck.`;
       jobManager.appendOutput(job, notice);
       queueDispatchProgress(job.ownerSession, notice);
       if (idleJobSessions.has(job.ownerSession))
         deliverDispatchProgress(job.ownerSession);
     }
   }
+  if (attempt > 1)
+    text += `
+(after ${attempt} attempt(s))`;
   jobManager.appendOutput(job, text);
   jobManager.markTerminal(job, "exited", exitCode);
   dispatchTasks.delete(job.id);
@@ -18188,7 +18537,7 @@ var taskDispatchTool = tool({
         });
         job2.dispatch = { agentID: target, childSessionID: created.sessionID, description };
         dispatchTasks.set(jobId2, { jobId: jobId2, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description });
-        runAsyncDispatchPoller(client, job2, created.sessionID);
+        runAsyncDispatchPoller(client, job2, created.sessionID, { prompt, directory: state.worktree, questionDeny: false });
         context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
         throw new Error(`[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` + `It remains a real session: inspect or abort it natively in the host TUI. ` + `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes, however long it takes (interim [forge:dispatch-progress] notices may arrive meanwhile); do not poll or re-dispatch in the meantime.`);
       }
@@ -18222,7 +18571,7 @@ ${fin.text}`].join(`
     });
     job.dispatch = { agentID: target, childSessionID: created.sessionID, description };
     dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description });
-    runAsyncDispatchPoller(client, job, created.sessionID);
+    runAsyncDispatchPoller(client, job, created.sessionID, { prompt, directory: state.worktree, questionDeny: true });
     context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
     return {
       title: `${target}: dispatch async (${jobId})`,
