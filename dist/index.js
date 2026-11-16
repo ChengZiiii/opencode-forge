@@ -16687,18 +16687,21 @@ function readTimeUpdated(record2) {
   return null;
 }
 async function sessionGet(client, sessionID) {
-  const get = client.session.get;
-  if (typeof get !== "function")
+  if (typeof client.session.get !== "function")
     return { exists: null, timeUpdated: null };
   let result;
   try {
-    result = await get({ path: { id: sessionID } });
+    result = await client.session.get({ path: { id: sessionID } });
   } catch (e) {
+    if (process.env.FORGE_DISPATCH_DEBUG === "1")
+      console.error(`[forge-dbg] sessionGet threw: ${String(e).slice(0, 300)}`);
     return sessionNotFoundSignal(e) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null };
   }
   if (result !== null && typeof result === "object" && (("error" in result) || ("data" in result))) {
     const env = result;
     if (env.error !== undefined && env.error !== null) {
+      if (process.env.FORGE_DISPATCH_DEBUG === "1")
+        console.error(`[forge-dbg] sessionGet error envelope: ${JSON.stringify(env.error).slice(0, 300)}`);
       return sessionNotFoundSignal(env.error) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null };
     }
     if (env.data == null)
@@ -18519,6 +18522,8 @@ var taskDispatchTool = tool({
       const waitStartedAt = Date.now();
       let syncCompleted = false;
       let syncError = null;
+      const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1";
+      let syncSliceCount = 0;
       syncWait:
         for (;; ) {
           const poll = await pollChild(client, {
@@ -18586,9 +18591,24 @@ var taskDispatchTool = tool({
           if (poll.status === "timeout") {
             if (Date.now() - waitStartedAt >= syncTimeoutMs)
               break syncWait;
+            if (syncDbg) {
+              syncSliceCount++;
+              if (syncSliceCount === 1) {
+                const names = [];
+                let cur = client.session;
+                while (cur && cur !== Object.prototype) {
+                  names.push(...Object.getOwnPropertyNames(cur));
+                  cur = Object.getPrototypeOf(cur);
+                }
+                console.error(`[forge-dbg] client.session methods: ${[...new Set(names)].filter((n) => n !== "constructor").join(",")}`);
+              }
+              console.error(`[forge-dbg] slice ${syncSliceCount}: status=timeout idle=${syncStability.textlessIdleSince === undefined ? "undef" : "set"} staleMs=${staleMsSync} floor=${staleFloorSync} mode=${staleModeSync} elapsed=${Math.round((Date.now() - syncStartedAt) / 1000)}s`);
+            }
             if (syncStability.textlessIdleSince === undefined) {
               const probe = await sessionGet(client, childSessionID);
               applyStaleProbe(syncStale, probe);
+              if (syncDbg)
+                console.error(`[forge-dbg] probe: exists=${probe.exists} timeUpdated=${probe.timeUpdated} anchor=${syncStale.lastActivity}`);
               if (staleThresholdCrossed(syncStale, Date.now(), syncStartedAt, staleMsSync, staleFloorSync)) {
                 const decision = decideStaleSweep(probe, syncStale, staleModeSync);
                 if (decision.action === "gone") {
@@ -18643,10 +18663,11 @@ var taskDispatchTool = tool({
         if (!fin.ok)
           throw new Error(`[forge:dispatch] ${fin.error}`);
         context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } });
+        const recoveredNote = attemptSync > 1 ? ` — recovered on attempt ${attemptSync}/${maxAttemptsSync} (previous child session(s) died with transient errors and were respawned; the [forge:dispatch-progress] notice lands in this transcript when the session idles)` : "";
         return {
           title: `${target}: dispatch complete`,
           metadata: { ...taskMetadata },
-          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID}).`, `Final report:
+          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID})${recoveredNote}.`, `Final report:
 ${fin.text}`].join(`
 `)
         };
