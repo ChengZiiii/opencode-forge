@@ -78,7 +78,8 @@ import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type Dept
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, abortChild, createChildSession, fetchFinalMessage, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, sendPrompt, type DispatchClient, type TerminalStabilityState } from "./src/dispatch-async.ts"
+import { DEFAULT_POLL_INTERVAL_MS, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
+import { buildRetryPrompt, classifyDispatchError, resolveMaxAttempts, resolveRetryBackoffMs } from "./src/dispatch-retry.ts"
 
 const FORGE_AGENT = "forge"
 
@@ -1947,7 +1948,42 @@ function dispatchClient(): DispatchClient | null {
 // it inline), and marks the job terminal — the manager's wake queue does
 // the rest (idle-only injection, at-most-once, delivery window, ledger
 // overflow).
-async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSessionID: string): Promise<void> {
+//
+// dispatch-resilience folds B+C:
+//  • Activity-stale reap (fold B): the SOLE clock-based termination of a
+//    RUNNING child. Each slice (while the child is believed active — the
+//    textless-idle floor below owns the not-active axis) probes
+//    session.get: a refreshed time.updated resets the anchor (a producing
+//    child can never be reaped); when the anchor has been silent for
+//    FORGE_DISPATCH_STALE_MS past the 60 s runtime floor, kill mode aborts
+//    the child via the SDK and delivers the ONE honest terminal wake
+//    (`stale: aborted after N min without activity`); a failed abort with
+//    the session still existing skips the sweep and re-arms (finalization
+//    only when existence proves the session gone). Observe mode notifies
+//    once per crossing and never kills.
+//  • Error-classified retry (fold C): a child terminating in a RETRYABLE
+//    error class with attempts remaining respawns after a fixed backoff —
+//    same agent, original prompt + the inspect-then-continue resume
+//    preamble — inheriting the dying child's registry slot (same job row,
+//    new child session id; no queue re-entry, no cap interaction). Stale
+//    kills, user aborts (registry kills), floor findings, and
+//    deterministic/unknown classes NEVER retry. The final wake discloses
+//    the attempt count; exactly one terminal wake still.
+type DispatchRetryContext = {
+  /** The ORIGINAL dispatch prompt (the retry prepends the resume preamble). */
+  prompt: string
+  /** The parent directory the child is anchored to. */
+  directory: string
+  /** Mode-keyed question policy (task-shadow) — re-applied on the fresh child. */
+  questionDeny: boolean
+}
+
+async function runAsyncDispatchPoller(
+  client: DispatchClient,
+  job: Job,
+  initialChildSessionID: string,
+  retryCtx: DispatchRetryContext,
+): Promise<void> {
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
   // sliceMs is the SLICE boundary, not a deadline — a slice timeout just
   // returns control here for the kill/floor/notify checks below.
@@ -1956,8 +1992,18 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
   // independent of FORGE_DISPATCH_POLL_TIMEOUT_MS — that knob scopes the
   // SYNC WAIT only and must never kill this tracker.
   const notifyIntervalMs = resolveNotifyIntervalMs()
+  // Fold B knobs (read at dispatch time, same as the interval knobs).
+  const staleMs = resolveStaleMs()
+  const staleMode: StaleMode = resolveStaleMode()
+  const staleFloorMs = resolveStaleFloorMs()
+  // Fold C knobs.
+  const maxAttempts = resolveMaxAttempts()
+  const retryBackoffMs = resolveRetryBackoffMs()
   const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
-  const startedAt = Date.now()
+  const agentID = dispatch?.agentID ?? "unknown"
+  let childSessionID = initialChildSessionID
+  let attempt = 1
+  let startedAt = Date.now()
   let lastNotifiedMultiple = 0
   let text = ""
   let exitCode = 0
@@ -1966,6 +2012,17 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
   // poll-slice boundaries (the async path inherits the same soundness — a
   // slice timeout must not reset the consecutive-tick run).
   const stability: TerminalStabilityState = { stableTicks: 0 }
+  // Stale-reap state (fold B): lastActivity = last OBSERVED time.updated;
+  // null until the first probe adopts the host's timestamp (no-message
+  // children anchor at the dispatch start time).
+  const stale: StaleSweepState = { lastActivity: null, staleNotified: false }
+  const flushProgress = (notice: string) => {
+    jobManager.appendOutput(job, notice)
+    queueDispatchProgress(job.ownerSession, notice)
+    // D6 parity (enqueue-while-idle): a notice parked while the owner is
+    // already idle has no future idle edge to ride — deliver now (lossy).
+    if (idleJobSessions.has(job.ownerSession)) void deliverDispatchProgress(job.ownerSession)
+  }
   for (;;) {
     const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability })
     if (poll.status === "completed") {
@@ -1974,6 +2031,74 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
       break
     }
     if (poll.status === "error") {
+      // Fold C respawn: retry ONLY transient classes, only while attempts
+      // remain, only while the registry row is still alive (a registry kill
+      // — owner death, dispose — is a user abort: never retried).
+      if (attempt < maxAttempts && job.state === "running" && classifyDispatchError(poll.error) === "retryable") {
+        const errorHead = poll.error.split("\n")[0].slice(0, 160)
+        attempt++
+        flushProgress(
+          `[forge:dispatch-progress] attempt ${attempt}/${maxAttempts} starting after ${errorHead}… — ` +
+            `respawning ${agentID} (task ${job.id}, previous child session ${childSessionID}) with the resume preamble; ` +
+            `the single [forge:dispatch-complete] wake reports when the last attempt settles.`,
+        )
+        await new Promise((resolve) => setTimeout(resolve, retryBackoffMs))
+        if (job.state !== "running") {
+          dispatchTasks.delete(job.id)
+          return
+        }
+        // Dispatch-time policies are re-applied on the fresh child the same
+        // way the original spawn applied them (crew belt + draft gate; the
+        // mode-keyed question deny rides the create body below).
+        const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID)
+        if (refusal) {
+          text = `(retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
+          exitCode = 1
+          break
+        }
+        const respawn = await createChildSession(client, {
+          parentSessionID: job.ownerSession,
+          parentDirectory: retryCtx.directory,
+          agentID,
+          description: dispatch?.description ?? "",
+          questionDeny: retryCtx.questionDeny,
+        })
+        if (!respawn.ok) {
+          text = `(retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
+          exitCode = 1
+          break
+        }
+        const sent = await sendPrompt(client, {
+          sessionID: respawn.sessionID,
+          agentID,
+          prompt: buildRetryPrompt(retryCtx.prompt),
+          directory: retryCtx.directory,
+        })
+        if (!sent.ok) {
+          text = `(retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
+          exitCode = 1
+          break
+        }
+        // Inherit the dying child's registry SLOT: same job row, new child
+        // session id — no queue re-entry, no cap interaction (the cap
+        // counts running rows, and the row never left the registry).
+        childSessionID = respawn.sessionID
+        ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" }
+        dispatchTasks.set(job.id, { jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" })
+        // Owner-death harvest must abort the LIVE child — rebind the kill hook.
+        job.killTree = () => {
+          void abortChild(client, childSessionID)
+        }
+        // Fresh tracking state for the fresh child (stability, floor,
+        // progress cadence, and the stale anchor all restart).
+        stability.stableTicks = 0
+        stability.textlessIdleSince = undefined
+        startedAt = Date.now()
+        lastNotifiedMultiple = 0
+        stale.lastActivity = null
+        stale.staleNotified = false
+        continue
+      }
       text = `(child session ended in error: ${poll.error})`
       exitCode = 1
       break
@@ -1995,6 +2120,48 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
       exitCode = 1
       break
     }
+    // Activity-stale reap (fold B) — only on the RUNNING axis (a textless
+    // idle streak is the floor's axis; the two never overlap). The probe
+    // doubles as the pre-kill re-read (it is fresh by construction) and the
+    // refresh rail: a producing child resets its anchor every slice.
+    if (stability.textlessIdleSince === undefined) {
+      const probe = await sessionGet(client, childSessionID)
+      applyStaleProbe(stale, probe)
+      if (staleThresholdCrossed(stale, Date.now(), startedAt, staleMs, staleFloorMs)) {
+        const decision = decideStaleSweep(probe, stale, staleMode)
+        if (decision.action === "gone") {
+          text = `(stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(stale, Date.now(), startedAt)} min without activity — dispatch finalized honestly)`
+          exitCode = 1
+          break
+        }
+        if (decision.action === "notify") {
+          stale.staleNotified = true
+          flushProgress(
+            `[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) shows no activity for ` +
+              `${staleSilentMinutes(stale, Date.now(), startedAt)} min (stale threshold crossed; FORGE_DISPATCH_STALE_MODE=observe — not killing).`,
+          )
+        } else if (decision.action === "kill") {
+          const minutes = staleSilentMinutes(stale, Date.now(), startedAt)
+          const ab = await abortChild(client, childSessionID)
+          if (!ab.ok) {
+            // Failed abort: finalize only when existence proves the session
+            // gone; otherwise skip this sweep and re-arm (next sweep retries).
+            const reprobe = await sessionGet(client, childSessionID)
+            if (reprobe.exists === false) {
+              text = `(stale: child session ${childSessionID} no longer exists after ${minutes} min without activity — dispatch finalized honestly)`
+              exitCode = 1
+              break
+            }
+          } else {
+            text = `(stale: aborted after ${minutes} min without activity — child session ${childSessionID} was killed by the stale reap (FORGE_DISPATCH_STALE_MS=${staleMs}); inspect its transcript in the host TUI)`
+            exitCode = 1
+            break
+          }
+        }
+        // "skip" (probe unresolved) and "quiet" (observe already notified):
+        // do nothing this sweep — the next slice re-probes.
+      }
+    }
     // Progress cadence: one informational notice per notification interval
     // WHILE THE CHILD RUNS (a textless-idle streak is not "running"). Never
     // touches markTerminal/wakeState — the completion budget stays intact.
@@ -2003,7 +2170,7 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
       lastNotifiedMultiple = multiple
       const minutes = Math.max(1, Math.round((Date.now() - startedAt) / 60000))
       const notice =
-        `[forge:dispatch-progress] task dispatch to ${dispatch?.agentID ?? "unknown"} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` +
+        `[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` +
         `tracking continues; the final [forge:dispatch-complete] wake with the report arrives when it finishes. ` +
         `Inspect/abort in the host TUI if this looks stuck.`
       jobManager.appendOutput(job, notice)
@@ -2013,6 +2180,7 @@ async function runAsyncDispatchPoller(client: DispatchClient, job: Job, childSes
       if (idleJobSessions.has(job.ownerSession)) void deliverDispatchProgress(job.ownerSession)
     }
   }
+  if (attempt > 1) text += `\n(after ${attempt} attempt(s))`
   jobManager.appendOutput(job, text)
   jobManager.markTerminal(job, "exited", exitCode)
   dispatchTasks.delete(job.id)
@@ -2174,7 +2342,7 @@ const taskDispatchTool = tool({
         })
         ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
         dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description })
-        void runAsyncDispatchPoller(client, job, created.sessionID)
+        void runAsyncDispatchPoller(client, job, created.sessionID, { prompt, directory: state.worktree, questionDeny: false })
         context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
         throw new Error(
           `[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` +
@@ -2212,7 +2380,7 @@ const taskDispatchTool = tool({
     })
     ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
     dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description })
-    void runAsyncDispatchPoller(client, job, created.sessionID)
+    void runAsyncDispatchPoller(client, job, created.sessionID, { prompt, directory: state.worktree, questionDeny: true })
     context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
     return {
       title: `${target}: dispatch async (${jobId})`,

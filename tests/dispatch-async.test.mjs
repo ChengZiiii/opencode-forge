@@ -21,7 +21,27 @@ import {
   DEFAULT_POLL_TIMEOUT_MS,
   MAX_POLL_TIMEOUT_MS,
   TERMINAL_STABILITY_TICKS,
+  // fold B (dispatch-resilience): session.get probe + stale knobs + sweep helpers
+  sessionGet,
+  resolveStaleMs,
+  resolveStaleMode,
+  resolveStaleFloorMs,
+  staleThresholdCrossed,
+  decideStaleSweep,
+  applyStaleProbe,
+  staleSilentMinutes,
+  DEFAULT_STALE_MS,
+  MIN_STALE_RUNTIME_MS,
 } from "../src/dispatch-async.ts"
+import {
+  classifyDispatchError,
+  buildRetryPrompt,
+  RESUME_PREAMBLE,
+  resolveMaxAttempts,
+  resolveRetryBackoffMs,
+  DEFAULT_MAX_ATTEMPTS,
+  RETRY_BACKOFF_MS,
+} from "../src/dispatch-retry.ts"
 
 // ---------------------------------------------------------------------------
 // Fake client: records every call; each endpoint's reply is scripted per
@@ -528,4 +548,233 @@ test("soundness: caller-owned stability state survives across pollChild calls (t
   const p2 = await pollChild(second.client, { sessionID: "s", intervalMs: 5, timeoutMs: 1000, stability }, fakeTime().seams)
   assert.equal(p2.status, "completed")
   assert.equal(p2.polls, 2, "only the two remaining stable ticks were needed — the run was NOT reset by the slice timeout")
+})
+
+// ---------------------------------------------------------------------------
+// sessionGet (dispatch-resilience fold B 2.1): the activity/existence probe.
+// One session.get call serves the refresh rail (time.updated) and the
+// existence probe (missing → finalize; fetch error → unresolved → skip).
+
+function probeClient(get) {
+  return { session: { get } }
+}
+
+test("sessionGet: envelope data with time.updated → exists + timestamp", async () => {
+  const c = probeClient(async () => ({ data: { id: "s", time: { created: 1, updated: 1234 } } }))
+  assert.deepEqual(await sessionGet(c, "s"), { exists: true, timeUpdated: 1234 })
+})
+
+test("sessionGet: bare record shape + time_updated fallback (omo parity)", async () => {
+  const c = probeClient(async () => ({ time: { updated: 99 } }))
+  assert.deepEqual(await sessionGet(c, "s"), { exists: true, timeUpdated: 99 })
+  const c2 = probeClient(async () => ({ time_updated: 77 }))
+  assert.deepEqual(await sessionGet(c2, "s"), { exists: true, timeUpdated: 77 })
+})
+
+test("sessionGet: record without any time field → exists, timeUpdated null", async () => {
+  const c = probeClient(async () => ({ data: { directory: "d" } }))
+  assert.deepEqual(await sessionGet(c, "s"), { exists: true, timeUpdated: null })
+})
+
+test("sessionGet: fetch errors are UNRESOLVED (exists null); not-found signals prove missing", async () => {
+  const boom = probeClient(async () => { throw new Error("endpoint down") })
+  assert.deepEqual(await sessionGet(boom, "s"), { exists: null, timeUpdated: null }, "generic throw → unresolved, never a verdict")
+  const envelope = probeClient(async () => ({ error: "boom" }))
+  assert.deepEqual(await sessionGet(envelope, "s"), { exists: null, timeUpdated: null })
+  const notFoundThrow = probeClient(async () => { throw new Error("session not found") })
+  assert.deepEqual(await sessionGet(notFoundThrow, "s"), { exists: false, timeUpdated: null }, "404/not-found text proves gone")
+  const notFoundStatus = probeClient(async () => { const e = new Error("x"); e.status = 404; throw e })
+  assert.deepEqual(await sessionGet(notFoundStatus, "s"), { exists: false, timeUpdated: null })
+})
+
+test("sessionGet: envelope with data null → missing; absent endpoint → unresolved", async () => {
+  const c = probeClient(async () => ({ data: null }))
+  assert.deepEqual(await sessionGet(c, "s"), { exists: false, timeUpdated: null })
+  assert.deepEqual(await sessionGet({ session: {} }, "s"), { exists: null, timeUpdated: null }, "no session.get on the client → unresolved, sweeps skip")
+})
+
+// ---------------------------------------------------------------------------
+// Stale knobs (fold B 2.2/2.3): tolerance convention + the 60 s floor clamp.
+
+test("resolveStaleMs: unset/empty/junk/non-positive → default 2700000", () => {
+  assert.equal(DEFAULT_STALE_MS, 2_700_000)
+  assert.equal(resolveStaleMs({}), DEFAULT_STALE_MS)
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "" }), DEFAULT_STALE_MS)
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "abc" }), DEFAULT_STALE_MS)
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "0" }), DEFAULT_STALE_MS)
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "-5" }), DEFAULT_STALE_MS)
+})
+
+test("resolveStaleMs: valid values take effect but NEVER below the 60 s floor (clamp UP)", () => {
+  assert.equal(MIN_STALE_RUNTIME_MS, 60_000)
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "300000" }), 300000)
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "3600000" }), 3_600_000)
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "5" }), 60_000, "sub-floor values clamp up")
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "59999" }), 60_000)
+  assert.equal(resolveStaleMs({ FORGE_DISPATCH_STALE_MS: "60000" }), 60_000)
+})
+
+test("resolveStaleMode: kill default; observe recognized; junk → kill", () => {
+  assert.equal(resolveStaleMode({}), "kill")
+  assert.equal(resolveStaleMode({ FORGE_DISPATCH_STALE_MODE: "observe" }), "observe")
+  assert.equal(resolveStaleMode({ FORGE_DISPATCH_STALE_MODE: "OBSERVE" }), "observe")
+  assert.equal(resolveStaleMode({ FORGE_DISPATCH_STALE_MODE: "kill" }), "kill")
+  assert.equal(resolveStaleMode({ FORGE_DISPATCH_STALE_MODE: "nonsense" }), "kill")
+  assert.equal(resolveStaleMode({ FORGE_DISPATCH_STALE_MODE: "" }), "kill")
+})
+
+test("resolveStaleFloorMs: fixed 60 s default; internal test seam override; junk → default", () => {
+  assert.equal(resolveStaleFloorMs({}), MIN_STALE_RUNTIME_MS)
+  assert.equal(resolveStaleFloorMs({ FORGE_DISPATCH_STALE_FLOOR_MS: "50" }), 50)
+  assert.equal(resolveStaleFloorMs({ FORGE_DISPATCH_STALE_FLOOR_MS: "abc" }), MIN_STALE_RUNTIME_MS)
+  assert.equal(resolveStaleFloorMs({ FORGE_DISPATCH_STALE_FLOOR_MS: "-1" }), MIN_STALE_RUNTIME_MS)
+})
+
+// ---------------------------------------------------------------------------
+// Stale sweep helpers (fold B): pure gate + decision + probe application.
+
+test("staleThresholdCrossed: the 60 s runtime floor blocks early reap however silent", () => {
+  const state = { lastActivity: null, staleNotified: false }
+  const startedAt = 1_000_000
+  // anchor silent for the FULL threshold, but the child is younger than the floor
+  assert.equal(staleThresholdCrossed(state, startedAt + 2_700_000, startedAt, 2_700_000, 60_000), true, "floor met + threshold met → crossed")
+  assert.equal(staleThresholdCrossed(state, startedAt + 2_700_000, startedAt, 2_700_000, 3_600_000), false, "floor NOT met → never crossed (however silent)")
+  assert.equal(staleThresholdCrossed(state, startedAt + 59_999, startedAt, 1000, 60_000), false, "sub-floor runtime is untouchable")
+})
+
+test("staleThresholdCrossed: anchor = last observed time.updated, else dispatch start (no-message child)", () => {
+  // No message ever → lastActivity null → anchor = dispatch start.
+  const none = { lastActivity: null, staleNotified: false }
+  assert.equal(staleThresholdCrossed(none, 5_000_000, 5_000_000 - 60_001, 60_000, 60_000), true)
+  // Observed anchor in the past (clock-skew adoption) is honored — and
+  // DISTINGUISHES from the start-time fallback anchor.
+  const adopted = { lastActivity: 1_000, staleNotified: false }
+  const startedAt = 5_000_000 - 3_600_000
+  assert.equal(staleThresholdCrossed(adopted, 5_000_000, startedAt, 4_000_000, 60_000), true, "anchor adopted from time.updated, even before dispatch start")
+  assert.equal(staleThresholdCrossed({ lastActivity: null, staleNotified: false }, 5_000_000, startedAt, 4_000_000, 60_000), false, "null anchor falls back to dispatch start (not yet silent long enough)")
+})
+
+test("applyStaleProbe: first observation ADOPTS the host timestamp; a refresh resets the notify flag", () => {
+  const state = { lastActivity: null, staleNotified: true }
+  applyStaleProbe(state, { exists: true, timeUpdated: 500 })
+  assert.equal(state.lastActivity, 500, "first observation adopts the anchor")
+  assert.equal(state.staleNotified, false, "adoption resets the observe-notify flag")
+  applyStaleProbe(state, { exists: true, timeUpdated: 400 })
+  assert.equal(state.lastActivity, 500, "an OLDER timestamp never moves the anchor")
+  applyStaleProbe(state, { exists: true, timeUpdated: 900 })
+  assert.equal(state.lastActivity, 900, "a refreshed timestamp advances the anchor (producing child)")
+  applyStaleProbe(state, { exists: null, timeUpdated: null })
+  assert.equal(state.lastActivity, 900, "unresolved probes change nothing")
+  applyStaleProbe(state, { exists: true, timeUpdated: null })
+  assert.equal(state.lastActivity, 900, "records without time.updated change nothing")
+})
+
+test("decideStaleSweep: the full decision matrix (skip / gone / notify / quiet / kill)", () => {
+  const state = { lastActivity: 100, staleNotified: false }
+  assert.deepEqual(decideStaleSweep({ exists: null, timeUpdated: null }, state, "kill"), { action: "skip" }, "unresolved → skip the sweep")
+  assert.deepEqual(decideStaleSweep({ exists: false, timeUpdated: null }, state, "kill"), { action: "gone" }, "missing session → finalize")
+  assert.deepEqual(decideStaleSweep({ exists: true, timeUpdated: 100 }, state, "kill"), { action: "kill" }, "silent child in kill mode → kill")
+  assert.deepEqual(decideStaleSweep({ exists: true, timeUpdated: null }, state, "kill"), { action: "kill" }, "no timestamp + silent-since-start → kill")
+  assert.deepEqual(decideStaleSweep({ exists: true, timeUpdated: 100 }, state, "observe"), { action: "notify" }, "observe crossing #1 → notify")
+  const notified = { lastActivity: 100, staleNotified: true }
+  assert.deepEqual(decideStaleSweep({ exists: true, timeUpdated: 100 }, notified, "observe"), { action: "quiet" }, "observe ticks after the notice stay quiet")
+})
+
+test("staleSilentMinutes: honest minute figure, minimum 1", () => {
+  assert.equal(staleSilentMinutes({ lastActivity: null, staleNotified: false }, 60_000, 0), 1)
+  assert.equal(staleSilentMinutes({ lastActivity: 0, staleNotified: false }, 45 * 60_000, 0), 45)
+})
+
+// ---------------------------------------------------------------------------
+// Error classifier (fold C 3.1) — ported from omo's error-classifier.ts.
+
+test("classifyDispatchError: RETRYABLE — transient transport / 5xx / overload / rate-limit patterns", () => {
+  const retryable = [
+    "fetch failed",
+    "ECONNRESET while streaming",
+    "ApiError: connection refused by peer",
+    "socket hang up",
+    "ETIMEDOUT after 30000ms",
+    "request timeout",
+    "provider overloaded — try again later",
+    "rate limit exceeded for model glm",
+    "Too Many Requests",
+    "APIError 503: Service Unavailable",
+    "internal server error",
+    "bad gateway",
+    "gateway timeout",
+  ]
+  for (const text of retryable) assert.equal(classifyDispatchError(text), "retryable", `expected retryable: ${text}`)
+  // numeric status on the error OBJECT (statusCode/status/code keys)
+  assert.equal(classifyDispatchError({ statusCode: 503, message: "upstream broke" }), "retryable")
+  assert.equal(classifyDispatchError({ status: 429 }), "retryable")
+  assert.equal(classifyDispatchError({ code: 500 }), "retryable")
+  assert.equal(classifyDispatchError({ response: { status: 502 } }), "retryable")
+})
+
+test("classifyDispatchError: DETERMINISTIC — omo's terminal set + auth + contract classes", () => {
+  const deterministic = [
+    "no provider available",
+    "provider not configured for this model",
+    "unknown provider: zai",
+    "model not supported: glm-unknown",
+    "model_not_supported",
+    "model not found",
+    "missing API key for provider",
+    "no api key configured",
+    "authentication key is required",
+    "no models available",
+    "all providers are unavailable",
+    "unauthorized",
+    "403 Forbidden",
+    "invalid_request_error: max_tokens too large",
+    "bad request",
+    "Error 400: malformed body",
+  ]
+  for (const text of deterministic) assert.equal(classifyDispatchError(text), "deterministic", `expected deterministic: ${text}`)
+  assert.equal(classifyDispatchError({ statusCode: 401, message: "bad key" }), "deterministic")
+  assert.equal(classifyDispatchError({ status: 403 }), "deterministic")
+  assert.equal(classifyDispatchError({ code: 400 }), "deterministic")
+})
+
+test("classifyDispatchError: UNKNOWN classes are fail-closed deterministic; deterministic WINS overlaps", () => {
+  assert.equal(classifyDispatchError("kaput"), "deterministic", "unrecognized → never retried")
+  assert.equal(classifyDispatchError({}), "deterministic")
+  assert.equal(classifyDispatchError(undefined), "deterministic")
+  assert.equal(
+    classifyDispatchError("no provider available (connection reset while probing)"),
+    "deterministic",
+    "a provider-config error is terminal even when transport words ride along",
+  )
+})
+
+// ---------------------------------------------------------------------------
+// Retry prompt + attempt/backoff knobs (fold C 3.2).
+
+test("buildRetryPrompt: the inspect-then-continue preamble is PREPENDED, clearly separated, original intact", () => {
+  const prompt = buildRetryPrompt("go audit the repo")
+  assert.ok(prompt.startsWith(RESUME_PREAMBLE), "the preamble leads")
+  assert.ok(prompt.includes("inspect the current workspace state"), "inspect instruction")
+  assert.ok(prompt.includes("CONTINUE the work"), "continue-not-redo instruction")
+  assert.ok(prompt.endsWith("go audit the repo"), "the ORIGINAL prompt rides verbatim at the end")
+  assert.match(prompt, /--- Original task ---/, "clear separator between preamble and original")
+})
+
+test("resolveMaxAttempts: default 2; junk → default; ≥1 enforced with a ceiling", () => {
+  assert.equal(DEFAULT_MAX_ATTEMPTS, 2)
+  assert.equal(resolveMaxAttempts({}), 2)
+  assert.equal(resolveMaxAttempts({ FORGE_DISPATCH_MAX_ATTEMPTS: "" }), 2)
+  assert.equal(resolveMaxAttempts({ FORGE_DISPATCH_MAX_ATTEMPTS: "abc" }), 2)
+  assert.equal(resolveMaxAttempts({ FORGE_DISPATCH_MAX_ATTEMPTS: "0" }), 2)
+  assert.equal(resolveMaxAttempts({ FORGE_DISPATCH_MAX_ATTEMPTS: "-3" }), 2)
+  assert.equal(resolveMaxAttempts({ FORGE_DISPATCH_MAX_ATTEMPTS: "3" }), 3)
+  assert.equal(resolveMaxAttempts({ FORGE_DISPATCH_MAX_ATTEMPTS: "99" }), 10, "sanity ceiling")
+})
+
+test("resolveRetryBackoffMs: fixed 10 s default; test-seam override; junk → default", () => {
+  assert.equal(RETRY_BACKOFF_MS, 10_000)
+  assert.equal(resolveRetryBackoffMs({}), 10_000)
+  assert.equal(resolveRetryBackoffMs({ FORGE_DISPATCH_RETRY_BACKOFF_MS: "30" }), 30)
+  assert.equal(resolveRetryBackoffMs({ FORGE_DISPATCH_RETRY_BACKOFF_MS: "abc" }), 10_000)
+  assert.equal(resolveRetryBackoffMs({ FORGE_DISPATCH_RETRY_BACKOFF_MS: "-1" }), 10_000)
 })

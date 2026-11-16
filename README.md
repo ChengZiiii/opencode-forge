@@ -646,6 +646,9 @@ the default):
 | `FORGE_DISPATCH_POLL_INTERVAL_MS` | `1000` | Poll interval for the sync loop and the async completion poller's slices, in ms. |
 | `FORGE_DISPATCH_POLL_SLICE_MS` | `5000` | Length of one async poller watch slice, in ms (registry kills take effect at slice boundaries). |
 | `FORGE_HEADLESS` | auto-detect | Overrides the headless host property for the `forge_shell` ask gate: `1` forces headless, `0` forces interactive. Unset/auto-detect reads the host process argv — `opencode serve` is headless; the TUI and `opencode run` are NOT (run mode keeps its ask auto-reject posture). Invalid values fall back to auto-detect. |
+| `FORGE_DISPATCH_STALE_MS` | `2700000` | The activity-stale reap threshold, in ms — a RUNNING dispatch child whose `session.get` `time.updated` has not advanced for this long past the 60 s runtime floor is reaped (`kill` mode aborts it with the honest `stale: aborted after N min without activity` wake). Values below the 60 s floor clamp UP to it; invalid values fall back to the default. |
+| `FORGE_DISPATCH_STALE_MODE` | `kill` | `kill` aborts a stale child (honest terminal wake); `observe` emits ONE `[forge:dispatch-progress]` notice per threshold crossing and never aborts. Anything unrecognized falls back to `kill`. |
+| `FORGE_DISPATCH_MAX_ATTEMPTS` | `2` | Total attempts per dispatch (1 original + N-1 automatic retries). A child that dies in a RETRYABLE error (transient transport/5xx/overload/rate-limit) respawns after a fixed 10 s backoff with the original prompt plus an inspect-then-continue resume preamble; deterministic errors (provider config/auth/model-not-supported/contract — and anything unrecognized), stale kills, user aborts, and floor findings NEVER retry. Invalid or sub-1 values fall back to the default; ceiling 10. |
 
 **Headless ask liveness (dispatch-resilience fold A).** On a headless host
 (`opencode serve`, or `FORGE_HEADLESS=1`) a `forge_shell` call whose posture

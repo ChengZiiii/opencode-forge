@@ -9,6 +9,7 @@
 //   session.promptAsync POST /session/{id}/prompt_async  body {agent,parts:[{type:"text",text}]} → 204 void
 //   session.status   GET  /session/status                → { [sessionID]: {type:"idle"|"busy"|"retry"} }
 //   session.messages GET  /session/{id}/message          → [{info:{role,finish,error,time},parts:[{type,text}]}]
+//   session.get      GET  /session/{id}                  → session record ({time:{updated}}) — fold B probe
 //   session.abort    POST /session/{id}/abort            → boolean
 //
 // The clock and sleeper are injectable so tests drive polls
@@ -64,6 +65,14 @@ export type DispatchClient = {
       query?: { directory?: string }
     }) => Promise<unknown>
     status: (args?: Record<string, never>) => Promise<{ data?: StatusMapLike; error?: unknown }>
+    /**
+     * Session record fetch (GET /session/{id}) — the fold B activity/
+     * existence probe. Optional: hosts/clients without the endpoint report
+     * `exists: null` (unresolved) and the stale reap skips its sweeps.
+     * Tolerates BOTH response shapes seen in the wild: the SDK's
+     * {data?, error?} envelope AND a bare session record.
+     */
+    get?: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<unknown>
     messages: (args: {
       path: { id: string }
       query?: { limit?: number }
@@ -244,6 +253,212 @@ export function resolveNotifyIntervalMs(env: { [key: string]: string | undefined
   const parsed = Number(raw)
   if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_POLL_TIMEOUT_MS
   return Math.min(Math.round(parsed), MAX_POLL_TIMEOUT_MS)
+}
+
+// ---------------------------------------------------------------------------
+// Activity-stale reap (dispatch-resilience fold B). The activity anchor is
+// the child's `session.get` `time.updated` timestamp (part-level updates —
+// a child streaming one long generation still refreshes it; a message-list
+// re-read one tick later adds no independent signal). When no activity
+// timestamp has ever been observed, the anchor is the dispatch start time.
+// Distinct from the textless-idle floor: floor = child GONE from the status
+// map with no reportable message; stale = child STILL BUSY (active) with no
+// activity advancement.
+
+/** Default stale threshold: 45 min without activity past the runtime floor. */
+export const DEFAULT_STALE_MS = 2_700_000
+
+/** Minimum runtime before ANY reap is considered (spec: 60-second floor). */
+export const MIN_STALE_RUNTIME_MS = 60_000
+
+export type StaleMode = "kill" | "observe"
+
+/**
+ * Resolve the stale threshold from `FORGE_DISPATCH_STALE_MS` (default
+ * 2700000). Same tolerance posture as the other dispatch knobs: unset/
+ * empty, non-numeric, or non-positive values fall back to the default; a
+ * valid value below the 60 s runtime floor clamps UP to the floor (design
+ * migration note, review F21).
+ */
+export function resolveStaleMs(env: { [key: string]: string | undefined } = process.env): number {
+  const raw = env.FORGE_DISPATCH_STALE_MS
+  if (raw === undefined || raw === "") return DEFAULT_STALE_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_STALE_MS
+  return Math.max(Math.round(parsed), MIN_STALE_RUNTIME_MS)
+}
+
+/**
+ * Resolve `FORGE_DISPATCH_STALE_MODE`: `kill` (default — abort the stale
+ * child, honest terminal wake) or `observe` (one progress notice per
+ * threshold crossing, never kill). Anything unrecognized falls back to
+ * `kill`.
+ */
+export function resolveStaleMode(env: { [key: string]: string | undefined } = process.env): StaleMode {
+  const raw = (env.FORGE_DISPATCH_STALE_MODE ?? "").trim().toLowerCase()
+  return raw === "observe" ? "observe" : "kill"
+}
+
+/**
+ * Internal test seam for the 60 s minimum-runtime floor
+ * (`FORGE_DISPATCH_STALE_FLOOR_MS`): production semantics are the fixed
+ * MIN_STALE_RUNTIME_MS; wiring tests shrink it to drive reaps in
+ * milliseconds. Invalid values fall back to the fixed floor.
+ */
+export function resolveStaleFloorMs(env: { [key: string]: string | undefined } = process.env): number {
+  const raw = env.FORGE_DISPATCH_STALE_FLOOR_MS
+  if (raw === undefined || raw === "") return MIN_STALE_RUNTIME_MS
+  const parsed = Number(raw)
+  if (!Number.isFinite(parsed) || parsed < 0) return MIN_STALE_RUNTIME_MS
+  return Math.round(parsed)
+}
+
+/** Result of the session.get activity/existence probe (see sessionGet). */
+export type SessionGetResult = {
+  /** true = session record resolved; false = session proven missing; null = UNRESOLVED (fetch error — never a verdict). */
+  exists: boolean | null
+  /** `time.updated` (or `time_updated`) when present and finite; else null. */
+  timeUpdated: number | null
+}
+
+// Ported not-found signals (omo session-existence.ts): a 404 status or a
+// not-found/missing message on the fetch proves the session GONE; any other
+// fetch failure is UNRESOLVED (skip the sweep — never a terminal verdict on
+// a signal that could not be read).
+function sessionNotFoundSignal(error: unknown): boolean {
+  let text = ""
+  let status: number | undefined
+  if (typeof error === "string") {
+    text = error
+  } else if (error && typeof error === "object") {
+    const rec = error as { message?: unknown; name?: unknown; status?: unknown; statusCode?: unknown; code?: unknown }
+    for (const key of ["statusCode", "status", "code"] as const) {
+      const val = rec[key]
+      if (typeof val === "number" && val >= 100 && val < 600) status = val
+      if (typeof val === "string" && /^\d{3}$/.test(val)) status = Number(val)
+    }
+    text = [String(rec.name ?? ""), String(rec.message ?? "")].join(" ")
+  }
+  if (status === 404) return true
+  return /not found|missing/i.test(text)
+}
+
+function readTimeUpdated(record: unknown): number | null {
+  if (!record || typeof record !== "object") return null
+  const rec = record as { time?: unknown; time_updated?: unknown }
+  const time = rec.time && typeof rec.time === "object" ? (rec.time as { updated?: unknown }) : undefined
+  // omo parity (session-activity.ts:18-22): time.updated ?? time_updated
+  for (const candidate of [time?.updated, rec.time_updated]) {
+    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0) return candidate
+  }
+  return null
+}
+
+/**
+ * The fold B activity/existence probe: ONE `session.get` call serving both
+ * the refresh rail (a refreshed `time.updated` proves the child producing —
+ * it can never be reaped) and the existence probe (session missing →
+ * finalize; fetch error → unresolved → skip the sweep). Handles the SDK
+ * envelope ({data?, error?}) and bare-record response shapes; an absent
+ * endpoint reports unresolved.
+ */
+export async function sessionGet(client: DispatchClient, sessionID: string): Promise<SessionGetResult> {
+  const get = client.session.get
+  if (typeof get !== "function") return { exists: null, timeUpdated: null }
+  let result: unknown
+  try {
+    result = await get({ path: { id: sessionID } })
+  } catch (e) {
+    return sessionNotFoundSignal(e) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null }
+  }
+  if (
+    result !== null &&
+    typeof result === "object" &&
+    ("error" in (result as Record<string, unknown>) || "data" in (result as Record<string, unknown>))
+  ) {
+    const env = result as { data?: unknown; error?: unknown }
+    if (env.error !== undefined && env.error !== null) {
+      return sessionNotFoundSignal(env.error) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null }
+    }
+    if (env.data == null) return { exists: false, timeUpdated: null }
+    return { exists: true, timeUpdated: readTimeUpdated(env.data) }
+  }
+  if (result == null) return { exists: false, timeUpdated: null }
+  return { exists: true, timeUpdated: readTimeUpdated(result) }
+}
+
+/**
+ * Per-tracked-child stale state: `lastActivity` is the last OBSERVED
+ * `time.updated` (adopted on first observation — the anchor IS the host's
+ * timestamp, even if clock skew puts it slightly before dispatch start);
+ * null while nothing has ever been observed (anchor = dispatch start).
+ */
+export type StaleSweepState = { lastActivity: number | null; staleNotified: boolean }
+
+/** The effective activity anchor: last observed time.updated, else dispatch start. */
+export function staleAnchor(state: StaleSweepState, startedAt: number): number {
+  return state.lastActivity ?? startedAt
+}
+
+/** Pure gate: runtime floor met AND the anchor has been silent for the threshold. */
+export function staleThresholdCrossed(
+  state: StaleSweepState,
+  now: number,
+  startedAt: number,
+  staleMs: number,
+  floorMs: number,
+): boolean {
+  return now - startedAt >= floorMs && now - staleAnchor(state, startedAt) >= staleMs
+}
+
+export type StaleSweepDecision =
+  | { action: "skip" } // probe unresolved — skip this sweep entirely
+  | { action: "gone" } // session missing — finalize honestly
+  | { action: "notify" } // observe mode: first crossing — emit the ONE notice
+  | { action: "quiet" } // observe mode: already notified this crossing
+  | { action: "kill" } // kill mode: proceed to the SDK abort
+
+/**
+ * Fold the fresh session.get probe into the stale state (run EVERY sweep
+ * cadence — this IS the refresh rail): a `time.updated` newer than the last
+ * observation resets the timer (a producing child can never be reaped) and
+ * the FIRST observation ADOPTS the host's timestamp as the anchor even if
+ * clock skew puts it before dispatch start (the anchor IS the host's
+ * timestamp; the dispatch start time is only the null fallback). The
+ * `staleNotified` flag resets with the anchor so a later crossing can
+ * notify again (observe mode: one notice per crossing).
+ */
+export function applyStaleProbe(state: StaleSweepState, probe: SessionGetResult): void {
+  if (probe.exists !== true) return
+  const t = probe.timeUpdated
+  if (t === null) return
+  if (state.lastActivity === null || t > state.lastActivity) {
+    state.lastActivity = t
+    state.staleNotified = false
+  }
+}
+
+/**
+ * Pure decision for one stale sweep WHEN THE THRESHOLD IS CROSSED (call
+ * applyStaleProbe with this same probe FIRST — a refreshed timestamp then
+ * reset the anchor and the crossing evaporates). The caller performs the
+ * abort (and the abort-failure existence re-probe) — this function never
+ * touches the client.
+ */
+export function decideStaleSweep(
+  probe: SessionGetResult,
+  state: StaleSweepState,
+  mode: StaleMode,
+): StaleSweepDecision {
+  if (probe.exists === null) return { action: "skip" }
+  if (probe.exists === false) return { action: "gone" }
+  if (mode === "observe") return state.staleNotified ? { action: "quiet" } : { action: "notify" }
+  return { action: "kill" }
+}
+
+/** Honest minutes-silent figure for the stale finding ("aborted after N min"). */
+export function staleSilentMinutes(state: StaleSweepState, now: number, startedAt: number): number {
+  return Math.max(1, Math.round((now - staleAnchor(state, startedAt)) / 60000))
 }
 
 function isActiveStatus(status: { type?: string } | undefined): boolean {
