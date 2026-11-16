@@ -645,6 +645,29 @@ the default):
 | `FORGE_DISPATCH_NOTIFY_INTERVAL_MS` | `600000` | The `[forge:dispatch-progress]` notification interval for the async/armed completion tracker, in ms — one informational notice per interval while the child runs; also the textless-idle floor window. Clamped to `3600000` (1 h). |
 | `FORGE_DISPATCH_POLL_INTERVAL_MS` | `1000` | Poll interval for the sync loop and the async completion poller's slices, in ms. |
 | `FORGE_DISPATCH_POLL_SLICE_MS` | `5000` | Length of one async poller watch slice, in ms (registry kills take effect at slice boundaries). |
+| `FORGE_HEADLESS` | auto-detect | Overrides the headless host property for the `forge_shell` ask gate: `1` forces headless, `0` forces interactive. Unset/auto-detect reads the host process argv — `opencode serve` is headless; the TUI and `opencode run` are NOT (run mode keeps its ask auto-reject posture). Invalid values fall back to auto-detect. |
+
+**Headless ask liveness (dispatch-resilience fold A).** On a headless host
+(`opencode serve`, or `FORGE_HEADLESS=1`) a `forge_shell` call whose posture
+would ask no longer hangs forever on a dialog nobody can answer: the command
+is classified by the same pure classifier as the readonly exec seal —
+**READ-CLASS commands run** (no dialog awaited) and **WRITE-CLASS commands
+are refused** with an honest `[forge:headless-denied]` error naming the
+command head, so the calling worker can adapt or report. An **explicit user
+`permission.forge_shell: "allow"`** skips the ask and runs in every mode
+(interactive, headless, and run alike — captured by a pre-rewrite config
+snapshot, the single documented respect in which interactive behavior
+changes); an explicit `deny` always wins. The 7 user-confirmation doors
+(`plan_approve`, `plan_close`, `goal_write (arm)`, `goal_complete`,
+`goal_resume`, `goal_discard`, `crew_close`) are **never** auto-resolved
+headlessly — they remain real dialogs. When both the readonly-exec-seal and
+the headless classifier would refuse, the seal finding lands first. **Bypass
+surface disclosure:** in headless mode the classifier is the effective
+enforcement boundary for write-shape workers — commands the classifier reads
+as READ-CLASS but that write internally (mutating scripts, process spawning
+via `Start-Process` writers, encoded payloads — the same README-disclosed
+bypass surface as the seal) run without confirmation. That boundary is
+accepted as part of this change.
 
 **Question policy is mode-keyed.** Sync dispatches keep questions available
 (native parity — the user is watching the panel). Async dispatches create

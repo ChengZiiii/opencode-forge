@@ -87,6 +87,10 @@ test("4.1 config: forge_shell permission rule injected as ask, explicit deny win
   cfg2.permission = { forge_shell: "deny" }
   await h.config(cfg2)
   assert.equal(cfg2.permission.forge_shell, "deny")
+  // Fold A snapshot isolation: the deny above is the USER'S explicit value in
+  // this scenario; later default-posture tests in this file must not inherit
+  // it from the module-level pre-rewrite snapshot.
+  h.__forgeSubagentsTest.resetGateSnapshot()
 })
 
 test("4.1 permission.ask belt: forge_shell stays a real ask unless explicitly denied", async () => {
