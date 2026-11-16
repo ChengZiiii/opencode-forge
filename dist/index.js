@@ -13233,13 +13233,20 @@ function resolveShell(deps = {}) {
 }
 
 // src/proc.ts
+var NON_INTERACTIVE_ENV = {
+  GIT_EDITOR: ":",
+  EDITOR: ":",
+  GIT_PAGER: "cat",
+  PAGER: "cat",
+  GIT_MERGE_AUTOEDIT: "no"
+};
 function shellSpawn(spawnFn, cmd, opts = {}) {
   const shell = opts.shell ?? resolveShell();
   const argv = shell.family === "ps" ? ["-NoProfile", "-Command", `${cmd}
 exit $LASTEXITCODE`] : shell.family === "cmd" ? ["/c", cmd] : shell.login ? ["-l", "-c", cmd] : ["-c", cmd];
   return spawnFn(shell.bin, argv, {
     ...opts.cwd !== undefined ? { cwd: opts.cwd } : {},
-    env: opts.env ? { ...process.env, ...opts.env } : process.env,
+    env: { ...process.env, ...NON_INTERACTIVE_ENV, ...opts.env },
     windowsHide: opts.windowsHide ?? true,
     detached: opts.detached ?? process.platform !== "win32",
     ...opts.stdio !== undefined ? { stdio: opts.stdio } : {}
@@ -15335,15 +15342,63 @@ function classifyExecCommand(cmd, opts) {
     return { klass: WRITE_CLASS, indicator: "workspace-write", detail: w.detail };
   return { klass: READ_CLASS };
 }
-
-// src/headless.ts
-function resolveHeadlessMode(env, argv) {
-  const raw = env.FORGE_HEADLESS;
-  if (raw === "1" || raw === "true")
-    return true;
-  if (raw === "0" || raw === "false")
-    return false;
-  return argv.slice(1).some((tok) => tok === "serve");
+var KNOWN_INTERACTIVE_COMMANDS = [
+  "npm login",
+  "npm adduser",
+  "pnpm login",
+  "yarn login",
+  "bun login",
+  "cargo login",
+  "docker login",
+  "podman login",
+  "gh auth login",
+  "az login",
+  "gcloud auth login",
+  "aws sso login",
+  "heroku login",
+  "netlify login",
+  "vercel login",
+  "supabase login",
+  "sudo",
+  "su",
+  "passwd",
+  "ssh",
+  "sftp",
+  "ftp",
+  "telnet",
+  "vim",
+  "vi",
+  "nano",
+  "emacs",
+  "top",
+  "htop",
+  "less",
+  "more",
+  "man"
+];
+function interactiveBanner(cmd) {
+  if (typeof cmd !== "string" || cmd.length === 0)
+    return null;
+  const segments = cmd.split(/\|\|?|&&|;|&/).map((s) => s.trim()).filter((s) => s.length > 0);
+  for (const seg of segments) {
+    const tokens = seg.split(/\s+/).filter((t) => t.length > 0 && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
+    for (const entry of KNOWN_INTERACTIVE_COMMANDS) {
+      const words = entry.split(" ");
+      if (words.length > tokens.length)
+        continue;
+      let ok = true;
+      for (let j = 0;j < words.length; j++) {
+        if (tokens[j] !== words[j]) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        return `[forge:interactive] "${entry}" is known to prompt interactively (credential / password / full-screen UI). It still runs — the spawn env already carries the non-interactive fallbacks (EDITOR=: GIT_PAGER=cat GIT_MERGE_AUTOEDIT=no) — but an interactive prompt cannot be answered here: prefer non-interactive flags (--yes / --non-interactive / token env vars) or the call may sit waiting until its wait budget expires.`;
+      }
+    }
+  }
+  return null;
 }
 
 // src/dispatch-depth.ts
@@ -17762,9 +17817,6 @@ var GATE_PERMISSION_KEYS = [
   "crew_close"
 ];
 var gatePermissionSnapshot = new Map;
-function isHeadlessHost() {
-  return resolveHeadlessMode(process.env, process.argv);
-}
 async function forgeShellGate(ask, command) {
   const explicit = gatePermissionSnapshot.get("forge_shell");
   if (explicit === "deny") {
@@ -17773,15 +17825,7 @@ async function forgeShellGate(ask, command) {
   if (explicit === "allow") {
     return;
   }
-  if (!isHeadlessHost()) {
-    await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`);
-    return;
-  }
-  const verdict = classifyExecCommand(command);
-  if (verdict.klass === WRITE_CLASS) {
-    const head = command.trim().split(/\s+/)[0]?.slice(0, 48) ?? "";
-    throw new Error(`[forge:headless-denied] Exec refused: this opencode host runs headless (serve mode) and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. Command head: ${head}. In headless mode READ-CLASS commands run and WRITE-CLASS commands are refused so the caller gets a real answer instead of hanging on an unanswered dialog. To let this command run, set permission forge_shell "allow" in your opencode config, or run the host with a TUI (or FORGE_HEADLESS=0). Report this refusal VERBATIM — do not work around it.`);
-  }
+  await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`);
 }
 var planApproveTool = tool({
   description: "Approve the session's draft plan (draft -> approved). Call it ONLY after presenting the plan and receiving the user's explicit go-ahead in chat — never in the same turn that presents the draft. The permission layer pins this call to a confirmation dialog — the user's Allow is the final hard gate and lifts the draft-phase write ban. Optionally pass a one-line summary of what changed since the last revision.",
@@ -18166,6 +18210,99 @@ var FORGE_SHELL_DESCRIPTION = [
   "Interpreter: commands run under the host-preferred shell — the PowerShell family on Windows (git-bash only on machines without PowerShell), the login shell with bash preferred on POSIX — the same interpreter the host's builtin shell tool uses."
 ].join(`
 `);
+var forgeShellExecute = async (args, context) => {
+  if (jobStage() >= 2) {
+    throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.");
+  }
+  const state = ensureSession(context.sessionID, worktreeFor(context));
+  await forgeShellGate(context.ask, args.command);
+  const survive = effectiveSurvive(jobsSurviveMode, args.survive);
+  let successPattern = null;
+  if (args.success_pattern) {
+    try {
+      successPattern = new RegExp(args.success_pattern);
+    } catch (err) {
+      throw new Error(`Invalid success_pattern: ${err.message}`);
+    }
+  }
+  const { registry: registry2, fence } = ensureJobLifecycle();
+  const cwd = args.workdir ? isAbsolute2(args.workdir) ? args.workdir : join6(state.worktree, args.workdir) : state.worktree;
+  const started = startJob(jobManager, {
+    cmd: args.command,
+    cwd,
+    ownerSession: context.sessionID,
+    worktree: state.worktree,
+    logDir: jobLogDir,
+    runInBackground: args.run_in_background === true,
+    ...args.idle_ms !== undefined ? { idleMs: args.idle_ms } : {},
+    ...args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {},
+    successPattern,
+    ...args.keep_alive !== undefined ? { keepAlive: args.keep_alive } : {},
+    ...args.notify !== undefined ? { notify: args.notify } : {},
+    ...survive ? { survive: true, registry: registry2 ?? undefined } : { fence, relocate: structuralRelocate, relocateAsync: structuralRelocateAsync }
+  });
+  if (survive) {
+    return {
+      title: `job started (survives host exit): ${started.job.id}`,
+      output: [
+        `[forge:job] Started in background — SURVIVES host exit (no fence, no exit kill).`,
+        `jobId: ${started.job.id}`,
+        `logPath: ${started.job.logPath}`,
+        "Recorded in the persistent registry: the next opencode run can poll/log/kill it via forge_jobs. Stop it explicitly when done."
+      ].join(`
+`)
+    };
+  }
+  context.metadata({ title: `forge_shell: ${args.command.slice(0, 60)}` });
+  if (args.run_in_background === true) {
+    return {
+      title: `job started: ${started.job.id}`,
+      output: [`[forge:job] Started in background.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `logPath: ${started.job.logPath}`, "Track with forge_jobs poll; a [forge:job-complete] message arrives on exit."].join(`
+`)
+    };
+  }
+  const r = await started.settle;
+  if (r.status === "exited") {
+    return {
+      title: `exit ${r.exitCode ?? "?"}`,
+      output: [
+        `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
+        `cwd: ${cwd}`,
+        `jobId: ${started.job.id}`,
+        `Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed).`,
+        ...r.spawnError ? [`spawn error: ${r.spawnError}`] : [],
+        `output:
+${r.outputTail || "(none)"}`
+      ].join(`
+`)
+    };
+  }
+  if (r.status === "succeeded") {
+    return {
+      title: `success: ${r.matched}`,
+      output: [
+        `[forge:job] Success pattern matched: "${r.matched}".`,
+        `cwd: ${cwd}`,
+        r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : `The process tree was terminated (keep_alive=false) — terminal evidence: job ${started.job.id} self-cleared from the registry (no wake, no clear needed).`,
+        `output:
+${r.outputTail}`
+      ].join(`
+`)
+    };
+  }
+  return {
+    title: `still running (${Math.round(r.idleForMs / 1000)}s idle)`,
+    output: [
+      `[forge:job] Still running — ${Math.round(r.idleForMs / 1000)}s without new output (or the wait budget ran out). The process is alive as job ${started.job.id}.`,
+      `cwd: ${cwd}`,
+      `logPath: ${started.job.logPath}`,
+      `recent output:
+${r.outputTail || "(none yet)"}`,
+      "Next: forge_jobs poll to keep waiting, forge_jobs log for history, forge_jobs kill to stop."
+    ].join(`
+`)
+  };
+};
 var forgeShellTool = tool({
   description: FORGE_SHELL_DESCRIPTION,
   args: {
@@ -18180,97 +18317,10 @@ var forgeShellTool = tool({
     survive: tool.schema.boolean().optional().describe("Opt this job OUT of dying with the host: it keeps running after opencode exits, recorded in the persistent registry so the next run can poll/kill it (config jobs.survive sets the default; an explicit config deny cannot be overridden)")
   },
   execute: async (args, context) => {
-    if (jobStage() >= 2) {
-      throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.");
-    }
-    const state = ensureSession(context.sessionID, worktreeFor(context));
-    await forgeShellGate(context.ask, args.command);
-    const survive = effectiveSurvive(jobsSurviveMode, args.survive);
-    let successPattern = null;
-    if (args.success_pattern) {
-      try {
-        successPattern = new RegExp(args.success_pattern);
-      } catch (err) {
-        throw new Error(`Invalid success_pattern: ${err.message}`);
-      }
-    }
-    const { registry: registry2, fence } = ensureJobLifecycle();
-    const cwd = args.workdir ? isAbsolute2(args.workdir) ? args.workdir : join6(state.worktree, args.workdir) : state.worktree;
-    const started = startJob(jobManager, {
-      cmd: args.command,
-      cwd,
-      ownerSession: context.sessionID,
-      worktree: state.worktree,
-      logDir: jobLogDir,
-      runInBackground: args.run_in_background === true,
-      ...args.idle_ms !== undefined ? { idleMs: args.idle_ms } : {},
-      ...args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {},
-      successPattern,
-      ...args.keep_alive !== undefined ? { keepAlive: args.keep_alive } : {},
-      ...args.notify !== undefined ? { notify: args.notify } : {},
-      ...survive ? { survive: true, registry: registry2 ?? undefined } : { fence, relocate: structuralRelocate, relocateAsync: structuralRelocateAsync }
-    });
-    if (survive) {
-      return {
-        title: `job started (survives host exit): ${started.job.id}`,
-        output: [
-          `[forge:job] Started in background — SURVIVES host exit (no fence, no exit kill).`,
-          `jobId: ${started.job.id}`,
-          `logPath: ${started.job.logPath}`,
-          "Recorded in the persistent registry: the next opencode run can poll/log/kill it via forge_jobs. Stop it explicitly when done."
-        ].join(`
-`)
-      };
-    }
-    context.metadata({ title: `forge_shell: ${args.command.slice(0, 60)}` });
-    if (args.run_in_background === true) {
-      return {
-        title: `job started: ${started.job.id}`,
-        output: [`[forge:job] Started in background.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `logPath: ${started.job.logPath}`, "Track with forge_jobs poll; a [forge:job-complete] message arrives on exit."].join(`
-`)
-      };
-    }
-    const r = await started.settle;
-    if (r.status === "exited") {
-      return {
-        title: `exit ${r.exitCode ?? "?"}`,
-        output: [
-          `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
-          `cwd: ${cwd}`,
-          `jobId: ${started.job.id}`,
-          `Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed).`,
-          ...r.spawnError ? [`spawn error: ${r.spawnError}`] : [],
-          `output:
-${r.outputTail || "(none)"}`
-        ].join(`
-`)
-      };
-    }
-    if (r.status === "succeeded") {
-      return {
-        title: `success: ${r.matched}`,
-        output: [
-          `[forge:job] Success pattern matched: "${r.matched}".`,
-          `cwd: ${cwd}`,
-          r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : `The process tree was terminated (keep_alive=false) — terminal evidence: job ${started.job.id} self-cleared from the registry (no wake, no clear needed).`,
-          `output:
-${r.outputTail}`
-        ].join(`
-`)
-      };
-    }
-    return {
-      title: `still running (${Math.round(r.idleForMs / 1000)}s idle)`,
-      output: [
-        `[forge:job] Still running — ${Math.round(r.idleForMs / 1000)}s without new output (or the wait budget ran out). The process is alive as job ${started.job.id}.`,
-        `cwd: ${cwd}`,
-        `logPath: ${started.job.logPath}`,
-        `recent output:
-${r.outputTail || "(none yet)"}`,
-        "Next: forge_jobs poll to keep waiting, forge_jobs log for history, forge_jobs kill to stop."
-      ].join(`
-`)
-    };
+    const res = await forgeShellExecute(args, context);
+    const banner = interactiveBanner(args.command);
+    return banner ? { ...res, output: `${banner}
+${res.output}` } : res;
   }
 });
 var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"];
@@ -20251,13 +20301,11 @@ var server = async (input, options) => {
           gatePermissionSnapshot.set(gateKey, incoming);
       }
       for (const gateKey of GATE_PERMISSION_KEYS) {
+        if (gateKey === "forge_shell")
+          continue;
         const v = permSection[gateKey];
-        if (gateKey === "forge_shell") {
-          if (v !== "deny" && v !== "allow")
-            permSection[gateKey] = "ask";
-        } else if (v !== "deny") {
+        if (v !== "deny")
           permSection[gateKey] = "ask";
-        }
       }
       const resolution = resolvePools();
       poolResolution = resolution;
@@ -20549,8 +20597,7 @@ var server = async (input, options) => {
       gateSnapshot: () => Object.fromEntries(gatePermissionSnapshot),
       resetGateSnapshot: () => {
         gatePermissionSnapshot.clear();
-      },
-      headless: () => isHeadlessHost()
+      }
     },
     "permission.ask": async (input2, output) => {
       const meta = input2.metadata ?? {};
@@ -20562,11 +20609,7 @@ var server = async (input, options) => {
 `);
         } catch {}
       }
-      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard" || name === "forge_shell") {
-        if (name === "forge_shell" && gatePermissionSnapshot.get("forge_shell") === "allow") {
-          output.status = "allow";
-          return;
-        }
+      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
         if (output.status !== "deny")
           output.status = "ask";
         return;
