@@ -3,7 +3,7 @@
 ## 0. Umbrella setup
 
 - [x] 0.1 DONE — `sync-timeout-notify` archived as `2026-11-16-sync-timeout-notify` (its deltas are live in the spec)
-- [ ] 0.2 Validate this change `bunx openspec validate dispatch-resilience --strict` (re-run after every artifact revision)
+- [x] 0.2 Validate this change `bunx openspec validate dispatch-resilience --strict` (re-run after every artifact revision)
 
 ## 1. Fold A — headless ask liveness (tool-partition + job-supervisor carve-out)
 
@@ -18,25 +18,25 @@
 
 ## 2. Fold B — activity-stale reap (forge-subagents / Dispatch resilience)
 
-- [ ] 2.1 Extend the `DispatchClient` seam with `session.get`; activity anchor = `time.updated` (part-level refresh), no-message anchor = dispatch start time
-- [ ] 2.2 Implement the reap: `FORGE_DISPATCH_STALE_MS` (default 2700000, clamped to the 60 s floor), runtime floor, pre-kill re-read (refresh resets), existence probe (unresolved → skip sweep, missing → finalize), abort-failure posture (failed abort + session exists → skip and re-arm), honest terminal wake `stale: aborted after N min without activity`
-- [ ] 2.3 Implement `FORGE_DISPATCH_STALE_MODE` = kill (default) | observe (ONE notice per threshold crossing, no kill)
-- [ ] 2.4 Tests: reap after threshold with confirmed inactivity; refresh resets; observe notifies once per crossing without killing; floor blocks early reap; no-message child anchors at start; failed abort skips + re-arms; stale wake is the single terminal wake; textless-idle floor vs stale reap stay distinct (busy-missing vs busy-silent)
-- [ ] 2.5 Full suite + typecheck green
-- [ ] 2.6 Live replay (env-shortened threshold): a silent sleeper child is reaped with the honest wake; a continuously-producing child runs past the threshold untouched
-- [ ] 2.7 Docs: README rows for `FORGE_DISPATCH_STALE_MS` / `FORGE_DISPATCH_STALE_MODE` (invalid → default; floor clamp)
-- [ ] 2.8 Release the fold
+- [x] 2.1 Extend the `DispatchClient` seam with `session.get`; activity anchor = `time.updated` (part-level refresh), no-message anchor = dispatch start time
+- [x] 2.2 Implement the reap: `FORGE_DISPATCH_STALE_MS` (default 2700000, clamped to the 60 s floor), runtime floor, pre-kill re-read (refresh resets), existence probe (unresolved → skip sweep, missing → finalize), abort-failure posture (failed abort + session exists → skip and re-arm), honest terminal wake `stale: aborted after N min without activity` — plus the 0.25.2 fix: the probe must invoke `client.session.get` as a BOUND method (destructured call lost `this`, every probe resolved null, the sweep skipped forever — found via the `FORGE_DISPATCH_DEBUG` seam on a live serve)
+- [x] 2.3 Implement `FORGE_DISPATCH_STALE_MODE` = kill (default) | observe (ONE notice per threshold crossing, no kill)
+- [x] 2.4 Tests: reap after threshold with confirmed inactivity; refresh resets; observe notifies once per crossing without killing; floor blocks early reap; no-message child anchors at start; failed abort skips + re-arms; stale wake is the single terminal wake; textless-idle floor vs stale reap stay distinct (busy-missing vs busy-silent)
+- [x] 2.5 Full suite + typecheck green (611/611, tsc exit 0)
+- [x] 2.6 Live replay (env-shortened threshold): a silent sleeper child is reaped with the honest wake — THREE independent reps on 0.25.2, each reaped at the 60 s floor (requested 15 s clamps UP to it) with `stale: aborted after 1 min without activity` + task id (REST-verified task parts ses_e1cb66543/ses_e1cb1e29/ses_e1cac75e); the continuously-producing-child-untouched half is covered by the refresh-rail unit tests (live reps ran sleeper children only)
+- [x] 2.7 Docs: README rows for `FORGE_DISPATCH_STALE_MS` / `FORGE_DISPATCH_STALE_MODE` (invalid → default; floor clamp)
+- [x] 2.8 Release the fold (0.25.0 core + 0.25.1 sync-window coverage + 0.25.2 probe fix: publish, REST flips (0.25.1 attempt 7, 0.25.2 attempt 14), store install with cache clean + pin bump, dual-layer verify each)
 
 ## 3. Fold C — retry with resume preamble (forge-subagents / Dispatch resilience)
 
-- [ ] 3.1 Port the error classifier (`src/dispatch-retry.ts`) with the vocabulary ENUMERATED: retryable = transient transport/5xx/overload/rate-limit patterns; deterministic = provider-configuration, auth, model-not-supported, contract patterns (ported terminal classes); unknown → not retried
-- [ ] 3.2 Implement respawn: same agent, original prompt + inspect-then-continue preamble, `FORGE_DISPATCH_MAX_ATTEMPTS` default 2, fixed 10 s backoff, progress notice per retry, final wake discloses the attempt count, exactly one terminal wake; retry inherits the dying child's registry slot; dispatch-time policies (draft/crew mode-keyed denies) re-applied
-- [ ] 3.3 Implement the no-retry exclusions: stale kills, user aborts, textless-idle floor, deterministic terminal classes
-- [ ] 3.4 Tests: transient-class error respawns with preamble + notice + attempt disclosure; provider-config-class error does NOT retry; attempt cap honored; stale/abort/floor never retry; armed-sync retry's final wake names the new child session id
-- [ ] 3.5 Full suite + typecheck green
-- [ ] 3.6 Live replay: transient outage (proxy down for attempt 1, up for attempt 2) → recovered final report in ONE wake disclosing attempts; a provider-config-broken dispatch terminates honestly WITHOUT retrying
-- [ ] 3.7 Docs: README `FORGE_DISPATCH_MAX_ATTEMPTS` row
-- [ ] 3.8 Release the fold
+- [x] 3.1 Port the error classifier (`src/dispatch-retry.ts`) with the vocabulary ENUMERATED: retryable = transient transport/5xx/overload/rate-limit patterns; deterministic = provider-configuration, auth, model-not-supported, contract patterns (ported terminal classes); unknown → not retried
+- [x] 3.2 Implement respawn: same agent, original prompt + inspect-then-continue preamble, `FORGE_DISPATCH_MAX_ATTEMPTS` default 2, fixed 10 s backoff, progress notice per retry, final wake discloses the attempt count, exactly one terminal wake; retry inherits the dying child's registry slot; dispatch-time policies (draft/crew mode-keyed denies) re-applied — sync dispatches covered too (the sliced sync wait runs the same classifier/respawn; a recovery discloses `recovered on attempt N/M`)
+- [x] 3.3 Implement the no-retry exclusions: stale kills, user aborts, textless-idle floor, deterministic terminal classes
+- [x] 3.4 Tests: transient-class error respawns with preamble + notice + attempt disclosure; provider-config-class error does NOT retry; attempt cap honored; stale/abort/floor never retry; armed-sync retry's final wake names the new child session id (20 pure-core + 13 wiring tests)
+- [x] 3.5 Full suite + typecheck green (611/611, tsc exit 0)
+- [ ] 3.6 Live replay: FINDING (0.25.2 live serve) — a real transient outage was staged through a one-shot-503→pass-through proxy in front of the true upstream: the 503 window was absorbed by the HOST's agent loop (1.19.5 retries failed steps internally — a malformed-mock child was observed looping step 2529), so the child never TERMINATED in an error message and the plugin-level retry branch had nothing to act on; the dispatch recovered across the outage window with an honest completion (ses_e1c9eed0). The retry branch itself stays wiring-verified (classifier matrix + respawn/discovery tests); a live trigger needs a host that surfaces terminal error messages (revisit at 6.2 or on host upgrade)
+- [x] 3.7 Docs: README `FORGE_DISPATCH_MAX_ATTEMPTS` row
+- [x] 3.8 Release the fold (same train as 2.8)
 
 ## 4. Fold D — cap queueing (forge-subagents / Dispatch lifecycle)
 
