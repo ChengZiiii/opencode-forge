@@ -19,6 +19,6 @@
 ## 3. Validation & release
 
 - [x] 3.1 `bun run typecheck` clean; targeted suites green; `bun test` full suite green
-- [ ] 3.2 `bunx openspec validate pool-rebind-on-resume --strict` clean; pre-archive `validate --all` clean
-- [ ] 3.3 README pool/dispatch section: one-line note that a restart-resumed session re-binds from the persisted anchor ledger (bounded, plugin-namespaced, fail-soft)
-- [ ] 3.4 Version bump + release commit + npm publish + push (publish flow per pitfalls §4.7: npm.cmd + shell:true, registry-fetch verification)
+- [x] 3.2 `bunx openspec validate pool-rebind-on-resume --strict` clean; pre-archive `validate --all` clean
+- [x] 3.3 README pool/dispatch section: one-line note that a restart-resumed session re-binds from the persisted anchor ledger (bounded, plugin-namespaced, fail-soft)
+- [x] 3.4 Version bump + release commit + npm publish + push (publish flow per pitfalls §4.7: npm.cmd + shell:true, registry-fetch verification)
