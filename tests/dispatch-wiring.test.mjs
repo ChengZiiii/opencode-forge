@@ -43,17 +43,26 @@ process.on("exit", () => {
 function makeClient(opts = {}) {
   const calls = { get: [], create: [], promptAsync: [], prompt: [], status: [], messages: [], abort: [] }
   let seq = 0
+  let abortMode = opts.abortMode ?? "ok"
   const childState = new Map()
   const client = {
     session: {
       get: async (args) => {
         calls.get.push(args)
+        // Child-id probes feed the fold B stale machinery (sessionGet);
+        // owner-id probes feed the pool-gate anchor resolution (opts.record).
+        if (typeof args.path?.id === "string" && args.path.id.startsWith("ses_child_")) {
+          if (typeof opts.childGet === "function") return opts.childGet(args.path.id)
+          // Default: a PRODUCING child (fresh time.updated every read).
+          return { time: { updated: Date.now() } }
+        }
         return opts.record
       },
       create: async (args) => {
         calls.create.push(args)
         const id = `ses_child_${++seq}`
-        childState.set(id, opts.mode ?? "done")
+        const mode = typeof opts.mode === "function" ? opts.mode(seq) : (opts.mode ?? "done")
+        childState.set(id, mode)
         return { data: { id } }
       },
       promptAsync: async (args) => {
@@ -85,17 +94,18 @@ function makeClient(opts = {}) {
           return { data: [{ info: { id: "m1", role: "assistant", finish: "stop", time: { created: 1 } }, parts: [{ type: "text", text: "" }] }] }
         }
         const info = { id: "m1", role: "assistant", finish: "stop", time: { created: 1 } }
-        if (st === "error") info.error = { name: "ProviderError", data: { message: "kaput" } }
+        if (st === "error") info.error = { name: "ProviderError", data: { message: opts.errorText ?? "kaput" } }
         return { data: [{ info, parts: [{ type: "text", text: `report from ${id}` }] }] }
       },
       abort: async (args) => {
         calls.abort.push(args)
+        if (abortMode === "throw") throw new Error("abort endpoint refused")
         childState.set(args.path.id, "done")
         return true
       },
     },
   }
-  return { client, calls, setChildState: (id, st) => childState.set(id, st) }
+  return { client, calls, setChildState: (id, st) => childState.set(id, st), setAbortMode: (m) => (abortMode = m) }
 }
 
 const input = (dir, client) => ({
@@ -879,4 +889,400 @@ test("copy: async discipline, handle text, and the ARMED finding disclose progre
   // Harvest both sessions (aborts the still-busy children, drains state).
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_copy" } } } })
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_copy2" } } } })
+})
+
+// ---------------------------------------------------------------------------
+// Activity-stale reap (dispatch-resilience fold B; spec scenarios "Stale
+// reap after prolonged inactivity", "Active children are never reaped",
+// "Stale observe mode only notifies", "Runtime floor blocks early reap",
+// "Failed abort skips the sweep", "Existence probe decides"). The runtime
+// floor is shrunk via the internal FORGE_DISPATCH_STALE_FLOOR_MS seam; the
+// stale threshold keeps its production default (45 min) with the fake's
+// time.updated anchored 46 min in the past — the clamp on
+// FORGE_DISPATCH_STALE_MS itself is unit-tested in dispatch-async.test.mjs.
+
+const MIN = 60_000
+
+test("stale reap (kill): silent busy child aborted via the SDK with the ONE honest stale wake; NEVER retried", async (t) => {
+  process.env.FORGE_DISPATCH_STALE_FLOOR_MS = "50"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_STALE_FLOOR_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const past = Date.now() - 46 * MIN
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy", childGet: () => ({ time: { updated: past } }) })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "hang forever", run_in_background: true },
+    allowCtx("ses_stale1", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  // The reaper aborts the child via the SDK...
+  await waitFor(() => calls.abort.some((a) => a.path.id === childID), "SDK abort on the stale child")
+  // ...and the tracker terminalizes with the honest stale finding.
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_stale1").length === 0, "tracker settles on the reap")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_stale1" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_stale1")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "stale wake delivered")
+  const wakes = toOwner().map(textOf).filter((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.equal(wakes.length, 1, "exactly ONE terminal wake")
+  assert.match(wakes[0], /stale: aborted after \d+ min without activity/, "the honest stale finding (verbatim shape)")
+  assert.ok(wakes[0].includes(childID), "the finding names the child session id")
+  assert.ok(wakes[0].includes(jobId), "the wake names the task id")
+  // A stale kill is EXCLUDED from fold C retry: no respawn happened.
+  assert.equal(calls.create.length, 1, "no retry — the stale kill is final")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_stale1" } } } })
+})
+
+test("stale reap: a continuously-producing child is NEVER reaped (refresh rail resets the timer)", async (t) => {
+  process.env.FORGE_DISPATCH_STALE_FLOOR_MS = "50"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_STALE_FLOOR_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "keep producing", run_in_background: true },
+    allowCtx("ses_stale2", dir),
+  )
+  // Default childGet returns a FRESH time.updated every probe — across many
+  // slice boundaries the anchor keeps resetting, so no abort ever fires.
+  await new Promise((res) => setTimeout(res, 700))
+  assert.equal(calls.abort.length, 0, "a producing child is never aborted")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_stale2").length, 1, "tracking continues (never reaped)")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_stale2" } } } })
+})
+
+test("stale observe mode: ONE progress notice per threshold crossing, NO kill", async (t) => {
+  process.env.FORGE_DISPATCH_STALE_FLOOR_MS = "50"
+  process.env.FORGE_DISPATCH_STALE_MODE = "observe"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_STALE_FLOOR_MS
+    delete process.env.FORGE_DISPATCH_STALE_MODE
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const past = Date.now() - 46 * MIN
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy", childGet: () => ({ time: { updated: past } }) })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "silent but observed", run_in_background: true },
+    allowCtx("ses_stale3", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  await waitFor(() => h.__forgeSubagentsTest.dispatchProgress("ses_stale3").length >= 1, "the observe notice parks")
+  // More slices pass (the crossing would repeat every tick without the
+  // staleNotified latch) — the notice must NOT repeat.
+  await new Promise((res) => setTimeout(res, 400))
+  const notices = h.__forgeSubagentsTest.dispatchProgress("ses_stale3").filter((s) => s.includes("no activity"))
+  assert.equal(notices.length, 1, "exactly ONE notice per crossing (not per tick)")
+  assert.match(notices[0], new RegExp(`child session ${childID}`), "the notice names the child")
+  assert.match(notices[0], /not killing/, "the observe posture is disclosed")
+  assert.equal(calls.abort.length, 0, "observe mode NEVER aborts")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_stale3").length, 1, "tracking continues")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_stale3" } } } })
+})
+
+test("stale reap: FAILED abort + session still exists → skip the sweep and re-arm; finalize only when the abort later succeeds", async (t) => {
+  process.env.FORGE_DISPATCH_STALE_FLOOR_MS = "50"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_STALE_FLOOR_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const past = Date.now() - 46 * MIN
+  const { client, calls, setAbortMode } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy", childGet: () => ({ time: { updated: past } }), abortMode: "throw" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "unabortable", run_in_background: true },
+    allowCtx("ses_stale4", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  // The abort fails but existence (sessionGet) proves the session alive —
+  // the sweep skips and re-arms; NO terminal wake fires.
+  await waitFor(() => calls.abort.length >= 1, "the reaper attempted the abort")
+  await new Promise((res) => setTimeout(res, 300))
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_stale4").length, 1, "skipped sweep re-armed — the row is still tracked")
+  assert.ok(calls.abort.length >= 2, "the sweep retried on later slices (re-armed)")
+  // The abort endpoint recovers — the next sweep kills and finalizes.
+  setAbortMode("ok")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_stale4").length === 0, "the recovered abort finalizes the reap")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_stale4" } } })
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(
+    () => calls.promptAsync.filter((a) => a.path?.id === "ses_stale4").some((a) => textOf(a).startsWith("[forge:dispatch-complete]")),
+    "the stale wake arrives once the abort landed",
+  )
+  const wake = calls.promptAsync.filter((a) => a.path?.id === "ses_stale4").map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.match(wake, /stale: aborted after \d+ min without activity/)
+  assert.ok(wake.includes(childID))
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_stale4" } } } })
+})
+
+test("stale reap: session MISSING at the sweep → finalize honestly without an abort", async (t) => {
+  process.env.FORGE_DISPATCH_STALE_FLOOR_MS = "50"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_STALE_FLOOR_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  // Deterministic gone-path: the anchor adopts a past time.updated, every
+  // kill sweep's ABORT fails (endpoint throws) while existence still proves
+  // the session alive (skip + re-arm), and THEN the probe flips to
+  // data:null — the next sweep finalizes the record as gone.
+  let goneNow = false
+  const past = Date.now() - 46 * MIN
+  const mk = makeClient({
+    record: { directory: dir, worktree: dir },
+    mode: "busy",
+    abortMode: "throw",
+    childGet: () => (goneNow ? { data: null } : { time: { updated: past } }),
+  })
+  const h = await startServer(input(dir, mk.client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "vanishing child", run_in_background: true },
+    allowCtx("ses_stale5", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  // Kill sweeps fire but the abort fails with the session still existing —
+  // skip + re-arm, NO terminal wake while existence holds.
+  await waitFor(() => mk.calls.abort.length >= 1, "the reaper attempted (and failed) the abort")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_stale5").length, 1, "failed abort + live session → sweep skipped, re-armed")
+  // The session vanishes: the next probe finalizes the record as gone.
+  goneNow = true
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_stale5").length === 0, "the missing session finalizes the record")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_stale5" } } })
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(
+    () => mk.calls.promptAsync.filter((a) => a.path?.id === "ses_stale5").some((a) => textOf(a).startsWith("[forge:dispatch-complete]")),
+    "the gone finding arrives",
+  )
+  const wake = mk.calls.promptAsync.filter((a) => a.path?.id === "ses_stale5").map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.match(wake, /no longer exists/, "the honest gone finding")
+  assert.ok(wake.includes(childID), "names the child session id")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_stale5" } } } })
+})
+
+test("stale reap: the 60 s runtime floor blocks early reap (however silent)", async (t) => {
+  process.env.FORGE_DISPATCH_STALE_FLOOR_MS = "600000" // 10 min floor — no reap inside this test
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_STALE_FLOOR_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const past = Date.now() - 46 * MIN
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy", childGet: () => ({ time: { updated: past } }) })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "young and silent", run_in_background: true },
+    allowCtx("ses_stale6", dir),
+  )
+  await new Promise((res) => setTimeout(res, 500))
+  assert.equal(calls.abort.length, 0, "a child younger than the runtime floor is never reaped, however silent")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_stale6").length, 1, "tracking continues")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_stale6" } } } })
+})
+
+// ---------------------------------------------------------------------------
+// Retry with resume preamble (dispatch-resilience fold C; spec scenarios
+// "Retryable error respawns with a resume preamble", "Deterministic terminal
+// classes are never retried", "Stale kills, aborts, and floor findings are
+// never retried"). The 10 s backoff is shrunk via the
+// FORGE_DISPATCH_RETRY_BACKOFF_MS test seam.
+
+test("retry: transient error respawns with the preamble — slot inherited, notice per attempt, final wake discloses attempts", async (t) => {
+  process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS = "30"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  // Child 1 dies in a TRANSIENT error; the retry child (create #2) completes.
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: (seq) => (seq === 1 ? "error" : "done"), errorText: "fetch failed: ECONNRESET mid-stream" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "recover me", run_in_background: true, description: "retry test" },
+    allowCtx("ses_rt1", dir),
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  const child1 = r.output.match(/child session: (ses_child_\d+)/)[1]
+  // The retry child spawned...
+  await waitFor(() => calls.create.length === 2, "the fresh child spawned")
+  const create2 = calls.create[1]
+  assert.equal(create2.body.parentID, "ses_rt1", "respawn keeps the owner as parent")
+  assert.deepEqual(create2.body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "the mode-keyed question deny is re-applied on the retry child")
+  const child2 = "ses_child_2"
+  // The retry prompt carries the ORIGINAL prompt + the inspect-then-continue preamble.
+  const retryPrompt = calls.promptAsync.map((a) => a.body?.parts?.[0]?.text ?? "").find((txt) => txt.includes("recover me") && txt.includes("inspect the current workspace state"))
+  assert.ok(retryPrompt, "the retry prompt contains the original prompt AND the inspect-then-continue preamble")
+  assert.ok(retryPrompt.startsWith("Note: a previous attempt"), "the preamble is PREPENDED")
+  assert.ok(retryPrompt.includes("CONTINUE the work"), "the continue-not-redo instruction")
+  // A progress notice disclosed the attempt.
+  await waitFor(() => h.__forgeSubagentsTest.dispatchProgress("ses_rt1").some((s) => s.includes(`attempt 2/2 starting after`)), "the attempt notice parks")
+  // Registry slot inherited: ONE row for the session the whole time, ending on child2.
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_rt1").length === 0, "the retry settles")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_rt1" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_rt1")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the final wake arrives")
+  const wakes = toOwner().map(textOf).filter((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.equal(wakes.length, 1, "exactly ONE terminal wake after the retry")
+  assert.ok(wakes[0].includes(child2), "the wake names the NEW child session id")
+  assert.ok(wakes[0].includes(`report from ${child2}`), "the retry child's report rides the wake")
+  assert.ok(wakes[0].includes("(after 2 attempt(s))"), "the final wake discloses the attempt count")
+  assert.ok(wakes[0].includes(jobId), "same registry slot — the original task id")
+  assert.ok(!wakes[0].includes(`report from ${child1}`), "the dead attempt's session is not the reported one")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rt1" } } } })
+})
+
+test("retry: provider-config-class error does NOT retry (omo terminal set)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "error", errorText: "no provider available for the pinned model" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "broken config", run_in_background: true },
+    allowCtx("ses_rt2", dir),
+  )
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_rt2").length === 0, "terminal on the first error")
+  assert.equal(calls.create.length, 1, "no respawn for a provider-configuration error")
+  assert.equal(h.__forgeSubagentsTest.dispatchProgress("ses_rt2").filter((s) => s.includes("attempt")).length, 0, "no attempt notice")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_rt2" } } })
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(
+    () => calls.promptAsync.filter((a) => a.path?.id === "ses_rt2").some((a) => textOf(a).startsWith("[forge:dispatch-complete]")),
+    "the honest error wake arrives as-is",
+  )
+  const wake = calls.promptAsync.filter((a) => a.path?.id === "ses_rt2").map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.ok(wake.includes("no provider available"), "the error is delivered as-is")
+  assert.ok(!wake.includes("attempt(s)"), "no attempt disclosure — nothing was retried")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rt2" } } } })
+})
+
+test("retry: UNKNOWN error class does NOT retry (fail-closed)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "error", errorText: "kaput" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "mystery death", run_in_background: true },
+    allowCtx("ses_rt3", dir),
+  )
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_rt3").length === 0, "terminal on the first error")
+  assert.equal(calls.create.length, 1, "unrecognized classes are never retried")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rt3" } } } })
+})
+
+test("retry: attempt cap honored — 2 transient deaths end in the honest terminal after BOTH attempts", async (t) => {
+  process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS = "30"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "error", errorText: "503 Service Unavailable" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "always down", run_in_background: true },
+    allowCtx("ses_rt4", dir),
+  )
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_rt4").length === 0, "the cap ends the tracking honestly")
+  assert.equal(calls.create.length, 2, "exactly 2 attempts (FORGE_DISPATCH_MAX_ATTEMPTS default 2)")
+  assert.ok(h.__forgeSubagentsTest.dispatchProgress("ses_rt4").some((s) => s.includes("attempt 2/2 starting after")), "the retry attempt was noticed")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_rt4" } } })
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(
+    () => calls.promptAsync.filter((a) => a.path?.id === "ses_rt4").some((a) => textOf(a).startsWith("[forge:dispatch-complete]")),
+    "the honest terminal wake",
+  )
+  const wake = calls.promptAsync.filter((a) => a.path?.id === "ses_rt4").map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.ok(wake.includes("child session ended in error"), "the terminal discloses the error")
+  assert.ok(wake.includes("(after 2 attempt(s))"), "the attempt count is disclosed")
+  assert.ok(wake.includes("ses_child_2"), "the wake names the LAST attempt's child session")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rt4" } } } })
+})
+
+test("retry: USER ABORT (registry kill at owner death) never retries", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "die with the owner", run_in_background: true },
+    allowCtx("ses_rt5", dir),
+  )
+  await new Promise((res) => setTimeout(res, 150))
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rt5" } } } })
+  await waitFor(() => calls.abort.length >= 1, "the harvest aborted the child")
+  await new Promise((res) => setTimeout(res, 250))
+  assert.equal(calls.create.length, 1, "a user abort is never retried")
+  await new Promise((res) => setTimeout(res, 100))
+})
+
+test("retry: textless-idle floor finding never retries", async (t) => {
+  process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS = "80"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "textless" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "go textless", run_in_background: true },
+    allowCtx("ses_rt6", dir),
+  )
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_rt6").length === 0, "the floor terminates")
+  assert.equal(calls.create.length, 1, "a floor finding is never retried")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rt6" } } } })
+})
+
+test("retry (armed-sync): a timed-out sync dispatch's armed poller retries too — the wake names the NEW child session id", async (t) => {
+  process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS = "150"
+  process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS = "30"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS
+    delete process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: (seq) => (seq === 1 ? "busy" : "done"), errorText: "socket hang up" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await assert.rejects(
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "long then flaky", description: "armed retry" }, allowCtx("ses_rt7", dir)),
+    /Completion tracking is ARMED/,
+  )
+  // The armed child dies in a transient error AFTER the timeout throw —
+  // the armed poller retries through the same machinery.
+  setChildState("ses_child_1", "error")
+  await waitFor(() => calls.create.length === 2, "the armed poller respawned")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_rt7").length === 0, "the retry settles")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_rt7" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_rt7")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the armed wake arrives")
+  const wake = toOwner().map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.match(wake, /finished \(task \S+, child session ses_child_2\)/, "the wake header names the NEW child session id")
+  assert.ok(wake.includes("report from ses_child_2"), "the retry child's report rides the wake")
+  assert.ok(wake.includes("(after 2 attempt(s))"), "the attempt count is disclosed")
+  assert.ok(!wake.includes("report from ses_child_1"), "the dead child's report is not the delivered one")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rt7" } } } })
 })

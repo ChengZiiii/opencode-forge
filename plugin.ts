@@ -2295,72 +2295,202 @@ const taskDispatchTool = tool({
       prompt,
     }
     if (!runInBackground) {
+      // dispatch-resilience folds B+C on the SYNC path: the wait is SLICED
+      // (5 s boundaries) so the same activity-stale reap and error-classified
+      // retry govern sync dispatches — the resilience SHALLs do not carve out
+      // the sync window. A real timeout still arms the standard tracker.
+      const syncIntervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
+      const syncSliceMs = Math.max(syncIntervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000))
+      const syncTimeoutMs = resolvePollTimeoutMs()
+      const staleMsSync = resolveStaleMs()
+      const staleModeSync: StaleMode = resolveStaleMode()
+      const staleFloorSync = resolveStaleFloorMs()
+      const maxAttemptsSync = resolveMaxAttempts()
+      const retryBackoffSync = resolveRetryBackoffMs()
+      const syncStability: TerminalStabilityState = { stableTicks: 0 }
+      const syncStale: StaleSweepState = { lastActivity: null, staleNotified: false }
       taskMetadata.taskId = newJobId()
-      const poll = await pollChild(client, {
-        sessionID: created.sessionID,
-        intervalMs: Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS),
-        timeoutMs: resolvePollTimeoutMs(),
-        signal: context.abort,
-      })
-      if (poll.status === "aborted") {
-        // Sync abort parity (design D4): abort the child via the SDK and
-        // resolve with the abort disclosed.
-        const ab = await abortChild(client, created.sessionID)
-        context.metadata({ title: `${target}: dispatch aborted`, metadata: { ...taskMetadata } })
+      const syncJobId = taskMetadata.taskId
+      let childSessionID = created.sessionID
+      let attemptSync = 1
+      let syncStartedAt = Date.now()
+      const waitStartedAt = Date.now()
+      let syncCompleted = false
+      let syncError: string | null = null
+      syncWait: for (;;) {
+        const poll = await pollChild(client, {
+          sessionID: childSessionID,
+          intervalMs: syncIntervalMs,
+          timeoutMs: syncSliceMs,
+          stability: syncStability,
+          signal: context.abort,
+        })
+        if (poll.status === "aborted") {
+          // Sync abort parity (design D4): abort the child via the SDK and
+          // resolve with the abort disclosed.
+          const ab = await abortChild(client, childSessionID)
+          context.metadata({ title: `${target}: dispatch aborted`, metadata: { ...taskMetadata } })
+          return {
+            title: `${target}: dispatch aborted`,
+            metadata: { ...taskMetadata },
+            output: [
+              `[forge:dispatch] The dispatching turn was aborted — child session ${childSessionID} was aborted via the SDK${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`}.`,
+              `task id: ${syncJobId}`,
+            ].join("\n"),
+          }
+        }
+        if (poll.status === "error") {
+          // Fold C on the sync path: retry ONLY transient classes while
+          // attempts remain (stale kills never reach this — they are
+          // orchestrator-side findings below; a registry kill cannot happen
+          // mid-sync-call).
+          if (attemptSync < maxAttemptsSync && classifyDispatchError(poll.error) === "retryable") {
+            const errorHead = poll.error.split("\n")[0].slice(0, 160)
+            attemptSync++
+            queueDispatchProgress(
+              context.sessionID,
+              `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`,
+            )
+            await new Promise((resolve) => setTimeout(resolve, retryBackoffSync))
+            const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusal(context.sessionID, target)
+            if (refusal) {
+              throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
+            }
+            const respawn = await createChildSession(client, {
+              parentSessionID: context.sessionID,
+              parentDirectory: state.worktree,
+              agentID: target,
+              description,
+              questionDeny: false,
+            })
+            if (!respawn.ok) {
+              throw new Error(`[forge:dispatch] retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
+            }
+            const sent = await sendPrompt(client, {
+              sessionID: respawn.sessionID,
+              agentID: target,
+              prompt: buildRetryPrompt(prompt),
+              directory: state.worktree,
+            })
+            if (!sent.ok) {
+              throw new Error(`[forge:dispatch] retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
+            }
+            // Slot inheritance: fresh child, same sync call. Stale, stability,
+            // and the clock restart for the fresh child.
+            childSessionID = respawn.sessionID
+            taskMetadata.sessionId = childSessionID
+            syncStartedAt = Date.now()
+            syncStale.lastActivity = null
+            syncStale.staleNotified = false
+            syncStability.stableTicks = 0
+            syncStability.textlessIdleSince = undefined
+            continue syncWait
+          }
+          syncError = attemptSync > 1 ? `${poll.error} — after ${attemptSync} attempt(s)` : poll.error
+          break syncWait
+        }
+        if (poll.status === "timeout") {
+          if (Date.now() - waitStartedAt >= syncTimeoutMs) break syncWait // real timeout → arm below
+          // Activity-stale reap (fold B) on the running axis — same helpers
+          // as the async poller; the probe doubles as the pre-kill re-read
+          // and the refresh rail.
+          if (syncStability.textlessIdleSince === undefined) {
+            const probe = await sessionGet(client, childSessionID)
+            applyStaleProbe(syncStale, probe)
+            if (staleThresholdCrossed(syncStale, Date.now(), syncStartedAt, staleMsSync, staleFloorSync)) {
+              const decision = decideStaleSweep(probe, syncStale, staleModeSync)
+              if (decision.action === "gone") {
+                context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } })
+                return {
+                  title: `${target}: dispatch stale-finalized`,
+                  metadata: { ...taskMetadata },
+                  output: [
+                    `[forge:dispatch] (stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly).`,
+                    `task id: ${syncJobId}`,
+                  ].join("\n"),
+                }
+              }
+              if (decision.action === "kill") {
+                const ab = await abortChild(client, childSessionID)
+                if (ab.ok) {
+                  context.metadata({ title: `${target}: dispatch stale-reaped`, metadata: { ...taskMetadata } })
+                  return {
+                    title: `${target}: dispatch stale-reaped`,
+                    metadata: { ...taskMetadata },
+                    output: [
+                      `[forge:dispatch] (stale: aborted after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — child session ${childSessionID} was killed by the stale reap (FORGE_DISPATCH_STALE_MS=${staleMsSync}); inspect its transcript in the host TUI).`,
+                      `task id: ${syncJobId}`,
+                    ].join("\n"),
+                  }
+                }
+                // Failed abort: finalize only when existence proves gone;
+                // otherwise skip this sweep and re-arm (next slice retries).
+                const reprobe = await sessionGet(client, childSessionID)
+                if (reprobe.exists === false) {
+                  context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } })
+                  return {
+                    title: `${target}: dispatch stale-finalized`,
+                    metadata: { ...taskMetadata },
+                    output: [
+                      `[forge:dispatch] (stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly).`,
+                      `task id: ${syncJobId}`,
+                    ].join("\n"),
+                  }
+                }
+              }
+              // observe mode / skipped sweeps: keep waiting (observe notices
+              // ride the armed tracker if the wait later times out)
+            }
+          }
+          continue syncWait
+        }
+        syncCompleted = true
+        break syncWait
+      }
+      if (syncCompleted) {
+        const fin = await fetchFinalMessage(client, childSessionID)
+        if (!fin.ok) throw new Error(`[forge:dispatch] ${fin.error}`)
+        context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } })
         return {
-          title: `${target}: dispatch aborted`,
+          title: `${target}: dispatch complete`,
           metadata: { ...taskMetadata },
-          output: [
-            `[forge:dispatch] The dispatching turn was aborted — child session ${created.sessionID} was aborted via the SDK${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`}.`,
-            `task id: ${taskMetadata.taskId}`,
-          ].join("\n"),
+          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID}).`, `Final report:\n${fin.text}`].join("\n"),
         }
       }
-      if (poll.status === "timeout") {
-        // sync-timeout-notify: arm, don't abandon (design D1). The child is
-        // already running; before the honest throw we register it in the
-        // dispatch registry and start the standard completion poller so
-        // exactly one [forge:dispatch-complete] wake carries the final
-        // report when it eventually finishes. Arming is UNCONDITIONAL
-        // (design D3): the async cap governs new async dispatch DECISIONS,
-        // not the reality of an already-running child — refusing to track
-        // it would change nothing except guaranteeing the result is lost.
-        const jobId = newJobId()
-        taskMetadata.taskId = jobId
-        const job = jobManager.create({
-          id: jobId,
-          cmd: `dispatch ${target}: ${description} (sync timeout, armed)`,
-          worktree: state.worktree,
-          ownerSession: context.sessionID,
-          logPath: join(jobLogDir, "dispatch", `${jobId}.txt`),
-          notify: true,
-          // Owner-death harvest parity: the manager's kill() on session end
-          // aborts the child via the SDK and ledgers the orphan.
-          killTree: () => {
-            void abortChild(client, created.sessionID)
-          },
-        })
-        ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
-        dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description })
-        void runAsyncDispatchPoller(client, job, created.sessionID, { prompt, directory: state.worktree, questionDeny: false })
-        context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
-        throw new Error(
-          `[forge:dispatch] Poll timeout after ${poll.timeoutMs}ms — child session ${created.sessionID} never reached a terminal state. ` +
-            `It remains a real session: inspect or abort it natively in the host TUI. ` +
-            `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes, however long it takes (interim [forge:dispatch-progress] notices may arrive meanwhile); do not poll or re-dispatch in the meantime.`,
-        )
+      if (syncError !== null) {
+        throw new Error(`[forge:dispatch] child session ${childSessionID} ended in error: ${syncError}`)
       }
-      if (poll.status === "error") {
-        throw new Error(`[forge:dispatch] child session ${created.sessionID} ended in error: ${poll.error}`)
-      }
-      const fin = await fetchFinalMessage(client, created.sessionID)
-      if (!fin.ok) throw new Error(`[forge:dispatch] ${fin.error}`)
-      context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } })
-      return {
-        title: `${target}: dispatch complete`,
-        metadata: { ...taskMetadata },
-        output: [`[forge:dispatch] ${target} finished (child session ${created.sessionID}).`, `Final report:\n${fin.text}`].join("\n"),
-      }
+      // sync-timeout-notify: arm, don't abandon (design D1). The child is
+      // already running; before the honest throw we register it in the
+      // dispatch registry and start the standard completion poller so
+      // exactly one [forge:dispatch-complete] wake carries the final
+      // report when it eventually finishes. Arming is UNCONDITIONAL
+      // (design D3): the async cap governs new async dispatch DECISIONS,
+      // not the reality of an already-running child — refusing to track
+      // it would change nothing except guaranteeing the result is lost.
+      const job = jobManager.create({
+        id: syncJobId,
+        cmd: `dispatch ${target}: ${description} (sync timeout, armed)`,
+        worktree: state.worktree,
+        ownerSession: context.sessionID,
+        logPath: join(jobLogDir, "dispatch", `${syncJobId}.txt`),
+        notify: true,
+        // Owner-death harvest parity: the manager's kill() on session end
+        // aborts the child via the SDK and ledgers the orphan.
+        killTree: () => {
+          void abortChild(client, childSessionID)
+        },
+      })
+      ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID, description }
+      dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description })
+      void runAsyncDispatchPoller(client, job, childSessionID, { prompt, directory: state.worktree, questionDeny: false })
+      context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
+      const attemptNote = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; retries continue in the armed tracker.` : ""
+      throw new Error(
+        `[forge:dispatch] Poll timeout after ${syncTimeoutMs}ms — child session ${childSessionID} never reached a terminal state.${attemptNote} ` +
+          `It remains a real session: inspect or abort it natively in the host TUI. ` +
+          `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes, however long it takes (interim [forge:dispatch-progress] notices may arrive meanwhile); do not poll or re-dispatch in the meantime.`,
+      )
     }
     // async: registry entry (kind=dispatch) + poller; the handle returns now.
     const jobId = newJobId()
