@@ -15039,9 +15039,17 @@ var WORKER_MANDATES = [
   "- Run every shell command through the forge_shell tool (the builtin shell is not part of your toolset by design). Long-running or non-exiting commands: forge_shell with run_in_background, then collect results via forge_jobs poll before yielding.",
   "- Run every search through the forge_grep/forge_glob tools first — the builtin grep/glob tools are fallback only. forge_grep/forge_glob see through symlinks/junctions and dot-directories because follow and hidden are on by default.",
   "- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial.",
-  "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."
+  "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced).",
+  "- Report-file delivery (reliability contract): when the dispatch prompt names a report path (convention: `reports/<task>-report.md`, workspace-relative), write your final report there in addition to replying on the result stream — the caller may need to recover your result from that file if the live result stream is lost. Readonly workers skip this: the reply is the report."
 ].join(`
 `);
+var REPORT_DELIVERY_LINE = (taskId) => `Report delivery contract (reliability): in addition to replying on the result stream, write your final report to \`reports/${taskId}-report.md\` (workspace-relative; create the directory if needed) — the caller may need to recover your result from that file if the live result stream is lost. If your toolset has no file write access, skip this: your reply is the report.`;
+function withReportDelivery(promptText, taskId) {
+  const stripped = promptText.replace(/\n+Report delivery contract \(reliability\):[\s\S]*$/, "");
+  return `${stripped}
+
+${REPORT_DELIVERY_LINE(taskId)}`;
+}
 var READONLY_DISCIPLINE = (agent) => `You are forge-${agent}, a readonly worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`;
 var WRITE_DISCIPLINE = (agent) => `You are forge-${agent}, a worker executing scoped tasks handed to you through the task tool. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no side quests.`;
 function materializeAgentPrompt(input) {
@@ -16800,6 +16808,7 @@ function isActiveStatus(status) {
   return status !== undefined && status.type !== undefined && ACTIVE_STATUS_TYPES.has(status.type);
 }
 var TERMINAL_STABILITY_TICKS = 3;
+var DEFAULT_VIEW_LOSS_TICKS = 30;
 function latestAssistant(messages) {
   let best;
   let bestCreated = -Infinity;
@@ -16853,6 +16862,7 @@ async function pollChild(client, input, seams = {}) {
       active = entry === undefined ? false : isActiveStatus(entry);
     }
     let messages = [];
+    let messagesFailed = false;
     try {
       const msgResult = await client.session.messages({
         path: { id: input.sessionID },
@@ -16860,9 +16870,21 @@ async function pollChild(client, input, seams = {}) {
       });
       if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
         messages = msgResult.data;
+      } else {
+        messagesFailed = true;
       }
     } catch {
       messages = [];
+      messagesFailed = true;
+    }
+    const viewLossLimit = input.viewLossTicks ?? DEFAULT_VIEW_LOSS_TICKS;
+    if (statusMap === undefined && messagesFailed) {
+      stability.viewLossTicks = (stability.viewLossTicks ?? 0) + 1;
+      if (stability.viewLossTicks >= viewLossLimit) {
+        return { status: "stream-lost", sessionID: input.sessionID, polls };
+      }
+    } else {
+      stability.viewLossTicks = 0;
     }
     const last = latestAssistant(messages);
     if (last?.info?.error != null) {
@@ -17549,6 +17571,15 @@ var idleJobSessions = new Set;
 function jobWakeText(job) {
   const dispatch = job.dispatch;
   if (dispatch) {
+    if (dispatch.outcome === "stream-lost/unknown") {
+      return [
+        `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — RESULT STREAM LOST (task ${job.id}, child session ${dispatch.childSessionID}): the dispatch view broke before a final report arrived; child state UNKNOWN (possibly still running).`,
+        `Last observation:
+${job.tail.slice(-2500) || "(no output)"}`,
+        `Ground-truth recovery: read reports/${job.id}-report.md in the workspace BEFORE considering a re-dispatch; the child session stays inspectable and natively abortable in the host TUI.`
+      ].join(`
+`);
+    }
     return [
       `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
       `Final report:
@@ -18889,6 +18920,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
   let lastNotifiedMultiple = 0;
   let text = "";
   let exitCode = 0;
+  let streamLost = false;
   const stability = { stableTicks: 0 };
   const stale = { lastActivity: null, staleNotified: false };
   const flushProgress = (notice) => {
@@ -18991,14 +19023,21 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
       exitCode = 1;
       break;
     }
+    if (poll.status === "stream-lost") {
+      streamLost = true;
+      const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString();
+      text = `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` + `the dispatch view (status + messages) was unreadable for the sustained poll streak; last observed activity ${lastObserved}. ` + `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` + `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`;
+      break;
+    }
     if (job.state !== "running") {
       dispatchTasks.delete(job.id);
       journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", "registry kill (owner session ended / dispose) — user abort");
       return;
     }
     if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
-      text = `(child session ${childSessionID} ended without a reportable final message — inspectable/abortable in the host TUI)`;
-      exitCode = 1;
+      streamLost = true;
+      const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString();
+      text = `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` + `the result stream ended before a final report arrived (last observed activity ${lastObserved}); ` + `the dispatch view cannot confirm completion. ` + `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` + `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`;
       break;
     }
     if (stability.textlessIdleSince === undefined) {
@@ -19047,6 +19086,12 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
     text += `
 (after ${attempt} attempt(s))`;
   jobManager.appendOutput(job, text);
+  if (streamLost) {
+    exitCode = null;
+    const meta = job.dispatch;
+    if (meta)
+      meta.outcome = "stream-lost/unknown";
+  }
   jobManager.markTerminal(job, "exited", exitCode);
   dispatchTasks.delete(job.id);
   journalTerminalRecord({
@@ -19055,7 +19100,8 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
     ownerSession: job.ownerSession,
     workspace: retryCtx.directory,
     description: dispatch?.description ?? ""
-  }, exitCode === 0 ? "completed" : "error", text.split(`
+  }, streamLost ? "stream-lost/unknown" : exitCode === 0 ? "completed" : "error", streamLost ? `${text.split(`
+`)[0].slice(0, 200)} — last observed activity ${new Date(stale.lastActivity ?? startedAt).toISOString()}` : text.split(`
 `)[0].slice(0, 200));
   pumpDispatchQueue(client, job.ownerSession);
 }
@@ -19078,7 +19124,9 @@ var taskDispatchTool = tool({
   execute: async (args, context) => {
     noteToolAgent(context);
     const target = String(args.subagent_type ?? "").trim();
-    const prompt = String(args.prompt ?? "");
+    const promptRaw = String(args.prompt ?? "");
+    const dispatchId = newJobId();
+    const prompt = promptRaw ? withReportDelivery(promptRaw, dispatchId) : "";
     const runInBackground = args.run_in_background === true;
     if (!target || !prompt)
       throw new Error("[forge:dispatch] subagent_type and prompt are both required.");
@@ -19131,7 +19179,7 @@ var taskDispatchTool = tool({
     const state = ensureSession(context.sessionID, worktreeFor(context));
     const description = typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60);
     if (queueAfterCap) {
-      const jobId2 = newJobId();
+      const jobId2 = dispatchId;
       const queue = dispatchQueues.get(context.sessionID) ?? [];
       const position = queue.length + 1;
       queue.push({ jobId: jobId2, agentID: target, ownerSession: context.sessionID, description, prompt, directory: state.worktree, questionDeny: true, enqueuedAt: Date.now() });
@@ -19172,7 +19220,7 @@ var taskDispatchTool = tool({
 `)
       };
     }
-    const asyncJobId = runInBackground ? newJobId() : "";
+    const asyncJobId = runInBackground ? dispatchId : "";
     if (asyncJobId) {
       journalTransition(state.worktree, {
         id: asyncJobId,
@@ -19220,8 +19268,8 @@ var taskDispatchTool = tool({
       const retryBackoffSync = resolveRetryBackoffMs();
       const syncStability = { stableTicks: 0 };
       const syncStale = { lastActivity: null, staleNotified: false };
-      taskMetadata.taskId = newJobId();
-      const syncJobId = taskMetadata.taskId;
+      taskMetadata.taskId = dispatchId;
+      const syncJobId = dispatchId;
       const syncJournalBase = { id: syncJobId, agent: target, ownerSession: context.sessionID, workspace: state.worktree, prompt, description, questionDeny: false };
       journalTransition(state.worktree, {
         id: syncJobId,
@@ -19255,6 +19303,7 @@ var taskDispatchTool = tool({
       let syncStartedAt = Date.now();
       const waitStartedAt = Date.now();
       let syncCompleted = false;
+      let syncStreamLost = false;
       let syncError = null;
       const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1";
       let syncSliceCount = 0;
@@ -19423,6 +19472,10 @@ var taskDispatchTool = tool({
             }
             continue syncWait;
           }
+          if (poll.status === "stream-lost") {
+            syncStreamLost = true;
+            break syncWait;
+          }
           syncCompleted = true;
           break syncWait;
         }
@@ -19447,23 +19500,52 @@ ${fin.text}`].join(`
         journalTerminalRecord(syncJournalBase, "error", `child session ${childSessionID} ended in error: ${syncError}`.slice(0, 200));
         throw new Error(`[forge:dispatch] child session ${childSessionID} ended in error: ${syncError}`);
       }
-      const job2 = jobManager.create({
-        id: syncJobId,
-        cmd: `dispatch ${target}: ${description} (sync timeout, armed)`,
-        worktree: state.worktree,
-        ownerSession: context.sessionID,
-        logPath: join6(jobLogDir, "dispatch", `${syncJobId}.txt`),
-        notify: true,
-        killTree: () => {
-          abortChild(client, childSessionID);
-        }
-      });
-      job2.dispatch = { agentID: target, childSessionID, description };
-      dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description });
-      runAsyncDispatchPoller(client, job2, childSessionID, { prompt, directory: state.worktree, questionDeny: false });
-      context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
+      const armSyncTracker = () => {
+        const job2 = jobManager.create({
+          id: syncJobId,
+          cmd: `dispatch ${target}: ${description} (sync wait ended, armed)`,
+          worktree: state.worktree,
+          ownerSession: context.sessionID,
+          logPath: join6(jobLogDir, "dispatch", `${syncJobId}.txt`),
+          notify: true,
+          killTree: () => {
+            abortChild(client, childSessionID);
+          }
+        });
+        job2.dispatch = { agentID: target, childSessionID, description };
+        dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description });
+        runAsyncDispatchPoller(client, job2, childSessionID, { prompt, directory: state.worktree, questionDeny: false });
+        context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
+      };
+      if (syncStreamLost) {
+        armSyncTracker();
+        const attemptNoteLost = attemptSync > 1 ? `${attemptSync} attempt(s) so far; tracking continues in the armed tracker.` : "";
+        return {
+          title: `${target}: dispatch continues (result stream lost)`,
+          metadata: { ...taskMetadata },
+          output: [
+            `[forge:dispatch] Result stream lost before a final report — child session ${childSessionID} state UNKNOWN (possibly still running). The dispatch continues in the background; collect with forge_jobs.`,
+            `task id: ${syncJobId}${attemptNoteLost ? ` — ${attemptNoteLost}` : ""}`,
+            `Ground-truth recovery: read reports/${syncJobId}-report.md in the workspace BEFORE considering a re-dispatch.`,
+            `If the view recovers and the child finishes, exactly one [forge:dispatch-complete] wake carries the outcome; the child session stays inspectable and natively abortable in the host TUI.`
+          ].join(`
+`)
+        };
+      }
+      armSyncTracker();
       const attemptNote = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; retries continue in the armed tracker.` : "";
-      throw new Error(`[forge:dispatch] Poll timeout after ${syncTimeoutMs}ms — child session ${childSessionID} never reached a terminal state.${attemptNote} ` + `It remains a real session: inspect or abort it natively in the host TUI. ` + `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes, however long it takes (interim [forge:dispatch-progress] notices may arrive meanwhile); do not poll or re-dispatch in the meantime.`);
+      return {
+        title: `${target}: dispatch continues in background`,
+        metadata: { ...taskMetadata },
+        output: [
+          `[forge:dispatch] Sync wait budget ended (${syncTimeoutMs}ms) — the dispatch continues in the background; collect with forge_jobs.`,
+          `task id: ${syncJobId}${attemptNote}`,
+          `child session: ${childSessionID} — it remains a real session: inspect or abort it natively in the host TUI.`,
+          `Report path (ground truth): reports/${syncJobId}-report.md.`,
+          `The completion contract: exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes (interim [forge:dispatch-progress] notices may arrive meanwhile), however long it takes; do not poll or re-dispatch in the meantime.`
+        ].join(`
+`)
+      };
     }
     const jobId = asyncJobId || newJobId();
     taskMetadata.taskId = jobId;
@@ -20140,6 +20222,7 @@ ${d.criteria.map((c, i) => `${i + 1}. ${c}`).join(`
 ${d.checks.map((c, i) => `${i + 1}. ${c.kind === "shell" ? `shell \`${c.cmd}\`` : `contains \`${c.file}\` :: \`${c.text}\``}`).join(`
 `)}`,
     d.constraints.trim() ? `Constraints: ${d.constraints.trim()}` : "",
+    `Per-turn discipline: land at least one verification command (forge_shell) or a real write every turn — the Turn Ledger scores read-only turns as no-progress, and consecutive no-progress turns auto-pause the loop (goal-no-progress-honesty: re-running the checks IS progress).`,
     `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. Work the criteria now; call goal_check when you believe they hold, then goal_complete (it re-runs every check itself and asks the user). If genuinely blocked, call goal_pause with the blocker — do not spin.`,
     crewLayerLine,
     `Goal file: ${relFrom(state.worktree, goal.path)}`
@@ -20842,7 +20925,7 @@ var server = async (input, options) => {
       if (act) {
         if (isWriteTool(input2.tool) || input2.tool === "plan_tick")
           act.writes++;
-        if (input2.tool === "goal_check")
+        if (input2.tool === "goal_check" || input2.tool === "forge_shell" || input2.tool === "shell" || input2.tool === "bash")
           act.checks++;
       }
       const crewAct = crewTurnActivity.get(input2.sessionID);
@@ -21186,7 +21269,7 @@ function v2RegisterToolHooks(ctx, anchorClient) {
         if (act) {
           if (isWriteTool(tool3) || tool3 === "plan_tick")
             act.writes++;
-          if (tool3 === "goal_check")
+          if (tool3 === "goal_check" || tool3 === "forge_shell" || tool3 === "shell" || tool3 === "bash")
             act.checks++;
         }
         const crewAct = crewTurnActivity.get(sessionID);
