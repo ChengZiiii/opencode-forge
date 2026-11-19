@@ -604,3 +604,131 @@ cross-read.
 
 - **WHEN** the plugin initializes and the journal holds a retry-pending record
 - **THEN** the retry decision resumes — the child respawns when attempts remain, otherwise the record terminates honestly
+
+### Requirement: Runtime model pin on v2 hosts
+
+On a v2 host, a forge-family agent whose pool def pins `model`
+(`"provider/model"`) `SHALL` serve every request on the pinned model:
+the context-injection path `SHALL` rewrite the payload's `model`
+(providerID + id/modelID spellings, variant dropped) to the pinned
+identity, resolved fresh per request (hot-apply contract). The agent
+draft `SHALL` still omit `model` (the host encoder rejects it).
+
+#### Scenario: Pinned pool agent serves on the pinned model
+
+- GIVEN a pool def pinning `model: "glm-coding-worker/glm-5.3"` on a v2
+  host whose default model differs
+- WHEN the pinned agent's session builds a request
+- THEN the served request uses the pinned model
+- AND the assistant message record names the pinned model
+
+#### Scenario: Unpinned agents keep the resolved model
+
+- WHEN a forge-family agent's def has no `model` pin
+- THEN the context path leaves the payload model untouched
+
+#### Scenario: Malformed pin skips silently
+
+- WHEN a def's `model` does not parse as `"provider/model"`
+- THEN no rewrite happens and no error surfaces
+
+### Requirement: Sandbox full-chain proof
+
+The change `SHALL` be verified on the live 2.3.2 sandbox: a pool agent
+with a model pin, dispatched as a subagent, completes a turn served by
+the pinned model (asserted on the served message record).
+
+#### Scenario: Dispatched pinned subagent serves on the pin
+
+- WHEN a primary dispatches a task to a pinned pool agent on the sandbox
+- THEN the subagent's assistant record names the pinned model
+
+### Requirement: Dispatch outcome honesty on result-stream loss
+
+The dispatch layer `SHALL` classify every dispatch outcome as exactly
+one of `completed`, `failed`, or `stream-lost/unknown`. A result stream
+that breaks before a final report arrives `SHALL` classify as
+`stream-lost/unknown` and `SHALL NOT` produce a terminal verdict:
+no exit-1 death certificate, no "no reportable final message" obituary.
+The surfaced message `SHALL` state that the result stream was lost and
+that the child state is unknown (possibly still running).
+
+#### Scenario: Result stream breaks mid-dispatch
+
+- WHEN the child session's result stream breaks (e.g. network
+  `Connection reset`) before a final report arrives
+- THEN the dispatch outcome is `stream-lost/unknown`
+- AND the surfaced message states "result stream lost" and that the
+  child state is UNKNOWN (possibly still running)
+- AND no exit-1 / death / terminal obituary wording is produced
+
+### Requirement: Ledger completeness across outcome classes
+
+The dispatch layer `SHALL` write a ledger entry for every dispatch
+outcome class, including `stream-lost/unknown`, carrying the
+last-observed activity timestamp.
+
+#### Scenario: Ledger entry on stream loss
+
+- WHEN a dispatch's result stream breaks before a final report
+- THEN the job ledger records a `stream-lost/unknown` entry carrying
+  the last-observed activity timestamp
+- AND `forge_jobs list` surfaces the dispatch as
+  `stream-lost/unknown`
+
+### Requirement: Report-file delivery contract
+
+The dispatch prompt template `SHALL` include a standing report-file
+delivery instruction naming the caller-provided report path
+(`reports/<task>-report.md` convention), so a worker's final report
+survives the primary's view loss.
+
+#### Scenario: Worker report survives view loss
+
+- WHEN a dispatched worker completes its work after the primary's
+  result stream was lost
+- THEN the worker's final report is available at the agreed report
+  path in the workspace
+- AND the primary can resolve the dispatch outcome by reading that
+  file without re-dispatching
+
+### Requirement: Sync wait-budget expiry presented as a notice
+
+The sync dispatch layer `SHALL` present a wait-budget expiry handoff as
+a normal notification — informational styling with wording naming the
+outcome ("sync wait budget ended — the dispatch continues in the
+background; collect with `forge_jobs`") — and `SHALL NOT` render it
+through the error channel.
+
+#### Scenario: Wait budget expires while child is healthy
+
+- WHEN a synchronous dispatch's wait budget expires while the child
+  session is still running
+- THEN the handoff surfaces as an informational notice naming the
+  outcome and the collection path (`forge_jobs`)
+- AND no error-channel rendering / alarm styling is used
+
+### Requirement: Genuine dispatch failures keep error presentation
+
+Genuine sync dispatch failures `SHALL` keep error-class presentation:
+dispatch refusal (gates, pool caps) and evidence-backed worker errors
+render through the error channel as before.
+
+#### Scenario: Refusal and evidence-backed failure stay errors
+
+- WHEN a dispatch is refused by a gate/pool cap, or the worker fails
+  with recorded evidence
+- THEN the message renders through the error channel unchanged
+
+### Requirement: Budget-expiry notice carries retrieval pointers
+
+The budget-expiry notice `SHALL` carry the retrieval pointers previously
+carried by the error message — job id, task handle, and report path
+when present — so the caller can collect the result without
+re-dispatching.
+
+#### Scenario: Notice is actionable
+
+- WHEN the budget-expiry notice surfaces
+- THEN it includes the job id (and task handle / report path when
+  present)
