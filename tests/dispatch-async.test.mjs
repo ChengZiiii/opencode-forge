@@ -778,3 +778,115 @@ test("resolveRetryBackoffMs: fixed 10 s default; test-seam override; junk → de
   assert.equal(resolveRetryBackoffMs({ FORGE_DISPATCH_RETRY_BACKOFF_MS: "abc" }), 10_000)
   assert.equal(resolveRetryBackoffMs({ FORGE_DISPATCH_RETRY_BACKOFF_MS: "-1" }), 10_000)
 })
+
+// ---------------------------------------------------------------------------
+// dispatch-stream-loss-honesty task 1: the sustained view-loss detector —
+// pollChild classifies a fully-unreadable poll view (status AND messages
+// both failing) sustained across the streak as `stream-lost` — an honest
+// UNKNOWN, never a terminal verdict on the child. Single unreadable ticks
+// are noise (the existing active posture); a status-only failure is the
+// SSE-cache-empty case (active, keep polling); any readable tick resets
+// the streak.
+
+const throwingStatus = () => {
+  throw new Error("Connection reset")
+}
+
+test("stream-lost: a sustained FULLY-unreadable view (status AND messages) classifies stream-lost at the threshold", async () => {
+  const { client } = fakeClient({
+    status: throwingStatus,
+    messages: () => {
+      throw new Error("Connection reset")
+    },
+  })
+  const { seams } = fakeTime()
+  const result = await pollChild(
+    client,
+    { sessionID: "ses_vl1", intervalMs: 1, timeoutMs: 60_000, viewLossTicks: 3 },
+    seams,
+  )
+  assert.equal(result.status, "stream-lost", "the sustained unreadable view classifies stream-lost")
+  assert.equal(result.sessionID, "ses_vl1")
+  assert.ok(result.polls >= 3, "the return carries the poll count")
+})
+
+test("stream-lost: a single unreadable tick is noise — recovery keeps polling to the honest timeout", async () => {
+  let statusCalls = 0
+  const { client } = fakeClient({
+    status: () => {
+      statusCalls++
+      if (statusCalls === 1) throwingStatus()
+      return { data: {} } // readable from tick 2: child idle-ish, no report
+    },
+    messages: () => {
+      if (statusCalls === 1) throw new Error("Connection reset")
+      return []
+    },
+  })
+  const { seams } = fakeTime()
+  const result = await pollChild(
+    client,
+    { sessionID: "ses_vl2", intervalMs: 1, timeoutMs: 50, viewLossTicks: 3 },
+    seams,
+  )
+  assert.equal(result.status, "timeout", "one lost tick never classifies stream-lost — the honest timeout is the bound")
+  assert.equal(result.sessionID, "ses_vl2")
+})
+
+test("stream-lost: a status-ONLY failure is the active posture (SSE cache empty) — never stream-lost", async () => {
+  const { client } = fakeClient({
+    status: throwingStatus,
+    // messages READABLE: the view is half-alive — the detector demands BOTH.
+    messages: () => [],
+  })
+  const { seams } = fakeTime()
+  const result = await pollChild(
+    client,
+    { sessionID: "ses_vl3", intervalMs: 1, timeoutMs: 50, viewLossTicks: 3 },
+    seams,
+  )
+  assert.equal(result.status, "timeout", "a status-only failure keeps the active posture to the timeout")
+})
+
+test("stream-lost: the streak RESETS on any readable tick — broken-recover-broken never accumulates", async () => {
+  let statusCalls = 0
+  const { client } = fakeClient({
+    status: () => {
+      statusCalls++
+      // Every THIRD tick readable: t1,t2 unreadable (2), t3 readable (reset),
+      // t4,t5 unreadable (2), t6 readable... the streak never accumulates.
+      if (statusCalls % 3 !== 0) throwingStatus()
+      return { data: {} }
+    },
+    messages: () => {
+      if (statusCalls % 3 !== 0) throw new Error("Connection reset")
+      return []
+    },
+  })
+  const { seams } = fakeTime()
+  const result = await pollChild(
+    client,
+    { sessionID: "ses_vl4", intervalMs: 1, timeoutMs: 50, viewLossTicks: 3 },
+    seams,
+  )
+  assert.equal(result.status, "timeout", "a resetting streak never reaches the threshold — timeout, not stream-lost")
+})
+
+test("stream-lost: the streak SURVIVES slice boundaries via the shared stability state", async () => {
+  const { client } = fakeClient({
+    status: throwingStatus,
+    messages: () => {
+      throw new Error("Connection reset")
+    },
+  })
+  const { seams } = fakeTime()
+  // Slice 1: threshold 8 — returns timeout (slice deadline) with the streak
+  // carried in the SHARED state; slice 2 continues the SAME state object and
+  // crosses the raised threshold after 4 more ticks (not 9).
+  const stability = { stableTicks: 0 }
+  const slice1 = await pollChild(client, { sessionID: "ses_vl5", intervalMs: 1, timeoutMs: 5, viewLossTicks: 8, stability }, seams)
+  assert.equal(slice1.status, "timeout", "slice 1 ends at its slice deadline")
+  assert.equal(stability.viewLossTicks, 5, "the shared state carries the sustained streak across slices")
+  const slice2 = await pollChild(client, { sessionID: "ses_vl5", intervalMs: 1, timeoutMs: 60_000, viewLossTicks: 9, stability }, seams)
+  assert.equal(slice2.status, "stream-lost", "slice 2 crosses the (raised) threshold by continuing the streak")
+})

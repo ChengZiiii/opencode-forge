@@ -659,10 +659,28 @@ the single `[forge:dispatch-complete]` wake with the final report arrives at
 true terminal. While the child runs past each notification interval
 (default 10 minutes, tunable — see the env knobs below), a non-terminal
 `[forge:dispatch-progress]` notice keeps the owner informed — informational
-and idle-only, it never replaces or consumes the completion wake. A child
-that stays continuously idle with no reportable final message across a full
-notification interval ends honestly as a no-reportable-final-message finding
-naming the child session id.
+and idle-only, it never replaces or consumes the completion wake.
+
+**Dispatch outcome honesty (three outcome classes).** Every dispatch
+settles as exactly one of `completed` (exit 0, the real final report),
+`failed` (exit 1, an explicit error or a deliberate stale/abort action), or
+`stream-lost/unknown` (exit-null settle — the dispatch VIEW broke before a
+final report arrived: the poll view was unreadable for a sustained streak,
+or the result stream ended without a final report across a full
+notification interval). A stream-lost outcome NEVER files a death
+certificate: the wake and the ledger say "result stream lost; child state
+UNKNOWN (possibly still running)" and name the agreed report file — the
+child stays inspectable and natively abortable in the host TUI, and the
+journal records `stream-lost/unknown` with the last-observed activity
+timestamp.
+
+**Report-file delivery contract.** Every dispatch prompt carries a standing
+line naming the agreed report path `reports/<task-id>-report.md`
+(workspace-relative); workers with write access write their final report
+there in addition to replying on the result stream (readonly workers skip
+it — the reply is the report). When a view is lost, that file is the
+ground-truth recovery channel: read it (its mtime shows whether the worker
+landed its report) BEFORE considering a re-dispatch.
 
 **Dispatch poll env knobs** (read at call time; invalid values fall back to
 the default):

@@ -377,7 +377,7 @@ test("recovery: live dispatch transitions journal; the terminal record REDACTS t
   assert.ok(started, "the dispatch journaled")
   assert.equal(started.state, "started", "the started transition is the latest for the id")
   assert.ok(typeof started.childSessionId === "string" && started.childSessionId.startsWith("ses_child_"), "the child session id rides the started record")
-  assert.equal(started.prompt, "journal me", "the prompt is RETAINED while non-terminal (recovery's only source)")
+  assert.ok(started.prompt?.startsWith("journal me"), "the prompt is RETAINED while non-terminal (recovery's only source; the report-file contract line appends)")
   // Owner death harvest → the record terminalizes with the prompt redacted
   // (the poller observes the registry kill at its next slice boundary).
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_live1" } } } })

@@ -177,8 +177,8 @@ test("knobs: ASYNC_DISPATCH_CAP stays 3; FORGE_DISPATCH_QUEUE_MAX default 10 wit
   assert.equal(ASYNC_DISPATCH_CAP, 3, "the cap number itself is unchanged (3 running)")
   assert.equal(resolveDispatchQueueMax({}), 10, "default queue bound 10")
   assert.equal(resolveDispatchQueueMax({ FORGE_DISPATCH_QUEUE_MAX: "2" }), 2, "valid override")
-  assert.equal(resolveDispatchQueueMax({ FORGE_DISPATCH_QUEUE_MAX: "nope" }), 10, "invalid â†?default")
-  assert.equal(resolveDispatchQueueMax({ FORGE_DISPATCH_QUEUE_MAX: "-3" }), 10, "non-positive â†?default")
+  assert.equal(resolveDispatchQueueMax({ FORGE_DISPATCH_QUEUE_MAX: "nope" }), 10, "invalid ï¿½?default")
+  assert.equal(resolveDispatchQueueMax({ FORGE_DISPATCH_QUEUE_MAX: "-3" }), 10, "non-positive ï¿½?default")
 })
 
 test("queue: the 4th wish returns a QUEUED handle immediately (metadata queued:true, position note, no child yet)", async (t) => {
@@ -205,11 +205,11 @@ test("queue: the 4th wish returns a QUEUED handle immediately (metadata queued:t
   // (the journal is the only prompt source after a restart).
   const recs = latestRecords(journal.files.get(join(dir, ".opencode", "forge", "dispatch-log.jsonl")))
   assert.equal(recs.get(wishId)?.state, "queued", "queued transition journaled")
-  assert.equal(recs.get(wishId)?.prompt, "p3", "prompt retained while queued")
+  assert.ok(recs.get(wishId)?.prompt?.startsWith("p3"), "prompt retained while queued (the report-file contract line appends)")
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_q1" } } } })
 })
 
-test("queue: 4th wish spawns on slot release (setChildState seam) â€?spawned-from-queue notice + journal started", async (t) => {
+test("queue: 4th wish spawns on slot release (setChildState seam) ï¿½?spawned-from-queue notice + journal started", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const journal = makeJournalFs()
   const mk = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
@@ -232,16 +232,16 @@ test("queue: 4th wish spawns on slot release (setChildState seam) â€?spawned-fro
   assert.deepEqual(spawn.body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "the async question deny is applied on the pump spawn")
   // The queued-start progress notice announces the spawn.
   await waitFor(() => h.__forgeSubagentsTest.dispatchProgress("ses_q2").some((s) => s.includes(`wish ${wishId} spawned from the queue`)), "the queued-start notice parks")
-  // Journal: queued â†?started transitions for the wish id.
+  // Journal: queued ï¿½?started transitions for the wish id.
   const recs = latestRecords(journal.files.get(join(dir, ".opencode", "forge", "dispatch-log.jsonl")))
-  assert.equal(recs.get(wishId)?.state, "started", "the wish's journal record advanced queued â†?started")
+  assert.equal(recs.get(wishId)?.state, "started", "the wish's journal record advanced queued ï¿½?started")
   assert.ok(recs.get(wishId)?.childSessionId, "the started record carries the child session id")
   // The wish is now a normal tracked dispatch (in the registry, counted by the cap).
   assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.jobId === wishId).length, 1, "the spawned wish is tracked")
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_q2" } } } })
 })
 
-test("queue: spawn-time roster vanish â†?honest error wake, the wish never spawns", async (t) => {
+test("queue: spawn-time roster vanish ï¿½?honest error wake, the wish never spawns", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const journal = makeJournalFs()
   const mk = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
@@ -256,7 +256,7 @@ test("queue: spawn-time roster vanish â†?honest error wake, the wish never spawn
   const wishId = r4.output.match(/task id: (\S+)/)[1]
   // The roster vanishes while the wish is queued (delete the pool file).
   writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "dq", agents: {} }))
-  mk.setChildState("ses_child_1", "done") // slot release â†?pump â†?re-check fails
+  mk.setChildState("ses_child_1", "done") // slot release ï¿½?pump ï¿½?re-check fails
   await waitFor(() => h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_q3").length === 0, "the wish left the queue")
   assert.equal(mk.calls.create.length, 3, "the vanished-roster wish NEVER spawns")
   // Honest error wake on idle.
@@ -273,7 +273,7 @@ test("queue: spawn-time roster vanish â†?honest error wake, the wish never spawn
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_q3" } } } })
 })
 
-test("queue: draft tightened while queued â†?spawn-time refusal with the draft gate copy (honest wake)", async (t) => {
+test("queue: draft tightened while queued ï¿½?spawn-time refusal with the draft gate copy (honest wake)", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const journal = makeJournalFs()
   const mk = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
@@ -281,18 +281,18 @@ test("queue: draft tightened while queued â†?spawn-time refusal with the draft g
   t.after(() => h.dispose?.())
   h.__forgeSubagentsTest.setDispatchJournalFs(journal.factory)
   await h.config(emptyCfg())
-  // Queue a WRITE-target wish (no draft at call time â€?passes).
+  // Queue a WRITE-target wish (no draft at call time ï¿½?passes).
   for (let i = 0; i < 3; i++) {
     await h.tool.task.execute({ subagent_type: "forge-dq-research", prompt: `p${i}`, run_in_background: true }, allowCtx("ses_q4", dir))
   }
   const r4 = await h.tool.task.execute({ subagent_type: "forge-dq-builder", prompt: "build it", run_in_background: true, description: "late build" }, allowCtx("ses_q4", dir))
   const wishId = r4.output.match(/task id: (\S+)/)[1]
-  // A draft lands while the wish is queued â†?the write target tightens.
+  // A draft lands while the wish is queued ï¿½?the write target tightens.
   await h.tool.plan_write.execute(
     { goal: "drafting late", context: "c", approach: "a", tasks: ["t1"], risks: "r", acceptance: ["a1"] },
     allowCtx("ses_q4", dir),
   )
-  mk.setChildState("ses_child_1", "done") // slot release â†?pump â†?draft re-check refuses
+  mk.setChildState("ses_child_1", "done") // slot release ï¿½?pump ï¿½?draft re-check refuses
   await waitFor(() => h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_q4").length === 0, "the wish left the queue")
   assert.equal(mk.calls.create.length, 3, "the tightened wish NEVER spawns")
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_q4" } } })
@@ -301,7 +301,7 @@ test("queue: draft tightened while queued â†?spawn-time refusal with the draft g
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_q4" } } } })
 })
 
-test("queue: crew pending belt registered while queued â†?spawn-time refusal with the PENDING copy (honest wake)", async (t) => {
+test("queue: crew pending belt registered while queued ï¿½?spawn-time refusal with the PENDING copy (honest wake)", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const journal = makeJournalFs()
   const mk = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
@@ -314,9 +314,9 @@ test("queue: crew pending belt registered while queued â†?spawn-time refusal wit
   }
   const r4 = await h.tool.task.execute({ subagent_type: "forge-dq-research", prompt: "queued then crewed", run_in_background: true }, allowCtx("ses_q5", dir))
   const wishId = r4.output.match(/task id: (\S+)/)[1]
-  // A pending crew registers while the wish is queued â€?the belt tightens.
+  // A pending crew registers while the wish is queued ï¿½?the belt tightens.
   await h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, allowCtx("ses_q5", dir))
-  mk.setChildState("ses_child_1", "done") // slot release â†?pump â†?crew belt refuses
+  mk.setChildState("ses_child_1", "done") // slot release ï¿½?pump ï¿½?crew belt refuses
   await waitFor(() => h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_q5").length === 0, "the wish left the queue")
   assert.equal(mk.calls.create.length, 3, "the belted wish NEVER spawns")
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_q5" } } })
@@ -349,7 +349,7 @@ test("queue: owner death flushes queued wishes WITHOUT spawning and terminalizes
   assert.equal(rec.prompt, undefined, "prompt redacted on the terminal record")
 })
 
-test("queueÃ—retry: the retry keeps its slot â€?queued wishes stay behind until the retry chain settles", async (t) => {
+test("queueÃ—retry: the retry keeps its slot ï¿½?queued wishes stay behind until the retry chain settles", async (t) => {
   process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS = "30"
   t.after(() => {
     delete process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS
@@ -368,14 +368,14 @@ test("queueÃ—retry: the retry keeps its slot â€?queued wishes stay behind until 
   const r4 = await h.tool.task.execute({ subagent_type: "forge-dq-research", prompt: "behind the retry", run_in_background: true, description: "wishD" }, allowCtx("ses_q7", dir))
   const wishId = r4.output.match(/task id: (\S+)/)[1]
   assert.equal(mk.calls.create.length, 3)
-  // Wish A's child dies in a TRANSIENT error â†?the retry chain holds the
+  // Wish A's child dies in a TRANSIENT error ï¿½?the retry chain holds the
   // slot (the registry row stays running); the queued wish must NOT jump.
   mk.setChildState("ses_child_1", "error")
   await waitFor(() => mk.calls.create.length === 4, "the retry respawned (create #4)")
   assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_q7").length, 1, "the queued wish stays behind the retry")
   assert.ok(!mk.calls.create.some((c) => String(c.body.title).includes("wishD")), "the queued wish has not spawned while the retry holds the slot")
-  // The retry child dies transiently again â€?attempt cap (2) reached â†?the
-  // chain settles â†?the slot truly releases â†?the wish spawns NOW.
+  // The retry child dies transiently again ï¿½?attempt cap (2) reached ï¿½?the
+  // chain settles ï¿½?the slot truly releases ï¿½?the wish spawns NOW.
   mk.setChildState("ses_child_4", "error")
   await waitFor(() => mk.calls.create.some((c) => String(c.body.title).includes("wishD")), "the wish spawns after the retry chain settles")
   const wishSpawnIdx = mk.calls.create.findIndex((c) => String(c.body.title).includes("wishD"))

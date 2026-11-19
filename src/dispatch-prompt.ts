@@ -22,7 +22,24 @@ export const WORKER_MANDATES = [
   "- Run every search through the forge_grep/forge_glob tools first — the builtin grep/glob tools are fallback only. forge_grep/forge_glob see through symlinks/junctions and dot-directories because follow and hidden are on by default.",
   "- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial.",
   "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced).",
+  "- Report-file delivery (reliability contract): when the dispatch prompt names a report path (convention: `reports/<task>-report.md`, workspace-relative), write your final report there in addition to replying on the result stream — the caller may need to recover your result from that file if the live result stream is lost. Readonly workers skip this: the reply is the report.",
 ].join("\n")
+
+/** The standing report-file delivery line appended to dispatch prompts (idempotent — see withReportDelivery). */
+export const REPORT_DELIVERY_LINE = (taskId: string): string =>
+  `Report delivery contract (reliability): in addition to replying on the result stream, write your final report to \`reports/${taskId}-report.md\` (workspace-relative; create the directory if needed) — the caller may need to recover your result from that file if the live result stream is lost. If your toolset has no file write access, skip this: your reply is the report.`
+
+/**
+ * Append the standing report-file delivery contract to a dispatch prompt,
+ * naming the concrete caller-provided report path. IDEMPOTENT by
+ * construction: any previously appended contract line (from a journal round
+ * trip or a re-wrap) is stripped first, so wrapping the same prompt twice
+ * yields exactly one contract line with the CURRENT task id.
+ */
+export function withReportDelivery(promptText: string, taskId: string): string {
+  const stripped = promptText.replace(/\n+Report delivery contract \(reliability\):[\s\S]*$/, "")
+  return `${stripped}\n\n${REPORT_DELIVERY_LINE(taskId)}`
+}
 
 const READONLY_DISCIPLINE = (agent: string) =>
   `You are forge-${agent}, a readonly worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`

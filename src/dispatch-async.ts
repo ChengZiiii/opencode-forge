@@ -207,6 +207,12 @@ export type PollInput = {
    * iteration (belt, not a listener: poll slices are short).
    */
   signal?: AbortSignal
+  /**
+   * Sustained view-loss threshold in consecutive fully-unreadable ticks
+   * (dispatch-stream-loss-honesty). Default DEFAULT_VIEW_LOSS_TICKS; tests
+   * pass a small value to drive the classification deterministically.
+   */
+  viewLossTicks?: number
 }
 
 export type PollResult =
@@ -214,6 +220,7 @@ export type PollResult =
   | { status: "error"; error: string; polls: number }
   | { status: "timeout"; sessionID: string; timeoutMs: number; polls: number }
   | { status: "aborted"; sessionID: string; polls: number }
+  | { status: "stream-lost"; sessionID: string; polls: number }
 
 export const DEFAULT_POLL_INTERVAL_MS = 1000
 export const DEFAULT_POLL_TIMEOUT_MS = 600000
@@ -487,7 +494,18 @@ export const TERMINAL_STABILITY_TICKS = 3
  * ignore it (their own wait window applies), so pollChild's return contract
  * is unchanged.
  */
-export type TerminalStabilityState = { stableTicks: number; textlessIdleSince?: number }
+export type TerminalStabilityState = { stableTicks: number; textlessIdleSince?: number; viewLossTicks?: number }
+
+/**
+ * Sustained view loss (dispatch-stream-loss-honesty): how many CONSECUTIVE
+ * poll ticks with BOTH the status fetch AND the messages fetch unreadable
+ * before pollChild classifies the dispatch view as lost (`stream-lost`) and
+ * returns — an HONEST UNKNOWN, never a terminal verdict on the child (which
+ * may still be running; only the layer's VIEW broke). A single failed tick
+ * is noise; the streak survives poll-slice boundaries via the shared
+ * stability state and resets on any readable tick.
+ */
+export const DEFAULT_VIEW_LOSS_TICKS = 30
 
 function latestAssistant(messages: SessionMessageLike[]): SessionMessageLike | undefined {
   let best: SessionMessageLike | undefined
@@ -573,6 +591,7 @@ export async function pollChild(
     }
 
     let messages: SessionMessageLike[] = []
+    let messagesFailed = false
     try {
       const msgResult = await client.session.messages({
         path: { id: input.sessionID },
@@ -580,9 +599,28 @@ export async function pollChild(
       })
       if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
         messages = msgResult.data
+      } else {
+        messagesFailed = true
       }
     } catch {
       messages = []
+      messagesFailed = true
+    }
+
+    // Sustained view loss (dispatch-stream-loss-honesty): the dispatch
+    // layer's ENTIRE view (status + messages) unreadable for the sustained
+    // streak is a VIEW loss, not a child death — classify honestly and
+    // return; the wiring surfaces stream-lost/unknown (no exit-1, no
+    // obituary, ledger entry with the last-observed activity timestamp).
+    // Any readable tick resets the streak (a recovered view keeps polling).
+    const viewLossLimit = input.viewLossTicks ?? DEFAULT_VIEW_LOSS_TICKS
+    if (statusMap === undefined && messagesFailed) {
+      stability.viewLossTicks = (stability.viewLossTicks ?? 0) + 1
+      if (stability.viewLossTicks >= viewLossLimit) {
+        return { status: "stream-lost", sessionID: input.sessionID, polls }
+      }
+    } else {
+      stability.viewLossTicks = 0
     }
 
     const last = latestAssistant(messages)

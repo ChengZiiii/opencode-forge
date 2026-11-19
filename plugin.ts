@@ -79,6 +79,7 @@ import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput,
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
 import { DEFAULT_POLL_INTERVAL_MS, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
 import { buildRetryPrompt, classifyDispatchError, resolveMaxAttempts, resolveRetryBackoffMs } from "./src/dispatch-retry.ts"
+import { withReportDelivery } from "./src/dispatch-prompt.ts"
 import {
   createDispatchJournal,
   resolveJournalMax,
@@ -770,11 +771,20 @@ const idleJobSessions = new Set<string>()
 // Dispatch marker riding async-dispatch registry entries (kind=dispatch,
 // async-dispatch design D3): the entry is a job-manager registry row, not a
 // process — the wake text carries the child's final assistant message inline.
-type DispatchJobMeta = { agentID: string; childSessionID: string; description: string }
+type DispatchJobMeta = { agentID: string; childSessionID: string; description: string; outcome?: string }
 
 function jobWakeText(job: Job): string {
   const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
   if (dispatch) {
+    // dispatch-stream-loss-honesty: the stream-lost/unknown wake states the
+    // view loss and the UNKNOWN child state — never a terminal verdict.
+    if (dispatch.outcome === "stream-lost/unknown") {
+      return [
+        `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — RESULT STREAM LOST (task ${job.id}, child session ${dispatch.childSessionID}): the dispatch view broke before a final report arrived; child state UNKNOWN (possibly still running).`,
+        `Last observation:\n${job.tail.slice(-2500) || "(no output)"}`,
+        `Ground-truth recovery: read reports/${job.id}-report.md in the workspace BEFORE considering a re-dispatch; the child session stays inspectable and natively abortable in the host TUI.`,
+      ].join("\n")
+    }
     return [
       `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
       `Final report:\n${job.tail.slice(-2500) || "(no output)"}`,
@@ -2656,7 +2666,14 @@ async function runAsyncDispatchPoller(
   let startedAt = Date.now()
   let lastNotifiedMultiple = 0
   let text = ""
-  let exitCode = 0
+  let exitCode: number | null = 0
+  // dispatch-stream-loss-honesty: the stream-lost/unknown outcome class —
+  // the dispatch VIEW broke (sustained unreadable poll view, or the result
+  // stream ended without a final report); the child's true state is
+  // UNKNOWN (possibly still running). Never an exit-1 death certificate:
+  // the registry row settles exit-null and the ledger records
+  // stream-lost/unknown with the last-observed activity timestamp.
+  let streamLost = false
   // Terminal-inference soundness is owned by pollChild; the stability
   // counter (and the textless-idle floor streak) live HERE so they survive
   // poll-slice boundaries (the async path inherits the same soundness — a
@@ -2791,6 +2808,21 @@ async function runAsyncDispatchPoller(
       exitCode = 1
       break
     }
+    // Sustained view loss (dispatch-stream-loss-honesty): the ENTIRE poll
+    // view (status + messages) was unreadable for the sustained streak —
+    // the layer's view broke, the child's state is UNKNOWN. Honest
+    // classification, no terminal verdict, the child stays alive and
+    // natively abortable; the report file is the recovery channel.
+    if (poll.status === "stream-lost") {
+      streamLost = true
+      const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString()
+      text =
+        `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` +
+        `the dispatch view (status + messages) was unreadable for the sustained poll streak; last observed activity ${lastObserved}. ` +
+        `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` +
+        `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`
+      break
+    }
     // slice timeout: a registry kill (owner session ended / dispose) stops
     // the watch — no wake fires for a killed row (markTerminal first-wins).
     if (job.state !== "running") {
@@ -2802,15 +2834,24 @@ async function runAsyncDispatchPoller(
       )
       return
     }
-    // Textless-idle floor (design D6): a child continuously not-active for a
+    // Textless-idle floor (design D6, reclassified by
+    // dispatch-stream-loss-honesty): a child continuously not-active for a
     // full notification interval whose latest finished assistant message
-    // still lacks a truthy finish or non-empty text ends honestly — the
-    // bounded exit for truly-gone children, NOT a dispatch-anchored clock.
+    // still lacks a truthy finish or non-empty text is a RESULT STREAM that
+    // ended without a final report — classified stream-lost/unknown: the
+    // child's state is UNKNOWN (possibly still running — the field incident
+    // proved this exit fires on live children), never a death certificate.
     // Any busy reading resets the streak inside pollChild, so a RUNNING
-    // child can never reach this.
+    // child with a readable view can never reach this.
     if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
-      text = `(child session ${childSessionID} ended without a reportable final message — inspectable/abortable in the host TUI)`
-      exitCode = 1
+      streamLost = true
+      const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString()
+      text =
+        `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` +
+        `the result stream ended before a final report arrived (last observed activity ${lastObserved}); ` +
+        `the dispatch view cannot confirm completion. ` +
+        `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` +
+        `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`
       break
     }
     // Activity-stale reap (fold B) — only on the RUNNING axis (a textless
@@ -2875,6 +2916,14 @@ async function runAsyncDispatchPoller(
   }
   if (attempt > 1) text += `\n(after ${attempt} attempt(s))`
   jobManager.appendOutput(job, text)
+  // stream-lost/unknown: exit-null settle (never an exit-1 death
+  // certificate) + the outcome marker rides the dispatch meta so the
+  // completion wake words itself honestly (jobWakeText).
+  if (streamLost) {
+    exitCode = null
+    const meta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
+    if (meta) meta.outcome = "stream-lost/unknown"
+  }
   jobManager.markTerminal(job, "exited", exitCode)
   dispatchTasks.delete(job.id)
   // Fold D: the terminal transition releases the session's async slot —
@@ -2888,8 +2937,10 @@ async function runAsyncDispatchPoller(
       workspace: retryCtx.directory,
       description: dispatch?.description ?? "",
     },
-    exitCode === 0 ? "completed" : "error",
-    text.split("\n")[0].slice(0, 200),
+    streamLost ? "stream-lost/unknown" : exitCode === 0 ? "completed" : "error",
+    streamLost
+      ? `${text.split("\n")[0].slice(0, 200)} — last observed activity ${new Date(stale.lastActivity ?? startedAt).toISOString()}`
+      : text.split("\n")[0].slice(0, 200),
   )
   void pumpDispatchQueue(client, job.ownerSession)
 }
@@ -2913,7 +2964,13 @@ const taskDispatchTool = tool({
   execute: async (args, context) => {
     noteToolAgent(context)
     const target = String(args.subagent_type ?? "").trim()
-    const prompt = String(args.prompt ?? "")
+    const promptRaw = String(args.prompt ?? "")
+    // The dispatch's stable id, allocated up front so the report-file
+    // delivery contract (dispatch-stream-loss-honesty) can name its
+    // concrete path in the child's prompt — the SAME id serves the queued,
+    // async, and sync branches (one newJobId() per dispatch).
+    const dispatchId = newJobId()
+    const prompt = promptRaw ? withReportDelivery(promptRaw, dispatchId) : ""
     const runInBackground = args.run_in_background === true
     if (!target || !prompt) throw new Error("[forge:dispatch] subagent_type and prompt are both required.")
     const forgeTarget = target.toLowerCase().startsWith("forge-")
@@ -2992,7 +3049,7 @@ const taskDispatchTool = tool({
       // Fold D: the queued handle returns immediately (like an async
       // handle) with queued: true panel metadata and a queue position note;
       // the pump spawns it when a slot frees.
-      const jobId = newJobId()
+      const jobId = dispatchId
       const queue = dispatchQueues.get(context.sessionID) ?? []
       const position = queue.length + 1
       queue.push({ jobId, agentID: target, ownerSession: context.sessionID, description, prompt, directory: state.worktree, questionDeny: true, enqueuedAt: Date.now() })
@@ -3035,7 +3092,7 @@ const taskDispatchTool = tool({
     // Fold E: journal the dispatch-time transition BEFORE the child exists —
     // a crash between create and spawn leaves this non-terminal record, which
     // recovery treats with queued semantics.
-    const asyncJobId = runInBackground ? newJobId() : ""
+    const asyncJobId = runInBackground ? dispatchId : ""
     if (asyncJobId) {
       journalTransition(state.worktree, {
         id: asyncJobId,
@@ -3090,8 +3147,8 @@ const taskDispatchTool = tool({
       const retryBackoffSync = resolveRetryBackoffMs()
       const syncStability: TerminalStabilityState = { stableTicks: 0 }
       const syncStale: StaleSweepState = { lastActivity: null, staleNotified: false }
-      taskMetadata.taskId = newJobId()
-      const syncJobId = taskMetadata.taskId
+      taskMetadata.taskId = dispatchId
+      const syncJobId = dispatchId
       // Fold E: the sync path journals the same transitions (dispatched →
       // started here; terminal at each return below; retry-pending/started
       // in the retry branch; the armed tracker terminalizes at its settle).
@@ -3128,6 +3185,7 @@ const taskDispatchTool = tool({
       let syncStartedAt = Date.now()
       const waitStartedAt = Date.now()
       let syncCompleted = false
+      let syncStreamLost = false
       let syncError: string | null = null
       const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1"
       let syncSliceCount = 0
@@ -3306,6 +3364,13 @@ const taskDispatchTool = tool({
           }
           continue syncWait
         }
+        // Sustained view loss (dispatch-stream-loss-honesty) on the sync
+        // path: the poll view broke — never misread as completion; break
+        // out to the honest arm-and-throw settle below.
+        if (poll.status === "stream-lost") {
+          syncStreamLost = true
+          break syncWait
+        }
         syncCompleted = true
         break syncWait
       }
@@ -3336,23 +3401,39 @@ const taskDispatchTool = tool({
       // (design D3): the async cap governs new async dispatch DECISIONS,
       // not the reality of an already-running child — refusing to track
       // it would change nothing except guaranteeing the result is lost.
-      const job = jobManager.create({
-        id: syncJobId,
-        cmd: `dispatch ${target}: ${description} (sync timeout, armed)`,
-        worktree: state.worktree,
-        ownerSession: context.sessionID,
-        logPath: join(jobLogDir, "dispatch", `${syncJobId}.txt`),
-        notify: true,
-        // Owner-death harvest parity: the manager's kill() on session end
-        // aborts the child via the SDK and ledgers the orphan.
-        killTree: () => {
-          void abortChild(client, childSessionID)
-        },
-      })
-      ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID, description }
-      dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description })
-      void runAsyncDispatchPoller(client, job, childSessionID, { prompt, directory: state.worktree, questionDeny: false })
-      context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
+      // Shared by BOTH honest wait-ends: the wait-budget timeout AND the
+      // sustained view loss (dispatch-stream-loss-honesty) — a lost view
+      // arms the same tracker (a recovered view + finish still delivers
+      // the wake; a sustained loss settles as a stream-lost wake).
+      const armSyncTracker = (): void => {
+        const job = jobManager.create({
+          id: syncJobId,
+          cmd: `dispatch ${target}: ${description} (sync wait ended, armed)`,
+          worktree: state.worktree,
+          ownerSession: context.sessionID,
+          logPath: join(jobLogDir, "dispatch", `${syncJobId}.txt`),
+          notify: true,
+          // Owner-death harvest parity: the manager's kill() on session end
+          // aborts the child via the SDK and ledgers the orphan.
+          killTree: () => {
+            void abortChild(client, childSessionID)
+          },
+        })
+        ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID, description }
+        dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description })
+        void runAsyncDispatchPoller(client, job, childSessionID, { prompt, directory: state.worktree, questionDeny: false })
+        context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
+      }
+      if (syncStreamLost) {
+        armSyncTracker()
+        const attemptNoteLost = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; tracking continues in the armed tracker.` : ""
+        throw new Error(
+          `[forge:dispatch] result stream lost before a final report — child session ${childSessionID} state UNKNOWN (possibly still running).${attemptNoteLost} ` +
+            `Completion tracking is re-armed: if the view recovers and the child finishes, exactly one [forge:dispatch-complete] wake carries the outcome. ` +
+            `Ground-truth recovery: read reports/${syncJobId}-report.md in the workspace BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`,
+        )
+      }
+      armSyncTracker()
       const attemptNote = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; retries continue in the armed tracker.` : ""
       throw new Error(
         `[forge:dispatch] Poll timeout after ${syncTimeoutMs}ms — child session ${childSessionID} never reached a terminal state.${attemptNote} ` +

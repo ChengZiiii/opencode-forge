@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs"
+import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -240,7 +240,8 @@ test("sync dispatch: parentID + NO question-deny create body, agent identity + c
   assert.ok(typeof meta.taskId === "string" && meta.taskId.length > 0, "taskId present")
   assert.equal(meta.run_in_background, false)
   assert.equal(meta.description, "repo audit")
-  assert.equal(meta.prompt, "audit the repo")
+  assert.ok(meta.prompt.startsWith("audit the repo"), "the original prompt leads the metadata verbatim")
+  assert.match(meta.prompt, new RegExp(`Report delivery contract[^\\n]*reports/${meta.taskId}-report\\.md`), "the metadata prompt carries the standing report-file contract (stream-loss honesty)")
   assert.deepEqual(Object.keys(meta).sort(), ["agent", "description", "prompt", "run_in_background", "sessionId", "taskId"], "exactly the native/OMO keys")
 })
 
@@ -825,6 +826,12 @@ test("textless-idle floor: idle child with a finished-but-textless message ends 
     allowCtx("ses_floor", dir),
   )
   const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  // Report-file delivery contract: the child's dispatch prompt names the
+  // concrete agreed path (reports/<task>-report.md).
+  const childSend = calls.promptAsync.find((a) => a.path?.id === childID)
+  assert.ok(childSend, "the child prompt send is recorded")
+  assert.match(String(childSend.body?.parts?.[0]?.text ?? ""), new RegExp(`Report delivery contract[^\\n]*reports/${jobId}-report\\.md`), "the dispatch prompt carries the standing report-file contract with the concrete agreed path")
   await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_floor").length === 0, "the floor terminates the tracker honestly")
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_floor" } } })
   const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_floor")
@@ -833,7 +840,21 @@ test("textless-idle floor: idle child with a finished-but-textless message ends 
   const sends = toOwner().map(textOf)
   const wakes = sends.filter((s) => s.startsWith("[forge:dispatch-complete]"))
   assert.equal(wakes.length, 1, "exactly one terminal wake")
-  assert.match(wakes[0], new RegExp(`child session ${childID} ended without a reportable final message`), "the honest no-reportable-final-message finding names the child session id")
+  // dispatch-stream-loss-honesty: the floor exit is the stream-lost/unknown
+  // class — result stream lost, child state UNKNOWN, never an obituary.
+  assert.match(wakes[0], /RESULT STREAM LOST/, "the wake states the result stream was lost")
+  assert.match(wakes[0], new RegExp(`child session ${childID} state UNKNOWN \\(possibly still running\\)`), "the wake names the child session id with the honest UNKNOWN state")
+  assert.match(wakes[0], new RegExp(`reports/${jobId}-report\\.md`), "the wake names the agreed report file as the ground-truth recovery channel")
+  assert.ok(!/ended without a reportable final message/.test(wakes[0]), "no death-certificate obituary wording")
+  // Ledger completeness: the journal records the stream-lost/unknown
+  // terminal with the last-observed activity timestamp.
+  const journalText = readFileSync(join(dir, ".opencode", "forge", "dispatch-log.jsonl"), "utf8")
+  const records = journalText.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l))
+  const lostRecord = records.find((rec) => rec.outcome === "stream-lost/unknown")
+  assert.ok(lostRecord, "the journal records a stream-lost/unknown entry (never a bare error)")
+  assert.equal(lostRecord.state, "terminal", "the stream-lost outcome is the dispatch's terminal record")
+  assert.equal(lostRecord.id, jobId, "the lost record names the dispatch task id")
+  assert.match(lostRecord.reason, /last observed activity \d{4}-\d{2}-\d{2}T/, "the lost record carries the last-observed activity timestamp")
   assert.equal(sends.filter((s) => s.startsWith("[forge:dispatch-progress]")).length, 0, "no progress notices — a textless-idle child is not 'running'")
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_floor" } } } })
 })

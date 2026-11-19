@@ -84,6 +84,15 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
     未知会话对注入 fail-silent、对拒绝 belt
     fail-open。stage 探测已退役：`auto`≡`forge`，仅 `native` 退役
     supervisor（隐藏同撤）。
+8. **派发结局诚实**（dispatch-stream-loss-honesty）：每个派发结局恰为
+   `completed`（exit 0）/`failed`（exit 1）/`stream-lost/unknown`（exit-null
+   安顿）三类。持续全不可读轮询视图（status+messages 双失败满 streak）或
+   结果流无最终报告满一个通知间隔 → `stream-lost/unknown`：措辞固定
+   "result stream lost; child state UNKNOWN (possibly still running)"，
+   **绝无** exit-1 死亡证明/讣告；台账（dispatch-log.jsonl）记
+   `stream-lost/unknown` 带最后活动时间戳。每条派发 prompt 注入 standing
+   报告文件契约（`reports/<task-id>-report.md`，幂等
+   `withReportDelivery`）——视图丢失后该文件是地面真相恢复通道，重派前必读。
 
 ## v1 / v2 双入口（全功能对等）
 

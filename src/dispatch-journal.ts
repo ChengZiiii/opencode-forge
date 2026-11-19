@@ -47,7 +47,11 @@ export type DispatchJournalRecord = {
   /** Mode-keyed question policy — re-applied on recovery respawns. */
   questionDeny?: boolean
   description?: string
-  /** Terminal-only outcome: completed | error | stale | aborted. */
+  /**
+   * Terminal-only outcome: completed | error | stale | aborted |
+   * stream-lost/unknown (the dispatch view broke before a final report —
+   * child state UNKNOWN, never a death certificate).
+   */
   outcome?: string
   /** Terminal-only human reason. */
   reason?: string

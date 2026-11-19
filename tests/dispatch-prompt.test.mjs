@@ -7,7 +7,7 @@ import assert from "node:assert/strict"
 // pins `model`, drops `hidden`, keeps the task recursion ban, and its
 // description is the task-tool vocabulary entry.
 
-import { materializeAgentPrompt, WORKER_MANDATES } from "../src/dispatch-prompt.ts"
+import { materializeAgentPrompt, WORKER_MANDATES, withReportDelivery, REPORT_DELIVERY_LINE } from "../src/dispatch-prompt.ts"
 import { rolePromptFor, forgeAgentDef, agentDescriptionFor, effectiveReadonlyShape, poolProvenanceLine } from "../src/dispatch-tiers.ts"
 
 test("role prompt layer 1: an explicit def.prompt overrides everything", () => {
@@ -294,4 +294,40 @@ test("materializeAgentPrompt composition order: shared-primed role keeps mandate
   assert.match(p, /workspace-relative paths ONLY/)
   assert.match(p, /Run every shell command through the forge_shell tool/)
   assert.match(p, /readonly worker.*REPORT/s)
+})
+
+// ---------------------------------------------------------------------------
+// dispatch-stream-loss-honesty task 3 (spec scenario "Worker report survives
+// view loss"): the standing report-file delivery contract — the mandates
+// carry the convention, and withReportDelivery names the concrete
+// caller-provided path idempotently.
+
+test("the mandates carry the standing report-file delivery line (reliability contract)", () => {
+  assert.match(WORKER_MANDATES, /Report-file delivery \(reliability contract\)/, "the standing mandate names the contract")
+  assert.match(WORKER_MANDATES, /reports\/<task>-report\.md/, "the convention path appears verbatim")
+  assert.match(WORKER_MANDATES, /result stream is lost/, "the line states WHY (recovery after view loss)")
+  assert.match(WORKER_MANDATES, /Readonly workers skip this/, "readonly workers are told the reply is the report")
+  // The materialized prompt embeds the standing line for both shapes.
+  for (const shape of ["readonly", "write"]) {
+    const p = materializeAgentPrompt({ agent: "x", shape, role: "r" })
+    assert.match(p, /Report-file delivery \(reliability contract\)/, `${shape} shape embeds the standing line`)
+  }
+})
+
+test("withReportDelivery: appends the contract naming the concrete agreed path", () => {
+  const out = withReportDelivery("Do the thing.", "job-123")
+  assert.ok(out.startsWith("Do the thing."), "the original prompt is preserved verbatim as the prefix")
+  assert.match(out, /Report delivery contract \(reliability\):[^\n]*reports\/job-123-report\.md/, "the contract names the concrete caller-provided path")
+  assert.match(out, /workspace-relative/, "the path is workspace-relative by contract")
+  assert.match(out, /result stream is lost/, "the line states the recovery rationale")
+  assert.match(out, /no file write access, skip this/, "readonly workers skip honestly")
+})
+
+test("withReportDelivery: idempotent — re-wrapping strips the old line and keeps exactly one contract", () => {
+  const once = withReportDelivery("Do the thing.", "job-a")
+  const twice = withReportDelivery(once, "job-b")
+  assert.equal((twice.match(/Report delivery contract \(reliability\):/g) ?? []).length, 1, "exactly one contract line after re-wrap")
+  assert.match(twice, /reports\/job-b-report\.md/, "the CURRENT task id wins")
+  assert.ok(!twice.includes("job-a"), "the stale path is stripped, not duplicated")
+  assert.ok(twice.startsWith("Do the thing."), "the original prompt survives both wraps")
 })
