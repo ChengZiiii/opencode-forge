@@ -5727,14 +5727,19 @@ export type V2SetupDeps = {
 // families purely lexicographically).
 const v2HostAnchors = new Map<string, string>()
 
-// Workspace-anchor candidates for this call: the guarded ctx.location
-// readers (SANDBOX-PENDING field names) plus the process cwd.
+// Workspace-anchor candidates for this call: the ctx.location readers plus
+// the process cwd. Field-reality probe (2.3.2 live host, 2026-11-20):
+// ctx.location.directory is a string PROPERTY carrying the load location and
+// ctx.location.worktree does not exist — the earlier function-only guard
+// skipped both, leaving the server process cwd (home on paseo-launched
+// services) as the sole anchor, so pool workers never materialized outside
+// the sandbox (where serve's cwd happened to be the workspace). Accept both
+// shapes; never guess.
 function v2AnchorCandidates(ctx: V2PluginContext): string[] {
   const out: string[] = []
   try {
     for (const reader of [ctx.location?.worktree, ctx.location?.directory]) {
-      if (typeof reader !== "function") continue
-      const v = reader()
+      const v = typeof reader === "function" ? (reader as () => unknown)() : reader
       if (typeof v === "string" && v) out.push(v)
     }
   } catch {

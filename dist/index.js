@@ -21007,9 +21007,7 @@ function v2AnchorCandidates(ctx) {
   const out = [];
   try {
     for (const reader of [ctx.location?.worktree, ctx.location?.directory]) {
-      if (typeof reader !== "function")
-        continue;
-      const v = reader();
+      const v = typeof reader === "function" ? reader() : reader;
       if (typeof v === "string" && v)
         out.push(v);
     }
