@@ -85,12 +85,25 @@ turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全�
     fail-open。stage 探测已退役：`auto`≡`forge`，仅 `native` 退役
     supervisor（隐藏同撤）。
 
-## v1 / v2 双入口
+## v1 / v2 双入口（全功能对等）
 
-- npm/github 安装（`opencode plugin`）→ v1 loader 只读 `server`，全功能。
-- v2 loader 只调 `setup`：仅注册 agent（结构化类型 + `?.` 守卫，
-  只创建不覆盖；字段用 v2 的 `system`）。**v2 @1.18 无 tool/permission 域**，
-  禁写与双门只能 v1 实现。上游补齐后按 vision-bridge 既定路线迁移。
+- npm/github 安装（`opencode plugin`）→ v1 loader 只读 `server`：
+  config 钩子 + 全套工具 + permission.ask 面板，功能基线。
+- v2 loader 只调 `setup`（模块默认导出 `{id, setup}`）：agent 域
+  （forge + 池子代理物化）、tool 域（全部 15 工具）、permission 域
+  （evaluate 变异 belt + assert 决策门）、session 钩子
+  （prompt/context/compaction/experimental.idle）、命令域
+  （execute 型 /plan /goal /crew）、event 域（AsyncIterable 播种 +
+  session.deleted 收割）——**与 v1 全功能对等**。
+- v2 已知 drift（详见 change design.md W6 field realities）：
+  ① 池子 model 钉扎不落 v2 draft（任何形状都 500 宿主 agent 编码器）
+  ——depth 钉扎不受影响（chat.params 运行时查表）；② 命令域无
+  create-only（forge 后写覆盖内置 /goal）；③ prompt/get 走扁平形状、
+  命令为 EXECUTE 型（模板经 execute 发送，字节不变）。
+- 沙盒 E2E：`live-loop-e2e-v2.mjs <baseUrl> <ws> <password>` 对
+  `opencode serve`（2.x）驱动 goal 全链闭环；会话必须带
+  `agent:"forge"`（族门），权限批复走
+  `POST /api/session/:sid/permission/:rid/reply {decision:"once"}`。
 
 ## 开发循环
 

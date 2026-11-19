@@ -17691,7 +17691,7 @@ async function resolveSessionAnchorForPools(anchorClient, sessionID) {
   let authoritative = "";
   try {
     const rec = anchorClient?.session?.get ? await anchorClient.session.get({ path: { id: sessionID } }) : undefined;
-    const anchor = effectiveWorktree(rec?.worktree, rec?.directory);
+    const anchor = effectiveWorktree(rec?.worktree, rec?.directory ?? rec?.location?.directory);
     if (anchor && !isRootish(anchor))
       authoritative = anchor;
   } catch {}
@@ -20182,7 +20182,7 @@ async function continueIfEligible(client, sessionID) {
     if (!state) {
       try {
         const info = await client.session.get({ path: { id: sessionID } });
-        const wt = effectiveWorktree(info?.worktree, info?.directory);
+        const wt = effectiveWorktree(info?.worktree, info?.directory ?? info?.location?.directory);
         if (!wt) {
           goalProbe(`skip: no worktree for lazy seed session=${sessionID}`);
           return;
@@ -20262,17 +20262,19 @@ async function continueIfEligible(client, sessionID) {
     }
     try {
       const briefText = goalBriefText(state, goal);
+      pendingContinuationTurn.add(sessionID);
+      turnActivity.set(sessionID, { writes: 0, checks: 0 });
       await client.session.prompt({
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: briefText }] }
       });
       transportFails.delete(sessionID);
-      pendingContinuationTurn.add(sessionID);
-      turnActivity.set(sessionID, { writes: 0, checks: 0 });
       state.goalPath = goal.path;
       atomicWrite(goal.path, incTurns(readFileSync9(goal.path, "utf8"), nowIso()));
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
+      pendingContinuationTurn.delete(sessionID);
+      turnActivity.delete(sessionID);
       const n = (transportFails.get(sessionID) ?? 0) + 1;
       transportFails.set(sessionID, n);
       goalProbe(`transport failure session=${sessionID} count=${n} err=${String(err)}`);
@@ -20300,6 +20302,25 @@ function scheduleIdleContinuation(client, sessionID) {
     idleTimers.delete(sessionID);
     continueIfEligible(client, sessionID);
   }, IDLE_DEBOUNCE_MS));
+}
+function harvestSessionEnd(sessionID) {
+  jobManager.onSessionEnd(sessionID);
+  for (const [id, handle] of [...dispatchTasks]) {
+    if (handle.ownerSession === sessionID)
+      dispatchTasks.delete(id);
+  }
+  flushDispatchQueue(sessionID);
+  sessionDepths.delete(sessionID);
+  dispatchProgressQueue.delete(sessionID);
+  sessionAgents.delete(sessionID);
+  sealFindings.delete(sessionID);
+  sealUnknownNotes.delete(sessionID);
+  poolGateUnknownNotes.delete(sessionID);
+  anchorPrefNotes.delete(sessionID);
+  poolGateLedgerNotes.delete(sessionID);
+  sessionAnchorLedgerMemo.delete(sessionID);
+  crews.delete(sessionID);
+  crewEngineForgetSession(sessionID);
 }
 var server = async (input, options) => {
   const effectiveInitDir = effectiveWorktree(input.worktree, input.directory) || input.directory || "";
@@ -20785,25 +20806,8 @@ var server = async (input, options) => {
       }
       if (event.type === "session.deleted") {
         const info = event.properties.info;
-        if (typeof info?.id === "string" && info.id) {
-          jobManager.onSessionEnd(info.id);
-          for (const [id, handle] of [...dispatchTasks]) {
-            if (handle.ownerSession === info.id)
-              dispatchTasks.delete(id);
-          }
-          flushDispatchQueue(info.id);
-          sessionDepths.delete(info.id);
-          dispatchProgressQueue.delete(info.id);
-          sessionAgents.delete(info.id);
-          sealFindings.delete(info.id);
-          sealUnknownNotes.delete(info.id);
-          poolGateUnknownNotes.delete(info.id);
-          anchorPrefNotes.delete(info.id);
-          poolGateLedgerNotes.delete(info.id);
-          sessionAnchorLedgerMemo.delete(info.id);
-          crews.delete(info.id);
-          crewEngineForgetSession(info.id);
-        }
+        if (typeof info?.id === "string" && info.id)
+          harvestSessionEnd(info.id);
       }
     },
     "shell.env": async (input2, output) => {
@@ -20915,7 +20919,608 @@ Post-compaction turns must keep following this goal and its constraints.`);
     }
   };
 };
-async function v2Setup(ctx) {
+var v2HostAnchors = new Map;
+function v2AnchorCandidates(ctx) {
+  const out = [];
+  try {
+    for (const reader of [ctx.location?.worktree, ctx.location?.directory]) {
+      if (typeof reader !== "function")
+        continue;
+      const v = reader();
+      if (typeof v === "string" && v)
+        out.push(v);
+    }
+  } catch {}
+  out.push(process.cwd());
+  return out;
+}
+function v2ToolInputSchema(args) {
+  try {
+    const z = tool.schema;
+    if (typeof z.object === "function" && typeof z.toJSONSchema === "function") {
+      const schema = z.toJSONSchema(z.object(args ?? {}), { io: "input" });
+      if (schema !== null && typeof schema === "object") {
+        const out = { ...schema };
+        delete out.$schema;
+        return out;
+      }
+    }
+  } catch {}
+  return { type: "object", properties: {} };
+}
+function wrapV2ToolResult(res) {
+  if (res !== null && typeof res === "object" && "output" in res) {
+    const r = res;
+    return typeof r.title === "string" ? { content: r.output, title: r.title } : { content: r.output };
+  }
+  return { content: res };
+}
+var v2PermissionAssertFn = null;
+function v2ToolContext(raw) {
+  const c = raw ?? {};
+  const pickStr = (...keys) => {
+    for (const k of keys) {
+      const v = c[k];
+      if (typeof v === "string" && v)
+        return v;
+    }
+    return;
+  };
+  const out = { ...c };
+  if (out.sessionID === undefined)
+    out.sessionID = pickStr("sessionId", "session_id");
+  if (out.worktree === undefined)
+    out.worktree = pickStr("worktree", "directory");
+  if (out.worktree === undefined && typeof out.sessionID === "string")
+    out.worktree = sessions.get(out.sessionID)?.worktree ?? hostWorktree;
+  if (typeof out.ask !== "function" && v2PermissionAssertFn && typeof out.sessionID === "string" && out.sessionID) {
+    const sid = out.sessionID;
+    const agentId = typeof out.agent === "string" && out.agent ? out.agent : undefined;
+    out.ask = (askInput) => v2PermissionAssertFn({
+      sessionID: sid,
+      ...agentId !== undefined ? { agent: agentId } : {},
+      action: askInput.permission,
+      resources: Array.isArray(askInput.patterns) ? askInput.patterns : ["*"],
+      metadata: askInput.metadata
+    });
+  }
+  if (typeof out.metadata !== "function")
+    out.metadata = () => {};
+  return out;
+}
+function v2PickStr(src, ...keys) {
+  if (src === null || typeof src !== "object")
+    return;
+  const o = src;
+  for (const k of keys) {
+    const v = o[k];
+    if (typeof v === "string" && v)
+      return v;
+  }
+  return;
+}
+function v2AgentNameOf(src) {
+  if (src === null || typeof src !== "object")
+    return;
+  const a = src.agent;
+  if (typeof a === "string" && a)
+    return a;
+  if (a !== null && typeof a === "object") {
+    const n = a.name;
+    if (typeof n === "string" && n)
+      return n;
+  }
+  return;
+}
+var V2_PERMISSION_DOORS = new Set(["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard"]);
+function v2RegisterPermissionBelt(ctx) {
+  if (typeof ctx.permission?.hook !== "function")
+    return;
+  try {
+    ctx.permission.hook("evaluate", async (raw) => {
+      try {
+        const evalInput = raw !== null && typeof raw === "object" ? raw : null;
+        if (!evalInput || typeof evalInput.effect !== "string")
+          return;
+        const meta = evalInput.metadata !== null && typeof evalInput.metadata === "object" ? evalInput.metadata : {};
+        const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof evalInput.action === "string" ? evalInput.action : undefined);
+        if (process.env.FORGE_PERM_PROBE) {
+          try {
+            appendFileSync2(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}
+`);
+          } catch {}
+        }
+        if (typeof name === "string" && V2_PERMISSION_DOORS.has(name)) {
+          if (evalInput.effect !== "deny")
+            evalInput.effect = "ask";
+          return;
+        }
+        if (typeof name === "string" && isWriteTool(name)) {
+          const sessionID = typeof evalInput.sessionID === "string" ? evalInput.sessionID : undefined;
+          const state = stateForBan(sessionID);
+          const active = state ? resolveActivePlan(state) : null;
+          if (active && active.doc.status === "draft") {
+            evalInput.effect = "deny";
+            evalInput.message = "[forge] A plan is in draft; write operations are denied. Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.";
+          }
+        }
+      } catch {}
+    });
+  } catch {}
+}
+function v2ToolEventArgs(raw) {
+  if (raw === null || typeof raw !== "object")
+    return { tool: undefined, sessionID: undefined, id: undefined, args: {} };
+  const o = raw;
+  const tool3 = typeof o.tool === "string" ? o.tool : undefined;
+  const sessionID = v2PickStr(o, "sessionID", "sessionId");
+  const id = v2PickStr(o, "id", "callID");
+  const rawArgs = o.input ?? o.args ?? o.arguments;
+  const args = rawArgs !== null && typeof rawArgs === "object" ? rawArgs : {};
+  return { tool: tool3, sessionID, id, args };
+}
+function v2AnchorClient(ctx) {
+  const rawGet = typeof ctx.session?.get === "function" ? ctx.session.get.bind(ctx.session) : undefined;
+  if (!rawGet)
+    return null;
+  const get = async (opts) => {
+    const sid = v2SessionIdOf(opts);
+    return sid !== undefined ? rawGet({ sessionID: sid }) : rawGet(opts);
+  };
+  return { session: { get } };
+}
+function v2RegisterToolHooks(ctx, anchorClient) {
+  if (typeof ctx.tool?.hook !== "function")
+    return;
+  try {
+    ctx.tool.hook("execute.before", async (raw) => {
+      const { tool: tool3, sessionID, args } = v2ToolEventArgs(raw);
+      const evAgent = v2AgentNameOf(raw);
+      if (evAgent && sessionID)
+        sessionAgents.set(sessionID, evAgent);
+      if (process.env.FORGE_PERM_PROBE) {
+        try {
+          appendFileSync2(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool3)} session=${JSON.stringify(sessionID)}
+`);
+        } catch {}
+      }
+      if (tool3 === "task") {
+        const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined;
+        const speaker = sessionID ? sessionAgents.get(sessionID) : undefined;
+        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+          if (target && target.toLowerCase().startsWith("forge-")) {
+            throw new Error(`[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use the native general/explore subagents, or switch to the forge agent to dispatch forge-* workers.`);
+          }
+        }
+        if (target && target.toLowerCase().startsWith("forge-") && sessionID) {
+          const poolRefusal = await poolGateRefusal(anchorClient, sessionID, target);
+          if (poolRefusal)
+            throw new Error(poolRefusal);
+        }
+        const pendingRefusal = crewPendingRefusal(sessionID);
+        if (pendingRefusal)
+          throw new Error(pendingRefusal);
+        if (target && target.toLowerCase().startsWith("forge-") && sessionID) {
+          const complianceRefusal = await crewComplianceRefusalFor(anchorClient, sessionID, target);
+          if (complianceRefusal)
+            throw new Error(complianceRefusal);
+        }
+      }
+      if ((tool3 === "write" || tool3 === "edit") && sessionID) {
+        const speaker = sessionAgents.get(sessionID);
+        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+          const raw2 = typeof args.filePath === "string" ? args.filePath : typeof args.path === "string" ? args.path : undefined;
+          if (raw2) {
+            const state = stateForBan(sessionID);
+            const base = state?.worktree ?? hostWorktree ?? "";
+            const abs = (isAbsolute2(raw2) ? raw2 : join6(base, raw2)).replaceAll("\\", "/").toLowerCase();
+            if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
+              throw new Error(`[forge:partition] Write refused: "${raw2}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`);
+            }
+          }
+        }
+      }
+      if (typeof tool3 === "string" && isWriteTool(tool3)) {
+        const state = stateForBan(sessionID);
+        const active = state ? resolveActivePlan(state) : null;
+        if (active && active.doc.status === "draft") {
+          if (tool3 === "task") {
+            const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined;
+            const refusal = draftDispatchRefusal(sessionID, target);
+            if (refusal)
+              throw new Error(refusal);
+          } else {
+            throw new Error(`[forge] A plan is in draft; write operations are denied (${tool3}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`);
+          }
+        }
+      }
+      if (tool3 === "forge_shell" && sessionID) {
+        const cmd = typeof args.command === "string" ? args.command : undefined;
+        if (cmd) {
+          const speaker = sessionAgents.get(sessionID);
+          const workerId = speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT ? speaker.slice("forge-".length) : undefined;
+          if (workerId !== undefined) {
+            const def = resolvePools()?.agents[workerId]?.def;
+            if (def !== undefined && effectiveReadonlyShape(def)) {
+              const verdict = classifyExecCommand(cmd);
+              if (verdict.klass === WRITE_CLASS) {
+                const seen = sealFindings.get(sessionID) ?? new Set;
+                if (!seen.has(verdict.indicator)) {
+                  seen.add(verdict.indicator);
+                  sealFindings.set(sessionID, seen);
+                  console.warn(`[forge:seal] session ${sessionID} (readonly worker "${speaker}"): write-class forge_shell command denied — indicator "${verdict.indicator}" (${verdict.detail ?? cmd.slice(0, 60)}). Remedy: "shape": "write" on the agent when its job legitimately mutates.`);
+                }
+                throw new Error(`[forge:seal] Exec refused: this session runs the readonly worker "${speaker}" (explicit "shape": "readonly") and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. READ-CLASS commands (inspection, search, read-only evals) flow normally. If this worker's job legitimately mutates, set "shape": "write" on its forge.json entry. Report this refusal VERBATIM — do not work around it.`);
+              }
+            }
+          } else if (speaker === undefined) {
+            const verdict = classifyExecCommand(cmd);
+            if (verdict.klass === WRITE_CLASS && !sealUnknownNotes.has(sessionID)) {
+              sealUnknownNotes.add(sessionID);
+              console.warn(`[forge:seal] session ${sessionID}: a WRITE-CLASS forge_shell command (${verdict.indicator}) flowed UNSEALED — the session's agent is unknown (fail-open; the exec seal binds explicit-readonly forge-* workers only).`);
+            }
+          }
+        }
+      }
+      if (sessionID && typeof tool3 === "string") {
+        const speaker = sessionAgents.get(sessionID);
+        if (speaker !== undefined) {
+          if (!isForgeFamilyAgent(speaker) && FORGE_TOOL_SET.has(tool3)) {
+            throw new Error(`[forge:partition] Tool refused: "${tool3}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`);
+          }
+          if (isForgeFamilyAgent(speaker) && (tool3 === "shell" || tool3 === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
+            throw new Error(`[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`);
+          }
+          if (isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT && FORGE_STATE_TOOL_SET.has(tool3)) {
+            throw new Error(`[forge:partition] Tool refused: "${tool3}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${tool3} at the gate.`);
+          }
+        }
+      }
+    });
+    ctx.tool.hook("execute.after", async (raw) => {
+      try {
+        const { tool: tool3, sessionID } = v2ToolEventArgs(raw);
+        if (typeof tool3 !== "string" || !sessionID)
+          return;
+        const act = turnActivity.get(sessionID);
+        if (act) {
+          if (isWriteTool(tool3) || tool3 === "plan_tick")
+            act.writes++;
+          if (tool3 === "goal_check")
+            act.checks++;
+        }
+        const crewAct = crewTurnActivity.get(sessionID);
+        if (crewAct) {
+          if (tool3 === "task")
+            crewAct.dispatches++;
+          if (isWriteTool(tool3))
+            crewAct.writes++;
+        }
+      } catch {}
+    });
+  } catch {}
+}
+function v2ContextInjection(raw) {
+  if (forgeDisabled)
+    return;
+  const o = raw !== null && typeof raw === "object" ? raw : {};
+  const sessionID = v2PickStr(o, "sessionID", "sessionId");
+  if (!sessionID)
+    return;
+  const agentName = v2AgentNameOf(o);
+  if (agentName)
+    sessionAgents.set(sessionID, agentName);
+  if (agentName && agentName.startsWith("forge-")) {
+    const frozen = sessionDepths.get(sessionID);
+    if (frozen) {
+      if (frozen.translation) {
+        if (o.options === null || typeof o.options !== "object")
+          o.options = {};
+        applyDepthTranslation(o.options, frozen.translation);
+      }
+    } else {
+      const agentId = agentName.slice("forge-".length);
+      const def = resolvePools()?.agents[agentId]?.def;
+      if (def?.thoughtLevel) {
+        const modelObj = o.model;
+        const providerID = typeof modelObj?.providerID === "string" ? modelObj.providerID : "";
+        const modelID = typeof modelObj?.modelID === "string" ? modelObj.modelID : typeof modelObj?.id === "string" ? modelObj.id : "";
+        const channel = resolveDepthChannel(providerID, modelID);
+        const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel);
+        sessionDepths.set(sessionID, { translation });
+        if (translation) {
+          if (o.options === null || typeof o.options !== "object")
+            o.options = {};
+          applyDepthTranslation(o.options, translation);
+        } else if (findingMessage && !depthFindingNotes.has(agentId)) {
+          depthFindingNotes.set(agentId, findingMessage);
+          console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`);
+        }
+      }
+    }
+  }
+  if (!sessionIsForgeFamily(sessionID))
+    return;
+  if (!Array.isArray(o.system))
+    o.system = [];
+  const system = o.system;
+  const crewActive = crews.get(sessionID);
+  if (crewActive && !system.some((s) => typeof s === "string" && s.startsWith("[forge:crew-active]"))) {
+    const modeText = crewActive.mode === "pending" ? "PENDING (present the execution-mode choice; every task dispatch is refused until armed)" : "armed (executing)";
+    system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict, or crew_close {abandon: true, reason} to re-shard.`);
+  }
+  if (!forgeDisabled && jobStage() < 2 && !system.some((s) => typeof s === "string" && s.startsWith("[forge:job-guidance]"))) {
+    system.push(jobsKeepBuiltinShell ? "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion." : "[forge:job-guidance] Every shell command — quick ones included — goes through forge_shell: the builtin shell/bash tools are refused on this agent, so never try them first. forge_shell returns on exit/success/idle with a jobId instead of blocking indefinitely; long-running or non-exiting commands use run_in_background. Manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.");
+  }
+  const state = sessions.get(sessionID);
+  if (!state)
+    return;
+  const active = resolveActivePlan(state);
+  if (active) {
+    const p = progressOf(active.doc);
+    const rel = relFrom(state.worktree, active.path);
+    const rule = active.doc.status === "draft" ? "while in draft, write operations are denied at the tool layer; present the plan then end your turn to await the user's review — on feedback revise via plan_write and re-present; call plan_approve only after the user explicitly approves in chat (their confirmation dialog is the final gate); /plan discard to abandon" : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close";
+    system.push(`[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`);
+  }
+  if (forgeDisabled)
+    return;
+  const goal = resolveLiveGoal(state);
+  if (goal) {
+    const rel = relFrom(state.worktree, goal.path);
+    const d = goal.doc;
+    const rule = d.status === "active" ? "continue working the success criteria; call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself); if genuinely blocked call goal_pause with the blocker" : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it";
+    system.push(`[forge:goal-notice] This session is bound to a goal: ${rel} (status: ${d.status}${d.stopReason ? `, stopped: ${d.stopReason}` : ""}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Rule: ${rule}. If the user has not mentioned the goal yet, relay its path and status to them in one short line at the start of your reply.`);
+  }
+}
+function v2CompactionInjection(raw) {
+  if (forgeDisabled)
+    return;
+  const o = raw !== null && typeof raw === "object" ? raw : {};
+  const sessionID = v2PickStr(o, "sessionID", "sessionId");
+  if (!sessionID)
+    return;
+  if (!sessionIsForgeFamily(sessionID))
+    return;
+  const state = sessions.get(sessionID);
+  if (!state)
+    return;
+  const goal = resolveLiveGoal(state);
+  if (!goal)
+    return;
+  const d = goal.doc;
+  if (!Array.isArray(o.context))
+    o.context = [];
+  o.context.push(`[forge:goal-brief] A live goal governs this session: ${relFrom(state.worktree, goal.path)} (status: ${d.status}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Goal: ${d.goal}. Success criteria:
+${d.criteria.map((c, i) => `${i + 1}. ${c}`).join(`
+`)}
+Post-compaction turns must keep following this goal and its constraints.`);
+}
+function v2RegisterSessionHooks(ctx, goalClient) {
+  const out = { disposables: [], idleHook: false };
+  if (typeof ctx.session?.hook !== "function")
+    return out;
+  const register = (name, cb) => {
+    try {
+      const registration = ctx.session.hook(name, cb);
+      if (registration !== null && typeof registration === "object" && typeof registration.dispose === "function") {
+        const dispose = registration.dispose;
+        out.disposables.push(() => void dispose());
+      }
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  register("prompt", async (raw) => {
+    try {
+      if (forgeDisabled)
+        return;
+      const sessionID = v2PickStr(raw, "sessionID", "sessionId");
+      if (!sessionID)
+        return;
+      idleJobSessions.delete(sessionID);
+      const agent = v2AgentNameOf(raw);
+      if (agent)
+        sessionAgents.set(sessionID, agent);
+    } catch {}
+  });
+  register("context", async (raw) => {
+    try {
+      v2ContextInjection(raw);
+    } catch {}
+  });
+  register("compaction", async (raw) => {
+    try {
+      v2CompactionInjection(raw);
+    } catch {}
+  });
+  out.idleHook = register("experimental.idle", async (raw) => {
+    const sessionID = v2PickStr(raw, "sessionID", "sessionId");
+    if (!sessionID)
+      return;
+    v2HandleIdle(sessionID, goalClient);
+  });
+  return out;
+}
+async function v2RegisterCommands(ctx) {
+  if (typeof ctx.command?.transform !== "function")
+    return;
+  try {
+    await ctx.command.transform(async (editor) => {
+      const addFn = editor?.add;
+      if (typeof addFn !== "function")
+        return;
+      const addTemplateCommand = (name, template, description) => {
+        addFn({
+          name,
+          description,
+          execute: async (input) => {
+            const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
+            if (!sessionID || typeof ctx.session?.prompt !== "function")
+              return;
+            await ctx.session.prompt({ sessionID, text: template() });
+          }
+        });
+      };
+      addTemplateCommand("plan", () => PLAN_COMMAND_TEMPLATE, "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline");
+      addTemplateCommand("goal", () => GOAL_COMMAND_TEMPLATE, "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)");
+      const registrationResolution = resolvePools();
+      const registrationAgentCount = Object.keys(registrationResolution?.agents ?? {}).length;
+      const crewTemplate = () => {
+        const res = resolvePools();
+        if (Object.keys(res?.agents ?? {}).length > 0)
+          return crewOrchestrationTemplate(res ?? null);
+        const anchorDir = hostAnchors[0] ?? undefined;
+        return CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: anchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}
+   - ${forgeConfigPaths({ projectDir: anchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`).replaceAll("{template}", JSON.stringify({ pool: "namespace (REQUIRED for crew-governed dispatch, [a-z0-9-] up to 24 chars — every pool materializes as forge-<ns>-<id>; the global fallback materializes as forge-global-<id>)", agents: { research: { model: "provider/model", thoughtLevel: "low", shape: "readonly", prompt: "short role description — what this agent does" }, coder: { model: "provider/model", thoughtLevel: "low", shape: "write", prompt: "short role description — what this agent does" } } }, null, 2).split(`
+`).map((l) => "   " + l).join(`
+`));
+      };
+      addTemplateCommand("crew", crewTemplate, registrationAgentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance");
+    });
+  } catch {}
+}
+function v2PromptInputOf(opts) {
+  if (opts === null || typeof opts !== "object")
+    return null;
+  const o = opts;
+  const sid = typeof o.path?.id === "string" && o.path.id ? o.path.id : typeof o.sessionID === "string" ? o.sessionID : undefined;
+  if (!sid)
+    return null;
+  const parts = Array.isArray(o.body?.parts) ? o.body.parts : [];
+  const textPart = parts.find((p) => p !== null && typeof p === "object" && typeof p.text === "string");
+  const text = textPart?.text ?? (typeof o.body?.text === "string" ? o.body.text : undefined);
+  if (typeof text !== "string" || !text)
+    return null;
+  return { sessionID: sid, text };
+}
+function v2SessionIdOf(opts) {
+  if (opts === null || typeof opts !== "object")
+    return;
+  const o = opts;
+  if (typeof o.path?.id === "string" && o.path.id)
+    return o.path.id;
+  if (typeof o.sessionID === "string" && o.sessionID)
+    return o.sessionID;
+  return;
+}
+function v2SessionClient(ctx) {
+  const s = ctx.session;
+  if (s === null || typeof s !== "object")
+    return null;
+  const out = {};
+  if (typeof s.prompt === "function") {
+    const send = async (opts) => {
+      const input = v2PromptInputOf(opts);
+      if (!input)
+        return;
+      return s.prompt(input);
+    };
+    out.prompt = send;
+    out.promptAsync = send;
+  }
+  if (typeof s.get === "function") {
+    out.get = async (opts) => {
+      const sid = v2SessionIdOf(opts);
+      return sid !== undefined ? s.get({ sessionID: sid }) : s.get(opts);
+    };
+  }
+  return Object.keys(out).length > 0 ? { session: out } : null;
+}
+function v2EventFields(raw) {
+  if (raw === null || typeof raw !== "object")
+    return {};
+  const o = raw;
+  if (o.data !== null && typeof o.data === "object")
+    return o.data;
+  if (o.properties !== null && typeof o.properties === "object")
+    return o.properties;
+  return o;
+}
+function v2HandleIdle(sessionID, goalClient) {
+  try {
+    goalProbe(`v2 idle session=${sessionID}`);
+    idleJobSessions.add(sessionID);
+    if (goalClient)
+      scheduleIdleContinuation(goalClient, sessionID);
+    deliverDispatchProgress(sessionID).then(() => deliverJobWakes(sessionID));
+  } catch {}
+}
+function v2SubscribeEvents(ctx, goalClient, idleFallback) {
+  if (typeof ctx.event?.subscribe !== "function")
+    return null;
+  try {
+    let iterable = null;
+    try {
+      const sub = ctx.event.subscribe();
+      if (sub !== null && typeof sub === "object" && typeof sub[Symbol.asyncIterator] === "function") {
+        iterable = sub;
+      }
+    } catch {}
+    if (!iterable)
+      return null;
+    const controller = new AbortController;
+    const iterator = iterable[Symbol.asyncIterator]();
+    const run = async () => {
+      try {
+        for (;; ) {
+          const next = await iterator.next();
+          if (next.done)
+            break;
+          const ev = next.value;
+          const type = ev !== null && typeof ev === "object" && typeof ev.type === "string" ? ev.type : undefined;
+          if (!type)
+            continue;
+          if (controller.signal.aborted)
+            break;
+          const fields = v2EventFields(ev);
+          if (type === "session.deleted") {
+            try {
+              const info = fields.info;
+              const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId");
+              if (id)
+                harvestSessionEnd(id);
+            } catch {}
+          } else if (idleFallback && (type === "session.execution.succeeded" || type === "session.idle")) {
+            const sessionID = v2PickStr(fields, "sessionID", "sessionId");
+            if (sessionID)
+              v2HandleIdle(sessionID, goalClient);
+          }
+        }
+      } catch {}
+    };
+    run();
+    let closed = false;
+    return () => {
+      if (closed)
+        return;
+      closed = true;
+      controller.abort();
+      try {
+        iterator.return?.();
+      } catch {}
+    };
+  } catch {
+    return null;
+  }
+}
+var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => {
+  hostAnchors.length = 0;
+  poolResolver = null;
+  poolResolution = null;
+} };
+async function v2Setup(ctx, deps) {
+  {
+    const v2Candidates = [...deps?.anchors ?? [], ...v2AnchorCandidates(ctx)];
+    for (const cand of v2Candidates) {
+      const t = cand.trim();
+      if (t)
+        rememberHostAnchor(t);
+    }
+    const first = v2Candidates.find((c) => c && !isRootish(c));
+    if (first)
+      hostWorktree = first;
+  }
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform(async (draft) => {
       if (typeof draft.get !== "function" || typeof draft.update !== "function")
@@ -20928,30 +21533,81 @@ async function v2Setup(ctx) {
         });
       }
       try {
-        const resolver = createPoolResolver({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
-        const resolution = resolver.resolve([process.cwd()]);
-        const v2GlobalPath = forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global;
+        const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
+        const candidates = [...deps?.anchors ?? [], ...v2AnchorCandidates(ctx)];
+        for (const cand of candidates) {
+          const key = normalizeAnchorDir(cand);
+          if (key && !v2HostAnchors.has(key))
+            v2HostAnchors.set(key, cand.trim());
+        }
+        const resolver = createPoolResolver({ homeDir, stat: deps?.stat, readFile: deps?.readFile });
+        const resolution = resolver.resolve([...v2HostAnchors.values()]);
+        for (const finding of resolution.findings) {
+          console.warn(`[forge:v2] ${finding.level}: ${finding.message}`);
+        }
+        const v2GlobalPath = forgeConfigPaths({ homeDir }).global;
         for (const [matId, agent] of Object.entries(resolution.agents)) {
           const id = `forge-${matId}`;
           if (draft.get(id) !== undefined)
             continue;
           const provenance = foldPath(agent.file) === foldPath(v2GlobalPath) ? { global: true } : { ns: agent.ns, file: agent.file };
           const v1def = forgeAgentDef(matId, agent.def, provenance, agent.shared ?? undefined);
-          draft.update(id, (agentDraft) => {
-            agentDraft.description = v1def.description;
-            agentDraft.system = v1def.prompt;
-            agentDraft.mode = v1def.mode;
-            if (v1def.model !== undefined)
-              agentDraft.model = v1def.model;
-            agentDraft.permission = v1def.permission;
-          });
+          try {
+            draft.update(id, (agentDraft) => {
+              agentDraft.description = v1def.description;
+              agentDraft.system = v1def.prompt;
+              agentDraft.mode = v1def.mode;
+              agentDraft.permission = v1def.permission;
+            });
+          } catch (err) {
+            console.warn(`[forge:v2] error: agent ${id} not materialized: ${String(err)}`);
+          }
         }
       } catch {}
     });
   }
+  if (typeof ctx.tool?.transform === "function") {
+    try {
+      await ctx.tool.transform(async (editor) => {
+        if (typeof editor?.add !== "function")
+          return;
+        for (const [name, def] of Object.entries(forgeTools())) {
+          const d = def;
+          editor.add({
+            name,
+            description: typeof d.description === "string" ? d.description : name,
+            input: v2ToolInputSchema(d.args),
+            async execute(args, toolCtx) {
+              const res = await d.execute?.(args, v2ToolContext(toolCtx));
+              return wrapV2ToolResult(res);
+            }
+          });
+        }
+      });
+    } catch {}
+  }
+  v2RegisterPermissionBelt(ctx);
+  v2PermissionAssertFn = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission.assert(input) : null;
+  v2RegisterToolHooks(ctx, v2AnchorClient(ctx));
+  const v2Client = v2SessionClient(ctx);
+  if (v2Client && (v2Client.session.promptAsync || v2Client.session.prompt))
+    jobClient = v2Client;
+  const goalClient = v2Client && typeof v2Client.session.prompt === "function" && typeof v2Client.session.get === "function" ? v2Client : null;
+  const sessionHooks = v2RegisterSessionHooks(ctx, goalClient);
+  await v2RegisterCommands(ctx);
+  const v2AbortEvents = v2SubscribeEvents(ctx, goalClient, !sessionHooks.idleHook);
+  const disposables = [...sessionHooks.disposables, ...v2AbortEvents ? [v2AbortEvents] : []];
+  return disposables.length > 0 ? () => {
+    for (const dispose of disposables) {
+      try {
+        dispose();
+      } catch {}
+    }
+  } : undefined;
 }
 var plugin_default = { id: "forge", server, setup: v2Setup };
 export {
+  v2WiringSeam,
   v2Setup,
   server,
   resolveDispatchQueueMax,
@@ -20959,6 +21615,10 @@ export {
   effectiveWorktree,
   effectiveSurvive,
   plugin_default as default,
+  crewOrchestrationTemplate,
+  PLAN_COMMAND_TEMPLATE,
+  GOAL_COMMAND_TEMPLATE,
   DEFAULT_DISPATCH_QUEUE_MAX,
+  CREW_INIT_TEMPLATE,
   ASYNC_DISPATCH_CAP
 };

@@ -108,7 +108,8 @@ runs and fresh sessions still land on forge under coexistence.
 
 ## Install
 
-Requires opencode ≥ 1.18.
+Requires opencode ≥ 1.18 (v1 hosts) or ≥ 2.0 (v2 hosts). Same install
+commands on both — the plugin ships both entries and the host picks one.
 
 ```bash
 # npm (recommended)
@@ -126,6 +127,23 @@ skill file).
 Note: do not enable opencode's experimental plan mode
 (`OPENCODE_EXPERIMENTAL_PLAN_MODE`) together with forge — two plan mechanisms
 would overlap.
+
+### v2-host notes (opencode 2.x)
+
+Full feature parity with v1 (agents, tools, permission belt and gates,
+session hooks, commands, goal/job engines), with two documented drifts:
+
+- **Model pins are v1-only.** A `forge.json` worker's `model` field is
+  honored on v1 hosts; on v2 hosts the pin is skipped (any model spelling
+  on the v2 agent draft breaks the host's agent registry). The
+  `thoughtLevel` pin works on both (it rides the runtime chat.params
+  lookup, not the agent record).
+- **`/plan` `/goal` `/crew` are execute-based commands on v2** (the
+  template text is sent into your session when you invoke them) and there
+  is no create-only guard — forge's `/goal` replaces the built-in one.
+  v2 hosts have no default per-turn auto-continue, so nothing fights the
+  goal loop; the plan/goal briefs survive compaction via the compaction
+  hook either way.
 
 ## Configuration
 
