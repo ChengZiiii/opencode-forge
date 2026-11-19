@@ -19790,7 +19790,10 @@ var crewBeginTool = tool({
             `[forge:crew] Crew ended as a CONVERSION record: ${crew.objective}`,
             "Now draft the goal contract: goal_write with arm=true, folding the declared subtasks below into its criteria and verification checks. The arm confirmation dialog is the user's gate for the whole autonomous path — do not ask again here.",
             `Declared subtasks to fold in (${crew.subtasks.length}):`,
-            ...crew.subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`)
+            ...crew.subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
+            `[forge:crew] Relay: the goal loop owns this plan from here — its continuation turns may re-register it as a BORN-ARMED crew in ONE call (crew_begin {objective, subtasks, execution: "waves"} — no pause mid-loop); the arming dialog already authorized this orchestration.`,
+            "Preserve the subtask STRUCTURE inside the goal contract (criteria or constraints) — keep the declared titles and their forge-* agent assignments verbatim enough to re-register; do not dissolve them into prose.",
+            'Born-armed registration sketch to adapt: crew_begin {objective: <this objective>, subtasks: [the declared subtasks with their agents], execution: "waves"}.'
           ].join(`
 `)
         };
@@ -20123,6 +20126,11 @@ async function continueCrewIfEligible(client, state, sessionID) {
 }
 function goalBriefText(state, goal) {
   const d = goal.doc;
+  const structureText = [...d.criteria, d.constraints.trim()].filter(Boolean).join(`
+`);
+  const structured = /\bforge-[a-z0-9-]+\b/.test(structureText) || /^\s*\d+[.).]/m.test(structureText);
+  const crewLayerBase = `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), dispatch forge-* waves, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Crew gates stay internal to this loop (your goal turns drive the crew — no separate crew idle briefs fire under this goal; standalone waves auto-advance on session idle until crew_close).`;
+  const crewLayerLine = structured ? `${crewLayerBase} The contract carries a subtask structure — PREFER re-registering it as a born-armed crew (one call, execution: "waves") over self-executing the whole plan in this session; drive the crew through your goal turns and keep per-subtask evidence for the close report.` : crewLayerBase;
   return [
     `[forge:goal-continue] Continue the active goal (revision ${d.revision}): ${d.goal}`,
     `Success criteria:
@@ -20133,7 +20141,7 @@ ${d.checks.map((c, i) => `${i + 1}. ${c.kind === "shell" ? `shell \`${c.cmd}\`` 
 `)}`,
     d.constraints.trim() ? `Constraints: ${d.constraints.trim()}` : "",
     `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. Work the criteria now; call goal_check when you believe they hold, then goal_complete (it re-runs every check itself and asks the user). If genuinely blocked, call goal_pause with the blocker — do not spin.`,
-    `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), dispatch forge-* waves, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Crew gates stay internal to this loop (your goal turns drive the crew — no separate crew idle briefs fire under this goal; standalone waves auto-advance on session idle until crew_close).`,
+    crewLayerLine,
     `Goal file: ${relFrom(state.worktree, goal.path)}`
   ].filter((s) => s.length > 0).join(`
 `);
