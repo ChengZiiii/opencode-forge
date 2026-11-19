@@ -4390,6 +4390,7 @@ function goalBriefText(state: SessionState, goal: ActiveGoal): string {
       .map((c, i) => `${i + 1}. ${c.kind === "shell" ? `shell \`${c.cmd}\`` : `contains \`${c.file}\` :: \`${c.text}\``}`)
       .join("\n")}`,
     d.constraints.trim() ? `Constraints: ${d.constraints.trim()}` : "",
+    `Per-turn discipline: land at least one verification command (forge_shell) or a real write every turn — the Turn Ledger scores read-only turns as no-progress, and consecutive no-progress turns auto-pause the loop (goal-no-progress-honesty: re-running the checks IS progress).`,
     `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. Work the criteria now; call goal_check when you believe they hold, then goal_complete (it re-runs every check itself and asks the user). If genuinely blocked, call goal_pause with the blocker — do not spin.`,
     crewLayerLine,
     `Goal file: ${relFrom(state.worktree, goal.path)}`,
@@ -5507,7 +5508,10 @@ export const server: Plugin = async (input, options) => {
       const act = turnActivity.get(input.sessionID)
       if (act) {
         if (isWriteTool(input.tool) || input.tool === "plan_tick") act.writes++
-        if (input.tool === "goal_check") act.checks++
+        // goal-no-progress-honesty: a verification command on an exec-class
+        // tool scores like goal_check — a turn that re-ran the contract's
+        // checks through forge_shell can never be scored no-progress.
+        if (input.tool === "goal_check" || input.tool === "forge_shell" || input.tool === "shell" || input.tool === "bash") act.checks++
       }
       // Crew-side counters (crew-autonomous-waves D3): task dispatches count
       // as crew-turn activity (waves ARE the work) plus write-family calls;
@@ -6104,7 +6108,9 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
         const act = turnActivity.get(sessionID)
         if (act) {
           if (isWriteTool(tool) || tool === "plan_tick") act.writes++
-          if (tool === "goal_check") act.checks++
+          // goal-no-progress-honesty: exec-class verification commands score
+          // like goal_check (mirror of the v1 activity ledger).
+          if (tool === "goal_check" || tool === "forge_shell" || tool === "shell" || tool === "bash") act.checks++
         }
         const crewAct = crewTurnActivity.get(sessionID)
         if (crewAct) {

@@ -753,6 +753,48 @@ test("no-progress: two activity-free continuation turns auto-pause; a write rese
   }
 })
 
+test("no-progress honesty: a forge_shell verification turn scores as activity and resets the streak; the brief carries the per-turn discipline", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "goal-noprog-exec-"))
+  try {
+    const { serverPromise, prompts } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = await armGoal(hooks, wt, { maxTurns: 10 })
+    // Turn 1: no activity.
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(60)
+    assert.equal(prompts.length, 1)
+    // The brief teaches the discipline the detector enforces.
+    assert.ok(prompts[0].body.parts[0].text.includes("Per-turn discipline"), "the brief states the per-turn verification-or-write discipline")
+    assert.ok(prompts[0].body.parts[0].text.includes("read-only turns"), "the discipline names the ledger consequence")
+    // Turn 2: a VERIFICATION COMMAND ran through forge_shell (no writes) —
+    // the goal-no-progress-honesty scoring: this is activity, the streak
+    // resets, and the loop continues (the 2026-11-19 misfire class).
+    await hooks["tool.execute.after"]({ tool: "forge_shell", sessionID: sid, callID: "c", args: {} }, { title: "", output: "", metadata: {} })
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(60)
+    assert.equal(prompts.length, 2, "the verifying turn continued the loop")
+    assert.equal(liveDoc(wt).doc.status, "active", "a verification-command turn is never scored no-progress")
+    const entry = liveDoc(wt).doc.ledger.at(-1)
+    assert.ok(entry, "the turn was ledgered")
+    assert.equal(entry.activity, true, "the ledger scores the exec turn as activity")
+    assert.equal(entry.checks, 1, "the exec rides the checks counter")
+    assert.equal(entry.writes, 0, "no write happened")
+    // Turns 3 and 4 with NO tool calls at all: the genuinely-idle path is
+    // unchanged — the streak builds and the auto-pause still fires.
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(60)
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await sleep(80)
+    const { doc } = liveDoc(wt)
+    assert.equal(doc.status, "paused")
+    assert.equal(doc.stopReason, "no-progress")
+    assert.ok(prompts.at(-1).body.parts[0].text.includes("[forge:goal-wrapup]"))
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
 test("transport failures: three consecutive failed deliveries auto-pause with transport-failures", async () => {
   const wt = mkdtempSync(join(tmpdir(), "goal-transport-"))
   try {

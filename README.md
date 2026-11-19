@@ -271,9 +271,14 @@ a `stop_reason` in the frontmatter — on: budget exhaustion, two consecutive
 no-progress continuation turns, three consecutive transport failures, or a
 live draft plan appearing in the session (the only plan/goal interop: a draft
 plan's write ban would wall the loop off, so the goal pauses instead of
-burning turns against it). `/goal pause` (or `goal_pause` with a blocker
-description) pauses by hand; `/goal resume` re-arms through another
-confirmation dialog.
+burning turns against it). Activity scoring is verification-honest: a turn
+that ran `goal_check` OR executed verification commands through
+`forge_shell`/`shell`/`bash` scores as active (a turn re-running the
+contract's checks is never mis-scored as no-progress); the continuation
+brief states the same per-turn discipline (land a verification command or a
+write — read-only turns are ledgered as no-progress). `/goal pause` (or
+`goal_pause` with a blocker description) pauses by hand; `/goal resume`
+re-arms through another confirmation dialog.
 
 **Completion is fail-closed.** `goal_complete` re-executes every check itself
 at the gate — results recorded in the Check Log never substitute for the
