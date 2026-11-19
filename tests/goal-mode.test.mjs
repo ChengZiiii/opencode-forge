@@ -609,6 +609,50 @@ test("idle continuation: armed goal continues the owner session with a compact b
   }
 })
 
+test("idle continuation brief: crew-layer directive is structure-aware — PREFER born-armed re-registration only for structured contracts", async () => {
+  // crew-goal-conversion-relay 1.2: a contract whose criteria name forge-* agents
+  // (or carry a numbered subtask structure) earns the PREFER directive; a plain
+  // contract keeps the baseline discretionary crew-layer line only.
+  const wtStructured = mkdtempSync(join(tmpdir(), "goal-pref-structured-"))
+  const wtPlain = mkdtempSync(join(tmpdir(), "goal-pref-plain-"))
+  try {
+    setShellRunnerForTests(fakeRunnerPass)
+    {
+      // Structured: the criteria name a forge-* worker -> PREFER re-registering.
+      const { serverPromise, prompts } = makeHarness({ worktree: wtStructured })
+      const hooks = await serverPromise
+      const sid = await armGoal(hooks, wtStructured, {
+        criteria: ["forge-plugindev-coder lands the wiring tests", "suite stays green"],
+        constraints: "keep per-subtask evidence for the close report",
+      })
+      await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+      await sleep(60)
+      assert.equal(prompts.length, 1)
+      const brief = prompts[0].body.parts[0].text
+      assert.match(brief, /Crew layer: you own it under this goal/, "the baseline crew-layer line still leads for a structured contract")
+      assert.match(brief, /PREFER re-registering it as a born-armed crew/, "a criterion naming a forge-* agent earns the PREFER directive over self-executing the plan")
+      await hooks.dispose?.()
+    }
+    {
+      // Plain: no forge-* mention, no numbered subtask list -> baseline only.
+      const { serverPromise, prompts } = makeHarness({ worktree: wtPlain })
+      const hooks = await serverPromise
+      const sid = await armGoal(hooks, wtPlain)
+      await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+      await sleep(60)
+      assert.equal(prompts.length, 1)
+      const brief = prompts[0].body.parts[0].text
+      assert.match(brief, /Crew layer: you own it under this goal/, "a plain contract still carries the baseline crew-layer line")
+      assert.doesNotMatch(brief, /PREFER/, "no PREFER directive without subtask structure")
+      await hooks.dispose?.()
+    }
+  } finally {
+    setShellRunnerForTests(null)
+    rmSync(wtStructured, { recursive: true, force: true })
+    rmSync(wtPlain, { recursive: true, force: true })
+  }
+})
+
 test("idle: non-owner session and unknown-session-without-directory never continue", async () => {
   const wt = mkdtempSync(join(tmpdir(), "goal-owner-"))
   try {

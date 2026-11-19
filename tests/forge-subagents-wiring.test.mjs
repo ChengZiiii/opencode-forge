@@ -900,6 +900,12 @@ test("crew lifecycle: goal conversion ends the crew and directs goal_write(arm)"
   assert.match(out.output, /CONVERSION record/)
   assert.match(out.output, /goal_write with arm=true/)
   assert.match(out.output, /1\. one/, "the declared plan rides along for folding")
+  // crew-goal-conversion-relay 1.1: the conversion output relays the crew layer
+  // into the goal loop — relay, structure-preservation directive, and a
+  // ready-to-adapt born-armed sketch the first post-arming turn can act on.
+  assert.match(out.output, /BORN-ARMED crew in ONE call/, "the relay states the goal loop may re-register the plan born-armed in ONE call")
+  assert.match(out.output, /Preserve the subtask STRUCTURE/, "the structure-preservation directive keeps subtask titles and forge-* agent assignments intact inside the goal contract")
+  assert.match(out.output, /Born-armed registration sketch/, "a ready-to-adapt born-armed registration sketch rides along (naming the declared subtasks)")
   assert.equal(h.__forgeSubagentsTest.crews().get("ses_conv"), undefined, "conversion ends the crew")
   assert.match(readFileSync(recordPath, "utf8"), /converted to goal/, "the record carries the conversion")
   // The belt is gone with the crew: task dispatch no longer refuses.
