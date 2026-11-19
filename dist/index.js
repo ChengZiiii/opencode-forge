@@ -21211,6 +21211,25 @@ function v2ContextInjection(raw) {
   if (agentName)
     sessionAgents.set(sessionID, agentName);
   if (agentName && agentName.startsWith("forge-")) {
+    const agentId = agentName.slice("forge-".length);
+    const pinnedDef = resolvePools()?.agents[agentId]?.def;
+    if (pinnedDef?.model) {
+      const identity = parseIdentity(pinnedDef.model);
+      if (identity && o.model && typeof o.model === "object") {
+        const before = JSON.stringify(o.model);
+        const m = o.model;
+        m.providerID = identity.provider;
+        m.id = identity.model;
+        m.modelID = identity.model;
+        delete m.variant;
+        if (process.env.FORGE_MODEL_PROBE) {
+          try {
+            appendFileSync2(join6(tmpdir3(), "forge-model-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} rewrite ${before} -> ${JSON.stringify(o.model)}
+`);
+          } catch {}
+        }
+      }
+    }
     const frozen = sessionDepths.get(sessionID);
     if (frozen) {
       if (frozen.translation) {
@@ -21219,8 +21238,7 @@ function v2ContextInjection(raw) {
         applyDepthTranslation(o.options, frozen.translation);
       }
     } else {
-      const agentId = agentName.slice("forge-".length);
-      const def = resolvePools()?.agents[agentId]?.def;
+      const def = pinnedDef;
       if (def?.thoughtLevel) {
         const modelObj = o.model;
         const providerID = typeof modelObj?.providerID === "string" ? modelObj.providerID : "";

@@ -69,7 +69,7 @@ import {
   type Watchdog,
 } from "./src/watchdog.ts"
 import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
-import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, type CatalogSnapshot } from "./src/models-dev.ts"
+import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, parseIdentity, type CatalogSnapshot } from "./src/models-dev.ts"
 import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
@@ -6037,6 +6037,34 @@ function v2ContextInjection(raw: unknown): void {
   if (agentName) sessionAgents.set(sessionID, agentName)
   // --- depth injection (chat.params port) ---
   if (agentName && agentName.startsWith("forge-")) {
+    const agentId = agentName.slice("forge-".length)
+    // Runtime model pin (v2-runtime-model-pin): the draft model field is
+    // V1-only (the host's /api/agent encoder 500s on it), so the pin applies
+    // HERE — the context payload carries the resolved model (SessionRequest),
+    // and mutations on this payload demonstrably propagate on 2.3.2 (the
+    // same mechanism as the options/system injections below; the resolve
+    // hook clone-eats mutations, the context hook does not). Resolve fresh
+    // per request (hot-apply); malformed pins skip silently (D3).
+    const pinnedDef: ForgeAgentDef | undefined = resolvePools()?.agents[agentId]?.def
+    if (pinnedDef?.model) {
+      const identity = parseIdentity(pinnedDef.model)
+      if (identity && o.model && typeof o.model === "object") {
+        const before = JSON.stringify(o.model)
+        const m = o.model as { providerID?: unknown; id?: unknown; modelID?: unknown; variant?: unknown }
+        m.providerID = identity.provider
+        m.id = identity.model
+        m.modelID = identity.model
+        delete m.variant
+        if (process.env.FORGE_MODEL_PROBE) {
+          try {
+            appendFileSync(
+              join(tmpdir(), "forge-model-probe.log"),
+              `${new Date().toISOString()} sid=${sessionID} agent=${agentName} rewrite ${before} -> ${JSON.stringify(o.model)}\n`,
+            )
+          } catch {}
+        }
+      }
+    }
     const frozen = sessionDepths.get(sessionID)
     if (frozen) {
       if (frozen.translation) {
@@ -6044,8 +6072,7 @@ function v2ContextInjection(raw: unknown): void {
         applyDepthTranslation(o.options as Record<string, unknown>, frozen.translation)
       }
     } else {
-      const agentId = agentName.slice("forge-".length)
-      const def: ForgeAgentDef | undefined = resolvePools()?.agents[agentId]?.def
+      const def = pinnedDef
       if (def?.thoughtLevel) {
         const modelObj = o.model as { modelID?: unknown; id?: unknown; providerID?: unknown } | undefined
         const providerID = typeof modelObj?.providerID === "string" ? modelObj.providerID : ""

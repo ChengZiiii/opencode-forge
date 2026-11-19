@@ -158,6 +158,43 @@ test("v2 session: context injects the pinned thoughtLevel onto event.options; fr
 })
 
 // ---------------------------------------------------------------------------
+// runtime model pin (v2-runtime-model-pin)
+
+test("v2 model pin: context rewrites the payload model to the pinned identity (variant dropped); unpinned/unparsable/missing-model payloads stay untouched", async () => {
+  const dir = poolDir("pin", {
+    pinned: { model: "glm-coding-worker/glm-5.3", thoughtLevel: "low" },
+    auto: {},
+    badpin: { model: "noslash", thoughtLevel: "low" },
+  })
+  const { context } = await setup(dir)
+  try {
+    // Wired: the pinned agent's payload model is rewritten; variant dropped.
+    const out1 = { options: {} }
+    const m1 = { providerID: "opencode", id: "tidepool-alpha-free", variant: "minimal" }
+    await context({ sessionID: "ses_pin1", agent: "forge-pin-pinned", model: m1, ...out1 })
+    assert.equal(m1.providerID, "glm-coding-worker", "providerID rewritten to the pin")
+    assert.equal(m1.id, "glm-5.3", "id rewritten to the pin")
+    assert.equal(m1.modelID, "glm-5.3", "modelID spelling rewritten too")
+    assert.equal("variant" in m1, false, "source variant dropped")
+    // Depth still rides the same payload (pinned model channel or frozen).
+    assert.equal(out1.options.reasoningEffort, "low", "thoughtLevel injection unaffected")
+    // Auto worker (no pin): payload model untouched.
+    const m2 = { providerID: "opencode", id: "tidepool-alpha-free" }
+    await context({ sessionID: "ses_pin2", agent: "forge-pin-auto", model: m2 })
+    assert.equal(m2.providerID, "opencode", "no pin -> untouched")
+    assert.equal(m2.id, "tidepool-alpha-free", "no pin -> id untouched")
+    // Unparsable pin: skip silently, no throw.
+    const m3 = { providerID: "opencode", id: "tidepool-alpha-free" }
+    await assert.doesNotReject(context({ sessionID: "ses_pin3", agent: "forge-pin-badpin", model: m3 }))
+    assert.equal(m3.providerID, "opencode", "unparsable pin -> untouched")
+    // Missing payload model: no throw.
+    await assert.doesNotReject(context({ sessionID: "ses_pin4", agent: "forge-pin-pinned" }))
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
 // compaction (goal-brief reinjection)
 
 test("v2 session: compaction reinjects the goal brief for a live-goal forge session; silent otherwise", async () => {

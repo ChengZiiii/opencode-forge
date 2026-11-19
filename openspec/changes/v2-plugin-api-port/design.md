@@ -308,15 +308,26 @@ Each verified against the RUNNING host, not just types:
     description is frozen at registration). **Documented drift**: the
     v1 create-only rule is not implementable (no editor.get) — forge
     adds last; on 2.3.2 forge's `/goal` overwrites the host built-in.
-11. **AGENT MODEL PINS** — writing a model on the v2 agent draft breaks
-    the agent layer in BOTH spellings (v1 string `"provider/model"` AND
-    parsed `{providerID, modelID}`): the /api/agent encoder later 500s
-    ("Server failed to encode its response"). **Documented drift**: the
+11. **AGENT MODEL PINS (superseded by change `v2-runtime-model-pin`)**
+    — writing a model on the v2 agent draft breaks the agent layer in
+    BOTH spellings (v1 string `"provider/model"` AND parsed
+    `{providerID, modelID}`): the /api/agent encoder later 500s
+    ("Server failed to encode its response"). ~~Documented drift: the
     pool model pin is V1-ONLY on this release; the v2 draft carries
-    description/system/mode/permission only. The thoughtLevel pin is
-    unaffected (runtime chat.params pool lookup by agent id). Verified
-    by live bisect: minimal pool (no model) materializes and lists fine
-    (`forge-live-research`, mode subagent).
+    description/system/mode/permission only.~~ **RESOLVED via runtime
+    pin (context hook)**: the draft stays model-free; on every v2
+    session.context request for a forge-family agent the pool def is
+    resolved fresh and `payload.model` is rewritten to the pinned
+    identity (providerID + id + modelID, variant dropped; malformed
+    pins skip silently). Probe ladder on 2.3.2: the
+    `experimental.model.resolve` hook FIRES but its rewrite does NOT
+    propagate (per-hook event cloning, void-return hooks); the
+    **context hook override IS honored** — full-chain proof: pinned
+    pool agent `forge-live-swapper` dispatched via task, served
+    assistant record `model=glm-5.3/glm-coding-worker` (host default
+    tidepool-alpha-free overridden). The thoughtLevel pin is
+    unaffected (runtime chat.params pool lookup by agent id; now
+    resolves against the pinned model).
 12. **PERMISSION ASK WIRE** — the ask gate surfaces as SSE
     `permission.asked` `{data: {id, sessionID, action, resources[],
     metadata{title}}}`; the reply route is
