@@ -555,14 +555,16 @@ test("wake: async completion delivers ONE idle wake carrying the child's final m
 
 // ---------------------------------------------------------------------------
 // Sync timeout arms completion tracking (change sync-timeout-notify; spec
-// scenario "Sync timeout is honest"): a sync dispatch whose child outlives
-// the poll window throws the honest finding — and the already-running child
-// is registered for the standard completion wake BEFORE the throw, so
-// exactly one [forge:dispatch-complete] wake carries the final report when
-// it later completes. Arming bypasses the async cap (design D3). The window
-// rides the FORGE_DISPATCH_POLL_TIMEOUT_MS env knob (read at call time).
+// scenario "Sync timeout is honest"; presentation reclassified by
+// dispatch-sync-handoff-notice): a sync dispatch whose child outlives the
+// poll window returns an INFORMATIONAL handoff notice (never the error
+// channel) — and the already-running child is registered for the standard
+// completion wake BEFORE the return, so exactly one
+// [forge:dispatch-complete] wake carries the final report when it later
+// completes. Arming bypasses the async cap (design D3). The window rides
+// the FORGE_DISPATCH_POLL_TIMEOUT_MS env knob (read at call time).
 
-test("sync timeout: honest throw disclosing the ARMED wake, then exactly one [forge:dispatch-complete] with the final report", async (t) => {
+test("sync timeout: informational handoff notice (not an error) disclosing the armed wake, then exactly one [forge:dispatch-complete] with the final report", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
   const h = await startServer(input(dir, client), {})
@@ -573,27 +575,24 @@ test("sync timeout: honest throw disclosing the ARMED wake, then exactly one [fo
     delete process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS
   })
   const ctx = allowCtx("ses_to", dir)
-  await assert.rejects(
-    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "long audit", description: "timeout test" }, ctx),
-    (err) => {
-      const m = String(err)
-      assert.match(m, /Poll timeout after 250ms/, "the resolved env-knob window is named (the knob flows through)")
-      assert.match(m, /child session ses_child_1 never reached a terminal state/, "the child session id is named")
-      assert.match(m, /It remains a real session: inspect or abort it natively in the host TUI/, "the native-inspectability disclosure stays")
-      assert.match(m, /Completion tracking is ARMED/, "the armed wake is disclosed")
-      assert.match(m, /exactly one \[forge:dispatch-complete\] wake carrying the final report/, "the wake contract is disclosed")
-      assert.match(m, /do not poll or re-dispatch in the meantime/, "the no-polling discipline is disclosed")
-      assert.ok(!m.includes("No auto-convert"), "the retired No-auto-convert line is gone")
-      return true
-    },
-  )
+  const r = await h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "long audit", description: "timeout test" }, ctx)
+  const m = r.output
+  assert.match(r.title, /dispatch continues in background/, "the handoff is a normal result (informational title, no error channel)")
+  assert.match(m, /Sync wait budget ended \(250ms\)/, "the resolved env-knob window is named (the knob flows through)")
+  assert.match(m, /the dispatch continues in the background; collect with forge_jobs/, "the outcome + collection path are named (spec wording)")
+  assert.match(m, /child session: ses_child_1/, "the child session id is named")
+  assert.match(m, /inspect or abort it natively in the host TUI/, "the native-inspectability disclosure stays")
+  assert.match(m, /Report path \(ground truth\): reports\/\S+-report\.md/, "the report-path retrieval pointer is present")
+  assert.match(m, /exactly one \[forge:dispatch-complete\] wake carrying the final report/, "the wake contract is disclosed")
+  assert.match(m, /do not poll or re-dispatch in the meantime/, "the no-polling discipline is disclosed")
+  assert.ok(!m.includes("No auto-convert"), "the retired No-auto-convert line is gone")
   // Arming happened: the registry holds the entry and the metadata publish
   // mirrors the async path (taskId = the armed job id).
   const armed = h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_to")
   assert.equal(armed.length, 1, "the timed-out child is registered for completion tracking")
   assert.equal(armed[0].childSessionID, "ses_child_1")
   const meta = ctx._metadataCalls.at(-1)?.metadata ?? {}
-  assert.equal(ctx._metadataCalls.at(-1)?.title, "forge-dp-research: dispatch async", "metadata published like the async path")
+  assert.equal(ctx._metadataCalls.at(-1)?.title, "forge-dp-research: dispatch async", "tracker metadata published like the async path")
   assert.equal(meta.taskId, armed[0].jobId, "the metadata taskId is the ARMED job id")
   assert.equal(meta.sessionId, "ses_child_1")
   assert.equal(meta.run_in_background, false, "the call itself stayed a sync dispatch")
@@ -609,6 +608,40 @@ test("sync timeout: honest throw disclosing the ARMED wake, then exactly one [fo
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_to" } } })
   await new Promise((res) => setTimeout(res, 100))
   assert.equal(wakesTo("ses_to").length, 1, "at-most-once: no duplicate wake")
+})
+
+test("sync handoff presentation matrix: genuine failures keep the error channel (dispatch-sync-handoff-notice)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client } = makeClient({ record: { directory: dir, worktree: dir }, mode: "error", errorText: "no provider available for the pinned model" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS = "120000"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS
+  })
+  // Evidence-backed worker failure: the SYNC call REJECTS (error channel) —
+  // the informational reclassification never covers real failures.
+  await assert.rejects(
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "broken config", description: "error channel" }, allowCtx("ses_matrix", dir)),
+    (err) => {
+      const m = String(err)
+      assert.match(m, /child session ses_child_1 ended in error/, "the worker error names the child + the recorded evidence")
+      assert.match(m, /no provider available/, "the evidence rides the error")
+      assert.ok(!m.includes("collect with forge_jobs"), "no informational handoff styling on a genuine failure")
+      return true
+    },
+  )
+  // Gate refusal: same error channel as before — pin ONE refusal class (the
+  // primary-only belt; the full gate matrix lives in its own tests).
+  await h["chat.message"]({ sessionID: "ses_matrix_worker", agent: "forge-dp-research" })
+  await assert.rejects(
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "worker dispatch" }, allowCtx("ses_matrix_worker", dir)),
+    /reserved for the primary forge agent/,
+    "gate refusal stays a rejection",
+  )
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_matrix" } } } })
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_matrix_worker" } } } })
 })
 
 test("sync timeout arming BYPASSES the async cap (design D3: the cap governs new dispatch decisions, not an already-running child)", async (t) => {
@@ -627,13 +660,11 @@ test("sync timeout arming BYPASSES the async cap (design D3: the cap governs new
   for (let i = 0; i < 3; i++) await dispatch(i)
   // A SYNC dispatch in the same at-cap session times out — arming must still
   // happen (the child is already running regardless of the cap).
-  await assert.rejects(
-    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "over the window", description: "cap bypass" }, allowCtx("ses_caparm", dir)),
-    (err) => {
-      assert.match(String(err), /Completion tracking is ARMED/)
-      return true
-    },
+  const rCap = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "over the window", description: "cap bypass" },
+    allowCtx("ses_caparm", dir),
   )
+  assert.match(rCap.output, /collect with forge_jobs/, "the informational handoff still surfaces at the cap")
   const armed = h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_caparm" && x.childSessionID === "ses_child_4")
   assert.equal(armed.length, 1, "the timed-out sync child is armed despite the session being at the async cap")
   setChildState("ses_child_4", "done")
@@ -908,22 +939,21 @@ test("copy: async discipline, handle text, and the ARMED finding disclose progre
   assert.match(r.output, /END YOUR TURN/, "the stop mandate stays")
   assert.match(r.output, /\[forge:dispatch-progress\] notices may arrive while the child runs/, "the handle mentions interim notices")
   assert.match(r.output, /however long it takes/, "the handle guarantees the final wake regardless of duration")
-  // The ARMED sync-timeout finding carries the same disclosure.
+  // The ARMED sync handoff carries the same disclosure (informational, not
+  // an error).
   process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS = "150"
   t.after(() => {
     delete process.env.FORGE_DISPATCH_POLL_TIMEOUT_MS
   })
-  await assert.rejects(
-    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "over the window", description: "copy armed" }, allowCtx("ses_copy2", dir)),
-    (err) => {
-      const m = String(err)
-      assert.match(m, /Completion tracking is ARMED/)
-      assert.match(m, /exactly one \[forge:dispatch-complete\] wake carrying the final report/, "at-most-one terminal wake stays TRUE")
-      assert.match(m, /however long it takes/)
-      assert.match(m, /\[forge:dispatch-progress\] notices may arrive meanwhile/)
-      return true
-    },
+  const rArmed = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "over the window", description: "copy armed" },
+    allowCtx("ses_copy2", dir),
   )
+  const mArmed = rArmed.output
+  assert.match(mArmed, /collect with forge_jobs/)
+  assert.match(mArmed, /exactly one \[forge:dispatch-complete\] wake carrying the final report/, "at-most-one terminal wake stays TRUE")
+  assert.match(mArmed, /however long it takes/)
+  assert.match(mArmed, /\[forge:dispatch-progress\] notices may arrive meanwhile/)
   // Harvest both sessions (aborts the still-busy children, drains state).
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_copy" } } } })
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_copy2" } } } })
@@ -1304,11 +1334,12 @@ test("retry (armed-sync): a timed-out sync dispatch's armed poller retries too �
   const h = await startServer(input(dir, client), {})
   t.after(() => h.dispose?.())
   await h.config(emptyCfg())
-  await assert.rejects(
-    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "long then flaky", description: "armed retry" }, allowCtx("ses_rt7", dir)),
-    /Completion tracking is ARMED/,
+  const rArmed = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "long then flaky", description: "armed retry" },
+    allowCtx("ses_rt7", dir),
   )
-  // The armed child dies in a transient error AFTER the timeout throw —
+  assert.match(rArmed.output, /collect with forge_jobs/, "the armed handoff is informational")
+  // The armed child dies in a transient error AFTER the timeout handoff —
   // the armed poller retries through the same machinery.
   setChildState("ses_child_1", "error")
   await waitFor(() => calls.create.length === 2, "the armed poller respawned")

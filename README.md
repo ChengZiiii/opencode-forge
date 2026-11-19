@@ -674,6 +674,15 @@ child stays inspectable and natively abortable in the host TUI, and the
 journal records `stream-lost/unknown` with the last-observed activity
 timestamp.
 
+**Sync handoff presentation.** A sync dispatch whose child outlives the
+wait budget does not fail: the handoff surfaces as a normal informational
+notice — "sync wait budget ended — the dispatch continues in the
+background; collect with `forge_jobs`" — carrying every retrieval pointer
+(task id, child session, the agreed report path) plus the armed-wake
+contract. The error channel is reserved for genuine failures: gate/pool
+refusals and evidence-backed worker errors render as errors exactly as
+before.
+
 **Report-file delivery contract.** Every dispatch prompt carries a standing
 line naming the agreed report path `reports/<task-id>-report.md`
 (workspace-relative); workers with write access write their final report

@@ -3425,21 +3425,39 @@ const taskDispatchTool = tool({
         context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
       }
       if (syncStreamLost) {
+        // dispatch-sync-handoff-notice: a view loss is NOT an error — the
+        // tracker is armed and the handoff surfaces as an informational
+        // notice (no error-channel rendering).
         armSyncTracker()
-        const attemptNoteLost = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; tracking continues in the armed tracker.` : ""
-        throw new Error(
-          `[forge:dispatch] result stream lost before a final report — child session ${childSessionID} state UNKNOWN (possibly still running).${attemptNoteLost} ` +
-            `Completion tracking is re-armed: if the view recovers and the child finishes, exactly one [forge:dispatch-complete] wake carries the outcome. ` +
-            `Ground-truth recovery: read reports/${syncJobId}-report.md in the workspace BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`,
-        )
+        const attemptNoteLost = attemptSync > 1 ? `${attemptSync} attempt(s) so far; tracking continues in the armed tracker.` : ""
+        return {
+          title: `${target}: dispatch continues (result stream lost)`,
+          metadata: { ...taskMetadata },
+          output: [
+            `[forge:dispatch] Result stream lost before a final report — child session ${childSessionID} state UNKNOWN (possibly still running). The dispatch continues in the background; collect with forge_jobs.`,
+            `task id: ${syncJobId}${attemptNoteLost ? ` — ${attemptNoteLost}` : ""}`,
+            `Ground-truth recovery: read reports/${syncJobId}-report.md in the workspace BEFORE considering a re-dispatch.`,
+            `If the view recovers and the child finishes, exactly one [forge:dispatch-complete] wake carries the outcome; the child session stays inspectable and natively abortable in the host TUI.`,
+          ].join("\n"),
+        }
       }
+      // dispatch-sync-handoff-notice: the wait-budget expiry handoff is a
+      // normal notification, NOT an error — neutral wording naming the
+      // outcome, with every retrieval pointer preserved (job id, task
+      // handle, child session, report path).
       armSyncTracker()
       const attemptNote = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; retries continue in the armed tracker.` : ""
-      throw new Error(
-        `[forge:dispatch] Poll timeout after ${syncTimeoutMs}ms — child session ${childSessionID} never reached a terminal state.${attemptNote} ` +
-          `It remains a real session: inspect or abort it natively in the host TUI. ` +
-          `Completion tracking is ARMED — exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes, however long it takes (interim [forge:dispatch-progress] notices may arrive meanwhile); do not poll or re-dispatch in the meantime.`,
-      )
+      return {
+        title: `${target}: dispatch continues in background`,
+        metadata: { ...taskMetadata },
+        output: [
+          `[forge:dispatch] Sync wait budget ended (${syncTimeoutMs}ms) — the dispatch continues in the background; collect with forge_jobs.`,
+          `task id: ${syncJobId}${attemptNote}`,
+          `child session: ${childSessionID} — it remains a real session: inspect or abort it natively in the host TUI.`,
+          `Report path (ground truth): reports/${syncJobId}-report.md.`,
+          `The completion contract: exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes (interim [forge:dispatch-progress] notices may arrive meanwhile), however long it takes; do not poll or re-dispatch in the meantime.`,
+        ].join("\n"),
+      }
     }
     // async: registry entry (kind=dispatch) + poller; the handle returns now.
     const jobId = asyncJobId || newJobId()
