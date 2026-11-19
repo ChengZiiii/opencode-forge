@@ -100,7 +100,9 @@ test("v2 setup: registers forge subagents from the cwd forge.json (create-only, 
     assert.equal(agents.has("forge-research"), false, "no plain-id agent exists on the v2 path")
     const sub = agents.get("forge-v2pool-research")
     assert.equal(sub.mode, "subagent")
-    assert.equal(sub.model, "zai/glm")
+    // W6 field reality (live bisect): the model pin is NOT written on the
+    // v2 draft — any spelling breaks the host's agent encoder (drift).
+    assert.equal("model" in sub, false)
     assert.equal(sub.permission.task, "deny")
     // Provenance (pool-namespace-contract D3/D5): the description names the
     // family namespace, the origin forge.json path, and the dispatchability

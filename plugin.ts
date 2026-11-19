@@ -156,7 +156,7 @@ function forgePromptText(opts: { hardRefusal: boolean }): string {
 // system prompt carries none of it). The `!` backtick block injects live
 // shell output (opencode command template syntax); $ARGUMENTS is the argument
 // string opencode substitutes.
-const PLAN_COMMAND_TEMPLATE = [
+export const PLAN_COMMAND_TEMPLATE = [
   '(forge plan harness routing. Argument: "$ARGUMENTS")',
   "",
   "FAMILY GUARD (step 0, before anything else): if you do not have the plan_write tool in your available tools, you are not in a forge session — STOP now: execute nothing below (including the directory listing), and tell the user that /plan belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
@@ -188,7 +188,7 @@ const PLAN_COMMAND_TEMPLATE = [
 // subcommands, "add ..." queues an inert goal, anything else is a new goal
 // statement whose contract markers (--check/--contains/--success/...) become
 // structured goal_write fields.
-const GOAL_COMMAND_TEMPLATE = [
+export const GOAL_COMMAND_TEMPLATE = [
   '(forge goal harness routing. Argument: "$ARGUMENTS")',
   "",
   "FAMILY GUARD (step 0, before anything else): if you do not have the goal_write tool in your available tools, you are not in a forge session — STOP now: execute nothing below (including the directory listing), and tell the user that /goal belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
@@ -957,10 +957,14 @@ async function resolveSessionAnchorForPools(anchorClient: { session?: { get?: (o
   if (!sessionID) return ""
   let authoritative = ""
   try {
+    // V2 session info carries the directory under `location.directory`
+    // (same field reality as the lazy-seed read); v1 had it flat.
     const rec = anchorClient?.session?.get
-      ? ((await anchorClient.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined)
+      ? ((await anchorClient.session.get({ path: { id: sessionID } })) as
+          | { directory?: string; worktree?: string; location?: { directory?: string } }
+          | undefined)
       : undefined
-    const anchor = effectiveWorktree(rec?.worktree, rec?.directory)
+    const anchor = effectiveWorktree(rec?.worktree, rec?.directory ?? rec?.location?.directory)
     if (anchor && !isRootish(anchor)) authoritative = anchor
   } catch {}
   const mapped = sessions.get(sessionID)?.worktree ?? ""
@@ -3674,7 +3678,7 @@ const forgeGlobTool = tool({
 // it carries the orchestration rulebook plus the live agent roster; with an
 // empty agent set it becomes the initialization guidance (hard gate, D10) —
 // the only configuration invitation in the plugin.
-const CREW_INIT_TEMPLATE = [
+export const CREW_INIT_TEMPLATE = [
   "(forge crew orchestration. Argument: \"$ARGUMENTS\")",
   "",
   "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
@@ -3694,7 +3698,7 @@ const CREW_INIT_TEMPLATE = [
   "After the file is saved: file edits, creations, and deletions apply at the next config hook — NO host restart is needed, and a DELETED pool file un-materializes its agents (deletion is real — no zombie pools survive on disk truth).",
 ].join("\n")
 
-function crewOrchestrationTemplate(resolution: PoolResolution | null): string {
+export function crewOrchestrationTemplate(resolution: PoolResolution | null): string {
   const families = resolution?.families ?? []
   const globalPath = forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global
   // Session-scoped roster (sole-pool-ownership): the template is composed
@@ -4349,8 +4353,12 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
     let state = sessions.get(sessionID)
     if (!state) {
       try {
-        const info = (await client.session.get({ path: { id: sessionID } })) as { directory?: string; worktree?: string } | undefined
-        const wt = effectiveWorktree(info?.worktree, info?.directory)
+        // V2 session info carries the directory under `location.directory`
+        // (live probe: {"location":{"directory":"..."}}); v1 had it flat.
+        const info = (await client.session.get({ path: { id: sessionID } })) as
+          | { directory?: string; worktree?: string; location?: { directory?: string } }
+          | undefined
+        const wt = effectiveWorktree(info?.worktree, info?.directory ?? info?.location?.directory)
         if (!wt) {
           goalProbe(`skip: no worktree for lazy seed session=${sessionID}`)
           return
@@ -4459,19 +4467,28 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
     }
     try {
       const briefText = goalBriefText(state, goal)
+      // Pre-mark the turn BEFORE the await: the v2 promise-layer prompt
+      // BLOCKS until the whole turn completes, and the idle hook may fire
+      // during that await — the pendingContinuationTurn/turnActivity state
+      // must already be in place so the guard chain can ledger the turn.
+      pendingContinuationTurn.add(sessionID)
+      turnActivity.set(sessionID, { writes: 0, checks: 0 })
       await client.session.prompt({
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: briefText }] },
       })
       transportFails.delete(sessionID)
-      pendingContinuationTurn.add(sessionID)
-      turnActivity.set(sessionID, { writes: 0, checks: 0 })
       // Remember which file this session's loop drives so the NEXT idle can
       // ledger the turn even after the goal goes terminal.
       state.goalPath = goal.path
       atomicWrite(goal.path, incTurns(readFileSync(goal.path, "utf8"), nowIso()))
       goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`)
     } catch (err) {
+      // Roll back the pre-send marks: no turn happened, and leaving them
+      // set would make the next idle ledger a phantom no-activity turn —
+      // the no-progress detector would outrun the transport counter.
+      pendingContinuationTurn.delete(sessionID)
+      turnActivity.delete(sessionID)
       const n = (transportFails.get(sessionID) ?? 0) + 1
       transportFails.set(sessionID, n)
       goalProbe(`transport failure session=${sessionID} count=${n} err=${String(err)}`)
@@ -4504,6 +4521,55 @@ function scheduleIdleContinuation(client: GoalClient, sessionID: string): void {
       void continueIfEligible(client, sessionID)
     }, IDLE_DEBOUNCE_MS),
   )
+}
+
+// session.deleted harvest (change v2-plugin-api-port task 5.1): the ONE
+// core both hosts call — the v1 event hook and the v2 event subscription
+// share it verbatim (parity by reuse). Owner session end kills its live
+// session-scoped jobs (unread completions ledgered), harvests its async
+// dispatches, flushes queued wishes without spawning, and evicts every
+// session-bounded map.
+function harvestSessionEnd(sessionID: string): void {
+  // Owner session ended: live session-scoped jobs are killed,
+  // unread completions ledgered (job-supervisor spec).
+  jobManager.onSessionEnd(sessionID)
+  // Async-dispatch harvest (spec: Async dispatch lifecycle —
+  // "Owner death harvests children"): onSessionEnd above killed the
+  // session's live dispatch registry rows — each killTree aborted the
+  // child session via the SDK and the orphan landed in the
+  // diagnostics ledger. The handle map follows.
+  for (const [id, handle] of [...dispatchTasks]) {
+    if (handle.ownerSession === sessionID) dispatchTasks.delete(id)
+  }
+  // Fold D (owner-death queue flush): queued wishes flush WITHOUT
+  // spawning (no child exists) and their journal records
+  // terminalize (fold E pairing).
+  flushDispatchQueue(sessionID)
+  // The frozen depth translation dies with its session (bounded table).
+  sessionDepths.delete(sessionID)
+  // Undelivered progress notices die with their audience (lossy by
+  // design — the terminal-wake guarantee never rode this queue).
+  dispatchProgressQueue.delete(sessionID)
+  // Same for the agent-family map (tool-partition).
+  sessionAgents.delete(sessionID)
+  // And the exec-seal finding bounds (readonly-exec-seal).
+  sealFindings.delete(sessionID)
+  sealUnknownNotes.delete(sessionID)
+  // Session-domain pool-gate disclosure bound (sole-pool-ownership).
+  poolGateUnknownNotes.delete(sessionID)
+  // Anchor-preference disclosure bound (anchor-pool-preference).
+  anchorPrefNotes.delete(sessionID)
+  // Ledger-rebind disclosure bound + dedup memo (pool-rebind-on-resume;
+  // the LEDGER file itself is persistent evidence and survives).
+  poolGateLedgerNotes.delete(sessionID)
+  sessionAnchorLedgerMemo.delete(sessionID)
+  // Crew hygiene (crew-autonomous-waves D4): the session's crew was
+  // in-memory and session-bound — end it with the session, and evict
+  // the crew continuation engine's maps alongside (mirrors the
+  // agent-family evictions above; the crew record on disk is history
+  // and stays).
+  crews.delete(sessionID)
+  crewEngineForgetSession(sessionID)
 }
 
 // ---------------------------------------------------------------------------
@@ -5300,48 +5366,7 @@ export const server: Plugin = async (input, options) => {
       }
       if (event.type === "session.deleted") {
         const info = (event as unknown as { properties: { info: { id?: string } } }).properties.info
-        if (typeof info?.id === "string" && info.id) {
-          // Owner session ended: live session-scoped jobs are killed,
-          // unread completions ledgered (job-supervisor spec).
-          jobManager.onSessionEnd(info.id)
-          // Async-dispatch harvest (spec: Async dispatch lifecycle —
-          // "Owner death harvests children"): onSessionEnd above killed the
-          // session's live dispatch registry rows — each killTree aborted the
-          // child session via the SDK and the orphan landed in the
-          // diagnostics ledger. The handle map follows.
-          for (const [id, handle] of [...dispatchTasks]) {
-            if (handle.ownerSession === info.id) dispatchTasks.delete(id)
-          }
-          // Fold D (owner-death queue flush): queued wishes flush WITHOUT
-          // spawning (no child exists) and their journal records
-          // terminalize (fold E pairing).
-          flushDispatchQueue(info.id)
-          // The frozen depth translation dies with its session (bounded table).
-          sessionDepths.delete(info.id)
-          // Undelivered progress notices die with their audience (lossy by
-          // design — the terminal-wake guarantee never rode this queue).
-          dispatchProgressQueue.delete(info.id)
-          // Same for the agent-family map (tool-partition).
-          sessionAgents.delete(info.id)
-          // And the exec-seal finding bounds (readonly-exec-seal).
-          sealFindings.delete(info.id)
-          sealUnknownNotes.delete(info.id)
-          // Session-domain pool-gate disclosure bound (sole-pool-ownership).
-          poolGateUnknownNotes.delete(info.id)
-          // Anchor-preference disclosure bound (anchor-pool-preference).
-          anchorPrefNotes.delete(info.id)
-          // Ledger-rebind disclosure bound + dedup memo (pool-rebind-on-resume;
-          // the LEDGER file itself is persistent evidence and survives).
-          poolGateLedgerNotes.delete(info.id)
-          sessionAnchorLedgerMemo.delete(info.id)
-          // Crew hygiene (crew-autonomous-waves D4): the session's crew was
-          // in-memory and session-bound — end it with the session, and evict
-          // the crew continuation engine's maps alongside (mirrors the
-          // agent-family evictions above; the crew record on disk is history
-          // and stays).
-          crews.delete(info.id)
-          crewEngineForgetSession(info.id)
-        }
+        if (typeof info?.id === "string" && info.id) harvestSessionEnd(info.id)
       }
     },
 
@@ -5498,19 +5523,952 @@ export const server: Plugin = async (input, options) => {
 // no-op instead of throwing (same contract as opencode-vision-bridge).
 // ---------------------------------------------------------------------------
 
+// V2 context domains, structurally typed (no @opencode/plugin import —
+// conventions §2). Every domain is optional and every method is `?.` +
+// typeof guarded at the call site; a drifted domain disables exactly its
+// own feature slice. Domains not yet wired (permission/session/command/
+// event) land in waves W3–W5; the types exist so the mock harness and the
+// guards have one contract to test against.
 type V2AgentDraft = {
   list(): Array<{ id: string }>
   get(id: string): unknown
   update(id: string, update: (agent: Record<string, unknown>) => void): void
   remove(id: string): void
 }
+type V2ToolEditor = {
+  add?(def: { name: string; description: string; input: Record<string, unknown>; execute: (args: unknown, toolCtx: unknown) => Promise<unknown> }): void
+  list?(): Array<{ name: string }>
+  get?(name: string): unknown
+}
+// Command-domain editor (task 4.3, W6a field reality — SDK 2.3.2
+// promise/command.d.ts): CommandDefinition is EXECUTE-based
+// {name, description?, execute({sessionID, prompt, delivery})} and the
+// editor exposes ONLY add() — no list/get/remove (the v1 create-only rule
+// is not implementable on this domain; documented drift in design.md).
+// The template text rides the execute closure: invoking the command sends
+// the SAME constant text into the invoking session via the flat
+// {sessionID, text} prompt.
+type V2CommandEditor = {
+  add?(def: { name: string; description?: string; execute: (input: { sessionID?: unknown }) => Promise<void> }): void
+}
 type V2PluginContext = {
   agent?: {
-    transform(cb: (draft: V2AgentDraft) => void | Promise<void>): Promise<unknown>
+    transform?(cb: (draft: V2AgentDraft) => void | Promise<void>): Promise<unknown>
+  }
+  tool?: {
+    transform?(cb: (editor: V2ToolEditor) => void | Promise<void>): Promise<unknown>
+    hook?(name: string, cb: (event: unknown) => void): void
+  }
+  // W6a field realities (SDK 2.3.2 promise/permission.d.ts): the evaluate
+  // hook hands the plugin a MUTABLE PermissionEvaluation ({sessionID, agent?,
+  // action, resources, metadata?, source?, effect, message?}) — the belt
+  // mutates input.effect ("allow" | "deny" | "ask", @opencode/schema
+  // permission.d.ts Effect union). The decision-RETURNING gates (the v1
+  // context.ask seam the plan/goal tool cores consume) map to
+  // ctx.permission.assert(input) — "evaluates rules and prompts the user,
+  // resolves when allowed, rejects with Tool.Error on deny".
+  permission?: {
+    hook?(name: string, cb: (event: unknown) => void): unknown
+    assert?(input: unknown): Promise<void>
+  }
+  // W6a field realities (SDK 2.3.2 promise/session.d.ts): the session domain
+  // is Pick<SessionApi, "list"|"create"|"get"|...|"prompt"|...|"context"> —
+  // there is NO promptAsync and NO status; prompt takes the flat
+  // SessionPrompt {sessionID, messageID?, prompt: PromptInput.Prompt,
+  // metadata?, delivery: "steer"|"queue"} (PromptInput.Prompt's minimal
+  // valid shape is {text} — @opencode/schema prompt-input.d.ts). hook()
+  // covers SessionHooks incl. "prompt"|"context"|"compaction" and
+  // "experimental.idle" (SessionIdle {sessionID, background[]} — the
+  // in-process idle signal; richer and race-free vs the SSE
+  // session.execution.succeeded edge) and returns a Registration{dispose}.
+  session?: {
+    hook?(name: string, cb: (event: unknown) => void): unknown
+    get?(opts: unknown): Promise<unknown>
+    prompt?(input: unknown): Promise<unknown>
+    context?(opts: unknown): Promise<unknown>
+  }
+  command?: { transform?(cb: (editor: V2CommandEditor) => void | Promise<void>): Promise<unknown> }
+  // W6a field realities (SDK 2.3.2 promise/event.d.ts): subscribe(options?)
+  // returns an ASYNC ITERABLE of OpenCodeEvent envelopes {id, created, type,
+  // data} — no handlers map, no abort return value. SubscribeOptions carries
+  // {types?, signal?} (adapter.js makeStreams); cleanup = breaking the
+  // for-await loop (iterator.return) and/or aborting the signal.
+  event?: { subscribe?(options?: unknown): unknown }
+  skill?: { transform?(cb: (draft: unknown) => void | Promise<void>): Promise<unknown> }
+  // SANDBOX-PENDING: ctx.location as the workspace/directory source follows
+  // the conventions §3 mapping (directory/project → ctx.location.*); the
+  // exact method names are verified in the sandbox stage. Guarded readers
+  // mean a drifted location simply leaves the process cwd as the anchor.
+  location?: { worktree?: () => unknown; directory?: () => unknown }
+}
+
+// Injection seam for the V2 harness (task 1.2): the resolver runs on real
+// fs by default; tests inject a fake fs + explicit anchors + homeDir.
+export type V2SetupDeps = {
+  anchors?: string[]
+  homeDir?: string
+  stat?: (path: string) => { mtimeMs: number; size: number } | null
+  readFile?: (path: string) => string
+}
+
+// Registry of every workspace anchor this process's v2 entry has been
+// initialized in — keyed by the normalized form (dedup, same
+// normalizeAnchorDir as the v1 host registry — parity with
+// rememberHostAnchor) but carrying the ORIGINAL spelling for resolution:
+// the resolver's stat/read and the provenance descriptions must see the
+// caller's own path casing (win32 case-fold would corrupt both against an
+// injected fs and the user-visible description). Pool membership is
+// re-resolved from disk truth on every setup call, so a deleted pool file
+// un-materializes on the next init exactly like v1 (no append-only POOL
+// set; anchor arrival order never influences ids — the resolver sorts
+// families purely lexicographically).
+const v2HostAnchors = new Map<string, string>()
+
+// Workspace-anchor candidates for this call: the guarded ctx.location
+// readers (SANDBOX-PENDING field names) plus the process cwd.
+function v2AnchorCandidates(ctx: V2PluginContext): string[] {
+  const out: string[] = []
+  try {
+    for (const reader of [ctx.location?.worktree, ctx.location?.directory]) {
+      if (typeof reader !== "function") continue
+      const v = reader()
+      if (typeof v === "string" && v) out.push(v)
+    }
+  } catch {
+    // Drifted location: cwd-only resolution (fail-soft).
+  }
+  out.push(process.cwd())
+  return out
+}
+
+// Shared JSON Schema builder (task 2.1): translates one tool's
+// `tool.schema.*` (zod) argument record into a plain JSON Schema input
+// contract for the v2 `editor.add({ input })` shape. io:"input" keeps
+// defaulted fields optional; the $schema decorator is dropped (the host
+// owns validation, not the dialect header). Builder drift degrades to an
+// empty object contract — the tool still registers, only its argument
+// documentation thins.
+function v2ToolInputSchema(args: Record<string, unknown> | undefined): Record<string, unknown> {
+  try {
+    const z = tool.schema as unknown as {
+      object?: (shape: Record<string, unknown>) => unknown
+      toJSONSchema?: (schema: unknown, opts?: { io?: string }) => unknown
+    }
+    if (typeof z.object === "function" && typeof z.toJSONSchema === "function") {
+      const schema = z.toJSONSchema(z.object(args ?? {}), { io: "input" })
+      if (schema !== null && typeof schema === "object") {
+        const out = { ...(schema as Record<string, unknown>) }
+        delete out.$schema
+        return out
+      }
+    }
+  } catch {
+    // Zod-shape drift: fall through to the minimal contract.
+  }
+  return { type: "object", properties: {} }
+}
+
+// Wrap the shared execute cores' result ({title, output}) in the v2
+// structured-content shape.
+// SANDBOX-PENDING: the exact V2 tool-result content shape is unverified
+// (a later sandbox stage verifies it against the real binary, same
+// pattern as the sibling repos); the sensible default is `{ content }`
+// until observed reality replaces it.
+function wrapV2ToolResult(res: unknown): { content: unknown; title?: unknown } {
+  if (res !== null && typeof res === "object" && "output" in (res as Record<string, unknown>)) {
+    const r = res as { output?: unknown; title?: unknown }
+    return typeof r.title === "string" ? { content: r.output, title: r.title } : { content: r.output }
+  }
+  return { content: res }
+}
+
+// Adapt the v2 ToolContext onto the ToolContext the shared execute cores
+// consume. W6a field realities (SDK 2.3.2 promise/tool.d.ts +
+// @opencode/schema tool.d.ts Context): the real context is {sessionID,
+// agent, messageID, signal, progress, ...} — NO `ask`, NO `worktree`, NO
+// `metadata`. The v1 ask-callback DECISION-RETURNING gates
+// (plan_approve/plan_close/goal_write arm/goal_complete/goal_resume/
+// goal_discard/crew_close user-confirmation gates inside the tool cores)
+// map to ctx.permission.assert(input) ("evaluates rules and prompts the
+// user, resolves when allowed, rejects with Tool.Error on deny") — the
+// adapter below synthesizes the AskFn the shared cores expect from the
+// permission domain captured at setup. worktree falls back to the
+// session-bound map then the host anchor. metadata defaults to a no-op so
+// ungated cores run.
+let v2PermissionAssertFn: ((input: unknown) => Promise<void>) | null = null
+
+function v2ToolContext(raw: unknown): Record<string, unknown> {
+  const c = (raw ?? {}) as Record<string, unknown>
+  const pickStr = (...keys: string[]): string | undefined => {
+    for (const k of keys) {
+      const v = c[k]
+      if (typeof v === "string" && v) return v
+    }
+    return undefined
+  }
+  const out: Record<string, unknown> = { ...c }
+  if (out.sessionID === undefined) out.sessionID = pickStr("sessionId", "session_id")
+  if (out.worktree === undefined) out.worktree = pickStr("worktree", "directory")
+  if (out.worktree === undefined && typeof out.sessionID === "string") out.worktree = sessions.get(out.sessionID)?.worktree ?? hostWorktree
+  if (typeof out.ask !== "function" && v2PermissionAssertFn && typeof out.sessionID === "string" && out.sessionID) {
+    const sid = out.sessionID
+    const agentId = typeof out.agent === "string" && out.agent ? out.agent : undefined
+    out.ask = (askInput: { permission: string; patterns: string[]; metadata: Record<string, unknown> }) =>
+      v2PermissionAssertFn!({
+        sessionID: sid,
+        ...(agentId !== undefined ? { agent: agentId } : {}),
+        action: askInput.permission,
+        resources: Array.isArray(askInput.patterns) ? askInput.patterns : ["*"],
+        metadata: askInput.metadata,
+      })
+  }
+  if (typeof out.metadata !== "function") out.metadata = () => {}
+  return out
+}
+
+// ---------------------------------------------------------------------------
+// v2 W3/W4 wiring (tasks 3.1 / 4.1 / 4.2 / 4.3): the permission belt, the
+// tool execute.before/after seams, the session prompt/context/compaction
+// seams, and the /plan /goal /crew command registrations. Every handler is
+// a port of the corresponding v1 hook body over the SAME module-level state
+// and the SAME shared predicates (crewPendingRefusal / poolGateRefusal /
+// crewComplianceRefusalFor / draftDispatchRefusal / stateForBan / ...) —
+// one code path per concern. The only deltas are the event adapters
+// (SANDBOX-PENDING field names per conventions §4.4 — the W6 sandbox pins
+// them; noted in the change design's Open Questions) and posture:
+// refusal belts signal by throwing INSIDE the hook callback exactly like
+// v1 tool.execute.before; injection/mutation handlers are try/catch
+// fail-soft so a drifted event shape degrades to a no-op, never a throw.
+// The v1-only watchdog blocks are deliberately absent here (the watchdog
+// instance is created inside server(); a v2 watchdog rides a later wave
+// once ctx.options pin the option surface).
+// ---------------------------------------------------------------------------
+
+// String pick over an assumed-shape event (never throws).
+function v2PickStr(src: unknown, ...keys: string[]): string | undefined {
+  if (src === null || typeof src !== "object") return undefined
+  const o = src as Record<string, unknown>
+  for (const k of keys) {
+    const v = o[k]
+    if (typeof v === "string" && v) return v
+  }
+  return undefined
+}
+
+// Agent name from an assumed-shape event: string verbatim, or { name }.
+function v2AgentNameOf(src: unknown): string | undefined {
+  if (src === null || typeof src !== "object") return undefined
+  const a = (src as Record<string, unknown>).agent
+  if (typeof a === "string" && a) return a
+  if (a !== null && typeof a === "object") {
+    const n = (a as Record<string, unknown>).name
+    if (typeof n === "string" && n) return n
+  }
+  return undefined
+}
+
+// ---------------------------------------------------------------------------
+// Permission belt (task 3.1) — ctx.permission.hook("evaluate")
+// ---------------------------------------------------------------------------
+
+// The 7-door set EXCLUDING forge_shell, exactly the names the v1
+// permission.ask belt rewrites to ask (crew_close never surfaces a
+// permission request of its own on the ask path — parity kept verbatim).
+const V2_PERMISSION_DOORS = new Set(["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard"])
+
+function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
+  if (typeof ctx.permission?.hook !== "function") return
+  try {
+    // W6a: the evaluate callback receives a MUTABLE PermissionEvaluation
+    // ({sessionID, agent?, action, resources, metadata?, source?, effect,
+    // message?}) and signals by MUTATING input.effect — the @opencode/schema
+    // Permission.Effect union is exactly "allow" | "deny" | "ask"
+    // (permission.d.ts: `Schema.Literals<readonly ["allow", "deny", "ask"]>`).
+    // Name chain (v1 parity, pruned to the fields the real type carries):
+    // metadata.tool → action. No status/decision/outcome slot exists.
+    ctx.permission.hook("evaluate", async (raw: unknown) => {
+      try {
+        const evalInput = raw !== null && typeof raw === "object" ? (raw as { sessionID?: unknown; agent?: unknown; action?: unknown; metadata?: unknown; effect?: unknown; message?: unknown }) : null
+        if (!evalInput || typeof evalInput.effect !== "string") return
+        const meta = (evalInput.metadata !== null && typeof evalInput.metadata === "object" ? evalInput.metadata : {}) as Record<string, unknown>
+        const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof evalInput.action === "string" ? evalInput.action : undefined)
+        if (process.env.FORGE_PERM_PROBE) {
+          try {
+            appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}\n`)
+          } catch {}
+        }
+        if (typeof name === "string" && V2_PERMISSION_DOORS.has(name)) {
+          // Doors: keep it a REAL ask unless explicitly denied — the user
+          // confirmation (the ask prompt the host raises for effect "ask")
+          // is the gate (v1 parity). forge_shell is deliberately absent
+          // (pass-through, shell-defang-default-open).
+          if (evalInput.effect !== "deny") evalInput.effect = "ask"
+          return
+        }
+        if (typeof name === "string" && isWriteTool(name)) {
+          const sessionID = typeof evalInput.sessionID === "string" ? evalInput.sessionID : undefined
+          const state = stateForBan(sessionID)
+          const active = state ? resolveActivePlan(state) : null
+          if (active && active.doc.status === "draft") {
+            evalInput.effect = "deny"
+            evalInput.message = "[forge] A plan is in draft; write operations are denied. Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan."
+          }
+        }
+      } catch {
+        // Belt posture: never throw into the host (fail-open on drift).
+      }
+    })
+  } catch {
+    // Drifted permission domain: silent no-op.
   }
 }
 
-export async function v2Setup(ctx: V2PluginContext): Promise<void> {
+// ---------------------------------------------------------------------------
+// Tool execute seams (task 4.1) — ctx.tool.hook("execute.before"/"after")
+// ---------------------------------------------------------------------------
+
+// W6a field reality (SDK 2.3.2 promise/tool.d.ts ToolHooks): the
+// execute.before payload is {tool, sessionID, agent, messageID,
+// id: Tool.CallID, input} — the v1 callID field is named `id` in v2 and
+// the arguments live under `input` (legacy spellings kept as harmless
+// fallbacks for the mock drift matrix).
+function v2ToolEventArgs(raw: unknown): { tool: string | undefined; sessionID: string | undefined; id: string | undefined; args: Record<string, unknown> } {
+  if (raw === null || typeof raw !== "object") return { tool: undefined, sessionID: undefined, id: undefined, args: {} }
+  const o = raw as Record<string, unknown>
+  const tool = typeof o.tool === "string" ? o.tool : undefined
+  const sessionID = v2PickStr(o, "sessionID", "sessionId")
+  const id = v2PickStr(o, "id", "callID")
+  const rawArgs = o.input ?? o.args ?? o.arguments
+  const args = rawArgs !== null && typeof rawArgs === "object" ? (rawArgs as Record<string, unknown>) : {}
+  return { tool, sessionID, id, args }
+}
+
+// Session-domain adapter for the shared dispatch-belt predicates: a v2
+// session.get() feeds the authoritative session record exactly like the v1
+// client.session.get seam; absent => null (predicates fall back to the
+// in-memory map, then the fail-open posture).
+function v2AnchorClient(ctx: V2PluginContext): { session?: { get?: (opts: unknown) => Promise<unknown> } } | null {
+  const rawGet = typeof ctx.session?.get === "function" ? ctx.session.get.bind(ctx.session) : undefined
+  if (!rawGet) return null
+  // Same flat-{sessionID} translation as v2SessionClient (W6a field
+  // reality): the dispatch-belt predicates call the v1 {path:{id}} shape.
+  const get = async (opts: unknown) => {
+    const sid = v2SessionIdOf(opts)
+    return sid !== undefined ? rawGet({ sessionID: sid }) : rawGet(opts)
+  }
+  return { session: { get } }
+}
+
+function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null): void {
+  if (typeof ctx.tool?.hook !== "function") return
+  try {
+    // Port of the v1 "tool.execute.before" belt (watchdog block excepted —
+    // see the region comment). Refusals throw; every message is verbatim
+    // v1. Unknown sessions fail open on every belt.
+    ctx.tool.hook("execute.before", async (raw: unknown) => {
+      const { tool, sessionID, args } = v2ToolEventArgs(raw)
+      // Strongest family-map source parity (tool context): an agent field
+      // on the event is an authoritative speaker statement.
+      const evAgent = v2AgentNameOf(raw)
+      if (evAgent && sessionID) sessionAgents.set(sessionID, evAgent)
+      if (process.env.FORGE_PERM_PROBE) {
+        try {
+          appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool)} session=${JSON.stringify(sessionID)}\n`)
+        } catch {}
+      }
+      // Dispatch belt (tool-partition): a non-forge session must not spawn
+      // forge-* workers. Unknown sessions fail open.
+      if (tool === "task") {
+        const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined
+        const speaker = sessionID ? sessionAgents.get(sessionID) : undefined
+        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+          if (target && target.toLowerCase().startsWith("forge-")) {
+            throw new Error(
+              `[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use the native general/explore subagents, or switch to the forge agent to dispatch forge-* workers.`,
+            )
+          }
+        }
+        // Session-domain pool gate (sole-pool-ownership).
+        if (target && target.toLowerCase().startsWith("forge-") && sessionID) {
+          const poolRefusal = await poolGateRefusal(anchorClient, sessionID, target)
+          if (poolRefusal) throw new Error(poolRefusal)
+        }
+        // Crew pending belt (crew-harness).
+        const pendingRefusal = crewPendingRefusal(sessionID)
+        if (pendingRefusal) throw new Error(pendingRefusal)
+        // Crew compliance belt (pool-namespace-contract) — after the pool
+        // gate, composing without replacing it.
+        if (target && target.toLowerCase().startsWith("forge-") && sessionID) {
+          const complianceRefusal = await crewComplianceRefusalFor(anchorClient, sessionID, target)
+          if (complianceRefusal) throw new Error(complianceRefusal)
+        }
+      }
+      // State-file boundary (tool-partition).
+      if ((tool === "write" || tool === "edit") && sessionID) {
+        const speaker = sessionAgents.get(sessionID)
+        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
+          const raw = typeof args.filePath === "string" ? args.filePath : typeof args.path === "string" ? args.path : undefined
+          if (raw) {
+            const state = stateForBan(sessionID)
+            const base = state?.worktree ?? hostWorktree ?? ""
+            const abs = (isAbsolute(raw) ? raw : join(base, raw)).replaceAll("\\", "/").toLowerCase()
+            if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
+              throw new Error(
+                `[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`,
+              )
+            }
+          }
+        }
+      }
+      if (typeof tool === "string" && isWriteTool(tool)) {
+        const state = stateForBan(sessionID)
+        const active = state ? resolveActivePlan(state) : null
+        if (active && active.doc.status === "draft") {
+          if (tool === "task") {
+            // allow-readonly-recon: carve-out keyed on the TARGET's shape.
+            const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined
+            const refusal = draftDispatchRefusal(sessionID, target)
+            if (refusal) throw new Error(refusal)
+          } else {
+            throw new Error(
+              `[forge] A plan is in draft; write operations are denied (${tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`,
+            )
+          }
+        }
+      }
+      // Exec seal (readonly-exec-seal): explicit-readonly forge-* workers
+      // get WRITE-CLASS forge_shell commands denied before spawn.
+      if (tool === "forge_shell" && sessionID) {
+        const cmd = typeof args.command === "string" ? args.command : undefined
+        if (cmd) {
+          const speaker = sessionAgents.get(sessionID)
+          const workerId =
+            speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT ? speaker.slice("forge-".length) : undefined
+          if (workerId !== undefined) {
+            const def = resolvePools()?.agents[workerId]?.def
+            if (def !== undefined && effectiveReadonlyShape(def)) {
+              const verdict = classifyExecCommand(cmd)
+              if (verdict.klass === WRITE_CLASS) {
+                const seen = sealFindings.get(sessionID) ?? new Set<string>()
+                if (!seen.has(verdict.indicator!)) {
+                  seen.add(verdict.indicator!)
+                  sealFindings.set(sessionID, seen)
+                  console.warn(
+                    `[forge:seal] session ${sessionID} (readonly worker "${speaker}"): write-class forge_shell command denied — indicator "${verdict.indicator}" (${verdict.detail ?? cmd.slice(0, 60)}). Remedy: "shape": "write" on the agent when its job legitimately mutates.`,
+                  )
+                }
+                throw new Error(
+                  `[forge:seal] Exec refused: this session runs the readonly worker "${speaker}" (explicit "shape": "readonly") and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. READ-CLASS commands (inspection, search, read-only evals) flow normally. If this worker's job legitimately mutates, set "shape": "write" on its forge.json entry. Report this refusal VERBATIM — do not work around it.`,
+                )
+              }
+            }
+          } else if (speaker === undefined) {
+            const verdict = classifyExecCommand(cmd)
+            if (verdict.klass === WRITE_CLASS && !sealUnknownNotes.has(sessionID)) {
+              sealUnknownNotes.add(sessionID)
+              console.warn(
+                `[forge:seal] session ${sessionID}: a WRITE-CLASS forge_shell command (${verdict.indicator}) flowed UNSEALED — the session's agent is unknown (fail-open; the exec seal binds explicit-readonly forge-* workers only).`,
+              )
+            }
+          }
+        }
+      }
+      // Partition fallback belts (tool-partition fallback requirement).
+      if (sessionID && typeof tool === "string") {
+        const speaker = sessionAgents.get(sessionID)
+        if (speaker !== undefined) {
+          if (!isForgeFamilyAgent(speaker) && FORGE_TOOL_SET.has(tool)) {
+            throw new Error(
+              `[forge:partition] Tool refused: "${tool}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`,
+            )
+          }
+          if (isForgeFamilyAgent(speaker) && (tool === "shell" || tool === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
+            throw new Error(
+              `[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`,
+            )
+          }
+          // R1 third quadrant: STATE tools are primary-only.
+          if (isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT && FORGE_STATE_TOOL_SET.has(tool)) {
+            throw new Error(
+              `[forge:partition] Tool refused: "${tool}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${tool} at the gate.`,
+            )
+          }
+        }
+      }
+    })
+    // Port of the v1 "tool.execute.after" activity ledger (watchdog untrack
+    // excepted). Never throws.
+    ctx.tool.hook("execute.after", async (raw: unknown) => {
+      try {
+        const { tool, sessionID } = v2ToolEventArgs(raw)
+        if (typeof tool !== "string" || !sessionID) return
+        const act = turnActivity.get(sessionID)
+        if (act) {
+          if (isWriteTool(tool) || tool === "plan_tick") act.writes++
+          if (tool === "goal_check") act.checks++
+        }
+        const crewAct = crewTurnActivity.get(sessionID)
+        if (crewAct) {
+          if (tool === "task") crewAct.dispatches++
+          if (isWriteTool(tool)) crewAct.writes++
+        }
+      } catch {}
+    })
+  } catch {
+    // Drifted tool-hook surface: silent no-op (transform may still work).
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session seams (task 4.2) — ctx.session.hook("prompt"/"context"/"compaction")
+// ---------------------------------------------------------------------------
+
+// The context handler merges the v1 chat.params port (family upsert +
+// frozen depth injection onto event.options) with the v1
+// experimental.chat.system.transform port (family-gated system injections
+// onto event.system) — Decision 3's event topology: capture happens in
+// prompt + execute.before; the context handler reads the map.
+function v2ContextInjection(raw: unknown): void {
+  if (forgeDisabled) return
+  const o = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
+  const sessionID = v2PickStr(o, "sessionID", "sessionId")
+  if (!sessionID) return
+  const agentName = v2AgentNameOf(o)
+  if (agentName) sessionAgents.set(sessionID, agentName)
+  // --- depth injection (chat.params port) ---
+  if (agentName && agentName.startsWith("forge-")) {
+    const frozen = sessionDepths.get(sessionID)
+    if (frozen) {
+      if (frozen.translation) {
+        if (o.options === null || typeof o.options !== "object") o.options = {}
+        applyDepthTranslation(o.options as Record<string, unknown>, frozen.translation)
+      }
+    } else {
+      const agentId = agentName.slice("forge-".length)
+      const def: ForgeAgentDef | undefined = resolvePools()?.agents[agentId]?.def
+      if (def?.thoughtLevel) {
+        const modelObj = o.model as { modelID?: unknown; id?: unknown; providerID?: unknown } | undefined
+        const providerID = typeof modelObj?.providerID === "string" ? modelObj.providerID : ""
+        const modelID = typeof modelObj?.modelID === "string" ? modelObj.modelID : typeof modelObj?.id === "string" ? modelObj.id : ""
+        const channel = resolveDepthChannel(providerID, modelID)
+        const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel)
+        sessionDepths.set(sessionID, { translation })
+        if (translation) {
+          if (o.options === null || typeof o.options !== "object") o.options = {}
+          applyDepthTranslation(o.options as Record<string, unknown>, translation)
+        } else if (findingMessage && !depthFindingNotes.has(agentId)) {
+          depthFindingNotes.set(agentId, findingMessage)
+          console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`)
+        }
+      }
+    }
+  }
+  // --- system injections (experimental.chat.system.transform port) ---
+  // Family gate (tool-partition): EVERY forge-authored system text is
+  // forge-family-only; unknown sessions receive nothing (fail-silent).
+  if (!sessionIsForgeFamily(sessionID)) return
+  if (!Array.isArray(o.system)) o.system = []
+  const system = o.system as unknown[]
+  const crewActive = crews.get(sessionID)
+  if (crewActive && !system.some((s) => typeof s === "string" && s.startsWith("[forge:crew-active]"))) {
+    const modeText = crewActive.mode === "pending"
+      ? "PENDING (present the execution-mode choice; every task dispatch is refused until armed)"
+      : "armed (executing)"
+    system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict, or crew_close {abandon: true, reason} to re-shard.`)
+  }
+  if (!forgeDisabled && jobStage() < 2 && !system.some((s) => typeof s === "string" && s.startsWith("[forge:job-guidance]"))) {
+    system.push(
+      jobsKeepBuiltinShell
+        ? "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion."
+        : "[forge:job-guidance] Every shell command — quick ones included — goes through forge_shell: the builtin shell/bash tools are refused on this agent, so never try them first. forge_shell returns on exit/success/idle with a jobId instead of blocking indefinitely; long-running or non-exiting commands use run_in_background. Manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.",
+    )
+  }
+  const state = sessions.get(sessionID)
+  if (!state) return
+  const active = resolveActivePlan(state)
+  if (active) {
+    const p = progressOf(active.doc)
+    const rel = relFrom(state.worktree, active.path)
+    const rule =
+      active.doc.status === "draft"
+        ? "while in draft, write operations are denied at the tool layer; present the plan then end your turn to await the user's review — on feedback revise via plan_write and re-present; call plan_approve only after the user explicitly approves in chat (their confirmation dialog is the final gate); /plan discard to abandon"
+        : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close"
+    system.push(
+      `[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`,
+    )
+  }
+  if (forgeDisabled) return
+  const goal = resolveLiveGoal(state)
+  if (goal) {
+    const rel = relFrom(state.worktree, goal.path)
+    const d = goal.doc
+    const rule =
+      d.status === "active"
+        ? "continue working the success criteria; call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself); if genuinely blocked call goal_pause with the blocker"
+        : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it"
+    system.push(
+      `[forge:goal-notice] This session is bound to a goal: ${rel} (status: ${d.status}${d.stopReason ? `, stopped: ${d.stopReason}` : ""}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Rule: ${rule}. If the user has not mentioned the goal yet, relay its path and status to them in one short line at the start of your reply.`,
+    )
+  }
+}
+
+// Goal-brief reinjection (experimental.session.compacting port): the goal
+// facts ride along in the compaction context so post-compaction turns keep
+// following the goal (compression-safety carrier).
+function v2CompactionInjection(raw: unknown): void {
+  if (forgeDisabled) return
+  const o = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
+  const sessionID = v2PickStr(o, "sessionID", "sessionId")
+  if (!sessionID) return
+  if (!sessionIsForgeFamily(sessionID)) return
+  const state = sessions.get(sessionID)
+  if (!state) return
+  const goal = resolveLiveGoal(state)
+  if (!goal) return
+  const d = goal.doc
+  if (!Array.isArray(o.context)) o.context = []
+  ;(o.context as unknown[]).push(
+    `[forge:goal-brief] A live goal governs this session: ${relFrom(state.worktree, goal.path)} (status: ${d.status}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Goal: ${d.goal}. Success criteria:\n${d.criteria
+      .map((c, i) => `${i + 1}. ${c}`)
+      .join("\n")}\nPost-compaction turns must keep following this goal and its constraints.`,
+  )
+}
+
+function v2RegisterSessionHooks(ctx: V2PluginContext, goalClient: GoalClient | null): { disposables: Array<() => void>; idleHook: boolean } {
+  const out = { disposables: [] as Array<() => void>, idleHook: false }
+  if (typeof ctx.session?.hook !== "function") return out
+  const register = (name: string, cb: (raw: unknown) => void): boolean => {
+    try {
+      const registration = ctx.session!.hook!(name, cb)
+      // Registration is {dispose: () => Promise<void>} (registration.d.ts);
+      // collect whichever dispose-like shape the host handed back.
+      if (registration !== null && typeof registration === "object" && typeof (registration as { dispose?: unknown }).dispose === "function") {
+        const dispose = (registration as { dispose: () => unknown }).dispose
+        out.disposables.push(() => void dispose())
+      }
+      return true
+    } catch {
+      // One drifted hook name never blocks the siblings.
+      return false
+    }
+  }
+  // chat.message port (family capture, primary source): a turn just
+  // started — the session is busy until the next idle (wake-push gate).
+  // W6a: SessionPrompt carries {sessionID, messageID, prompt, metadata?,
+  // delivery} — NO agent field, so family capture rides the context hook
+  // (SessionContext.agent) and execute.before's agent; the v1 agent
+  // reader stays as a harmless pass-through.
+  register("prompt", async (raw: unknown) => {
+    try {
+      if (forgeDisabled) return
+      const sessionID = v2PickStr(raw, "sessionID", "sessionId")
+      if (!sessionID) return
+      idleJobSessions.delete(sessionID)
+      const agent = v2AgentNameOf(raw)
+      if (agent) sessionAgents.set(sessionID, agent)
+    } catch {}
+  })
+  register("context", async (raw: unknown) => {
+    try {
+      v2ContextInjection(raw)
+    } catch {}
+  })
+  register("compaction", async (raw: unknown) => {
+    try {
+      v2CompactionInjection(raw)
+    } catch {}
+  })
+  // W6a CHOICE (documented in design.md Open Questions): the idle edge —
+  // goal continuation + job-wake delivery — rides the IN-PROCESS
+  // ctx.session.hook("experimental.idle") (SessionIdle {sessionID,
+  // background[]}, session.d.ts: "runs when a Session finishes model work
+  // and has no pending input, just before it goes idle"): no SSE race,
+  // richer background info, and notices the hook admits run in the same
+  // execution. The SSE session.execution.succeeded edge stays only as the
+  // event-domain fallback (see v2SubscribeEvents). The work itself is
+  // DETACHED (void) so the hook returns promptly — the host proceeds to
+  // idle while the continuation/wake sends settle on their own.
+  out.idleHook = register("experimental.idle", async (raw: unknown) => {
+    const sessionID = v2PickStr(raw, "sessionID", "sessionId")
+    if (!sessionID) return
+    v2HandleIdle(sessionID, goalClient)
+  })
+  return out
+}
+// ---------------------------------------------------------------------------
+// Commands (task 4.3) — ctx.command.transform, create-only, templates
+// byte-identical by construction (the SAME constants/functions the v1
+// config hook registers — they ship in dist unchanged).
+// ---------------------------------------------------------------------------
+
+async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
+  if (typeof ctx.command?.transform !== "function") return
+  try {
+    await ctx.command.transform(async (editor) => {
+      // W6a field reality (SDK 2.3.2 promise/command.d.ts + live host): the
+      // v2 CommandDefinition is EXECUTE-based — {name, description?,
+      // execute({sessionID, prompt, delivery})} — the editor exposes ONLY
+      // add() (no get), so the v1 create-only rule is NOT implementable on
+      // the v2 domain (documented drift in design.md; the host dedupes or
+      // last-wins). Each v1 template command becomes an executable that
+      // sends the SAME template text into the invoking session — the
+      // templates stay byte-identical by construction (same constants).
+      const addFn = editor?.add
+      if (typeof addFn !== "function") return
+      const addTemplateCommand = (name: string, template: () => string, description: string) => {
+        addFn({
+          name,
+          description,
+          execute: async (input: { sessionID?: unknown }) => {
+            const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
+            if (!sessionID || typeof ctx.session?.prompt !== "function") return
+            await ctx.session.prompt({ sessionID, text: template() })
+          },
+        })
+      }
+      addTemplateCommand(
+        "plan",
+        () => PLAN_COMMAND_TEMPLATE,
+        "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline",
+      )
+      addTemplateCommand(
+        "goal",
+        () => GOAL_COMMAND_TEMPLATE,
+        "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)",
+      )
+      // /crew — composed per the live pool resolution exactly like the v1
+      // config hook (same template functions => byte-identical text). The
+      // composition re-resolves at INVOCATION time (mtime hot-apply is
+      // reflected without a host restart); the description is frozen at
+      // registration (the editor has no update path).
+      const registrationResolution = resolvePools()
+      const registrationAgentCount = Object.keys(registrationResolution?.agents ?? {}).length
+      const crewTemplate = () => {
+        const res = resolvePools()
+        if (Object.keys(res?.agents ?? {}).length > 0) return crewOrchestrationTemplate(res ?? null)
+        const anchorDir = hostAnchors[0] ?? undefined
+        return CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: anchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}\n   - ${forgeConfigPaths({ projectDir: anchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`)
+          .replaceAll("{template}", JSON.stringify({ pool: "namespace (REQUIRED for crew-governed dispatch, [a-z0-9-] up to 24 chars — every pool materializes as forge-<ns>-<id>; the global fallback materializes as forge-global-<id>)", agents: { research: { model: "provider/model", thoughtLevel: "low", shape: "readonly", prompt: "short role description — what this agent does" }, coder: { model: "provider/model", thoughtLevel: "low", shape: "write", prompt: "short role description — what this agent does" } } }, null, 2).split("\n").map((l) => "   " + l).join("\n"))
+      }
+      addTemplateCommand(
+        "crew",
+        crewTemplate,
+        registrationAgentCount > 0
+          ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report"
+          : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance",
+      )
+    })
+  } catch {
+    // Drifted command domain: silent no-op.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Continuation engines (task 5.1) — ctx.event.subscribe()
+// ---------------------------------------------------------------------------
+
+// Session-domain client adapter (task 5.1, W6a-resolved): collects the
+// v2 session domain's REAL surface (prompt + get — there is no promptAsync
+// and no status in SessionDomain) onto one v1-client-shaped object the
+// shared cores consume. prompt translation: the v1 cores send
+// {path:{id}, body:{parts:[{type:"text",text}]}}; the accepted v2 input is
+// the FLAT root-level {sessionID, text} (see the live shape matrix below).
+// promptAsync is approximated by the blocking send (same fallback posture
+// as before; the wakes target idle sessions so the block is bounded by the
+// send, not a model turn). Missing methods simply disable their own slice,
+// never a throw.
+// W6a field reality (live shape matrix, probe plugin 2026-11-19): the v2
+// promise-layer ctx.session.prompt validates its input against a FLAT
+// {sessionID, text} — prompt:{text} / prompt:{parts} / {path,body} shapes
+// all throw SchemaError (missing ["text"] or ["sessionID"]); only the flat
+// root-level spelling passes and starts a turn (the call then BLOCKS until
+// the turn completes — no promptAsync on the promise layer, the send is
+// the fire-and-forget approximation). v1-shaped callers stay untouched.
+function v2PromptInputOf(opts: unknown): { sessionID: string; text: string } | null {
+  if (opts === null || typeof opts !== "object") return null
+  const o = opts as { path?: { id?: unknown }; body?: { parts?: unknown; text?: unknown }; sessionID?: unknown }
+  const sid = typeof o.path?.id === "string" && o.path.id ? o.path.id : typeof o.sessionID === "string" ? o.sessionID : undefined
+  if (!sid) return null
+  const parts = Array.isArray(o.body?.parts) ? (o.body!.parts as unknown[]) : []
+  const textPart = parts.find((p) => p !== null && typeof p === "object" && typeof (p as { text?: unknown }).text === "string") as { text: string } | undefined
+  const text = textPart?.text ?? (typeof o.body?.text === "string" ? o.body.text : undefined)
+  if (typeof text !== "string" || !text) return null
+  return { sessionID: sid, text }
+}
+
+type V2SessionClient = {
+  session: {
+    prompt?: (opts: unknown) => Promise<unknown>
+    promptAsync?: (opts: unknown) => Promise<unknown>
+    get?: (opts: unknown) => Promise<unknown>
+  }
+}
+// W6a field reality (live probe 2026-11-19): the v2 promise-layer session
+// domain validates its params against a FLAT {sessionID} key — the v1
+// client shape {path:{id}} throws SchemaError(Missing key at ["sessionID"])
+// (seen in the sandbox probe log as "lazy-seed failed ... err=SchemaError").
+// Both call spellings are accepted by the translator; v1-shaped callers
+// (goal engine, job seam, dispatch belt) stay untouched.
+function v2SessionIdOf(opts: unknown): string | undefined {
+  if (opts === null || typeof opts !== "object") return undefined
+  const o = opts as { path?: { id?: unknown }; sessionID?: unknown }
+  if (typeof o.path?.id === "string" && o.path.id) return o.path.id
+  if (typeof o.sessionID === "string" && o.sessionID) return o.sessionID
+  return undefined
+}
+function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
+  const s = ctx.session
+  if (s === null || typeof s !== "object") return null
+  const out: V2SessionClient["session"] = {}
+  if (typeof s.prompt === "function") {
+    const send = async (opts: unknown) => {
+      const input = v2PromptInputOf(opts)
+      if (!input) return undefined
+      return s.prompt!(input)
+    }
+    out.prompt = send
+    out.promptAsync = send // fire-and-forget approximated by the blocking send
+  }
+  if (typeof s.get === "function") {
+    out.get = async (opts: unknown) => {
+      const sid = v2SessionIdOf(opts)
+      return sid !== undefined ? s.get!({ sessionID: sid }) : s.get!(opts)
+    }
+  }
+  return Object.keys(out).length > 0 ? { session: out } : null
+}
+
+// W6a field reality (SDK 2.3.2 @opencode/protocol session-event.d.ts +
+// sandbox SSE capture): the subscription yields OpenCodeEvent envelopes
+// {id, created, type, data: {...}} — the payload lives under `data`, NOT
+// `properties` (the v1 envelope spelling, kept as a harmless fallback).
+function v2EventFields(raw: unknown): Record<string, unknown> {
+  if (raw === null || typeof raw !== "object") return {}
+  const o = raw as Record<string, unknown>
+  if (o.data !== null && typeof o.data === "object") return o.data as Record<string, unknown>
+  if (o.properties !== null && typeof o.properties === "object") return o.properties as Record<string, unknown>
+  return o
+}
+
+// The shared idle body (v1 session.idle port): idle bookkeeping
+// (wake-push gate), the debounced goal continuation (same engine, same
+// guards, same [forge:goal-continue] brief), then progress flushes BEFORE
+// terminal wakes (design D6) — all shared cores, one code path whether the
+// edge arrives from the in-process experimental.idle hook or the SSE
+// session.execution.succeeded fallback.
+function v2HandleIdle(sessionID: string, goalClient: GoalClient | null): void {
+  try {
+    goalProbe(`v2 idle session=${sessionID}`)
+    idleJobSessions.add(sessionID)
+    if (goalClient) scheduleIdleContinuation(goalClient, sessionID)
+    void deliverDispatchProgress(sessionID).then(() => deliverJobWakes(sessionID))
+  } catch {
+    // Drifted idle payload: no-op, never a throw into the host.
+  }
+}
+
+// The v2 event subscription (task 5.1, W6a-resolved):
+// ctx.event.subscribe(options?) returns an AsyncIterable of
+// {id, type, data} envelopes — consumed with for-await in a DETACHED task
+// (never blocking setup). session.deleted (26x literal in the sandbox
+// scan; schema Deleted.data = {sessionID}) rides the shared
+// harvestSessionEnd core. The idle edge (session.execution.succeeded —
+// the emitted idle signal on 2.3.2; "session.idle" exists in the schema
+// but is NOT emitted, kept as a harmless alias) is handled HERE only as a
+// FALLBACK for hosts without the in-process experimental.idle hook — the
+// primary idle mechanism is ctx.session.hook("experimental.idle")
+// (in-process, no SSE race, richer background info; see
+// v2RegisterSessionHooks). Returns the CLEANUP (abort the controller +
+// close the iterator — SubscribeOptions.signal + iterator.return per
+// adapter.js makeStreams); a drifted event domain returns null (slice
+// disabled, no throw).
+function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, idleFallback: boolean): (() => void) | null {
+  if (typeof ctx.event?.subscribe !== "function") return null
+  try {
+    let iterable: AsyncIterable<unknown> | null = null
+    try {
+      const sub = ctx.event.subscribe()
+      if (sub !== null && typeof sub === "object" && typeof (sub as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function") {
+        iterable = sub as AsyncIterable<unknown>
+      }
+    } catch {
+      // Drifted subscribe call: slice disabled below.
+    }
+    if (!iterable) return null
+    const controller = new AbortController()
+    const iterator = iterable[Symbol.asyncIterator]()
+    const run = async () => {
+      try {
+        for (;;) {
+          const next = await iterator.next()
+          if (next.done) break
+          const ev = next.value as { type?: unknown } | null
+          const type = ev !== null && typeof ev === "object" && typeof ev.type === "string" ? ev.type : undefined
+          if (!type) continue
+          if (controller.signal.aborted) break
+          const fields = v2EventFields(ev)
+          if (type === "session.deleted") {
+            try {
+              const info = fields.info as { id?: unknown } | undefined
+              const id =
+                info !== null && typeof info === "object" && typeof info.id === "string" && info.id
+                  ? info.id
+                  : v2PickStr(fields, "sessionID", "sessionId")
+              if (id) harvestSessionEnd(id)
+            } catch {
+              // Drifted deleted payload: no-op, never a throw into the host.
+            }
+          } else if (idleFallback && (type === "session.execution.succeeded" || type === "session.idle")) {
+            const sessionID = v2PickStr(fields, "sessionID", "sessionId")
+            if (sessionID) v2HandleIdle(sessionID, goalClient)
+          }
+        }
+      } catch {
+        // Stream error: end the loop (the host owns reconnect semantics).
+      }
+    }
+    void run()
+    let closed = false
+    return () => {
+      if (closed) return
+      closed = true
+      controller.abort()
+      try {
+        void iterator.return?.()
+      } catch {
+        // Already-closed iterator: nothing to do.
+      }
+    }
+  } catch {
+    // Drifted event domain: silent no-op.
+    return null
+  }
+}
+
+// Test seam for the v2 wiring suites (same pragmatic module-state style as
+// the v1 __forgeSubagentsTest): live references to the module maps the v2
+// handlers share with the v1 hooks, so tests seed and inspect without a
+// host. NOT part of the plugin API surface.
+export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
+
+export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise<void | (() => void)> {
+  // ---- host-axis parity (tasks 3.1/4.x): the belts and injections below
+  // share the v1 module state (only ONE entry ever runs per host process),
+  // so seed the workspace registry + launch anchor exactly like server()
+  // does — the shared predicates (resolvePools / stateForBan / the pool
+  // gates) then see the same disk truth as on a v1 host.
+  {
+    const v2Candidates = [...(deps?.anchors ?? []), ...v2AnchorCandidates(ctx)]
+    for (const cand of v2Candidates) {
+      const t = cand.trim()
+      if (t) rememberHostAnchor(t)
+    }
+    const first = v2Candidates.find((c) => c && !isRootish(c))
+    if (first) hostWorktree = first
+  }
+  // ---- agent domain: forge primary + full sole-pool-ownership
+  // materialization (task 1.2 — parity with the v1 config hook, same
+  // createPoolResolver + forgeAgentDef cores).
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform(async (draft) => {
       if (typeof draft.get !== "function" || typeof draft.update !== "function") return
@@ -5523,17 +6481,38 @@ export async function v2Setup(ctx: V2PluginContext): Promise<void> {
         })
       }
       // Static forge subagents (spec: forge-subagents — v2 parity): same
-      // create-only discipline as the forge entry. The pool resolver reads
-      // the process cwd (v2 ctx exposes no launch directory) as the single
-      // workspace anchor — its walk-up nearest pool materializes NAMESPACED
-      // (forge-<ns>-<id>; the global fallback is forge-global-<id> — sole
-      // ownership, nested forge.json files ignored); descriptions carry the
-      // pool provenance line (shared forgeAgentDef path, D3/D5); any failure
-      // degrades to no subagents, never a throw.
+      // create-only discipline as the forge entry. The COMPLETE
+      // sole-pool-ownership resolver (src/forge-config.ts createPoolResolver,
+      // reused as-is incl. its workspacePoolOf primitive — the W4
+      // session-domain gate's seam) resolves over the accumulated host
+      // anchor registry: materialization set = global fallback layer + each
+      // seen workspace's pool (per anchor the walk-up NEAREST forge.json;
+      // nested forge.json files ignored); families materialize NAMESPACED
+      // (forge-<ns>-<id>; the global fallback is forge-global-<id> — no
+      // plain-id family), ids stable across host/init order (pure
+      // lexicographic resolution); descriptions carry the pool provenance
+      // line (shared forgeAgentDef path, D3/D5); pinned models ride the
+      // entry, Auto workers carry no model key; permissions seal readonly
+      // workers (MUTATING_TOOLS deny family) and force task: deny always.
+      // Findings surface through the diagnostics channel like the v1 config
+      // hook; any failure degrades to no subagents, never a throw.
       try {
-        const resolver = createPoolResolver({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
-        const resolution = resolver.resolve([process.cwd()])
-        const v2GlobalPath = forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global
+        const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir()
+        // Anchor registry: explicit deps.anchors (test seam) plus the
+        // guarded location/cwd candidates, deduped by normalized form
+        // (original spelling preserved for resolution — see the registry
+        // comment above).
+        const candidates = [...(deps?.anchors ?? []), ...v2AnchorCandidates(ctx)]
+        for (const cand of candidates) {
+          const key = normalizeAnchorDir(cand)
+          if (key && !v2HostAnchors.has(key)) v2HostAnchors.set(key, cand.trim())
+        }
+        const resolver = createPoolResolver({ homeDir, stat: deps?.stat, readFile: deps?.readFile })
+        const resolution = resolver.resolve([...v2HostAnchors.values()])
+        for (const finding of resolution.findings) {
+          console.warn(`[forge:v2] ${finding.level}: ${finding.message}`)
+        }
+        const v2GlobalPath = forgeConfigPaths({ homeDir }).global
         for (const [matId, agent] of Object.entries(resolution.agents)) {
           const id = `forge-${matId}`
           if (draft.get(id) !== undefined) continue // create-only
@@ -5542,19 +6521,128 @@ export async function v2Setup(ctx: V2PluginContext): Promise<void> {
           // segment rides the prompt here too (create-only semantics and
           // guards untouched).
           const v1def = forgeAgentDef(matId, agent.def, provenance, agent.shared ?? undefined)
-          draft.update(id, (agentDraft) => {
-            agentDraft.description = v1def.description
-            agentDraft.system = v1def.prompt
-            agentDraft.mode = v1def.mode
-            if (v1def.model !== undefined) agentDraft.model = v1def.model // Auto workers carry no model key
-            agentDraft.permission = v1def.permission
-          })
+          try {
+            draft.update(id, (agentDraft) => {
+              agentDraft.description = v1def.description
+              agentDraft.system = v1def.prompt
+              agentDraft.mode = v1def.mode
+              // W6 field reality (live bisect 2026-11-19): writing ANY model
+              // spelling on the v2 agent draft breaks the agent layer — the
+              // v1 string form OR the parsed {providerID, modelID} object
+              // both leave /api/agent 500-ing ("Server failed to encode").
+              // The model pin therefore stays a V1-ONLY feature until the v2
+              // agent schema documents a draft-settable model shape
+              // (documented drift; the thoughtLevel pin is unaffected — it
+              // rides the runtime chat.params pool lookup by agent id).
+              agentDraft.permission = v1def.permission
+            })
+          } catch (err) {
+            // Per-agent fail-soft (same posture as the v1 config hook's
+            // findings): one bad def never skips the rest of the pool.
+            console.warn(`[forge:v2] error: agent ${id} not materialized: ${String(err)}`)
+          }
         }
       } catch {
         // Host-shape drift or unreadable config: skip silently (v2 contract).
       }
     })
   }
+
+  // ---- tool domain (task 2.1): register the ENTIRE tool surface through
+  // the same forgeTools() factory the v1 tool hook uses — the shared
+  // execute cores, descriptions, and argument contracts are one code path
+  // (design: "one code path per concern"). The JSON Schema builder
+  // translates each tool.schema.* chain above. Result wrapping and the
+  // context adaptation carry SANDBOX-PENDING readers (see above). The
+  // tool-partition behavior (family-based hiding) is a W4 session-seam
+  // concern and is deliberately NOT attempted here — only registration.
+  if (typeof ctx.tool?.transform === "function") {
+    try {
+      await ctx.tool.transform(async (editor) => {
+        if (typeof editor?.add !== "function") return
+        for (const [name, def] of Object.entries(forgeTools())) {
+          const d = def as {
+            description?: unknown
+            args?: Record<string, unknown>
+            execute?: (args: unknown, context: unknown) => Promise<unknown>
+          }
+          editor.add({
+            name,
+            description: typeof d.description === "string" ? d.description : name,
+            input: v2ToolInputSchema(d.args),
+            async execute(args: unknown, toolCtx: unknown) {
+              const res = await d.execute?.(args, v2ToolContext(toolCtx))
+              return wrapV2ToolResult(res)
+            },
+          })
+        }
+      })
+    } catch {
+      // Host-shape drift: tool registration is a silent no-op, never a throw.
+    }
+  }
+
+  // ---- permission domain (task 3.1): the belt on ctx.permission.hook
+  // ("evaluate") — doors keep a REAL ask (explicit deny stands), draft
+  // write-freeze denies, forge_shell passes through untouched. Same
+  // decision table as the v1 permission.ask hook; W6a pinned the event to
+  // the real PermissionEvaluation shape (effect mutation). The assert
+  // seam captured here backs the tool cores' ask adapter
+  // (v2ToolContext): the v1 ask-callback decision gates —
+  // plan_approve/plan_close/goal_write(arm)/goal_complete/goal_resume/
+  // goal_discard/crew_close — map to ctx.permission.assert; pure
+  // classification/refusal stays evaluate-mutation.
+  v2RegisterPermissionBelt(ctx)
+  v2PermissionAssertFn = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission!.assert!(input) : null
+
+  // ---- tool hooks (task 4.1): activity marking (execute.after ledger) +
+  // the full dispatch-guard belt + the readonly-exec seal
+  // (execute.before), all over the shared module predicates. W6a: the
+  // before payload is {tool, sessionID, agent, messageID, id, input} —
+  // the call id is `id` (Tool.CallID), the arguments are `input`.
+  v2RegisterToolHooks(ctx, v2AnchorClient(ctx))
+
+  // ---- session-domain client (task 5.1, W6a-resolved): one client feeds
+  // BOTH the goal continuation engine (prompt + get) and the module-level
+  // jobClient seam (promptAsync ≈ the blocking prompt send) — only ONE
+  // entry ever runs per host process, so the assignment is race-free.
+  const v2Client = v2SessionClient(ctx)
+  if (v2Client && (v2Client.session.promptAsync || v2Client.session.prompt)) jobClient = v2Client
+  const goalClient =
+    v2Client && typeof v2Client.session.prompt === "function" && typeof v2Client.session.get === "function" ? (v2Client as unknown as GoalClient) : null
+
+  // ---- session seams (task 4.2 + W6a idle choice): prompt (busy
+  // marking) / context (thoughtLevel injection + family-gated system
+  // injections + channel mandate + plan/goal notices) / compaction
+  // (goal-brief reinjection) / experimental.idle (the PRIMARY idle edge —
+  // goal continuation + job-wake delivery; SSE fallback below) —
+  // Decision 3's event topology, fail-open on drift, registrations
+  // collected for the setup cleanup.
+  const sessionHooks = v2RegisterSessionHooks(ctx, goalClient)
+
+  // ---- command domain (task 4.3): /plan /goal /crew, create-only,
+  // templates byte-identical to the v1 constants.
+  await v2RegisterCommands(ctx)
+
+  // ---- event domain (task 5.1, W6a-resolved): the session.deleted
+  // harvest on the AsyncIterable subscription (payload under .data); the
+  // idle edge rides it ONLY when the in-process experimental.idle hook
+  // could not be registered (drifted session domain). The returned
+  // cleanup aborts the loop; the combined cleanup (hook disposals + loop
+  // abort) is the setup Cleanup.
+  const v2AbortEvents = v2SubscribeEvents(ctx, goalClient, !sessionHooks.idleHook)
+  const disposables = [...sessionHooks.disposables, ...(v2AbortEvents ? [v2AbortEvents] : [])]
+  return disposables.length > 0
+    ? () => {
+        for (const dispose of disposables) {
+          try {
+            dispose()
+          } catch {
+            // Cleanup is best-effort.
+          }
+        }
+      }
+    : undefined
 }
 
 export default { id: "forge", server, setup: v2Setup }
