@@ -30,7 +30,7 @@
 
 ## 7. W7 — Manifest, docs, release
 
-- [ ] 7.1 `engines.opencode` → `^1.18.0 || ^2.0.0`; README V2 install section; AGENTS.md v1/v2 section rewritten for full parity — verify: manifest valid, docs present
-- [ ] 7.2 Version bump, `bun run bundle`, dist self-containment re-check, `npm pack --dry-run` shape check — verify: recorded outputs
-- [ ] 7.3 Release train per the recipe (conventional commits, push with retry, npm publish, registry cache-buster verify, store flip) — verify: recorded registry fetch + store integrity outputs
-- [ ] 7.4 V1-host install regression + `openspec validate --all` green — verify: recorded outputs; archive only on the user's explicit word
+- [x] 7.1 `engines.opencode` → `^1.18.0 || ^2.0.0`; README V2 install section; AGENTS.md v1/v2 section rewritten for full parity — verify: manifest valid, docs present (engines live in the registry metadata; README gained the v2-host notes section; AGENTS v1/v2 section rewritten with the three documented drifts)
+- [x] 7.2 Version bump, `bun run bundle`, dist self-containment re-check, `npm pack --dry-run` shape check — verify: recorded outputs (0.26.0; dist 0.81MB zero external imports; pack 3 files / 198.8kB, shasum 2a0c71b9)
+- [x] 7.3 Release train per the recipe (conventional commits, push with retry, npm publish, registry cache-buster verify, store flip) — verify: recorded registry fetch + store integrity outputs (commits dfce83d + fcd5142; push 2ebaea9..fcd5142; publish exit 0; registry beat-10 FOUND integrity sha512-I/O9eWHZaUB4T…SkDJkQ== matching, dist-tags.latest → 0.26.0)
+- [x] 7.4 V1-host install regression + `openspec validate --all` green — verify: recorded outputs; archive only on the user's explicit word (official `opencode plugin @sorenllm/opencode-forge --global` on the 1.19.5 host resolved 0.26.0; `opencode auth list` exit 0 with ZERO forge load errors; openspec validate --all → 10 passed, 0 failed)
