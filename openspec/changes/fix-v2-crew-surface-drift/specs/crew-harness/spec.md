@@ -36,6 +36,11 @@ When `/crew` is invoked and the session's dispatchable roster is empty (neither 
 - **WHEN** the session was created in a pool-less directory, the host session record now carries a pool-owning directory (session moved / re-anchored), and the tool context still reports the original pool-less directory
 - **THEN** the gate resolves the roster from the authoritative record's directory (the workspace pool IS the roster) and does NOT fire the unconfigured refusal — the same verdict the dispatch belts give for that session
 
+#### Scenario: A freshly moved session's roster follows the host's live move statement
+
+- **WHEN** the host emits `session.moved` carrying the session's new directory while the plugin-facing session record seam still reports the pre-move location — the move being into a pooled workspace or out of one
+- **THEN** the gate resolves the roster from the moved workspace (the live move statement outranks the stale record seam; moving into a pool gains its roster, moving out loses it with the honest unconfigured refusal) — neither the pooled-map preference nor the resume ledger resurrects the abandoned workspace's pool
+
 #### Scenario: A fresh install with only a per-project pool enters crew
 
 - **WHEN** a host has no global forge.json anywhere, the session's workspace carries a `.opencode/forge.json` with at least one agent, and `/crew` is invoked
