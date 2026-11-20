@@ -74,11 +74,12 @@ import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type Crew
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
-import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
+import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type DispatchNodeConfig, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
+import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, ACTIVE_TEXTFUL_OVERRIDE_NOTE, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
 import { buildRetryPrompt, classifyDispatchError, resolveMaxAttempts, resolveRetryBackoffMs } from "./src/dispatch-retry.ts"
+import { createDispatchGate, type DispatchGate, type ModelIdentity } from "./src/dispatch-gate.ts"
 import { withReportDelivery } from "./src/dispatch-prompt.ts"
 import {
   createDispatchJournal,
@@ -2099,6 +2100,101 @@ const knownHostAgents = new Set<string>(["general", ...NATIVE_PARTITION_FALLBACK
 // Per-session concurrent async cap (spec: Dispatch lifecycle).
 export const ASYNC_DISPATCH_CAP = 3
 
+// ---------------------------------------------------------------------------
+// Provider-dimension dispatch gate + circuit breaker
+// (harden-dispatch-resilience design D3). One host-process gate singleton:
+// live counters (provider + provider/model) and per-provider breaker state
+// survive config hot-applies (updateConfig only swaps the limits). Fed at
+// the terminal-recording seam (journalTerminalRecord), enforced at the
+// dispatch call before child creation and re-checked at queue dequeue.
+// ---------------------------------------------------------------------------
+
+// sessionID → the session's resolved model (captured at chat.params /
+// session.context request-build time — the same resolution chain chat.params
+// sees; child sessions report here too, so a finished child's model is the
+// terminal feed's session-model fallback).
+const sessionModels = new Map<string, ModelIdentity>()
+
+// The host-process gate singleton (null until the first dispatch resolves
+// it — an unconfigured host never builds one).
+let dispatchGate: DispatchGate | null = null
+
+// jobId → identity for every ADMITTED dispatch whose terminal has not yet
+// fed the gate (the release bookkeeping; spawn failures release eagerly).
+const admittedGate = new Map<string, ModelIdentity>()
+
+// Every provider ever admitted on this host (test seam: the breaker table
+// survives releases, so the observation set is tracked alongside).
+const gateProvidersSeen = new Set<string>()
+
+// Anchor-keyed cascade loaders for the dispatch node (global base + the
+// session workspace's nearest forge.json override — the same cascade
+// semantics as the agent set, with mtime hot-apply).
+const dispatchConfigLoaders = new Map<string, ReturnType<typeof createForgeConfigLoader>>()
+function dispatchConfigFor(anchor: string): DispatchNodeConfig | null {
+  const key = anchor || "-"
+  let l = dispatchConfigLoaders.get(key)
+  if (!l) {
+    l = createForgeConfigLoader({ projectDir: anchor, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
+    dispatchConfigLoaders.set(key, l)
+    while (dispatchConfigLoaders.size > 8) {
+      const oldest = dispatchConfigLoaders.keys().next().value
+      if (oldest === undefined) break
+      dispatchConfigLoaders.delete(oldest)
+    }
+  }
+  return l.load().dispatch ?? null
+}
+
+/** The gate with the anchor's dispatch config hot-applied (state survives). */
+function gateFor(anchor: string): DispatchGate {
+  if (!dispatchGate) dispatchGate = createDispatchGate()
+  const node = dispatchConfigFor(anchor)
+  dispatchGate.updateConfig(
+    node
+      ? {
+          providerConcurrency: node.providerConcurrency,
+          modelConcurrency: node.modelConcurrency,
+          circuitBreaker: { consecutiveFailures: node.circuitBreaker.consecutiveFailures ?? 0, cooldownMs: node.circuitBreaker.cooldownMs ?? 0 },
+        }
+      : null,
+  )
+  return dispatchGate
+}
+
+/**
+ * Agent → model identity (the chat.params resolution chain): a forge-*
+ * target's PINNED model from the pool lookup (fresh resolve, hot-apply);
+ * anything unpinned falls back to the session's captured model — the CHILD
+ * session's when known, else the dispatching owner's (the child inherits
+ * the parent's model until its own first request-build reports). Null when
+ * nothing resolves: the dispatch is honestly uncounted (no gate applies —
+ * an uncounted dimension is never limited).
+ */
+function dispatchModelIdentity(agentID: string, ownerSession: string, childSessionID?: string): ModelIdentity | null {
+  if (agentID.toLowerCase().startsWith("forge-")) {
+    const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def
+    if (def?.model) {
+      const identity = parseIdentity(def.model)
+      if (identity) return { provider: identity.provider, model: identity.model }
+    }
+  }
+  if (childSessionID && sessionModels.has(childSessionID)) return sessionModels.get(childSessionID) ?? null
+  return sessionModels.get(ownerSession) ?? null
+}
+
+/** Release an admission eagerly (spawn failed before any child existed). */
+function releaseGateAdmission(jobId: string): void {
+  const identity = admittedGate.get(jobId)
+  if (!identity) return
+  admittedGate.delete(jobId)
+  try {
+    dispatchGate?.release(identity)
+  } catch {
+    // Fail-soft by contract.
+  }
+}
+
 type DispatchHandle = { jobId: string; childSessionID: string; agentID: string; ownerSession: string; description: string }
 // jobId -> handle. Entries are pruned when the poller settles or the owner
 // session ends; the cap counts entries whose registry job is still running.
@@ -2236,6 +2332,23 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       failQueuedWishHonestly(wish, draftRefusal)
       continue
     }
+    // Provider gate re-check (harden-dispatch-resilience D3): the gate is
+    // re-evaluated at DEQUEUE time — a breaker that opened (or a limit that
+    // tightened via hot-apply) while the wish was queued fails it as an
+    // honest error wake, never a silent skip. Breaker refusals are the
+    // plugin's own throttle — they never enter the provider-retry path
+    // (nothing has spawned; the classifier is never consulted).
+    const gate = gateFor(wish.directory)
+    const wishIdentity = dispatchModelIdentity(wish.agentID, wish.ownerSession)
+    if (wishIdentity) {
+      const admission = gate.admit(wishIdentity)
+      if (!admission.ok) {
+        failQueuedWishHonestly(wish, admission.refusal)
+        continue
+      }
+      gateProvidersSeen.add(wishIdentity.provider)
+      admittedGate.set(wish.jobId, wishIdentity)
+    }
     // --- spawn: same engine as the direct async path.
     const created = await createChildSession(client, {
       parentSessionID: wish.ownerSession,
@@ -2245,6 +2358,7 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       questionDeny: wish.questionDeny,
     })
     if (!created.ok) {
+      releaseGateAdmission(wish.jobId)
       failQueuedWishHonestly(wish, `child session creation failed: ${created.error}`)
       continue
     }
@@ -2255,6 +2369,7 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       directory: wish.directory,
     })
     if (!sent.ok) {
+      releaseGateAdmission(wish.jobId)
       failQueuedWishHonestly(wish, `prompt send to child session ${created.sessionID} failed: ${sent.error}`)
       continue
     }
@@ -2371,6 +2486,23 @@ function journalTransition(worktree: string, record: DispatchJournalRecord): voi
 
 /** Terminal transition: the prompt is REDACTED (dropped) on terminal records. */
 function journalTerminalRecord(base: JournalBase, outcome: string, reason: string): void {
+  // Provider-gate feed (harden-dispatch-resilience D3): every terminal of an
+  // ADMITTED dispatch releases its concurrency slot and advances the breaker
+  // ("completed" closes/resets, "error"/"stream-lost/unknown" count as
+  // failed terminals, user aborts / stale kills are neutral). Records that
+  // were never admitted (queued refusals, owner-death flushes) feed nothing.
+  const admitted = admittedGate.get(base.id)
+  if (admitted) {
+    admittedGate.delete(base.id)
+    try {
+      dispatchGate?.recordTerminal(
+        admitted,
+        outcome === "completed" ? "completed" : outcome === "error" || outcome === "stream-lost/unknown" ? "failed" : "neutral",
+      )
+    } catch {
+      // Fail-soft by contract (the journal append below still runs).
+    }
+  }
   journalTransition(base.workspace, { ...journalRecord(base, "terminal"), prompt: undefined, outcome, reason })
 }
 
@@ -2689,6 +2821,11 @@ async function runAsyncDispatchPoller(
   // the registry row settles exit-null and the ledger records
   // stream-lost/unknown with the last-observed activity timestamp.
   let streamLost = false
+  // Active-textful override disclosure (harden-dispatch-resilience D1):
+  // set when the terminal completion was established from the message
+  // stream while the status view lagged — the wake text and the journal
+  // reason both name the establishment path.
+  let activeOverride = false
   // Terminal-inference soundness is owned by pollChild; the stability
   // counter (and the textless-idle floor streak) live HERE so they survive
   // poll-slice boundaries (the async path inherits the same soundness — a
@@ -2708,8 +2845,10 @@ async function runAsyncDispatchPoller(
   for (;;) {
     const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability })
     if (poll.status === "completed") {
+      activeOverride = poll.via === "active-textful"
       const fin = await fetchFinalMessage(client, childSessionID)
       text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`
+      if (activeOverride) text += `\n(${ACTIVE_TEXTFUL_OVERRIDE_NOTE})`
       break
     }
     if (poll.status === "error") {
@@ -2812,6 +2951,7 @@ async function runAsyncDispatchPoller(
         // Fresh tracking state for the fresh child (stability, floor,
         // progress cadence, and the stale anchor all restart).
         stability.stableTicks = 0
+        stability.activeTextfulTicks = 0
         stability.textlessIdleSince = undefined
         startedAt = Date.now()
         lastNotifiedMultiple = 0
@@ -2955,7 +3095,9 @@ async function runAsyncDispatchPoller(
     streamLost ? "stream-lost/unknown" : exitCode === 0 ? "completed" : "error",
     streamLost
       ? `${text.split("\n")[0].slice(0, 200)} — last observed activity ${new Date(stale.lastActivity ?? startedAt).toISOString()}`
-      : text.split("\n")[0].slice(0, 200),
+      : activeOverride
+        ? `${text.split("\n")[0].slice(0, 200)} (${ACTIVE_TEXTFUL_OVERRIDE_NOTE})`
+        : text.split("\n")[0].slice(0, 200),
   )
   void pumpDispatchQueue(client, job.ownerSession)
 }
@@ -3083,6 +3225,23 @@ const taskDispatchTool = tool({
     const state = ensureSession(context.sessionID, anchorDir)
     const description =
       typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60)
+    // Provider gate (harden-dispatch-resilience D3): admission is checked
+    // BEFORE any child exists — breaker first, then provider/model
+    // concurrency. A refusal throws the gate's honest string (mechanism,
+    // counted dimension + current value, recovery condition); breaker
+    // refusals are the plugin's own throttle and NEVER enter the
+    // provider-retry path (no child was created, the error classifier is
+    // never consulted). A QUEUED wish checks now but releases immediately —
+    // the pump re-checks (and re-admits) at dequeue time.
+    const gate = gateFor(state.worktree)
+    const gateIdentity = dispatchModelIdentity(target, context.sessionID)
+    if (gateIdentity) {
+      const admission = gate.admit(gateIdentity)
+      if (!admission.ok) throw new Error(admission.refusal)
+      gateProvidersSeen.add(gateIdentity.provider)
+      if (queueAfterCap) dispatchGate?.release(gateIdentity)
+      else admittedGate.set(dispatchId, gateIdentity)
+    }
     if (queueAfterCap) {
       // Fold D: the queued handle returns immediately (like an async
       // handle) with queued: true panel metadata and a queue position note;
@@ -3155,9 +3314,13 @@ const taskDispatchTool = tool({
       // available (native parity); async seals the child unattended.
       questionDeny: runInBackground,
     })
-    if (!created.ok) throw new Error(`[forge:dispatch] child session creation failed: ${created.error}`)
+    if (!created.ok) {
+      releaseGateAdmission(dispatchId)
+      throw new Error(`[forge:dispatch] child session creation failed: ${created.error}`)
+    }
     const sent = await sendPrompt(client, { sessionID: created.sessionID, agentID: target, prompt, directory: state.worktree })
     if (!sent.ok) {
+      releaseGateAdmission(dispatchId)
       throw new Error(`[forge:dispatch] prompt send to child session ${created.sessionID} failed: ${sent.error} — the child exists and is natively abortable in the TUI.`)
     }
     // Tool-part metadata mirroring the native/OMO task shape (design D3) —
@@ -3224,6 +3387,7 @@ const taskDispatchTool = tool({
       const waitStartedAt = Date.now()
       let syncCompleted = false
       let syncStreamLost = false
+      let syncOverride = false
       let syncError: string | null = null
       const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1"
       let syncSliceCount = 0
@@ -3324,6 +3488,7 @@ const taskDispatchTool = tool({
             syncStale.lastActivity = null
             syncStale.staleNotified = false
             syncStability.stableTicks = 0
+            syncStability.activeTextfulTicks = 0
             syncStability.textlessIdleSince = undefined
             continue syncWait
           }
@@ -3410,6 +3575,7 @@ const taskDispatchTool = tool({
           break syncWait
         }
         syncCompleted = true
+        syncOverride = poll.via === "active-textful"
         break syncWait
       }
       if (syncCompleted) {
@@ -3418,13 +3584,18 @@ const taskDispatchTool = tool({
           journalTerminalRecord(syncJournalBase, "error", fin.error)
           throw new Error(`[forge:dispatch] ${fin.error}`)
         }
-        journalTerminalRecord(syncJournalBase, "completed", `${target} finished (child session ${childSessionID})`)
+        journalTerminalRecord(
+          syncJournalBase,
+          "completed",
+          `${target} finished (child session ${childSessionID})${syncOverride ? ` (${ACTIVE_TEXTFUL_OVERRIDE_NOTE})` : ""}`,
+        )
         context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } })
         const recoveredNote = attemptSync > 1 ? ` — recovered on attempt ${attemptSync}/${maxAttemptsSync} (previous child session(s) died with transient errors and were respawned; the [forge:dispatch-progress] notice lands in this transcript when the session idles)` : ""
+        const overrideNote = syncOverride ? ` — ${ACTIVE_TEXTFUL_OVERRIDE_NOTE}` : ""
         return {
           title: `${target}: dispatch complete`,
           metadata: { ...taskMetadata },
-          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID})${recoveredNote}.`, `Final report:\n${fin.text}`].join("\n"),
+          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID})${recoveredNote}${overrideNote}.`, `Final report:\n${fin.text}`].join("\n"),
         }
       }
       if (syncError !== null) {
@@ -4704,6 +4875,8 @@ function harvestSessionEnd(sessionID: string): void {
   dispatchProgressQueue.delete(sessionID)
   // Same for the agent-family map (tool-partition).
   sessionAgents.delete(sessionID)
+  // And the session-model capture table (harden-dispatch-resilience D3).
+  sessionModels.delete(sessionID)
   // And the exec-seal finding bounds (readonly-exec-seal).
   sealFindings.delete(sessionID)
   sealUnknownNotes.delete(sessionID)
@@ -5304,6 +5477,17 @@ export const server: Plugin = async (input, options) => {
       // Family-map upsert (tool-partition): fires for every request build,
       // including task-spawned sessions (probe P1).
       if (typeof agentName === "string" && agentName) sessionAgents.set(sessionID, agentName)
+      // Session-model capture (harden-dispatch-resilience D3): every
+      // request build reports the session's resolved model — the dispatch
+      // gate's session-model fallback for unpinned targets. Both host
+      // shapes accepted (modelID plugin-SDK shape, id host 1.18.34 shape);
+      // a missing model id records nothing.
+      {
+        const capObj = raw.model as { modelID?: unknown; id?: unknown } | undefined
+        const capProvider = typeof raw.model?.providerID === "string" ? raw.model.providerID : ""
+        const capModel = typeof capObj?.modelID === "string" ? capObj.modelID : typeof capObj?.id === "string" ? capObj.id : ""
+        if (capProvider && capModel) sessionModels.set(sessionID, { provider: capProvider, model: capModel })
+      }
       if (typeof agentName !== "string" || !agentName.startsWith("forge-")) return
       const frozen = sessionDepths.get(sessionID)
       if (frozen) {
@@ -5442,6 +5626,24 @@ export const server: Plugin = async (input, options) => {
       // Pending [forge:dispatch-progress] notices for a session (fold #2
       // wiring tests observe the enqueue side of the lossy queue).
       dispatchProgress: (sessionID: string) => [...(dispatchProgressQueue.get(sessionID) ?? [])],
+      // Provider-gate seams (harden-dispatch-resilience D3): observe the
+      // host-process gate's counters/breaker, and reset module state for
+      // test isolation (server() calls share one process).
+      dispatchGateState: () => {
+        if (!dispatchGate) return null
+        const live = dispatchGate.liveCounts()
+        const providers = new Set([...Object.keys(live.provider), ...gateProvidersSeen])
+        const breakers: Record<string, { state: string; failures: number }> = {}
+        for (const p of providers) breakers[p] = dispatchGate.breakerState(p)
+        return { live, breakers }
+      },
+      resetDispatchGate: () => {
+        dispatchGate = null
+        admittedGate.clear()
+        gateProvidersSeen.clear()
+        sessionModels.clear()
+        dispatchConfigLoaders.clear()
+      },
       jobLedger: () => jobManager.ledgerEntries(),
       // Posture seams (shell-defang-default-open): the pre-rewrite permission
       // snapshot and a reset for test isolation (module state is shared
@@ -6208,6 +6410,14 @@ function v2ContextInjection(raw: unknown): void {
   if (!sessionID) return
   const agentName = v2AgentNameOf(o)
   if (agentName) sessionAgents.set(sessionID, agentName)
+  // Session-model capture (harden-dispatch-resilience D3, v2 port): the
+  // context payload's resolved model seeds the same session→model table.
+  {
+    const capObj = o.model as { providerID?: unknown; id?: unknown; modelID?: unknown } | undefined
+    const capProvider = typeof capObj?.providerID === "string" ? capObj.providerID : ""
+    const capModel = typeof capObj?.modelID === "string" ? capObj.modelID : typeof capObj?.id === "string" ? capObj.id : ""
+    if (capProvider && capModel) sessionModels.set(sessionID, { provider: capProvider, model: capModel })
+  }
   // --- depth injection (chat.params port) ---
   if (agentName && agentName.startsWith("forge-")) {
     const agentId = agentName.slice("forge-".length)
