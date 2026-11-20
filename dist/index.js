@@ -15811,7 +15811,7 @@ function validateAgentSet(raw) {
       if (entry.shape === "readonly" || entry.shape === "write") {
         def.shape = entry.shape;
       } else {
-        findings.push({ level: "warn", code: "shape-invalid", message: `${label}.shape must be "readonly" or "write" — defaulting to readonly` });
+        findings.push({ level: "warn", code: "shape-invalid", message: `${label}.shape must be "readonly" or "write" — defaulting to write (absent shape is write)` });
       }
     }
     if (entry.permission !== undefined) {
@@ -16692,6 +16692,7 @@ async function jsSearch(params, seams, maxWalkEntries = MAX_WALK_ENTRIES) {
 // src/dispatch-async.ts
 var QUESTION_DENY_PERMISSION = [{ permission: "question", action: "deny", pattern: "*" }];
 var QUESTION_DENY_PERMISSIONS_V2 = [{ action: "question", resource: "*", effect: "deny" }];
+var TASK_DENY_PERMISSIONS_V2 = [{ action: "task", resource: "*", effect: "deny" }];
 var ACTIVE_STATUS_TYPES = new Set(["busy", "retry", "running"]);
 var defaultNow = () => Date.now();
 var defaultSleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
@@ -16709,7 +16710,13 @@ async function createChildSession(client, input) {
       body: {
         parentID: input.parentSessionID,
         title: childSessionTitle(input.description, input.agentID),
-        ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION, permissions: [...QUESTION_DENY_PERMISSIONS_V2] } : {}
+        ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {},
+        ...input.questionDeny === true || input.taskDeny === true ? {
+          permissions: [
+            ...input.questionDeny === true ? QUESTION_DENY_PERMISSIONS_V2 : [],
+            ...input.taskDeny === true ? TASK_DENY_PERMISSIONS_V2 : []
+          ]
+        } : {}
       },
       query: { directory: input.parentDirectory }
     });
@@ -18805,6 +18812,13 @@ function dispatchModelIdentity(agentID, ownerSession, childSessionID) {
     return sessionModels.get(childSessionID) ?? null;
   return sessionModels.get(ownerSession) ?? null;
 }
+function nestedTaskDenyFor(agentID, ownerSession, childSessionID) {
+  const id = agentID.toLowerCase();
+  if (id === "forge" || id.startsWith("forge-"))
+    return false;
+  const identity = dispatchModelIdentity(agentID, ownerSession, childSessionID);
+  return identity !== null && dispatchProviderFamily(identity.provider) === "anthropic";
+}
 function releaseGateAdmission(jobId) {
   const identity = admittedGate.get(jobId);
   if (!identity)
@@ -18915,7 +18929,8 @@ async function pumpDispatchQueue(client, sessionID) {
       parentDirectory: wish.directory,
       agentID: wish.agentID,
       description: wish.description,
-      questionDeny: wish.questionDeny
+      questionDeny: wish.questionDeny,
+      taskDeny: nestedTaskDenyFor(wish.agentID, wish.ownerSession)
     });
     if (!created.ok) {
       releaseGateAdmission(wish.jobId);
@@ -19145,7 +19160,8 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
         parentDirectory: workspace,
         agentID: rec.agent,
         description: rec.description ?? "",
-        questionDeny: base.questionDeny ?? true
+        questionDeny: base.questionDeny ?? true,
+        taskDeny: nestedTaskDenyFor(rec.agent, rec.ownerSession, typeof rec.childSessionId === "string" ? rec.childSessionId : undefined)
       });
       if (!respawn.ok) {
         journalTerminalRecord(base, "error", `retry spawn failed at recovery: ${respawn.error}`);
@@ -19267,7 +19283,8 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           parentDirectory: retryCtx.directory,
           agentID,
           description: dispatch?.description ?? "",
-          questionDeny: retryCtx.questionDeny
+          questionDeny: retryCtx.questionDeny,
+          taskDeny: nestedTaskDenyFor(agentID, job.ownerSession, childSessionID)
         });
         if (!respawn.ok) {
           text = `(retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
@@ -19554,7 +19571,8 @@ var taskDispatchTool = tool({
       parentDirectory: state.worktree,
       agentID: target,
       description,
-      questionDeny: runInBackground
+      questionDeny: runInBackground,
+      taskDeny: nestedTaskDenyFor(target, context.sessionID)
     });
     if (!created.ok) {
       releaseGateAdmission(dispatchId);
@@ -19677,7 +19695,8 @@ var taskDispatchTool = tool({
                 parentDirectory: state.worktree,
                 agentID: target,
                 description,
-                questionDeny: false
+                questionDeny: false,
+                taskDeny: nestedTaskDenyFor(target, context.sessionID, childSessionID)
               });
               if (!respawn.ok) {
                 journalTerminalRecord(syncJournalBase, "error", `retry spawn failed: ${respawn.error}`);
@@ -21133,6 +21152,12 @@ var server = async (input, options) => {
       resolveNow: () => resolvePools(),
       workspacePoolOf: (anchor) => sessionPoolFileOf(anchor),
       dispatchTasks: () => [...dispatchTasks.values()],
+      setSessionModel: (sessionID, identity) => {
+        if (identity === null)
+          sessionModels.delete(sessionID);
+        else
+          sessionModels.set(sessionID, identity);
+      },
       dispatchQueues: () => [...dispatchQueues.entries()].flatMap(([owner, wishes]) => wishes.map((w) => ({ ownerSession: owner, jobId: w.jobId, agentID: w.agentID }))),
       setDispatchJournalFs: (factory) => {
         dispatchJournalFsFactory = factory;
