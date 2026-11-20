@@ -395,6 +395,96 @@ export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAg
 }
 
 // ---------------------------------------------------------------------------
+// dispatch node (harden-dispatch-resilience D3): optional per-file top-level
+// `dispatch` { providerConcurrency, modelConcurrency, circuitBreaker }.
+// Field-level fail-soft exactly like the agent set: a bad value drops with a
+// warn finding and never throws; an absent node means no limits. Layers
+// cascade-merge (global base, project override per map key / breaker field).
+// ---------------------------------------------------------------------------
+
+export type DispatchNodeConfig = {
+  providerConcurrency: Record<string, number>
+  modelConcurrency: Record<string, number>
+  circuitBreaker: { consecutiveFailures?: number; cooldownMs?: number }
+}
+
+function isPositiveInt(v: unknown): v is number {
+  return typeof v === "number" && Number.isInteger(v) && v >= 1
+}
+
+function parseLimitMap(raw: unknown, label: string, findings: ForgeConfigFinding[]): Record<string, number> | null {
+  if (raw === undefined || raw === null) return {}
+  if (!isRecord(raw)) {
+    findings.push({ level: "warn", code: "dispatch-map-invalid", message: `${label} must be an object mapping keys to positive-integer limits — field ignored` })
+    return null
+  }
+  const out: Record<string, number> = {}
+  for (const [key, value] of Object.entries(raw)) {
+    const k = key.trim()
+    if (!k) {
+      findings.push({ level: "warn", code: "dispatch-map-key-invalid", message: `${label}: an empty key cannot carry a limit — entry ignored` })
+      continue
+    }
+    if (!isPositiveInt(value)) {
+      findings.push({ level: "warn", code: "dispatch-map-value-invalid", message: `${label}.${key} must be a positive integer — entry ignored (fail-soft, never a throw)` })
+      continue
+    }
+    out[k] = value
+  }
+  return out
+}
+
+/**
+ * Validate one layer's `dispatch` node. Returns `{ config: null }` for an
+ * absent node (no limits — today's behavior) and a config with whatever
+ * valid fields survived otherwise; every dropped field carries a warn
+ * finding. Pure data-in/data-out.
+ */
+export function validateDispatchNode(raw: unknown, label: string): { config: DispatchNodeConfig | null; findings: ForgeConfigFinding[] } {
+  const findings: ForgeConfigFinding[] = []
+  if (raw === undefined || raw === null) return { config: null, findings }
+  if (!isRecord(raw)) {
+    findings.push({ level: "warn", code: "dispatch-node-invalid", message: `${label} must be an object ({providerConcurrency, modelConcurrency, circuitBreaker}) — the whole node is ignored` })
+    return { config: null, findings }
+  }
+  const providerConcurrency = parseLimitMap(raw.providerConcurrency, `${label}.providerConcurrency`, findings)
+  const modelConcurrency = parseLimitMap(raw.modelConcurrency, `${label}.modelConcurrency`, findings)
+  const cbRaw = raw.circuitBreaker
+  const circuitBreaker: DispatchNodeConfig["circuitBreaker"] = {}
+  if (cbRaw !== undefined && cbRaw !== null) {
+    if (!isRecord(cbRaw)) {
+      findings.push({ level: "warn", code: "dispatch-breaker-invalid", message: `${label}.circuitBreaker must be an object ({consecutiveFailures, cooldownMs}) — field ignored` })
+    } else {
+      if (cbRaw.consecutiveFailures !== undefined) {
+        if (isPositiveInt(cbRaw.consecutiveFailures)) circuitBreaker.consecutiveFailures = cbRaw.consecutiveFailures
+        else findings.push({ level: "warn", code: "dispatch-breaker-failures-invalid", message: `${label}.circuitBreaker.consecutiveFailures must be a positive integer — field ignored` })
+      }
+      if (cbRaw.cooldownMs !== undefined) {
+        if (isPositiveInt(cbRaw.cooldownMs)) circuitBreaker.cooldownMs = cbRaw.cooldownMs
+        else findings.push({ level: "warn", code: "dispatch-breaker-cooldown-invalid", message: `${label}.circuitBreaker.cooldownMs must be a positive integer — field ignored` })
+      }
+    }
+  }
+  return { config: { providerConcurrency: providerConcurrency ?? {}, modelConcurrency: modelConcurrency ?? {}, circuitBreaker }, findings }
+}
+
+/**
+ * Cascade merge (global base, project override): each map merges per key
+ * with the override winning; the breaker merges per FIELD with the
+ * override winning. null on both sides = no dispatch node at all.
+ */
+export function mergeDispatchNodes(base: DispatchNodeConfig | null, override: DispatchNodeConfig | null): DispatchNodeConfig | null {
+  if (base === null && override === null) return null
+  const b = base ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: {} }
+  const o = override ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: {} }
+  return {
+    providerConcurrency: { ...b.providerConcurrency, ...o.providerConcurrency },
+    modelConcurrency: { ...b.modelConcurrency, ...o.modelConcurrency },
+    circuitBreaker: { ...b.circuitBreaker, ...o.circuitBreaker },
+  }
+}
+
+// ---------------------------------------------------------------------------
 // opencode-aligned cascade loader (change align-forge-config-discovery):
 // global base + NEAREST project override MERGED per agent id; the project
 // layer is discovered by walking UP from the anchor directory to the
@@ -414,6 +504,10 @@ export type LoadedForgeConfig = {
   // anchor's ancestor chain); null when no project layer exists.
   projectPath: string | null
   findings: ForgeConfigFinding[]
+  // harden-dispatch-resilience D3: this layer's validated `dispatch` node
+  // (null when absent/wholly invalid — no limits). Optional for backward
+  // compatibility with existing LoadedForgeConfig consumers.
+  dispatch?: DispatchNodeConfig | null
 }
 
 export function forgeConfigPaths(opts: { projectDir?: string; homeDir?: string }): { project: string; global: string } {
@@ -542,6 +636,11 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
       } else {
         const validated = validateAgentSet(top === undefined ? undefined : (top as Record<string, unknown>).agents)
         result = { agents: validated.agents, source, path, projectPath: source === "project" ? path : null, findings: validated.findings }
+        // dispatch node (harden-dispatch-resilience D3): field-level
+        // fail-soft; findings ride the same channel as the agent findings.
+        const dispatchNode = validateDispatchNode(top === undefined ? undefined : (top as Record<string, unknown>).dispatch, `${path}: dispatch`)
+        result.dispatch = dispatchNode.config
+        result.findings.push(...dispatchNode.findings)
       }
     }
     cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result })
@@ -558,7 +657,9 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
       const project = projectPath ? readCandidate(projectPath, "project") : null
       const global = globalPath ? readCandidate(globalPath, "global") : null
       // Merge, never replace: global base, project definition wins per agent
-      // id (wholesale — one definition per id, no cross-layer blending).
+      // id (wholesale — one definition per id, no cross-layer blending). The
+      // dispatch node cascade-merges separately (D3: per map key / breaker
+      // field, project over global).
       if (project && global) {
         return {
           agents: { ...global.agents, ...project.agents },
@@ -566,10 +667,11 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
           path: project.path,
           projectPath: project.path,
           findings: [...global.findings, ...project.findings],
+          dispatch: mergeDispatchNodes(global.dispatch ?? null, project.dispatch ?? null),
         }
       }
-      if (project) return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings }
-      if (global) return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings }
+      if (project) return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings, dispatch: project.dispatch ?? null }
+      if (global) return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings, dispatch: global.dispatch ?? null }
       // Unconfigured: inert and silent (spec — "the unconfigured state SHALL
       // be inert: no subagents registered, no errors raised, no AI-facing
       // configuration recipe emitted").
