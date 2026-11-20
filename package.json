@@ -10,14 +10,15 @@
     },
     "./server": {
       "import": "./dist/index.js"
-    }
+    },
+    "./schema.json": "./dist/forge.schema.json"
   },
   "files": [
     "dist",
     "README.md"
   ],
   "scripts": {
-    "bundle": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && bun build ./plugin.ts --outfile ./dist/index.js --target node --format esm",
+    "bundle": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && bun build ./plugin.ts --outfile ./dist/index.js --target node --format esm && node -e \"require('node:fs').copyFileSync('schema/forge.schema.json','dist/forge.schema.json')\"",
     "test": "node --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },

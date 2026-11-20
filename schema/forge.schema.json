@@ -1,0 +1,77 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://unpkg.com/@sorenllm/opencode-forge@latest/dist/forge.schema.json",
+  "title": "opencode-forge forge.json",
+  "description": "Static worker subagent definitions for the opencode-forge plugin. The file is JSONC (comments and trailing commas allowed). Validation in the plugin is field-level fail-soft: a bad entry is skipped with a finding while its siblings still apply; this schema is an editor-side convenience mirror of that surface, not the enforcement. The plugin only ever READS this file.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "Editor-side schema reference. Ignored by the plugin (unknown keys are tolerated)."
+    },
+    "pool": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]{1,24}$",
+      "description": "Namespace for this pool's materialized ids (forge-<ns>-<id>). REQUIRED for crew-governed dispatch: without a valid declared `pool`, `crew_begin` refuses registration and crew `forge-*` dispatches stay blocked until the field is added. Invalid values degrade to a warning + the directory-derived namespace. Ignored on the global fallback file (that namespace is fixed to \"global\"). Note: the plugin trims before validating, so a padded value passes the plugin but fails this schema — write it unpadded."
+    },
+    "shared": {
+      "type": "string",
+      "minLength": 1,
+      "description": "Optional pool-level shared prompt segment, written once at the top of the file and inherited by every agent this file materializes. A plain string, no interpolation."
+    },
+    "agents": {
+      "type": "object",
+      "description": "Agent id -> definition. An ABSENT shape defaults to WRITE (open permissions). Unknown keys inside an entry are tolerated and ignored.",
+      "propertyNames": {
+        "pattern": "^(?:forge-)*[a-z0-9-]+$",
+        "description": "Lowercase [a-z0-9-]. A `forge-` prefix is tolerated (auto-stripped with a warning at load); write ids without it."
+      },
+      "additionalProperties": { "$ref": "#/definitions/agent" }
+    }
+  },
+  "definitions": {
+    "agent": {
+      "type": "object",
+      "description": "One worker. model + thoughtLevel form an ATOMIC PAIR: set BOTH to pin the brain and depth, set NEITHER for an Auto worker (inherits the parent session's model at dispatch, provider-default depth). Exactly one of the two is rejected at load — the entry is skipped, its siblings still apply.",
+      "properties": {
+        "model": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Exact \"provider/model\" string (as resolved by your opencode model config). Open string — no enum by design.",
+          "examples": ["zai-coding-plan/glm-5.3", "anthropic/claude-sonnet-4-5"]
+        },
+        "thoughtLevel": {
+          "type": "string",
+          "minLength": 1,
+          "description": "One thought-level word, written LOWERCASE. The dictionary ships none/minimal/low/medium/high/xhigh/max, but it is open — any word passes through verbatim on word-shaped channels. The plugin normalizes to lowercase with a warning if you write mixed case.",
+          "examples": ["none", "minimal", "low", "medium", "high", "xhigh", "max"]
+        },
+        "prompt": {
+          "type": "string",
+          "minLength": 1,
+          "description": "Short role description. An explicit prompt fully overrides the built-in defaults (only research/review ids have built-ins; any other id without a prompt gets a generic one-liner)."
+        },
+        "shape": {
+          "type": "string",
+          "enum": ["readonly", "write"],
+          "description": "Absent = WRITE (open permissions). \"readonly\" is the explicit seal: denies write/edit/bash + the patch family (patch/applypatch/apply/multiedit) and seals readonly workers' forge_shell to read-classified commands."
+        },
+        "permission": {
+          "type": "object",
+          "additionalProperties": { "type": "string" },
+          "description": "Optional per-tool override map (tool name -> string verdict), e.g. { \"bash\": \"deny\" }. \"task\" is ALWAYS denied regardless of this map."
+        },
+        "depths": {
+          "type": "array",
+          "deprecated": true,
+          "description": "DEPRECATED — ignored with a warning finding. Static agents pin ONE thoughtLevel; set \"thoughtLevel\" instead.",
+          "items": { "type": "string" }
+        }
+      },
+      "anyOf": [
+        { "required": ["model", "thoughtLevel"] },
+        { "not": { "anyOf": [ { "required": ["model"] }, { "required": ["thoughtLevel"] } ] } }
+      ]
+    }
+  }
+}
