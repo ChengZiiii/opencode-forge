@@ -15825,6 +15825,74 @@ function validateAgentSet(raw) {
   }
   return { agents, findings };
 }
+function isPositiveInt(v) {
+  return typeof v === "number" && Number.isInteger(v) && v >= 1;
+}
+function parseLimitMap(raw, label, findings) {
+  if (raw === undefined || raw === null)
+    return {};
+  if (!isRecord(raw)) {
+    findings.push({ level: "warn", code: "dispatch-map-invalid", message: `${label} must be an object mapping keys to positive-integer limits — field ignored` });
+    return null;
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(raw)) {
+    const k = key.trim();
+    if (!k) {
+      findings.push({ level: "warn", code: "dispatch-map-key-invalid", message: `${label}: an empty key cannot carry a limit — entry ignored` });
+      continue;
+    }
+    if (!isPositiveInt(value)) {
+      findings.push({ level: "warn", code: "dispatch-map-value-invalid", message: `${label}.${key} must be a positive integer — entry ignored (fail-soft, never a throw)` });
+      continue;
+    }
+    out[k] = value;
+  }
+  return out;
+}
+function validateDispatchNode(raw, label) {
+  const findings = [];
+  if (raw === undefined || raw === null)
+    return { config: null, findings };
+  if (!isRecord(raw)) {
+    findings.push({ level: "warn", code: "dispatch-node-invalid", message: `${label} must be an object ({providerConcurrency, modelConcurrency, circuitBreaker}) — the whole node is ignored` });
+    return { config: null, findings };
+  }
+  const providerConcurrency = parseLimitMap(raw.providerConcurrency, `${label}.providerConcurrency`, findings);
+  const modelConcurrency = parseLimitMap(raw.modelConcurrency, `${label}.modelConcurrency`, findings);
+  const cbRaw = raw.circuitBreaker;
+  const circuitBreaker = {};
+  if (cbRaw !== undefined && cbRaw !== null) {
+    if (!isRecord(cbRaw)) {
+      findings.push({ level: "warn", code: "dispatch-breaker-invalid", message: `${label}.circuitBreaker must be an object ({consecutiveFailures, cooldownMs}) — field ignored` });
+    } else {
+      if (cbRaw.consecutiveFailures !== undefined) {
+        if (isPositiveInt(cbRaw.consecutiveFailures))
+          circuitBreaker.consecutiveFailures = cbRaw.consecutiveFailures;
+        else
+          findings.push({ level: "warn", code: "dispatch-breaker-failures-invalid", message: `${label}.circuitBreaker.consecutiveFailures must be a positive integer — field ignored` });
+      }
+      if (cbRaw.cooldownMs !== undefined) {
+        if (isPositiveInt(cbRaw.cooldownMs))
+          circuitBreaker.cooldownMs = cbRaw.cooldownMs;
+        else
+          findings.push({ level: "warn", code: "dispatch-breaker-cooldown-invalid", message: `${label}.circuitBreaker.cooldownMs must be a positive integer — field ignored` });
+      }
+    }
+  }
+  return { config: { providerConcurrency: providerConcurrency ?? {}, modelConcurrency: modelConcurrency ?? {}, circuitBreaker }, findings };
+}
+function mergeDispatchNodes(base, override) {
+  if (base === null && override === null)
+    return null;
+  const b = base ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: {} };
+  const o = override ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: {} };
+  return {
+    providerConcurrency: { ...b.providerConcurrency, ...o.providerConcurrency },
+    modelConcurrency: { ...b.modelConcurrency, ...o.modelConcurrency },
+    circuitBreaker: { ...b.circuitBreaker, ...o.circuitBreaker }
+  };
+}
 function forgeConfigPaths(opts) {
   const sep2 = opts.projectDir?.includes("\\") && !opts.projectDir?.includes("/") ? "\\" : "/";
   const project = opts.projectDir ? `${opts.projectDir}${sep2}.opencode${sep2}forge.json` : "";
@@ -15919,6 +15987,9 @@ function createForgeConfigLoader(deps) {
       } else {
         const validated = validateAgentSet(top === undefined ? undefined : top.agents);
         result = { agents: validated.agents, source, path, projectPath: source === "project" ? path : null, findings: validated.findings };
+        const dispatchNode = validateDispatchNode(top === undefined ? undefined : top.dispatch, `${path}: dispatch`);
+        result.dispatch = dispatchNode.config;
+        result.findings.push(...dispatchNode.findings);
       }
     }
     cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result });
@@ -15935,13 +16006,14 @@ function createForgeConfigLoader(deps) {
           source: "project+global",
           path: project.path,
           projectPath: project.path,
-          findings: [...global.findings, ...project.findings]
+          findings: [...global.findings, ...project.findings],
+          dispatch: mergeDispatchNodes(global.dispatch ?? null, project.dispatch ?? null)
         };
       }
       if (project)
-        return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings };
+        return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings, dispatch: project.dispatch ?? null };
       if (global)
-        return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings };
+        return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings, dispatch: global.dispatch ?? null };
       return { agents: {}, source: "none", path: null, projectPath: null, findings: [] };
     }
   };
@@ -16821,6 +16893,7 @@ function isActiveStatus(status) {
   return status !== undefined && status.type !== undefined && ACTIVE_STATUS_TYPES.has(status.type);
 }
 var TERMINAL_STABILITY_TICKS = 3;
+var ACTIVE_TEXTFUL_OVERRIDE_NOTE = "completion established from the message stream while the status view lagged";
 var DEFAULT_VIEW_LOSS_TICKS = 30;
 function latestAssistant(messages) {
   let best;
@@ -16907,11 +16980,19 @@ async function pollChild(client, input, seams = {}) {
     const textful = last !== undefined && (last.parts ?? []).some((p) => p.type === "text" && typeof p.text === "string" && p.text !== "");
     if (!active && finished && textful) {
       stability.stableTicks++;
+      stability.activeTextfulTicks = 0;
       if (stability.stableTicks >= TERMINAL_STABILITY_TICKS) {
         return { status: "completed", polls };
       }
+    } else if (active && statusMap !== undefined && finished && textful) {
+      stability.stableTicks = 0;
+      stability.activeTextfulTicks = (stability.activeTextfulTicks ?? 0) + 1;
+      if (stability.activeTextfulTicks >= TERMINAL_STABILITY_TICKS) {
+        return { status: "completed", polls, via: "active-textful" };
+      }
     } else {
       stability.stableTicks = 0;
+      stability.activeTextfulTicks = 0;
     }
     if (active || finished && textful) {
       stability.textlessIdleSince = undefined;
@@ -17092,6 +17173,124 @@ function resolveRetryBackoffMs(env = process.env) {
   if (!Number.isFinite(parsed) || parsed < 0)
     return RETRY_BACKOFF_MS;
   return Math.round(parsed);
+}
+
+// src/dispatch-gate.ts
+function modelKey(identity) {
+  return `${identity.provider}/${identity.model}`;
+}
+function concurrencyRefusal(dimension, key, live, limit) {
+  return `[forge:dispatch-gate] Dispatch refused by the ${dimension} concurrency gate: ${live}/${limit} live dispatch children already run on ${dimension} "${key}". ` + `Recovery: a live child on that ${dimension} finishing frees a slot — its [forge:dispatch-complete] wake announces it. ` + `This is the plugin's own throttle, not a provider error — do not retry the provider.`;
+}
+function breakerRefusal(provider, failures, threshold, cooldownMs, msLeft) {
+  return `[forge:dispatch-gate] Dispatch refused by the provider circuit breaker: provider "${provider}" is OPEN after ${failures} consecutive failed dispatch terminals (threshold ${threshold}). ` + `Recovery: the breaker half-opens when the ${cooldownMs}ms cooldown elapses (${msLeft}ms left) and admits one probe dispatch; its success closes the breaker, its failure re-opens it. ` + `This is the plugin's own throttle, not a provider error — it is never retried as one.`;
+}
+function breakerHalfOpenRefusal(provider) {
+  return `[forge:dispatch-gate] Dispatch refused by the provider circuit breaker: provider "${provider}" is HALF-OPEN and its one probe dispatch is already in flight. ` + `Recovery: the probe's terminal outcome closes the breaker (success) or re-opens it (failure). ` + `This is the plugin's own throttle, not a provider error — it is never retried as one.`;
+}
+function createDispatchGate(config2 = null, clock = { now: () => Date.now() }) {
+  let cfg = config2 ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: { consecutiveFailures: 0, cooldownMs: 0 } };
+  const liveProvider = new Map;
+  const liveModel = new Map;
+  const breakers = new Map;
+  const breakerFor = (provider) => {
+    let cell = breakers.get(provider);
+    if (!cell) {
+      cell = { state: "closed", failures: 0, openedAt: 0, probeInFlight: false };
+      breakers.set(provider, cell);
+    }
+    return cell;
+  };
+  const bump = (map2, key, delta) => {
+    const next = Math.max(0, (map2.get(key) ?? 0) + delta);
+    if (next === 0)
+      map2.delete(key);
+    else
+      map2.set(key, next);
+  };
+  return {
+    updateConfig(next) {
+      cfg = next ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: { consecutiveFailures: 0, cooldownMs: 0 } };
+    },
+    config() {
+      return cfg;
+    },
+    admit(identity) {
+      const cell = breakerFor(identity.provider);
+      if (cell.state === "open") {
+        const elapsed = clock.now() - cell.openedAt;
+        if (cfg.circuitBreaker.cooldownMs > 0 && cfg.circuitBreaker.consecutiveFailures > 0 && elapsed >= cfg.circuitBreaker.cooldownMs) {
+          cell.state = "half-open";
+          cell.probeInFlight = false;
+        } else {
+          const msLeft = Math.max(0, cfg.circuitBreaker.cooldownMs - elapsed);
+          return { ok: false, refusal: breakerRefusal(identity.provider, cell.failures, cfg.circuitBreaker.consecutiveFailures, cfg.circuitBreaker.cooldownMs, msLeft) };
+        }
+      }
+      if (cell.state === "half-open" && cell.probeInFlight) {
+        return { ok: false, refusal: breakerHalfOpenRefusal(identity.provider) };
+      }
+      const pLimit = cfg.providerConcurrency[identity.provider];
+      if (typeof pLimit === "number" && pLimit >= 1) {
+        const live = liveProvider.get(identity.provider) ?? 0;
+        if (live >= pLimit) {
+          return { ok: false, refusal: concurrencyRefusal("provider", identity.provider, live, pLimit) };
+        }
+      }
+      const mk = modelKey(identity);
+      const mLimit = cfg.modelConcurrency[mk];
+      if (typeof mLimit === "number" && mLimit >= 1) {
+        const live = liveModel.get(mk) ?? 0;
+        if (live >= mLimit) {
+          return { ok: false, refusal: concurrencyRefusal("provider/model", mk, live, mLimit) };
+        }
+      }
+      bump(liveProvider, identity.provider, 1);
+      bump(liveModel, mk, 1);
+      if (cell.state === "half-open")
+        cell.probeInFlight = true;
+      return { ok: true };
+    },
+    release(identity) {
+      bump(liveProvider, identity.provider, -1);
+      bump(liveModel, modelKey(identity), -1);
+    },
+    recordTerminal(identity, outcome) {
+      this.release(identity);
+      const cell = breakerFor(identity.provider);
+      if (cell.state === "half-open") {
+        cell.probeInFlight = false;
+        if (outcome === "completed") {
+          cell.state = "closed";
+          cell.failures = 0;
+        } else if (outcome === "failed") {
+          cell.failures++;
+          cell.state = "open";
+          cell.openedAt = clock.now();
+        }
+        return;
+      }
+      if (cell.state === "closed") {
+        if (outcome === "completed") {
+          cell.failures = 0;
+        } else if (outcome === "failed") {
+          cell.failures++;
+          const threshold = cfg.circuitBreaker.consecutiveFailures;
+          if (threshold > 0 && cell.failures >= threshold) {
+            cell.state = "open";
+            cell.openedAt = clock.now();
+          }
+        }
+      }
+    },
+    liveCounts() {
+      return { provider: Object.fromEntries(liveProvider), model: Object.fromEntries(liveModel) };
+    },
+    breakerState(provider) {
+      const cell = breakerFor(provider);
+      return { state: cell.state, failures: cell.failures };
+    }
+  };
 }
 
 // src/dispatch-journal.ts
@@ -18562,6 +18761,59 @@ ${p.newOutput || "(none in this window)"}`,
 });
 var knownHostAgents = new Set(["general", ...NATIVE_PARTITION_FALLBACKS]);
 var ASYNC_DISPATCH_CAP = 3;
+var sessionModels = new Map;
+var dispatchGate = null;
+var admittedGate = new Map;
+var gateProvidersSeen = new Set;
+var dispatchConfigLoaders = new Map;
+function dispatchConfigFor(anchor) {
+  const key = anchor || "-";
+  let l = dispatchConfigLoaders.get(key);
+  if (!l) {
+    l = createForgeConfigLoader({ projectDir: anchor, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
+    dispatchConfigLoaders.set(key, l);
+    while (dispatchConfigLoaders.size > 8) {
+      const oldest = dispatchConfigLoaders.keys().next().value;
+      if (oldest === undefined)
+        break;
+      dispatchConfigLoaders.delete(oldest);
+    }
+  }
+  return l.load().dispatch ?? null;
+}
+function gateFor(anchor) {
+  if (!dispatchGate)
+    dispatchGate = createDispatchGate();
+  const node = dispatchConfigFor(anchor);
+  dispatchGate.updateConfig(node ? {
+    providerConcurrency: node.providerConcurrency,
+    modelConcurrency: node.modelConcurrency,
+    circuitBreaker: { consecutiveFailures: node.circuitBreaker.consecutiveFailures ?? 0, cooldownMs: node.circuitBreaker.cooldownMs ?? 0 }
+  } : null);
+  return dispatchGate;
+}
+function dispatchModelIdentity(agentID, ownerSession, childSessionID) {
+  if (agentID.toLowerCase().startsWith("forge-")) {
+    const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def;
+    if (def?.model) {
+      const identity = parseIdentity(def.model);
+      if (identity)
+        return { provider: identity.provider, model: identity.model };
+    }
+  }
+  if (childSessionID && sessionModels.has(childSessionID))
+    return sessionModels.get(childSessionID) ?? null;
+  return sessionModels.get(ownerSession) ?? null;
+}
+function releaseGateAdmission(jobId) {
+  const identity = admittedGate.get(jobId);
+  if (!identity)
+    return;
+  admittedGate.delete(jobId);
+  try {
+    dispatchGate?.release(identity);
+  } catch {}
+}
 var dispatchTasks = new Map;
 function inFlightAsyncDispatches(sessionID) {
   const ids = [];
@@ -18647,6 +18899,17 @@ async function pumpDispatchQueue(client, sessionID) {
       failQueuedWishHonestly(wish, draftRefusal);
       continue;
     }
+    const gate2 = gateFor(wish.directory);
+    const wishIdentity = dispatchModelIdentity(wish.agentID, wish.ownerSession);
+    if (wishIdentity) {
+      const admission = gate2.admit(wishIdentity);
+      if (!admission.ok) {
+        failQueuedWishHonestly(wish, admission.refusal);
+        continue;
+      }
+      gateProvidersSeen.add(wishIdentity.provider);
+      admittedGate.set(wish.jobId, wishIdentity);
+    }
     const created = await createChildSession(client, {
       parentSessionID: wish.ownerSession,
       parentDirectory: wish.directory,
@@ -18655,6 +18918,7 @@ async function pumpDispatchQueue(client, sessionID) {
       questionDeny: wish.questionDeny
     });
     if (!created.ok) {
+      releaseGateAdmission(wish.jobId);
       failQueuedWishHonestly(wish, `child session creation failed: ${created.error}`);
       continue;
     }
@@ -18665,6 +18929,7 @@ async function pumpDispatchQueue(client, sessionID) {
       directory: wish.directory
     });
     if (!sent.ok) {
+      releaseGateAdmission(wish.jobId);
       failQueuedWishHonestly(wish, `prompt send to child session ${created.sessionID} failed: ${sent.error}`);
       continue;
     }
@@ -18734,6 +18999,13 @@ function journalTransition(worktree, record2) {
   } catch {}
 }
 function journalTerminalRecord(base, outcome, reason) {
+  const admitted = admittedGate.get(base.id);
+  if (admitted) {
+    admittedGate.delete(base.id);
+    try {
+      dispatchGate?.recordTerminal(admitted, outcome === "completed" ? "completed" : outcome === "error" || outcome === "stream-lost/unknown" ? "failed" : "neutral");
+    } catch {}
+  }
   journalTransition(base.workspace, { ...journalRecord(base, "terminal"), prompt: undefined, outcome, reason });
 }
 var recoveredDispatchWorkspaces = new Set;
@@ -18938,6 +19210,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
   let text = "";
   let exitCode = 0;
   let streamLost = false;
+  let activeOverride = false;
   const stability = { stableTicks: 0 };
   const stale = { lastActivity: null, staleNotified: false };
   const flushProgress = (notice) => {
@@ -18949,8 +19222,12 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
   for (;; ) {
     const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability });
     if (poll.status === "completed") {
+      activeOverride = poll.via === "active-textful";
       const fin = await fetchFinalMessage(client, childSessionID);
       text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`;
+      if (activeOverride)
+        text += `
+(${ACTIVE_TEXTFUL_OVERRIDE_NOTE})`;
       break;
     }
     if (poll.status === "error") {
@@ -19029,6 +19306,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           abortChild(client, childSessionID);
         };
         stability.stableTicks = 0;
+        stability.activeTextfulTicks = 0;
         stability.textlessIdleSince = undefined;
         startedAt = Date.now();
         lastNotifiedMultiple = 0;
@@ -19118,7 +19396,8 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
     workspace: retryCtx.directory,
     description: dispatch?.description ?? ""
   }, streamLost ? "stream-lost/unknown" : exitCode === 0 ? "completed" : "error", streamLost ? `${text.split(`
-`)[0].slice(0, 200)} — last observed activity ${new Date(stale.lastActivity ?? startedAt).toISOString()}` : text.split(`
+`)[0].slice(0, 200)} — last observed activity ${new Date(stale.lastActivity ?? startedAt).toISOString()}` : activeOverride ? `${text.split(`
+`)[0].slice(0, 200)} (${ACTIVE_TEXTFUL_OVERRIDE_NOTE})` : text.split(`
 `)[0].slice(0, 200));
   pumpDispatchQueue(client, job.ownerSession);
 }
@@ -19200,6 +19479,18 @@ var taskDispatchTool = tool({
     const anchorDir = anchorSeam && typeof anchorSeam.session?.get === "function" ? await resolveSessionAnchorForPools(anchorSeam, context.sessionID) || sessionAnchor(context) || context.worktree : sessionAnchor(context) || context.worktree;
     const state = ensureSession(context.sessionID, anchorDir);
     const description = typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60);
+    const gate2 = gateFor(state.worktree);
+    const gateIdentity = dispatchModelIdentity(target, context.sessionID);
+    if (gateIdentity) {
+      const admission = gate2.admit(gateIdentity);
+      if (!admission.ok)
+        throw new Error(admission.refusal);
+      gateProvidersSeen.add(gateIdentity.provider);
+      if (queueAfterCap)
+        dispatchGate?.release(gateIdentity);
+      else
+        admittedGate.set(dispatchId, gateIdentity);
+    }
     if (queueAfterCap) {
       const jobId2 = dispatchId;
       const queue = dispatchQueues.get(context.sessionID) ?? [];
@@ -19265,10 +19556,13 @@ var taskDispatchTool = tool({
       description,
       questionDeny: runInBackground
     });
-    if (!created.ok)
+    if (!created.ok) {
+      releaseGateAdmission(dispatchId);
       throw new Error(`[forge:dispatch] child session creation failed: ${created.error}`);
+    }
     const sent = await sendPrompt(client, { sessionID: created.sessionID, agentID: target, prompt, directory: state.worktree });
     if (!sent.ok) {
+      releaseGateAdmission(dispatchId);
       throw new Error(`[forge:dispatch] prompt send to child session ${created.sessionID} failed: ${sent.error} — the child exists and is natively abortable in the TUI.`);
     }
     const taskMetadata = {
@@ -19326,6 +19620,7 @@ var taskDispatchTool = tool({
       const waitStartedAt = Date.now();
       let syncCompleted = false;
       let syncStreamLost = false;
+      let syncOverride = false;
       let syncError = null;
       const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1";
       let syncSliceCount = 0;
@@ -19418,6 +19713,7 @@ var taskDispatchTool = tool({
               syncStale.lastActivity = null;
               syncStale.staleNotified = false;
               syncStability.stableTicks = 0;
+              syncStability.activeTextfulTicks = 0;
               syncStability.textlessIdleSince = undefined;
               continue syncWait;
             }
@@ -19499,6 +19795,7 @@ var taskDispatchTool = tool({
             break syncWait;
           }
           syncCompleted = true;
+          syncOverride = poll.via === "active-textful";
           break syncWait;
         }
       if (syncCompleted) {
@@ -19507,13 +19804,14 @@ var taskDispatchTool = tool({
           journalTerminalRecord(syncJournalBase, "error", fin.error);
           throw new Error(`[forge:dispatch] ${fin.error}`);
         }
-        journalTerminalRecord(syncJournalBase, "completed", `${target} finished (child session ${childSessionID})`);
+        journalTerminalRecord(syncJournalBase, "completed", `${target} finished (child session ${childSessionID})${syncOverride ? ` (${ACTIVE_TEXTFUL_OVERRIDE_NOTE})` : ""}`);
         context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } });
         const recoveredNote = attemptSync > 1 ? ` — recovered on attempt ${attemptSync}/${maxAttemptsSync} (previous child session(s) died with transient errors and were respawned; the [forge:dispatch-progress] notice lands in this transcript when the session idles)` : "";
+        const overrideNote = syncOverride ? ` — ${ACTIVE_TEXTFUL_OVERRIDE_NOTE}` : "";
         return {
           title: `${target}: dispatch complete`,
           metadata: { ...taskMetadata },
-          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID})${recoveredNote}.`, `Final report:
+          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID})${recoveredNote}${overrideNote}.`, `Final report:
 ${fin.text}`].join(`
 `)
         };
@@ -20419,6 +20717,7 @@ function harvestSessionEnd(sessionID) {
   sessionDepths.delete(sessionID);
   dispatchProgressQueue.delete(sessionID);
   sessionAgents.delete(sessionID);
+  sessionModels.delete(sessionID);
   sealFindings.delete(sessionID);
   sealUnknownNotes.delete(sessionID);
   poolGateUnknownNotes.delete(sessionID);
@@ -20768,6 +21067,13 @@ var server = async (input, options) => {
       const agentName = typeof raw.agent === "string" ? raw.agent : raw.agent?.name;
       if (typeof agentName === "string" && agentName)
         sessionAgents.set(sessionID, agentName);
+      {
+        const capObj = raw.model;
+        const capProvider = typeof raw.model?.providerID === "string" ? raw.model.providerID : "";
+        const capModel = typeof capObj?.modelID === "string" ? capObj.modelID : typeof capObj?.id === "string" ? capObj.id : "";
+        if (capProvider && capModel)
+          sessionModels.set(sessionID, { provider: capProvider, model: capModel });
+      }
       if (typeof agentName !== "string" || !agentName.startsWith("forge-"))
         return;
       const frozen = sessionDepths.get(sessionID);
@@ -20863,6 +21169,23 @@ var server = async (input, options) => {
         }
       },
       dispatchProgress: (sessionID) => [...dispatchProgressQueue.get(sessionID) ?? []],
+      dispatchGateState: () => {
+        if (!dispatchGate)
+          return null;
+        const live = dispatchGate.liveCounts();
+        const providers = new Set([...Object.keys(live.provider), ...gateProvidersSeen]);
+        const breakers = {};
+        for (const p of providers)
+          breakers[p] = dispatchGate.breakerState(p);
+        return { live, breakers };
+      },
+      resetDispatchGate: () => {
+        dispatchGate = null;
+        admittedGate.clear();
+        gateProvidersSeen.clear();
+        sessionModels.clear();
+        dispatchConfigLoaders.clear();
+      },
       jobLedger: () => jobManager.ledgerEntries(),
       gateSnapshot: () => Object.fromEntries(gatePermissionSnapshot),
       resetGateSnapshot: () => {
@@ -21315,6 +21638,13 @@ function v2ContextInjection(raw) {
   const agentName = v2AgentNameOf(o);
   if (agentName)
     sessionAgents.set(sessionID, agentName);
+  {
+    const capObj = o.model;
+    const capProvider = typeof capObj?.providerID === "string" ? capObj.providerID : "";
+    const capModel = typeof capObj?.modelID === "string" ? capObj.modelID : typeof capObj?.id === "string" ? capObj.id : "";
+    if (capProvider && capModel)
+      sessionModels.set(sessionID, { provider: capProvider, model: capModel });
+  }
   if (agentName && agentName.startsWith("forge-")) {
     const agentId = agentName.slice("forge-".length);
     const pinnedDef = resolvePools()?.agents[agentId]?.def;
