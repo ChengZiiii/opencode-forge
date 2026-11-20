@@ -76,6 +76,33 @@
   vision-agent knob investigation). Otherwise: no code, README keeps
   the `default_agent` recipe (this host already has it in config).
 
+## Probe verdicts (sandbox P1/P2/P3, 2.3.2, 2026-11-20 — reports/probe-v2-surface-report.md)
+
+- **P1 merge-after-transform: CONFIRMED.** At plugin transform time the
+  config-only agents did not exist in the draft (`get` → `exists:false`),
+  and their config values appear only in the final records. The plugin's
+  `draft.default("probe-forge")` returned ok with ZERO observable trace
+  — no record created, `/api/config` keeps the user's
+  `default_agent: "build"`. D5's ordering assumption holds: the
+  config→agent merge runs after plugin transforms, an explicit user
+  `default_agent` wins. Task 1.2 verdict: keep D5 — its effect is scoped
+  to prompt-time resolution when the user has NOT configured a default.
+- **P3 record-level deny: CONFIRMED.** The final p3 record carries the
+  shell deny verbatim (`{"action":"shell","resource":"*","effect":"deny"}`
+  inside the `permissions` array), ordered AFTER the global allow —
+  findLast semantics make the deny win. No per-agent tool-list HTTP
+  surface exists (`/api/tool`, `/api/agent/:id/tool` → 404); end-to-end
+  enforcement of the model-facing tool list remains the 4.1 E2E leg.
+- **P2 (informational for this change):** at execute time the agent
+  domain handle is alive (`get/list/transform/reload`, `exists:true`)
+  but records serialize to `{}` (class-instance shape) — recorded as a
+  host-shape fact; the dispatch/crew paths consume records through
+  other seams.
+- Operational findings for the E2E wave: plugin loading is LAZY on
+  2.3.2 (first API request triggers it; cold `/api/agent` returns `[]`
+  until first assembly), and one load fired the `ctx.tool.transform`
+  editor callback TWICE — neither blocks this change.
+
 ## Non-goals
 
 - No v1 changes: the v1 config hook already hides shell from the family

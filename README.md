@@ -145,6 +145,63 @@ session hooks, commands, goal/job engines), with two documented drifts:
   goal loop; the plan/goal briefs survive compaction via the compaction
   hook either way.
 
+#### v2 single-agent surface (hide natives, forge default, no builtin shell)
+
+On a v2 host the plugin additionally delivers the single-agent surface as
+**pure runtime agent-layer state**:
+
+- The native `build` and `plan` primaries are **hidden** (never removed —
+  sessions referencing them keep working; no other field is touched), so
+  the agent picker offers `forge` as the visible primary. `general`,
+  `explore`, and host-internal agents stay untouched.
+- New sessions **default to `forge`** where the host's agent draft editor
+  exposes a default setter (2.3.2 does). An explicit `default_agent` in
+  your opencode config still wins — the host merges user config agent
+  entries after plugin transforms.
+- Every forge-family record (the `forge` primary and each materialized
+  `forge-*` worker) carries a deny permission
+  (`{action:"shell", resource:"*", effect:"deny"}`), so the model-facing
+  tool surface never offers the builtin shell to the forge family. The
+  permission-belt refusals remain underneath as belt-in-depth.
+
+**Zero pollution:** none of this is written to your opencode config or any
+file outside the plugin's own domain — uninstall the plugin and the next
+agent-layer rebuild restores the native primaries and the default subject,
+byte-identical, with zero residue.
+
+Opt-out (keep the native `build`/`plan` primaries visible) — the plugin's
+own config file, the GLOBAL forge.json layer (`~/.config/opencode/forge.json`
+on POSIX, `%USERPROFILE%\.config\opencode\forge.json` on Windows):
+
+```jsonc
+{
+  "hideNativeAgents": false
+}
+```
+
+`agent.forge.disable = true` remains the whole-plugin off switch. A user's
+explicit `agent.build.hidden: false` in opencode config also wins on 2.3.2
+(config merge runs after plugin transforms).
+
+#### v1-host config recipe (hide the extra primaries manually)
+
+The v1 loader cannot touch native agent records (the config hook returns
+its own entries only). If you want the same single-agent picker on a v1
+host, hide the natives yourself — your config, your files:
+
+```jsonc
+{
+  "agent": {
+    "build": { "hidden": true },
+    "plan": { "hidden": true }
+  },
+  "default_agent": "forge"
+}
+```
+
+`hidden` is a first-class, hot-reloadable field on opencode 2.3.x — the
+picker updates without a restart. Remove the lines to restore the natives.
+
 ## Configuration
 
 Everything works with zero config. Optional knobs (your config, your files —
