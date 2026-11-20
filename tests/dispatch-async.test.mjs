@@ -9,6 +9,8 @@ import assert from "node:assert/strict"
 
 import {
   QUESTION_DENY_PERMISSION,
+  QUESTION_DENY_PERMISSIONS_V2,
+  TASK_DENY_PERMISSIONS_V2,
   TASK_CREATE_SEAM_ABSENT,
   childSessionTitle,
   createChildSession,
@@ -143,7 +145,55 @@ test("createChildSession: parentID + native title + parent directory; question-d
   })
   assert.equal(r2.ok, true)
   assert.deepEqual(calls2.create[0].body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "async create body carries the question-deny seal")
+  // harden-dispatch-resilience 4.1/5.3 (probe-1.1): the v2 array spelling
+  // rides the SAME create body — the legacy spelling alone is silently
+  // dropped on 2.3.2, so the effective seal is the `permissions` array.
+  assert.deepEqual(calls2.create[0].body.permissions, [{ action: "question", resource: "*", effect: "deny" }], "async create body carries the v2 permissions array spelling")
+  assert.deepEqual([...QUESTION_DENY_PERMISSIONS_V2], [{ action: "question", resource: "*", effect: "deny" }])
   assert.equal(QUESTION_DENY_PERMISSION.length, 1)
+})
+
+test("createChildSession taskDeny (harden-dispatch-resilience D2): the v2 task deny rides the permissions array; merged when the question seal is set; absent when unset", async () => {
+  // taskDeny alone (sync guard case): exactly the task entry, nothing else.
+  const { client: c1, calls: calls1 } = fakeClient()
+  const r1 = await createChildSession(c1, {
+    parentSessionID: "ses_parent",
+    parentDirectory: "C:/repo",
+    agentID: "general",
+    description: "guarded",
+    taskDeny: true,
+  })
+  assert.equal(r1.ok, true)
+  assert.deepEqual(calls1.create[0].body.permissions, [{ action: "task", resource: "*", effect: "deny" }], "taskDeny alone → exactly the v2 task entry")
+  assert.equal(calls1.create[0].body.permission, undefined, "no v1 seal rides the task-only case")
+
+  // Both seals (async guard case): ONE permissions key, question first then
+  // task (merge order is contract: the question seal precedes the guard).
+  const { client: c2, calls: calls2 } = fakeClient()
+  const r2 = await createChildSession(c2, {
+    parentSessionID: "ses_parent",
+    parentDirectory: "C:/repo",
+    agentID: "general",
+    description: "guarded async",
+    questionDeny: true,
+    taskDeny: true,
+  })
+  assert.equal(r2.ok, true)
+  assert.deepEqual(calls2.create[0].body.permissions, [{ action: "question", resource: "*", effect: "deny" }, { action: "task", resource: "*", effect: "deny" }], "both seals merge into one permissions array")
+  assert.deepEqual(calls2.create[0].body.permission, [{ permission: "question", action: "deny", pattern: "*" }], "the v1 question spelling still rides")
+
+  // Neither seal: the create body carries no permission keys at all.
+  const { client: c3, calls: calls3 } = fakeClient()
+  const r3 = await createChildSession(c3, {
+    parentSessionID: "ses_parent",
+    parentDirectory: "C:/repo",
+    agentID: "general",
+    description: "unsealed",
+  })
+  assert.equal(r3.ok, true)
+  assert.equal(calls3.create[0].body.permissions, undefined, "no permissions key without seals")
+  assert.equal(calls3.create[0].body.permission, undefined, "no permission key without seals")
+  assert.deepEqual([...TASK_DENY_PERMISSIONS_V2], [{ action: "task", resource: "*", effect: "deny" }])
 })
 
 test("childSessionTitle matches host-native child title format", () => {
