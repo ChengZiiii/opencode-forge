@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-21
+goal: dispatch path survives stuck status views, nested anthropic 400s, and
+  provider-dimension storms
