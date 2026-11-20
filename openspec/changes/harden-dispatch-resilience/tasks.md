@@ -2,11 +2,12 @@
 
 ## 1. Probes
 
-- [ ] 1.1 Create-body task-deny effectiveness probe (independent of the
-  crew change): sandbox serve + directory-discovery probe plugin, create a
-  child with the task-tool deny riding the create body, observe the
-  child's tool surface (message-parts tool listing or probe echo) —
-  evidence archived into this change's dir (feeds D2).
+- [x] 1.1 Create-body task-deny effectiveness probe — DONE
+  (probe-1.1-evidence.md + attachments, commit da1375b): v2 array
+  spelling lands verbatim in the child record on both HTTP and
+  `ctx.session.create` paths; legacy `permission:[{permission,action,
+  pattern}]` silently dropped (QUESTION_DENY no-op bug found → block B
+  task 4.1).
 
 ## 2. Block A — active-textful completion override
 

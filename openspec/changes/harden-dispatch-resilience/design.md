@@ -30,6 +30,11 @@
   the message stream while the status view lagged). No new timers, no
   config; the branch sits next to the existing stability window so sync
   and async inherit. Revert = delete the branch.
+  **Implementation refinement (apply phase, review-synced):** only a
+  READABLE active status map advances the counter — an UNREADABLE status
+  view (poll failure) never advances it (a status-failure streak must not
+  fabricate completion through this branch; the existing
+  status-failure-resilience tests govern that case).
 - **D2 — Nested-dispatch guard (block B):** `createChildSession(...,
   opts.taskDeny?)` — when true, the create body carries the task-tool deny
   permission. Caller-side rule: target is non-forge AND
@@ -65,10 +70,19 @@
   dimension, and the recovery condition (cooldown elapse for the breaker;
   a slot freeing for the concurrency gate); breaker refusals are NOT
   retry-classified as provider errors (they are our own throttle).
-- **D4 — Not doing:** `maxLiveDescendantsPerRoot` — the forge family's
-  depth is structurally capped at ≤1 by `task: deny`; per-session cap
-  already approximates per-root under that invariant. Revisit only if
-  crew's native-fallback grows deep trees.
+## Not doing / known leftovers
+
+- `maxLiveDescendantsPerRoot` — the forge family's depth is structurally
+  capped at ≤1 by `task: deny`; per-session cap already approximates
+  per-root under that invariant. Revisit only if crew's native-fallback
+  grows deep trees.
+- Review observations (not blocking, recorded for follow-up):
+  `dispatchModelIdentity`'s `childSessionID` parameter currently has no
+  caller (dead parameter — candidate for the block-B commit to consume
+  or drop); the host-singleton gate's open-breaker display can show
+  "0ms left" while still refusing under multi-anchor/hot-removal edges
+  (`dispatch-gate.ts:143` condition never true) — cosmetic-honesty
+  candidate, tracked here.
 
 ## Non-goals
 
