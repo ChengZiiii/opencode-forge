@@ -379,7 +379,7 @@ export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAg
       if (entry.shape === "readonly" || entry.shape === "write") {
         def.shape = entry.shape
       } else {
-        findings.push({ level: "warn", code: "shape-invalid", message: `${label}.shape must be "readonly" or "write" — defaulting to readonly` })
+        findings.push({ level: "warn", code: "shape-invalid", message: `${label}.shape must be "readonly" or "write" — defaulting to write (absent shape is write)` })
       }
     }
     if (entry.permission !== undefined) {
