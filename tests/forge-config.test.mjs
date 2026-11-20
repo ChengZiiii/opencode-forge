@@ -9,7 +9,7 @@ import { join } from "node:path"
 // field-level fail-soft degradations, cascade with a single winner, hot-apply
 // cache, NO seed, NO recipe, inert unconfigured state.
 
-import { createForgeConfigLoader, parseForgeJsonc, validateAgentSet, forgeConfigPaths } from "../src/forge-config.ts"
+import { createForgeConfigLoader, parseForgeJsonc, validateAgentSet, forgeConfigPaths, validateDispatchNode, mergeDispatchNodes } from "../src/forge-config.ts"
 
 function loaderWith(files, opts = {}) {
   return createForgeConfigLoader({
@@ -263,4 +263,84 @@ test("loader against a real temp dir end to end", () => {
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+// ---------------------------------------------------------------------------
+// dispatch node (harden-dispatch-resilience D3): field-level fail-soft
+// parsing + cascade merge. Absent node = no limits (today's behavior); a
+// bad value drops with a warn finding and never throws.
+// ---------------------------------------------------------------------------
+
+test("dispatch node: absent/undefined means null (no limits), zero findings", () => {
+  for (const raw of [undefined, null]) {
+    const r = validateDispatchNode(raw, "f: dispatch")
+    assert.equal(r.config, null)
+    assert.deepEqual(r.findings, [])
+  }
+})
+
+test("dispatch node: a non-object node drops wholly with one warn finding (never a throw)", () => {
+  const r = validateDispatchNode("nope", "f: dispatch")
+  assert.equal(r.config, null)
+  assert.equal(r.findings.length, 1)
+  assert.equal(r.findings[0].level, "warn")
+  assert.equal(r.findings[0].code, "dispatch-node-invalid")
+})
+
+test("dispatch node: valid maps and breaker fields parse through", () => {
+  const r = validateDispatchNode(
+    { providerConcurrency: { zai: 2, anthropic: 5 }, modelConcurrency: { "zai/glm": 1 }, circuitBreaker: { consecutiveFailures: 3, cooldownMs: 60000 } },
+    "f: dispatch",
+  )
+  assert.equal(r.findings.length, 0)
+  assert.deepEqual(r.config.providerConcurrency, { zai: 2, anthropic: 5 })
+  assert.deepEqual(r.config.modelConcurrency, { "zai/glm": 1 })
+  assert.deepEqual(r.config.circuitBreaker, { consecutiveFailures: 3, cooldownMs: 60000 })
+})
+
+test("dispatch node: bad map values drop per entry with a warn finding; siblings survive", () => {
+  const r = validateDispatchNode({ providerConcurrency: { zai: "oops", anthropic: 0, openai: 1.5, ok: 2 } }, "f: dispatch")
+  assert.deepEqual(r.config.providerConcurrency, { ok: 2 })
+  const codes = r.findings.map((f) => f.code)
+  assert.deepEqual(codes, ["dispatch-map-value-invalid", "dispatch-map-value-invalid", "dispatch-map-value-invalid"])
+  for (const f of r.findings) assert.equal(f.level, "warn")
+})
+
+test("dispatch node: a non-object map drops wholly with a warn; breaker bad fields drop per field", () => {
+  const r = validateDispatchNode(
+    { providerConcurrency: [1, 2], circuitBreaker: { consecutiveFailures: "x", cooldownMs: -5, extra: true } },
+    "f: dispatch",
+  )
+  assert.deepEqual(r.config.providerConcurrency, {})
+  assert.deepEqual(r.config.circuitBreaker, {})
+  const codes = r.findings.map((f) => f.code).sort()
+  assert.deepEqual(codes, ["dispatch-breaker-cooldown-invalid", "dispatch-breaker-failures-invalid", "dispatch-map-invalid"])
+})
+
+test("dispatch node: mergeDispatchNodes cascades per map key and per breaker field; null+null = null", () => {
+  assert.equal(mergeDispatchNodes(null, null), null)
+  const merged = mergeDispatchNodes(
+    { providerConcurrency: { zai: 1, anthropic: 2 }, modelConcurrency: { "zai/glm": 1 }, circuitBreaker: { consecutiveFailures: 3, cooldownMs: 60000 } },
+    { providerConcurrency: { zai: 4 }, modelConcurrency: {}, circuitBreaker: { cooldownMs: 1000 } },
+  )
+  assert.deepEqual(merged.providerConcurrency, { zai: 4, anthropic: 2 })
+  assert.deepEqual(merged.modelConcurrency, { "zai/glm": 1 })
+  assert.deepEqual(merged.circuitBreaker, { consecutiveFailures: 3, cooldownMs: 1000 })
+})
+
+test("dispatch node: the loader cascade-merges global base + project override", () => {
+  const files = {
+    "C:/proj/.opencode/forge.json": JSON.stringify({ dispatch: { providerConcurrency: { zai: 4 }, circuitBreaker: { cooldownMs: 1000 } } }),
+    "C:/home/.config/opencode/forge.json": JSON.stringify({ dispatch: { providerConcurrency: { zai: 1, anthropic: 2 }, circuitBreaker: { consecutiveFailures: 3, cooldownMs: 60000 } } }),
+  }
+  const r = loaderWith(files).load()
+  assert.deepEqual(r.dispatch.providerConcurrency, { zai: 4, anthropic: 2 })
+  assert.deepEqual(r.dispatch.circuitBreaker, { consecutiveFailures: 3, cooldownMs: 1000 })
+})
+
+test("dispatch node: fail-soft in the loader — malformed values warn and limit nothing", () => {
+  const files = { "C:/proj/.opencode/forge.json": JSON.stringify({ dispatch: { providerConcurrency: { zai: "boom" } } }) }
+  const r = loaderWith(files).load()
+  assert.deepEqual(r.dispatch.providerConcurrency, {})
+  assert.ok(r.findings.some((f) => f.code === "dispatch-map-value-invalid" && f.level === "warn"))
 })

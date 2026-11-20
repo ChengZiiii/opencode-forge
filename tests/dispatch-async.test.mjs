@@ -917,3 +917,82 @@ test("stream-lost: the streak SURVIVES slice boundaries via the shared stability
   const slice2 = await pollChild(client, { sessionID: "ses_vl5", intervalMs: 1, timeoutMs: 60_000, viewLossTicks: 9, stability }, seams)
   assert.equal(slice2.status, "stream-lost", "slice 2 crosses the (raised) threshold by continuing the streak")
 })
+
+// ---------------------------------------------------------------------------
+// Active-textful completion override (harden-dispatch-resilience D1): a
+// status view stuck on active while the final assistant text is already out
+// completes from the message stream alone, at the SAME 3-tick stability
+// window, with via="active-textful". NO text ⇒ the override never fires
+// (stuck-active stays honest — textless-idle/stale handling governs).
+// ---------------------------------------------------------------------------
+
+test("active-textful override: status stuck busy + finished textful message → COMPLETE at the same 3-tick window, via=active-textful", async () => {
+  const { client } = fakeClient({
+    status: () => ({ data: { s: { type: "busy" } } }),
+    messages: () => [assistantMsg()],
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 1000 }, fakeTime().seams)
+  assert.equal(poll.status, "completed", "the message stream alone establishes completion")
+  assert.equal(poll.via, "active-textful", "the override path is disclosed on the result")
+  assert.equal(poll.polls, TERMINAL_STABILITY_TICKS, "the SAME 3-tick stability window — no fast path")
+})
+
+test("active-textful override: a flapped run resets — busy-with-text then busy-without-text never completes", async () => {
+  let tick = 0
+  const { client } = fakeClient({
+    status: () => ({ data: { s: { type: "busy" } } }),
+    messages: () => (tick++ < 2 ? [assistantMsg()] : []),
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
+  assert.equal(poll.status, "timeout", "two override ticks then a textless observation reset the run — no completion invented")
+})
+
+test("active-textful override: stuck-active with NO text stays honest (existing timeout semantics govern)", async () => {
+  const { client } = fakeClient({
+    status: () => ({ data: { s: { type: "busy" } } }),
+    messages: () => [],
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
+  assert.equal(poll.status, "timeout", "no text ⇒ never a fabricated completion")
+  assert.equal(poll.via, undefined)
+})
+
+test("active-textful override: the healthy not-active path is UNCHANGED (no via flag)", async () => {
+  const { client } = fakeClient({
+    status: () => ({ data: { s: { type: "idle" } } }),
+    messages: () => [assistantMsg()],
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 1000 }, fakeTime().seams)
+  assert.equal(poll.status, "completed")
+  assert.equal(poll.via, undefined, "an ordinary completion never claims the override")
+  assert.equal(poll.polls, TERMINAL_STABILITY_TICKS)
+})
+
+test("active-textful override: an UNREADABLE status map never advances the run (soundness posture intact)", async () => {
+  const { client } = fakeClient({
+    status: () => {
+      throw new Error("view down")
+    },
+    messages: () => [assistantMsg()],
+  })
+  const poll = await pollChild(client, { sessionID: "s", intervalMs: 5, timeoutMs: 30 }, fakeTime().seams)
+  assert.equal(poll.status, "timeout", "a status we cannot read is never a completion signal — override or not")
+})
+
+test("active-textful override: the streak survives poll-slice boundaries via the shared stability state", async () => {
+  // Slice 1 banks two active-textful ticks; slice 2 (fresh pollChild call,
+  // SAME stability object — the async wiring's seam) supplies the third.
+  const stability = { stableTicks: 0 }
+  const mk = () =>
+    fakeClient({
+      status: () => ({ data: { s: { type: "busy" } } }),
+      messages: () => [assistantMsg()],
+    })
+  const { seams } = fakeTime()
+  const p1 = await pollChild(mk().client, { sessionID: "s", intervalMs: 1, timeoutMs: 1, stability }, seams)
+  assert.equal(p1.status, "timeout", "slice 1 ends at its slice deadline")
+  assert.equal(stability.activeTextfulTicks, 1)
+  const p2 = await pollChild(mk().client, { sessionID: "s", intervalMs: 1, timeoutMs: 1000, stability }, seams)
+  assert.equal(p2.status, "completed")
+  assert.equal(p2.via, "active-textful", "the override run survived the slice boundary")
+})
