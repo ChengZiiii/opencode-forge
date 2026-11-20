@@ -71,7 +71,14 @@ test("v2 pools: workspace pool materializes NAMESPACED with provenance, task den
   // NOT written on the v2 draft (documented drift; the depth pin still
   // rides the runtime chat.params pool lookup by agent id).
   assert.equal("model" in r, false, "no model key on the v2 draft (pin would 500 the agent encoder)")
-  assert.equal(r.permission.task, "deny", "recursion ban always forced")
+  // v2-single-agent-surface field-name fix: v2 records carry `permissions`
+  // as an ARRAY of {action, resource, effect} — the singular record spelling
+  // never reached the host. Task deny and the shell-deny front door both
+  // ride the array now.
+  assert.ok(Array.isArray(r.permissions), "worker permissions are the v2 array form")
+  assert.ok(r.permissions.some((p) => p.action === "task" && p.resource === "*" && p.effect === "deny"), "recursion ban always forced")
+  assert.ok(r.permissions.some((p) => p.action === "shell" && p.resource === "*" && p.effect === "deny"), "shell-deny front door rides the array")
+  assert.equal("permission" in r, false, "the singular permission key is gone")
   assert.match(r.description, /Pool 'alpha' — origin/)
   assert.ok(r.description.includes("C:/WsA/.opencode/forge.json"), "origin path rides the description")
   assert.match(r.description, /dispatchable only from sessions whose workspace pool is this file/)
@@ -89,11 +96,12 @@ test("v2 pools: readonly shape denies the mutating family; absent shape defaults
     json({ pool: "beta", agents: { reviewer: { shape: "readonly" }, coder: {} } }),
   )
   const state = await hostInit(fs, ["C:/WsB"], "C:/v2home-none")
-  const ro = state.agents.get("forge-beta-reviewer").permission
-  const wr = state.agents.get("forge-beta-coder").permission
-  for (const t of MUTATING) assert.equal(ro[t], "deny", `readonly denies ${t}`)
-  for (const t of MUTATING) assert.equal(wr[t], undefined, `write default leaves ${t} alone`)
-  assert.equal(wr.task, "deny", "task deny is forced on every shape")
+  const ro = state.agents.get("forge-beta-reviewer").permissions
+  const wr = state.agents.get("forge-beta-coder").permissions
+  for (const t of MUTATING) assert.ok(ro.some((p) => p.action === t && p.effect === "deny"), `readonly denies ${t}`)
+  for (const t of MUTATING) assert.equal(wr.some((p) => p.action === t), false, `write default leaves ${t} alone`)
+  assert.ok(wr.some((p) => p.action === "task" && p.effect === "deny"), "task deny is forced on every shape")
+  assert.ok(wr.some((p) => p.action === "shell" && p.effect === "deny"), "every worker carries the shell-deny front door")
 })
 
 // 3. Global fallback when the workspace has no pool
@@ -107,7 +115,7 @@ test("v2 pools: pool-less workspace falls back to the GLOBAL layer (forge-global
   assert.ok(state.agents.has("forge-global-research"), "global fallback materializes under the FIXED global namespace")
   const g = state.agents.get("forge-global-research")
   assert.match(g.description, /Pool 'global' — origin: the global fallback layer\./)
-  assert.equal(g.permission.task, "deny")
+  assert.ok(Array.isArray(g.permissions) && g.permissions.some((p) => p.action === "task" && p.effect === "deny"), "task deny rides the v2 permissions array")
 })
 
 // 4. Global fallback NON-MERGE ported analog: workspace pool + global layer

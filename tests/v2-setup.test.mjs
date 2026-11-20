@@ -24,23 +24,31 @@ test("worktree resolution: global-project root falls back to the launch director
   assert.equal(effectiveWorktree(undefined, undefined), "")
 })
 
-function makeCtx() {
+function makeCtx(opts = {}) {
   const agents = new Map()
+  const calls = { update: [], default: [] }
+  const draft = {
+    list: () => [...agents.keys()].map((id) => ({ id })),
+    get: (id) => agents.get(id),
+    update: (id, fn) => {
+      calls.update.push(id)
+      const a = agents.get(id) ?? {}
+      fn(a)
+      agents.set(id, a)
+    },
+    remove: (id) => agents.delete(id),
+  }
+  if (!opts.noDefault) draft.default = (id) => {
+    if (opts.throwDefault) throw new Error("default boom")
+    calls.default.push(id)
+  }
   return {
     agents,
+    calls,
     ctx: {
       agent: {
         transform: async (cb) => {
-          await cb({
-            list: () => [...agents.keys()].map((id) => ({ id })),
-            get: (id) => agents.get(id),
-            update: (id, fn) => {
-              const a = agents.get(id) ?? {}
-              fn(a)
-              agents.set(id, a)
-            },
-            remove: (id) => agents.delete(id),
-          })
+          await cb(draft)
         },
       },
     },
@@ -53,7 +61,6 @@ test("v2 setup: registers the forge agent", async () => {
   assert.ok(agents.has("forge"))
   assert.equal(agents.get("forge").mode, "primary")
 })
-
 test("v2 setup: does not clobber an existing forge entry (create-only)", async () => {
   const { ctx, agents } = makeCtx()
   // simulate a pre-existing user-owned entry
@@ -103,16 +110,22 @@ test("v2 setup: registers forge subagents from the cwd forge.json (create-only, 
     // W6 field reality (live bisect): the model pin is NOT written on the
     // v2 draft — any spelling breaks the host's agent encoder (drift).
     assert.equal("model" in sub, false)
-    assert.equal(sub.permission.task, "deny")
+    // v2 field reality (v2-single-agent-surface): `permissions` is an ARRAY
+    // of {action, resource, effect} entries — the shape map (task:deny) and
+    // the shell-deny front door both land there; the singular `permission`
+    // spelling no longer exists on this path.
+    assert.ok(Array.isArray(sub.permissions), "worker permissions are the v2 array form")
+    assert.ok(sub.permissions.some((p) => p.action === "task" && p.resource === "*" && p.effect === "deny"), "task:deny recursion ban rides the array")
+    assert.ok("permission" in sub === false, "the old singular permission key is not written")
     // Provenance (pool-namespace-contract D3/D5): the description names the
     // family namespace, the origin forge.json path, and the dispatchability
     // restriction.
     assert.match(sub.description, /Pool 'v2pool' — origin/)
     assert.ok(sub.description.includes(join(dir, ".opencode", "forge.json")), "the origin path rides the description")
     assert.match(sub.description, /dispatchable only from sessions whose workspace pool is this file/)
-    // Partition boundary (task 3.2): v2 has no tool domain — the materialized
-    // subagent carries NO tools injection on this path.
-    assert.equal(sub.tools, undefined, "v2 performs no partition injection")
+    // Partition boundary: v2 has no tool domain — the partition is delivered
+    // permission-shaped (the shell deny above), never as a tools injection.
+    assert.equal(sub.tools, undefined, "v2 performs no tools-map injection")
   } finally {
     process.chdir(prevCwd)
     rmSync(dir, { recursive: true, force: true })
@@ -178,3 +191,156 @@ test("v2 setup: unreadable config degrades to forge-only registration, never thr
     rmSync(dir, { recursive: true, force: true })
   }
 })
+
+// ---- v2-single-agent-surface (tasks 2.1/2.2/2.3 + spec matrix 3.1) ----
+
+// Isolated home so the REAL user's global forge.json cannot flip the
+// hideNativeAgents knob under a test's feet.
+function withIsolatedHome(fn) {
+  return async () => {
+    const dir = mkdtempSync(join(tmpdir(), "forge-v2-sas-"))
+    const prevCwd = process.cwd()
+    const prevHome = process.env.FORGE_TEST_FORGE_HOME
+    try {
+      process.chdir(dir)
+      process.env.FORGE_TEST_FORGE_HOME = join(dir, "home")
+      await fn(dir)
+    } finally {
+      if (prevHome === undefined) delete process.env.FORGE_TEST_FORGE_HOME
+      else process.env.FORGE_TEST_FORGE_HOME = prevHome
+      process.chdir(prevCwd)
+      rmSync(dir, { recursive: true, force: true })
+    }
+  }
+}
+
+function shellDenyOf(rec) {
+  return (rec.permissions ?? []).find((p) => p.action === "shell")
+}
+
+test("v2 setup: hides native build/plan primaries (hide-only, other fields and non-natives untouched)", withIsolatedHome(async () => {
+  const { ctx, agents } = makeCtx()
+  agents.set("build", { id: "build", mode: "primary", system: "NATIVE", hidden: false })
+  agents.set("plan", { id: "plan", mode: "primary", system: "NATIVE", hidden: false })
+  agents.set("general", { id: "general", mode: "primary", hidden: false })
+  agents.set("explore", { id: "explore", mode: "subagent", hidden: false })
+  await v2Setup(ctx)
+  assert.equal(agents.get("build").hidden, true)
+  assert.equal(agents.get("plan").hidden, true)
+  assert.equal(agents.get("build").system, "NATIVE", "no other field is touched")
+  assert.equal(agents.get("build").mode, "primary", "hide-only — never a demote")
+  assert.equal(agents.get("general").hidden, false, "general stays visible")
+  assert.equal(agents.get("explore").hidden, false, "explore stays visible")
+}))
+
+test("v2 setup: absent native records are skipped, never created", withIsolatedHome(async () => {
+  const { ctx, agents, calls } = makeCtx()
+  await v2Setup(ctx)
+  assert.equal(agents.has("build"), false)
+  assert.equal(agents.has("plan"), false)
+  assert.equal(calls.update.includes("build"), false)
+  assert.equal(calls.update.includes("plan"), false)
+}))
+
+test("v2 setup: an already-hidden native record is left untouched", withIsolatedHome(async () => {
+  const { ctx, agents, calls } = makeCtx()
+  agents.set("build", { id: "build", hidden: true, system: "ALREADY" })
+  agents.set("plan", { id: "plan", hidden: false })
+  await v2Setup(ctx)
+  assert.equal(calls.update.includes("build"), false, "no update call for the already-hidden record")
+  assert.equal(agents.get("build").system, "ALREADY")
+  assert.equal(agents.get("plan").hidden, true, "the sibling still hides")
+}))
+
+test("v2 setup: one native record throwing never blocks the other (per-record fail-soft)", withIsolatedHome(async () => {
+  const { ctx, agents } = makeCtx()
+  agents.set("build", { id: "build", hidden: false })
+  agents.set("plan", { id: "plan", hidden: false })
+  const orig = ctx.agent.transform.bind(ctx.agent)
+  ctx.agent.transform = async (cb) =>
+    orig((draft) => {
+      const upd = draft.update.bind(draft)
+      draft.update = (id, fn) => {
+        if (id === "build") throw new Error("update boom")
+        return upd(id, fn)
+      }
+      return cb(draft)
+    })
+  await assert.doesNotReject(v2Setup(ctx))
+  assert.equal(agents.get("build").hidden, false, "the throwing record is skipped")
+  assert.equal(agents.get("plan").hidden, true, "the sibling still applies")
+}))
+
+test("v2 setup: hideNativeAgents:false in the GLOBAL forge.json leaves natives untouched", withIsolatedHome(async (dir) => {
+  mkdirSync(join(dir, "home", ".config", "opencode"), { recursive: true })
+  writeFileSync(join(dir, "home", ".config", "opencode", "forge.json"), JSON.stringify({ hideNativeAgents: false }))
+  const { ctx, agents } = makeCtx()
+  agents.set("build", { id: "build", hidden: false })
+  agents.set("plan", { id: "plan", hidden: false })
+  await v2Setup(ctx)
+  assert.equal(agents.get("build").hidden, false)
+  assert.equal(agents.get("plan").hidden, false)
+  assert.ok(agents.has("forge"), "the forge primary still registers with the knob off")
+}))
+
+test("v2 setup: an unreadable global layer keeps the default (hide on)", withIsolatedHome(async (dir) => {
+  mkdirSync(join(dir, "home", ".config", "opencode"), { recursive: true })
+  writeFileSync(join(dir, "home", ".config", "opencode", "forge.json"), "{ broken jsonc !!!")
+  const { ctx, agents } = makeCtx()
+  agents.set("build", { id: "build", hidden: false })
+  await v2Setup(ctx)
+  assert.equal(agents.get("build").hidden, true)
+}))
+
+test("v2 setup: primary + worker records carry the shell-deny front door (never execute)", withIsolatedHome(async (dir) => {
+  mkdirSync(join(dir, ".opencode"), { recursive: true })
+  writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "sas", agents: { research: { model: "zai/glm", thoughtLevel: "low" }, scout: { shape: "readonly" } } }))
+  const { ctx, agents } = makeCtx()
+  await v2Setup(ctx)
+  const primary = shellDenyOf(agents.get("forge"))
+  assert.ok(primary && primary.resource === "*" && primary.effect === "deny", "the primary record carries {action:shell,resource:*,effect:deny}")
+  for (const id of ["forge-sas-research", "forge-sas-scout"]) {
+    const rec = agents.get(id)
+    assert.ok(rec, `${id} materializes`)
+    const deny = shellDenyOf(rec)
+    assert.ok(deny && deny.resource === "*" && deny.effect === "deny", `${id} carries the shell deny`)
+    assert.equal((rec.permissions ?? []).some((p) => p.action === "execute"), false, `${id} never denies action "execute"`)
+  }
+  // the readonly seal rides the same array (field-name fix)
+  const scout = agents.get("forge-sas-scout")
+  for (const tool of ["write", "edit", "bash", "patch"]) {
+    assert.ok(scout.permissions.some((p) => p.action === tool && p.effect === "deny"), `scout seals ${tool}`)
+  }
+  assert.ok(agents.get("forge-sas-research").permissions.some((p) => p.action === "task" && p.effect === "deny"), "write-shape worker keeps task:deny")
+}))
+
+test("v2 setup: a user-defined forge entry keeps its fields but gains the shell deny", withIsolatedHome(async () => {
+  const { ctx, agents } = makeCtx()
+  await ctx.agent.transform(async (draft) => {
+    draft.update("forge", (a) => {
+      a.system = "USER OWNED"
+      a.mode = "subagent"
+    })
+  })
+  await v2Setup(ctx)
+  const rec = agents.get("forge")
+  assert.equal(rec.system, "USER OWNED")
+  assert.equal(rec.mode, "subagent")
+  assert.ok(shellDenyOf(rec), "the deny lands on the user-owned entry too (tools-merge semantics)")
+}))
+
+test("v2 setup: default setter called with forge under the typeof guard", withIsolatedHome(async () => {
+  const { ctx, calls } = makeCtx()
+  await v2Setup(ctx)
+  assert.deepEqual(calls.default, ["forge"])
+}))
+
+test("v2 setup: no default setter on the draft → silently skipped", withIsolatedHome(async () => {
+  const { ctx } = makeCtx({ noDefault: true })
+  await assert.doesNotReject(v2Setup(ctx))
+}))
+
+test("v2 setup: a throwing default setter never escapes", withIsolatedHome(async () => {
+  const { ctx } = makeCtx({ throwDefault: true })
+  await assert.doesNotReject(v2Setup(ctx))
+}))
