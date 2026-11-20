@@ -77,7 +77,7 @@ import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type Dept
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
+import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
 import { buildRetryPrompt, classifyDispatchError, resolveMaxAttempts, resolveRetryBackoffMs } from "./src/dispatch-retry.ts"
 import { withReportDelivery } from "./src/dispatch-prompt.ts"
 import {
@@ -762,6 +762,21 @@ type JobClient = {
   }
 }
 let jobClient: JobClient | null = null
+
+// fix-v2-crew-surface-drift task 1.1 (design D1): the authoritative
+// anchor-client seam, hoisted into SHARED module state so the dispatch
+// belts AND the crew tools consume ONE client. Seeded at exactly the
+// moments the belts get it today — v1 server() initialization
+// (input.client) and v2 setup (v2AnchorClient(ctx), the session.get
+// translation of the promise-layer session domain). Consumers read it via
+// sharedAnchorClient() with the same `?.`/typeof guards the belts use;
+// with no client available, anchor resolution is EXACTLY today's
+// tool-context behavior (a pure strict improvement, no new failure mode).
+type AnchorClient = { session?: { get?: (opts: unknown) => Promise<unknown> } }
+let anchorClientShared: AnchorClient | null = null
+function sharedAnchorClient(): AnchorClient | null {
+  return anchorClientShared
+}
 
 // Sessions believed idle (job-read-consumption D6): chat.message marks a
 // turn in flight (busy), session.idle marks it over. Unknown sessions are
@@ -2945,6 +2960,13 @@ async function runAsyncDispatchPoller(
   void pumpDispatchQueue(client, job.ownerSession)
 }
 
+// fix-v2-crew-surface-drift task 2.2 (design D2): the honest-degradation
+// CONTRACT STRING for a host client with no child-session creation seam —
+// names the native task tool as the dispatch surface. Contract-tested
+// verbatim (tests assert this exact string); never a raw TypeError.
+export const TASK_SEAM_DEGRADED_ERROR =
+  "[forge:dispatch] child-session creation is unavailable on this host (the client exposes no session.create seam) — use the NATIVE task tool as the dispatch surface for subagent dispatches."
+
 const TASK_DESCRIPTION = [
   "Dispatch a subagent as a REAL child session on this host (SDK session.create with parentID): the call renders in the host session tree with native subagent affordances — the live task panel, progress, expandable transcript, user abort — and runs the target agent with its own permission map. This is the single dispatch surface: ANY materialized target dispatches through here — configured `forge-*` subagents AND every other host agent.",
   'run_in_background is YOUR dispatch-time decision: omit it (sync) when your very next step depends on the result — the call blocks until the child finishes and returns its final report (native parity: the child MAY ask the user questions; the user is present at the panel). Set run_in_background: true (async) when the result does NOT block your next steps — the call returns a task handle immediately and the child is created with the question tool denied session-wide (unattended: it never blocks on human input; an unanswered permission ask degrades to the honest poll-timeout finding naming the child session id, which stays inspectable and natively abortable in the TUI).',
@@ -3042,7 +3064,23 @@ const taskDispatchTool = tool({
     }
     const client = dispatchClient()
     if (!client) throw new Error("[forge:dispatch] no host client available — dispatch cannot create a child session.")
-    const state = ensureSession(context.sessionID, worktreeFor(context))
+    // fix-v2-crew-surface-drift task 2.2 (design D2): guarded shape probe on
+    // the child-session creation seam. When the host client resolves NO
+    // create seam, the tool degrades with the honest contract string naming
+    // the native task tool as the dispatch surface — never a raw TypeError
+    // (the 2.3.2 live failure: "client.session.create is not a function").
+    if (typeof client.session?.create !== "function") throw new Error(TASK_SEAM_DEGRADED_ERROR)
+    // fix-v2-crew-surface-drift task 2.3 (design D2): the child's parent
+    // directory resolves from the AUTHORITATIVE anchor (the same
+    // authoritative-first chain as the belts) — a re-anchored parent
+    // produces a correctly-anchored child. Without an anchor client the
+    // resolution is exactly today's (tool-context anchor).
+    const anchorSeam = sharedAnchorClient()
+    const anchorDir =
+      anchorSeam && typeof anchorSeam.session?.get === "function"
+        ? (await resolveSessionAnchorForPools(anchorSeam, context.sessionID)) || sessionAnchor(context) || context.worktree
+        : sessionAnchor(context) || context.worktree
+    const state = ensureSession(context.sessionID, anchorDir)
     const description =
       typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60)
     if (queueAfterCap) {
@@ -3867,7 +3905,21 @@ const crewBeginTool = tool({
     // has not materialized is named with its remediation, never masked as
     // plain "unconfigured".
     const resolution = resolvePools()
-    const anchor = sessionAnchor(context)
+    // fix-v2-crew-surface-drift task 2.1 (design D1): the roster gate's
+    // anchor resolves AUTHORITATIVE-FIRST — the same chain the dispatch
+    // belts use (resolveSessionAnchorForPools over the shared anchor
+    // client, with its pooled-map preference and ledger-rebind semantics).
+    // The tool-context anchor (structural launch-directory source) is ONLY
+    // the no-client path, and there it is EXACTLY today's resolution — a
+    // pure strict improvement, no new failure mode (the live
+    // re-anchored-session incident: session record says the workspace,
+    // tool context still says the launch dir, the gate refused while the
+    // belt accepted).
+    const anchorClient = sharedAnchorClient()
+    const anchor =
+      anchorClient && typeof anchorClient.session?.get === "function"
+        ? (await resolveSessionAnchorForPools(anchorClient, context.sessionID)) || sessionAnchor(context)
+        : sessionAnchor(context)
     // Bind the session to its anchor so the dispatch gate scopes this
     // session exactly where the crew guidance says it is.
     if (anchor) ensureSession(context.sessionID, anchor)
@@ -4695,6 +4747,10 @@ export const server: Plugin = async (input, options) => {
   // so the task interception belt and the task tool execute
   // share one seam over the same client.
   jobClient = input.client as unknown as JobClient
+  // fix-v2-crew-surface-drift task 1.1: seed the shared anchor-client seam
+  // at the same moment the dispatch belts get their client (the v1 task
+  // tool belt reads jobClient — one seam, one source).
+  anchorClientShared = (input.client as unknown as AnchorClient | null | undefined) ?? null
   // Fold E (restart recovery): the LAUNCH-ANCHOR workspace's journal recovers
   // at init; every other workspace recovers lazily on its first session
   // (event handler). Fail-soft by construction.
@@ -5692,6 +5748,10 @@ type V2PluginContext = {
     get?(opts: unknown): Promise<unknown>
     prompt?(input: unknown): Promise<unknown>
     context?(opts: unknown): Promise<unknown>
+    // fix-v2-crew-surface-drift D2 (sandbox-probed 2.3.2): the promise-layer
+    // session domain DOES expose create — flat single-object param, bare
+    // record response (see v2SessionClient's create adapter).
+    create?(input: unknown): Promise<unknown>
   }
   command?: { transform?(cb: (editor: V2CommandEditor) => void | Promise<void>): Promise<unknown> }
   // W6a field realities (SDK 2.3.2 promise/event.d.ts): subscribe(options?)
@@ -6441,6 +6501,7 @@ type V2SessionClient = {
     prompt?: (opts: unknown) => Promise<unknown>
     promptAsync?: (opts: unknown) => Promise<unknown>
     get?: (opts: unknown) => Promise<unknown>
+    create?: (args: { body: Record<string, unknown>; query?: { directory?: string } }) => Promise<{ data?: unknown; error?: unknown }>
   }
 }
 // W6a field reality (live probe 2026-11-19): the v2 promise-layer session
@@ -6458,7 +6519,7 @@ function v2SessionIdOf(opts: unknown): string | undefined {
 }
 function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
   const s = ctx.session
-  if (s === null || typeof s !== "object") return null
+  if (s === null || typeof s !== "object") return null;
   const out: V2SessionClient["session"] = {}
   if (typeof s.prompt === "function") {
     const send = async (opts: unknown) => {
@@ -6473,6 +6534,39 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
     out.get = async (opts: unknown) => {
       const sid = v2SessionIdOf(opts)
       return sid !== undefined ? s.get!({ sessionID: sid }) : s.get!(opts)
+    }
+  }
+  // fix-v2-crew-surface-drift task 2.2 (design D2 — sandbox-probed
+  // 2026-11-21 on 2.3.2): the child-session creation seam EXISTS on the
+  // promise-layer session domain as ctx.session.create — same name, FLAT
+  // single-object param ({parentID?, title?, ...extras}) instead of the
+  // v1 {body, query} envelope, and it returns the BARE session record
+  // ({id, location:{directory}, ...}) with no {data,error} envelope. The
+  // adapter translates the v1 dispatch call shape into the flat form and
+  // re-wraps the bare record into the envelope createChildSession reads.
+  // parentID is honored (a nonexistent parent rejects with
+  // Session.NotFoundError); the directory anchor rides the flat object
+  // best-effort (the observed 2.3.2 host anchors to its own cwd when the
+  // key is dropped — fail-soft, never fatal).
+  if (typeof (s as { create?: unknown }).create === "function") {
+    const rawCreate = (s as unknown as { create: (input: Record<string, unknown>) => Promise<unknown> }).create
+    out.create = async (args) => {
+      const body = args?.body
+      const flat: Record<string, unknown> = {}
+      if (body && typeof body === "object") {
+        for (const key of ["parentID", "title", "permission", "permissions", "directory"] as const) {
+          const v = (body as Record<string, unknown>)[key]
+          if (v !== undefined) flat[key] = v
+        }
+      }
+      const directory = args?.query?.directory
+      if (typeof directory === "string" && directory !== "" && flat.directory === undefined) flat.directory = directory
+      const record = await rawCreate.call(s, flat)
+      // Bare record (observed) → envelope; already-enveloped stays as-is.
+      if (record !== null && typeof record === "object" && ("data" in (record as Record<string, unknown>) || "error" in (record as Record<string, unknown>))) {
+        return record as { data?: unknown; error?: unknown }
+      }
+      return { data: record }
     }
   }
   return Object.keys(out).length > 0 ? { session: out } : null
@@ -6839,7 +6933,9 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // (execute.before), all over the shared module predicates. W6a: the
   // before payload is {tool, sessionID, agent, messageID, id, input} —
   // the call id is `id` (Tool.CallID), the arguments are `input`.
-  v2RegisterToolHooks(ctx, v2AnchorClient(ctx))
+  const v2Anchor = v2AnchorClient(ctx)
+  anchorClientShared = v2Anchor
+  v2RegisterToolHooks(ctx, v2Anchor)
 
   // ---- session-domain client (task 5.1, W6a-resolved): one client feeds
   // BOTH the goal continuation engine (prompt + get) and the module-level

@@ -16619,34 +16619,47 @@ async function jsSearch(params, seams, maxWalkEntries = MAX_WALK_ENTRIES) {
 
 // src/dispatch-async.ts
 var QUESTION_DENY_PERMISSION = [{ permission: "question", action: "deny", pattern: "*" }];
+var QUESTION_DENY_PERMISSIONS_V2 = [{ action: "question", resource: "*", effect: "deny" }];
 var ACTIVE_STATUS_TYPES = new Set(["busy", "retry", "running"]);
 var defaultNow = () => Date.now();
 var defaultSleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
 function childSessionTitle(description, agentID) {
   return `${description} (@${agentID} subagent)`;
 }
+var TASK_CREATE_SEAM_ABSENT = "task-create-seam-absent";
 async function createChildSession(client, input) {
+  if (!client || typeof client.session?.create !== "function") {
+    return { ok: false, error: TASK_CREATE_SEAM_ABSENT };
+  }
   let result;
   try {
     result = await client.session.create({
       body: {
         parentID: input.parentSessionID,
         title: childSessionTitle(input.description, input.agentID),
-        ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {}
+        ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION, permissions: [...QUESTION_DENY_PERMISSIONS_V2] } : {}
       },
       query: { directory: input.parentDirectory }
     });
   } catch (e) {
     return { ok: false, error: `session.create threw: ${String(e)}` };
   }
-  if (result.error !== undefined) {
-    return { ok: false, error: `session.create failed: ${String(result.error)}` };
+  if (result !== null && typeof result === "object" && (("data" in result) || ("error" in result))) {
+    if (result.error !== undefined) {
+      return { ok: false, error: `session.create failed: ${String(result.error)}` };
+    }
+    const id = result.data?.id;
+    if (typeof id !== "string" || id === "") {
+      return { ok: false, error: "session.create returned no session id" };
+    }
+    return { ok: true, sessionID: id };
   }
-  const id = result.data?.id;
-  if (typeof id !== "string" || id === "") {
+  const bare = result;
+  const bareId = bare?.id;
+  if (typeof bareId !== "string" || bareId === "") {
     return { ok: false, error: "session.create returned no session id" };
   }
-  return { ok: true, sessionID: id };
+  return { ok: true, sessionID: bareId };
 }
 function buildPromptArgs(input) {
   return {
@@ -17567,6 +17580,10 @@ async function deliverDispatchProgress(sessionID) {
   }
 }
 var jobClient = null;
+var anchorClientShared = null;
+function sharedAnchorClient() {
+  return anchorClientShared;
+}
 var idleJobSessions = new Set;
 function jobWakeText(job) {
   const dispatch = job.dispatch;
@@ -19105,6 +19122,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
 `)[0].slice(0, 200));
   pumpDispatchQueue(client, job.ownerSession);
 }
+var TASK_SEAM_DEGRADED_ERROR = "[forge:dispatch] child-session creation is unavailable on this host (the client exposes no session.create seam) — use the NATIVE task tool as the dispatch surface for subagent dispatches.";
 var TASK_DESCRIPTION = [
   "Dispatch a subagent as a REAL child session on this host (SDK session.create with parentID): the call renders in the host session tree with native subagent affordances — the live task panel, progress, expandable transcript, user abort — and runs the target agent with its own permission map. This is the single dispatch surface: ANY materialized target dispatches through here — configured `forge-*` subagents AND every other host agent.",
   "run_in_background is YOUR dispatch-time decision: omit it (sync) when your very next step depends on the result — the call blocks until the child finishes and returns its final report (native parity: the child MAY ask the user questions; the user is present at the panel). Set run_in_background: true (async) when the result does NOT block your next steps — the call returns a task handle immediately and the child is created with the question tool denied session-wide (unattended: it never blocks on human input; an unanswered permission ask degrades to the honest poll-timeout finding naming the child session id, which stays inspectable and natively abortable in the TUI).",
@@ -19176,7 +19194,11 @@ var taskDispatchTool = tool({
     const client = dispatchClient();
     if (!client)
       throw new Error("[forge:dispatch] no host client available — dispatch cannot create a child session.");
-    const state = ensureSession(context.sessionID, worktreeFor(context));
+    if (typeof client.session?.create !== "function")
+      throw new Error(TASK_SEAM_DEGRADED_ERROR);
+    const anchorSeam = sharedAnchorClient();
+    const anchorDir = anchorSeam && typeof anchorSeam.session?.get === "function" ? await resolveSessionAnchorForPools(anchorSeam, context.sessionID) || sessionAnchor(context) || context.worktree : sessionAnchor(context) || context.worktree;
+    const state = ensureSession(context.sessionID, anchorDir);
     const description = typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60);
     if (queueAfterCap) {
       const jobId2 = dispatchId;
@@ -19817,7 +19839,8 @@ var crewBeginTool = tool({
       throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Three exits: " + "plan_approve puts the plan to user approval (an APPROVED plan does not block /crew — only a draft does); " + "/plan discard abandons the plan outright; " + '/plan discard {supersede: "<successor path or id>"} moves the work into this crew (the plan becomes superseded, the successor recorded).');
     }
     const resolution = resolvePools();
-    const anchor = sessionAnchor(context);
+    const anchorClient = sharedAnchorClient();
+    const anchor = anchorClient && typeof anchorClient.session?.get === "function" ? await resolveSessionAnchorForPools(anchorClient, context.sessionID) || sessionAnchor(context) : sessionAnchor(context);
     if (anchor)
       ensureSession(context.sessionID, anchor);
     const sessionLoaded = anchor ? loaderForAnchor(anchor).load() : null;
@@ -20411,6 +20434,7 @@ var server = async (input, options) => {
   rememberHostAnchor(effectiveInitDir);
   const client = input.client;
   jobClient = input.client;
+  anchorClientShared = input.client ?? null;
   if (effectiveInitDir && !isRootish(effectiveInitDir)) {
     recoverWorkspaceDispatches(input.client, effectiveInitDir);
   }
@@ -21524,6 +21548,28 @@ function v2SessionClient(ctx) {
       return sid !== undefined ? s.get({ sessionID: sid }) : s.get(opts);
     };
   }
+  if (typeof s.create === "function") {
+    const rawCreate = s.create;
+    out.create = async (args) => {
+      const body = args?.body;
+      const flat = {};
+      if (body && typeof body === "object") {
+        for (const key of ["parentID", "title", "permission", "permissions", "directory"]) {
+          const v = body[key];
+          if (v !== undefined)
+            flat[key] = v;
+        }
+      }
+      const directory = args?.query?.directory;
+      if (typeof directory === "string" && directory !== "" && flat.directory === undefined)
+        flat.directory = directory;
+      const record2 = await rawCreate.call(s, flat);
+      if (record2 !== null && typeof record2 === "object" && (("data" in record2) || ("error" in record2))) {
+        return record2;
+      }
+      return { data: record2 };
+    };
+  }
   return Object.keys(out).length > 0 ? { session: out } : null;
 }
 function v2EventFields(raw) {
@@ -21740,7 +21786,9 @@ async function v2Setup(ctx, deps) {
   }
   v2RegisterPermissionBelt(ctx);
   v2PermissionAssertFn = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission.assert(input) : null;
-  v2RegisterToolHooks(ctx, v2AnchorClient(ctx));
+  const v2Anchor = v2AnchorClient(ctx);
+  anchorClientShared = v2Anchor;
+  v2RegisterToolHooks(ctx, v2Anchor);
   const v2Client = v2SessionClient(ctx);
   if (v2Client && (v2Client.session.promptAsync || v2Client.session.prompt))
     jobClient = v2Client;
@@ -21768,6 +21816,7 @@ export {
   effectiveSurvive,
   plugin_default as default,
   crewOrchestrationTemplate,
+  TASK_SEAM_DEGRADED_ERROR,
   PLAN_COMMAND_TEMPLATE,
   GOAL_COMMAND_TEMPLATE,
   DEFAULT_DISPATCH_QUEUE_MAX,

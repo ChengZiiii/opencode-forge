@@ -22,6 +22,23 @@ export const QUESTION_DENY_PERMISSION: ReadonlyArray<{
   pattern: "*"
 }> = [{ permission: "question", action: "deny", pattern: "*" }]
 
+/**
+ * fix-v2-crew-surface-drift D2 (cross-checked against
+ * openspec/changes/harden-dispatch-resilience/probe-1.1-evidence.md,
+ * sandbox-probed 2026-11-21 on opencode 2.3.2): the v1 spelling above
+ * (`permission:[{permission,action,pattern}]`) is SILENTLY DROPPED by the
+ * 2.3.2 session-create body; the effective spelling is the v2 permissions
+ * array `{action,resource,effect}` — probed verbatim landing on the child
+ * session record (persisted, both the HTTP and the ctx.session.create
+ * channels). The create body carries BOTH spellings: each host reads its
+ * own key and ignores the other (fail-soft on both generations).
+ */
+export const QUESTION_DENY_PERMISSIONS_V2: ReadonlyArray<{
+  action: "question"
+  resource: "*"
+  effect: "deny"
+}> = [{ action: "question", resource: "*", effect: "deny" }]
+
 /** Active (non-terminal) session status types — mirrors the SDK SessionStatus union. */
 const ACTIVE_STATUS_TYPES = new Set(["busy", "retry", "running"])
 
@@ -116,31 +133,59 @@ export type CreateChildResult =
   | { ok: true; sessionID: string }
   | { ok: false; error: string }
 
+/**
+ * fix-v2-crew-surface-drift task 2.2 (design D2): the sentinel error for a
+ * host client that exposes NO child-session creation seam. Callers surface
+ * this as the honest degradation (the contract string naming the native
+ * task tool) — never a raw TypeError.
+ */
+export const TASK_CREATE_SEAM_ABSENT = "task-create-seam-absent"
+
 export async function createChildSession(
   client: DispatchClient,
   input: CreateChildInput,
 ): Promise<CreateChildResult> {
+  // Guarded shape probe (D2): the seam is resolved BEFORE the call — an
+  // absent session.create is the honest absent-seam verdict, not a crash.
+  if (!client || typeof client.session?.create !== "function") {
+    return { ok: false, error: TASK_CREATE_SEAM_ABSENT }
+  }
   let result: { data?: SessionLike; error?: unknown }
   try {
     result = await client.session.create({
       body: {
         parentID: input.parentSessionID,
         title: childSessionTitle(input.description, input.agentID),
-        ...(input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {}),
+        // Both spellings (see QUESTION_DENY_PERMISSIONS_V2): v1 hosts read
+        // `permission`, 2.3.2 reads `permissions` — the foreign key is
+        // dropped silently on each, the native one lands.
+        ...(input.questionDeny === true
+          ? { permission: QUESTION_DENY_PERMISSION, permissions: [...QUESTION_DENY_PERMISSIONS_V2] }
+          : {}),
       },
       query: { directory: input.parentDirectory },
     })
   } catch (e) {
     return { ok: false, error: `session.create threw: ${String(e)}` }
   }
-  if (result.error !== undefined) {
-    return { ok: false, error: `session.create failed: ${String(result.error)}` }
+  if (result !== null && typeof result === "object" && ("data" in result || "error" in result)) {
+    if (result.error !== undefined) {
+      return { ok: false, error: `session.create failed: ${String(result.error)}` }
+    }
+    const id = result.data?.id
+    if (typeof id !== "string" || id === "") {
+      return { ok: false, error: "session.create returned no session id" }
+    }
+    return { ok: true, sessionID: id }
   }
-  const id = result.data?.id
-  if (typeof id !== "string" || id === "") {
+  // BARE-record response shape (2.3.2 promise-layer session.create returns
+  // the session record itself, no {data,error} envelope).
+  const bare = result as unknown as SessionLike | undefined
+  const bareId = (bare as { id?: unknown } | undefined)?.id
+  if (typeof bareId !== "string" || bareId === "") {
     return { ok: false, error: "session.create returned no session id" }
   }
-  return { ok: true, sessionID: id }
+  return { ok: true, sessionID: bareId }
 }
 
 export type SendPromptInput = {
