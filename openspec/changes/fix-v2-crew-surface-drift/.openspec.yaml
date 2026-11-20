@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-20
+goal: crew orchestration works end-to-end on 2.3.2 for the fresh-install
+  per-project pool pattern
