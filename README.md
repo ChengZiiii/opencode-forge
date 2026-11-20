@@ -869,6 +869,11 @@ out of a materialized id.
 
 ```jsonc
 {
+  // OPTIONAL editor support: point $schema at the published copy for
+  // completion/validation of the fields below.
+  // "$schema": "https://unpkg.com/@sorenllm/opencode-forge@latest/dist/forge.schema.json",
+  // local install form (same file, no network): pin the major you run.
+  // "$schema": "./node_modules/@sorenllm/opencode-forge/dist/forge.schema.json",
   // namespace for this pool's ids (forge-<ns>-<id> — EVERY pool is
   // namespaced; declare it instead of riding the directory name).
   // Short, stable, [a-z0-9-] up to 24 chars — ids survive directory renames.
@@ -903,6 +908,15 @@ out of a materialized id.
 ```
 
 **The atomic pair — the one rule that matters:**
+
+> **`$schema` editor support:** the two commented lines at the top of the
+> snippet are optional — the plugin silently tolerates the `$schema` key (and
+> any unknown key) in both parse paths. One editor-side caveat: forge.json is
+> a JSONC file with a `.json` extension, so comments and trailing commas draw
+> squiggles from the editor's *own* plain-JSON association (unrelated to the
+> schema). A one-line file association fixes both validation and the
+> squiggles: `"files.associations": { "**/.opencode/forge.json": "jsonc" }`
+> (schema validation works under a jsonc association too).
 
 | `model` | `thoughtLevel` | result |
 | --- | --- | --- |
