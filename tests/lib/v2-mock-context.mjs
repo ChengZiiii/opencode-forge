@@ -45,6 +45,7 @@ export function createV2MockContext(opts = {}) {
     // and the job-wake queue ride these (prompt = flat SessionPrompt).
     sessionRecords: new Map(), // get({path:{id}} | {sessionID}) -> record
     prompts: [], // session.prompt({sessionID, text}) sends (continuations AND wakes)
+    creates: [], // session.create(flatInput) calls (fix-v2-crew-surface-drift D2 seam)
     // command domain (W4 seam)
     commands: new Map(),
     // event domain (W5/W6a seam): subscribe() returns an AsyncIterable;
@@ -142,6 +143,15 @@ export function createV2MockContext(opts = {}) {
       // W6a field reality: flat {sessionID, text} prompt in (blocking, no
       // promptAsync/status on the promise layer).
       get: async (opts) => state.sessionRecords.get(opts?.path?.id ?? opts?.sessionID),
+      // fix-v2-crew-surface-drift D2 (sandbox-probed on opencode 2.3.2,
+      // 2026-11-21): the promise-layer session domain DOES expose create —
+      // FLAT single-object param ({parentID?, title?, ...extras}), BARE
+      // session-record response (no {data,error} envelope). The mock
+      // records the flat input and returns a bare record.
+      create: async (input) => {
+        state.creates.push(input)
+        return { id: `ses_mockchild_${state.creates.length}`, title: input?.title ?? null, location: { directory: input?.directory ?? null } }
+      },
       prompt: async (input) => {
         state.prompts.push(input)
         return { ok: true }

@@ -24,7 +24,7 @@ process.env.FORGE_DISPATCH_POLL_SLICE_MS = "20"
 process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "forge-disp-home-"))
 process.env.FORGE_TEST_NO_DISPATCH_FETCH = "1"
 
-import { server } from "../plugin.ts"
+import { server, TASK_SEAM_DEGRADED_ERROR } from "../plugin.ts"
 
 const worktreeRoot = mkdtempSync(join(tmpdir(), "forge-disp-"))
 process.on("exit", () => {
@@ -1354,4 +1354,52 @@ test("retry (armed-sync): a timed-out sync dispatch's armed poller retries too â
   assert.ok(wake.includes("(after 2 attempt(s))"), "the attempt count is disclosed")
   assert.ok(!wake.includes("report from ses_child_1"), "the dead child's report is not the delivered one")
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rt7" } } } })
+})
+
+// ---------------------------------------------------------------------------
+// fix-v2-crew-surface-drift task 3.2 (design D2): the task tool's guarded
+// client-shape probe â€” absent creation seam degrades with the exact
+// contract string (never a raw TypeError), and the child's parent directory
+// resolves from the AUTHORITATIVE anchor (task 2.3).
+
+test("task client guard: absent session.create seam -> the EXACT honest degradation contract string, never a raw TypeError", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client } = makeClient({ record: { directory: dir, worktree: dir } })
+  delete client.session.create // the 2.3.2 live-failure shape: no creation seam on the client
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await assert.rejects(
+    () => h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: "x" }, allowCtx("ses_noseam", dir)),
+    (err) => {
+      assert.equal(String(err?.message ?? err), TASK_SEAM_DEGRADED_ERROR, "the degradation contract string verbatim (names the native task tool)")
+      assert.match(String(err?.message ?? err), /NATIVE task tool/, "the native task tool is named as the dispatch surface")
+      return true
+    },
+  )
+})
+
+test("task client guard: child creation parent directory resolves from the AUTHORITATIVE anchor (re-anchored parents -> anchored children)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const elsewhere = mkdtempSync(join(tmpdir(), "forge-disp-moved-"))
+  t.after(() => {
+    try {
+      rmSync(elsewhere, { recursive: true, force: true })
+    } catch {}
+  })
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir } })
+  const h = await startServer(input(elsewhere, client), {}) // host launched in the POOL-LESS dir
+  t.after(() => h.dispose?.())
+  await server(input(dir, client), {}) // shared host: the pooled workspace joins the registry (same fake client - one seam)
+  await h.config(emptyCfg())
+  // The tool context (worktree/directory) still reports the pool-less dir -
+  // the session RECORD (authoritative) says the pooled workspace. The child
+  // must anchor to the RECORD's directory, not the tool context's.
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "audit", description: "moved parent" },
+    allowCtx("ses_moved", elsewhere),
+  )
+  assert.equal(r.metadata.agent, "forge-dp-research")
+  assert.equal(calls.create[0].query.directory, dir, "query.directory comes from the authoritative session record, not the tool context")
+  assert.equal(calls.create[0].body.parentID, "ses_moved", "parentID is the calling session")
 })

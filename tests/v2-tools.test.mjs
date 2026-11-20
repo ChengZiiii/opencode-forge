@@ -156,3 +156,32 @@ test("v2 tools: agent materialization and tool registration are independent slic
   await v2Setup(t2.ctx, { anchors: [join(tmpdir(), "no-such-ws-v2")] })
   assert.ok(t2.state.agents.has("forge"), "the agent registers regardless of the tool domain")
 })
+
+test("v2 task dispatch (fix-v2-crew-surface-drift D2): the 2.3.2 promise-layer create seam adapts — FLAT create input, bare record resolved, anchored parent directory", async (t) => {
+  process.env.FORGE_DISPATCH_POLL_INTERVAL_MS = "5"
+  process.env.FORGE_DISPATCH_POLL_SLICE_MS = "10"
+  const state = await setupTools()
+  const dir = mkdtempSync(join(tmpdir(), "forge-v2-task-seam-"))
+  t.after(() => {
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.FORGE_DISPATCH_POLL_INTERVAL_MS
+    delete process.env.FORGE_DISPATCH_POLL_SLICE_MS
+  })
+  // The authoritative record for the calling session anchors the child
+  // (design D2 2.3): a record pointing at the tool-context workspace makes
+  // the flat create's directory resolve from the authoritative chain.
+  state.sessionRecords.set("s-v2-task", { sessionID: "s-v2-task", directory: dir, worktree: dir })
+  const res = await state.tools.get("task").execute(
+    { subagent_type: "general", prompt: "probe dispatch", description: "seam probe", run_in_background: true },
+    { sessionID: "s-v2-task", worktree: dir, directory: dir, metadata: () => {}, message: async () => {} },
+  )  // The moved-seam adaptation (D2): the dispatch engine's v1 {body,query}
+  // call is translated to the FLAT single-object param the 2.3.2
+  // promise-layer create accepts, and the BARE record response resolves.
+  assert.ok(state.creates.length >= 1, "the flat create seam was called")
+  const flat = state.creates[0]
+  assert.equal(flat.parentID, "s-v2-task", "flat param: parentID rides the root object")
+  assert.ok(typeof flat.title === "string" && flat.title.includes("(@general subagent)"), "flat param: the native child title format")
+  assert.ok(!("body" in flat) && !("query" in flat), "the v1 {body,query} envelope is NOT handed to the 2.3.2 create seam")
+  assert.equal(flat.directory, dir, "the parent directory anchors the child (authoritative-first chain, tool-context fallback here)")
+  assert.ok(/task id|dispatched/i.test(String(res.content ?? res)), "an async handle returns")
+})

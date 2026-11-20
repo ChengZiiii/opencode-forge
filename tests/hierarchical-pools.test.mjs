@@ -1385,3 +1385,104 @@ test("shared: hot-apply — editing shared re-materializes at the next resolve (
   const p = materializeAgentPrompt({ agent: "research", shape: "write", role: rolePromptFor("research", agent.def, agent.shared ?? undefined) })
   assert.equal(p, materializeAgentPrompt({ agent: "research", shape: "write", role: rolePromptFor("research", agent.def) }))
 })
+
+// ---------------------------------------------------------------------------
+// fix-v2-crew-surface-drift task 3.1 (design D1): the crew gate anchor
+// matrix — authoritative-first resolution (the live re-anchored-session
+// incident as a regression), the no-client fallback keeping today's exact
+// behavior, and the fresh-install workspace-pool-only shape.
+
+test("crew anchor matrix (a): the authoritative pool-owning record beats a stale pool-less tool context (the live incident as a regression)", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-cam1-", { pool: "crewa", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-cam-launch-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  // Fresh-install axis: NO global forge.json anywhere under the home.
+  const prevHome = process.env.FORGE_TEST_FORGE_HOME
+  const emptyHome = mkdtempSync(join(tmpdir(), "forge-pool-cam-home-"))
+  process.env.FORGE_TEST_FORGE_HOME = emptyHome
+  t.after(() => {
+    process.env.FORGE_TEST_FORGE_HOME = prevHome
+    try {
+      rmSync(emptyHome, { recursive: true, force: true })
+    } catch {}
+  })
+  // The incident shape: the authoritative session RECORD anchors to the
+  // pooled workspace; the TOOL CONTEXT still reports the launch dir
+  // (pool-less). Before the fix the gate read the tool context and refused
+  // ("CREW IS NOT INITIALIZED") while the dispatch belt accepted.
+  const h = await startServer(recordInput(dirA, { ses_live: { directory: dirA, worktree: dirA } }), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await h.tool.crew_begin.execute(
+    { objective: "moved session crew", subtasks: [{ title: "one" }] },
+    { ...allowCtx("ses_live"), worktree: launchDir, directory: launchDir },
+  )
+  assert.match(out.output, /forge-crewa-research/, "the workspace pool's roster dispatches (authoritative record won)")
+  assert.match(out.output, /DISPATCHABLE from this session — workspace pool/, "the roster line names the workspace pool")
+  assert.ok(!out.output.includes("CREW IS NOT INITIALIZED"), "the stale-anchor refusal is gone")
+  // The crew record path anchors to the RECORD's workspace, not the launch dir.
+  assert.ok(existsSync(join(dirA, ".opencode", "crew")), "the crew record is written under the authoritative anchor's workspace")
+  await h.tool.crew_close.execute({ abandon: true, reason: "anchor matrix" }, { ...allowCtx("ses_live"), worktree: launchDir, directory: launchDir })
+})
+
+test("crew anchor matrix (b): with NO client the resolution is EXACTLY today's (tool-context anchor; no rescue, no regression)", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-cam2-", { pool: "crewb", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-cam2-launch-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const prevHome = process.env.FORGE_TEST_FORGE_HOME
+  const emptyHome = mkdtempSync(join(tmpdir(), "forge-pool-cam2-home-"))
+  process.env.FORGE_TEST_FORGE_HOME = emptyHome
+  t.after(() => {
+    process.env.FORGE_TEST_FORGE_HOME = prevHome
+    try {
+      rmSync(emptyHome, { recursive: true, force: true })
+    } catch {}
+  })
+  // input() has NO session.get — the no-client path. Unmapped session,
+  // tool context at the pool-less launch dir: today's refusal stands.
+  const h = await startServer(input(dirA), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, { ...allowCtx("ses_nc"), worktree: launchDir, directory: launchDir }),
+    (err) => {
+      assert.match(String(err), /CREW IS NOT INITIALIZED/, "the honest unconfigured refusal (no client = no rescue)")
+      return true
+    },
+  )
+  // Same no-client host, tool context AT the pool: registers (today's pass).
+  const out = await h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, { ...allowCtx("ses_nc2"), worktree: dirA, directory: dirA })
+  assert.match(out.output, /forge-crewb-research/)
+  await h.tool.crew_close.execute({ abandon: true, reason: "matrix b" }, allowCtx("ses_nc2"))
+})
+
+test("crew anchor matrix (c): fresh install — ONLY a workspace pool, no global layer anywhere — passes the gate", async (t) => {
+  const dirA = dirWithForgeJson(t, "forge-pool-cam3-", { pool: "crewc", agents: { scout: { model: "zai/glm", thoughtLevel: "low", shape: "readonly" } } })
+  const prevHome = process.env.FORGE_TEST_FORGE_HOME
+  const emptyHome = mkdtempSync(join(tmpdir(), "forge-pool-cam3-home-"))
+  process.env.FORGE_TEST_FORGE_HOME = emptyHome
+  t.after(() => {
+    process.env.FORGE_TEST_FORGE_HOME = prevHome
+    try {
+      rmSync(emptyHome, { recursive: true, force: true })
+    } catch {}
+  })
+  const h = await startServer(recordInput(dirA, { ses_fresh: { directory: dirA, worktree: dirA } }), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await h.tool.crew_begin.execute(
+    { objective: "fresh install crew", subtasks: [{ title: "recon", agent: "forge-crewc-scout" }] },
+    { ...allowCtx("ses_fresh"), worktree: dirA, directory: dirA },
+  )
+  assert.match(out.output, /forge-crewc-scout/, "the workspace pool IS the roster with zero global configuration")
+  assert.ok(!existsSync(join(emptyHome, ".config", "opencode", "forge.json")), "no global layer was required (D3 acceptance shape)")
+  await h.tool.crew_close.execute({ abandon: true, reason: "matrix c" }, allowCtx("ses_fresh"))
+})

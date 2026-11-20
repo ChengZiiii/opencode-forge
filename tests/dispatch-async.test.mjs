@@ -9,6 +9,7 @@ import assert from "node:assert/strict"
 
 import {
   QUESTION_DENY_PERMISSION,
+  TASK_CREATE_SEAM_ABSENT,
   childSessionTitle,
   createChildSession,
   sendPrompt,
@@ -173,6 +174,32 @@ test("createChildSession: error and missing-id branches are honest", async () =>
   })
   assert.equal(rc.ok, false)
   assert.match(rc.error, /threw/)
+})
+
+// fix-v2-crew-surface-drift task 3.2 (design D2): the guarded shape probe.
+test("createChildSession seam guard (fix-v2-crew-surface-drift): absent session.create → the TASK_CREATE_SEAM_ABSENT sentinel (no raw TypeError); the 2.3.2 BARE-record response resolves", async () => {
+  // The 2.3.2 live-failure shape: a client whose session object has NO
+  // create method (the v2 adapter before this change dropped it). The
+  // guarded probe returns the honest sentinel — never a TypeError.
+  const noSeam = await createChildSession({ session: {} }, {
+    parentSessionID: "p", parentDirectory: "d", agentID: "g", description: "x",
+  })
+  assert.equal(noSeam.ok, false)
+  assert.equal(noSeam.error, TASK_CREATE_SEAM_ABSENT, "the absent-seam sentinel, exact")
+
+  const nullish = await createChildSession(null, {
+    parentSessionID: "p", parentDirectory: "d", agentID: "g", description: "x",
+  })
+  assert.equal(nullish.ok, false)
+  assert.equal(nullish.error, TASK_CREATE_SEAM_ABSENT, "a null client is the same honest verdict")
+
+  // Sandbox-probed 2.3.2 promise-layer create returns the BARE session
+  // record ({id, location:{directory}, ...}) — no {data,error} envelope.
+  const bare = await createChildSession({ session: { create: async () => ({ id: "ses_v2_child", location: { directory: "C:/ws" } }) } }, {
+    parentSessionID: "p", parentDirectory: "d", agentID: "g", description: "x",
+  })
+  assert.equal(bare.ok, true)
+  assert.equal(bare.sessionID, "ses_v2_child", "the bare record's id resolves as the child session id")
 })
 
 test("sendPrompt: promptAsync endpoint with agent id + text part + directory", async () => {
