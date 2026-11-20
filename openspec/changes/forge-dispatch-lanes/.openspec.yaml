@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-21
+goal: "same agent identity, tiered models: express a model chain on an agent
+  entry instead of a single pinned model"
