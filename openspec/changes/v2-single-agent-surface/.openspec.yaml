@@ -1,0 +1,4 @@
+schema: spec-driven
+created: 2026-11-20
+goal: "single-agent UX on v2: forge is the visible default primary; the model is
+  never offered the builtin shell on the forge family"
