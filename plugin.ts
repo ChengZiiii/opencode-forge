@@ -2183,6 +2183,23 @@ function dispatchModelIdentity(agentID: string, ownerSession: string, childSessi
   return sessionModels.get(ownerSession) ?? null
 }
 
+/**
+ * Nested-dispatch guard rule (harden-dispatch-resilience D2): a NON-forge
+ * host-agent target served by the anthropic family gets the task-tool deny
+ * on its create body. forge family targets are untouched here — their depth
+ * is structurally capped at ≤1 by the materialized `task: deny`
+ * (dispatch-tiers), so this guard never stacks on it. The childSessionID
+ * seam (design "known leftovers" — the dead parameter, consumed here):
+ * respawn sites pass the PREVIOUS child's id so an unpinned (Auto) worker
+ * resolves the child's own captured model, not just the owner's.
+ */
+function nestedTaskDenyFor(agentID: string, ownerSession: string, childSessionID?: string): boolean {
+  const id = agentID.toLowerCase()
+  if (id === "forge" || id.startsWith("forge-")) return false
+  const identity = dispatchModelIdentity(agentID, ownerSession, childSessionID)
+  return identity !== null && dispatchProviderFamily(identity.provider) === "anthropic"
+}
+
 /** Release an admission eagerly (spawn failed before any child existed). */
 function releaseGateAdmission(jobId: string): void {
   const identity = admittedGate.get(jobId)
@@ -2356,6 +2373,10 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       agentID: wish.agentID,
       description: wish.description,
       questionDeny: wish.questionDeny,
+      // Nested-dispatch guard (D2): re-resolved at SPAWN time like every
+      // other pump re-check — the model identity may have shifted while the
+      // wish sat queued.
+      taskDeny: nestedTaskDenyFor(wish.agentID, wish.ownerSession),
     })
     if (!created.ok) {
       releaseGateAdmission(wish.jobId)
@@ -2684,6 +2705,7 @@ async function recoverOneDispatchRecord(client: DispatchClient, workspace: strin
         agentID: rec.agent,
         description: rec.description ?? "",
         questionDeny: base.questionDeny ?? true,
+        taskDeny: nestedTaskDenyFor(rec.agent, rec.ownerSession, typeof rec.childSessionId === "string" ? rec.childSessionId : undefined),
       })
       if (!respawn.ok) {
         journalTerminalRecord(base, "error", `retry spawn failed at recovery: ${respawn.error}`)
@@ -2905,6 +2927,7 @@ async function runAsyncDispatchPoller(
           agentID,
           description: dispatch?.description ?? "",
           questionDeny: retryCtx.questionDeny,
+          taskDeny: nestedTaskDenyFor(agentID, job.ownerSession, childSessionID),
         })
         if (!respawn.ok) {
           text = `(retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
@@ -3313,6 +3336,10 @@ const taskDispatchTool = tool({
       // Question policy is mode-keyed (task-shadow): sync keeps questions
       // available (native parity); async seals the child unattended.
       questionDeny: runInBackground,
+      // Nested-dispatch guard (D2): non-forge ∧ anthropic family — the
+      // deny rides the create body on BOTH modes (a sync child can nest as
+      // much as an async one).
+      taskDeny: nestedTaskDenyFor(target, context.sessionID),
     })
     if (!created.ok) {
       releaseGateAdmission(dispatchId)
@@ -3451,6 +3478,7 @@ const taskDispatchTool = tool({
               agentID: target,
               description,
               questionDeny: false,
+              taskDeny: nestedTaskDenyFor(target, context.sessionID, childSessionID),
             })
             if (!respawn.ok) {
               journalTerminalRecord(syncJournalBase, "error", `retry spawn failed: ${respawn.error}`)
@@ -5577,6 +5605,13 @@ export const server: Plugin = async (input, options) => {
       workspacePoolOf: (anchor: string) => sessionPoolFileOf(anchor),
       // Async-dispatch seams (change async-dispatch wiring tests).
       dispatchTasks: () => [...dispatchTasks.values()],
+      // harden-dispatch-resilience D2 seams (nested-dispatch guard wiring
+      // tests): seed the session-model capture (the anthropic-family input
+      // the guard resolves through dispatchModelIdentity) and reset it.
+      setSessionModel: (sessionID: string, identity: { provider: string; model: string } | null) => {
+        if (identity === null) sessionModels.delete(sessionID)
+        else sessionModels.set(sessionID, identity)
+      },
       // Fold D seams: the per-session FIFO queues and the journal/recovery
       // surfaces (tests inject an in-memory journal fs BEFORE dispatching).
       dispatchQueues: () =>

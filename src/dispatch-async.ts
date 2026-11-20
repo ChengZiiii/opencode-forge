@@ -39,6 +39,20 @@ export const QUESTION_DENY_PERMISSIONS_V2: ReadonlyArray<{
   effect: "deny"
 }> = [{ action: "question", resource: "*", effect: "deny" }]
 
+/**
+ * Nested-dispatch guard seal (harden-dispatch-resilience D2, probe 1.1):
+ * the task-tool deny in the v2 array spelling — same shape contract as
+ * QUESTION_DENY_PERMISSIONS_V2 (the action names the tool, matching the
+ * existing QUESTION_DENY action vocabulary). Lands on the child session
+ * record; findLast semantics let this session-side deny override the
+ * agent record's own allow entries.
+ */
+export const TASK_DENY_PERMISSIONS_V2: ReadonlyArray<{
+  action: "task"
+  resource: "*"
+  effect: "deny"
+}> = [{ action: "task", resource: "*", effect: "deny" }]
+
 /** Active (non-terminal) session status types — mirrors the SDK SessionStatus union. */
 const ACTIVE_STATUS_TYPES = new Set(["busy", "retry", "running"])
 
@@ -121,6 +135,17 @@ export type CreateChildInput = {
   agentID: string
   description: string
   /**
+   * Nested-dispatch guard (harden-dispatch-resilience D2): when true the
+   * create body carries a task-tool deny in the v2 array spelling —
+   * probe-1.1-evidence.md: `{action,resource,effect}` lands verbatim on the
+   * child session record (persisted, both the HTTP and ctx.session.create
+   * channels) and the host splices session permissions AFTER agent
+   * permissions with findLast semantics, so the deny hides the task tool
+   * from the child regardless of the agent record's own allow entries.
+   * Caller rule: non-forge target ∧ anthropic provider family.
+   */
+  taskDeny?: boolean
+  /**
    * Question policy (task-shadow, mode-keyed): async dispatches seal the
    * child with the session-wide question deny (unattended safety, 0.22.0
    * semantics); sync dispatches omit the seal entirely — native parity, the
@@ -159,8 +184,18 @@ export async function createChildSession(
         // Both spellings (see QUESTION_DENY_PERMISSIONS_V2): v1 hosts read
         // `permission`, 2.3.2 reads `permissions` — the foreign key is
         // dropped silently on each, the native one lands.
-        ...(input.questionDeny === true
-          ? { permission: QUESTION_DENY_PERMISSION, permissions: [...QUESTION_DENY_PERMISSIONS_V2] }
+        ...(input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {}),
+        // v2 array spelling: question seal and/or the nested-dispatch guard
+        // (D2) ride ONE `permissions` key — merged entries when both are
+        // set. The guard is v2-only by design (the v1 spelling has no
+        // action/resource/effect equivalent 2.3.2 reads).
+        ...(input.questionDeny === true || input.taskDeny === true
+          ? {
+              permissions: [
+                ...(input.questionDeny === true ? QUESTION_DENY_PERMISSIONS_V2 : []),
+                ...(input.taskDeny === true ? TASK_DENY_PERMISSIONS_V2 : []),
+              ],
+            }
           : {}),
       },
       query: { directory: input.parentDirectory },
