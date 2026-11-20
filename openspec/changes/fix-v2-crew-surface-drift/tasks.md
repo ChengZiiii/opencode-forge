@@ -40,6 +40,24 @@
   on the test machine): full crew loop — register → arm waves → dispatch
   (plugin task tool) → report → crew_close; plus the re-anchored-session
   scenario (create session in a pool-less dir, move it, crew works).
+  (E2E RUN 2026-11-21, reports/e2e-crew-surface-drift-report.md —
+  **PARTIAL**: the decisive acceptance PASSED (crew registers in the
+  fresh-install shape, no more "CREW IS NOT INITIALIZED"; the
+  ctx.session.create dispatch seam works; the standing report contract
+  closed the loop; crew_close reconciled) and the degraded re-anchor
+  double-verdict holds — but TWO new implementation bugs surfaced and
+  are queued as fixes: (1) arm-only `crew_begin {execution}` is refused
+  by the tool schema — `subtasks` lacks `.optional()` in crewBeginTool,
+  contradicting the tool's own description; (2) after a REAL
+  `POST /api/session/:id/move` with `location.directory` verified
+  changed, the crew gate still refuses naming the OLD directory — the
+  authoritative anchor does not re-resolve after a move (the unit-mock
+  passes but the live host disagrees; suspects: the
+  effectiveWorktree-priority branch or a stale anchor-client read).
+  Also recorded: host 500 `slice` bug on move with absolute
+  forward-slash paths (reported upstream); sandbox isolation requires
+  OPENCODE_TEST_HOME + OPENCODE_DB + serve CWD=workspace on 2.3.2,
+  OPENCODE_CONFIG_DIR alone does NOT isolate the store.)
 - [ ] 4.2 `bun run bundle`; official-install verify per AGENTS
   (git+file → github → npm pack tgz); version bump + `npm publish` only
   after user approval.
