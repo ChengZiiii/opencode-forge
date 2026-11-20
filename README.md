@@ -128,6 +128,25 @@ Note: do not enable opencode's experimental plan mode
 (`OPENCODE_EXPERIMENTAL_PLAN_MODE`) together with forge — two plan mechanisms
 would overlap.
 
+### Upgrading (verified installer behavior)
+
+`opencode plugin add` APPENDS — it never replaces an existing entry for the
+same plugin id, so a bare `opencode plugin @sorenllm/opencode-forge --global`
+over an existing install fails with `Duplicate plugin ID: forge`. The
+verified upgrade path:
+
+1. Remove the old entry first (uninstall step 1 below: edit the `plugin`
+   array in `~/.config/opencode/opencode.json`).
+2. Install the new source: `opencode plugin @sorenllm/opencode-forge --global`.
+3. Smoke-check (`opencode agent list` shows forge + forge-* workers), then
+   clean the stale store dir (uninstall step 2) if you switched sources.
+
+Also verified on the 2.x installer: `remove` only removes the config entry
+of its own registered source; the `npm:` prefix is not accepted by `add`
+(use the bare package name); and the store path is derived from the
+specifier spelling, so switching between npm and github sources leaves both
+store dirs behind — delete the stale one.
+
 ### v2-host notes (opencode 2.x)
 
 Full feature parity with v1 (agents, tools, permission belt and gates,
