@@ -261,7 +261,7 @@ export type PollInput = {
 }
 
 export type PollResult =
-  | { status: "completed"; polls: number }
+  | { status: "completed"; polls: number; via?: "active-textful" }
   | { status: "error"; error: string; polls: number }
   | { status: "timeout"; sessionID: string; timeoutMs: number; polls: number }
   | { status: "aborted"; sessionID: string; polls: number }
@@ -539,7 +539,28 @@ export const TERMINAL_STABILITY_TICKS = 3
  * ignore it (their own wait window applies), so pollChild's return contract
  * is unchanged.
  */
-export type TerminalStabilityState = { stableTicks: number; textlessIdleSince?: number; viewLossTicks?: number }
+export type TerminalStabilityState = {
+  stableTicks: number
+  textlessIdleSince?: number
+  viewLossTicks?: number
+  /**
+   * Active-textful override streak (harden-dispatch-resilience D1):
+   * consecutive ticks where the status map STILL reports the child active
+   * but the finish + non-empty-text conditions hold. Lives on the shared
+   * stability state so the async poll-slice seam inherits it exactly like
+   * stableTicks.
+   */
+  activeTextfulTicks?: number
+}
+
+/**
+ * The active-textful override disclosure (harden-dispatch-resilience
+ * D1): when pollChild verdicts COMPLETE from the message stream while the
+ * status view never flipped, the terminal wake carries this sentence so
+ * the establishment path is named. Contract-tested verbatim.
+ */
+export const ACTIVE_TEXTFUL_OVERRIDE_NOTE =
+  "completion established from the message stream while the status view lagged"
 
 /**
  * Sustained view loss (dispatch-stream-loss-honesty): how many CONSECUTIVE
@@ -684,13 +705,32 @@ export async function pollChild(
       (last.parts ?? []).some((p) => p.type === "text" && typeof p.text === "string" && p.text !== "")
     if (!active && finished && textful) {
       stability.stableTicks++
+      stability.activeTextfulTicks = 0
       if (stability.stableTicks >= TERMINAL_STABILITY_TICKS) {
         return { status: "completed", polls }
+      }
+    } else if (active && statusMap !== undefined && finished && textful) {
+      // Active-textful override (harden-dispatch-resilience D1): the status
+      // map — READABLE and listing the child as active — never flips, but
+      // the finish conditions hold on a non-empty final text: the message
+      // stream has the report the status view refuses to confirm. The SAME
+      // 3-tick stability window applies (a single observation is never a
+      // verdict; any observation that breaks the conditions resets the run
+      // below). An UNREADABLE status map does NOT advance the run (the
+      // soundness posture stands: never a verdict on a signal we could not
+      // read). NO text ⇒ the override never fires — a stuck-active child
+      // without a final report keeps its honest textless-idle/stale
+      // handling (completion is never invented).
+      stability.stableTicks = 0
+      stability.activeTextfulTicks = (stability.activeTextfulTicks ?? 0) + 1
+      if (stability.activeTextfulTicks >= TERMINAL_STABILITY_TICKS) {
+        return { status: "completed", polls, via: "active-textful" }
       }
     } else {
       // Any busy/active reading or a failed candidate observation breaks the
       // consecutive run (spec: "resetting when the session turns busy again").
       stability.stableTicks = 0
+      stability.activeTextfulTicks = 0
     }
     // Textless-idle floor streak: a NOT-ACTIVE child whose latest assistant
     // message is not a reportable final message (no message, falsy finish,
