@@ -34,12 +34,17 @@
 
 ## 4. Block B — nested-dispatch guard (AFTER the crew change merges)
 
-- [ ] 4.1 Fix the async question-deny no-op (probe 1.1 finding): migrate
+- [x] 4.1 Fix the async question-deny no-op (probe 1.1 finding): migrate
   QUESTION_DENIED_SESSION_PERMISSION to the v2 array spelling
   (`permissions: [{action, resource, effect}]`) and add `permissions` to
   the v2 session-client forwarding-key list (`plugin.ts:6548`). Own
   commit — a standalone bug fix the guard rides on.
-- [ ] 4.2 `createChildSession` gains `taskDeny` create-body option (v2
+  DONE — verified already satisfied by the crew change (commit 7d7a497,
+  cross-checked against probe-1.1-evidence.md): `QUESTION_DENY_PERMISSIONS_V2`
+  (`src/dispatch-async.ts`) + dual-spelling create body + `permissions` in
+  the v2 forwarding-key list (`plugin.ts` v2SessionClient adapter). No gap
+  remained; payload assertions added under 5.3.
+- [x] 4.2 `createChildSession` gains `taskDeny` create-body option (v2
   array spelling, per probe-1.1-evidence.md); caller rule: non-forge
   target ∧ `dispatchProviderFamily(...) === "anthropic"` → set it.
   Independent commit, sequenced behind `fix-v2-crew-surface-drift`.
@@ -51,7 +56,7 @@
 - [x] 5.2 Block C: module tests (bounds, breaker transitions, half-open,
   fail-soft parse); wiring tests (terminal feeds, pump refuses, dequeue
   re-check, refusal strings verbatim).
-- [ ] 5.3 Block B: guard rule matrix (non-forge+anthropic → deny rides;
+- [x] 5.3 Block B: guard rule matrix (non-forge+anthropic → deny rides;
   non-forge+other → untouched; forge-* → untouched by this guard).
 - [x] 5.4 `bun run typecheck`; `node --test tests/*.test.mjs` all green
   (735+ baseline, zero regressions); `bun run bundle` (dist committed).
