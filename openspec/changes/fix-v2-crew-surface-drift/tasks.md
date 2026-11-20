@@ -58,6 +58,13 @@
   forward-slash paths (reported upstream); sandbox isolation requires
   OPENCODE_TEST_HOME + OPENCODE_DB + serve CWD=workspace on 2.3.2,
   OPENCODE_CONFIG_DIR alone does NOT isolate the store.)
+  (FIX RUN 2026-11-21, reports/fix-crew-e2e-bugs-report.md — both bugs fixed
+  and live-retested: (1) `subtasks` is now `.optional()` in crewBeginTool's
+  args (arm-only `{execution}` passes the host schema — live-armed in the
+  retest); (2) post-move anchor re-resolution: the resolver prefers the
+  host's `session.moved` event statement over the session.get record, which
+  live-probing showed does not reflect moves; regression matrices (d)/(e)/(f)
+  added, scenario B retest PASSED.)
 - [ ] 4.2 `bun run bundle`; official-install verify per AGENTS
   (git+file → github → npm pack tgz); version bump + `npm publish` only
   after user approval.

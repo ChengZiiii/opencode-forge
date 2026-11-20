@@ -247,6 +247,47 @@ type SessionState = {
 // implicitly on the next plan_* tool call via the directory fallback.
 const sessions = new Map<string, SessionState>()
 
+// sessionID -> the directory of the host's LATEST `session.moved` event
+// (post-move anchor re-resolution, fix-v2-crew-surface-drift 4.1). Live-probe
+// fact (2.3.2 sandbox, 2026-11-21): the plugin-facing `session.get` seam does
+// NOT reflect session moves — it keeps reporting the session's pre-move
+// (creation-anchored) location while REST `GET /api/session/:id` shows the
+// moved one. The `session.moved` event IS emitted with the new location, so
+// it is the plugin's only live, in-process statement of a session's CURRENT
+// workspace; the anchor resolver prefers it over the stale record. Bounded by
+// session.deleted eviction like the maps above.
+const sessionMovedAnchors = new Map<string, string>()
+const anchorMovedNotes = new Set<string>()
+
+// Record a host `session.moved` statement. Tolerant to payload drift (v1
+// properties / v2 flat-data shapes); a degenerate directory is ignored
+// (never poisons a good binding). Fail-soft by construction.
+function noteSessionMoved(sessionID: unknown, directory: unknown): void {
+  if (typeof sessionID !== "string" || !sessionID) return
+  if (typeof directory !== "string" || !directory || isRootish(directory)) return
+  sessionMovedAnchors.set(sessionID, directory)
+  const existing = sessions.get(sessionID)
+  if (existing) {
+    // Same non-degenerate-refinement rule as ensureSession: a real move
+    // statement re-binds the session map (the old binding is now stale).
+    existing.worktree = directory
+  }
+}
+
+// Extract the moved-directory payload of a session.moved event across the
+// observed host shapes (v1 {properties:{sessionID, location:{directory}}},
+// v2 flat {sessionID, location:{directory}} / {directory}).
+function movedEventFields(fields: Record<string, unknown>): { sessionID: unknown; directory: unknown } {
+  const loc = fields.location as { directory?: unknown } | undefined
+  const directory =
+    loc !== null && typeof loc === "object" && typeof loc.directory === "string"
+      ? loc.directory
+      : typeof fields.directory === "string"
+        ? fields.directory
+        : undefined
+  return { sessionID: fields.sessionID ?? fields.sessionId, directory }
+}
+
 // sessionID -> current agent name (tool-partition family gate). Primary
 // source: chat.message (earliest per-turn signal); belt: chat.params (always
 // carries the agent, fires for task-spawned sessions too). Bounded by
@@ -979,6 +1020,16 @@ function noteSessionAnchorLedgerBinding(sessionID: string, worktree: string): vo
 // session's own pool — the both-degenerate shape the live sources cannot
 // resolve. The re-bind path is the resolver's ONLY map write (a seed under
 // the non-degenerate-refinement rule); every other consumer is untouched.
+// Diagnostics seam (env-gated, off by default): when FORGE_ANCHOR_PROBE names a
+// file path, resolveSessionAnchorForPools appends its raw inputs (the host
+// session record and the in-memory map binding) there — the live shape probe
+// used to pin down the post-move anchor drift (fix-v2-crew-surface-drift 4.1).
+function anchorProbeLog(kind: string, sessionID: string | undefined, payload: Record<string, unknown>): void {
+  try {
+    appendFileSync(process.env.FORGE_ANCHOR_PROBE as string, JSON.stringify({ t: new Date().toISOString(), kind, sessionID, ...payload }) + "\n")
+  } catch {}
+}
+
 async function resolveSessionAnchorForPools(anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null | undefined, sessionID: string | undefined): Promise<string> {
   if (!sessionID) return ""
   let authoritative = ""
@@ -992,8 +1043,32 @@ async function resolveSessionAnchorForPools(anchorClient: { session?: { get?: (o
       : undefined
     const anchor = effectiveWorktree(rec?.worktree, rec?.directory ?? rec?.location?.directory)
     if (anchor && !isRootish(anchor)) authoritative = anchor
+    if (process.env.FORGE_ANCHOR_PROBE) anchorProbeLog("rec", sessionID, { rec: rec ?? null, authoritative })
   } catch {}
   const mapped = sessions.get(sessionID)?.worktree ?? ""
+  if (process.env.FORGE_ANCHOR_PROBE) anchorProbeLog("map", sessionID, { mapped })
+  // Post-move anchor re-resolution (fix-v2-crew-surface-drift 4.1): on 2.3.2
+  // the plugin-facing session.get seam keeps the PRE-MOVE location after a
+  // real `POST /api/session/:id/move` (live-probed: REST shows the moved
+  // directory, session.get does not) — so the "authoritative" record above
+  // is STALE for moved sessions. The host's `session.moved` event (recorded
+  // in sessionMovedAnchors by the v1/v2 event hooks) is the live statement
+  // of the session's CURRENT workspace; it wins over the stale record —
+  // both directions (into a pool and out of one; POOLS follow workspaces).
+  // No ledger consult on this branch: a deliberate move must not be
+  // "resurrected" back to the session's historical pool by the resume
+  // ledger (that ledger exists for the restart-resume shape, not to
+  // override a live host statement).
+  const moved = sessionMovedAnchors.get(sessionID) ?? ""
+  if (moved && (authoritative === "" || foldPath(moved) !== foldPath(authoritative))) {
+    if (!anchorMovedNotes.has(sessionID)) {
+      anchorMovedNotes.add(sessionID)
+      console.warn(
+        `[forge:pool] session ${sessionID}: dispatch anchor re-resolved from the host's session.moved event (${moved}) — the session.get seam still reports the pre-move location${authoritative ? ` (${authoritative})` : ""}; the moved workspace wins this resolution.`,
+      )
+    }
+    return moved
+  }
   if (authoritative === "") return resolveAnchorViaLedger(sessionID, mapped)
   // anchor-pool-preference (the 0.20.0 evening incident's mirror of the
   // 0.18.0 one): a restart-RESUMED session's authoritative record can carry
@@ -4080,7 +4155,7 @@ const crewBeginTool = tool({
     subtasks: tool.schema.array(tool.schema.object({
       title: tool.schema.string().describe("Short unique subtask title — the crew_close report must use these exact titles"),
       agent: tool.schema.string().optional().describe("Intended forge-* agent id for this subtask, when one matches"),
-    })).describe("The declared subtask plan — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list"),
+    })).optional().describe("The declared subtask plan (REQUIRED on registration, ABSENT on the arm call) — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list"),
     lineage: tool.schema.string().optional().describe("Free-text origin of the macro contract — e.g. the plan artifact path this crew descends from (.opencode/plan/<date>-<slug>.md). Recorded as a first-class lineage: line in the crew record header and disclosed in the registration output. Explicit argument only — never inferred from recently-terminal plans."),
   },
   execute: async (args, context) => {
@@ -4916,6 +4991,10 @@ function harvestSessionEnd(sessionID: string): void {
   // the LEDGER file itself is persistent evidence and survives).
   poolGateLedgerNotes.delete(sessionID)
   sessionAnchorLedgerMemo.delete(sessionID)
+  // Post-move anchor bound (fix-v2-crew-surface-drift 4.1): the moved
+  // workspace statement dies with the session.
+  sessionMovedAnchors.delete(sessionID)
+  anchorMovedNotes.delete(sessionID)
   // Crew hygiene (crew-autonomous-waves D4): the session's crew was
   // in-memory and session-bound — end it with the session, and evict
   // the crew continuation engine's maps alongside (mirrors the
@@ -5760,6 +5839,19 @@ export const server: Plugin = async (input, options) => {
       if (event.type === "session.deleted") {
         const info = (event as unknown as { properties: { info: { id?: string } } }).properties.info
         if (typeof info?.id === "string" && info.id) harvestSessionEnd(info.id)
+      }
+      if ((event as unknown as { type?: string }).type === "session.moved") {
+        // Post-move anchor re-resolution: the host's live statement of the
+        // session's new workspace (the session.get seam stays pre-move).
+        // Typed defensively: "session.moved" is a 2.3.2 v2 event; older v1
+        // hosts never emit it (the branch simply never fires there).
+        try {
+          const props = (event as unknown as { properties?: Record<string, unknown>; location?: unknown }).properties ?? (event as unknown as Record<string, unknown>)
+          const f = movedEventFields(props)
+          noteSessionMoved(f.sessionID, f.directory)
+        } catch {
+          // Drifted moved payload: no-op, never a throw into the host.
+        }
       }
     },
 
@@ -6897,6 +6989,16 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
             } catch {
               // Drifted deleted payload: no-op, never a throw into the host.
             }
+          } else if (type === "session.moved") {
+            // Post-move anchor re-resolution (see the resolver branch): the
+            // v2 event payload is flat {sessionID, location:{directory}}
+            // under .data — v2EventFields already unwraps it.
+            try {
+              const f = movedEventFields(fields)
+              noteSessionMoved(f.sessionID, f.directory)
+            } catch {
+              // Drifted moved payload: no-op, never a throw into the host.
+            }
           } else if (idleFallback && (type === "session.execution.succeeded" || type === "session.idle")) {
             const sessionID = v2PickStr(fields, "sessionID", "sessionId")
             if (sessionID) v2HandleIdle(sessionID, goalClient)
@@ -6928,7 +7030,7 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
 // the v1 __forgeSubagentsTest): live references to the module maps the v2
 // handlers share with the v1 hooks, so tests seed and inspect without a
 // host. NOT part of the plugin API surface.
-export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
+export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
 
 // ---- v2-single-agent-surface: single-agent-surface primitives (v2Setup
 // only — the v1 config-hook path never uses these) ----

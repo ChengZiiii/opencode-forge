@@ -17496,6 +17496,24 @@ function effectiveWorktree(worktree, fallback) {
   return (fallback ?? "").trim();
 }
 var sessions = new Map;
+var sessionMovedAnchors = new Map;
+var anchorMovedNotes = new Set;
+function noteSessionMoved(sessionID, directory) {
+  if (typeof sessionID !== "string" || !sessionID)
+    return;
+  if (typeof directory !== "string" || !directory || isRootish(directory))
+    return;
+  sessionMovedAnchors.set(sessionID, directory);
+  const existing = sessions.get(sessionID);
+  if (existing) {
+    existing.worktree = directory;
+  }
+}
+function movedEventFields(fields) {
+  const loc = fields.location;
+  const directory = loc !== null && typeof loc === "object" && typeof loc.directory === "string" ? loc.directory : typeof fields.directory === "string" ? fields.directory : undefined;
+  return { sessionID: fields.sessionID ?? fields.sessionId, directory };
+}
 var sessionAgents = new Map;
 var sealFindings = new Map;
 var sealUnknownNotes = new Set;
@@ -17939,6 +17957,12 @@ function noteSessionAnchorLedgerBinding(sessionID, worktree) {
     sessionAnchorLedgerWarnOnce("write", err);
   }
 }
+function anchorProbeLog(kind, sessionID, payload) {
+  try {
+    appendFileSync2(process.env.FORGE_ANCHOR_PROBE, JSON.stringify({ t: new Date().toISOString(), kind, sessionID, ...payload }) + `
+`);
+  } catch {}
+}
 async function resolveSessionAnchorForPools(anchorClient, sessionID) {
   if (!sessionID)
     return "";
@@ -17948,8 +17972,20 @@ async function resolveSessionAnchorForPools(anchorClient, sessionID) {
     const anchor = effectiveWorktree(rec?.worktree, rec?.directory ?? rec?.location?.directory);
     if (anchor && !isRootish(anchor))
       authoritative = anchor;
+    if (process.env.FORGE_ANCHOR_PROBE)
+      anchorProbeLog("rec", sessionID, { rec: rec ?? null, authoritative });
   } catch {}
   const mapped = sessions.get(sessionID)?.worktree ?? "";
+  if (process.env.FORGE_ANCHOR_PROBE)
+    anchorProbeLog("map", sessionID, { mapped });
+  const moved = sessionMovedAnchors.get(sessionID) ?? "";
+  if (moved && (authoritative === "" || foldPath(moved) !== foldPath(authoritative))) {
+    if (!anchorMovedNotes.has(sessionID)) {
+      anchorMovedNotes.add(sessionID);
+      console.warn(`[forge:pool] session ${sessionID}: dispatch anchor re-resolved from the host's session.moved event (${moved}) — the session.get seam still reports the pre-move location${authoritative ? ` (${authoritative})` : ""}; the moved workspace wins this resolution.`);
+    }
+    return moved;
+  }
   if (authoritative === "")
     return resolveAnchorViaLedger(sessionID, mapped);
   if (mapped && !isRootish(mapped) && foldPath(mapped) !== foldPath(authoritative) && sessionPoolFileOf(authoritative) === null && sessionPoolFileOf(mapped) !== null) {
@@ -20145,7 +20181,7 @@ var crewBeginTool = tool({
     subtasks: tool.schema.array(tool.schema.object({
       title: tool.schema.string().describe("Short unique subtask title — the crew_close report must use these exact titles"),
       agent: tool.schema.string().optional().describe("Intended forge-* agent id for this subtask, when one matches")
-    })).describe("The declared subtask plan — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list"),
+    })).optional().describe("The declared subtask plan (REQUIRED on registration, ABSENT on the arm call) — decompose the objective into these before any execution; crew_close cross-checks the report against exactly this list"),
     lineage: tool.schema.string().optional().describe("Free-text origin of the macro contract — e.g. the plan artifact path this crew descends from (.opencode/plan/<date>-<slug>.md). Recorded as a first-class lineage: line in the crew record header and disclosed in the registration output. Explicit argument only — never inferred from recently-terminal plans.")
   },
   execute: async (args, context) => {
@@ -20743,6 +20779,8 @@ function harvestSessionEnd(sessionID) {
   anchorPrefNotes.delete(sessionID);
   poolGateLedgerNotes.delete(sessionID);
   sessionAnchorLedgerMemo.delete(sessionID);
+  sessionMovedAnchors.delete(sessionID);
+  anchorMovedNotes.delete(sessionID);
   crews.delete(sessionID);
   crewEngineForgetSession(sessionID);
 }
@@ -21263,6 +21301,13 @@ var server = async (input, options) => {
         const info = event.properties.info;
         if (typeof info?.id === "string" && info.id)
           harvestSessionEnd(info.id);
+      }
+      if (event.type === "session.moved") {
+        try {
+          const props = event.properties ?? event;
+          const f = movedEventFields(props);
+          noteSessionMoved(f.sessionID, f.directory);
+        } catch {}
       }
     },
     "shell.env": async (input2, output) => {
@@ -21981,6 +22026,11 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
               if (id)
                 harvestSessionEnd(id);
             } catch {}
+          } else if (type === "session.moved") {
+            try {
+              const f = movedEventFields(fields);
+              noteSessionMoved(f.sessionID, f.directory);
+            } catch {}
           } else if (idleFallback && (type === "session.execution.succeeded" || type === "session.idle")) {
             const sessionID = v2PickStr(fields, "sessionID", "sessionId");
             if (sessionID)
@@ -22004,7 +22054,7 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
     return null;
   }
 }
-var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => {
+var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => {
   hostAnchors.length = 0;
   poolResolver = null;
   poolResolution = null;

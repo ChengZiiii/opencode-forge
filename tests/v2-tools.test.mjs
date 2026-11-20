@@ -96,6 +96,24 @@ test("v2 tools: schema translation — required vs optional, ints, arrays, descr
   assert.deepEqual(gj.required, ["action"])
 })
 
+test("v2 tools: crew_begin schema — subtasks is OPTIONAL (the arm-only {execution} call passes parameter validation)", async () => {
+  // fix-v2-crew-surface-drift 4.1 bug 1, live-proved on 2.3.2 (E2E A-2): the
+  // arm-only call crew_begin {execution:"waves"} was refused by the HOST
+  // schema validator ("subtasks: Missing key") because subtasks lacked
+  // .optional() — contradicting the tool's own description ("called with
+  // {execution} ONLY (no objective/subtasks) it ARMS the pending crew").
+  // The v2 input translation is the exact schema the host validates against.
+  const state = await setupTools()
+  const cb = state.tools.get("crew_begin").input
+  const req = Array.isArray(cb.required) ? cb.required : []
+  assert.equal(cb.properties.subtasks.type, "array", "subtasks stays an array arg")
+  assert.equal(req.includes("subtasks"), false, "subtasks is OPTIONAL — the arm call omits it")
+  for (const opt of ["objective", "execution", "lineage"]) {
+    assert.equal(req.includes(opt), false, `crew_begin.${opt} optional`)
+  }
+  assert.equal(req.length, 0, "no crew_begin argument is required (registration enforces objective+subtasks in execute, not the schema)")
+})
+
 test("v2 tools: execute reuses the shared cores — results wrap in { content } (SANDBOX-PENDING shape)", async () => {
   const state = await setupTools()
   // forge_jobs list: harmless, registry empty on a fresh process.

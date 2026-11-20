@@ -1486,3 +1486,109 @@ test("crew anchor matrix (c): fresh install — ONLY a workspace pool, no global
   assert.ok(!existsSync(join(emptyHome, ".config", "opencode", "forge.json")), "no global layer was required (D3 acceptance shape)")
   await h.tool.crew_close.execute({ abandon: true, reason: "matrix c" }, allowCtx("ses_fresh"))
 })
+
+// ---------------------------------------------------------------------------
+// fix-v2-crew-surface-drift 4.1 appendage: post-move anchor re-resolution.
+// Live-probed on 2.3.2 (reports/e2e-crew-surface-drift-report.md B-2/B-3 +
+// the follow-up anchor-probe run): after a REAL POST /api/session/:id/move,
+// the plugin-facing session.get seam keeps reporting the PRE-MOVE location
+// (REST shows the moved one). The host's `session.moved` event carries the
+// new location — the resolver must prefer it over the stale record.
+
+test("crew anchor matrix (d): after a session.move INTO the pooled workspace, the moved event beats the stale session-get record (the E2E B-2/B-3 bug as a regression)", async (t) => {
+  const dirPool = dirWithForgeJson(t, "forge-pool-camd-", { pool: "crewd", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const dirPlain = mkdtempSync(join(tmpdir(), "forge-pool-camd-plain-"))
+  t.after(() => {
+    try {
+      rmSync(dirPlain, { recursive: true, force: true })
+    } catch {}
+  })
+  const prevHome = process.env.FORGE_TEST_FORGE_HOME
+  const emptyHome = mkdtempSync(join(tmpdir(), "forge-pool-camd-home-"))
+  process.env.FORGE_TEST_FORGE_HOME = emptyHome
+  t.after(() => {
+    process.env.FORGE_TEST_FORGE_HOME = prevHome
+    try {
+      rmSync(emptyHome, { recursive: true, force: true })
+    } catch {}
+  })
+  // The LIVE bug shape: the session-get record (and the tool context) still
+  // report the PRE-MOVE pool-less directory; only the session.moved event
+  // knows the session now lives in the pooled workspace.
+  const h = await startServer(recordInput(dirPool, { ses_moved_in: { directory: dirPlain, worktree: dirPlain } }), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.event({ event: { type: "session.moved", properties: { sessionID: "ses_moved_in", location: { directory: dirPool } } } })
+  const out = await h.tool.crew_begin.execute(
+    { objective: "moved-in crew", subtasks: [{ title: "one" }] },
+    { ...allowCtx("ses_moved_in"), worktree: dirPlain, directory: dirPlain },
+  )
+  assert.match(out.output, /forge-crewd-research/, "the moved-into workspace's pool IS the roster")
+  assert.ok(!out.output.includes("CREW IS NOT INITIALIZED"), "the stale-record refusal is gone (re-anchor after move)")
+  assert.ok(existsSync(join(dirPool, ".opencode", "crew")), "the crew record is written under the MOVED workspace")
+  await h.tool.crew_close.execute({ abandon: true, reason: "matrix d" }, { ...allowCtx("ses_moved_in"), worktree: dirPlain, directory: dirPlain })
+})
+
+test("crew anchor matrix (e): after a session.move OUT of the pooled workspace, the moved event wins over BOTH the stale record and the pooled in-memory binding (no pool resurrection)", async (t) => {
+  const dirPool = dirWithForgeJson(t, "forge-pool-came-", { pool: "crewe", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const dirPlain = mkdtempSync(join(tmpdir(), "forge-pool-came-plain-"))
+  t.after(() => {
+    try {
+      rmSync(dirPlain, { recursive: true, force: true })
+    } catch {}
+  })
+  const prevHome = process.env.FORGE_TEST_FORGE_HOME
+  const emptyHome = mkdtempSync(join(tmpdir(), "forge-pool-came-home-"))
+  process.env.FORGE_TEST_FORGE_HOME = emptyHome
+  t.after(() => {
+    process.env.FORGE_TEST_FORGE_HOME = prevHome
+    try {
+      rmSync(emptyHome, { recursive: true, force: true })
+    } catch {}
+  })
+  // Stale record AND a pooled in-memory binding both say dirPool; the host
+  // moved the session to a pool-less directory. POOLS follow workspaces: the
+  // moved (pool-less) anchor wins — the pooled preference rule must NOT
+  // resurrect the abandoned workspace's dispatch rights.
+  const h = await startServer(recordInput(dirPool, { ses_moved_out: { directory: dirPool, worktree: dirPool } }), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await bindSession(h, "ses_moved_out", dirPool)
+  await h.event({ event: { type: "session.moved", properties: { sessionID: "ses_moved_out", location: { directory: dirPlain } } } })
+  await assert.rejects(
+    () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, { ...allowCtx("ses_moved_out"), worktree: dirPool, directory: dirPool }),
+    (err) => {
+      assert.match(String(err), /CREW IS NOT INITIALIZED/, "the moved-out session honestly refuses (no stale pool rights)")
+      assert.ok(!String(err).includes("crewe"), "the refusal does not name the abandoned pool's workspace")
+      return true
+    },
+  )
+})
+
+test("crew anchor matrix (f): no move event — the record-first chain is EXACTLY today's (the moved-event branch never fires)", async (t) => {
+  const dirPool = dirWithForgeJson(t, "forge-pool-camf-", { pool: "crewf", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } })
+  const launchDir = mkdtempSync(join(tmpdir(), "forge-pool-camf-launch-"))
+  t.after(() => {
+    try {
+      rmSync(launchDir, { recursive: true, force: true })
+    } catch {}
+  })
+  const prevHome = process.env.FORGE_TEST_FORGE_HOME
+  const emptyHome = mkdtempSync(join(tmpdir(), "forge-pool-camf-home-"))
+  process.env.FORGE_TEST_FORGE_HOME = emptyHome
+  t.after(() => {
+    process.env.FORGE_TEST_FORGE_HOME = prevHome
+    try {
+      rmSync(emptyHome, { recursive: true, force: true })
+    } catch {}
+  })
+  const h = await startServer(recordInput(dirPool, { ses_nomove: { directory: dirPool, worktree: dirPool } }), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const out = await h.tool.crew_begin.execute(
+    { objective: "no-move crew", subtasks: [{ title: "one" }] },
+    { ...allowCtx("ses_nomove"), worktree: launchDir, directory: launchDir },
+  )
+  assert.match(out.output, /forge-crewf-research/, "the record-first chain keeps matrix (a)'s semantics untouched")
+  await h.tool.crew_close.execute({ abandon: true, reason: "matrix f" }, { ...allowCtx("ses_nomove"), worktree: launchDir, directory: launchDir })
+})
