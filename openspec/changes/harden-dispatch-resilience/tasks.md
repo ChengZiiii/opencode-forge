@@ -33,10 +33,15 @@
 
 ## 4. Block B — nested-dispatch guard (AFTER the crew change merges)
 
-- [ ] 4.1 `createChildSession` gains `taskDeny` create-body option
-  (guarded by probe 1.1's evidence); caller rule: non-forge target ∧
-  `dispatchProviderFamily(...) === "anthropic"` → set it. Independent
-  commit, sequenced behind `fix-v2-crew-surface-drift`.
+- [ ] 4.1 Fix the async question-deny no-op (probe 1.1 finding): migrate
+  QUESTION_DENIED_SESSION_PERMISSION to the v2 array spelling
+  (`permissions: [{action, resource, effect}]`) and add `permissions` to
+  the v2 session-client forwarding-key list (`plugin.ts:6548`). Own
+  commit — a standalone bug fix the guard rides on.
+- [ ] 4.2 `createChildSession` gains `taskDeny` create-body option (v2
+  array spelling, per probe-1.1-evidence.md); caller rule: non-forge
+  target ∧ `dispatchProviderFamily(...) === "anthropic"` → set it.
+  Independent commit, sequenced behind `fix-v2-crew-surface-drift`.
 
 ## 5. Tests
 

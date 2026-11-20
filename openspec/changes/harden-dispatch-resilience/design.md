@@ -34,10 +34,21 @@
   opts.taskDeny?)` — when true, the create body carries the task-tool deny
   permission. Caller-side rule: target is non-forge AND
   `dispatchProviderFamily(model) === "anthropic"` (existing helper,
-  `plugin.ts:561`). A sandbox probe FIRST proves the create-body permission
-  actually hides the task tool from the child (QUESTION_DENY's channel is
-  the precedent; verify, don't assume). Sequenced AFTER the crew change
-  merges (`createChildSession` is in its diff); implemented as its own
+  `plugin.ts:561`). **Probe 1.1 evidence (2026-11-21,
+  probe-1.1-evidence.md): the create-body channel WORKS on 2.3.2 — a
+  `permissions: [{action, resource, effect}]` array lands verbatim in the
+  child's session record via both `POST /api/session` and the
+  `ctx.session.create` plugin seam.** Two corrections the probe forced:
+  (a) the LEGACY spelling `permission: [{permission, action, pattern}]` —
+  which the existing QUESTION_DENIED_SESSION_PERMISSION uses — is
+  SILENTLY DROPPED on 2.3.2: the async question-deny has been a no-op on
+  v2 hosts; block B therefore also MIGRATES the question-deny payload to
+  the v2 array spelling and adds `permissions` to the v2 session-client
+  forwarding-key list (`plugin.ts:6548`) — its own commit, a bug fix the
+  guard rides on. (b) the child-create seam for this change is
+  `ctx.session.create` (flat single-object args, honors parentID/
+  directory). Sequenced AFTER the crew change merges
+  (`createChildSession` is in its diff); implemented as its own
   commit for clean revert.
 - **D3 — Provider gate + breaker (block C):** new pure-logic module
   `src/dispatch-gate.ts` (counters, breaker state machine: closed → open
