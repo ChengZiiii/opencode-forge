@@ -55,6 +55,16 @@ drift, registration `SHALL` skip silently instead of throwing; a domain
 that is absent or reshaped disables exactly its own feature slice and the
 rest of `setup` still runs.
 
+Pool and workspace anchor resolution `SHALL` accept anchor fields in BOTH
+shapes: a zero-arg function (invoked for the value, unchanged) or a plain
+property value used directly as the anchor string. A non-callable anchor
+field `SHALL NOT` be treated as absent: on the 2.3.2 host, where
+`ctx.location.directory` is a string property and `ctx.location.worktree`
+does not exist, anchor resolution `SHALL` still produce candidates from
+the property so the `forge-<ns>-<id>` workers materialize. Guarded
+degradation `SHALL NOT` swallow the entire pool when only the anchor
+field's shape differs from the function expectation.
+
 #### Scenario: An existing same-name entry is not clobbered under v2
 
 - **WHEN** a v2 loader calls `setup` and the agent draft already contains a
@@ -83,6 +93,22 @@ rest of `setup` still runs.
   while the other domains are intact
 - **THEN** the permission belt registration is skipped without throwing
   and the tool, agent, session, command, and event registrations still run
+
+#### Scenario: Property-shaped location anchors resolve on real v2 hosts
+
+- **WHEN** a v2 host exposes `ctx.location.directory` as a plain string
+  property (opencode 2.3.2 field reality) and a workspace pool declares
+  anchor-based workers
+- **THEN** the resolver reads the property value directly, materializes
+  the `forge-<ns>-<id>` workers for the pool, and `/api/agent` lists them
+  for the pool's directory
+
+#### Scenario: Absent anchor fields fall through without failing
+
+- **WHEN** the host context lacks an anchor field entirely (e.g.
+  `ctx.location.worktree` does not exist on 2.3.2)
+- **THEN** that field yields no candidate, resolution falls through to the
+  remaining candidates, and no error is thrown
 
 ### Requirement: Register the forge primary agent on the forge exec surface
 
