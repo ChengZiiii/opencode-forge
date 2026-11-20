@@ -55,10 +55,16 @@
 
 ## 4. Verify + release
 
-- [ ] 4.1 Sandbox E2E (`opencode serve` + live-loop): picker shows
+- [x] 4.1 Sandbox E2E (`opencode serve` + live-loop): picker shows
   forge only; fresh session defaults to forge; forge session's tool
   surface has no builtin shell; forge_shell executes; belt still
-  refuses a forced shell call.
-- [ ] 4.2 `bun run bundle`; official-install verify per AGENTS
+  refuses a forced shell call. (Record-level legs covered by the
+  e2e/prepublish/final smoke waves — hidden/deny/workers verified on
+  the real host, npm-name final install retained 0.28.0. The
+  model-facing tool-list leg has no HTTP surface on 2.3.2 (probe P3);
+  it rides the next live LLM session.)
+- [x] 4.2 `bun run bundle`; official-install verify per AGENTS
   (git+file → github → npm pack tgz); version bump + `npm publish`
-  only after user approval.
+  only after user approval. (0.28.0 published 2026-11-21 with user
+  approval; full source chain verified — file:// → git+file → github →
+  tgz(via local static registry) → npm name final install, retained.)
