@@ -2,20 +2,21 @@
 
 ## 1. Sandbox probes (gating — 2.3.2, OPENCODE_CONFIG_DIR isolated)
 
-- [ ] 1.1 Deny-shapes-visibility probe: register a test agent with
-  `{action:"shell", resource:"*", effect:"deny"}`; assert whether the
-  model-facing tool list (prompt assembly) excludes the builtin shell
-  while forge_shell still executes. Record the verdict in design.md D4 —
-  if deny is execution-only, close the front-door slice as a documented
-  limitation (belt stays) and update the delta before apply ends.
+- [x] 1.1 Deny-shapes-visibility probe — STATIC LEG DONE (binary,
+  2026-11-20): `Tool.snapshot` skips blanket-denied tools from the
+  model-facing inventory; `Tool.check` applies the same filter to the
+  Code Mode catalog; hard rule recorded: never deny action `"execute"`
+  (Code Mode kill switch). Live leg: end-to-end sandbox confirm that a
+  deny-shell forge session offers no builtin shell while forge_shell
+  executes.
 - [ ] 1.2 Ordering probe: plugin transform vs the config→agent merge
   (`id:"opencode.agent"`) — does an explicit user `agent.build.hidden:
   false` / `default_agent` survive the plugin's writes? Decides D3's
   override claim and D5's gate. Record observed order.
-- [ ] 1.3 Action-name + blast-radius probe: confirm the deny action id
-  for the builtin shell (`shell`; check whether a `bash` alias matters
-  on 2.3.2) and that the deny on forge-family records leaves non-forge
-  agents' shell untouched.
+- [ ] 1.3 Action-name + blast-radius probe (live leg): confirm the deny
+  action id `shell` end-to-end (explore def + snapshot filter use the
+  same namespace) and that the deny on forge-family records leaves
+  non-forge agents' shell untouched.
 
 ## 2. Implement
 

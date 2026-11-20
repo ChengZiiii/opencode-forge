@@ -29,19 +29,27 @@ Two live defects on the real opencode 2.3.2 host, both user-reported:
 
 ## What Changes
 
+- **Zero-persistence contract (user directive):** everything below is
+  delivered exclusively as runtime agent-layer state. The plugin writes
+  NOTHING to the user's opencode config — uninstalling the plugin
+  restores the native primaries and the default subject on the next
+  agent-layer rebuild. (The interim manual `agent.build/plan.hidden`
+  config edit made while scoping this change was reverted and verified
+  live: both records back to `hidden: false`, hot, zero residue.)
 - **Native primary suppression (v2 only):** `v2Setup`'s agent transform
   sets `hidden: true` on the native `build` and `plan` records via
   `draft.update` — guarded (record must exist), fail-soft per record,
   never un-hides, never touches any other field. Records are hidden,
   NOT removed (existing sessions that reference them keep working).
   Opt-out: `"hideNativeAgents": false` in the GLOBAL forge.json layer
-  (the one config channel the plugin can read on v2).
+  (the plugin's own config file — forge.json, not the opencode config).
 - **Default subject (v2, ordering-gated):** where the agent draft editor
   exposes `default()` and the plugin-before-config transform ordering is
   confirmed (so a user's explicit `default_agent` still wins), `v2Setup`
-  sets the agent default to `forge`. If ordering cannot be confirmed on
-  a host shape, this slice degrades to the documented config recipe
-  (`default_agent: "forge"`) and ships nothing.
+  sets the agent default to `forge` — retiring the need for a manual
+  `default_agent` config line (the dev host's line is removed once this
+  ships). If ordering cannot be confirmed on a host shape, this slice
+  degrades to the documented config recipe and ships nothing.
 - **Exec-surface front door (v2 only):** the forge agent record and every
   materialized `forge-*` record carry
   `{ action: "shell", resource: "*", effect: "deny" }` in their

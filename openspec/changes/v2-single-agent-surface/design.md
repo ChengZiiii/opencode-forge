@@ -29,6 +29,12 @@
 
 ## Decision tree
 
+- **D0 zero persistence (user directive 2026-11-20):** the single-agent
+  surface SHALL be plugin-owned runtime state only. No writes to the
+  user's opencode config, ever — uninstall must restore the natives
+  (ties into the forge-agent spec's existing Uninstall self-healing
+  requirement). The plugin's own knobs live in forge.json (the plugin's
+  own config file domain), never in opencode.json(c).
 - **D1 hide vs remove:** hide (`hidden: true`), records stay — existing
   build/plan sessions keep resolving; nothing else in the record is
   touched.
@@ -45,17 +51,23 @@
   `agent.build.hidden: false` in opencode config ALSO wins (merge runs
   later); otherwise the forge.json knob is the only opt-out and the
   README says so.
-- **D4 shell front door:** every forge-family record (primary + all
-  materialized `forge-*`, any shape) pushes
-  `{action:"shell", resource:"*", effect:"deny"}` into its permission
-  payload at registration. GATING PROBE (task 1.1): if deny shapes the
-  model-facing tool list (expected, per the explore-agent design), this
-  is the front door and the belt stays as depth. If deny turns out to
-  be execution-only on this host, the slice closes as a verified
-  limitation: belt + system mandate remain the v2 posture and the drift
-  is documented — global `tool.transform` removal is rejected because
-  it would strip the shell from NON-forge agents, violating the
-  non-forge isolation requirement.
+- **D4 shell front door — STATICALLY CONFIRMED (binary, 2.3.2):** the
+  host's `Tool.snapshot` (model-facing tool inventory assembly) skips
+  every tool whose permission action is blanket-denied —
+  `if (Dc(tool.options?.permission ?? name, permissions)) continue` —
+  and `Tool.check` (Code Mode validation) applies the same filter, so a
+  denied tool disappears from BOTH the plain tool list and the Code
+  Mode catalog. `Dc` = findLast permission entry matching the action,
+  true when `resource==="*" && effect==="deny"`; last-match-wins means
+  later config-merged permissions (user's explicit allow) can override
+  the plugin's deny — the same user-wins precedence as D3/D5. Every
+  forge-family record (primary + all materialized `forge-*`, any shape)
+  pushes `{action:"shell", resource:"*", effect:"deny"}` at
+  registration. HARD RULE: never deny action `"execute"` —
+  `!Dc("execute", perms)` is the Code Mode kill switch. The sandbox leg
+  of 1.1 remains as end-to-end confirmation only; global
+  `tool.transform` removal stays rejected (would strip shell from
+  NON-forge agents, violating the non-forge isolation requirement).
 - **D5 default subject:** `draft.default(FORGE_AGENT)` guarded by
   `typeof draft.default === "function"`, shipped ONLY if task 1.2
   confirms plugin transforms run BEFORE the config merge on 2.3.2 (so
