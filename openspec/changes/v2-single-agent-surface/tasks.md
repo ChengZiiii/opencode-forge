@@ -44,12 +44,14 @@
 
 ## 3. Tests
 
-- [ ] 3.1 v2-setup wiring: suppression matrix (record exists / absent /
+- [x] 3.1 v2-setup wiring: suppression matrix (record exists / absent /
   already hidden / knob off / one record throws), primary+worker
   records carry the shell deny, default setter called only under the
-  confirmed guard.
-- [ ] 3.2 `bun run typecheck` clean; `node --test tests/*.test.mjs` all
-  green (v1 suites must not regress).
+  confirmed guard. (Verified: 728/0 suite run, review report
+  VERIFIED across the matrix.)
+- [x] 3.2 `bun run typecheck` clean; `node --test tests/*.test.mjs` all
+  green (v1 suites must not regress). (728 pass / 0 fail, exit 0 —
+  gate run 2026-11-21.)
 
 ## 4. Verify + release
 
