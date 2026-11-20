@@ -5637,6 +5637,9 @@ type V2AgentDraft = {
   get(id: string): unknown
   update(id: string, update: (agent: Record<string, unknown>) => void): void
   remove(id: string): void
+  // v2-single-agent-surface D5: the agent draft editor exposes a default
+  // setter (binary-verified 2.3.2) — guarded everywhere it is called.
+  default?(id: string): void
 }
 type V2ToolEditor = {
   add?(def: { name: string; description: string; input: Record<string, unknown>; execute: (args: unknown, toolCtx: unknown) => Promise<unknown> }): void
@@ -6588,6 +6591,54 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
 // host. NOT part of the plugin API surface.
 export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
 
+// ---- v2-single-agent-surface: single-agent-surface primitives (v2Setup
+// only — the v1 config-hook path never uses these) ----
+//
+// Host reality (binary + /api/agent, 2.3.2): v2 agent records carry
+// `permissions` as an ARRAY of {action, resource, effect} entries; per-agent
+// tool visibility is permission-driven (the host's tool inventory assembly
+// drops any tool whose action is blanket-denied, last-match-wins). The deny
+// front door for the builtin shell rides that array. HARD RULE: never deny
+// action "execute" — that is the Code Mode kill switch.
+const V2_SHELL_DENY: { action: string; resource: string; effect: string } = { action: "shell", resource: "*", effect: "deny" }
+
+function v2WithShellDeny(perms: unknown): Array<Record<string, unknown>> {
+  const arr: Array<Record<string, unknown>> = Array.isArray(perms) ? perms.filter((p) => p !== null && typeof p === "object") : []
+  if (!arr.some((p) => p.action === "shell")) arr.push({ ...V2_SHELL_DENY })
+  return arr
+}
+
+// Translate the v1 shape-derived permission record ({"task":"deny", ...})
+// into the v2 array form, always appending the shell-deny front door. The
+// readonly seal (MUTATING_TOOLS deny family) and the task:deny recursion ban
+// land in the array form — the old singular `permission` spelling was a
+// wrong field name on this domain and never reached the host.
+function v2PermissionArray(record: Record<string, string>): Array<Record<string, unknown>> {
+  const arr = Object.entries(record).map(([action, effect]) => ({ action, resource: "*", effect }))
+  arr.push({ ...V2_SHELL_DENY })
+  return arr
+}
+
+// hideNativeAgents knob (D3): GLOBAL forge.json layer only (the plugin's own
+// config domain — never the user's opencode config), JSONC read-only parse,
+// default true; only an explicit false disables. Any read/parse failure keeps
+// the default (fail-soft).
+function v2ReadHideNatives(deps?: V2SetupDeps): boolean {
+  try {
+    const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir()
+    const globalPath = forgeConfigPaths({ homeDir }).global
+    const text = deps?.readFile ? deps.readFile(globalPath) : readFileSync(globalPath, "utf8")
+    const parsed = parseForgeJsonc(text)
+    if (parsed.ok && parsed.config !== null && typeof parsed.config === "object") {
+      const knob = (parsed.config as { hideNativeAgents?: unknown }).hideNativeAgents
+      if (knob === false) return false
+    }
+  } catch {
+    // Absent/unreadable global layer: keep the default.
+  }
+  return true
+}
+
 export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise<void | (() => void)> {
   // ---- host-axis parity (tasks 3.1/4.x): the belts and injections below
   // share the v1 module state (only ONE entry ever runs per host process),
@@ -6616,6 +6667,38 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
           agent.system = FORGE_PROMPT
           agent.mode = "primary"
         })
+      }
+      // v2-single-agent-surface D4: the builtin-shell deny front door rides
+      // the PRIMARY record too — idempotent append, so a user-defined forge
+      // entry keeps every other field (tools-merge parity with the v1
+      // loader's user-entry semantics).
+      try {
+        draft.update(FORGE_AGENT, (agent) => {
+          agent.permissions = v2WithShellDeny(agent.permissions)
+        })
+      } catch (err) {
+        console.warn(`[forge:v2] error: shell deny not applied to the forge record: ${String(err)}`)
+      }
+      // ---- v2-single-agent-surface D1/D2: native primary suppression ----
+      // Hide-only (records stay — existing build/plan sessions keep
+      // resolving), guarded (absent → skip; already hidden → untouched),
+      // per-record fail-soft, never touching any other field. Opt-out:
+      // "hideNativeAgents": false in the GLOBAL forge.json layer (D3). This
+      // block is v2-only — the v1 config hook path never touches native
+      // records.
+      if (v2ReadHideNatives(deps)) {
+        for (const nativeId of ["build", "plan"] as const) {
+          try {
+            const rec = draft.get(nativeId)
+            if (rec === undefined || rec === null) continue
+            if (typeof rec === "object" && (rec as { hidden?: unknown }).hidden === true) continue
+            draft.update(nativeId, (r) => {
+              r.hidden = true
+            })
+          } catch (err) {
+            console.warn(`[forge:v2] error: native agent ${nativeId} not hidden: ${String(err)}`)
+          }
+        }
       }
       // Static forge subagents (spec: forge-subagents — v2 parity): same
       // create-only discipline as the forge entry. The COMPLETE
@@ -6671,7 +6754,15 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
               // agent schema documents a draft-settable model shape
               // (documented drift; the thoughtLevel pin is unaffected — it
               // rides the runtime chat.params pool lookup by agent id).
-              agentDraft.permission = v1def.permission
+              // v2-single-agent-surface D4 + field-name fix: v2 agent
+              // records carry `permissions` as an ARRAY of
+              // {action, resource, effect} entries — the old singular
+              // `permission` record spelling was a wrong field name on this
+              // domain and never reached the host. The shape-derived map
+              // (readonly seal, task:deny recursion ban) lands in the array
+              // form, and every worker — regardless of shape — carries the
+              // builtin-shell deny front door. NEVER deny action "execute".
+              agentDraft.permissions = v2PermissionArray(v1def.permission as Record<string, string>)
             })
           } catch (err) {
             // Per-agent fail-soft (same posture as the v1 config hook's
@@ -6681,6 +6772,17 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
         }
       } catch {
         // Host-shape drift or unreadable config: skip silently (v2 contract).
+      }
+      // ---- v2-single-agent-surface D5: default subject ----
+      // draft.default(FORGE_AGENT) guarded by typeof + try/catch. Ordering
+      // gate (task 1.2): the host's config→agent merge (id "opencode.agent")
+      // runs AFTER plugin transforms on 2.3.2, so an explicit user
+      // default_agent overrides ours — same user-wins precedence as D3/D4.
+      // If the ordering probe refutes this, revert this whole block.
+      try {
+        if (typeof draft.default === "function") draft.default(FORGE_AGENT)
+      } catch {
+        // Host drift on the default setter: no-op, never a throw into the host.
       }
     })
   }

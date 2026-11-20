@@ -21608,6 +21608,32 @@ var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity
   poolResolver = null;
   poolResolution = null;
 } };
+var V2_SHELL_DENY = { action: "shell", resource: "*", effect: "deny" };
+function v2WithShellDeny(perms) {
+  const arr = Array.isArray(perms) ? perms.filter((p) => p !== null && typeof p === "object") : [];
+  if (!arr.some((p) => p.action === "shell"))
+    arr.push({ ...V2_SHELL_DENY });
+  return arr;
+}
+function v2PermissionArray(record2) {
+  const arr = Object.entries(record2).map(([action, effect]) => ({ action, resource: "*", effect }));
+  arr.push({ ...V2_SHELL_DENY });
+  return arr;
+}
+function v2ReadHideNatives(deps) {
+  try {
+    const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
+    const globalPath = forgeConfigPaths({ homeDir }).global;
+    const text = deps?.readFile ? deps.readFile(globalPath) : readFileSync9(globalPath, "utf8");
+    const parsed = parseForgeJsonc(text);
+    if (parsed.ok && parsed.config !== null && typeof parsed.config === "object") {
+      const knob = parsed.config.hideNativeAgents;
+      if (knob === false)
+        return false;
+    }
+  } catch {}
+  return true;
+}
 async function v2Setup(ctx, deps) {
   {
     const v2Candidates = [...deps?.anchors ?? [], ...v2AnchorCandidates(ctx)];
@@ -21630,6 +21656,29 @@ async function v2Setup(ctx, deps) {
           agent.system = FORGE_PROMPT;
           agent.mode = "primary";
         });
+      }
+      try {
+        draft.update(FORGE_AGENT, (agent) => {
+          agent.permissions = v2WithShellDeny(agent.permissions);
+        });
+      } catch (err) {
+        console.warn(`[forge:v2] error: shell deny not applied to the forge record: ${String(err)}`);
+      }
+      if (v2ReadHideNatives(deps)) {
+        for (const nativeId of ["build", "plan"]) {
+          try {
+            const rec = draft.get(nativeId);
+            if (rec === undefined || rec === null)
+              continue;
+            if (typeof rec === "object" && rec.hidden === true)
+              continue;
+            draft.update(nativeId, (r) => {
+              r.hidden = true;
+            });
+          } catch (err) {
+            console.warn(`[forge:v2] error: native agent ${nativeId} not hidden: ${String(err)}`);
+          }
+        }
       }
       try {
         const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
@@ -21656,12 +21705,16 @@ async function v2Setup(ctx, deps) {
               agentDraft.description = v1def.description;
               agentDraft.system = v1def.prompt;
               agentDraft.mode = v1def.mode;
-              agentDraft.permission = v1def.permission;
+              agentDraft.permissions = v2PermissionArray(v1def.permission);
             });
           } catch (err) {
             console.warn(`[forge:v2] error: agent ${id} not materialized: ${String(err)}`);
           }
         }
+      } catch {}
+      try {
+        if (typeof draft.default === "function")
+          draft.default(FORGE_AGENT);
       } catch {}
     });
   }
