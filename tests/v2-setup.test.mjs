@@ -344,3 +344,126 @@ test("v2 setup: a throwing default setter never escapes", withIsolatedHome(async
   const { ctx } = makeCtx({ throwDefault: true })
   await assert.doesNotReject(v2Setup(ctx))
 }))
+
+// ---- harden-tests wave: v2WithShellDeny defensive faces + knob JSONC boundary ----
+//
+// The user config can pre-set the forge record's `permissions` to anything
+// before the plugin's transform sees it. The merge (v2WithShellDeny) must
+// normalize every weird shape into a VALID v2 array while always landing the
+// shell-deny front door.
+
+const DENY = { action: "shell", resource: "*", effect: "deny" }
+
+test("v2 setup: weird pre-set permissions shapes normalize to [shell deny] (defensive merge)", withIsolatedHome(async () => {
+  const weirds = [
+    null,
+    "nope",
+    42,
+    {},
+  ]
+  for (const weird of weirds) {
+    const { ctx, agents } = makeCtx()
+    await ctx.agent.transform(async (draft) => {
+      draft.update("forge", (a) => {
+        a.system = "USER OWNED"
+        a.permissions = weird
+      })
+    })
+    await v2Setup(ctx)
+    const rec = agents.get("forge")
+    assert.equal(rec.system, "USER OWNED", "other fields survive the normalize")
+    assert.ok(Array.isArray(rec.permissions), `permissions becomes an array (input: ${JSON.stringify(weird)})`)
+    assert.deepEqual(rec.permissions, [DENY], `null/non-array/junk-entry arrays collapse to the deny-only array (input: ${JSON.stringify(weird)})`)
+  }
+}))
+
+test("v2 setup: junk entries in a pre-set permissions array are filtered; real entries survive verbatim", withIsolatedHome(async () => {
+  const { ctx, agents } = makeCtx()
+  const editEntry = { action: "edit", resource: "src/**", effect: "deny" }
+  const nopeEntry = { nope: true } // an object, so it survives (only null/non-objects are dropped)
+  await ctx.agent.transform(async (draft) => {
+    draft.update("forge", (a) => {
+      a.permissions = [null, 42, "x", undefined, nopeEntry, editEntry]
+    })
+  })
+  await v2Setup(ctx)
+  const perms = agents.get("forge").permissions
+  assert.ok(Array.isArray(perms))
+  // junk gone, object entries kept in order, deny appended
+  assert.deepEqual(perms, [nopeEntry, editEntry, DENY], "non-object entries dropped, object entries kept, deny appended")
+}))
+
+test("v2 setup: the appended shell deny is the LAST array slot (findLast — deny wins over anything merged in front)", withIsolatedHome(async () => {
+  const { ctx, agents } = makeCtx()
+  await ctx.agent.transform(async (draft) => {
+    draft.update("forge", (a) => {
+      // a plausible user allow that precedes the plugin's append
+      a.permissions = [{ action: "edit", resource: "*", effect: "allow" }]
+    })
+  })
+  await v2Setup(ctx)
+  const perms = agents.get("forge").permissions
+  assert.deepEqual(perms[perms.length - 1], DENY, "the plugin's deny is appended at the end of the array")
+  assert.deepEqual(perms.findLast((p) => p.action === "shell"), DENY, "findLast(shell) resolves to the deny (last-match-wins hosts see the deny)")
+}))
+
+test("v2 setup: a record already carrying a shell entry keeps it verbatim (idempotent append, no duplicate)", withIsolatedHome(async () => {
+  const { ctx, agents } = makeCtx()
+  const userShell = { action: "shell", resource: "build.ts", effect: "allow" }
+  await ctx.agent.transform(async (draft) => {
+    draft.update("forge", (a) => {
+      a.permissions = [userShell]
+    })
+  })
+  await v2Setup(ctx)
+  const perms = agents.get("forge").permissions
+  assert.equal(perms.length, 1, "no second shell entry appended")
+  assert.deepEqual(perms, [userShell], "the pre-existing shell entry is untouched (current idempotent-keep semantics)")
+}))
+
+test("v2 setup: readonly worker — the shell deny rides LAST after the seal family (findLast nail)", withIsolatedHome(async (dir) => {
+  mkdirSync(join(dir, ".opencode"), { recursive: true })
+  writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "harden", agents: { scout: { shape: "readonly" } } }))
+  const { ctx, agents } = makeCtx()
+  await v2Setup(ctx)
+  const perms = agents.get("forge-harden-scout").permissions
+  assert.ok(Array.isArray(perms) && perms.length > 1)
+  assert.deepEqual(perms[perms.length - 1], DENY, "the seal entries and task:deny come first; the shell deny closes the array")
+  assert.deepEqual(perms.findLast((p) => p.action === "shell"), DENY)
+}))
+
+test("v2 setup: native suppression and the shell-deny front door coexist in the same transform", withIsolatedHome(async () => {
+  const { ctx, agents, calls } = makeCtx()
+  agents.set("build", { id: "build", mode: "primary", system: "NATIVE", hidden: false })
+  agents.set("plan", { id: "plan", mode: "primary", system: "NATIVE", hidden: false })
+  await v2Setup(ctx)
+  // both effects of the one transform, in one assertion set
+  assert.equal(agents.get("build").hidden, true, "build suppressed")
+  assert.equal(agents.get("plan").hidden, true, "plan suppressed")
+  assert.ok(agents.has("forge"), "forge primary registered")
+  assert.deepEqual(shellDenyOf(agents.get("forge")), DENY, "shell-deny front door applied")
+  assert.deepEqual(calls.default, ["forge"], "default setter still fired")
+}))
+
+test("v2 setup: hideNativeAgents JSONC boundary — comments/trailing commas honor the knob; bad shapes keep the default", withIsolatedHome(async (dir) => {
+  const globalDir = join(dir, "home", ".config", "opencode")
+  const cases = [
+    // [content, expectedHidden] — fail-soft means anything unreadable/invalid keeps hide ON
+    [`{ // line comment\n  /* block */ "hideNativeAgents": false }`, false],
+    [`{ "hideNativeAgents": false, }`, false],
+    [`["not", "an", "object"]`, true],
+    [`{ "hideNativeAgents": "false" }`, true],
+    [`{ "hideNativeAgents": 0 }`, true],
+    [`{ "other": true, }`, true],
+  ]
+  for (const [content, expectedHidden] of cases) {
+    mkdirSync(globalDir, { recursive: true })
+    writeFileSync(join(globalDir, "forge.json"), content)
+    const { ctx, agents } = makeCtx()
+    agents.set("build", { id: "build", hidden: false })
+    agents.set("plan", { id: "plan", hidden: false })
+    await v2Setup(ctx)
+    assert.equal(agents.get("build").hidden, expectedHidden, `build hidden=${expectedHidden} for config: ${JSON.stringify(content)}`)
+    assert.equal(agents.get("plan").hidden, expectedHidden, `plan hidden=${expectedHidden} for config: ${JSON.stringify(content)}`)
+  }
+}))
