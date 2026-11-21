@@ -1,5 +1,25 @@
 # forge-dispatch-lanes
 
+> **VERDICT 2026-11-21: PARKED — proposed, never applied (owner decision).**
+> Owner verdict: complexity-vs-value fails the sniff test ("中看不中用").
+> Archaeology: this is the idea's second life — the FIRST design (per-dispatch
+> dynamic `(model, depth)` binding through a custom HTTP child-session
+> engine, `forge_dispatch` tool family) was cut by archived change
+> `2026-09-28-simplify-dispatch-to-static-agents`, whose adjudication read
+> in part: *"the owner's real topology is a single endpoint with a single
+> model family, where the dynamic engine delivers nothing actually
+> consumed."* That economic finding still holds. This variant is strictly
+> smaller than what was cut (static identity, native task channel,
+> chain-at-spawn only — the original failure modes of TUI-invisible
+> children and AI-authored forge.json do not apply), and the new
+> circuit breaker would interlock with it — but the incremental value
+> over today's reality is one automatic config edit during an incident
+> (hot-apply already makes manual model switching a save-file-and-go
+> operation). Not worth the permanent surface (rotation state, demotion
+> wiring across five spawn sites, schema, tests).
+> **Revisit trigger**: daily-use tiered rosters with recurring
+> provider-failover pain that manual hot-apply doesn't cover.
+
 ## Why
 
 OMO's proven `categories` pattern (`reports/omo-subagent-research-report.md`
