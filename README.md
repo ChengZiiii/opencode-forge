@@ -976,6 +976,39 @@ child stays inspectable and natively abortable in the host TUI, and the
 journal records `stream-lost/unknown` with the last-observed activity
 timestamp.
 
+**Agent-bound creation (binding guarantees).** The child is created with
+the target agent BOUND at the create call (and the roster's pinned model
+when one is defined) — the same contract the host's own subagent tool uses.
+Before spawn, a `forge-*` target that does not resolve in the live roster is
+REFUSED (the refusal names the agent and the roster source — a drifted
+roster can never spawn a naked default-agent child); after create, the
+plugin reads the child record back and asserts the bound agent matches the
+request — a mismatch or missing binding fails the dispatch LOUD
+(`binding-lost` error class + journal entry) and no prompt is ever sent to
+the wrong or naked child.
+
+**Completion from host signals (never a single fragile view).** On v2
+hosts the watcher settles a child primarily from the host's own durable
+`session.execution.{succeeded, failed, interrupted}` events and the
+one-shot idle wait — the synchronous status/messages view survives only as
+a reconcile pass (≥10 s cadence, skipped when nothing is in flight). The
+`stream-lost/unknown` verdict requires reconcile confirmation: execution
+events that keep flowing for a child overrule an unread synchronous view —
+a child the host signals show to be alive is NEVER declared lost; the
+verdict fires only when both channels have gone silent for the sustained
+streak. A lost event stream re-subscribes automatically (backoff until the
+domain returns).
+
+**Reload adoption (in-flight dispatches survive the plugin).** Every
+in-flight async dispatch is persisted (task id, child session, agent,
+prompt anchor, timestamps) in the host's plugin storage AND the on-disk
+journal. After a plugin hot-reload or host restart, the new generation
+re-arms watching for each still-observable child (deduped, watch-only — an
+adopted dispatch is never re-spawned) and the final outcome is delivered
+exactly once; an unreadable row falls back to walking the parent-session
+relationship, and a child that died while nobody watched terminalizes
+honestly without a fabricated wake.
+
 **Sync handoff presentation.** A sync dispatch whose child outlives the
 wait budget does not fail: the handoff surfaces as a normal informational
 notice — "sync wait budget ended — the dispatch continues in the

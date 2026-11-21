@@ -17034,6 +17034,24 @@ function childSessionTitle(description, agentID) {
   return `${description} (@${agentID} subagent)`;
 }
 var TASK_CREATE_SEAM_ABSENT = "task-create-seam-absent";
+function assertBoundRecord(record2, sessionID, input) {
+  if (!input.assertBinding)
+    return { ok: true, sessionID };
+  const bound = record2?.agent;
+  if (typeof bound !== "string" || bound === "") {
+    return {
+      ok: false,
+      error: `binding-lost: created child ${sessionID} reports no bound agent (requested ${input.agentID}) — refusing to prompt an unbound child`
+    };
+  }
+  if (bound !== input.agentID) {
+    return {
+      ok: false,
+      error: `binding-lost: created child ${sessionID} reports agent ${bound} (requested ${input.agentID}) — refusing to prompt the mismatched child`
+    };
+  }
+  return { ok: true, sessionID };
+}
 async function createChildSession(client, input) {
   if (!client || typeof client.session?.create !== "function") {
     return { ok: false, error: TASK_CREATE_SEAM_ABSENT };
@@ -17044,6 +17062,14 @@ async function createChildSession(client, input) {
       body: {
         parentID: input.parentSessionID,
         title: childSessionTitle(input.description, input.agentID),
+        agent: input.agentID,
+        ...input.modelPin ? {
+          model: {
+            providerID: input.modelPin.providerID,
+            modelID: input.modelPin.modelID,
+            id: `${input.modelPin.providerID}/${input.modelPin.modelID}`
+          }
+        } : {},
         ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {},
         ...input.questionDeny === true || input.taskDeny === true ? {
           permissions: [
@@ -17065,14 +17091,14 @@ async function createChildSession(client, input) {
     if (typeof id !== "string" || id === "") {
       return { ok: false, error: "session.create returned no session id" };
     }
-    return { ok: true, sessionID: id };
+    return assertBoundRecord(result.data, id, input);
   }
   const bare = result;
   const bareId = bare?.id;
   if (typeof bareId !== "string" || bareId === "") {
     return { ok: false, error: "session.create returned no session id" };
   }
-  return { ok: true, sessionID: bareId };
+  return assertBoundRecord(bare, bareId, input);
 }
 function buildPromptArgs(input) {
   return {
@@ -19481,6 +19507,23 @@ function dispatchModelIdentity(agentID, ownerSession, childSessionID) {
     return sessionModels.get(childSessionID) ?? null;
   return sessionModels.get(ownerSession) ?? null;
 }
+function rosterModelPin(agentID) {
+  if (!agentID.toLowerCase().startsWith("forge-"))
+    return null;
+  const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def;
+  if (!def?.model)
+    return null;
+  const identity = parseIdentity(def.model);
+  return identity ? { providerID: identity.provider, modelID: identity.model } : null;
+}
+function forgeTargetUnresolved(agentID) {
+  if (!agentID.toLowerCase().startsWith("forge-"))
+    return null;
+  const resolution = resolvePools();
+  if (resolution?.agents[agentID.slice("forge-".length)])
+    return null;
+  return `"${agentID}" does not resolve in the live roster (pool source: ` + `${resolution ? "the workspace pool resolution" : "none — no forge.json in scope for this host"}); ` + `refusing to spawn a default-agent child — re-sync the roster (/forge-sync) or correct the target`;
+}
 function nestedTaskDenyFor(agentID, ownerSession, childSessionID) {
   const id = agentID.toLowerCase();
   if (id === "forge" || id.startsWith("forge-"))
@@ -19599,6 +19642,8 @@ async function pumpDispatchQueue(client, sessionID) {
       agentID: wish.agentID,
       description: wish.description,
       questionDeny: wish.questionDeny,
+      modelPin: rosterModelPin(wish.agentID),
+      assertBinding: v2HostSeen,
       taskDeny: nestedTaskDenyFor(wish.agentID, wish.ownerSession)
     });
     if (!created.ok) {
@@ -19691,6 +19736,7 @@ function journalTerminalRecord(base, outcome, reason) {
     } catch {}
   }
   journalTransition(base.workspace, { ...journalRecord(base, "terminal"), prompt: undefined, outcome, reason });
+  removeDispatchStorageRow(base.id);
 }
 var recoveredDispatchWorkspaces = new Set;
 async function recoverWorkspaceDispatches(client, workspace) {
@@ -19819,7 +19865,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
   if (rec.state === "retry-pending") {
     const maxAttempts = resolveMaxAttempts();
     if (attempts <= maxAttempts && prompt !== "") {
-      const refusal = crewPendingRefusal(rec.ownerSession) ?? draftDispatchRefusal(rec.ownerSession, rec.agent);
+      const refusal = crewPendingRefusal(rec.ownerSession) ?? draftDispatchRefusal(rec.ownerSession, rec.agent) ?? forgeTargetUnresolved(rec.agent);
       if (refusal) {
         journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`);
         return;
@@ -19830,6 +19876,8 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
         agentID: rec.agent,
         description: rec.description ?? "",
         questionDeny: base.questionDeny ?? true,
+        modelPin: rosterModelPin(rec.agent),
+        assertBinding: v2HostSeen,
         taskDeny: nestedTaskDenyFor(rec.agent, rec.ownerSession, typeof rec.childSessionId === "string" ? rec.childSessionId : undefined)
       });
       if (!respawn.ok) {
@@ -19877,9 +19925,171 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
 function dispatchClient() {
   return jobClient;
 }
+var dispatchTerminalInbox = new Map;
+var dispatchChildActivityAt = new Map;
+function noteDispatchTerminalSignal(sessionID, kind, detail) {
+  dispatchChildActivityAt.set(sessionID, Date.now());
+  if (dispatchTerminalInbox.has(sessionID))
+    return;
+  dispatchTerminalInbox.set(sessionID, { kind, detail, at: Date.now() });
+}
+function noteDispatchChildActivity(sessionID) {
+  dispatchChildActivityAt.set(sessionID, Date.now());
+}
+function takeDispatchTerminalSignal(sessionID) {
+  const signal = dispatchTerminalInbox.get(sessionID);
+  if (signal)
+    dispatchTerminalInbox.delete(sessionID);
+  return signal ?? null;
+}
+function recentDispatchChildActivity(sessionID, withinMs) {
+  const at = dispatchChildActivityAt.get(sessionID);
+  return at !== undefined && Date.now() - at <= withinMs;
+}
+function forgetDispatchSignals(sessionID) {
+  dispatchTerminalInbox.delete(sessionID);
+  dispatchChildActivityAt.delete(sessionID);
+}
+var v2SessionWaitSeam = null;
+function setDispatchWaitSeamForTests(seam) {
+  v2SessionWaitSeam = seam;
+}
+function armDispatchWaitWatcher(sessionID) {
+  const wait = v2SessionWaitSeam;
+  if (!wait)
+    return;
+  wait(sessionID).then(() => {
+    if (!dispatchTerminalInbox.has(sessionID))
+      noteDispatchTerminalSignal(sessionID, "succeeded", "wait-latch");
+  }).catch(() => {});
+}
+var DISPATCH_STORAGE_PREFIX = "forge-dispatch/";
+var v2DispatchStorage = null;
+function setDispatchStorageForTests(storage) {
+  v2DispatchStorage = storage;
+}
+async function writeDispatchStorageRow(row) {
+  const storage = v2DispatchStorage;
+  if (!storage)
+    return;
+  try {
+    await storage.set(DISPATCH_STORAGE_PREFIX + row.taskId, row);
+  } catch {}
+}
+async function removeDispatchStorageRow(taskId) {
+  const storage = v2DispatchStorage;
+  if (!storage)
+    return;
+  try {
+    await storage.remove(DISPATCH_STORAGE_PREFIX + taskId);
+  } catch {}
+}
+async function findChildByParentWalk(client, ownerSession, agent) {
+  try {
+    const raw = await client.session?.list?.({});
+    const body = raw?.data ?? raw;
+    const list = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : [];
+    const hits = [];
+    for (const s of list) {
+      if (!s || typeof s.id !== "string")
+        continue;
+      if (s.parentID !== ownerSession)
+        continue;
+      if (agent && s.agent !== agent)
+        continue;
+      const t = Number(s.time?.created ?? 0);
+      hits.push({ id: s.id, created: Number.isFinite(t) ? t : 0 });
+    }
+    hits.sort((a, b) => b.created - a.created);
+    return hits[0]?.id ?? null;
+  } catch {
+    return null;
+  }
+}
+function rearmDispatchWatch(client, input) {
+  const job = jobManager.create({
+    id: input.id,
+    cmd: `dispatch ${input.agent}: ${input.description || "(adopted)"} (adopted, re-armed)`,
+    worktree: input.workspace,
+    ownerSession: input.ownerSession,
+    logPath: join6(jobLogDir, "dispatch", `${input.id}.txt`),
+    notify: true,
+    killTree: () => {
+      abortChild(client, input.childId);
+    }
+  });
+  job.dispatch = { agentID: input.agent, childSessionID: input.childId, description: input.description };
+  dispatchTasks.set(input.id, { jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description });
+  journalTransition(input.workspace, {
+    id: input.id,
+    agent: input.agent,
+    ownerSession: input.ownerSession,
+    workspace: input.workspace,
+    state: "started",
+    childSessionId: input.childId,
+    attempts: input.attempts,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    prompt: input.prompt,
+    questionDeny: input.questionDeny,
+    description: input.description
+  });
+  runAsyncDispatchPoller(client, job, input.childId, {
+    prompt: input.prompt,
+    directory: input.workspace,
+    questionDeny: input.questionDeny,
+    attemptOffset: Math.max(0, input.attempts - 1)
+  });
+}
+async function adoptPersistedDispatchRows(client, workspace) {
+  const storage = v2DispatchStorage;
+  if (!client || !storage || !workspace || isRootish(workspace))
+    return 0;
+  let adopted = 0;
+  try {
+    const scanned = await storage.scan({ prefix: DISPATCH_STORAGE_PREFIX });
+    for (const entry of scanned?.entries ?? []) {
+      const row = entry?.value;
+      if (!row || typeof row !== "object")
+        continue;
+      if (normalizeAnchorDir(String(row.workspace ?? "")) !== normalizeAnchorDir(workspace))
+        continue;
+      const taskId = String(row.taskId ?? "");
+      if (!taskId || dispatchTasks.has(taskId))
+        continue;
+      const owner = String(row.ownerSession ?? "");
+      const agent = String(row.agent ?? "");
+      let childId = String(row.childSessionID ?? "");
+      if (!childId) {
+        childId = await findChildByParentWalk(client, owner, agent) ?? "";
+      }
+      if (!childId)
+        continue;
+      const probe = await sessionGet(client, childId);
+      if (probe.exists === false) {
+        journalTerminalRecord({ id: taskId, agent, ownerSession: owner, workspace, description: String(row.description ?? "") }, "error", `adopted row's child session ${childId} no longer exists — finalized honestly at adoption`);
+        continue;
+      }
+      rearmDispatchWatch(client, {
+        id: taskId,
+        agent,
+        ownerSession: owner,
+        workspace,
+        childId,
+        description: String(row.description ?? ""),
+        prompt: String(row.prompt ?? ""),
+        questionDeny: row.questionDeny !== false,
+        attempts: Number.isFinite(Number(row.attempts)) && Number(row.attempts) > 0 ? Number(row.attempts) : 1
+      });
+      adopted++;
+    }
+  } catch {}
+  return adopted;
+}
 async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryCtx) {
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
-  const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5000));
+  const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5000), v2HostSeen ? Number(process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS ?? 1e4) : 0);
+  const viewLossTicks = sliceMs >= 1e4 ? 12 : undefined;
   const notifyIntervalMs = resolveNotifyIntervalMs();
   const staleMs = resolveStaleMs();
   const staleMode = resolveStaleMode();
@@ -19898,14 +20108,49 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
   let activeOverride = false;
   const stability = { stableTicks: 0 };
   const stale = { lastActivity: null, staleNotified: false };
+  armDispatchWaitWatcher(childSessionID);
+  writeDispatchStorageRow({
+    taskId: job.id,
+    childSessionID,
+    agent: agentID,
+    ownerSession: job.ownerSession,
+    workspace: retryCtx.directory,
+    description: dispatch?.description ?? "",
+    prompt: retryCtx.prompt,
+    questionDeny: retryCtx.questionDeny,
+    attempts: attempt,
+    startedAt,
+    updatedAt: Date.now()
+  });
   const flushProgress = (notice) => {
     jobManager.appendOutput(job, notice);
     queueDispatchProgress(job.ownerSession, notice);
     if (idleJobSessions.has(job.ownerSession))
       deliverDispatchProgress(job.ownerSession);
   };
+  let reconcileHoldNotified = false;
   for (;; ) {
-    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability });
+    const signal = takeDispatchTerminalSignal(childSessionID);
+    if (signal) {
+      forgetDispatchSignals(childSessionID);
+      if (signal.kind === "failed") {
+        text = `(child session ended in error: ${signal.detail ?? "session.execution.failed"})`;
+        exitCode = 1;
+        break;
+      }
+      if (signal.kind === "interrupted" && signal.detail === "user") {
+        text = `(child session ${childSessionID} was interrupted by the user — dispatch finalized honestly; the transcript stays inspectable and natively abortable in the host TUI)`;
+        exitCode = 1;
+        break;
+      }
+      if (signal.kind === "succeeded") {
+        const fin = await fetchFinalMessage(client, childSessionID);
+        text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`;
+        break;
+      }
+      noteDispatchChildActivity(childSessionID);
+    }
+    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability, viewLossTicks });
     if (poll.status === "completed") {
       activeOverride = poll.via === "active-textful";
       const fin = await fetchFinalMessage(client, childSessionID);
@@ -19941,7 +20186,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", "registry kill during retry backoff (owner session ended / dispose) — user abort, never retried");
           return;
         }
-        const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID);
+        const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID) ?? forgeTargetUnresolved(agentID);
         if (refusal) {
           text = `(retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
           exitCode = 1;
@@ -19953,6 +20198,8 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           agentID,
           description: dispatch?.description ?? "",
           questionDeny: retryCtx.questionDeny,
+          modelPin: rosterModelPin(agentID),
+          assertBinding: v2HostSeen,
           taskDeny: nestedTaskDenyFor(agentID, job.ownerSession, childSessionID)
         });
         if (!respawn.ok) {
@@ -19971,7 +20218,23 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           exitCode = 1;
           break;
         }
+        const previousChild = childSessionID;
         childSessionID = respawn.sessionID;
+        forgetDispatchSignals(previousChild);
+        armDispatchWaitWatcher(childSessionID);
+        writeDispatchStorageRow({
+          taskId: job.id,
+          childSessionID,
+          agent: agentID,
+          ownerSession: job.ownerSession,
+          workspace: retryCtx.directory,
+          description: dispatch?.description ?? "",
+          prompt: retryCtx.prompt,
+          questionDeny: retryCtx.questionDeny,
+          attempts: attempt,
+          startedAt,
+          updatedAt: Date.now()
+        });
         job.dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" };
         dispatchTasks.set(job.id, { jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" });
         journalTransition(retryCtx.directory, {
@@ -20005,6 +20268,15 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
       break;
     }
     if (poll.status === "stream-lost") {
+      if (recentDispatchChildActivity(childSessionID, notifyIntervalMs)) {
+        if (!reconcileHoldNotified) {
+          reconcileHoldNotified = true;
+          flushProgress(`[forge:dispatch-progress] the dispatch view (status + messages) is unreadable for child session ${childSessionID}, but host execution signals keep arriving — the child stays in flight (stream-lost verdict withheld; reconcile confirmation active).`);
+        }
+        await new Promise((resolve2) => setTimeout(resolve2, sliceMs));
+        continue;
+      }
+      reconcileHoldNotified = false;
       streamLost = true;
       const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString();
       text = `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` + `the dispatch view (status + messages) was unreadable for the sustained poll streak; last observed activity ${lastObserved}. ` + `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` + `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`;
@@ -20016,6 +20288,10 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
       return;
     }
     if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
+      if (recentDispatchChildActivity(childSessionID, notifyIntervalMs)) {
+        await new Promise((resolve2) => setTimeout(resolve2, sliceMs));
+        continue;
+      }
       streamLost = true;
       const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString();
       text = `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` + `the result stream ended before a final report arrived (last observed activity ${lastObserved}); ` + `the dispatch view cannot confirm completion. ` + `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` + `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`;
@@ -20066,6 +20342,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
   if (attempt > 1)
     text += `
 (after ${attempt} attempt(s))`;
+  forgetDispatchSignals(childSessionID);
   jobManager.appendOutput(job, text);
   if (streamLost) {
     exitCode = null;
@@ -20236,12 +20513,19 @@ var taskDispatchTool = tool({
         description
       });
     }
+    const rosterRefusal = forgeTargetUnresolved(target);
+    if (rosterRefusal) {
+      releaseGateAdmission(dispatchId);
+      throw new Error(`[forge:dispatch] target refused: ${rosterRefusal}`);
+    }
     const created = await createChildSession(client, {
       parentSessionID: context.sessionID,
       parentDirectory: state.worktree,
       agentID: target,
       description,
       questionDeny: runInBackground,
+      modelPin: rosterModelPin(target),
+      assertBinding: v2HostSeen,
       taskDeny: nestedTaskDenyFor(target, context.sessionID)
     });
     if (!created.ok) {
@@ -20312,8 +20596,49 @@ var taskDispatchTool = tool({
       let syncError = null;
       const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1";
       let syncSliceCount = 0;
+      armDispatchWaitWatcher(childSessionID);
+      writeDispatchStorageRow({
+        taskId: syncJobId,
+        childSessionID,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        description,
+        prompt,
+        questionDeny: false,
+        attempts: attemptSync,
+        startedAt: syncStartedAt,
+        updatedAt: Date.now()
+      });
       syncWait:
         for (;; ) {
+          const signal = takeDispatchTerminalSignal(childSessionID);
+          if (signal) {
+            forgetDispatchSignals(childSessionID);
+            if (signal.kind === "failed") {
+              syncError = signal.detail ?? "session.execution.failed";
+              break syncWait;
+            }
+            if (signal.kind === "interrupted" && signal.detail === "user") {
+              const ab = await abortChild(client, childSessionID);
+              journalTerminalRecord(syncJournalBase, "aborted", `child session ${childSessionID} was interrupted by the user (execution.interrupted)`);
+              context.metadata({ title: `${target}: dispatch interrupted`, metadata: { ...taskMetadata } });
+              return {
+                title: `${target}: dispatch interrupted`,
+                metadata: { ...taskMetadata },
+                output: [
+                  `[forge:dispatch] Child session ${childSessionID} was interrupted by the user${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`} — dispatch finalized honestly.`,
+                  `task id: ${syncJobId}`
+                ].join(`
+`)
+              };
+            }
+            if (signal.kind === "succeeded") {
+              syncCompleted = true;
+              break syncWait;
+            }
+            noteDispatchChildActivity(childSessionID);
+          }
           const poll = await pollChild(client, {
             sessionID: childSessionID,
             intervalMs: syncIntervalMs,
@@ -20355,7 +20680,7 @@ var taskDispatchTool = tool({
               });
               queueDispatchProgress(context.sessionID, `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`);
               await new Promise((resolve2) => setTimeout(resolve2, retryBackoffSync));
-              const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusal(context.sessionID, target);
+              const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusal(context.sessionID, target) ?? forgeTargetUnresolved(target);
               if (refusal) {
                 journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`);
                 throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
@@ -20366,6 +20691,8 @@ var taskDispatchTool = tool({
                 agentID: target,
                 description,
                 questionDeny: false,
+                modelPin: rosterModelPin(target),
+                assertBinding: v2HostSeen,
                 taskDeny: nestedTaskDenyFor(target, context.sessionID, childSessionID)
               });
               if (!respawn.ok) {
@@ -20382,7 +20709,22 @@ var taskDispatchTool = tool({
                 journalTerminalRecord(syncJournalBase, "error", `retry prompt send failed: ${sent2.error}`);
                 throw new Error(`[forge:dispatch] retry prompt send failed: ${sent2.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
               }
+              forgetDispatchSignals(childSessionID);
               childSessionID = respawn.sessionID;
+              armDispatchWaitWatcher(childSessionID);
+              writeDispatchStorageRow({
+                taskId: syncJobId,
+                childSessionID,
+                agent: target,
+                ownerSession: context.sessionID,
+                workspace: state.worktree,
+                description,
+                prompt,
+                questionDeny: false,
+                attempts: attemptSync,
+                startedAt: syncStartedAt,
+                updatedAt: Date.now()
+              });
               taskMetadata.sessionId = childSessionID;
               journalTransition(state.worktree, {
                 id: syncJobId,
@@ -20487,6 +20829,7 @@ var taskDispatchTool = tool({
           syncOverride = poll.via === "active-textful";
           break syncWait;
         }
+      forgetDispatchSignals(childSessionID);
       if (syncCompleted) {
         const fin = await fetchFinalMessage(client, childSessionID);
         if (!fin.ok) {
@@ -21982,6 +22325,16 @@ var server = async (input, options) => {
           noteSessionMoved(f.sessionID, f.directory);
         } catch {}
       }
+      const v1Type = event.type;
+      const v1Props = event.properties ?? {};
+      const v1Session = typeof v1Props.sessionID === "string" && v1Props.sessionID ? v1Props.sessionID : undefined;
+      if (v1Session && (v1Type === "session.execution.succeeded" || v1Type === "session.execution.failed" || v1Type === "session.execution.interrupted")) {
+        const kind = v1Type === "session.execution.succeeded" ? "succeeded" : v1Type === "session.execution.failed" ? "failed" : "interrupted";
+        const detail = kind === "failed" ? v1Props.error?.message !== undefined ? String(v1Props.error.message) : v1Props.error !== undefined ? String(v1Props.error) : undefined : kind === "interrupted" ? v1Props.reason !== undefined ? String(v1Props.reason) : undefined : undefined;
+        noteDispatchTerminalSignal(v1Session, kind, detail);
+      } else if (v1Session && (v1Type === "session.execution.started" || v1Type === "session.step.started" || v1Type === "session.step.ended")) {
+        noteDispatchChildActivity(v1Session);
+      }
     },
     "shell.env": async (input2, output) => {
       if (watchdog.mode === "off")
@@ -22744,7 +23097,7 @@ function v2SessionClient(ctx) {
       const body = args?.body;
       const flat = {};
       if (body && typeof body === "object") {
-        for (const key of ["parentID", "title", "permission", "permissions", "directory"]) {
+        for (const key of ["parentID", "title", "agent", "model", "permission", "permissions", "directory"]) {
           const v = body[key];
           if (v !== undefined)
             flat[key] = v;
@@ -22782,52 +23135,95 @@ function v2HandleIdle(sessionID, goalClient) {
   } catch {}
 }
 function v2SubscribeEvents(ctx, goalClient, idleFallback) {
-  if (typeof ctx.event?.subscribe !== "function")
+  const subscribeFn = ctx.event?.subscribe?.bind(ctx.event);
+  if (typeof subscribeFn !== "function")
     return null;
-  try {
-    let iterable = null;
+  const trySubscribe = () => {
     try {
-      const sub = ctx.event.subscribe();
+      const sub = subscribeFn();
       if (sub !== null && typeof sub === "object" && typeof sub[Symbol.asyncIterator] === "function") {
-        iterable = sub;
+        return sub[Symbol.asyncIterator]();
       }
     } catch {}
-    if (!iterable)
+    return null;
+  };
+  try {
+    let iterator = trySubscribe();
+    if (!iterator)
       return null;
     const controller = new AbortController;
-    const iterator = iterable[Symbol.asyncIterator]();
     const run = async () => {
-      try {
-        for (;; ) {
-          const next = await iterator.next();
-          if (next.done)
-            break;
-          const ev = next.value;
-          const type = ev !== null && typeof ev === "object" && typeof ev.type === "string" ? ev.type : undefined;
-          if (!type)
-            continue;
-          if (controller.signal.aborted)
-            break;
-          const fields = v2EventFields(ev);
-          if (type === "session.deleted") {
-            try {
-              const info = fields.info;
-              const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId");
-              if (id)
-                harvestSessionEnd(id);
-            } catch {}
-          } else if (type === "session.moved") {
-            try {
-              const f = movedEventFields(fields);
-              noteSessionMoved(f.sessionID, f.directory);
-            } catch {}
-          } else if (idleFallback && (type === "session.execution.succeeded" || type === "session.idle")) {
-            const sessionID = v2PickStr(fields, "sessionID", "sessionId");
-            if (sessionID)
-              v2HandleIdle(sessionID, goalClient);
+      let backoffMs = 1000;
+      while (!controller.signal.aborted) {
+        const iter = iterator;
+        if (!iter)
+          return;
+        try {
+          for (;; ) {
+            const next = await iter.next();
+            if (next.done)
+              break;
+            const ev = next.value;
+            const type = ev !== null && typeof ev === "object" && typeof ev.type === "string" ? ev.type : undefined;
+            if (!type)
+              continue;
+            if (controller.signal.aborted)
+              return;
+            const fields = v2EventFields(ev);
+            if (type === "session.deleted") {
+              try {
+                const info = fields.info;
+                const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId");
+                if (id)
+                  harvestSessionEnd(id);
+              } catch {}
+            } else if (type === "session.moved") {
+              try {
+                const f = movedEventFields(fields);
+                noteSessionMoved(f.sessionID, f.directory);
+              } catch {}
+            } else if (type === "session.execution.succeeded" || type === "session.execution.failed" || type === "session.execution.interrupted") {
+              const sessionID = v2PickStr(fields, "sessionID", "sessionId");
+              if (sessionID) {
+                const kind = type === "session.execution.succeeded" ? "succeeded" : type === "session.execution.failed" ? "failed" : "interrupted";
+                const detail = kind === "failed" ? fields.error?.message !== undefined ? String(fields.error.message) : fields.error !== undefined ? String(fields.error) : undefined : kind === "interrupted" ? fields.reason !== undefined ? String(fields.reason) : undefined : undefined;
+                noteDispatchTerminalSignal(sessionID, kind, detail);
+                if (idleFallback && type === "session.execution.succeeded")
+                  v2HandleIdle(sessionID, goalClient);
+              }
+            } else if (type === "session.execution.started" || type === "session.step.started" || type === "session.step.ended") {
+              const sessionID = v2PickStr(fields, "sessionID", "sessionId");
+              if (sessionID)
+                noteDispatchChildActivity(sessionID);
+            } else if (type === "session.created") {
+              try {
+                const info = fields.info ?? fields.session;
+                const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId");
+                const worktree = effectiveWorktree(info !== null && typeof info === "object" && typeof info.worktree === "string" ? info.worktree : undefined, info !== null && typeof info === "object" && typeof info.directory === "string" ? info.directory : undefined);
+                if (id && typeof worktree === "string" && worktree) {
+                  ensureSession(id, worktree);
+                  if (!isRootish(worktree))
+                    recoverWorkspaceDispatches(jobClient, worktree);
+                }
+              } catch {}
+            } else if (idleFallback && type === "session.idle") {
+              const sessionID = v2PickStr(fields, "sessionID", "sessionId");
+              if (sessionID)
+                v2HandleIdle(sessionID, goalClient);
+            }
           }
-        }
-      } catch {}
+        } catch {}
+        if (controller.signal.aborted)
+          return;
+        await new Promise((resolve2) => setTimeout(resolve2, backoffMs));
+        if (controller.signal.aborted)
+          return;
+        const fresh = trySubscribe();
+        if (!fresh)
+          return;
+        iterator = fresh;
+        backoffMs = 1000;
+      }
     };
     run();
     let closed = false;
@@ -22837,14 +23233,14 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
       closed = true;
       controller.abort();
       try {
-        iterator.return?.();
+        iterator?.return?.();
       } catch {}
     };
   } catch {
     return null;
   }
 }
-var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => {
+var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, resetHostAnchors: () => {
   hostAnchors.length = 0;
   poolResolver = null;
   poolResolution = null;
@@ -23033,6 +23429,18 @@ async function v2Setup(ctx, deps) {
   if (v2Client && (v2Client.session.promptAsync || v2Client.session.prompt))
     jobClient = v2Client;
   const goalClient = v2Client && typeof v2Client.session.prompt === "function" && typeof v2Client.session.get === "function" ? v2Client : null;
+  v2SessionWaitSeam = typeof ctx.session?.wait === "function" ? (sessionID) => ctx.session.wait({ sessionID }) : null;
+  v2DispatchStorage = ctx.storage && typeof ctx.storage.scan === "function" && typeof ctx.storage.set === "function" ? ctx.storage : null;
+  try {
+    if (hostWorktree && !isRootish(hostWorktree)) {
+      recoverWorkspaceDispatches(v2Client, hostWorktree);
+    }
+  } catch {}
+  try {
+    if (hostWorktree && !isRootish(hostWorktree)) {
+      adoptPersistedDispatchRows(v2Client, hostWorktree);
+    }
+  } catch {}
   const sessionHooks = v2RegisterSessionHooks(ctx, goalClient);
   await v2RegisterCommands(ctx);
   const v2AbortEvents = v2SubscribeEvents(ctx, goalClient, !sessionHooks.idleHook);
@@ -23049,16 +23457,24 @@ var plugin_default = { id: "forge", server, setup: v2Setup };
 export {
   v2WiringSeam,
   v2Setup,
+  takeDispatchTerminalSignal,
+  setDispatchWaitSeamForTests,
+  setDispatchStorageForTests,
   server,
   resolveForgeShellPosture,
   resolveDispatchQueueMax,
+  recentDispatchChildActivity,
+  noteDispatchTerminalSignal,
+  noteDispatchChildActivity,
   isRootish,
+  forgetDispatchSignals,
   forgeFamilyGuard,
   effectiveWorktree,
   effectiveSurvive,
   plugin_default as default,
   crewOrchestrationTemplate,
   composeCommandPrompt,
+  adoptPersistedDispatchRows,
   __workerShellRescueTestSurface,
   TASK_SEAM_DEGRADED_ERROR,
   SYNC_LEVER_BODY,

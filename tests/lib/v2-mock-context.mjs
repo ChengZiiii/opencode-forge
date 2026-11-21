@@ -150,7 +150,16 @@ export function createV2MockContext(opts = {}) {
       // records the flat input and returns a bare record.
       create: async (input) => {
         state.creates.push(input)
-        return { id: `ses_mockchild_${state.creates.length}`, title: input?.title ?? null, location: { directory: input?.directory ?? null } }
+        // dispatch-v2-hostsignals field reality (task 1.1 probe, 2.3.2): the
+        // created bare record ECHOES the bound agent (and the stored model) —
+        // the host persists both keys on the session record.
+        return {
+          id: `ses_mockchild_${state.creates.length}`,
+          title: input?.title ?? null,
+          agent: input?.agent ?? undefined,
+          model: input?.model ?? undefined,
+          location: { directory: input?.directory ?? null },
+        }
       },
       prompt: async (input) => {
         state.prompts.push(input)

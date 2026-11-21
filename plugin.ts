@@ -2680,6 +2680,41 @@ function dispatchModelIdentity(agentID: string, ownerSession: string, childSessi
 }
 
 /**
+ * Roster pin → create-time model binding (dispatch-v2-hostsignals task 2.1):
+ * a forge-* target's PINNED model from the FRESH pool resolution — the
+ * create body's `model` key binds it at spawn (host precedence: an explicit
+ * create model wins). Null for Auto workers and non-forge targets: no model
+ * key, the host default applies (agent's configured model, else inherited).
+ */
+function rosterModelPin(agentID: string): { providerID: string; modelID: string } | null {
+  if (!agentID.toLowerCase().startsWith("forge-")) return null
+  const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def
+  if (!def?.model) return null
+  const identity = parseIdentity(def.model)
+  return identity ? { providerID: identity.provider, modelID: identity.model } : null
+}
+
+/**
+ * Pre-spawn roster validation (dispatch-v2-hostsignals task 2.2): a forge-*
+ * target MUST resolve in the live pool resolution — refuse-not-degrade,
+ * naming the agent and the roster source (the task 1.1 probe proved the
+ * host's create accepts ANY agent id verbatim, bogus included: without this
+ * check a drifted roster spawns a naked default-agent child). Host-built-in
+ * targets (general/explore) resolve in the host's own registry and pass.
+ * Null = dispatchable.
+ */
+function forgeTargetUnresolved(agentID: string): string | null {
+  if (!agentID.toLowerCase().startsWith("forge-")) return null
+  const resolution = resolvePools()
+  if (resolution?.agents[agentID.slice("forge-".length)]) return null
+  return (
+    `"${agentID}" does not resolve in the live roster (pool source: ` +
+    `${resolution ? "the workspace pool resolution" : "none — no forge.json in scope for this host"}); ` +
+    `refusing to spawn a default-agent child — re-sync the roster (/forge-sync) or correct the target`
+  )
+}
+
+/**
  * Nested-dispatch guard rule (harden-dispatch-resilience D2): a NON-forge
  * host-agent target served by the anthropic family gets the task-tool deny
  * on its create body. forge family targets are untouched here — their depth
@@ -2869,6 +2904,12 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       agentID: wish.agentID,
       description: wish.description,
       questionDeny: wish.questionDeny,
+      // Agent-bound creation (dispatch-v2-hostsignals 2.1): the roster pin
+      // rides the create body; the binding is asserted on the record read
+      // back (v2 proven by the task 1.1 probe — v1 records not probed, the
+      // assert stays off there).
+      modelPin: rosterModelPin(wish.agentID),
+      assertBinding: v2HostSeen,
       // Nested-dispatch guard (D2): re-resolved at SPAWN time like every
       // other pump re-check — the model identity may have shifted while the
       // wish sat queued.
@@ -3021,6 +3062,11 @@ function journalTerminalRecord(base: JournalBase, outcome: string, reason: strin
     }
   }
   journalTransition(base.workspace, { ...journalRecord(base, "terminal"), prompt: undefined, outcome, reason })
+  // Persisted registry (dispatch-v2-hostsignals 4.1): terminal is the
+  // removal choke point — every terminal path (completed / error /
+  // aborted / stream-lost / stale) clears its row exactly once here (a
+  // no-op on v1 hosts, where no rows are written).
+  void removeDispatchStorageRow(base.id)
 }
 
 // Workspaces whose journals have been recovered this process (idempotence:
@@ -3190,7 +3236,10 @@ async function recoverOneDispatchRecord(client: DispatchClient, workspace: strin
     if (attempts <= maxAttempts && prompt !== "") {
       // Attempts remain: respawn the child (same agent, prompt from the
       // journal — its ONLY source after a restart — plus the preamble).
-      const refusal = crewPendingRefusal(rec.ownerSession) ?? draftDispatchRefusal(rec.ownerSession, rec.agent)
+      const refusal =
+        crewPendingRefusal(rec.ownerSession) ??
+        draftDispatchRefusal(rec.ownerSession, rec.agent) ??
+        forgeTargetUnresolved(rec.agent)
       if (refusal) {
         journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`)
         return
@@ -3201,6 +3250,8 @@ async function recoverOneDispatchRecord(client: DispatchClient, workspace: strin
         agentID: rec.agent,
         description: rec.description ?? "",
         questionDeny: base.questionDeny ?? true,
+        modelPin: rosterModelPin(rec.agent),
+        assertBinding: v2HostSeen,
         taskDeny: nestedTaskDenyFor(rec.agent, rec.ownerSession, typeof rec.childSessionId === "string" ? rec.childSessionId : undefined),
       })
       if (!respawn.ok) {
@@ -3303,6 +3354,271 @@ type DispatchRetryContext = {
   attemptOffset?: number
 }
 
+// ---------------------------------------------------------------------------
+// Host-signal completion core (dispatch-v2-hostsignals D4): child-session-id
+// keyed terminal-signal inbox + activity ledger. The v2 event subscription
+// (and the v1 event hook, where its bus delivers) route durable
+// session.execution.{succeeded,failed,interrupted} events here; the watch
+// loops consume an inbox signal BEFORE their REST poll — task 3.5: the poll
+// is demoted to reconcile plumbing, never the sole terminal signal. The
+// activity ledger (execution.started / step edges) feeds the
+// reconcile-confirmation rule: a child whose execution events keep flowing
+// is NEVER declared stream-lost by an unread synchronous view.
+// Exported for tests (same seam posture as TASK_SEAM_DEGRADED_ERROR).
+// ---------------------------------------------------------------------------
+
+export type DispatchTerminalSignal = {
+  kind: "succeeded" | "failed" | "interrupted"
+  /** execution.failed error head / interrupted reason / wait-latch marker. */
+  detail?: string
+  at: number
+}
+
+const dispatchTerminalInbox = new Map<string, DispatchTerminalSignal>()
+const dispatchChildActivityAt = new Map<string, number>()
+
+/** Route a durable terminal event for a child (first terminal wins). */
+export function noteDispatchTerminalSignal(sessionID: string, kind: DispatchTerminalSignal["kind"], detail?: string): void {
+  dispatchChildActivityAt.set(sessionID, Date.now())
+  if (dispatchTerminalInbox.has(sessionID)) return
+  dispatchTerminalInbox.set(sessionID, { kind, detail, at: Date.now() })
+}
+
+/** Non-terminal execution activity ping (execution.started / step edges). */
+export function noteDispatchChildActivity(sessionID: string): void {
+  dispatchChildActivityAt.set(sessionID, Date.now())
+}
+
+/** Consume the inbox signal (if any) — the watch loops own this. */
+export function takeDispatchTerminalSignal(sessionID: string): DispatchTerminalSignal | null {
+  const signal = dispatchTerminalInbox.get(sessionID)
+  if (signal) dispatchTerminalInbox.delete(sessionID)
+  return signal ?? null
+}
+
+/** Reconcile confirmation: execution activity for this child within `withinMs`? */
+export function recentDispatchChildActivity(sessionID: string, withinMs: number): boolean {
+  const at = dispatchChildActivityAt.get(sessionID)
+  return at !== undefined && Date.now() - at <= withinMs
+}
+
+/** Watch ended for this child: drop its signal state (bounded ledgers). */
+export function forgetDispatchSignals(sessionID: string): void {
+  dispatchTerminalInbox.delete(sessionID)
+  dispatchChildActivityAt.delete(sessionID)
+}
+
+// D4 one-shot wait seam (task 3.2, v2-only): armed per in-flight child —
+// resolves when the host's agent loop goes idle (POST
+// /api/experimental/session/:id/wait, NoContent). Routed into the SAME
+// inbox as the durable events (first-terminal-wins); failures are silent —
+// the events + the reconcile pass remain the primaries.
+let v2SessionWaitSeam: ((sessionID: string) => Promise<unknown>) | null = null
+
+/** Test seam: inject/clear the v2 wait latch (null restores v1 posture). */
+export function setDispatchWaitSeamForTests(seam: ((sessionID: string) => Promise<unknown>) | null): void {
+  v2SessionWaitSeam = seam
+}
+
+function armDispatchWaitWatcher(sessionID: string): void {
+  const wait = v2SessionWaitSeam
+  if (!wait) return
+  void wait(sessionID)
+    .then(() => {
+      // Idle latch: settle as succeeded UNLESS a durable terminal event
+      // already claimed the inbox (first-terminal-wins ordering).
+      if (!dispatchTerminalInbox.has(sessionID)) noteDispatchTerminalSignal(sessionID, "succeeded", "wait-latch")
+    })
+    .catch(() => {
+      // Session gone / service unavailable: silent — the stale reap and the
+      // reconcile pass own gone children.
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Persisted dispatch registry (dispatch-v2-hostsignals D5, tasks 4.1-4.3):
+// in-flight rows mirrored into ctx.storage (host-native plugin KV) at
+// watch start, removed at terminal — the journalTerminalRecord choke point
+// owns removal, so every terminal path (completed / error / aborted /
+// stream-lost / stale) clears its row exactly once. Setup scans the rows,
+// dedupes against the journal recovery's re-arms, adopts running rows back
+// into the active watcher set (watch-only — an adopted dispatch NEVER
+// re-spawns: the re-dispatch guard is the adoption itself), and falls back
+// to a parentID walk when a row is unreadable. v1 hosts keep the
+// journal-only posture (design risk table: ctx.storage unavailable →
+// fail-soft to today's behavior).
+// ---------------------------------------------------------------------------
+
+const DISPATCH_STORAGE_PREFIX = "forge-dispatch/"
+
+type DispatchStorageRow = {
+  taskId: string
+  childSessionID: string
+  agent: string
+  ownerSession: string
+  workspace: string
+  description: string
+  /** The prompt anchor (the retry context rides it when the child errors). */
+  prompt: string
+  questionDeny: boolean
+  attempts: number
+  startedAt: number
+  updatedAt: number
+}
+
+// Test seam: the v2 storage domain (null on v1 — every call is a no-op).
+let v2DispatchStorage: {
+  get: (key: string) => Promise<unknown>
+  set: (key: string, value: unknown) => Promise<void>
+  remove: (key: string) => Promise<void>
+  scan: (options: { prefix: string }) => Promise<{ entries?: ReadonlyArray<{ key: string; value: unknown }> } | undefined> | undefined
+} | null = null
+
+export function setDispatchStorageForTests(storage: typeof v2DispatchStorage): void {
+  v2DispatchStorage = storage
+}
+
+async function writeDispatchStorageRow(row: DispatchStorageRow): Promise<void> {
+  const storage = v2DispatchStorage
+  if (!storage) return
+  try {
+    await storage.set(DISPATCH_STORAGE_PREFIX + row.taskId, row)
+  } catch {
+    // Storage drift: fail-soft — the journal remains the durable truth.
+  }
+}
+
+async function removeDispatchStorageRow(taskId: string): Promise<void> {
+  const storage = v2DispatchStorage
+  if (!storage) return
+  try {
+    await storage.remove(DISPATCH_STORAGE_PREFIX + taskId)
+  } catch {
+    // Fail-soft: a stale row is adoption-deduped by the child-observable check.
+  }
+}
+
+/** parentID walk fallback (task 4.2): find the child by its parent link. */
+async function findChildByParentWalk(client: DispatchClient, ownerSession: string, agent: string): Promise<string | null> {
+  try {
+    const raw = await (client as unknown as { session?: { list?: (args?: unknown) => Promise<unknown> } }).session?.list?.({})
+    const body = (raw as { data?: unknown } | undefined)?.data ?? raw
+    const list = Array.isArray(body)
+      ? (body as Array<Record<string, unknown>>)
+      : Array.isArray((body as { sessions?: unknown[] } | undefined)?.sessions)
+        ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
+        : []
+    const hits: { id: string; created: number }[] = []
+    for (const s of list) {
+      if (!s || typeof s.id !== "string") continue
+      if (s.parentID !== ownerSession) continue
+      if (agent && s.agent !== agent) continue
+      const t = Number((s.time as { created?: unknown } | undefined)?.created ?? 0)
+      hits.push({ id: s.id, created: Number.isFinite(t) ? t : 0 })
+    }
+    hits.sort((a, b) => b.created - a.created)
+    return hits[0]?.id ?? null
+  } catch {
+    return null
+  }
+}
+
+/** Re-arm the standard completion watcher for an adopted child (watch-only). */
+function rearmDispatchWatch(
+  client: DispatchClient,
+  input: { id: string; agent: string; ownerSession: string; workspace: string; childId: string; description: string; prompt: string; questionDeny: boolean; attempts: number },
+): void {
+  const job = jobManager.create({
+    id: input.id,
+    cmd: `dispatch ${input.agent}: ${input.description || "(adopted)"} (adopted, re-armed)`,
+    worktree: input.workspace,
+    ownerSession: input.ownerSession,
+    logPath: join(jobLogDir, "dispatch", `${input.id}.txt`),
+    notify: true,
+    killTree: () => {
+      void abortChild(client, input.childId)
+    },
+  })
+  ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: input.agent, childSessionID: input.childId, description: input.description }
+  dispatchTasks.set(input.id, { jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description })
+  // Fold E continuity: the adopted watch journals a started transition (a
+  // missing journal record gets one; an existing one re-affirms).
+  journalTransition(input.workspace, {
+    id: input.id,
+    agent: input.agent,
+    ownerSession: input.ownerSession,
+    workspace: input.workspace,
+    state: "started",
+    childSessionId: input.childId,
+    attempts: input.attempts,
+    createdAt: Date.now(),
+    updatedAt: Date.now(),
+    prompt: input.prompt,
+    questionDeny: input.questionDeny,
+    description: input.description,
+  })
+  void runAsyncDispatchPoller(client, job, input.childId, {
+    prompt: input.prompt,
+    directory: input.workspace,
+    questionDeny: input.questionDeny,
+    attemptOffset: Math.max(0, input.attempts - 1),
+  })
+}
+
+/** Setup-time adoption (task 4.2): scan persisted rows, adopt what's live. */
+export async function adoptPersistedDispatchRows(client: DispatchClient | null, workspace: string): Promise<number> {
+  const storage = v2DispatchStorage
+  if (!client || !storage || !workspace || isRootish(workspace)) return 0
+  let adopted = 0
+  try {
+    const scanned = await storage.scan({ prefix: DISPATCH_STORAGE_PREFIX })
+    for (const entry of scanned?.entries ?? []) {
+      const row = entry?.value as Partial<DispatchStorageRow> | undefined
+      if (!row || typeof row !== "object") continue
+      if (normalizeAnchorDir(String(row.workspace ?? "")) !== normalizeAnchorDir(workspace)) continue
+      const taskId = String(row.taskId ?? "")
+      if (!taskId || dispatchTasks.has(taskId)) continue // journal recovery re-armed it first (dedupe)
+      const owner = String(row.ownerSession ?? "")
+      const agent = String(row.agent ?? "")
+      let childId = String(row.childSessionID ?? "")
+      if (!childId) {
+        // Unreadable/incomplete row → parentID walk fallback (spec 4.2).
+        childId = (await findChildByParentWalk(client, owner, agent)) ?? ""
+      }
+      if (!childId) continue // child unobservable: the journal owns the verdict
+      // Child observable? Adopt watch-only. An adopted dispatch never
+      // re-spawns (the re-dispatch guard IS the adoption — task 4.3).
+      const probe = await sessionGet(client, childId)
+      if (probe.exists === false) {
+        // Gone child: terminalize the row honestly via the journal choke
+        // point (which also removes the storage row).
+        journalTerminalRecord(
+          { id: taskId, agent, ownerSession: owner, workspace, description: String(row.description ?? "") },
+          "error",
+          `adopted row's child session ${childId} no longer exists — finalized honestly at adoption`,
+        )
+        continue
+      }
+      rearmDispatchWatch(client, {
+        id: taskId,
+        agent,
+        ownerSession: owner,
+        workspace,
+        childId,
+        description: String(row.description ?? ""),
+        prompt: String(row.prompt ?? ""),
+        questionDeny: row.questionDeny !== false,
+        attempts: Number.isFinite(Number(row.attempts)) && Number(row.attempts) > 0 ? Number(row.attempts) : 1,
+      })
+      adopted++
+    }
+  } catch {
+    // Storage drift / unreadable scan: fail-soft — the journal recovery
+    // remains the durable path.
+  }
+  return adopted
+}
+
 async function runAsyncDispatchPoller(
   client: DispatchClient,
   job: Job,
@@ -3312,7 +3628,21 @@ async function runAsyncDispatchPoller(
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
   // sliceMs is the SLICE boundary, not a deadline — a slice timeout just
   // returns control here for the kill/floor/notify checks below.
-  const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000))
+  const sliceMs = Math.max(
+    intervalMs,
+    Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000),
+    // Reconcile cadence floor (dispatch-v2-hostsignals 3.3): on v2 hosts —
+    // where durable events are the PRIMARY completion channel — the REST
+    // reconcile pass runs at ≥10s (spec SHALL: "at a cadence of at least 10
+    // seconds"; FORGE_DISPATCH_RECONCILE_FLOOR_MS overrides, 0 disables).
+    // v1 hosts keep the proven 5s cadence (v1 is a design non-goal).
+    v2HostSeen ? Number(process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS ?? 10_000) : 0,
+  )
+  // The blind-view streak scales with the cadence so the last-resort
+  // verdict stays inside ~2 minutes even at the 10s floor (30×10s would be
+  // 5 minutes): 12×10s ≈ the proven 30×5s window. At the 5s cadence the
+  // proven default stands.
+  const viewLossTicks = sliceMs >= 10_000 ? 12 : undefined
   // Notify cadence (design D6): FORGE_DISPATCH_NOTIFY_INTERVAL_MS is
   // independent of FORGE_DISPATCH_POLL_TIMEOUT_MS — that knob scopes the
   // SYNC WAIT only and must never kill this tracker.
@@ -3353,6 +3683,24 @@ async function runAsyncDispatchPoller(
   // null until the first probe adopts the host's timestamp (no-message
   // children anchor at the dispatch start time).
   const stale: StaleSweepState = { lastActivity: null, staleNotified: false }
+  // Host-signal completion (dispatch-v2-hostsignals): the one-shot wait
+  // latch arms for the FIRST child here (respawns re-arm below) and the
+  // persisted registry row mirrors this watch (removed at terminal by the
+  // journalTerminalRecord choke point).
+  armDispatchWaitWatcher(childSessionID)
+  void writeDispatchStorageRow({
+    taskId: job.id,
+    childSessionID,
+    agent: agentID,
+    ownerSession: job.ownerSession,
+    workspace: retryCtx.directory,
+    description: dispatch?.description ?? "",
+    prompt: retryCtx.prompt,
+    questionDeny: retryCtx.questionDeny,
+    attempts: attempt,
+    startedAt,
+    updatedAt: Date.now(),
+  })
   const flushProgress = (notice: string) => {
     jobManager.appendOutput(job, notice)
     queueDispatchProgress(job.ownerSession, notice)
@@ -3360,8 +3708,39 @@ async function runAsyncDispatchPoller(
     // already idle has no future idle edge to ride — deliver now (lossy).
     if (idleJobSessions.has(job.ownerSession)) void deliverDispatchProgress(job.ownerSession)
   }
+  // Reconcile-hold disclosure state (task 3.5): when the synchronous view
+  // is unreadable but host execution signals keep flowing, the verdict is
+  // HELD (disclosed once per hold, not per slice).
+  let reconcileHoldNotified = false
   for (;;) {
-    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability })
+    // D4 (task 3.1): host-signal first — a durable terminal event settles
+    // the dispatch with ZERO REST polls (the spec: "settles from that
+    // signal without any status polling"). The final-message read below is
+    // the report carrier, not a poll.
+    const signal = takeDispatchTerminalSignal(childSessionID)
+    if (signal) {
+      forgetDispatchSignals(childSessionID)
+      if (signal.kind === "failed") {
+        text = `(child session ended in error: ${signal.detail ?? "session.execution.failed"})`
+        exitCode = 1
+        break
+      }
+      if (signal.kind === "interrupted" && signal.detail === "user") {
+        text = `(child session ${childSessionID} was interrupted by the user — dispatch finalized honestly; the transcript stays inspectable and natively abortable in the host TUI)`
+        exitCode = 1
+        break
+      }
+      if (signal.kind === "succeeded") {
+        const fin = await fetchFinalMessage(client, childSessionID)
+        text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`
+        break
+      }
+      // Non-user interruption: the host's own goal consumer ignores these
+      // (the run may be internally restarted) — treat as activity, keep
+      // reconciling.
+      noteDispatchChildActivity(childSessionID)
+    }
+    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability, viewLossTicks })
     if (poll.status === "completed") {
       activeOverride = poll.via === "active-textful"
       const fin = await fetchFinalMessage(client, childSessionID)
@@ -3411,7 +3790,8 @@ async function runAsyncDispatchPoller(
         // Dispatch-time policies are re-applied on the fresh child the same
         // way the original spawn applied them (crew belt + draft gate; the
         // mode-keyed question deny rides the create body below).
-        const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID)
+        const refusal =
+          crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID) ?? forgeTargetUnresolved(agentID)
         if (refusal) {
           text = `(retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
           exitCode = 1
@@ -3423,6 +3803,8 @@ async function runAsyncDispatchPoller(
           agentID,
           description: dispatch?.description ?? "",
           questionDeny: retryCtx.questionDeny,
+          modelPin: rosterModelPin(agentID),
+          assertBinding: v2HostSeen,
           taskDeny: nestedTaskDenyFor(agentID, job.ownerSession, childSessionID),
         })
         if (!respawn.ok) {
@@ -3444,7 +3826,26 @@ async function runAsyncDispatchPoller(
         // Inherit the dying child's registry SLOT: same job row, new child
         // session id — no queue re-entry, no cap interaction (the cap
         // counts running rows, and the row never left the registry).
+        const previousChild = childSessionID
         childSessionID = respawn.sessionID
+        // Host-signal rebind: the dead child's signal state is dropped, the
+        // wait latch re-arms for the fresh child, and the persisted row
+        // mirrors the new binding (terminal removal stays the choke point).
+        forgetDispatchSignals(previousChild)
+        armDispatchWaitWatcher(childSessionID)
+        void writeDispatchStorageRow({
+          taskId: job.id,
+          childSessionID,
+          agent: agentID,
+          ownerSession: job.ownerSession,
+          workspace: retryCtx.directory,
+          description: dispatch?.description ?? "",
+          prompt: retryCtx.prompt,
+          questionDeny: retryCtx.questionDeny,
+          attempts: attempt,
+          startedAt,
+          updatedAt: Date.now(),
+        })
         ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" }
         dispatchTasks.set(job.id, { jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" })
         // Fold E: the respawn is a journaled started transition (prompt
@@ -3488,6 +3889,23 @@ async function runAsyncDispatchPoller(
     // classification, no terminal verdict, the child stays alive and
     // natively abortable; the report file is the recovery channel.
     if (poll.status === "stream-lost") {
+      // MODIFIED requirement (dispatch-v2-hostsignals): the verdict requires
+      // reconcile confirmation — execution events that keep flowing for the
+      // child overrule the unread synchronous view ("a child that host
+      // signals show to be alive SHALL NOT be declared lost"). Only when
+      // BOTH channels have gone silent for the notification window does the
+      // last-resort verdict stand.
+      if (recentDispatchChildActivity(childSessionID, notifyIntervalMs)) {
+        if (!reconcileHoldNotified) {
+          reconcileHoldNotified = true
+          flushProgress(
+            `[forge:dispatch-progress] the dispatch view (status + messages) is unreadable for child session ${childSessionID}, but host execution signals keep arriving — the child stays in flight (stream-lost verdict withheld; reconcile confirmation active).`,
+          )
+        }
+        await new Promise((resolve) => setTimeout(resolve, sliceMs))
+        continue
+      }
+      reconcileHoldNotified = false
       streamLost = true
       const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString()
       text =
@@ -3518,6 +3936,13 @@ async function runAsyncDispatchPoller(
     // Any busy reading resets the streak inside pollChild, so a RUNNING
     // child with a readable view can never reach this.
     if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
+      // Reconcile confirmation (task 3.5): execution signals flowing within
+      // the notification window overrule the textless-idle reading — the
+      // settled signal (if any) is consumed at the next loop top.
+      if (recentDispatchChildActivity(childSessionID, notifyIntervalMs)) {
+        await new Promise((resolve) => setTimeout(resolve, sliceMs))
+        continue
+      }
       streamLost = true
       const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString()
       text =
@@ -3589,6 +4014,10 @@ async function runAsyncDispatchPoller(
     }
   }
   if (attempt > 1) text += `\n(after ${attempt} attempt(s))`
+  // Host-signal watch over: drop this child's signal state (bounded
+  // ledgers; the terminal removal of the persisted row rides the
+  // journalTerminalRecord choke point below).
+  forgetDispatchSignals(childSessionID)
   jobManager.appendOutput(job, text)
   // stream-lost/unknown: exit-null settle (never an exit-1 death
   // certificate) + the outcome marker rides the dispatch meta so the
@@ -3825,6 +4254,16 @@ const taskDispatchTool = tool({
         description,
       })
     }
+    // Pre-spawn roster validation (dispatch-v2-hostsignals 2.2): a drifted
+    // roster refuses HERE — the task 1.1 probe proved the host's create
+    // accepts ANY agent id verbatim (bogus included), so without this check
+    // a stale target spawns a naked default-agent child. Gate admission is
+    // released on the same failure shape as a create failure.
+    const rosterRefusal = forgeTargetUnresolved(target)
+    if (rosterRefusal) {
+      releaseGateAdmission(dispatchId)
+      throw new Error(`[forge:dispatch] target refused: ${rosterRefusal}`)
+    }
     const created = await createChildSession(client, {
       parentSessionID: context.sessionID,
       parentDirectory: state.worktree,
@@ -3833,6 +4272,12 @@ const taskDispatchTool = tool({
       // Question policy is mode-keyed (task-shadow): sync keeps questions
       // available (native parity); async seals the child unattended.
       questionDeny: runInBackground,
+      // Agent-bound creation (dispatch-v2-hostsignals 2.1): the roster pin
+      // rides the create body; the binding is asserted on the record read
+      // back (v2 proven by the task 1.1 probe — v1 records not probed, the
+      // assert stays off there).
+      modelPin: rosterModelPin(target),
+      assertBinding: v2HostSeen,
       // Nested-dispatch guard (D2): non-forge ∧ anthropic family — the
       // deny rides the create body on BOTH modes (a sync child can nest as
       // much as an async one).
@@ -3915,7 +4360,55 @@ const taskDispatchTool = tool({
       let syncError: string | null = null
       const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1"
       let syncSliceCount = 0
+      // Host-signal completion (dispatch-v2-hostsignals): the wait latch
+      // arms for the FIRST sync child (respawns re-arm below) and the
+      // persisted registry row mirrors this watch while the sync call
+      // blocks (removed at terminal by the journal choke point).
+      armDispatchWaitWatcher(childSessionID)
+      void writeDispatchStorageRow({
+        taskId: syncJobId,
+        childSessionID,
+        agent: target,
+        ownerSession: context.sessionID,
+        workspace: state.worktree,
+        description,
+        prompt,
+        questionDeny: false,
+        attempts: attemptSync,
+        startedAt: syncStartedAt,
+        updatedAt: Date.now(),
+      })
       syncWait: for (;;) {
+        // D4 (task 3.1): host-signal first — a durable terminal event
+        // settles the sync wait with zero REST polls. The final-message
+        // read below is the report carrier, not a poll.
+        const signal = takeDispatchTerminalSignal(childSessionID)
+        if (signal) {
+          forgetDispatchSignals(childSessionID)
+          if (signal.kind === "failed") {
+            syncError = signal.detail ?? "session.execution.failed"
+            break syncWait
+          }
+          if (signal.kind === "interrupted" && signal.detail === "user") {
+            const ab = await abortChild(client, childSessionID)
+            journalTerminalRecord(syncJournalBase, "aborted", `child session ${childSessionID} was interrupted by the user (execution.interrupted)`)
+            context.metadata({ title: `${target}: dispatch interrupted`, metadata: { ...taskMetadata } })
+            return {
+              title: `${target}: dispatch interrupted`,
+              metadata: { ...taskMetadata },
+              output: [
+                `[forge:dispatch] Child session ${childSessionID} was interrupted by the user${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`} — dispatch finalized honestly.`,
+                `task id: ${syncJobId}`,
+              ].join("\n"),
+            }
+          }
+          if (signal.kind === "succeeded") {
+            syncCompleted = true
+            break syncWait
+          }
+          // Non-user interruption: treat as activity, keep waiting.
+          noteDispatchChildActivity(childSessionID)
+        }
         const poll = await pollChild(client, {
           sessionID: childSessionID,
           intervalMs: syncIntervalMs,
@@ -3964,7 +4457,10 @@ const taskDispatchTool = tool({
               `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`,
             )
             await new Promise((resolve) => setTimeout(resolve, retryBackoffSync))
-            const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusal(context.sessionID, target)
+            const refusal =
+              crewPendingRefusal(context.sessionID) ??
+              draftDispatchRefusal(context.sessionID, target) ??
+              forgeTargetUnresolved(target)
             if (refusal) {
               journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`)
               throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
@@ -3975,6 +4471,8 @@ const taskDispatchTool = tool({
               agentID: target,
               description,
               questionDeny: false,
+              modelPin: rosterModelPin(target),
+              assertBinding: v2HostSeen,
               taskDeny: nestedTaskDenyFor(target, context.sessionID, childSessionID),
             })
             if (!respawn.ok) {
@@ -3992,8 +4490,24 @@ const taskDispatchTool = tool({
               throw new Error(`[forge:dispatch] retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
             }
             // Slot inheritance: fresh child, same sync call. Stale, stability,
-            // and the clock restart for the fresh child.
+            // and the clock restart for the fresh child. Host-signal rebind:
+            // drop the dead child's signals, re-arm the latch + registry row.
+            forgetDispatchSignals(childSessionID)
             childSessionID = respawn.sessionID
+            armDispatchWaitWatcher(childSessionID)
+            void writeDispatchStorageRow({
+              taskId: syncJobId,
+              childSessionID,
+              agent: target,
+              ownerSession: context.sessionID,
+              workspace: state.worktree,
+              description,
+              prompt,
+              questionDeny: false,
+              attempts: attemptSync,
+              startedAt: syncStartedAt,
+              updatedAt: Date.now(),
+            })
             taskMetadata.sessionId = childSessionID
             journalTransition(state.worktree, {
               id: syncJobId,
@@ -4103,6 +4617,9 @@ const taskDispatchTool = tool({
         syncOverride = poll.via === "active-textful"
         break syncWait
       }
+      // Sync watch over: drop this child's signal state (the persisted row
+      // removal rides the journalTerminalRecord choke points above).
+      forgetDispatchSignals(childSessionID)
       if (syncCompleted) {
         const fin = await fetchFinalMessage(client, childSessionID)
         if (!fin.ok) {
@@ -6347,6 +6864,32 @@ export const server: Plugin = async (input, options) => {
           // Drifted moved payload: no-op, never a throw into the host.
         }
       }
+      // Host-signal completion routing (dispatch-v2-hostsignals 3.1): the
+      // v1 hook's bus delivers the same durable execution events where the
+      // host publishes them — routed into the child-keyed inbox (a Map-miss
+      // for non-children is a no-op). Defensively typed, never a throw.
+      const v1Type = (event as unknown as { type?: string }).type
+      const v1Props = ((event as unknown as { properties?: Record<string, unknown> }).properties ?? {}) as Record<string, unknown>
+      const v1Session = typeof v1Props.sessionID === "string" && v1Props.sessionID ? v1Props.sessionID : undefined
+      if (v1Session && (v1Type === "session.execution.succeeded" || v1Type === "session.execution.failed" || v1Type === "session.execution.interrupted")) {
+        const kind =
+          v1Type === "session.execution.succeeded" ? ("succeeded" as const) : v1Type === "session.execution.failed" ? ("failed" as const) : ("interrupted" as const)
+        const detail =
+          kind === "failed"
+            ? ((v1Props.error as { message?: unknown } | undefined)?.message !== undefined
+                ? String((v1Props.error as { message?: unknown }).message)
+                : v1Props.error !== undefined
+                  ? String(v1Props.error)
+                  : undefined)
+            : kind === "interrupted"
+              ? v1Props.reason !== undefined
+                ? String(v1Props.reason)
+                : undefined
+              : undefined
+        noteDispatchTerminalSignal(v1Session, kind, detail)
+      } else if (v1Session && (v1Type === "session.execution.started" || v1Type === "session.step.started" || v1Type === "session.step.ended")) {
+        noteDispatchChildActivity(v1Session)
+      }
     },
 
     // Per-turn activity ledger for the goal no-progress detector: writes,
@@ -6571,6 +7114,10 @@ type V2PluginContext = {
     get?(opts: unknown): Promise<unknown>
     prompt?(input: unknown): Promise<unknown>
     context?(opts: unknown): Promise<unknown>
+    // dispatch-v2-hostsignals 3.2 (protocol-verified 2.3.2): the one-shot
+    // idle latch — POST /api/experimental/session/:sessionID/wait
+    // (NoContent success; "Wait for a session agent loop to become idle").
+    wait?(input: unknown): Promise<unknown>
     // fix-v2-crew-surface-drift D2 (sandbox-probed 2.3.2): the promise-layer
     // session domain DOES expose create — flat single-object param, bare
     // record response (see v2SessionClient's create adapter).
@@ -6589,6 +7136,16 @@ type V2PluginContext = {
   // {types?, signal?} (adapter.js makeStreams); cleanup = breaking the
   // for-await loop (iterator.return) and/or aborting the signal.
   event?: { subscribe?(options?: unknown): unknown }
+  // dispatch-v2-hostsignals 4.1 (promise/storage.d.ts, 2.3.2): the host
+  // plugin KV — get(key)→Json|undefined, set/remove, scan({prefix})→
+  // {entries:[{key,value}], next?}. The persisted dispatch registry rides
+  // it; a drifted/absent domain fails soft to the journal-only posture.
+  storage?: {
+    get?(key: string): Promise<unknown>
+    set?(key: string, value: unknown): Promise<void>
+    remove?(key: string): Promise<void>
+    scan?(options: { prefix: string; after?: string; limit?: number }): Promise<{ entries?: ReadonlyArray<{ key: string; value: unknown }>; next?: string } | undefined>
+  }
   skill?: { transform?(cb: (draft: unknown) => void | Promise<void>): Promise<unknown> }
   // SANDBOX-PENDING: ctx.location as the workspace/directory source follows
   // the conventions §3 mapping (directory/project → ctx.location.*); the
@@ -7585,7 +8142,12 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
       const body = args?.body
       const flat: Record<string, unknown> = {}
       if (body && typeof body === "object") {
-        for (const key of ["parentID", "title", "permission", "permissions", "directory"] as const) {
+        // dispatch-v2-hostsignals 2.1: `agent` + `model` join the allowlist —
+        // the agent-bound creation rides the flat object exactly like the
+        // host's own subagent tool ({parentID, title, agent, model}); the
+        // probe proved both keys land on the created record (model wants the
+        // {providerID, modelID, id} shape the dispatch core already sends).
+        for (const key of ["parentID", "title", "agent", "model", "permission", "permissions", "directory"] as const) {
           const v = (body as Record<string, unknown>)[key]
           if (v !== undefined) flat[key] = v
         }
@@ -7632,74 +8194,149 @@ function v2HandleIdle(sessionID: string, goalClient: GoalClient | null): void {
   }
 }
 
-// The v2 event subscription (task 5.1, W6a-resolved):
-// ctx.event.subscribe(options?) returns an AsyncIterable of
-// {id, type, data} envelopes — consumed with for-await in a DETACHED task
-// (never blocking setup). session.deleted (26x literal in the sandbox
-// scan; schema Deleted.data = {sessionID}) rides the shared
-// harvestSessionEnd core. The idle edge (session.execution.succeeded —
-// the emitted idle signal on 2.3.2; "session.idle" exists in the schema
-// but is NOT emitted, kept as a harmless alias) is handled HERE only as a
-// FALLBACK for hosts without the in-process experimental.idle hook — the
-// primary idle mechanism is ctx.session.hook("experimental.idle")
-// (in-process, no SSE race, richer background info; see
-// v2RegisterSessionHooks). Returns the CLEANUP (abort the controller +
-// close the iterator — SubscribeOptions.signal + iterator.return per
-// adapter.js makeStreams); a drifted event domain returns null (slice
-// disabled, no throw).
+// The v2 event subscription (task 5.1, W6a-resolved; dispatch-v2-hostsignals
+// 3.1/3.4): ctx.event.subscribe(options?) returns an AsyncIterable of
+// {id, type, data} envelopes — consumed in a DETACHED task (never blocking
+// setup). session.deleted (26x literal in the sandbox scan; schema
+// Deleted.data = {sessionID}) rides the shared harvestSessionEnd core.
+// The idle edge (session.execution.succeeded — the emitted idle signal on
+// 2.3.2; "session.idle" exists in the schema but is NOT emitted, kept as a
+// harmless alias) is handled HERE only as a FALLBACK for hosts without the
+// in-process experimental.idle hook — the primary idle mechanism is
+// ctx.session.hook("experimental.idle") (in-process, no SSE race, richer
+// background info; see v2RegisterSessionHooks).
+//
+// dispatch-v2-hostsignals: the durable execution events now ALSO route into
+// the host-signal completion core (noteDispatchTerminalSignal /
+// noteDispatchChildActivity) — the durable terminal channel of task 3.1 —
+// and session.created seeds the session map + runs the LAZY per-workspace
+// journal recovery (v1-hook parity; the reload-adoption leg). The stream is
+// self-healing: an ended or errored stream RE-SUBSCRIBES with backoff
+// (task 3.4) until cleanup; the reconcile pass covers children whose
+// terminal events fired inside a gap. Returns the CLEANUP (abort the
+// controller + close the current iterator); a drifted event domain returns
+// null (slice disabled, no throw).
 function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, idleFallback: boolean): (() => void) | null {
-  if (typeof ctx.event?.subscribe !== "function") return null
-  try {
-    let iterable: AsyncIterable<unknown> | null = null
+  const subscribeFn = ctx.event?.subscribe?.bind(ctx.event)
+  if (typeof subscribeFn !== "function") return null
+  const trySubscribe = (): AsyncIterator<unknown> | null => {
     try {
-      const sub = ctx.event.subscribe()
+      const sub = subscribeFn()
       if (sub !== null && typeof sub === "object" && typeof (sub as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function") {
-        iterable = sub as AsyncIterable<unknown>
+        return (sub as AsyncIterable<unknown>)[Symbol.asyncIterator]()
       }
     } catch {
-      // Drifted subscribe call: slice disabled below.
+      // Drifted subscribe call: no iterator.
     }
-    if (!iterable) return null
+    return null
+  }
+  try {
+    let iterator = trySubscribe()
+    if (!iterator) return null
     const controller = new AbortController()
-    const iterator = iterable[Symbol.asyncIterator]()
     const run = async () => {
-      try {
-        for (;;) {
-          const next = await iterator.next()
-          if (next.done) break
-          const ev = next.value as { type?: unknown } | null
-          const type = ev !== null && typeof ev === "object" && typeof ev.type === "string" ? ev.type : undefined
-          if (!type) continue
-          if (controller.signal.aborted) break
-          const fields = v2EventFields(ev)
-          if (type === "session.deleted") {
-            try {
-              const info = fields.info as { id?: unknown } | undefined
-              const id =
-                info !== null && typeof info === "object" && typeof info.id === "string" && info.id
-                  ? info.id
-                  : v2PickStr(fields, "sessionID", "sessionId")
-              if (id) harvestSessionEnd(id)
-            } catch {
-              // Drifted deleted payload: no-op, never a throw into the host.
+      // Task 3.4: stream loss → re-subscribe loop (1s → 5s backoff) until
+      // cleanup or a dead domain; the reconcile pass covers the gap.
+      let backoffMs = 1_000
+      while (!controller.signal.aborted) {
+        const iter = iterator
+        if (!iter) return
+        try {
+          for (;;) {
+            const next = await iter.next()
+            if (next.done) break
+            const ev = next.value as { type?: unknown } | null
+            const type = ev !== null && typeof ev === "object" && typeof ev.type === "string" ? ev.type : undefined
+            if (!type) continue
+            if (controller.signal.aborted) return
+            const fields = v2EventFields(ev)
+            if (type === "session.deleted") {
+              try {
+                const info = fields.info as { id?: unknown } | undefined
+                const id =
+                  info !== null && typeof info === "object" && typeof info.id === "string" && info.id
+                    ? info.id
+                    : v2PickStr(fields, "sessionID", "sessionId")
+                if (id) harvestSessionEnd(id)
+              } catch {
+                // Drifted deleted payload: no-op, never a throw into the host.
+              }
+            } else if (type === "session.moved") {
+              // Post-move anchor re-resolution (see the resolver branch): the
+              // v2 event payload is flat {sessionID, location:{directory}}
+              // under .data — v2EventFields already unwraps it.
+              try {
+                const f = movedEventFields(fields)
+                noteSessionMoved(f.sessionID, f.directory)
+              } catch {
+                // Drifted moved payload: no-op, never a throw into the host.
+              }
+            } else if (type === "session.execution.succeeded" || type === "session.execution.failed" || type === "session.execution.interrupted") {
+              // Task 3.1: the durable terminal channel — routed into the
+              // host-signal completion core (child-keyed inbox; non-children
+              // are a Map-miss no-op).
+              const sessionID = v2PickStr(fields, "sessionID", "sessionId")
+              if (sessionID) {
+                const kind =
+                  type === "session.execution.succeeded" ? "succeeded" : type === "session.execution.failed" ? "failed" : "interrupted"
+                const detail =
+                  kind === "failed"
+                    ? (fields.error as { message?: unknown } | undefined)?.message !== undefined
+                      ? String((fields.error as { message?: unknown }).message)
+                      : fields.error !== undefined
+                        ? String(fields.error)
+                        : undefined
+                    : kind === "interrupted"
+                      ? fields.reason !== undefined
+                        ? String(fields.reason)
+                        : undefined
+                      : undefined
+                noteDispatchTerminalSignal(sessionID, kind, detail)
+                // Idle parity: on hosts without the in-process idle hook,
+                // the succeeded edge IS the idle edge (existing fallback).
+                if (idleFallback && type === "session.execution.succeeded") v2HandleIdle(sessionID, goalClient)
+              }
+            } else if (type === "session.execution.started" || type === "session.step.started" || type === "session.step.ended") {
+              // Reconcile-confirmation pings: execution activity keeps the
+              // stream-lost verdict withheld for a live child.
+              const sessionID = v2PickStr(fields, "sessionID", "sessionId")
+              if (sessionID) noteDispatchChildActivity(sessionID)
+            } else if (type === "session.created") {
+              // Lazy per-workspace recovery + session-map seeding (v1-hook
+              // parity): workspaces beyond the launch anchor recover on
+              // their FIRST session; a hot-reloaded generation adopts the
+              // in-flight dispatch journal here.
+              try {
+                const info = (fields.info ?? (fields as { session?: unknown }).session) as
+                  | { id?: unknown; directory?: unknown; worktree?: unknown }
+                  | undefined
+                const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId")
+                const worktree = effectiveWorktree(
+                  info !== null && typeof info === "object" && typeof info.worktree === "string" ? info.worktree : undefined,
+                  info !== null && typeof info === "object" && typeof info.directory === "string" ? info.directory : undefined,
+                )
+                if (id && typeof worktree === "string" && worktree) {
+                  ensureSession(id, worktree)
+                  if (!isRootish(worktree)) void recoverWorkspaceDispatches(jobClient as unknown as DispatchClient | null, worktree)
+                }
+              } catch {
+                // Drifted created payload: no-op, never a throw into the host.
+              }
+            } else if (idleFallback && type === "session.idle") {
+              const sessionID = v2PickStr(fields, "sessionID", "sessionId")
+              if (sessionID) v2HandleIdle(sessionID, goalClient)
             }
-          } else if (type === "session.moved") {
-            // Post-move anchor re-resolution (see the resolver branch): the
-            // v2 event payload is flat {sessionID, location:{directory}}
-            // under .data — v2EventFields already unwraps it.
-            try {
-              const f = movedEventFields(fields)
-              noteSessionMoved(f.sessionID, f.directory)
-            } catch {
-              // Drifted moved payload: no-op, never a throw into the host.
-            }
-          } else if (idleFallback && (type === "session.execution.succeeded" || type === "session.idle")) {
-            const sessionID = v2PickStr(fields, "sessionID", "sessionId")
-            if (sessionID) v2HandleIdle(sessionID, goalClient)
           }
+        } catch {
+          // Stream error: fall through to the re-subscribe beat.
         }
-      } catch {
-        // Stream error: end the loop (the host owns reconnect semantics).
+        if (controller.signal.aborted) return
+        await new Promise((resolve) => setTimeout(resolve, backoffMs))
+        if (controller.signal.aborted) return
+        const fresh = trySubscribe()
+        if (!fresh) return // the event domain itself is gone: cleanup semantics
+        iterator = fresh
+        backoffMs = 1_000
       }
     }
     void run()
@@ -7709,7 +8346,7 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
       closed = true
       controller.abort()
       try {
-        void iterator.return?.()
+        void iterator?.return?.()
       } catch {
         // Already-closed iterator: nothing to do.
       }
@@ -7724,7 +8361,7 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
 // the v1 __forgeSubagentsTest): live references to the module maps the v2
 // handlers share with the v1 hooks, so tests seed and inspect without a
 // host. NOT part of the plugin API surface.
-export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
+export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
 
 // ---- v2-single-agent-surface: single-agent-surface primitives (v2Setup
 // only — the v1 config-hook path never uses these) ----
@@ -8057,6 +8694,37 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   if (v2Client && (v2Client.session.promptAsync || v2Client.session.prompt)) jobClient = v2Client
   const goalClient =
     v2Client && typeof v2Client.session.prompt === "function" && typeof v2Client.session.get === "function" ? (v2Client as unknown as GoalClient) : null
+
+  // ---- host-signal completion seams (dispatch-v2-hostsignals 3.2/4.1):
+  // the one-shot wait latch (ctx.session.wait) and the persisted registry
+  // domain (ctx.storage). v2-only — v1 keeps its journal-only posture
+  // (design risk table: fail-soft to today's behavior).
+  v2SessionWaitSeam = typeof ctx.session?.wait === "function" ? (sessionID: string) => ctx.session!.wait!({ sessionID }) : null
+  v2DispatchStorage =
+    ctx.storage && typeof ctx.storage.scan === "function" && typeof ctx.storage.set === "function"
+      ? (ctx.storage as unknown as typeof v2DispatchStorage)
+      : null
+  // Launch-anchor journal recovery (task 4.2, server()-init parity): the
+  // reload-mid-dispatch leg — a hot-reloaded generation replays the launch
+  // anchor's journal exactly like a fresh v1 process does. Fail-soft.
+  try {
+    if (hostWorktree && !isRootish(hostWorktree)) {
+      void recoverWorkspaceDispatches(v2Client as unknown as DispatchClient, hostWorktree)
+    }
+  } catch {
+    // Recovery is best-effort by construction; never a throw into the host.
+  }
+  // Persisted-row adoption (task 4.2): scan ctx.storage rows for the
+  // launch anchor and re-arm watching for live children (watch-only — an
+  // adopted dispatch never re-spawns). Non-launch anchors adopt lazily via
+  // the session.created branch of the event subscription.
+  try {
+    if (hostWorktree && !isRootish(hostWorktree)) {
+      void adoptPersistedDispatchRows(v2Client as unknown as DispatchClient, hostWorktree)
+    }
+  } catch {
+    // Adoption is fail-soft; the journal recovery remains the durable path.
+  }
 
   // ---- session seams (task 4.2 + W6a idle choice): prompt (busy
   // marking) / context (thoughtLevel injection + family-gated system

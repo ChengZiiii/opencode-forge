@@ -135,6 +135,25 @@ export type CreateChildInput = {
   agentID: string
   description: string
   /**
+   * Agent-bound creation (dispatch-v2-hostsignals task 2.1): when set, the
+   * create body carries the roster's PINNED model — the host create schema
+   * wants `{providerID, modelID, id}` (task 1.1 probe field reality; the
+   * record stores `{id, providerID, variant}`). Null/omitted for Auto
+   * workers: no model key, the host's own precedence applies
+   * (agent's configured model, else the inherited parent model).
+   */
+  modelPin?: { providerID: string; modelID: string } | null
+  /**
+   * Read-back assertion (task 2.3): when true, the created record's `agent`
+   * is asserted against `agentID` — a mismatch or missing binding fails the
+   * dispatch LOUD (`binding-lost`), never a silently-naked child. v2-only:
+   * v1 clients bind via the prompt body (`buildPromptArgs`) and their records
+   * carry no agent field, so they omit this flag. Field reality (2.3.2,
+   * task 1.1 probe): the create response AND `session.get` both carry
+   * `agent`/`model`; the host does NOT validate agent existence at create.
+   */
+  assertBinding?: boolean
+  /**
    * Nested-dispatch guard (harden-dispatch-resilience D2): when true the
    * create body carries a task-tool deny in the v2 array spelling —
    * probe-1.1-evidence.md: `{action,resource,effect}` lands verbatim on the
@@ -166,6 +185,37 @@ export type CreateChildResult =
  */
 export const TASK_CREATE_SEAM_ABSENT = "task-create-seam-absent"
 
+/**
+ * Read-back assertion (dispatch-v2-hostsignals task 2.3): the created
+ * record's `agent` must match the requested target. Mismatch / no binding =
+ * the loud `binding-lost` error (journal class: non-retryable — a re-spawn
+ * would bind the same naked way). Field reality (task 1.1 probe, 2.3.2):
+ * both the create response and session.get carry `agent`; the host accepts
+ * ANY agent id verbatim (bogus ids echo back), so this assert is the only
+ * guard against a silently-naked child.
+ */
+function assertBoundRecord(
+  record: SessionLike | undefined,
+  sessionID: string,
+  input: CreateChildInput,
+): CreateChildResult {
+  if (!input.assertBinding) return { ok: true, sessionID }
+  const bound = (record as { agent?: unknown } | undefined)?.agent
+  if (typeof bound !== "string" || bound === "") {
+    return {
+      ok: false,
+      error: `binding-lost: created child ${sessionID} reports no bound agent (requested ${input.agentID}) — refusing to prompt an unbound child`,
+    }
+  }
+  if (bound !== input.agentID) {
+    return {
+      ok: false,
+      error: `binding-lost: created child ${sessionID} reports agent ${bound} (requested ${input.agentID}) — refusing to prompt the mismatched child`,
+    }
+  }
+  return { ok: true, sessionID }
+}
+
 export async function createChildSession(
   client: DispatchClient,
   input: CreateChildInput,
@@ -181,6 +231,25 @@ export async function createChildSession(
       body: {
         parentID: input.parentSessionID,
         title: childSessionTitle(input.description, input.agentID),
+        // Agent-bound creation (task 2.1): the create body carries the
+        // target agent — mirroring the host's own subagent tool
+        // (core/src/tool/plugin/subagent.ts: sessions.create({parentID,
+        // title, agent: agent.id, model})). The host does NOT validate
+        // existence here (task 1.1 probe: a bogus agent is accepted and
+        // echoed) — the refusal-not-degrade check lives with the caller.
+        agent: input.agentID,
+        // The pinned model rides the roster pin (shape per task 1.1 probe:
+        // {providerID, modelID, id}; the record stores {id, providerID,
+        // variant}). Absent for Auto workers by design.
+        ...(input.modelPin
+          ? {
+              model: {
+                providerID: input.modelPin.providerID,
+                modelID: input.modelPin.modelID,
+                id: `${input.modelPin.providerID}/${input.modelPin.modelID}`,
+              },
+            }
+          : {}),
         // Both spellings (see QUESTION_DENY_PERMISSIONS_V2): v1 hosts read
         // `permission`, 2.3.2 reads `permissions` — the foreign key is
         // dropped silently on each, the native one lands.
@@ -211,7 +280,7 @@ export async function createChildSession(
     if (typeof id !== "string" || id === "") {
       return { ok: false, error: "session.create returned no session id" }
     }
-    return { ok: true, sessionID: id }
+    return assertBoundRecord(result.data, id, input)
   }
   // BARE-record response shape (2.3.2 promise-layer session.create returns
   // the session record itself, no {data,error} envelope).
@@ -220,7 +289,7 @@ export async function createChildSession(
   if (typeof bareId !== "string" || bareId === "") {
     return { ok: false, error: "session.create returned no session id" }
   }
-  return { ok: true, sessionID: bareId }
+  return assertBoundRecord(bare, bareId, input)
 }
 
 export type SendPromptInput = {
