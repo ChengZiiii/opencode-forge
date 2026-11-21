@@ -611,6 +611,31 @@ never writes your config.
 No forge.json? Nothing happens — the plugin registers nothing and the native
 subagent behavior is untouched. Onboarding is this README, for you the human.
 
+### Slash commands — the roster levers
+
+Four commands, registered on every host generation:
+
+- **`/forge-sync`** — force a roster sync NOW (`forge_sync`) and show the full
+  diff. The manual force/debug lever; the default staleness-gate posture and
+  `sync:"auto"` are unchanged.
+- **`/forge-init`** — draft THIS workspace's `.opencode/forge.json` in-band
+  (interview or infer, show, write only on your explicit go-ahead; refuses
+  and reviews when one already exists).
+- **`/forge-init-global`** — same drafting flow for the GLOBAL
+  `~/.config/opencode/forge.json`, with the built-in override entries
+  (`general`/`explore`) shipped commented out (inert until you fill one).
+- **`/forge <argument>`** — the router (`sync` / `init` / `init global`),
+  kept as the fallback entry for muscle memory. On v2 hosts typed arguments
+  are composed into the delivered prompt by the plugin (the host does no
+  `$ARGUMENTS` substitution for plugin commands).
+
+The hyphenated family is the primary surface: zero-argument, each with its
+own description in the slash menu — deterministic routing, no argument
+pipeline. All four carry the same family guard (a non-forge session gets a
+"switch to forge (Tab)" pointer instead of acting) and never write anything
+themselves — every write goes through `forge_sync` or the normal write tool
+on your explicit go-ahead, transcript-visible.
+
 ### forge.json — the configuration
 
 A dedicated `forge.json` (JSONC — comments allowed) with **workspace pool

@@ -254,19 +254,87 @@ export const GLOBAL_RECIPE_SCAFFOLD_JSONC = [
   "}",
 ].join("\n")
 
+// Per-lever bodies live in single-source constants (change v2-command-surface
+// task 2.1): the /forge router embeds them VERBATIM (byte-identical routing
+// template), and the dedicated hyphenated commands (forge-sync / forge-init /
+// forge-init-global) embed the same text as standalone levers — the two
+// surfaces cannot fork.
+
+// Step-0 family guard, parameterized by the invoking command's name.
+export function forgeFamilyGuard(command: string): string {
+  return `FAMILY GUARD (step 0, before anything else): if you do not have the forge_sync tool in your available tools, you are not in a forge session — STOP now: execute nothing below, and tell the user that ${command} belongs to the forge agent, who should switch to forge (Tab) and rerun it there.`
+}
+
+export const FORGE_BOUNDARIES_TEXT =
+  'Boundaries: this command never writes anything by itself — every write goes through forge_sync or the normal write tool on the user\'s explicit go-ahead, transcript-visible. The staleness gate, the in-band sync default, and sync:"auto" behave exactly as without this command.'
+
+export const SYNC_LEVER_BODY =
+  'call the forge_sync tool NOW and report its output verbatim to the user — every created/updated/unchanged/gc\'d file and any error line. This is the manual force lever: the default posture (staleness gate + in-band sync; the sync:"auto" opt-in) is unchanged, so report the diff and stop there.'
+
+export const INIT_WORKSPACE_LEAD = "draft THIS workspace's recipe (.opencode/forge.json) in-band with the user."
+
+export const INIT_FLOW_BODY =
+  "First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent's shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user's explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes."
+
+export const INIT_GLOBAL_SCAFFOLD_NOTE =
+  "The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in's prompt wholesale; the scaffold's inline comments say the same)."
+
+export const INIT_GLOBAL_BODY =
+  `same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. ${INIT_GLOBAL_SCAFFOLD_NOTE}`
+
+export const FORGE_HELP_ROUTE_LINE =
+  "- Argument empty or unknown: tell the user the three forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries) — and stop."
+
 export const FORGE_COMMAND_TEMPLATE = [
   '(forge roster levers. Argument: "$ARGUMENTS")',
   "",
-  "FAMILY GUARD (step 0, before anything else): if you do not have the forge_sync tool in your available tools, you are not in a forge session — STOP now: execute nothing below, and tell the user that /forge belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
+  forgeFamilyGuard("/forge"),
   "",
   "Route on the argument above (decide silently; do not recite this routing text to the user):",
-  '- Argument "sync": call the forge_sync tool NOW and report its output verbatim to the user — every created/updated/unchanged/gc\'d file and any error line. This is the manual force lever: the default posture (staleness gate + in-band sync; the sync:"auto" opt-in) is unchanged, so report the diff and stop there.',
-  '- Argument "init": draft THIS workspace\'s recipe (.opencode/forge.json) in-band with the user. First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent\'s shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user\'s explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes.',
-  '- Argument "init global": same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in\'s prompt wholesale; the scaffold\'s inline comments say the same). Scaffold shape:',
+  `- Argument "sync": ${SYNC_LEVER_BODY}`,
+  `- Argument "init": ${INIT_WORKSPACE_LEAD} ${INIT_FLOW_BODY}`,
+  `- Argument "init global": ${INIT_GLOBAL_BODY} Scaffold shape:`,
   ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split("\n").map((l) => `  ${l}`),
-  '- Argument empty or unknown: tell the user the three forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace\'s forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries) — and stop.',
+  FORGE_HELP_ROUTE_LINE,
   "",
-  "Boundaries: this command never writes anything by itself — every write goes through forge_sync or the normal write tool on the user\'s explicit go-ahead, transcript-visible. The staleness gate, the in-band sync default, and sync:\"auto\" behave exactly as without this command.",
+  FORGE_BOUNDARIES_TEXT,
+  "",
+].join("\n")
+
+// Dedicated zero-argument levers (change v2-command-surface): the SAME body
+// text as the /forge route, standalone — host-deterministic routing, no
+// argument pipeline, each with its own description (menu-as-documentation).
+export const FORGE_SYNC_LEVER_TEMPLATE = [
+  "(forge roster lever: sync — force a roster sync NOW and show the diff)",
+  "",
+  forgeFamilyGuard("/forge-sync"),
+  "",
+  SYNC_LEVER_BODY,
+  "",
+  FORGE_BOUNDARIES_TEXT,
+  "",
+].join("\n")
+
+export const FORGE_INIT_LEVER_TEMPLATE = [
+  "(forge roster lever: init — draft THIS workspace's recipe (.opencode/forge.json) in-band)",
+  "",
+  forgeFamilyGuard("/forge-init"),
+  "",
+  `${INIT_WORKSPACE_LEAD} ${INIT_FLOW_BODY}`,
+  "",
+  FORGE_BOUNDARIES_TEXT,
+  "",
+].join("\n")
+
+export const FORGE_INIT_GLOBAL_LEVER_TEMPLATE = [
+  "(forge roster lever: init global — draft the GLOBAL recipe (~/.config/opencode/forge.json))",
+  "",
+  forgeFamilyGuard("/forge-init-global"),
+  "",
+  `Draft the GLOBAL recipe (~/.config/opencode/forge.json) in-band with the user. ${INIT_FLOW_BODY} ${INIT_GLOBAL_SCAFFOLD_NOTE} Scaffold shape:`,
+  ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split("\n").map((l) => `  ${l}`),
+  "",
+  FORGE_BOUNDARIES_TEXT,
   "",
 ].join("\n")
 
@@ -5596,6 +5664,29 @@ export const server: Plugin = async (input, options) => {
           'forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out',
       }
 
+      // Dedicated zero-argument levers (change v2-command-surface task 3.2):
+      // the hyphenated family joins /forge as the DOCUMENTED primary surface —
+      // each with its own template (same route body, standalone) and its own
+      // description. Same no-clobber rule. v1 config commands get $ARGUMENTS
+      // substitution from the host's config-command path; these templates
+      // contain no placeholder, so a user typing trailing text still gets it
+      // delivered by the host's append semantics — the levers never depend on
+      // arguments for routing either way.
+      cfg.command["forge-sync"] ??= {
+        template: FORGE_SYNC_LEVER_TEMPLATE,
+        description: "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff",
+      }
+      cfg.command["forge-init"] ??= {
+        template: FORGE_INIT_LEVER_TEMPLATE,
+        description:
+          "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)",
+      }
+      cfg.command["forge-init-global"] ??= {
+        template: FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
+        description:
+          "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out",
+      }
+
       // Gate permission rules (shell-defang-default-open): the 7 doors keep
       // the full "ask" rewrite — they stay real user confirmations (an
       // explicit allow on a door is still rewritten to ask). forge_shell is
@@ -7287,15 +7378,38 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
       // sends the SAME template text into the invoking session — the
       // templates stay byte-identical by construction (same constants).
       const addFn = editor?.add
-      if (typeof addFn !== "function") return
+      if (typeof addFn !== "function") {
+        console.warn("forge: command domain editor drifted — add() missing; commands not registered")
+        return
+      }
       const addTemplateCommand = (name: string, template: () => string, description: string) => {
         addFn({
           name,
           description,
-          execute: async (input: { sessionID?: unknown }) => {
+          // Task 4.1 (change v2-command-surface): the v2 host passes typed
+          // arguments in `prompt.text` and does NO $ARGUMENTS substitution
+          // for plugin commands — the registrar composes (upstream
+          // evaluateTemplate parity) and passes the delivery hint through.
+          execute: async (input: { sessionID?: unknown; prompt?: unknown; delivery?: unknown }) => {
             const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined
             if (!sessionID || typeof ctx.session?.prompt !== "function") return
-            await ctx.session.prompt({ sessionID, text: template() })
+            const promptShape = input?.prompt as { text?: unknown } | undefined
+            const typed =
+              promptShape && typeof promptShape === "object" && typeof promptShape.text === "string" ? promptShape.text : undefined
+            const text = composeCommandPrompt(template(), typed)
+            const delivery = typeof input?.delivery === "string" && input.delivery ? input.delivery : undefined
+            try {
+              await ctx.session.prompt(delivery ? { sessionID, text, delivery } : { sessionID, text })
+            } catch (e) {
+              // Delivery rides the send; a drifted host schema that rejects
+              // the extra key degrades DISCLOSED (retry without it) — never
+              // silently, never a non-schema error swallowed.
+              if (!delivery) throw e
+              const head = `${(e as Error)?.name ?? ""} ${(e as Error)?.message ?? String(e)}`
+              if (!/schema/i.test(head)) throw e
+              console.warn(`forge: command '${name}' delivery hint rejected by host prompt schema — delivering without it (${head.slice(0, 120)})`)
+              await ctx.session.prompt({ sessionID, text })
+            }
           },
         })
       }
@@ -7338,10 +7452,46 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
         () => FORGE_COMMAND_TEMPLATE,
         "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out",
       )
+      // Dedicated zero-argument levers (change v2-command-surface task 3.1):
+      // the hyphenated family — host-deterministic routing (the hyphenated
+      // name was probed live in gate task 1.1), the SAME route bodies as
+      // /forge (single-source constants), per-lever descriptions.
+      addTemplateCommand(
+        "forge-sync",
+        () => FORGE_SYNC_LEVER_TEMPLATE,
+        "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff",
+      )
+      addTemplateCommand(
+        "forge-init",
+        () => FORGE_INIT_LEVER_TEMPLATE,
+        "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)",
+      )
+      addTemplateCommand(
+        "forge-init-global",
+        () => FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
+        "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out",
+      )
     })
-  } catch {
-    // Drifted command domain: silent no-op.
+  } catch (e) {
+    // Drifted command domain: DISCLOSED degradation (change v2-command-surface
+    // task 4.2) — never crash the plugin, never a silent no-op either (the
+    // mem0 #7602 incident class).
+    const head = e instanceof Error ? e.message : String(e)
+    console.warn(`forge: command domain registration drifted — ${head.slice(0, 160)}`)
   }
+}
+
+// Typed-argument composition (change v2-command-surface task 4.1) — upstream
+// evaluateTemplate semantics for the one placeholder forge templates use:
+// $ARGUMENTS → the full typed text (function replacer, so $&-style sequences
+// inside the argument are NOT expanded; all occurrences); a template with no
+// placeholder + non-empty typed text → the text appended after a blank line;
+// empty/whitespace typed text → the template unchanged.
+export function composeCommandPrompt(template: string, typed: string | undefined | null): string {
+  const text = typeof typed === "string" ? typed : ""
+  if (!text.trim()) return template
+  if (template.includes("$ARGUMENTS")) return template.replaceAll("$ARGUMENTS", () => text)
+  return `${template}\n\n${text}`
 }
 
 // ---------------------------------------------------------------------------

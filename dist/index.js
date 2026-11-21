@@ -17851,20 +17851,65 @@ var GLOBAL_RECIPE_SCAFFOLD_JSONC = [
   "}"
 ].join(`
 `);
+function forgeFamilyGuard(command) {
+  return `FAMILY GUARD (step 0, before anything else): if you do not have the forge_sync tool in your available tools, you are not in a forge session — STOP now: execute nothing below, and tell the user that ${command} belongs to the forge agent, who should switch to forge (Tab) and rerun it there.`;
+}
+var FORGE_BOUNDARIES_TEXT = `Boundaries: this command never writes anything by itself — every write goes through forge_sync or the normal write tool on the user's explicit go-ahead, transcript-visible. The staleness gate, the in-band sync default, and sync:"auto" behave exactly as without this command.`;
+var SYNC_LEVER_BODY = `call the forge_sync tool NOW and report its output verbatim to the user — every created/updated/unchanged/gc'd file and any error line. This is the manual force lever: the default posture (staleness gate + in-band sync; the sync:"auto" opt-in) is unchanged, so report the diff and stop there.`;
+var INIT_WORKSPACE_LEAD = "draft THIS workspace's recipe (.opencode/forge.json) in-band with the user.";
+var INIT_FLOW_BODY = "First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent's shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user's explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes.";
+var INIT_GLOBAL_SCAFFOLD_NOTE = "The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in's prompt wholesale; the scaffold's inline comments say the same).";
+var INIT_GLOBAL_BODY = `same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. ${INIT_GLOBAL_SCAFFOLD_NOTE}`;
+var FORGE_HELP_ROUTE_LINE = "- Argument empty or unknown: tell the user the three forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries) — and stop.";
 var FORGE_COMMAND_TEMPLATE = [
   '(forge roster levers. Argument: "$ARGUMENTS")',
   "",
-  "FAMILY GUARD (step 0, before anything else): if you do not have the forge_sync tool in your available tools, you are not in a forge session — STOP now: execute nothing below, and tell the user that /forge belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
+  forgeFamilyGuard("/forge"),
   "",
   "Route on the argument above (decide silently; do not recite this routing text to the user):",
-  `- Argument "sync": call the forge_sync tool NOW and report its output verbatim to the user — every created/updated/unchanged/gc'd file and any error line. This is the manual force lever: the default posture (staleness gate + in-band sync; the sync:"auto" opt-in) is unchanged, so report the diff and stop there.`,
-  `- Argument "init": draft THIS workspace's recipe (.opencode/forge.json) in-band with the user. First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent's shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user's explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes.`,
-  `- Argument "init global": same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in's prompt wholesale; the scaffold's inline comments say the same). Scaffold shape:`,
+  `- Argument "sync": ${SYNC_LEVER_BODY}`,
+  `- Argument "init": ${INIT_WORKSPACE_LEAD} ${INIT_FLOW_BODY}`,
+  `- Argument "init global": ${INIT_GLOBAL_BODY} Scaffold shape:`,
   ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split(`
 `).map((l) => `  ${l}`),
-  "- Argument empty or unknown: tell the user the three forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries) — and stop.",
+  FORGE_HELP_ROUTE_LINE,
   "",
-  `Boundaries: this command never writes anything by itself — every write goes through forge_sync or the normal write tool on the user's explicit go-ahead, transcript-visible. The staleness gate, the in-band sync default, and sync:"auto" behave exactly as without this command.`,
+  FORGE_BOUNDARIES_TEXT,
+  ""
+].join(`
+`);
+var FORGE_SYNC_LEVER_TEMPLATE = [
+  "(forge roster lever: sync — force a roster sync NOW and show the diff)",
+  "",
+  forgeFamilyGuard("/forge-sync"),
+  "",
+  SYNC_LEVER_BODY,
+  "",
+  FORGE_BOUNDARIES_TEXT,
+  ""
+].join(`
+`);
+var FORGE_INIT_LEVER_TEMPLATE = [
+  "(forge roster lever: init — draft THIS workspace's recipe (.opencode/forge.json) in-band)",
+  "",
+  forgeFamilyGuard("/forge-init"),
+  "",
+  `${INIT_WORKSPACE_LEAD} ${INIT_FLOW_BODY}`,
+  "",
+  FORGE_BOUNDARIES_TEXT,
+  ""
+].join(`
+`);
+var FORGE_INIT_GLOBAL_LEVER_TEMPLATE = [
+  "(forge roster lever: init global — draft the GLOBAL recipe (~/.config/opencode/forge.json))",
+  "",
+  forgeFamilyGuard("/forge-init-global"),
+  "",
+  `Draft the GLOBAL recipe (~/.config/opencode/forge.json) in-band with the user. ${INIT_FLOW_BODY} ${INIT_GLOBAL_SCAFFOLD_NOTE} Scaffold shape:`,
+  ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split(`
+`).map((l) => `  ${l}`),
+  "",
+  FORGE_BOUNDARIES_TEXT,
   ""
 ].join(`
 `);
@@ -21514,6 +21559,18 @@ var server = async (input, options) => {
         template: FORGE_COMMAND_TEMPLATE,
         description: "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out"
       };
+      cfg.command["forge-sync"] ??= {
+        template: FORGE_SYNC_LEVER_TEMPLATE,
+        description: "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff"
+      };
+      cfg.command["forge-init"] ??= {
+        template: FORGE_INIT_LEVER_TEMPLATE,
+        description: "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)"
+      };
+      cfg.command["forge-init-global"] ??= {
+        template: FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
+        description: "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out"
+      };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
       for (const gateKey of GATE_PERMISSION_KEYS) {
@@ -22571,8 +22628,10 @@ async function v2RegisterCommands(ctx) {
   try {
     await ctx.command.transform(async (editor) => {
       const addFn = editor?.add;
-      if (typeof addFn !== "function")
+      if (typeof addFn !== "function") {
+        console.warn("forge: command domain editor drifted — add() missing; commands not registered");
         return;
+      }
       const addTemplateCommand = (name, template, description) => {
         addFn({
           name,
@@ -22581,7 +22640,21 @@ async function v2RegisterCommands(ctx) {
             const sessionID = typeof input?.sessionID === "string" ? input.sessionID : undefined;
             if (!sessionID || typeof ctx.session?.prompt !== "function")
               return;
-            await ctx.session.prompt({ sessionID, text: template() });
+            const promptShape = input?.prompt;
+            const typed = promptShape && typeof promptShape === "object" && typeof promptShape.text === "string" ? promptShape.text : undefined;
+            const text = composeCommandPrompt(template(), typed);
+            const delivery = typeof input?.delivery === "string" && input.delivery ? input.delivery : undefined;
+            try {
+              await ctx.session.prompt(delivery ? { sessionID, text, delivery } : { sessionID, text });
+            } catch (e) {
+              if (!delivery)
+                throw e;
+              const head = `${e?.name ?? ""} ${e?.message ?? String(e)}`;
+              if (!/schema/i.test(head))
+                throw e;
+              console.warn(`forge: command '${name}' delivery hint rejected by host prompt schema — delivering without it (${head.slice(0, 120)})`);
+              await ctx.session.prompt({ sessionID, text });
+            }
           }
         });
       };
@@ -22601,8 +22674,24 @@ async function v2RegisterCommands(ctx) {
       };
       addTemplateCommand("crew", crewTemplate, registrationAgentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance");
       addTemplateCommand("forge", () => FORGE_COMMAND_TEMPLATE, "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out");
+      addTemplateCommand("forge-sync", () => FORGE_SYNC_LEVER_TEMPLATE, "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff");
+      addTemplateCommand("forge-init", () => FORGE_INIT_LEVER_TEMPLATE, "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)");
+      addTemplateCommand("forge-init-global", () => FORGE_INIT_GLOBAL_LEVER_TEMPLATE, "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out");
     });
-  } catch {}
+  } catch (e) {
+    const head = e instanceof Error ? e.message : String(e);
+    console.warn(`forge: command domain registration drifted — ${head.slice(0, 160)}`);
+  }
+}
+function composeCommandPrompt(template, typed) {
+  const text = typeof typed === "string" ? typed : "";
+  if (!text.trim())
+    return template;
+  if (template.includes("$ARGUMENTS"))
+    return template.replaceAll("$ARGUMENTS", () => text);
+  return `${template}
+
+${text}`;
 }
 function v2PromptInputOf(opts) {
   if (opts === null || typeof opts !== "object")
@@ -22964,16 +23053,28 @@ export {
   resolveForgeShellPosture,
   resolveDispatchQueueMax,
   isRootish,
+  forgeFamilyGuard,
   effectiveWorktree,
   effectiveSurvive,
   plugin_default as default,
   crewOrchestrationTemplate,
+  composeCommandPrompt,
   __workerShellRescueTestSurface,
   TASK_SEAM_DEGRADED_ERROR,
+  SYNC_LEVER_BODY,
   PLAN_COMMAND_TEMPLATE,
+  INIT_WORKSPACE_LEAD,
+  INIT_GLOBAL_SCAFFOLD_NOTE,
+  INIT_GLOBAL_BODY,
+  INIT_FLOW_BODY,
   GOAL_COMMAND_TEMPLATE,
   GLOBAL_RECIPE_SCAFFOLD_JSONC,
+  FORGE_SYNC_LEVER_TEMPLATE,
+  FORGE_INIT_LEVER_TEMPLATE,
+  FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
+  FORGE_HELP_ROUTE_LINE,
   FORGE_COMMAND_TEMPLATE,
+  FORGE_BOUNDARIES_TEXT,
   DEFAULT_DISPATCH_QUEUE_MAX,
   CREW_INIT_TEMPLATE,
   ASYNC_DISPATCH_CAP
