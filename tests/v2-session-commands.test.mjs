@@ -246,12 +246,12 @@ test("v2 session: goal-notice rides the context system injections for the live-g
 // ---------------------------------------------------------------------------
 // Commands (task 4.3)
 
-test("v2 commands: /plan /goal /crew register as execute-based definitions", async () => {
+test("v2 commands: /plan /goal /crew /forge register as execute-based definitions", async () => {
   const dir = poolDir("cmds", { research: { model: "openai/gpt", thoughtLevel: "low", shape: "readonly" } })
   const { state } = await setup(dir)
   try {
-    assert.deepEqual([...state.commands.keys()].sort(), ["crew", "goal", "plan"])
-    for (const name of ["plan", "goal", "crew"]) {
+    assert.deepEqual([...state.commands.keys()].sort(), ["crew", "forge", "goal", "plan"])
+    for (const name of ["plan", "goal", "crew", "forge"]) {
       const def = state.commands.get(name)
       assert.equal(typeof def.description, "string", `${name} description`)
       assert.equal(typeof def.execute, "function", `${name} is EXECUTE-based (CommandDefinition.execute)`)
