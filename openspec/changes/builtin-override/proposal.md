@@ -9,7 +9,10 @@ configuration layer over native agent files, and the host already
 merges same-name definitions (project-wins-scalars, permissions
 spliced). That opens a zero-seam way to make the built-ins
 configurable: a GLOBAL forge.json with same-name entries compiles to
-`General.md` / `Explore.md` in the host's global agent dir, overriding
+`general.md` / `explore.md` — the built-ins' exact ids, LOWERCASE
+(probe 2026-11-21: the identity key is the agent id = filename stem,
+case-sensitive; only the lowercase stem truly overrides) — in the
+host's global agent dir, overriding
 the built-ins machine-wide — pin a model, pin a depth word, reshape.
 Not configured = official behavior (the Auto worker inherits the
 primary model and its depth, which IS the built-in default).
@@ -36,16 +39,23 @@ part — same-name override semantics — carried natively by the host.
   byte-equal to official built-in behavior — we never hard-copy vendor
   prompt text (it drifts every host version).
 - **ADDED — Collision redline:** when sync would emit a same-name
-  non-namespaced file (`General.md`, `Explore.md`) and a hand-written
+  non-namespaced file (`general.md`, `explore.md` — lowercase stems
+  only) and a hand-written
   file of that name already exists, sync REFUSES + discloses. The GC
   predicate for override files keys on the GENERATED marker
   (content-level), not the `forge-` prefix — override files
-  intentionally carry no prefix.
-- **PROBE FIRST — verify, don't assume:** user same-name file vs
-  BUILT-IN agent precedence is unprobed (probe 2026-11-21 covered
-  project-vs-global layers, not built-ins). A short sandbox probe
-  gates implementation; if the host does NOT let files shadow
-  built-ins, this change dies in propose.
+  intentionally carry no prefix. Emission is case-locked: a
+  capitalized variant (`General.md`) does NOT override — it creates an
+  ambiguous duplicate entry (probe-verified negative form) — so the
+  compiler never emits one and the handbook warns hand-writers.
+- **PROBE RESULT (2026-11-21, reports/probe-builtin-override.md) —
+  POSITIVE with a hard constraint:** user same-name files DO shadow
+  the built-ins — description/system/model fully replaced, permissions
+  = builtin base ∪ appended, ≤2s hot-apply — but ONLY on the exact
+  lowercase id stem (`general`/`explore`). Capitalized files coexist as
+  ambiguous duplicates. Layer mechanics identical global vs project;
+  dual-layer same-id: project wins (existing layering rule holds).
+  Change lives; implementation pins lowercase emission.
 
 ## Capabilities
 
@@ -68,7 +78,6 @@ part — same-name override semantics — carried natively by the host.
 Owner proposed the direction (2026-11-21), corrected the init shape
 (trigger-driven, like the unconfigured-crew gate), then confirmed the
 final posture: net (gates) + levers (`/forge init global`, see
-forge-commands). Remaining patches: commented defaults, collision
-redline. Implementation starts only on explicit approval. Foundation:
-native-first-roster (0.30.0) lands first — this change targets
-0.31.0.
+forge-commands). **Apply approved 2026-11-21** (probe POSITIVE).
+Foundation: native-first-roster (0.30.0, released) — this change
+targets 0.31.0.

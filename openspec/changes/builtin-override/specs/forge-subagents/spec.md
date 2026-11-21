@@ -13,15 +13,18 @@ override entries in comment form — uncommenting and filling an entry
 is the user's act, and the default-installed state `SHALL` be
 byte-equal to official built-in behavior (no vendor prompt text is
 ever copied). When the global recipe contains an override entry, sync
-`SHALL` emit it as a same-name, non-namespaced file
-(`General.md` / `Explore.md`) in the host's global agent directory;
-if a hand-written file of that name already exists, sync `SHALL`
+`SHALL` emit it as a same-name, non-namespaced file in the host's
+global agent directory, case-locked to the built-in's exact LOWERCASE
+id stem (`general.md` / `explore.md` — the probe-established identity
+key; a capitalized variant creates an ambiguous duplicate entry and
+`SHALL` never be emitted); if a hand-written file of that name already
+exists, sync `SHALL`
 refuse and disclose rather than overwrite. Garbage collection for
 override files `SHALL` key on the in-content GENERATED marker rather
-than the `forge-` prefix. Implementation `SHALL` be gated on a
-sandbox probe confirming that a user same-name agent file actually
-shadows the BUILT-IN agent on the target host; a negative probe
-result `SHALL` kill the change in propose.
+than the `forge-` prefix. The gating probe ran 2026-11-21
+(`reports/probe-builtin-override.md`): user same-name files DO shadow
+the built-ins (description/system/model replaced, permissions
+base-∪-appended, hot-apply) on the lowercase id only — POSITIVE.
 
 #### Scenario: The scaffold arrives only on ask, inert by default
 
@@ -37,14 +40,15 @@ result `SHALL` kill the change in propose.
 
 - **WHEN** the global recipe's Explore entry is uncommented with a
   model and depth word and forge_sync runs
-- **THEN** `Explore.md` lands in the host's global agent dir, the
+- **THEN** `explore.md` (lowercase id stem) lands in the host's
+  global agent dir, the
   compiled identity shadows the built-in in every workspace, and a
   later sync garbage-collects it (marker-keyed) when the entry is
   re-commented or removed
 
 #### Scenario: Hand-written same-name files are never clobbered
 
-- **WHEN** sync would emit `General.md` and a hand-written file of
+- **WHEN** sync would emit `general.md` and a hand-written file of
   that name exists in the host's global agent dir
 - **THEN** sync refuses with a disclosure naming the collision, and
   the hand-written file is left byte-identical
