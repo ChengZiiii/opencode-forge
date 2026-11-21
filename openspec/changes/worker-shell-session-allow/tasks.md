@@ -2,44 +2,59 @@
 
 ## 1. Implementation
 
-- [ ] 1.1 Posture snapshot dual-shape: read legacy v1 `permission.forge_shell`
+- [x] 1.1 Posture snapshot dual-shape: read legacy v1 `permission.forge_shell`
   AND the v2 `permissions` rule array (findLast over action-wildcard match on
   `forge_shell` with resource `*`); explicit deny in either shape resolves to
   `deny`; extend the existing plugin-side refusal to fire on the v2 shape too.
-- [ ] 1.2 Session-rule injection helper (pure-ish core, injectable
+  (Pure core `resolveForgeShellPosture` + `hostConfigDocumentsFor` — v2 hosts
+  read the host config documents from disk, fail-soft; v1 hosts keep the
+  snapshot truth byte-equal.)
+- [x] 1.2 Session-rule injection helper (pure-ish core, injectable
   session-api shim): rule `{action:"forge_shell", resource:"*", effect:"allow"}`;
   read-back-merge via `session.get` → append unless an identical entry exists →
   `session.update`; never clobbers; in-memory idempotence set; explicit-deny
   gate returns "rescue disabled"; fail-soft when get/update are absent or
   throw (returns "unavailable", never surfaces to the user).
-- [ ] 1.3 Wire primary injection at the v2 session prompt hook (agent = forge
-  primary): call the helper, swallow failures silently.
-- [ ] 1.4 Wire worker belt at the `forge_shell` handler entry: family map says
-  the session's agent is a forge worker → call the helper before the posture
-  gate (deny-gate inside the helper short-circuits).
-- [ ] 1.5 Fallback belt on the assert path: rejection carries the bare
-  no-reason deny signature (message exactly `Permission denied: forge_shell`)
-  AND posture ≠ explicit deny → proceed; attach bounded `[forge:session-rescue]`
-  finding once per session.
-- [ ] 1.6 README: native-mode rescue disclosure (scope: forge-family sessions,
-  forge_shell action only), the deny recipe for both config shapes, note that
-  session rules are host state (no new plugin filesystem writes — File ledger
-  unchanged).
+- [x] 1.3 Wire primary injection at the v2 session context hook (agent = forge
+  primary — SessionPrompt carries no agent field): fire-and-forget seeding so
+  worker children created later inherit session rules at creation.
+- [x] 1.4 Wire worker belt at the `forge_shell` handler entry: family map says
+  the session's agent is a forge worker (`forge-*`, primary `forge` excluded)
+  → belt-inject before the posture gate (deny-gate inside the helper
+  short-circuits); also wins the first-turn race against 1.3.
+- [x] 1.5 Fallback belt on the assert path: rejection message exactly
+  `Permission denied: forge_shell` (bare, no reason) AND posture ≠ explicit
+  deny AND the session is a forge WORKER session (primary bare denies are
+  real denies and propagate) → proceed; bounded `[forge:session-rescue]`
+  disclosure once per session (diagnostics line + the tool call's metadata
+  title). Harvested on session.deleted alongside the other session maps.
+- [x] 1.6 README: "Worker shell rescue (v2 hosts)" disclosure — scope
+  (forge-family sessions, forge_shell action only), session-rules-are-host-
+  state note (File ledger unchanged), and the deny recipe for both config
+  shapes.
 
-## 2. Tests (`tests/worker-shell-session-allow.test.mjs` + adjacent suites)
+## 2. Tests (`tests/worker-shell-session-allow.test.mjs` — 19 tests, green)
 
-- [ ] 2.1 Posture dual-shape matrix: v1 map three values; v2 array
-  exact/wildcard/deny/allow/ask precedence (findLast); mixed shapes; unset.
-- [ ] 2.2 Injection helper matrix: appends into empty rules; appends keeping
-  unknown existing rules (no clobber); skips when identical rule present;
-  explicit-deny → disabled; get/update absent → unavailable; update throws →
-  unavailable (no throw); idempotence set short-circuits second call.
-- [ ] 2.3 Fallback belt matrix: bare-deny + unconfigured → proceed + finding;
-  bare-deny + explicit deny → refusal (belt silent); rejection with any other
-  message → surfaces verbatim (belt silent); finding emitted once per session.
-- [ ] 2.4 Wiring: prompt-hook path calls the helper for the forge primary
-  agent; worker belt path calls it for family-mapped worker sessions; v1 code
-  path byte-untouched (regression guard on the v1 gate).
+- [x] 2.1 Posture dual-shape matrix: v1 map three values (+bogus → unset);
+  v2 array exact/wildcard/`?` action, resource gating (non-`*` never
+  matches), foreign action, last-match-wins both orders, array-wins-over-map
+  within a document, array-without-match falls through to the map, workspace
+  overrides global both orders; empty/broken documents fail-soft.
+- [x] 2.2 Injection helper matrix: appends into empty (exact rule shape);
+  unknown existing rules survive byte-for-byte; identical-rule-present → no
+  write; explicit deny → disabled (no write); api absent / get throws /
+  update throws → unavailable (no throw).
+- [x] 2.3 Fallback belt matrix: bare-deny + worker + unconfigured → proceeds
+  + disclosure attaches exactly once; explicit deny refuses BEFORE the ask
+  (verbatim refusal); explicit allow skips the ask; bare deny on primary
+  `forge` / unknown sessions propagates; other messages (unanswered-ask
+  wording, reasoned deny) propagate verbatim; v1 regression guard — host not
+  v2 → belt inert even for worker sessions.
+- [x] 2.4 Wiring: v2Setup captures a fake session domain's get/update and
+  the registered context hook seeds the forge PRIMARY exactly once with the
+  exact rule; a non-forge agent never seeds. (Worker-belt glue in the
+  forge_shell execute is covered by the isWorker+ensure unit composition and
+  the production-geometry verification in 3.2 — the E2E-only geometry.)
 
 ## 3. Verification
 

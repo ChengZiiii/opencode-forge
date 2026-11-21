@@ -54,7 +54,12 @@ deny-all. A user's explicit deny remains fully effective (D3).
 
 ## D3. Posture gate — dual-shape, deny is sacred
 
-- The posture snapshot reads BOTH user-config shapes:
+- The posture snapshot reads BOTH user-config shapes — on v2 hosts
+  directly from the host config documents (global layer + workspace
+  layers, disk read, fail-soft; a v2 host never runs the v1 config hook
+  so the in-memory snapshot is empty there and is only used as the
+  diagnostics mirror), on v1 hosts from the merged-config snapshot
+  (byte-equal legacy behavior):
   - v1 legacy: `permission.forge_shell` (`"allow"|"deny"|"ask"`);
   - v2: `permissions` rule array — `findLast` over rules whose action
     wildcard-matches `forge_shell` (action `forge_shell` or `*`) with
@@ -108,12 +113,15 @@ deny-all. A user's explicit deny remains fully effective (D3).
 
 ## D5. Fallback belt — posture-driven, never past a deny
 
-If the host assert still rejects AND the rejection is the bare
-no-reason deny (`Permission denied: forge_shell`, no reason payload)
-AND the resolved posture is NOT an explicit deny → the call proceeds
-and a bounded one-line finding `[forge:session-rescue]` is attached to
-the tool result (first occurrence per session; the finding names the
-upstream root cause in one clause and the README pointer).
+If the host assert still rejects AND the session is a forge WORKER session
+AND the rejection is the bare no-reason deny (`Permission denied:
+forge_shell`, no reason payload) AND the resolved posture is NOT an
+explicit deny → the call proceeds and the rescue is disclosed twice, once
+per session each: a diagnostics line (`[forge:session-rescue] warn:` — the
+project's findings channel, same as `[forge:sync] warn:`) and the tool
+call's metadata title. Worker scoping is deliberate: a PRIMARY session's
+agent resolves at the assert anchor, so a bare deny there is a real deny
+and must propagate.
 
 Rationale: with no explicit deny configured, a bare no-reason deny can
 only be the cross-anchor fallback (D1) — saved-rule denies carry

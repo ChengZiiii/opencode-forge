@@ -1648,8 +1648,8 @@ const gatePermissionSnapshot = new Map<string, "allow" | "deny">()
 // shell tool's ask in the current mode (TUI dialog / run-mode auto-reject /
 // serve pending ask). No headless branch, no classifier: the plugin is not
 // smarter than the host (omo parity, product decision 2026-11-16).
-async function forgeShellGate(ask: AskFn, command: string): Promise<void> {
-  const explicit = gatePermissionSnapshot.get("forge_shell")
+async function forgeShellGate(ask: AskFn, command: string, sessionID?: string): Promise<void> {
+  const explicit = explicitForgeShellPosture()
   if (explicit === "deny") {
     throw new Error(
       `[forge] forge_shell is explicitly denied by user configuration (permission forge_shell: "deny"). Nothing was executed. Remove or change the deny rule to re-enable the exec surface.`,
@@ -1658,7 +1658,135 @@ async function forgeShellGate(ask: AskFn, command: string): Promise<void> {
   if (explicit === "allow") {
     return // the user's own rule — skip the ask round-trip, run
   }
-  await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`)
+  try {
+    await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`)
+  } catch (err) {
+    // worker-shell-session-allow D5 — the fallback belt (v2 worker sessions
+    // ONLY): the bare no-reason deny `Permission denied: forge_shell` is the
+    // host's cross-anchor deny-all fallback (the assert resolves the agent
+    // at the PLUGIN HOST's location; a native worker md registers only at
+    // the project location — never resolvable there). A real user deny was
+    // already refused above (posture gate); a saved-rule deny carries its
+    // rules and an unanswered ask reads differently ("nobody is present"),
+    // so inside this scoping the bare message can ONLY be the fallback.
+    // Proceed + disclose; never fires on primary sessions (their agent
+    // resolves — a bare deny there is a real deny) nor on v1 hosts.
+    if (
+      v2HostSeen &&
+      isForgeWorkerSession(sessionID) &&
+      (err as { message?: unknown } | null)?.message === "Permission denied: forge_shell"
+    ) {
+      markSessionRescueDisclosed(sessionID!)
+      return
+    }
+    throw err
+  }
+}
+
+// ---------------------------------------------------------------------------
+// worker-shell-session-allow D3 — explicit forge_shell posture from the
+// host's own config DOCUMENTS (not forge.json). v2 hosts never run the v1
+// config hook, so the snapshot above stays empty there; the belt resolves
+// the posture by reading the host config files directly: global layer first,
+// workspace layers last (highest precedence — the host's own load order);
+// within one document the v2 `permissions` rule array (the V2-native field)
+// wins over the legacy `permission` map; the array resolves LAST-match-wins,
+// mirroring the host's findLast evaluation. allow/deny mirror into the
+// snapshot so diagnostics keep one truth. Fail-soft on every layer.
+// ---------------------------------------------------------------------------
+
+// Pure core (exported for the test matrix). `documents` ordered
+// lowest→highest precedence; null = absent/unreadable layer.
+export function resolveForgeShellPosture(documents: Array<string | null>): "allow" | "deny" | "ask" | undefined {
+  let resolved: "allow" | "deny" | "ask" | undefined
+  for (const text of documents) {
+    if (typeof text !== "string" || !text.trim()) continue
+    const parsed = parseForgeJsonc(text)
+    if (!parsed.ok) continue // a broken layer never blocks the belt
+    const cfg = parsed.config as Record<string, unknown>
+    // v2 rule array — the V2-native field, wins within this document.
+    if (Array.isArray(cfg.permissions)) {
+      let hit: "allow" | "deny" | "ask" | undefined
+      for (const rule of cfg.permissions) {
+        if (rule === null || typeof rule !== "object") continue
+        const r = rule as { action?: unknown; resource?: unknown; effect?: unknown }
+        if (r.effect !== "allow" && r.effect !== "deny" && r.effect !== "ask") continue
+        if (!ruleMatchesForgeShellAssert(r.action, r.resource)) continue
+        hit = r.effect // last match wins
+      }
+      if (hit !== undefined) {
+        resolved = hit
+        continue // the array decided this document
+      }
+    }
+    // legacy v1 map.
+    const legacy = cfg.permission as unknown
+    const v = legacy !== null && typeof legacy === "object" ? (legacy as Record<string, unknown>).forge_shell : undefined
+    if (v === "allow" || v === "deny" || v === "ask") resolved = v
+  }
+  return resolved
+}
+
+// The belt's assert shape is exactly (action "forge_shell", resource "*") —
+// a rule matches when its action pattern matches "forge_shell" AND its
+// resource pattern matches "*" (host wildcard semantics: `*` and `?`).
+function ruleMatchesForgeShellAssert(action: unknown, resource: unknown): boolean {
+  return wildcardMatchValue("forge_shell", action) && wildcardMatchValue("*", resource)
+}
+
+function wildcardMatchValue(value: string, pattern: unknown): boolean {
+  if (typeof pattern !== "string" || pattern === "") return false
+  const re = new RegExp(
+    "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
+    "i",
+  )
+  return re.test(value)
+}
+
+// The host config documents for the posture belt, lowest→highest: the
+// global layer (OPENCODE_CONFIG_DIR override honored, mirroring
+// globalAgentDirFor's host resolution) then the workspace layers. Per
+// directory the first existing name wins (opencode.json over .jsonc).
+function hostConfigDocumentsFor(homeDir: string, workspace: string | null | undefined): Array<string | null> {
+  const docs: Array<string | null> = []
+  const pushDir = (dir: string | null | undefined) => {
+    if (!dir) return
+    let pushed = false
+    for (const name of ["opencode.json", "opencode.jsonc"]) {
+      try {
+        docs.push(readFileSync(join(dir, name), "utf8"))
+        pushed = true
+        break
+      } catch {
+        // absent — try the next name
+      }
+    }
+    if (!pushed) docs.push(null)
+  }
+  const cfgEnv = (process.env.OPENCODE_CONFIG_DIR ?? "").trim()
+  const sep = homeDir.includes("\\") && !homeDir.includes("/") ? "\\" : "/"
+  pushDir(cfgEnv || join(homeDir, ".config", "opencode"))
+  if (workspace) {
+    pushDir(workspace)
+    pushDir(join(workspace, ".opencode"))
+  }
+  return docs
+}
+
+// Single posture entry: v1 hosts keep the snapshot truth (byte-equal
+// behavior — the belt never reads disk there); v2 hosts resolve from the
+// config documents on demand.
+let v2PostureHomeDir: string | null = null
+// Test seam (worker-shell-session-allow): non-null = resolve verbatim,
+// keeping unit tests off the real config disk. Never set in production.
+let v2PostureTestOverride: { value: "allow" | "deny" | "ask" | undefined } | null = null
+function explicitForgeShellPosture(): "allow" | "deny" | "ask" | undefined {
+  if (v2PostureTestOverride !== null) return v2PostureTestOverride.value
+  if (!v2HostSeen) return gatePermissionSnapshot.get("forge_shell")
+  const home = v2PostureHomeDir ?? homedir()
+  const resolved = resolveForgeShellPosture(hostConfigDocumentsFor(home, hostWorktree))
+  if (resolved === "allow" || resolved === "deny") gatePermissionSnapshot.set("forge_shell", resolved)
+  return resolved
 }
 
 const planApproveTool = tool({
@@ -2161,7 +2289,16 @@ const forgeShellExecute = async (args: {
   // user deny always wins (snapshot-enforced). The readonly-exec-seal in
   // tool.execute.before fires structurally BEFORE this execute, so a seal
   // refusal always lands first.
-  await forgeShellGate(context.ask, args.command)
+  //
+  // worker-shell-session-allow D4 (coverage channel): belt-inject the
+  // session-rule rescue directly on a WORKER session (covers children
+  // created before the primary seeding landed — and wins the first-turn
+  // race against it). Fail-soft; v1 hosts have no session-rule API and
+  // skip this entirely (their drafts resolve at the host anchor).
+  if (isForgeWorkerSession(context.sessionID)) await ensureSessionRescueRule(context.sessionID)
+  await forgeShellGate(context.ask, args.command, context.sessionID)
+  const rescueNote = takeSessionRescueDisclosure(context.sessionID)
+  if (rescueNote) context.metadata({ title: rescueNote })
     const survive = effectiveSurvive(jobsSurviveMode, args.survive)
     let successPattern: RegExp | null = null
     if (args.success_pattern) {
@@ -5211,6 +5348,12 @@ function harvestSessionEnd(sessionID: string): void {
   dispatchProgressQueue.delete(sessionID)
   // Same for the agent-family map (tool-partition).
   sessionAgents.delete(sessionID)
+  // worker-shell-session-allow: the rescue bookkeeping dies with its
+  // session (the injected session rule itself is host state and follows
+  // the session's own lifecycle).
+  sessionRescueInjected.delete(sessionID)
+  sessionRescueDisclosed.delete(sessionID)
+  sessionRescueAttached.delete(sessionID)
   // And the session-model capture table (harden-dispatch-resilience D3).
   sessionModels.delete(sessionID)
   // And the exec-seal finding bounds (readonly-exec-seal).
@@ -6323,6 +6466,12 @@ type V2PluginContext = {
     // session domain DOES expose create — flat single-object param, bare
     // record response (see v2SessionClient's create adapter).
     create?(input: unknown): Promise<unknown>
+    // worker-shell-session-allow (source-verified 2.3.2 plugin/host.ts):
+    // update carries {sessionID, ...mutations} incl. `permissions` — the
+    // whole session ruleset is REPLACED, so the rescue always read-back-
+    // merges first. Guarded: a drifted host simply disables the rescue's
+    // injection channel (the D5 fallback belt still covers workers).
+    update?(input: unknown): Promise<unknown>
   }
   command?: { transform?(cb: (editor: V2CommandEditor) => void | Promise<void>): Promise<unknown> }
   // W6a field realities (SDK 2.3.2 promise/event.d.ts): subscribe(options?)
@@ -6441,6 +6590,123 @@ function wrapV2ToolResult(res: unknown): { content: unknown; title?: unknown } {
 // session-bound map then the host anchor. metadata defaults to a no-op so
 // ungated cores run.
 let v2PermissionAssertFn: ((input: unknown) => Promise<void>) | null = null
+
+// worker-shell-session-allow D2/D4 — the documented session-rule rescue.
+// The host's permission assert evaluates the calling agent at the PLUGIN
+// HOST's location; a native worker md registers only at the project
+// location, so the assert falls back to a literal deny-all BEFORE any
+// rule/saved-approval/hook/ask is consulted (v2.3.2 permission.ts,
+// missingAgentPermissions — reports/research-plugin-tool-permission.md
+// §1). Session rules merge AFTER agent rules with last-match-wins, so one
+// appended allow rule restores the documented default-open posture in
+// exactly that geometry. Captured alongside the assert bridge; every call
+// site guards. The rule is scoped to the forge_shell action alone — it can
+// never affect a builtin tool or another plugin.
+let v2SessionRuleApi: {
+  get: (sessionID: string) => Promise<unknown>
+  update: (input: { sessionID: string; permissions: unknown }) => Promise<unknown>
+} | null = null
+
+const SESSION_RESCUE_RULE = { action: "forge_shell", resource: "*", effect: "allow" } as const
+const sessionRescueInjected = new Set<string>()
+const sessionRescueDisclosed = new Set<string>()
+
+function isSessionRescueRule(rule: unknown): boolean {
+  if (rule === null || typeof rule !== "object") return false
+  const o = rule as { action?: unknown; resource?: unknown; effect?: unknown }
+  return o.action === "forge_shell" && o.resource === "*" && o.effect === "allow"
+}
+
+// A forge WORKER session (the primary agent id is exactly "forge" — no
+// dash — so the prefix test excludes it). Unknown sessions (family-map
+// miss) are NOT workers: the rescue never fires for them.
+function isForgeWorkerSession(sessionID: string | undefined): boolean {
+  if (!sessionID) return false
+  const agent = sessionAgents.get(sessionID)
+  return typeof agent === "string" && agent.startsWith("forge-")
+}
+
+// D4: ensure the session's permission rules END with our allow rule —
+// read-back-merge (never clobbers existing rules), idempotent, disabled
+// entirely under an explicit user deny (D3: deny is sacred). Returns
+// whether the rule is in place after the call; every failure is fail-soft
+// (the D5 fallback belt owns the unavailable case).
+async function ensureSessionRescueRule(sessionID: string): Promise<boolean> {
+  if (!v2SessionRuleApi) return false
+  if (sessionRescueInjected.has(sessionID)) return true
+  if (explicitForgeShellPosture() === "deny") return false
+  try {
+    const record = await v2SessionRuleApi.get(sessionID)
+    const current =
+      record !== null && typeof record === "object" ? (record as Record<string, unknown>).permissions : undefined
+    const merged = Array.isArray(current) ? current.slice() : []
+    if (merged.some(isSessionRescueRule)) {
+      // already in place — mark idempotent, no write
+      sessionRescueInjected.add(sessionID)
+      return true
+    }
+    merged.push({ ...SESSION_RESCUE_RULE })
+    await v2SessionRuleApi.update({ sessionID, permissions: merged })
+    sessionRescueInjected.add(sessionID)
+    return true
+  } catch {
+    return false
+  }
+}
+
+// D5 disclosure bookkeeping: the fallback belt fires at most one
+// diagnostics line + one tool-call metadata title per session.
+function markSessionRescueDisclosed(sessionID: string): void {
+  if (sessionRescueDisclosed.has(sessionID)) return
+  sessionRescueDisclosed.add(sessionID)
+  console.warn(
+    `[forge:session-rescue] warn: worker session ${sessionID} — the host permission assert fell back to deny-all (cross-anchor agent resolution; README "Native mode — worker shell rescue"); the documented session-rule rescue let this call through.`,
+  )
+}
+
+// One-shot disclosure side-channel consumed by the forge_shell execute
+// (attaches the rescue note to the tool call's metadata title, once).
+const sessionRescueAttached = new Set<string>()
+function takeSessionRescueDisclosure(sessionID: string): string | null {
+  if (!sessionRescueDisclosed.has(sessionID) || sessionRescueAttached.has(sessionID)) return null
+  sessionRescueAttached.add(sessionID)
+  return "[forge:session-rescue] cross-anchor deny-all rescued via the session rule (see diagnostics)"
+}
+
+// Test surface (worker-shell-session-allow tasks 2.1–2.4): unit seams over
+// module state that production reaches only through host surfaces. Nothing
+// here runs in production paths.
+export const __workerShellRescueTestSurface = {
+  setPosture(value: "allow" | "deny" | "ask" | undefined) {
+    v2PostureTestOverride = { value }
+  },
+  clearPosture() {
+    v2PostureTestOverride = null
+  },
+  setHostSeen(value: boolean) {
+    v2HostSeen = value
+  },
+  setSessionRuleApi(api: {
+    get: (sessionID: string) => Promise<unknown>
+    update: (input: { sessionID: string; permissions: unknown }) => Promise<unknown>
+  } | null) {
+    v2SessionRuleApi = api
+  },
+  setFamily(sessionID: string, agent: string | undefined) {
+    if (agent === undefined) sessionAgents.delete(sessionID)
+    else sessionAgents.set(sessionID, agent)
+  },
+  ensure: ensureSessionRescueRule,
+  isWorker: isForgeWorkerSession,
+  gate: forgeShellGate,
+  markDisclosed: markSessionRescueDisclosed,
+  takeDisclosure: takeSessionRescueDisclosure,
+  resetState() {
+    sessionRescueInjected.clear()
+    sessionRescueDisclosed.clear()
+    sessionRescueAttached.clear()
+  },
+}
 
 function v2ToolContext(raw: unknown): Record<string, unknown> {
   const c = (raw ?? {}) as Record<string, unknown>
@@ -6782,6 +7048,13 @@ function v2ContextInjection(raw: unknown): void {
   if (!sessionID) return
   const agentName = v2AgentNameOf(o)
   if (agentName) sessionAgents.set(sessionID, agentName)
+  // worker-shell-session-allow D4 (inheritance channel): seed the rescue
+  // rule on the forge PRIMARY session — child worker sessions created
+  // AFTER this inherit the session rules in effect at creation (official
+  // semantics), so most workers never even reach the belt. Fire-and-forget:
+  // the first-turn race is covered by the worker-side belt in the
+  // forge_shell execute.
+  if (agentName === FORGE_AGENT) void ensureSessionRescueRule(sessionID).catch(() => {})
   // Session-model capture (harden-dispatch-resilience D3, v2 port): the
   // context payload's resolved model seeds the same session→model table.
   {
@@ -7356,6 +7629,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // path below then runs exactly as before. Knob resolution: explicit
   // deps override (test seam) > GLOBAL forge.json layer > default.
   v2HostSeen = true
+  v2PostureHomeDir = deps?.homeDir ?? homedir()
   const globalKnobs = readGlobalKnobs(deps)
   v2MaterializeMode = deps?.materialize ?? globalKnobs.materialize ?? "native"
   // ---- sync:"auto" opt-in (design D4): at session start, pools whose
@@ -7585,6 +7859,18 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // classification/refusal stays evaluate-mutation.
   v2RegisterPermissionBelt(ctx)
   v2PermissionAssertFn = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission!.assert!(input) : null
+  // worker-shell-session-allow D2/D4: capture the documented session-rule
+  // surface (source-verified on 2.3.2: host.ts routes update.permissions to
+  // sessions.setPermissions). The belt's read-back-merge lives in
+  // ensureSessionRescueRule; absence degrades to the D5 fallback.
+  if (typeof ctx.session?.get === "function" && typeof ctx.session.update === "function") {
+    const rawGet = ctx.session.get.bind(ctx.session)
+    const rawUpdate = ctx.session.update.bind(ctx.session)
+    v2SessionRuleApi = {
+      get: (sessionID) => rawGet({ sessionID }),
+      update: (input) => rawUpdate(input),
+    }
+  }
 
   // ---- tool hooks (task 4.1): activity marking (execute.after ledger) +
   // the full dispatch-guard belt + the readonly-exec seal

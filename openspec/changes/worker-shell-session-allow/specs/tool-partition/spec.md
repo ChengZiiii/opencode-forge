@@ -49,11 +49,14 @@ idempotent, and scoped to the `forge_shell` action alone. An explicit user
 `deny` — in EITHER supported config shape (legacy `permission.forge_shell`
 or the v2 `permissions` rule array) — SHALL disable the rescue entirely (no
 injection on any session) and SHALL refuse the call plugin-side before the
-assert, verbatim as today. As belt-in-depth, when the host assert rejects
-with the bare no-reason deny signature AND the resolved posture is not an
-explicit deny (the rejection can only be the cross-anchor fallback), the
-call SHALL proceed with a bounded `[forge:session-rescue]` finding naming
-the rescue; the belt SHALL never fire past an explicit deny. v1 hosts are
+assert, verbatim as today. As belt-in-depth, when the host assert rejects a `forge_shell` call FROM A
+FORGE WORKER SESSION with the bare no-reason deny signature AND the
+resolved posture is not an explicit deny (the rejection can only be the
+cross-anchor fallback), the call SHALL proceed with a bounded
+`[forge:session-rescue]` finding naming the rescue; the belt SHALL never
+fire past an explicit deny, nor outside worker sessions (a primary
+session's agent resolves at the assert anchor — a bare deny there is a
+real deny and propagates). v1 hosts are
 untouched (draft materialization resolves at the host anchor; the v1 domain
 has no session-rule surface and no defect).
 
@@ -109,5 +112,5 @@ has no session-rule surface and no defect).
 
 #### Scenario: Fallback belt behind the injection
 
-- **WHEN** the host assert rejects a `forge_shell` call with the bare no-reason deny signature, the resolved posture is not an explicit deny, and the session-rule surface is unavailable or the injection failed
-- **THEN** the call proceeds and a bounded `[forge:session-rescue]` finding is attached naming the rescue — the belt never fires when the posture is an explicit deny
+- **WHEN** the host assert rejects a `forge_shell` call from a forge WORKER session with the bare no-reason deny signature, the resolved posture is not an explicit deny, and the session-rule surface is unavailable or the injection failed
+- **THEN** the call proceeds and a bounded `[forge:session-rescue]` finding is attached naming the rescue — the belt never fires when the posture is an explicit deny, and never outside worker sessions
