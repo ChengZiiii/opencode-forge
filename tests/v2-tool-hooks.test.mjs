@@ -27,7 +27,11 @@ process.env.FORGE_TEST_FORGE_HOME = HOME
 
 async function setup(dir) {
   const { ctx, state } = createV2MockContext()
-  await v2Setup(ctx, { anchors: [dir] })
+  // materialize:"runtime" — the belts under test key on the RESOLVER, but
+  // the crew gate suite here registers crews, and the native default would
+  // route it through the roster-staleness gate instead (covered in
+  // tests/native-roster-wiring.test.mjs).
+  await v2Setup(ctx, { anchors: [dir], materialize: "runtime" })
   const byName = (n) => state.toolHooks.find((h) => h.name === n)?.cb
   return { ctx, state, before: byName("execute.before"), after: byName("execute.after") }
 }

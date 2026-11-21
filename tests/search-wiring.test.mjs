@@ -40,7 +40,7 @@ function inputFor(wt) {
   }
 }
 
-test("registration: both search tools are registered — plugin tool count is 18 (17 forge-family tools + the `task` shadow)", async () => {
+test("registration: both search tools are registered — plugin tool count is 19 (18 forge-family tools + the `task` shadow)", async () => {
   const wt = mkdtempSync(join(tmpdir(), "search-reg-"))
   try {
     const h = await startServer(inputFor(wt), {})
@@ -50,9 +50,11 @@ test("registration: both search tools are registered — plugin tool count is 18
     // takes over the native NAME `task` — the plugin registry stays at 18
     // keys (swap, not add), while the forge-family partition vocabulary
     // (FORGE_ALL_TOOLS) drops 18 → 17 (asserted in the partition test below).
+    // native-first-roster adds forge_sync (in-band roster compilation).
     assert.equal(h.tool.forge_dispatch, undefined, "forge_dispatch is retired")
     assert.equal(typeof h.tool.task?.execute, "function", "task is our dispatch implementation")
-    assert.equal(Object.keys(h.tool).length, 18, "15 prior tools + the search pair + the task shadow (forge_dispatch swapped out)")
+    assert.equal(typeof h.tool.forge_sync?.execute, "function", "forge_sync registered")
+    assert.equal(Object.keys(h.tool).length, 19, "15 prior tools + the search pair + forge_sync + the task shadow (forge_dispatch swapped out)")
     // Descriptions carry the preference line (D7 — teaches the primary,
     // which has no materialized mandate).
     for (const name of ["forge_grep", "forge_glob"]) {
@@ -109,10 +111,11 @@ test("partition: non-forge fallback entries hide both search tools", async () =>
       }
     }
     // task-shadow: the forge-family partition vocabulary (FORGE_ALL_TOOLS)
-    // drops 18 → 17 with forge_dispatch's retirement — `mine` (no explicit
-    // opt-ins) hides EXACTLY the 17 forge-family tools, and `task` is NOT
-    // among them (non-forge agents keep the shadowed native surface).
-    assert.equal(Object.keys(cfg.agent.mine.tools).length, 17, "partition vocabulary: 17 forge-family tools after forge_dispatch retirement")
+    // drops 18 → 17 with forge_dispatch's retirement, then regains one with
+    // forge_sync (native-first-roster) — `mine` (no explicit opt-ins) hides
+    // EXACTLY the 18 forge-family tools, and `task` is NOT among them
+    // (non-forge agents keep the shadowed native surface).
+    assert.equal(Object.keys(cfg.agent.mine.tools).length, 18, "partition vocabulary: 18 forge-family tools (forge_dispatch retired, forge_sync added)")
     assert.equal(cfg.agent.mine.tools.forge_dispatch, undefined, "forge_dispatch left the vocabulary")
     assert.equal(cfg.agent.mine.tools.task, undefined, "task is not hidden from non-forge agents")
     await h.dispose?.()

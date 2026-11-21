@@ -101,7 +101,9 @@ test("v2 setup: registers forge subagents from the cwd forge.json (create-only, 
     writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "v2pool", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
     process.chdir(dir)
     const { ctx, agents } = makeCtx()
-    await v2Setup(ctx)
+    // materialize:"runtime" — this test pins the DRAFT materialization path
+    // (the v2 escape hatch); the native default has its own suite.
+    await v2Setup(ctx, { materialize: "runtime" })
     assert.ok(agents.has("forge"), "the primary agent still registers")
     assert.ok(agents.has("forge-v2pool-research"), "the subagent registers NAMESPACED (forge-<ns>-<id>)")
     assert.equal(agents.has("forge-research"), false, "no plain-id agent exists on the v2 path")
@@ -140,7 +142,7 @@ test("v2 setup: never clobbers a user-defined forge-* entry", async () => {
     writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "v2pool", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
     process.chdir(dir)
     const { ctx, agents } = makeCtx()
-    await v2Setup(ctx)
+    await v2Setup(ctx, { materialize: "runtime" })
     agents.get("forge-v2pool-research").system = "USER OWNED"
     await v2Setup(ctx)
     assert.equal(agents.get("forge-v2pool-research").system, "USER OWNED")
@@ -158,7 +160,7 @@ test("v2 setup: an Auto worker registers without a model key", async () => {
     writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "v2pool", agents: { scout: {} } }))
     process.chdir(dir)
     const { ctx, agents } = makeCtx()
-    await v2Setup(ctx)
+    await v2Setup(ctx, { materialize: "runtime" })
     const sub = agents.get("forge-v2pool-scout")
     assert.ok(sub, "the Auto worker registers (namespaced)")
     assert.equal(false, "model" in sub, "no model key on the v2 path either")
@@ -296,7 +298,7 @@ test("v2 setup: primary + worker records carry the shell-deny front door (never 
   mkdirSync(join(dir, ".opencode"), { recursive: true })
   writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "sas", agents: { research: { model: "zai/glm", thoughtLevel: "low" }, scout: { shape: "readonly" } } }))
   const { ctx, agents } = makeCtx()
-  await v2Setup(ctx)
+  await v2Setup(ctx, { materialize: "runtime" })
   const primary = shellDenyOf(agents.get("forge"))
   assert.ok(primary && primary.resource === "*" && primary.effect === "deny", "the primary record carries {action:shell,resource:*,effect:deny}")
   for (const id of ["forge-sas-research", "forge-sas-scout"]) {
@@ -425,7 +427,7 @@ test("v2 setup: readonly worker — the shell deny rides LAST after the seal fam
   mkdirSync(join(dir, ".opencode"), { recursive: true })
   writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "harden", agents: { scout: { shape: "readonly" } } }))
   const { ctx, agents } = makeCtx()
-  await v2Setup(ctx)
+  await v2Setup(ctx, { materialize: "runtime" })
   const perms = agents.get("forge-harden-scout").permissions
   assert.ok(Array.isArray(perms) && perms.length > 1)
   assert.deepEqual(perms[perms.length - 1], DENY, "the seal entries and task:deny come first; the shell deny closes the array")

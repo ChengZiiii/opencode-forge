@@ -23,7 +23,8 @@ process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 
 import { v2Setup } from "../plugin.ts"
 
-// The full W2 registration surface (18 tools).
+// The full W2 registration surface (19 tools — forge_sync joined with
+// native-first-roster).
 const EXPECTED_TOOLS = [
   "forge_shell",
   "forge_jobs",
@@ -40,6 +41,7 @@ const EXPECTED_TOOLS = [
   "goal_discard",
   "crew_begin",
   "crew_close",
+  "forge_sync",
   "task",
   "forge_grep",
   "forge_glob",
@@ -58,7 +60,7 @@ async function setupTools() {
   return state
 }
 
-test("v2 tools: ALL 18 tools register with descriptions and object input schemas", async () => {
+test("v2 tools: ALL 19 tools register with descriptions and object input schemas", async () => {
   const state = await setupTools()
   assert.deepEqual([...state.tools.keys()].sort(), [...EXPECTED_TOOLS].sort())
   for (const name of EXPECTED_TOOLS) {

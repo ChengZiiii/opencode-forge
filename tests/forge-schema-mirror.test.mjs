@@ -10,11 +10,25 @@ import { dirname, join } from "node:path"
 // constants), plus the `$schema`-key tolerance regression and the
 // shape-invalid finding-text fix (write default — shape-default-open).
 
-import { validateAgentSet, validatePoolField, parseForgeJsonc, createForgeConfigLoader } from "../src/forge-config.ts"
+import { validateAgentSet, validatePoolField, parseForgeJsonc, createForgeConfigLoader, parseTopLevelKnobs } from "../src/forge-config.ts"
 
 const repoRoot = join(dirname(fileURLToPath(import.meta.url)), "..")
 const schema = JSON.parse(readFileSync(join(repoRoot, "schema", "forge.schema.json"), "utf8"))
 const agentSchema = schema.definitions.agent
+
+// native-first-roster: the host knobs mirror their fail-soft validators.
+test("mirror: materialize/sync enums equal the code's accepted knob values", () => {
+  const mat = schema.properties.materialize.enum
+  for (const v of ["native", "runtime", "sometimes", 5]) {
+    const parsed = parseTopLevelKnobs({ materialize: v }, "mirror").materialize
+    assert.equal(mat.includes(v), parsed !== undefined, `materialize ${JSON.stringify(v)}: schema=${mat.includes(v)} code=${parsed !== undefined}`)
+  }
+  const sync = schema.properties.sync.enum
+  for (const v of ["auto", "fast", true]) {
+    const parsed = parseTopLevelKnobs({ sync: v }, "mirror").syncAuto
+    assert.equal(sync.includes(v), parsed, `sync ${JSON.stringify(v)}: schema=${sync.includes(v)} code=${parsed}`)
+  }
+})
 
 test("mirror: shape enum equals the code's accepted shape set (both directions)", () => {
   const enumValues = agentSchema.properties.shape.enum

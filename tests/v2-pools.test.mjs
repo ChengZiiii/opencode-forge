@@ -45,7 +45,10 @@ const MUTATING = ["write", "edit", "bash", "patch", "applypatch", "apply", "mult
 // anchors + fake fs + home.
 async function hostInit(fs, anchors, home = "C:/v2home") {
   const { ctx, state } = createV2MockContext()
-  await v2Setup(ctx, { anchors, homeDir: home, stat: fs.stat, readFile: fs.readFile })
+  // materialize:"runtime" — this suite pins the DRAFT materialization path
+  // (the v2 escape hatch); the native default has its own suite
+  // (tests/native-roster-wiring.test.mjs).
+  await v2Setup(ctx, { anchors, homeDir: home, stat: fs.stat, readFile: fs.readFile, materialize: "runtime" })
   return state
 }
 
@@ -243,7 +246,7 @@ test("v2 pools: user-owned forge-* entries are never clobbered (create-only)", a
   fs.setDir("C:/WsF", [".opencode"])
   fs.setDir("C:/WsF/.opencode", [{ name: "forge.json", dir: false }])
   fs.writeFile("C:/WsF/.opencode/forge.json", json({ pool: "zeta", agents: { research: {} } }))
-  const deps = { anchors: ["C:/WsF"], homeDir: "C:/v2home-none", stat: fs.stat, readFile: fs.readFile }
+  const deps = { anchors: ["C:/WsF"], homeDir: "C:/v2home-none", stat: fs.stat, readFile: fs.readFile, materialize: "runtime" }
   const { ctx, state } = createV2MockContext()
   await v2Setup(ctx, deps)
   assert.ok(state.agents.has("forge-zeta-research"))
