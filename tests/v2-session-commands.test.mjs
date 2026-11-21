@@ -253,13 +253,14 @@ test("v2 commands: /plan /goal /crew /forge + the dedicated hyphenated family re
     assert.deepEqual([...state.commands.keys()].sort(), [
       "crew",
       "forge",
+      "forge-cancel",
       "forge-init",
       "forge-init-global",
       "forge-sync",
       "goal",
       "plan",
     ])
-    for (const name of ["plan", "goal", "crew", "forge", "forge-sync", "forge-init", "forge-init-global"]) {
+    for (const name of ["plan", "goal", "crew", "forge", "forge-sync", "forge-init", "forge-init-global", "forge-cancel"]) {
       const def = state.commands.get(name)
       assert.equal(typeof def.description, "string", `${name} description`)
       assert.equal(typeof def.execute, "function", `${name} is EXECUTE-based (CommandDefinition.execute)`)

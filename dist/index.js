@@ -17939,6 +17939,20 @@ var FORGE_INIT_GLOBAL_LEVER_TEMPLATE = [
   ""
 ].join(`
 `);
+var FORGE_CANCEL_LEVER_TEMPLATE = [
+  '(forge dispatch lever: cancel — stop an in-flight async dispatch. Argument: "$ARGUMENTS")',
+  "",
+  forgeFamilyGuard("/forge-cancel"),
+  "",
+  "Route on the argument above (decide silently; do not recite this routing text to the user):",
+  '- No argument: call forge_jobs with action "list" and report ONLY the async dispatches in flight — task id, agent, child session id, age, description — plus the exact cancel invocation for each. Cancel NOTHING on a bare listing.',
+  '- A task id: call forge_jobs {action: "cancel", jobId: "<task-id>"}. Relay the tool result verbatim — it names the confirmed-idle proof or the resisted-cancellation warning. Then STOP: no re-dispatch, no replacement work.',
+  '- "all": call forge_jobs {action: "cancel", jobId: "all"} — every in-flight dispatch cancels under the same confirmed-abort contract; relay each per-task result.',
+  "",
+  "Boundaries: cancellation is USER intent only — never cancel a dispatch on your own initiative; a cancelled dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entry and the owner wake are delivered by the plugin's terminal path, not by you.",
+  ""
+].join(`
+`);
 function isRootish(p) {
   if (!p)
     return true;
@@ -18773,7 +18787,39 @@ var planTickTool = tool({
   }
 });
 async function gate(ask, permission, title) {
-  await ask({ permission, patterns: ["*"], always: [], metadata: { title } });
+  const watchdogMs = resolveGateAskWatchdogMs();
+  if (watchdogMs <= 0) {
+    await ask({ permission, patterns: ["*"], always: [], metadata: { title } });
+    return;
+  }
+  let decided = false;
+  const decision = (async () => ask({ permission, patterns: ["*"], always: [], metadata: { title } }))();
+  decision.then(() => {
+    decided = true;
+  }, () => {
+    decided = true;
+  });
+  let timer;
+  const watchdog = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      if (!decided) {
+        console.warn(`[gate-watchdog] warn: no adjudication arrived within ${Math.round(watchdogMs / 1000)}s for the ${permission} confirmation gate (${title}) — refusing the call fail-closed.`);
+        reject(new Error(`[gate-watchdog] no adjudication arrived within ${Math.round(watchdogMs / 1000)}s for the ${permission} confirmation gate — REFUSED (fail-closed; state is unchanged, nothing was approved). ` + `The confirmation dialog may not be rendering (the known TUI wedge) or is simply unanswered. A late click on the stale dialog cannot approve this refused call: ` + `re-run the action when the user can actually see and answer the dialog.`));
+      }
+    }, watchdogMs);
+  });
+  try {
+    await Promise.race([decision, watchdog]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+var GATE_ASK_WATCHDOG_DEFAULT_MS = 300000;
+function resolveGateAskWatchdogMs(env = process.env) {
+  const raw = Number(env.FORGE_GATE_ASK_WATCHDOG_MS);
+  if (!Number.isFinite(raw) || raw < 0)
+    return GATE_ASK_WATCHDOG_DEFAULT_MS;
+  return Math.min(raw, 3600000);
 }
 var GATE_PERMISSION_KEYS = [
   "plan_approve",
@@ -19385,9 +19431,9 @@ var forgeShellTool = tool({
 ${res.output}` } : res;
   }
 });
-var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"];
+var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "clear", "handoff"];
 var forgeJobsTool = tool({
-  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel an in-flight ASYNC DISPATCH (its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried — the dispatch-specific cancel lever behind /forge-cancel); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
     jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
@@ -19448,6 +19494,27 @@ ${p.newOutput || "(none in this window)"}`,
     if (action === "kill") {
       jobManager.kill(job);
       return { title: `${job.id} killed`, output: `[forge:job] ${job.id}: tree kill issued (state: killed).` };
+    }
+    if (action === "cancel") {
+      const client = dispatchClient();
+      if (!client)
+        throw new Error("[forge] cancel: no dispatch client on this host.");
+      if (String(args.jobId).trim().toLowerCase() === "all") {
+        const { count, results } = await cancelAllDispatches(client);
+        if (count === 0) {
+          return { title: "cancel all", output: "[forge:job] (no async dispatches in flight — nothing to cancel)" };
+        }
+        return {
+          title: `${count} dispatch(es) cancelled`,
+          output: `[forge:job] Cancelled ${count} in-flight dispatch(es):
+${results.join(`
+`)}`
+        };
+      }
+      const res = await cancelDispatch(client, args.jobId);
+      if (!res.ok)
+        return { title: `${args.jobId} not cancellable`, output: `[forge:job] ${res.text}` };
+      return { title: `${args.jobId} cancelled (${res.idle})`, output: `[forge:job] ${res.text}` };
     }
     if (action === "clear") {
       const ok = jobManager.clear(args.jobId);
@@ -19760,6 +19827,10 @@ async function recoverWorkspaceDispatches(client, workspace) {
 async function recoverOneDispatchRecord(client, workspace, rec) {
   if (dispatchTasks.has(rec.id) || jobManager.get(rec.id))
     return;
+  if (isDispatchCancelled(rec.id)) {
+    journalTerminalRecord({ id: rec.id, agent: rec.agent, ownerSession: rec.ownerSession, workspace, description: rec.description ?? "" }, "aborted", "cancelled by the user lever (forge-cancel) — recovery refuses to respawn a cancelled dispatch");
+    return;
+  }
   const base = {
     id: rec.id,
     agent: rec.agent,
@@ -19925,6 +19996,113 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
 function dispatchClient() {
   return jobClient;
 }
+var cancelledDispatchIds = new Set;
+var CANCEL_IDLE_ASSERTION_MS = Number(process.env.FORGE_CANCEL_IDLE_ASSERTION_MS ?? 1e4);
+function inFlightDispatchList() {
+  const rows = [];
+  for (const row of dispatchTasks.values()) {
+    const job = jobManager.get(row.jobId);
+    if (!job || job.state !== "running") {
+      dispatchTasks.delete(row.jobId);
+      continue;
+    }
+    rows.push({
+      taskId: row.jobId,
+      agent: row.agentID,
+      childSessionID: row.childSessionID,
+      ownerSession: row.ownerSession,
+      description: row.description ?? "",
+      ageMs: job?.startedAt ? Date.now() - job.startedAt : null
+    });
+  }
+  return rows;
+}
+function formatInFlightDispatchList() {
+  const rows = inFlightDispatchList();
+  if (rows.length === 0)
+    return "(no async dispatches in flight)";
+  return rows.map((r) => {
+    const age = r.ageMs !== null ? ` — running ${Math.max(1, Math.round(r.ageMs / 1000))}s` : "";
+    const desc = r.description ? ` — ${r.description.slice(0, 80)}` : "";
+    return `- ${r.taskId}  agent ${r.agent}  child session ${r.childSessionID}${age}${desc}`;
+  }).join(`
+`);
+}
+var interruptDisclosureSeen = new Set;
+function disclosedInterruptFlights() {
+  return interruptDisclosureSeen.size;
+}
+function discloseInterruptedParent(sessionID) {
+  const flight = inFlightAsyncDispatches(sessionID);
+  if (flight.length === 0)
+    return false;
+  const key = `${sessionID}:${flight.slice().sort().join(",")}`;
+  if (interruptDisclosureSeen.has(key))
+    return false;
+  interruptDisclosureSeen.add(key);
+  queueDispatchProgress(sessionID, `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):
+${formatInFlightDispatchList()}
+Cancel with /forge-cancel <task-id> or /forge-cancel all. Nothing was cancelled automatically.`);
+  return true;
+}
+async function assertChildIdleAfterAbort(client, childSessionID) {
+  const deadline = Date.now() + CANCEL_IDLE_ASSERTION_MS;
+  while (Date.now() < deadline) {
+    await new Promise((resolve2) => setTimeout(resolve2, 400));
+    try {
+      const st = await client.session.status();
+      const map2 = st?.data;
+      if (map2 && typeof map2 === "object") {
+        if (map2[childSessionID] === undefined)
+          return "idle";
+      }
+    } catch {}
+  }
+  try {
+    const st = await client.session.status();
+    const map2 = st?.data;
+    if (!map2)
+      return "unresolved";
+    return map2[childSessionID] === undefined ? "idle" : "resisted";
+  } catch {
+    return "unresolved";
+  }
+}
+async function cancelDispatch(client, taskId) {
+  const row = dispatchTasks.get(taskId);
+  const job = jobManager.get(taskId);
+  if (!row || !job) {
+    return {
+      ok: false,
+      idle: "not-asserted",
+      text: `"${taskId}" is not an in-flight async dispatch — nothing to cancel.
+In flight now:
+${formatInFlightDispatchList()}`
+    };
+  }
+  cancelledDispatchIds.add(taskId);
+  jobManager.kill(job);
+  const idle = await assertChildIdleAfterAbort(client, row.childSessionID);
+  const idleNote = idle === "idle" ? `the child session ${row.childSessionID} is confirmed idle (the cancellation is REAL, not bookkeeping)` : idle === "resisted" ? `the child session ${row.childSessionID} did NOT reach idle within ${Math.round(CANCEL_IDLE_ASSERTION_MS / 1000)}s — it may have resisted cancellation; inspect or abort it natively in the host TUI` : `the child session ${row.childSessionID}'s state could not be read to confirm idle — verify it natively in the host TUI`;
+  return {
+    ok: true,
+    childSessionID: row.childSessionID,
+    idle,
+    text: `Cancelled ${taskId} (agent ${row.agentID}, child session ${row.childSessionID}) — cancelled by the user lever; never retried. ${idleNote}.`
+  };
+}
+function isDispatchCancelled(taskId) {
+  return cancelledDispatchIds.has(taskId);
+}
+async function cancelAllDispatches(client) {
+  const flight = inFlightDispatchList();
+  const results = [];
+  for (const row of flight) {
+    const res = await cancelDispatch(client, row.taskId);
+    results.push(`- ${res.text}`);
+  }
+  return { count: flight.length, results };
+}
 var dispatchTerminalInbox = new Map;
 var dispatchChildActivityAt = new Map;
 function noteDispatchTerminalSignal(sessionID, kind, detail) {
@@ -20042,49 +20220,108 @@ function rearmDispatchWatch(client, input) {
   });
 }
 async function adoptPersistedDispatchRows(client, workspace) {
-  const storage = v2DispatchStorage;
-  if (!client || !storage || !workspace || isRootish(workspace))
+  if (!client || !workspace || isRootish(workspace))
     return 0;
+  const storage = v2DispatchStorage;
   let adopted = 0;
-  try {
-    const scanned = await storage.scan({ prefix: DISPATCH_STORAGE_PREFIX });
-    for (const entry of scanned?.entries ?? []) {
-      const row = entry?.value;
-      if (!row || typeof row !== "object")
-        continue;
-      if (normalizeAnchorDir(String(row.workspace ?? "")) !== normalizeAnchorDir(workspace))
-        continue;
-      const taskId = String(row.taskId ?? "");
-      if (!taskId || dispatchTasks.has(taskId))
-        continue;
-      const owner = String(row.ownerSession ?? "");
-      const agent = String(row.agent ?? "");
-      let childId = String(row.childSessionID ?? "");
-      if (!childId) {
-        childId = await findChildByParentWalk(client, owner, agent) ?? "";
+  if (storage) {
+    try {
+      const scanned = await storage.scan({ prefix: DISPATCH_STORAGE_PREFIX });
+      for (const entry of scanned?.entries ?? []) {
+        const row = entry?.value;
+        if (!row || typeof row !== "object")
+          continue;
+        if (normalizeAnchorDir(String(row.workspace ?? "")) !== normalizeAnchorDir(workspace))
+          continue;
+        const taskId = String(row.taskId ?? "");
+        if (!taskId || dispatchTasks.has(taskId))
+          continue;
+        if (isDispatchCancelled(taskId)) {
+          journalTerminalRecord({ id: taskId, agent: String(row.agent ?? ""), ownerSession: String(row.ownerSession ?? ""), workspace, description: String(row.description ?? "") }, "aborted", "cancelled by the user lever (forge-cancel) — adoption refuses to re-arm a cancelled dispatch");
+          continue;
+        }
+        const owner = String(row.ownerSession ?? "");
+        const agent = String(row.agent ?? "");
+        let childId = String(row.childSessionID ?? "");
+        if (!childId) {
+          childId = await findChildByParentWalk(client, owner, agent) ?? "";
+        }
+        if (!childId)
+          continue;
+        const probe = await sessionGet(client, childId);
+        if (probe.exists === false) {
+          journalTerminalRecord({ id: taskId, agent, ownerSession: owner, workspace, description: String(row.description ?? "") }, "error", `adopted row's child session ${childId} no longer exists — finalized honestly at adoption`);
+          continue;
+        }
+        rearmDispatchWatch(client, {
+          id: taskId,
+          agent,
+          ownerSession: owner,
+          workspace,
+          childId,
+          description: String(row.description ?? ""),
+          prompt: String(row.prompt ?? ""),
+          questionDeny: row.questionDeny !== false,
+          attempts: Number.isFinite(Number(row.attempts)) && Number(row.attempts) > 0 ? Number(row.attempts) : 1
+        });
+        adopted++;
       }
-      if (!childId)
-        continue;
-      const probe = await sessionGet(client, childId);
-      if (probe.exists === false) {
-        journalTerminalRecord({ id: taskId, agent, ownerSession: owner, workspace, description: String(row.description ?? "") }, "error", `adopted row's child session ${childId} no longer exists — finalized honestly at adoption`);
-        continue;
-      }
-      rearmDispatchWatch(client, {
-        id: taskId,
-        agent,
-        ownerSession: owner,
-        workspace,
-        childId,
-        description: String(row.description ?? ""),
-        prompt: String(row.prompt ?? ""),
-        questionDeny: row.questionDeny !== false,
-        attempts: Number.isFinite(Number(row.attempts)) && Number(row.attempts) > 0 ? Number(row.attempts) : 1
-      });
-      adopted++;
-    }
-  } catch {}
+    } catch {}
+  }
+  detectOrphanDispatchChildren(client, workspace).catch(() => {});
   return adopted;
+}
+var orphanDisclosuresSeen = new Set;
+function observedOrphanDispatches() {
+  return orphanDisclosuresSeen.size;
+}
+async function detectOrphanDispatchChildren(client, workspace) {
+  const trackedChildren = new Set;
+  for (const h of dispatchTasks.values())
+    trackedChildren.add(h.childSessionID);
+  let listed = [];
+  try {
+    const raw = await client.session?.list?.({});
+    const body = raw?.data ?? raw;
+    listed = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : [];
+  } catch {
+    return 0;
+  }
+  if (listed.length === 0)
+    return 0;
+  let active;
+  try {
+    const st = await client.session.status();
+    const map2 = st?.data;
+    if (!map2 || typeof map2 !== "object")
+      return 0;
+    active = new Set(Object.keys(map2));
+  } catch {
+    return 0;
+  }
+  let found = 0;
+  for (const s of listed) {
+    const id = typeof s?.id === "string" ? s.id : "";
+    if (!id || trackedChildren.has(id) || orphanDisclosuresSeen.has(id))
+      continue;
+    const agent = typeof s.agent === "string" ? s.agent : "";
+    const parent = typeof s.parentID === "string" ? s.parentID : "";
+    if (!parent || !agent.startsWith("forge-"))
+      continue;
+    if (!active.has(id))
+      continue;
+    orphanDisclosuresSeen.add(id);
+    found++;
+    let taskId = "(unknown)";
+    try {
+      const rec = journalFor(workspace).nonTerminal().find((r) => r.childSessionId === id);
+      if (rec)
+        taskId = rec.id;
+    } catch {}
+    console.warn(`[forge:orphan-dispatch] warn: forge child ${id} (agent ${agent}, parent ${parent}) is STREAMING with no live dispatch row (task id ${taskId}) — adoption gap. Adopt: restart the host or touch the workspace to re-run recovery; Cancel: /forge-cancel <task-id> (or forge_jobs action=cancel).`);
+    queueDispatchProgress(parent, `[forge:dispatch-notice] Orphaned dispatch child detected: forge child ${id} (agent ${agent}, task id ${taskId}) is running with no live dispatch row. It will NOT deliver an outcome on its own — recover it (restart/touch to re-run adoption) or cancel it (/forge-cancel ${taskId === "(unknown)" ? "<task-id>" : taskId}).`);
+  }
+  return found;
 }
 async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryCtx) {
   const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
@@ -20284,7 +20521,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
     }
     if (job.state !== "running") {
       dispatchTasks.delete(job.id);
-      journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", "registry kill (owner session ended / dispose) — user abort");
+      journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", isDispatchCancelled(job.id) ? "cancelled by the user lever (forge-cancel) — the child was aborted and the dispatch is never retried" : "registry kill (owner session ended / dispose) — user abort");
       return;
     }
     if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
@@ -21914,6 +22151,10 @@ var server = async (input, options) => {
         template: FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
         description: "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out"
       };
+      cfg.command["forge-cancel"] ??= {
+        template: FORGE_CANCEL_LEVER_TEMPLATE,
+        description: 'forge dispatch lever: cancel an in-flight async dispatch by task id (or "all"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried'
+      };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
       for (const gateKey of GATE_PERMISSION_KEYS) {
@@ -22332,6 +22573,11 @@ var server = async (input, options) => {
         const kind = v1Type === "session.execution.succeeded" ? "succeeded" : v1Type === "session.execution.failed" ? "failed" : "interrupted";
         const detail = kind === "failed" ? v1Props.error?.message !== undefined ? String(v1Props.error.message) : v1Props.error !== undefined ? String(v1Props.error) : undefined : kind === "interrupted" ? v1Props.reason !== undefined ? String(v1Props.reason) : undefined : undefined;
         noteDispatchTerminalSignal(v1Session, kind, detail);
+        if (kind === "interrupted") {
+          try {
+            discloseInterruptedParent(v1Session);
+          } catch {}
+        }
       } else if (v1Session && (v1Type === "session.execution.started" || v1Type === "session.step.started" || v1Type === "session.step.ended")) {
         noteDispatchChildActivity(v1Session);
       }
@@ -23030,6 +23276,7 @@ async function v2RegisterCommands(ctx) {
       addTemplateCommand("forge-sync", () => FORGE_SYNC_LEVER_TEMPLATE, "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff");
       addTemplateCommand("forge-init", () => FORGE_INIT_LEVER_TEMPLATE, "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)");
       addTemplateCommand("forge-init-global", () => FORGE_INIT_GLOBAL_LEVER_TEMPLATE, "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out");
+      addTemplateCommand("forge-cancel", () => FORGE_CANCEL_LEVER_TEMPLATE, 'forge dispatch lever: cancel an in-flight async dispatch by task id (or "all"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried');
     });
   } catch (e) {
     const head = e instanceof Error ? e.message : String(e);
@@ -23188,6 +23435,11 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
                 const kind = type === "session.execution.succeeded" ? "succeeded" : type === "session.execution.failed" ? "failed" : "interrupted";
                 const detail = kind === "failed" ? fields.error?.message !== undefined ? String(fields.error.message) : fields.error !== undefined ? String(fields.error) : undefined : kind === "interrupted" ? fields.reason !== undefined ? String(fields.reason) : undefined : undefined;
                 noteDispatchTerminalSignal(sessionID, kind, detail);
+                if (kind === "interrupted") {
+                  try {
+                    discloseInterruptedParent(sessionID);
+                  } catch {}
+                }
                 if (idleFallback && type === "session.execution.succeeded")
                   v2HandleIdle(sessionID, goalClient);
               }
@@ -23240,7 +23492,7 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
     return null;
   }
 }
-var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, resetHostAnchors: () => {
+var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, resetHostAnchors: () => {
   hostAnchors.length = 0;
   poolResolver = null;
   poolResolution = null;
@@ -23461,19 +23713,29 @@ export {
   setDispatchWaitSeamForTests,
   setDispatchStorageForTests,
   server,
+  resolveGateAskWatchdogMs,
   resolveForgeShellPosture,
   resolveDispatchQueueMax,
+  recoverOneDispatchRecord,
   recentDispatchChildActivity,
+  observedOrphanDispatches,
   noteDispatchTerminalSignal,
   noteDispatchChildActivity,
   isRootish,
+  isDispatchCancelled,
+  gate,
   forgetDispatchSignals,
   forgeFamilyGuard,
   effectiveWorktree,
   effectiveSurvive,
+  disclosedInterruptFlights,
+  discloseInterruptedParent,
+  detectOrphanDispatchChildren,
   plugin_default as default,
   crewOrchestrationTemplate,
   composeCommandPrompt,
+  cancelDispatch,
+  cancelAllDispatches,
   adoptPersistedDispatchRows,
   __workerShellRescueTestSurface,
   TASK_SEAM_DEGRADED_ERROR,
@@ -23490,6 +23752,7 @@ export {
   FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
   FORGE_HELP_ROUTE_LINE,
   FORGE_COMMAND_TEMPLATE,
+  FORGE_CANCEL_LEVER_TEMPLATE,
   FORGE_BOUNDARIES_TEXT,
   DEFAULT_DISPATCH_QUEUE_MAX,
   CREW_INIT_TEMPLATE,

@@ -52,6 +52,18 @@ OpenSpec spec workflows remain a third, separate lane.
   see Design stance.
 - `plan_approve` / `plan_close` are pinned to a confirmation dialog: the
   model can never flip the state itself.
+- **Confirmation gates are time-boxed (gated-ask watchdog)**: every
+  confirmation gate (`plan_approve` / `plan_close` / `goal_write` arm /
+  `goal_complete` / `goal_resume` / `goal_discard` / `crew_close`) is
+  wrapped by a watchdog — when no answer arrives within the window (default
+  300 s, `FORGE_GATE_ASK_WATCHDOG_MS`, 0 disables), the gate resolves as a
+  DISCLOSED REJECTION: the awaiting tool call fails with a finding that
+  names the gate, the timeout, the fail-closed posture (state unchanged,
+  nothing approved — the invariant survives verbatim) and the retry
+  contract (re-run when the dialog is actually visible; a late click on the
+  stale dialog cannot approve the refused call). The plugin NEVER
+  auto-approves. This exists because of a real incident: a TUI wedge where
+  the dialog never rendered and `goal_write` hung forever.
 - Goal files: `.opencode/goal/<date>-<slug>.md`, state machine
   `queued → active ⇄ paused → completed / abandoned`, one live goal per
   session plus a workspace queue. Completion is **verified by the plugin**,
@@ -1008,6 +1020,27 @@ adopted dispatch is never re-spawned) and the final outcome is delivered
 exactly once; an unreadable row falls back to walking the parent-session
 relationship, and a child that died while nobody watched terminalizes
 honestly without a fabricated wake.
+
+**Cancellation (`/forge-cancel` — a user lever, ESC is not one).** Host
+children are independent sessions: since 2.3.0 ESC interrupts the parent
+turn only and a background child keeps running (upstream #64073). The
+`/forge-cancel` command is the lever: no argument lists every in-flight
+dispatch (task id, agent, child session, age); a task id cancels that one;
+`all` cancels every in-flight dispatch. Cancellation aborts the child
+through the same engine the owner-death path uses, then PROVES the stop —
+the plugin polls the host's status view until the child reads idle
+(`FORGE_CANCEL_IDLE_ASSERTION_MS`, default 10 s) and the disclosure says
+exactly which happened: confirmed idle, or "did NOT reach idle — it may
+have resisted; inspect or abort it natively in the host TUI". A cancelled
+dispatch settles as `aborted` in the journal and ledger, the owner gets the
+wake, and NO resilience path (retry, stale reap, adoption) ever respawns
+it. Interruptions disclose: an ESC with children in flight surfaces the
+in-flight list with cancel guidance (disclose-only — an interrupt never
+cancels a child); a streaming forge child with no live row (an adoption
+gap) is surfaced as an orphan with the adopt/cancel paths instead of
+running invisibly. The lever is also reachable without the command:
+`forge_jobs` with `action: "cancel"` (and `kill` remains the generic
+process-tree lever for shell jobs).
 
 **Sync handoff presentation.** A sync dispatch whose child outlives the
 wait budget does not fail: the handoff surfaces as a normal informational

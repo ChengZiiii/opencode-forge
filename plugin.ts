@@ -338,6 +338,27 @@ export const FORGE_INIT_GLOBAL_LEVER_TEMPLATE = [
   "",
 ].join("\n")
 
+// Dedicated dispatch lever (change dispatch-cancel-lifecycle task 1.1): the
+// user-facing cancellation lever for in-flight async dispatches. Host
+// children are independent sessions — ESC interrupts the parent turn only,
+// so without this lever a runaway worker is unkillable (upstream #64073).
+// The lever routes through the forge_jobs cancel action (the plugin's
+// cancel engine: abort + confirmed-idle assertion + aborted settle +
+// never-retried); the AGENT is the router, the PLUGIN is the killer.
+export const FORGE_CANCEL_LEVER_TEMPLATE = [
+  '(forge dispatch lever: cancel — stop an in-flight async dispatch. Argument: "$ARGUMENTS")',
+  "",
+  forgeFamilyGuard("/forge-cancel"),
+  "",
+  "Route on the argument above (decide silently; do not recite this routing text to the user):",
+  '- No argument: call forge_jobs with action "list" and report ONLY the async dispatches in flight — task id, agent, child session id, age, description — plus the exact cancel invocation for each. Cancel NOTHING on a bare listing.',
+  '- A task id: call forge_jobs {action: "cancel", jobId: "<task-id>"}. Relay the tool result verbatim — it names the confirmed-idle proof or the resisted-cancellation warning. Then STOP: no re-dispatch, no replacement work.',
+  '- "all": call forge_jobs {action: "cancel", jobId: "all"} — every in-flight dispatch cancels under the same confirmed-abort contract; relay each per-task result.',
+  "",
+  "Boundaries: cancellation is USER intent only — never cancel a dispatch on your own initiative; a cancelled dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entry and the owner wake are delivered by the plugin's terminal path, not by you.",
+  "",
+].join("\n")
+
 // ---------------------------------------------------------------------------
 // Worktree resolution
 // ---------------------------------------------------------------------------
@@ -1687,8 +1708,67 @@ type AskFn = (input: {
   metadata: Record<string, unknown>
 }) => Promise<unknown>
 
-async function gate(ask: AskFn, permission: string, title: string): Promise<void> {
-  await ask({ permission, patterns: ["*"], always: [], metadata: { title } })
+// Exported for tests (dispatch-cancel-lifecycle 4.2): the watchdog is the
+// gate() choke point itself — every door already awaits it.
+export async function gate(ask: AskFn, permission: string, title: string): Promise<void> {
+  const watchdogMs = resolveGateAskWatchdogMs()
+  // Gated-ask watchdog (dispatch-cancel-lifecycle, gate-asks spec): every
+  // door awaits THIS choke point, so the watchdog is one timed race. When
+  // no client adjudication arrives within the window (the 2026-11-22 TUI
+  // wedge: the dialog never rendered and goal_write hung forever), the gate
+  // resolves as a DISCLOSED REJECTION — fail-closed, state unchanged,
+  // nothing auto-approved. 0 disables (today's posture). A decision inside
+  // the window wins and cancels the timer; a late reply after a rejection
+  // is harmless (the refused call stays refused).
+  if (watchdogMs <= 0) {
+    await ask({ permission, patterns: ["*"], always: [], metadata: { title } })
+    return
+  }
+  let decided = false
+  // Promise-wrapped: the v1 ask MAY return a plain undefined (sync ack) —
+  // the proven gates awaited it verbatim; the race needs a thenable.
+  const decision = (async () => ask({ permission, patterns: ["*"], always: [], metadata: { title } }))()
+  decision.then(
+    () => {
+      decided = true
+    },
+    () => {
+      decided = true
+    },
+  )
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const watchdog = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => {
+      if (!decided) {
+        console.warn(
+          `[gate-watchdog] warn: no adjudication arrived within ${Math.round(watchdogMs / 1000)}s for the ${permission} confirmation gate (${title}) — refusing the call fail-closed.`,
+        )
+        reject(
+          new Error(
+            `[gate-watchdog] no adjudication arrived within ${Math.round(watchdogMs / 1000)}s for the ${permission} confirmation gate — REFUSED (fail-closed; state is unchanged, nothing was approved). ` +
+              `The confirmation dialog may not be rendering (the known TUI wedge) or is simply unanswered. A late click on the stale dialog cannot approve this refused call: ` +
+              `re-run the action when the user can actually see and answer the dialog.`,
+          ),
+        )
+      }
+    }, watchdogMs)
+  })
+  try {
+    await Promise.race([decision, watchdog])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+// The watchdog window (spec gate-asks): default 300 s; env-tunable; 0
+// disables (the gates then wait indefinitely — byte-identical to the proven
+// posture). Clamped to 1 h so a typo'd value cannot wedge the other way.
+const GATE_ASK_WATCHDOG_DEFAULT_MS = 300_000
+
+export function resolveGateAskWatchdogMs(env: NodeJS.ProcessEnv = process.env): number {
+  const raw = Number(env.FORGE_GATE_ASK_WATCHDOG_MS)
+  if (!Number.isFinite(raw) || raw < 0) return GATE_ASK_WATCHDOG_DEFAULT_MS
+  return Math.min(raw, 3_600_000)
 }
 
 // ---------------------------------------------------------------------------
@@ -2492,11 +2572,11 @@ const forgeShellTool = tool({
   },
 })
 
-const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "clear", "handoff"]
+const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "clear", "handoff"]
 
 const forgeJobsTool = tool({
   description:
-    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel an in-flight ASYNC DISPATCH (its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried — the dispatch-specific cancel lever behind /forge-cancel); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
     jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
@@ -2553,6 +2633,29 @@ const forgeJobsTool = tool({
     if (action === "kill") {
       jobManager.kill(job)
       return { title: `${job.id} killed`, output: `[forge:job] ${job.id}: tree kill issued (state: killed).` }
+    }
+    if (action === "cancel") {
+      // Dispatch cancellation lever core (dispatch-cancel-lifecycle): the
+      // SAME engine /forge-cancel drives — abort + CONFIRMED-idle assertion
+      // + aborted settle + never-retried. "all" cancels every in-flight
+      // dispatch SERIALLY (concurrent aborts would race the idle
+      // assertion); a non-dispatch job refuses with the in-flight list
+      // (kill stays the generic lever).
+      const client = dispatchClient()
+      if (!client) throw new Error("[forge] cancel: no dispatch client on this host.")
+      if (String(args.jobId).trim().toLowerCase() === "all") {
+        const { count, results } = await cancelAllDispatches(client)
+        if (count === 0) {
+          return { title: "cancel all", output: "[forge:job] (no async dispatches in flight — nothing to cancel)" }
+        }
+        return {
+          title: `${count} dispatch(es) cancelled`,
+          output: `[forge:job] Cancelled ${count} in-flight dispatch(es):\n${results.join("\n")}`,
+        }
+      }
+      const res = await cancelDispatch(client, args.jobId)
+      if (!res.ok) return { title: `${args.jobId} not cancellable`, output: `[forge:job] ${res.text}` }
+      return { title: `${args.jobId} cancelled (${res.idle})`, output: `[forge:job] ${res.text}` }
     }
     if (action === "clear") {
       const ok = jobManager.clear(args.jobId)
@@ -3102,9 +3205,21 @@ async function recoverWorkspaceDispatches(client: DispatchClient | null, workspa
   }
 }
 
-async function recoverOneDispatchRecord(client: DispatchClient, workspace: string, rec: DispatchJournalRecord): Promise<void> {
+/** Exported for tests (dispatch-cancel-lifecycle 4.1): the recovery respawn path. */
+export async function recoverOneDispatchRecord(client: DispatchClient, workspace: string, rec: DispatchJournalRecord): Promise<void> {
   // Idempotence: an id already tracked in this process is never re-armed.
   if (dispatchTasks.has(rec.id) || jobManager.get(rec.id)) return
+  // Retry guard (dispatch-cancel-lifecycle 1.4): a cancelled dispatch is
+  // never resurrected by recovery — its non-terminal journal record (a
+  // retry-pending scheduled before the cancel landed) terminalizes here.
+  if (isDispatchCancelled(rec.id)) {
+    journalTerminalRecord(
+      { id: rec.id, agent: rec.agent, ownerSession: rec.ownerSession, workspace, description: rec.description ?? "" },
+      "aborted",
+      "cancelled by the user lever (forge-cancel) — recovery refuses to respawn a cancelled dispatch",
+    )
+    return
+  }
   const base: JournalBase = {
     id: rec.id,
     agent: rec.agent,
@@ -3355,6 +3470,161 @@ type DispatchRetryContext = {
 }
 
 // ---------------------------------------------------------------------------
+// User-facing cancellation lever (dispatch-cancel-lifecycle, forge-subagents
+// spec "User-facing dispatch cancellation"): the cancel core behind the
+// dedicated `forge-cancel` command. Cancel = the EXISTING registry kill (the
+// manager's kill fires the row's killTree → abortChild) + the honest
+// settle: the journal records `aborted` with the USER-LEVER reason, the
+// persisted row is removed by the terminal choke point, and the owner gets
+// a wake through the normal aborted-wake path. Post-abort idle assertion:
+// the child must be observed idle (absent from the host status map — the
+// proven field reality) within the assertion window or the disclosure says
+// it resisted. Retry guard: cancelled ids are excluded from every
+// resilience path (fold-C respawn checks the set; terminal rows are skipped
+// by recovery/adoption by construction).
+// ---------------------------------------------------------------------------
+
+const cancelledDispatchIds = new Set<string>()
+
+const CANCEL_IDLE_ASSERTION_MS = Number(process.env.FORGE_CANCEL_IDLE_ASSERTION_MS ?? 10_000)
+
+function inFlightDispatchList(): Array<{ taskId: string; agent: string; childSessionID: string; ownerSession: string; description: string; ageMs: number | null }> {
+  const rows: Array<{ taskId: string; agent: string; childSessionID: string; ownerSession: string; description: string; ageMs: number | null }> = []
+  for (const row of dispatchTasks.values()) {
+    const job = jobManager.get(row.jobId)
+    // Listing semantics match inFlightAsyncDispatches: only RUNNING jobs
+    // are in flight; a dead handle is pruned on sight.
+    if (!job || job.state !== "running") {
+      dispatchTasks.delete(row.jobId)
+      continue
+    }
+    rows.push({
+      taskId: row.jobId,
+      agent: row.agentID,
+      childSessionID: row.childSessionID,
+      ownerSession: row.ownerSession,
+      description: row.description ?? "",
+      ageMs: job?.startedAt ? Date.now() - job.startedAt : null,
+    })
+  }
+  return rows
+}
+
+function formatInFlightDispatchList(): string {
+  const rows = inFlightDispatchList()
+  if (rows.length === 0) return "(no async dispatches in flight)"
+  return rows
+    .map((r) => {
+      const age = r.ageMs !== null ? ` — running ${Math.max(1, Math.round(r.ageMs / 1000))}s` : ""
+      const desc = r.description ? ` — ${r.description.slice(0, 80)}` : ""
+      return `- ${r.taskId}  agent ${r.agent}  child session ${r.childSessionID}${age}${desc}`
+    })
+    .join("\n")
+}
+
+// Parent-interrupt disclosure (dispatch-cancel-lifecycle 2.1, spec
+// "Parent-interrupt disclosure"): ESC interrupts the parent turn ONLY —
+// in-flight host children keep running (upstream #64073). Disclose-only:
+// the interrupt NEVER cancels a child; the disclosure names the flight and
+// the exact cancel lever. Deduplicated per flight COMPOSITION (same flight
+// re-discloses nothing; a newly spawned dispatch re-arms the disclosure).
+const interruptDisclosureSeen = new Set<string>()
+
+export function disclosedInterruptFlights(): number {
+  return interruptDisclosureSeen.size
+}
+
+export function discloseInterruptedParent(sessionID: string): boolean {
+  const flight = inFlightAsyncDispatches(sessionID)
+  if (flight.length === 0) return false
+  const key = `${sessionID}:${flight.slice().sort().join(",")}`
+  if (interruptDisclosureSeen.has(key)) return false
+  interruptDisclosureSeen.add(key)
+  queueDispatchProgress(
+    sessionID,
+    `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):\n${formatInFlightDispatchList()}\nCancel with /forge-cancel <task-id> or /forge-cancel all. Nothing was cancelled automatically.`,
+  )
+  return true
+}
+
+/** Post-abort idle assertion: the child must reach idle within the window. */
+async function assertChildIdleAfterAbort(client: DispatchClient, childSessionID: string): Promise<"idle" | "resisted" | "unresolved"> {
+  const deadline = Date.now() + CANCEL_IDLE_ASSERTION_MS
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 400))
+    try {
+      const st = await client.session.status()
+      const map = (st as { data?: Record<string, unknown> } | undefined)?.data
+      if (map && typeof map === "object") {
+        // Field reality (soundness, pollChild): the host's status map holds
+        // ONLY active sessions — an absent child IS idle.
+        if (map[childSessionID] === undefined) return "idle"
+      }
+    } catch {
+      // View unreadable: keep trying until the window closes.
+    }
+  }
+  try {
+    const st = await client.session.status()
+    const map = (st as { data?: Record<string, unknown> } | undefined)?.data
+    if (!map) return "unresolved"
+    return map[childSessionID] === undefined ? "idle" : "resisted"
+  } catch {
+    return "unresolved"
+  }
+}
+
+export async function cancelDispatch(
+  client: DispatchClient,
+  taskId: string,
+): Promise<{ ok: boolean; childSessionID?: string; idle: "idle" | "resisted" | "unresolved" | "not-asserted"; text: string }> {
+  const row = dispatchTasks.get(taskId)
+  const job = jobManager.get(taskId)
+  if (!row || !job) {
+    return {
+      ok: false,
+      idle: "not-asserted",
+      text: `"${taskId}" is not an in-flight async dispatch — nothing to cancel.\nIn flight now:\n${formatInFlightDispatchList()}`,
+    }
+  }
+  cancelledDispatchIds.add(taskId)
+  // The registry kill fires the row's killTree (abortChild via the SDK) —
+  // the SAME engine the owner-death path uses; the watcher settles the row
+  // as aborted at its next slice, the journal choke point removes the
+  // persisted row, and the owner gets the normal aborted wake.
+  jobManager.kill(job)
+  const idle = await assertChildIdleAfterAbort(client, row.childSessionID)
+  const idleNote =
+    idle === "idle"
+      ? `the child session ${row.childSessionID} is confirmed idle (the cancellation is REAL, not bookkeeping)`
+      : idle === "resisted"
+        ? `the child session ${row.childSessionID} did NOT reach idle within ${Math.round(CANCEL_IDLE_ASSERTION_MS / 1000)}s — it may have resisted cancellation; inspect or abort it natively in the host TUI`
+        : `the child session ${row.childSessionID}'s state could not be read to confirm idle — verify it natively in the host TUI`
+  return {
+    ok: true,
+    childSessionID: row.childSessionID,
+    idle,
+    text: `Cancelled ${taskId} (agent ${row.agentID}, child session ${row.childSessionID}) — cancelled by the user lever; never retried. ${idleNote}.`,
+  }
+}
+
+/** Retry guard (task 1.4): a cancelled dispatch is never respawned. */
+export function isDispatchCancelled(taskId: string): boolean {
+  return cancelledDispatchIds.has(taskId)
+}
+
+/** "all" verb (task 1.1): cancel every in-flight dispatch, SERIALLY. */
+export async function cancelAllDispatches(client: DispatchClient): Promise<{ count: number; results: string[] }> {
+  const flight = inFlightDispatchList()
+  const results: string[] = []
+  for (const row of flight) {
+    const res = await cancelDispatch(client, row.taskId)
+    results.push(`- ${res.text}`)
+  }
+  return { count: flight.length, results }
+}
+
+// ---------------------------------------------------------------------------
 // Host-signal completion core (dispatch-v2-hostsignals D4): child-session-id
 // keyed terminal-signal inbox + activity ledger. The v2 event subscription
 // (and the v1 event hook, where its bus delivers) route durable
@@ -3567,56 +3837,143 @@ function rearmDispatchWatch(
 
 /** Setup-time adoption (task 4.2): scan persisted rows, adopt what's live. */
 export async function adoptPersistedDispatchRows(client: DispatchClient | null, workspace: string): Promise<number> {
+  if (!client || !workspace || isRootish(workspace)) return 0
   const storage = v2DispatchStorage
-  if (!client || !storage || !workspace || isRootish(workspace)) return 0
   let adopted = 0
-  try {
-    const scanned = await storage.scan({ prefix: DISPATCH_STORAGE_PREFIX })
-    for (const entry of scanned?.entries ?? []) {
-      const row = entry?.value as Partial<DispatchStorageRow> | undefined
-      if (!row || typeof row !== "object") continue
-      if (normalizeAnchorDir(String(row.workspace ?? "")) !== normalizeAnchorDir(workspace)) continue
-      const taskId = String(row.taskId ?? "")
-      if (!taskId || dispatchTasks.has(taskId)) continue // journal recovery re-armed it first (dedupe)
-      const owner = String(row.ownerSession ?? "")
-      const agent = String(row.agent ?? "")
-      let childId = String(row.childSessionID ?? "")
-      if (!childId) {
-        // Unreadable/incomplete row → parentID walk fallback (spec 4.2).
-        childId = (await findChildByParentWalk(client, owner, agent)) ?? ""
+  if (storage) {
+    try {
+      const scanned = await storage.scan({ prefix: DISPATCH_STORAGE_PREFIX })
+      for (const entry of scanned?.entries ?? []) {
+        const row = entry?.value as Partial<DispatchStorageRow> | undefined
+        if (!row || typeof row !== "object") continue
+        if (normalizeAnchorDir(String(row.workspace ?? "")) !== normalizeAnchorDir(workspace)) continue
+        const taskId = String(row.taskId ?? "")
+        if (!taskId || dispatchTasks.has(taskId)) continue // journal recovery re-armed it first (dedupe)
+        if (isDispatchCancelled(taskId)) {
+          // Retry guard (1.4): adoption never resurrects a cancelled dispatch.
+          journalTerminalRecord(
+            { id: taskId, agent: String(row.agent ?? ""), ownerSession: String(row.ownerSession ?? ""), workspace, description: String(row.description ?? "") },
+            "aborted",
+            "cancelled by the user lever (forge-cancel) — adoption refuses to re-arm a cancelled dispatch",
+          )
+          continue
+        }
+        const owner = String(row.ownerSession ?? "")
+        const agent = String(row.agent ?? "")
+        let childId = String(row.childSessionID ?? "")
+        if (!childId) {
+          // Unreadable/incomplete row → parentID walk fallback (spec 4.2).
+          childId = (await findChildByParentWalk(client, owner, agent)) ?? ""
+        }
+        if (!childId) continue // child unobservable: the journal owns the verdict
+        // Child observable? Adopt watch-only. An adopted dispatch never
+        // re-spawns (the re-dispatch guard IS the adoption — task 4.3).
+        const probe = await sessionGet(client, childId)
+        if (probe.exists === false) {
+          // Gone child: terminalize the row honestly via the journal choke
+          // point (which also removes the storage row).
+          journalTerminalRecord(
+            { id: taskId, agent, ownerSession: owner, workspace, description: String(row.description ?? "") },
+            "error",
+            `adopted row's child session ${childId} no longer exists — finalized honestly at adoption`,
+          )
+          continue
+        }
+        rearmDispatchWatch(client, {
+          id: taskId,
+          agent,
+          ownerSession: owner,
+          workspace,
+          childId,
+          description: String(row.description ?? ""),
+          prompt: String(row.prompt ?? ""),
+          questionDeny: row.questionDeny !== false,
+          attempts: Number.isFinite(Number(row.attempts)) && Number(row.attempts) > 0 ? Number(row.attempts) : 1,
+        })
+        adopted++
       }
-      if (!childId) continue // child unobservable: the journal owns the verdict
-      // Child observable? Adopt watch-only. An adopted dispatch never
-      // re-spawns (the re-dispatch guard IS the adoption — task 4.3).
-      const probe = await sessionGet(client, childId)
-      if (probe.exists === false) {
-        // Gone child: terminalize the row honestly via the journal choke
-        // point (which also removes the storage row).
-        journalTerminalRecord(
-          { id: taskId, agent, ownerSession: owner, workspace, description: String(row.description ?? "") },
-          "error",
-          `adopted row's child session ${childId} no longer exists — finalized honestly at adoption`,
-        )
-        continue
-      }
-      rearmDispatchWatch(client, {
-        id: taskId,
-        agent,
-        ownerSession: owner,
-        workspace,
-        childId,
-        description: String(row.description ?? ""),
-        prompt: String(row.prompt ?? ""),
-        questionDeny: row.questionDeny !== false,
-        attempts: Number.isFinite(Number(row.attempts)) && Number(row.attempts) > 0 ? Number(row.attempts) : 1,
-      })
-      adopted++
+    } catch {
+      // Storage drift / unreadable scan: fail-soft — the journal recovery
+      // remains the durable path.
     }
-  } catch {
-    // Storage drift / unreadable scan: fail-soft — the journal recovery
-    // remains the durable path.
   }
+  // Orphan-child disclosure (dispatch-cancel-lifecycle 2.2) rides the same
+  // adoption pass — but does NOT serialize behind it: fire-and-forget, so
+  // the adoption return contract (and the re-armed watcher's head start)
+  // stays byte-identical to the proven pass. A streaming forge-* child with
+  // no live row is surfaced with the adopt/cancel guidance.
+  void detectOrphanDispatchChildren(client, workspace).catch(() => {})
   return adopted
+}
+
+// ---------------------------------------------------------------------------
+// Orphan-child disclosure (dispatch-cancel-lifecycle 2.2, spec "Orphan-child
+// disclosure"): a forge-* child session observed STREAMING with no live
+// dispatch row (an adoption gap) is running invisibly — surfaced with its
+// task id (when the journal knows it) and the adopt/cancel guidance.
+// Deduplicated per child id per process; the active-map read is the ONLY
+// streaming classifier — when the host status view is unreadable the sweep
+// stays silent (never cry wolf).
+// ---------------------------------------------------------------------------
+
+const orphanDisclosuresSeen = new Set<string>()
+
+export function observedOrphanDispatches(): number {
+  return orphanDisclosuresSeen.size
+}
+
+export async function detectOrphanDispatchChildren(client: DispatchClient, workspace: string): Promise<number> {
+  const trackedChildren = new Set<string>()
+  for (const h of dispatchTasks.values()) trackedChildren.add(h.childSessionID)
+  // Same list-shape tolerance as findChildByParentWalk (the walk proven on
+  // 2.3.2): array | {sessions} | {data:...} envelopes.
+  let listed: Array<Record<string, unknown>> = []
+  try {
+    const raw = await (client as unknown as { session?: { list?: (args?: unknown) => Promise<unknown> } }).session?.list?.({})
+    const body = (raw as { data?: unknown } | undefined)?.data ?? raw
+    listed = Array.isArray(body)
+      ? (body as Array<Record<string, unknown>>)
+      : Array.isArray((body as { sessions?: unknown[] } | undefined)?.sessions)
+        ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
+        : []
+  } catch {
+    return 0
+  }
+  if (listed.length === 0) return 0
+  let active: Set<string>
+  try {
+    const st = await client.session.status()
+    const map = (st as { data?: Record<string, unknown> } | undefined)?.data
+    if (!map || typeof map !== "object") return 0
+    active = new Set(Object.keys(map))
+  } catch {
+    return 0 // streaming unclassifiable: silent (never a false orphan)
+  }
+  let found = 0
+  for (const s of listed) {
+    const id = typeof s?.id === "string" ? s.id : ""
+    if (!id || trackedChildren.has(id) || orphanDisclosuresSeen.has(id)) continue
+    const agent = typeof s.agent === "string" ? s.agent : ""
+    const parent = typeof s.parentID === "string" ? s.parentID : ""
+    if (!parent || !agent.startsWith("forge-")) continue
+    if (!active.has(id)) continue // not streaming: not an orphan NOW
+    orphanDisclosuresSeen.add(id)
+    found++
+    // The journal may still name the task id even though the row is gone.
+    let taskId = "(unknown)"
+    try {
+      const rec = journalFor(workspace).nonTerminal().find((r) => r.childSessionId === id)
+      if (rec) taskId = rec.id
+    } catch {}
+    console.warn(
+      `[forge:orphan-dispatch] warn: forge child ${id} (agent ${agent}, parent ${parent}) is STREAMING with no live dispatch row (task id ${taskId}) — adoption gap. Adopt: restart the host or touch the workspace to re-run recovery; Cancel: /forge-cancel <task-id> (or forge_jobs action=cancel).`,
+    )
+    queueDispatchProgress(
+      parent,
+      `[forge:dispatch-notice] Orphaned dispatch child detected: forge child ${id} (agent ${agent}, task id ${taskId}) is running with no live dispatch row. It will NOT deliver an outcome on its own — recover it (restart/touch to re-run adoption) or cancel it (/forge-cancel ${taskId === "(unknown)" ? "<task-id>" : taskId}).`,
+    )
+  }
+  return found
 }
 
 async function runAsyncDispatchPoller(
@@ -3922,7 +4279,9 @@ async function runAsyncDispatchPoller(
       journalTerminalRecord(
         { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
         "aborted",
-        "registry kill (owner session ended / dispose) — user abort",
+        isDispatchCancelled(job.id)
+          ? "cancelled by the user lever (forge-cancel) — the child was aborted and the dispatch is never retried"
+          : "registry kill (owner session ended / dispose) — user abort",
       )
       return
     }
@@ -6203,6 +6562,15 @@ export const server: Plugin = async (input, options) => {
         description:
           "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out",
       }
+      // Dedicated dispatch lever (change dispatch-cancel-lifecycle task 1.1):
+      // the user-facing cancellation lever. Same no-clobber rule; routes on
+      // $ARGUMENTS (empty = list-only, task id = cancel one, "all" = cancel
+      // every in-flight dispatch) through the forge_jobs cancel action.
+      cfg.command["forge-cancel"] ??= {
+        template: FORGE_CANCEL_LEVER_TEMPLATE,
+        description:
+          "forge dispatch lever: cancel an in-flight async dispatch by task id (or \"all\"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried",
+      }
 
       // Gate permission rules (shell-defang-default-open): the 7 doors keep
       // the full "ask" rewrite — they stay real user confirmations (an
@@ -6887,6 +7255,14 @@ export const server: Plugin = async (input, options) => {
                 : undefined
               : undefined
         noteDispatchTerminalSignal(v1Session, kind, detail)
+        // Parent-interrupt disclosure (dispatch-cancel-lifecycle 2.1): the
+        // v1 hook's bus carries the same interrupted edge — disclose-only,
+        // deduped, never a throw into the host callback.
+        if (kind === "interrupted") {
+          try {
+            discloseInterruptedParent(v1Session)
+          } catch {}
+        }
       } else if (v1Session && (v1Type === "session.execution.started" || v1Type === "session.step.started" || v1Type === "session.step.ended")) {
         noteDispatchChildActivity(v1Session)
       }
@@ -8028,6 +8404,15 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
         () => FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
         "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out",
       )
+      // Dedicated dispatch lever (change dispatch-cancel-lifecycle task 1.1):
+      // the user-facing cancellation lever — same constant the v1 config
+      // hook registers (byte-identical by construction); the typed argument
+      // rides prompt.text via composeCommandPrompt (v2-command-surface 4.1).
+      addTemplateCommand(
+        "forge-cancel",
+        () => FORGE_CANCEL_LEVER_TEMPLATE,
+        "forge dispatch lever: cancel an in-flight async dispatch by task id (or \"all\"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried",
+      )
     })
   } catch (e) {
     // Drifted command domain: DISCLOSED degradation (change v2-command-surface
@@ -8292,6 +8677,15 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
                         : undefined
                       : undefined
                 noteDispatchTerminalSignal(sessionID, kind, detail)
+                // Parent-interrupt disclosure (dispatch-cancel-lifecycle
+                // 2.1): an interrupted OWNER session with children in flight
+                // gets the disclose-only notice (a child sessionID is a
+                // flight-miss no-op inside the helper).
+                if (kind === "interrupted") {
+                  try {
+                    discloseInterruptedParent(sessionID)
+                  } catch {}
+                }
                 // Idle parity: on hosts without the in-process idle hook,
                 // the succeeded edge IS the idle edge (existing fallback).
                 if (idleFallback && type === "session.execution.succeeded") v2HandleIdle(sessionID, goalClient)
@@ -8361,7 +8755,7 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
 // the v1 __forgeSubagentsTest): live references to the module maps the v2
 // handlers share with the v1 hooks, so tests seed and inspect without a
 // host. NOT part of the plugin API surface.
-export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
+export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
 
 // ---- v2-single-agent-surface: single-agent-surface primitives (v2Setup
 // only — the v1 config-hook path never uses these) ----
