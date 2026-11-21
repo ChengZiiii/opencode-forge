@@ -497,9 +497,10 @@ function readGlobalKnobs(deps?: { readFile?: (path: string) => string }): { mate
 // OPENCODE_CONFIG_DIR-aware) as non-namespaced lowercase files.
 function runRosterSync(): { lines: string[]; errorCount: number } {
   const resolution = resolvePools()
+  const overrideDir = globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR })
   const overridePlan = resolution
     ? planOverrideSync(resolution.overrides ?? {}, {
-        dir: globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR }),
+        dir: overrideDir,
         recipeFile: globalPoolPathOf(),
       })
     : null
@@ -507,16 +508,33 @@ function runRosterSync(): { lines: string[]; errorCount: number } {
     return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection)."], errorCount: 0 }
   }
   const plans: SyncPlan[] = [...planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() })]
-  if (overridePlan !== null) plans.push(overridePlan)
+  // builtin-override (E2E scenario-6 fix): the override channel ALWAYS rides
+  // the sync — planOverrideSync returning null (no ACTIVE entries) becomes an
+  // empty plan, which is exactly the DEACTIVATION pass: the executor's
+  // marker-keyed GC removes stale general.md/explore.md the recipe no longer
+  // wants. Hand-written files never carry the marker and are never touched;
+  // when nothing is configured and nothing stale exists the pass is a no-op
+  // (one readdir + marker check, zero writes).
+  plans.push(overridePlan ?? { kind: "override", dir: overrideDir, files: [] })
   const outcome = executeRosterSync(plans, realRosterFs())
-  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.length} pool(s):`]
+  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.filter((p) => p.files.length > 0).length} pool(s):`]
   if (outcome.created.length) lines.push(`  created: ${outcome.created.join(", ")}`)
   if (outcome.updated.length) lines.push(`  updated: ${outcome.updated.join(", ")}`)
   if (outcome.unchanged.length) lines.push(`  unchanged: ${outcome.unchanged.length} file(s) already current`)
   if (outcome.gced.length) lines.push(`  gc'd (entries removed from the recipe): ${outcome.gced.join(", ")}`)
   if (outcome.errors.length) lines.push(`  errors: ${outcome.errors.join("; ")}`)
+  // Recipe findings ride the sync disclosure (E2E scenario-9 fix): the
+  // resolver's warn/error findings — e.g. a workspace-layer `override` node
+  // being ignored by design (global-only, D1) — must be SEEN, not swallowed.
+  // Console parity for the design-relevant warn and for errors matches the
+  // readGlobalKnobs precedent.
+  for (const f of resolution.findings) {
+    if (f.level !== "warn" && f.level !== "error") continue
+    lines.push(`  finding [${f.level}] ${f.code}: ${f.message}`)
+    if (f.level === "error" || f.code === "override-node-ignored-workspace") console.warn(`[forge:sync] ${f.level}: ${f.message}`)
+  }
   lines.push("The host hot-applies the files — no restart. Edit the RECIPE (forge.json), never the generated files; forge_sync re-emits.")
-  return { lines, errorCount: outcome.errors.length }
+  return { lines, errorCount: outcome.errors.length + resolution.findings.filter((f) => f.level === "error").length }
 }
 
 // Content oracle for the staleness gate: compile one entry's expected

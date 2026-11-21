@@ -17973,18 +17973,18 @@ function readGlobalKnobs(deps) {
 }
 function runRosterSync() {
   const resolution = resolvePools();
+  const overrideDir = globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR });
   const overridePlan = resolution ? planOverrideSync(resolution.overrides ?? {}, {
-    dir: globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR }),
+    dir: overrideDir,
     recipeFile: globalPoolPathOf()
   }) : null;
   if (!resolution || resolution.families.length === 0 && overridePlan === null) {
     return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection)."], errorCount: 0 };
   }
   const plans = [...planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() })];
-  if (overridePlan !== null)
-    plans.push(overridePlan);
+  plans.push(overridePlan ?? { kind: "override", dir: overrideDir, files: [] });
   const outcome = executeRosterSync(plans, realRosterFs());
-  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.length} pool(s):`];
+  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.filter((p) => p.files.length > 0).length} pool(s):`];
   if (outcome.created.length)
     lines.push(`  created: ${outcome.created.join(", ")}`);
   if (outcome.updated.length)
@@ -17995,8 +17995,15 @@ function runRosterSync() {
     lines.push(`  gc'd (entries removed from the recipe): ${outcome.gced.join(", ")}`);
   if (outcome.errors.length)
     lines.push(`  errors: ${outcome.errors.join("; ")}`);
+  for (const f of resolution.findings) {
+    if (f.level !== "warn" && f.level !== "error")
+      continue;
+    lines.push(`  finding [${f.level}] ${f.code}: ${f.message}`);
+    if (f.level === "error" || f.code === "override-node-ignored-workspace")
+      console.warn(`[forge:sync] ${f.level}: ${f.message}`);
+  }
   lines.push("The host hot-applies the files — no restart. Edit the RECIPE (forge.json), never the generated files; forge_sync re-emits.");
-  return { lines, errorCount: outcome.errors.length };
+  return { lines, errorCount: outcome.errors.length + resolution.findings.filter((f) => f.level === "error").length };
 }
 function rosterContentOf(resolution) {
   const globalPath = globalPoolPathOf();

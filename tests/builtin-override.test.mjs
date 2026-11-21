@@ -213,6 +213,21 @@ test("executeRosterSync (override): emits lowercase files; re-plan without the e
   assert.ok(fs.text(`${GLOBAL_AGENT_DIR}/explore.md`) !== null, "the surviving entry's file stays")
 })
 
+test("executeRosterSync (override): FULL deactivation — the empty plan (runRosterSync's always-ride pass) GCs every marker-keyed file", () => {
+  const fs = fakeFs()
+  const plan = planOverrideSync(OV, { dir: GLOBAL_AGENT_DIR, recipeFile: GLOBAL_FILE })
+  executeRosterSync([plan], fs)
+  const handWritten = "---\ndescription: HAND WRITTEN\n---\nmine\n"
+  // E2E scenario-6 wiring semantic: planOverrideSync → null becomes the
+  // EMPTY plan — the deactivation pass. Marker files go, hand-written stays.
+  // (writeFile overwrites: general.md becomes a hand-written, marker-less file)
+  fs.writeFile(`${GLOBAL_AGENT_DIR}/general.md`, handWritten)
+  const out = executeRosterSync([{ kind: "override", dir: GLOBAL_AGENT_DIR, files: [] }], fs)
+  assert.deepEqual(out.gced, [`${GLOBAL_AGENT_DIR}/explore.md`], "the generated explore.md is GC'd")
+  assert.equal(fs.text(`${GLOBAL_AGENT_DIR}/general.md`), handWritten, "the hand-written file is never touched")
+  assert.equal(out.created.length, 0, "zero emission — the pass writes nothing")
+})
+
 test("executeRosterSync (override): collision redline — a hand-written same-name file is refused, disclosed, byte-identical; siblings still apply", () => {
   const fs = fakeFs()
   const handWritten = "---\ndescription: HAND WRITTEN\nmode: subagent\n---\nuser's own general\n"
