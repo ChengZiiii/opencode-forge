@@ -1,7 +1,7 @@
 # native-first-roster — tasks
 
-> Status: APPLY IN PROGRESS (owner approved apply 2026-11-21, three
-> resolutions recorded). Tasks 1.1–5.1 done; 5.2/5.3 pending.
+> Status: COMPLETE (owner approved apply 2026-11-21; released as
+> 0.30.0 the same day; archived on owner instruction).
 
 ## 1. Compiler core
 
@@ -38,8 +38,16 @@
 
 - [x] 5.1 Full design test plan (compiler matrix, staleness round-trip,
   atomicity, depth split, knob matrix).
-- [ ] 5.2 Sandbox E2E on 2.3.2: sync → native dispatch → hot-apply →
+- [x] 5.2 Sandbox E2E on 2.3.2: sync → native dispatch → hot-apply →
   cross-machine shape (second directory pull simulation).
-- [ ] 5.3 `openspec validate --all`; typecheck; bundle; git+file
+  **7/7 PASS** (`reports/e2e-native-first-roster-report.md` — pinned
+  model live with variant, readonly seal, GC redline incl. hand-written
+  survivor, ws2 zero-init pull simulation); real-machine round-trip
+  confirmed at release (`reports/release-0300-verify-report.md`).
+- [x] 5.3 `openspec validate --all`; typecheck; bundle; git+file
   official-install round-trip paired; version bump + npm publish ONLY
-  after owner approval.
+  after owner approval. **Released 0.30.0 (2026-11-21, owner
+  approved): npm publish → CDN → real-machine remove/store-clear/add →
+  payload 4/4 hash-equal → native default verified live (drafts off,
+  22→9) → forge_sync round-trip (9→14 natives, hot-apply) → config
+  zero-drift** (`reports/release-0300-verify-report.md`).
