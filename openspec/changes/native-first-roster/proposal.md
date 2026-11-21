@@ -60,10 +60,13 @@ recipe stays the single human-editable surface.
   recipes (scout/coder/reviewer), the `mode: subagent` trap and
   vocabulary notes for hand-writers, cross-machine story (generated
   files are committed; `git pull` = zero-init, lockfile pattern).
-- **KNOB — `materialize: "native" | "runtime"`:** runtime
-  draft-materialization becomes the escape hatch behind a knob (default
-  decision at review: one deprecation version of "runtime" after
-  "native" lands).
+- **KNOB — `materialize: "native" | "runtime"`:** defaults by host
+  generation — v1 hosts pinned to "runtime" (byte-equal to today,
+  forever); v2 hosts default DIRECTLY to "native" (owner decision
+  2026-11-21, no deprecation window), "runtime" stays selectable as the
+  escape hatch. `sync: "auto"` is kept as an exposed opt-in (absent =
+  gate + in-band sync, the default posture; present = silent
+  regeneration at session-start detection with a disclosed finding).
 
 ## Capabilities
 

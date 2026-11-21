@@ -54,11 +54,13 @@ project-wins + global permissions spliced, no collision protection;
 - **D5 — Migration knob.** `materialize: "native" | "runtime"`: the knob
   defaults BY HOST GENERATION — v1 hosts pin "runtime" (native agent
   files are a v2 host facility; v1 behavior stays byte-equal forever),
-  v2 hosts take the review-decided default (target: native after one
-  deprecation version of "runtime"). Both modes coexist safely because
-  the pool resolver is shared; existing workspaces with a recipe and no
-  artifacts read as "stale" and are healed by one in-band sync — no
-  workspace-file migration ever.
+  and **v2 hosts default DIRECTLY to "native"** (owner decision
+  2026-11-21: no deprecation window — the v2 experience is strictly
+  better and v1 is unaffected by generation pinning). "runtime" remains
+  selectable on v2 as an escape hatch. Both modes coexist safely
+  because the pool resolver is shared; existing workspaces with a
+  recipe and no artifacts read as "stale" and are healed by one in-band
+  sync — no workspace-file migration ever.
 - **D6 — Vocabulary drift is a first-class risk.** The host already
   renamed bash→execute and task→subagent within one minor era. Compiler
   emits from a single `NATIVE_TOOL_VOCAB` constant; a drift-mirror test
