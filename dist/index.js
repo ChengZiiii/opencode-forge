@@ -15737,17 +15737,18 @@ function isRecord(v) {
 function nonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0;
 }
-function validateAgentSet(raw) {
+var BUILTIN_OVERRIDE_IDS = ["general", "explore"];
+function validateAgentSet(raw, labelPrefix = "agents") {
   const findings = [];
   const agents = {};
   if (raw === undefined)
     return { agents, findings };
   if (!isRecord(raw)) {
-    findings.push({ level: "error", code: "agents-not-object", message: 'forge.json "agents" must be an object mapping agent ids to definitions — the agent set is empty' });
+    findings.push({ level: "error", code: "agents-not-object", message: `forge.json "${labelPrefix}" must be an object mapping agent ids to definitions — the agent set is empty` });
     return { agents, findings };
   }
   for (const [rawId, entry] of Object.entries(raw)) {
-    let label = `agents.${rawId}`;
+    let label = `${labelPrefix}.${rawId}`;
     let id = rawId;
     if (rawId.startsWith("forge-")) {
       id = rawId.replace(/^(forge-)+/, "");
@@ -15824,6 +15825,30 @@ function validateAgentSet(raw) {
     agents[id] = def;
   }
   return { agents, findings };
+}
+function validateOverrideNode(raw, label) {
+  if (raw === undefined || raw === null)
+    return { overrides: {}, findings: [] };
+  if (!isRecord(raw)) {
+    return {
+      overrides: {},
+      findings: [{ level: "warn", code: "override-node-invalid", message: `${label}: the top-level "override" field must be an object mapping built-in ids ("general", "explore") to definitions — field ignored` }]
+    };
+  }
+  const validated = validateAgentSet(raw, "override");
+  const overrides = {};
+  for (const [id, def] of Object.entries(validated.agents)) {
+    if (!BUILTIN_OVERRIDE_IDS.includes(id)) {
+      validated.findings.push({
+        level: "warn",
+        code: "override-id-unknown",
+        message: `${label}: override.${id} is not a built-in subagent id — the built-ins are exactly ${BUILTIN_OVERRIDE_IDS.map((i) => `"${i}"`).join(", ")} (lowercase, case-sensitive: a capitalized key creates an ambiguous duplicate, never an override) — entry skipped`
+      });
+      continue;
+    }
+    overrides[id] = def;
+  }
+  return { overrides, findings: validated.findings };
 }
 function isPositiveInt(v) {
   return typeof v === "number" && Number.isInteger(v) && v >= 1;
@@ -16108,6 +16133,7 @@ function createPoolResolver(deps) {
         agents: {},
         declaredPool: null,
         shared: null,
+        overrides: null,
         findings: [
           {
             level: "error",
@@ -16117,10 +16143,20 @@ function createPoolResolver(deps) {
         ]
       };
     } else if (doc2.config !== undefined && !isRecord(doc2.config)) {
-      parsed = { agents: {}, declaredPool: null, shared: null, findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this pool contributes no agents` }] };
+      parsed = { agents: {}, declaredPool: null, shared: null, overrides: null, findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this pool contributes no agents` }] };
     } else {
       const top = doc2.config === undefined ? undefined : doc2.config;
       const validated = validateAgentSet(top === undefined ? undefined : top.agents);
+      let overrides = null;
+      if (top?.override !== undefined && top.override !== null) {
+        if (path === globalPath) {
+          const ov = validateOverrideNode(top.override, path);
+          validated.findings.push(...ov.findings);
+          overrides = ov.overrides;
+        } else {
+          validated.findings.push({ level: "warn", code: "override-node-ignored-workspace", message: `${path}: the top-level "override" field is GLOBAL-layer-only (workspace pools always compile namespaced as forge-<ns>-<id>) — field ignored` });
+        }
+      }
       const sharedRaw = top === undefined ? undefined : top.shared;
       let shared = null;
       if (sharedRaw !== undefined && sharedRaw !== null) {
@@ -16130,7 +16166,7 @@ function createPoolResolver(deps) {
           validated.findings.push({ level: "warn", code: "shared-invalid", message: `${path}: the top-level "shared" field must be a non-empty string — ignored` });
         }
       }
-      parsed = { agents: validated.agents, declaredPool: top === undefined ? null : top.pool, shared, findings: validated.findings };
+      parsed = { agents: validated.agents, declaredPool: top === undefined ? null : top.pool, shared, overrides, findings: validated.findings };
     }
     fileCache.set(path, { mtimeMs: st.mtimeMs, size: st.size, parsed });
     return parsed;
@@ -16223,7 +16259,7 @@ function createPoolResolver(deps) {
         }
         origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, shared: f.shared, materializedIds: ids });
       }
-      return { families: origins, agents, findings };
+      return { families: origins, agents, overrides: globalParsed?.overrides ?? {}, findings };
     }
   };
 }
@@ -16300,6 +16336,28 @@ ${body}
 `
   };
 }
+var OVERRIDE_DEFAULT_PROMPTS = {
+  general: "You are the user-overridden built-in General subagent. Do the dispatched work directly and report a compact result with evidence.",
+  explore: "You are the user-overridden built-in Explore subagent. Search and read the codebase for the dispatched question; report a compact brief with file:line evidence."
+};
+function compileOverrideEntry(input) {
+  if (!BUILTIN_OVERRIDE_IDS.includes(input.id))
+    return null;
+  const shape = input.def.shape === "readonly" ? "readonly" : "write";
+  const description = `Built-in ${input.id} override — pinned by the global forge.json "override" node (${input.def.model !== undefined ? "pinned model" : "Auto worker"}).`;
+  const model = modelStringFor(input.def);
+  const tools = toolsFaceFor(shape);
+  const body = input.def.prompt !== undefined && input.def.prompt.trim().length > 0 ? input.def.prompt : OVERRIDE_DEFAULT_PROMPTS[input.id];
+  return {
+    fileName: `${input.id}.md`,
+    content: `${frontmatterFor({ description, model, tools })}
+
+${generatedHeader(input.recipeFile)}
+
+${body}
+`
+  };
+}
 function agentDirFor(poolFile) {
   const sep2 = poolFile.includes("\\") && !poolFile.includes("/") ? "\\" : "/";
   const parts = poolFile.split(/[\\/]/);
@@ -16307,6 +16365,28 @@ function agentDirFor(poolFile) {
   const dirName = parts.pop();
   const base = parts.join(sep2);
   return `${base}${sep2}${dirName}${sep2}agent`;
+}
+function globalAgentDirFor(opts) {
+  const cfg = (opts.configDir ?? "").trim();
+  if (cfg) {
+    const sep3 = cfg.includes("\\") && !cfg.includes("/") ? "\\" : "/";
+    return cfg.endsWith(sep3) ? `${cfg}agent` : `${cfg}${sep3}agent`;
+  }
+  const sep2 = opts.homeDir.includes("\\") && !opts.homeDir.includes("/") ? "\\" : "/";
+  const base = opts.homeDir.endsWith(sep2) ? opts.homeDir : `${opts.homeDir}${sep2}`;
+  return `${base}.config${sep2}opencode${sep2}agent`;
+}
+function planOverrideSync(overrides, opts) {
+  const files = [];
+  for (const id of BUILTIN_OVERRIDE_IDS) {
+    const def = overrides[id];
+    if (def === undefined)
+      continue;
+    const compiled = compileOverrideEntry({ id, def, recipeFile: opts.recipeFile });
+    if (compiled !== null)
+      files.push(compiled);
+  }
+  return files.length > 0 ? { kind: "override", dir: opts.dir, files } : null;
 }
 function provenanceFor(family, globalPoolFile) {
   return family.file === globalPoolFile ? { global: true } : { ns: family.ns, file: family.file };
@@ -16320,7 +16400,7 @@ function planRosterSync(resolution, opts) {
       const compiled = compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined });
       return { matId, ...compiled };
     });
-    plans.push({ family, dir: agentDirFor(family.file), files });
+    plans.push({ kind: "family", family, dir: agentDirFor(family.file), files });
   }
   return plans;
 }
@@ -16355,6 +16435,10 @@ function executeRosterSync(plans, deps = {}) {
       let tmp = null;
       try {
         const existing = stat(dest) !== null ? readFile(dest) : null;
+        if (plan.kind === "override" && existing !== null && !existing.includes(GENERATED_MARKER)) {
+          out.errors.push(`${dest}: collision refused — a hand-written file of this exact name already exists; sync never overwrites it. Fold your changes into the global recipe's "override" entry, or rename/remove the hand-written file.`);
+          continue;
+        }
         if (existing === file2.content) {
           out.unchanged.push(dest);
           continue;
@@ -16383,11 +16467,18 @@ function executeRosterSync(plans, deps = {}) {
         out.errors.push(`${dest}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
+    const gcEligible = (name) => {
+      if (!name.endsWith(".md"))
+        return false;
+      if (plan.kind === "override")
+        return BUILTIN_OVERRIDE_IDS.some((id) => name === `${id}.md`);
+      return name.startsWith("forge-");
+    };
     try {
       const listing = readdir(plan.dir);
       if (listing !== null) {
         for (const name of listing) {
-          if (!name.startsWith("forge-") || !name.endsWith(".md"))
+          if (!gcEligible(name))
             continue;
           if (wanted.has(name))
             continue;
@@ -17728,6 +17819,55 @@ var GOAL_COMMAND_TEMPLATE = [
   ""
 ].join(`
 `);
+var GLOBAL_RECIPE_SCAFFOLD_JSONC = [
+  "{",
+  "  // GLOBAL forge.json — the machine-wide FALLBACK roster (sole ownership:",
+  "  // the nearest .opencode/forge.json walking up from a session's worktree",
+  "  // IS that session's whole roster when it exists; this layer is a",
+  "  // fallback, never a merge). Agents here materialize as forge-global-<id>",
+  "  // in the host's global agent dir once forge_sync runs.",
+  '  "agents": {',
+  '    // "research": { "model": "provider/model", "thoughtLevel": "low",',
+  '    //   "shape": "readonly", "prompt": "short role description" },',
+  "  },",
+  "  // OPTIONAL built-in overrides: uncomment and fill an entry to pin the",
+  "  // host's built-in General/Explore subagents machine-wide. Keys are the",
+  `  // built-ins' exact LOWERCASE ids ("general" / "explore") — capitalized`,
+  "  // files create ambiguous duplicates, never overrides. Activating an",
+  "  // entry REPLACES the built-in's prompt wholesale (vendor text is never",
+  "  // copied) — write your own general/explore prompt. model+thoughtLevel",
+  "  // pin brain and depth (an ATOMIC pair); leaving both out of an active",
+  "  // entry keeps the Auto worker (inherits the parent session's model —",
+  "  // the official default). forge_sync compiles an active entry to",
+  "  // <global agent dir>/general.md|explore.md (GENERATED marker; re-comment",
+  "  // the entry and sync again to garbage-collect it). A hand-written file",
+  "  // of the same name is NEVER overwritten — sync refuses and discloses.",
+  '  // "override": {',
+  '  //   "general": { "model": "provider/model", "thoughtLevel": "low",',
+  '  //     "prompt": "You are my general-purpose worker. ..." },',
+  '  //   "explore": { "model": "provider/model", "thoughtLevel": "low",',
+  '  //     "shape": "readonly", "prompt": "You are my codebase scout. ..." },',
+  "  // },",
+  "}"
+].join(`
+`);
+var FORGE_COMMAND_TEMPLATE = [
+  '(forge roster levers. Argument: "$ARGUMENTS")',
+  "",
+  "FAMILY GUARD (step 0, before anything else): if you do not have the forge_sync tool in your available tools, you are not in a forge session — STOP now: execute nothing below, and tell the user that /forge belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
+  "",
+  "Route on the argument above (decide silently; do not recite this routing text to the user):",
+  `- Argument "sync": call the forge_sync tool NOW and report its output verbatim to the user — every created/updated/unchanged/gc'd file and any error line. This is the manual force lever: the default posture (staleness gate + in-band sync; the sync:"auto" opt-in) is unchanged, so report the diff and stop there.`,
+  `- Argument "init": draft THIS workspace's recipe (.opencode/forge.json) in-band with the user. First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent's shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user's explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes.`,
+  `- Argument "init global": same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in's prompt wholesale; the scaffold's inline comments say the same). Scaffold shape:`,
+  ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split(`
+`).map((l) => `  ${l}`),
+  "- Argument empty or unknown: tell the user the three forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries) — and stop.",
+  "",
+  `Boundaries: this command never writes anything by itself — every write goes through forge_sync or the normal write tool on the user's explicit go-ahead, transcript-visible. The staleness gate, the in-band sync default, and sync:"auto" behave exactly as without this command.`,
+  ""
+].join(`
+`);
 function isRootish(p) {
   if (!p)
     return true;
@@ -17833,10 +17973,16 @@ function readGlobalKnobs(deps) {
 }
 function runRosterSync() {
   const resolution = resolvePools();
-  if (!resolution || resolution.families.length === 0) {
+  const overridePlan = resolution ? planOverrideSync(resolution.overrides ?? {}, {
+    dir: globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR }),
+    recipeFile: globalPoolPathOf()
+  }) : null;
+  if (!resolution || resolution.families.length === 0 && overridePlan === null) {
     return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection)."], errorCount: 0 };
   }
-  const plans = planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() });
+  const plans = [...planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() })];
+  if (overridePlan !== null)
+    plans.push(overridePlan);
   const outcome = executeRosterSync(plans, realRosterFs());
   const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.length} pool(s):`];
   if (outcome.created.length)
@@ -20554,7 +20700,8 @@ var crewBeginTool = tool({
         "Two axes, distinct: POOLS follow workspaces (sole ownership above — dispatch is gated to the session's own pool / the global fallback); SESSION ARTIFACTS (plan/goal/crew records) follow the session. A forge.json in another workspace is not dispatchable from this session.",
         `Template (JSONC): the top-level "pool" field names this file's namespace (short stable [a-z0-9-] up to 24 chars — REQUIRED for crew-governed dispatch; every pool materializes as forge-<ns>-<id>, the global fallback materializes as forge-global-<id>); {"pool": "short-stable-namespace", "agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "shape": "readonly", "prompt": "short role description"}}} — an absent shape defaults to WRITE (open permissions); "shape": "readonly" is the explicit seal denying write/edit/bash + the patch family for read-only roles.`,
         "Agent ids are plain role words WITHOUT the `forge-` prefix — every pool materializes as `forge-<ns>-<id>` under its `pool` namespace (the global fallback materializes as `forge-global-<id>`); a prefixed id is auto-stripped with a warning.",
-        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it: give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request), give every agent an EXPLICIT shape (readonly for read-only roles like reviewer/scout/planner; write for implementers and build drivers), and INCLUDE the top-level `pool` namespace — it is REQUIRED for crew-governed dispatch (the compliance gate refuses a missing or invalid field) and keeps ids stable across directory renames. File edits, creations, and deletions apply at the next config hook — no host restart needed, and a DELETED pool file un-materializes its agents (deletion is real)."
+        "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it: give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request), give every agent an EXPLICIT shape (readonly for read-only roles like reviewer/scout/planner; write for implementers and build drivers), and INCLUDE the top-level `pool` namespace — it is REQUIRED for crew-governed dispatch (the compliance gate refuses a missing or invalid field) and keeps ids stable across directory renames. File edits, creations, and deletions apply at the next config hook — no host restart needed, and a DELETED pool file un-materializes its agents (deletion is real).",
+        "Levers: the user can also run /forge init (draft this workspace's forge.json in-band, refuse-and-review when one exists) or /forge init global (draft the global layer, built-in override entries shipped commented out) — the explicit one-command starters for exactly this setup."
       ];
       if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject && !sessionCovered) {
         lines2.push(`NOTE: this session's workspace DOES have a forge.json (${sessionProject}) with usable agents — but this host has NOT materialized it (no initialization in that workspace). Re-initialize the host in that workspace, or move the agents into the global layer (${globalPoolPath}).`);
@@ -21259,6 +21406,10 @@ var server = async (input, options) => {
       cfg.command["goal"] ??= {
         template: GOAL_COMMAND_TEMPLATE,
         description: "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)"
+      };
+      cfg.command["forge"] ??= {
+        template: FORGE_COMMAND_TEMPLATE,
+        description: "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out"
       };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
@@ -22262,6 +22413,7 @@ async function v2RegisterCommands(ctx) {
 `));
       };
       addTemplateCommand("crew", crewTemplate, registrationAgentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance");
+      addTemplateCommand("forge", () => FORGE_COMMAND_TEMPLATE, "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out");
     });
   } catch {}
 }
@@ -22622,6 +22774,8 @@ export {
   TASK_SEAM_DEGRADED_ERROR,
   PLAN_COMMAND_TEMPLATE,
   GOAL_COMMAND_TEMPLATE,
+  GLOBAL_RECIPE_SCAFFOLD_JSONC,
+  FORGE_COMMAND_TEMPLATE,
   DEFAULT_DISPATCH_QUEUE_MAX,
   CREW_INIT_TEMPLATE,
   ASYNC_DISPATCH_CAP

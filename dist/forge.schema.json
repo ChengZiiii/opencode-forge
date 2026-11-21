@@ -37,6 +37,15 @@
         "description": "Lowercase [a-z0-9-]. A `forge-` prefix is tolerated (auto-stripped with a warning at load); write ids without it."
       },
       "additionalProperties": { "$ref": "#/definitions/agent" }
+    },
+    "override": {
+      "type": "object",
+      "description": "Built-in subagent overrides — GLOBAL layer file ONLY (ignored with a warning in workspace pool files). Keys are the built-in subagents' exact LOWERCASE ids: \"general\" and \"explore\" — the identity key is the filename stem and is case-sensitive, so a capitalized key creates an ambiguous duplicate entry instead of an override and is skipped with a warning. Entries stay inert until uncommented/added: an ACTIVE entry compiles (forge_sync) to a same-name non-namespaced file (general.md / explore.md) in the host's global agent dir, overriding the built-in machine-wide. Activating an entry REPLACES the built-in's prompt wholesale — write your own; vendor text is never copied. model+thoughtLevel keep the atomic-pair rules (both = pinned, neither = Auto worker inheriting the parent session's model). A hand-written file of the same name is never overwritten: sync refuses and discloses.",
+      "propertyNames": {
+        "enum": ["general", "explore"],
+        "description": "The two built-in subagent ids, exact lowercase (case-sensitive identity key)."
+      },
+      "additionalProperties": { "$ref": "#/definitions/agent" }
     }
   },
   "definitions": {
