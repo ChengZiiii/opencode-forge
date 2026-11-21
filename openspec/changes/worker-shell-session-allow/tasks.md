@@ -58,14 +58,24 @@
 
 ## 3. Verification
 
-- [ ] 3.1 `bun run typecheck`, full `node --test` suite green, `bun run
-  bundle`, dist committed.
-- [ ] 3.2 Production-geometry verification (the only geometry that exhibits
-  the defect — sandbox serves cannot reproduce it, probe §0): deploy the
-  patched dist, `opencode service restart`, dispatch a plugindev worker with
-  `forge_shell echo` → PASS verbatim; explicit-deny config → verbatim refusal;
-  `[forge:session-rescue]`/injection disclosure present in the right places;
-  revert any test config afterwards (byte-identical restore, hash-verified).
+- [x] 3.1 `bun run typecheck`, full `node --test` suite green, `bun run
+  bundle`, dist committed. (859/859 — 840 baseline + 19 new; HEAD 188ecca.)
+- [x] 3.2 Production-geometry verification (2026-11-21, server PID 43308,
+  fresh plugin load run=0793a9cf @ 21:48 — AFTER the patched dist deploy at
+  21:37):
+  - PASS leg: plugindev worker `forge_shell echo RESCUE-VERIFIED-OK` →
+    exit=0, output verbatim; second call (`git log --oneline -1`) →
+    `188ecca chore: dist rebuild (worker-shell-session-allow)` exit=0.
+    Zero `[forge:session-rescue]` lines in the host log → the session-rule
+    injection channel worked silently (primary seeding / worker belt);
+    the fallback belt never fired — the designed clean path.
+  - DENY leg: v2-array `permissions: [{action:"forge_shell",effect:"deny"}]`
+    in opencode.jsonc → worker receives the plugin's EXPLICIT refusal
+    verbatim (`[forge] forge_shell is explicitly denied by user
+    configuration…`) — not the host's bare deny — proving the dual-shape
+    posture resolver reads real disk and the deny gate short-circuits
+    before any injection. Config restored byte-identical afterwards
+    (SHA256 prefix 979DA33455822E1E = baseline).
 - [ ] 3.3 Fold into the 0.31.0 release train: unblocks the dual-change sandbox
   E2E (write workers regain command execution); E2E scenario list gains the
   worker-shell PASS leg.
