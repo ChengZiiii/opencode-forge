@@ -3486,7 +3486,13 @@ type DispatchRetryContext = {
 
 const cancelledDispatchIds = new Set<string>()
 
-const CANCEL_IDLE_ASSERTION_MS = Number(process.env.FORGE_CANCEL_IDLE_ASSERTION_MS ?? 10_000)
+// Read at CALL time (the poll envs' lazy posture): ESM evaluates imported
+// modules BEFORE the importing test file's env preamble, so a module-level
+// read would freeze the 10 s default into every suite run.
+function cancelIdleAssertionMs(): number {
+  const raw = Number(process.env.FORGE_CANCEL_IDLE_ASSERTION_MS)
+  return Number.isFinite(raw) && raw > 0 ? raw : 10_000
+}
 
 function inFlightDispatchList(): Array<{ taskId: string; agent: string; childSessionID: string; ownerSession: string; description: string; ageMs: number | null }> {
   const rows: Array<{ taskId: string; agent: string; childSessionID: string; ownerSession: string; description: string; ageMs: number | null }> = []
@@ -3549,7 +3555,8 @@ export function discloseInterruptedParent(sessionID: string): boolean {
 
 /** Post-abort idle assertion: the child must reach idle within the window. */
 async function assertChildIdleAfterAbort(client: DispatchClient, childSessionID: string): Promise<"idle" | "resisted" | "unresolved"> {
-  const deadline = Date.now() + CANCEL_IDLE_ASSERTION_MS
+  const assertionMs = cancelIdleAssertionMs()
+  const deadline = Date.now() + assertionMs
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 400))
     try {
@@ -3594,11 +3601,12 @@ export async function cancelDispatch(
   // persisted row, and the owner gets the normal aborted wake.
   jobManager.kill(job)
   const idle = await assertChildIdleAfterAbort(client, row.childSessionID)
+  const assertionMs = cancelIdleAssertionMs()
   const idleNote =
     idle === "idle"
       ? `the child session ${row.childSessionID} is confirmed idle (the cancellation is REAL, not bookkeeping)`
       : idle === "resisted"
-        ? `the child session ${row.childSessionID} did NOT reach idle within ${Math.round(CANCEL_IDLE_ASSERTION_MS / 1000)}s — it may have resisted cancellation; inspect or abort it natively in the host TUI`
+        ? `the child session ${row.childSessionID} did NOT reach idle within ${Math.round(assertionMs / 1000)}s — it may have resisted cancellation; inspect or abort it natively in the host TUI`
         : `the child session ${row.childSessionID}'s state could not be read to confirm idle — verify it natively in the host TUI`
   return {
     ok: true,
