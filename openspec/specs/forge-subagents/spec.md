@@ -291,28 +291,7 @@ A pool's forge.json MAY declare an optional top-level `shared` field — a strin
 
 ### Requirement: Task shadow surface (native name, forge engine)
 
-The plugin SHALL register its dispatch implementation under the tool
-name `task`, shadowing the native task tool host-wide, so the TUI drives
-its native task rendering (the live subagent panel) for forge dispatches.
-The tool SHALL accept `description`, `prompt`, `subagent_type`, and
-`run_in_background` and SHALL dispatch ANY materialized target agent via
-SDK child sessions (`client.session.create` with `parentID`, the target
-agent id, the parent's session directory, and the native-parity title):
-forge-* targets pass the forge dispatch gates (session-domain pool gate
-with the `not dispatchable from this session` finding, crew pending and
-pool-compliance belts); non-forge host targets dispatch through the same
-engine without the forge pool gate — the crew pending belt stays
-SESSION-keyed (it refuses ANY `task` call per the crew-harness pause
-semantics, target class notwithstanding) while the pool-compliance belt
-stays forge-*-keyed. Child sessions carry tool-part
-metadata mirroring the native shape (`agent`, `sessionId`, `taskId`,
-`run_in_background`, `description`, `prompt`). Question policy is
-mode-keyed: sync dispatches keep questions available (native parity);
-async (`run_in_background: true`) dispatches create the child with the
-question tool denied session-wide. Sync dispatches SHALL abort the child
-when the dispatching turn is aborted; async children survive turn aborts
-and die at session death. The `forge_dispatch` tool SHALL NOT be
-registered.
+The plugin SHALL register its dispatch implementation under the tool name `task`, shadowing the native task tool host-wide, so the TUI drives its native task rendering (the live subagent panel) for forge dispatches. The tool SHALL accept `description`, `prompt`, `subagent_type`, and `run_in_background` and SHALL dispatch ANY materialized target agent via SDK child sessions (child creation with `parentID`, the target agent id, the parent's session directory — resolved from the authoritative session anchor — and the native-parity title): forge-* targets pass the forge dispatch gates (session-domain pool gate with the `not dispatchable from this session` finding, crew pending and pool-compliance belts); non-forge host targets dispatch through the same engine without the forge pool gate — the crew pending belt stays SESSION-keyed (it refuses ANY `task` call per the crew-harness pause semantics, target class notwithstanding) while the pool-compliance belt stays forge-*-keyed. Child-session creation SHALL resolve the ACTUAL client surface on the host with guarded shape probing (the literal `client.session.create` seam is a pre-2.3.2 shape; on hosts where the seam moved or is absent, the tool SHALL adapt to the host's exposed create surface), and when NO create seam is resolvable on the host, the tool SHALL return an honest degradation error naming the native task tool as the available dispatch surface — never a raw TypeError. Child sessions carry tool-part metadata mirroring the native shape (`agent`, `sessionId`, `taskId`, `run_in_background`, `description`, `prompt`). Question policy is mode-keyed: sync dispatches keep questions available (native parity); async (`run_in_background: true`) dispatches create the child with the question tool denied session-wide. Sync dispatches SHALL abort the child when the dispatching turn is aborted; async children survive turn aborts and die at session death. The `forge_dispatch` tool SHALL NOT be registered.
 
 #### Scenario: A forge dispatch renders in the native task panel
 
@@ -337,6 +316,16 @@ registered.
 
 - **WHEN** the plugin's tool registrations are enumerated
 - **THEN** no `forge_dispatch` tool exists; `task` is the single dispatch surface
+
+#### Scenario: A moved child-creation seam adapts by probing
+
+- **WHEN** the host's client exposes child-session creation under a different receiver or method name than the pre-2.3.2 shape
+- **THEN** the guarded probe finds the exposed create surface and dispatch proceeds through it, with the parent's directory resolved from the authoritative session anchor
+
+#### Scenario: An absent create seam degrades honestly
+
+- **WHEN** the host's client surface exposes no resolvable child-session creation seam
+- **THEN** the task tool returns the contract degradation error naming the native task tool as the dispatch surface (exact string, no raw TypeError), and the native task tool remains fully functional for the same dispatch
 
 ### Requirement: Dispatch lifecycle (wake, cap, harvest)
 
@@ -732,3 +721,152 @@ re-dispatching.
 - WHEN the budget-expiry notice surfaces
 - THEN it includes the job id (and task handle / report path when
   present)
+
+### Requirement: Active-textful completion override
+
+When a dispatch child's status view keeps reporting the session active but
+the child's final assistant text has already arrived and remained stable,
+the poller `SHALL` verdict the dispatch COMPLETE from the message-stream
+evidence alone — it `SHALL NOT` wait for the status view to flip, `SHALL
+NOT` run the dispatch to a timeout, and the terminal wake `SHALL` disclose
+that completion was established from the message stream while the status
+view lagged. The override `SHALL` use the same stability window (three
+consecutive poll ticks with finish conditions holding and non-empty final
+text) as the ordinary not-active completion path, `SHALL` cover sync and
+async dispatches alike, and `SHALL NOT` fire when the final text has not
+arrived (a stuck-active child with no text keeps its existing honest
+uncertainty handling — the override never invents completion).
+
+#### Scenario: Stuck-active status with the final report already out
+
+- **WHEN** a child's status map reports active on every poll tick while
+  the child's final assistant text is readable and has held the finish
+  conditions for the stability window
+- **THEN** the poller verdicts COMPLETE, the terminal wake names the
+  message-stream override as the establishment path, and no timeout path
+  runs
+
+#### Scenario: Stuck-active with no text stays honest
+
+- **WHEN** a child's status map reports active and no final assistant text
+  has arrived
+- **THEN** the override does not fire and the existing textless-idle and
+  stale handling governs — no completion is invented
+
+### Requirement: Nested-dispatch tool guard on non-forge child sessions
+
+Child-session creation `SHALL` accept a task-deny option that carries the
+task-tool deny permission in the create body (the channel QUESTION_DENY
+already uses, proven effective by a sandbox probe before the guard ships).
+The dispatch path `SHALL` set this option when — and only when — the
+target is a non-forge host agent whose resolved provider family is
+anthropic: such children `SHALL NOT` receive a dispatchable task tool,
+preventing the nested-delegation 400 that family returns. Forge-*
+targets `SHALL` remain governed solely by their structural `task: deny`
+(this guard adds nothing to them), and non-forge targets on other
+provider families `SHALL` be untouched by this guard. The guard lives at
+the single child-creation funnel so every spawn site inherits it.
+
+#### Scenario: Non-forge anthropic target denies the task tool in the child
+
+- **WHEN** a dispatch targets a non-forge host agent whose provider family
+  resolves to anthropic
+- **THEN** the child session is created with the task-tool deny riding the
+  create body, and the child cannot dispatch further subagents
+
+#### Scenario: Forge family and other families are untouched
+
+- **WHEN** a dispatch targets a forge-* agent, or a non-forge agent on a
+  non-anthropic family
+- **THEN** the create body carries no task deny from this guard (forge's
+  structural deny still applies to forge-* targets through the materialized
+  permissions)
+
+### Requirement: Provider-dimension dispatch gate and circuit breaker
+
+The dispatch path `SHALL` maintain in-process counters of live children
+keyed by provider and by provider/model, fed at the terminal-recording
+seam, and `SHALL` enforce optional per-provider and per-model concurrency
+limits. A circuit breaker `SHALL` track consecutive failed terminals per
+provider: at the configured threshold the breaker opens and refuses NEW
+dispatches on that provider; after the configured cooldown it half-opens
+(one dispatch allowed; success closes, failure re-opens). Both mechanisms
+`SHALL` be configured through an optional `dispatch` node in forge.json
+(`providerConcurrency` map, `modelConcurrency` map, `circuitBreaker`
+`{consecutiveFailures, cooldownMs}`), cascade-merged across config layers
+with field-level fail-soft (a bad value drops with a warn finding and
+never throws); an absent node `SHALL` mean no limits (today's behavior).
+Queued dispatches `SHALL` re-check the gate at dequeue time. Every
+refusal `SHALL` be an honest message naming the mechanism, the counted
+dimension and its current value, and the recovery condition (a live child
+  finishing for the concurrency gate; the cooldown elapsing for the
+breaker); breaker refusals `SHALL` be classified as the plugin's own
+throttle, not as provider errors, and `SHALL NOT` trigger the provider
+  retry path.
+
+#### Scenario: Provider concurrency gate refuses and admits
+
+- **WHEN** the live count for a provider is at its configured limit and a
+  new dispatch on that provider arrives
+- **THEN** the dispatch is refused with the gate named, the counted
+  dimension shown, and the recovery condition stated; when a live child on
+  that provider terminates, the next dispatch is admitted
+
+#### Scenario: Breaker opens, half-opens, and closes
+
+- **WHEN** a provider accumulates the configured number of consecutive
+  failed terminals
+- **THEN** new dispatches on that provider are refused naming the breaker
+  and cooldown; after the cooldown the next dispatch is admitted
+  (half-open) and on its success the breaker closes (a failure re-opens it
+  with the cooldown re-armed)
+
+#### Scenario: Absent or malformed dispatch node is fail-soft
+
+- **WHEN** forge.json carries no `dispatch` node, or one with malformed
+  values
+- **THEN** dispatches are unlimited (or the malformed fields are ignored
+  with a warn finding) and no dispatch is ever refused due to a parse
+  failure
+
+### Requirement: JSON Schema publication for forge.json
+
+The plugin `SHALL` publish a hand-written JSON Schema
+(`schema/forge.schema.json`, mirrored into `dist/forge.schema.json` by
+the bundle step and exposed via the package `exports` map under
+`./schema.json`) describing the forge.json surface: the consumed
+top-level keys (`agents`, `pool`, `shared`), the per-agent entry fields
+(`prompt`, the atomic `model`+`thoughtLevel` pair expressed so that
+half-pairs fail validation, `shape` with exactly the values `readonly`
+and `write`, `permission` overrides), the id and pool naming rules the
+validator enforces, and the deprecated `depths` key. The schema `SHALL`
+be mirror-locked to the code: a test `SHALL` assert the schema's enums
+and patterns against the code constants they mirror (the shape union,
+the id/pool regexes, the atomic-pair rule), failing when either side
+drifts. The parser's existing unknown-key tolerance `SHALL` keep
+accepting a user-pasted `$schema` key verbatim (documented in README
+with the node_modules reference form and the `.json`-extension comment
+caveat), and the `shape-invalid` finding `SHALL` state the true default
+(`write`), matching the shape-default-open semantics.
+
+#### Scenario: Editor completion and typo defense
+
+- **WHEN** a user references the published schema from their forge.json
+  (`$schema` pointing at the package's `./schema.json` export)
+- **THEN** their editor offers completion over the documented surface and
+  flags invalid entries — a `model` without `thoughtLevel`, or a
+  misspelled `shape` — before the file ever reaches the plugin
+
+#### Scenario: Schema and validator cannot drift silently
+
+- **WHEN** the validator's shape union, id/pool patterns, or atomic-pair
+  rule changes without the schema changing in step (or vice versa)
+- **THEN** the drift-mirror test fails, naming the drifted pair
+
+#### Scenario: $schema stays tolerated and the finding tells the truth
+
+- **WHEN** a forge.json carries a `$schema` key, or an entry carries an
+  invalid `shape` value
+- **THEN** the `$schema` key parses clean (unknown-key tolerance), and
+  the `shape-invalid` finding states that the entry defaults to WRITE
+  (not readonly) while naming the accepted values
