@@ -485,6 +485,48 @@ export function mergeDispatchNodes(base: DispatchNodeConfig | null, override: Di
 }
 
 // ---------------------------------------------------------------------------
+// Top-level host knobs (change native-first-roster, design D5): optional
+// `materialize: "native" | "runtime"` and `sync: "auto"` on a forge.json
+// top level. Field-level fail-soft exactly like everything else: a bad
+// value drops with a warn finding and counts as absent (the CALLER owns
+// the default — v1 hosts pin runtime, v2 hosts default native).
+// ---------------------------------------------------------------------------
+
+export type ForgeMaterializeKnob = "native" | "runtime"
+
+export function parseMaterializeKnob(v: unknown, label: string): { value: ForgeMaterializeKnob | undefined; findings: ForgeConfigFinding[] } {
+  if (v === undefined || v === null) return { value: undefined, findings: [] }
+  if (v === "native" || v === "runtime") return { value: v, findings: [] }
+  return {
+    value: undefined,
+    findings: [{ level: "warn", code: "materialize-invalid", message: `${label}.materialize must be "native" or "runtime" — field ignored (the default applies)` }],
+  }
+}
+
+export function parseSyncKnob(v: unknown, label: string): { auto: boolean; findings: ForgeConfigFinding[] } {
+  if (v === undefined || v === null) return { auto: false, findings: [] }
+  if (v === "auto") return { auto: true, findings: [] }
+  return {
+    auto: false,
+    findings: [{ level: "warn", code: "sync-invalid", message: `${label}.sync must be "auto" (the only opt-in) — field ignored; the default posture applies (staleness gate + in-band /forge sync)` }],
+  }
+}
+
+// Combined parse over a parsed top level (data in, data out — pure).
+export function parseTopLevelKnobs(
+  top: unknown,
+  label: string,
+): { materialize: ForgeMaterializeKnob | undefined; syncAuto: boolean; findings: ForgeConfigFinding[] } {
+  const findings: ForgeConfigFinding[] = []
+  const rec = top !== null && typeof top === "object" ? (top as Record<string, unknown>) : {}
+  const mat = parseMaterializeKnob(rec.materialize, label)
+  findings.push(...mat.findings)
+  const sync = parseSyncKnob(rec.sync, label)
+  findings.push(...sync.findings)
+  return { materialize: mat.value, syncAuto: sync.auto, findings }
+}
+
+// ---------------------------------------------------------------------------
 // opencode-aligned cascade loader (change align-forge-config-discovery):
 // global base + NEAREST project override MERGED per agent id; the project
 // layer is discovered by walking UP from the anchor directory to the

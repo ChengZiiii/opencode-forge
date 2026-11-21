@@ -22,7 +22,10 @@ import { materializeAgentPrompt } from "./dispatch-prompt.ts"
 // BOTH faces — forgeAgentDef's materialized readonly permission AND
 // effectiveReadonlyShape's draft-dispatch lifting test — so they can never
 // drift apart again.
-const MUTATING_TOOLS = ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"] as const
+// Exported since native-first-roster: src/roster-compile.ts feeds the
+// native compiler's readonly tools face from the SAME constant (one
+// source, zero drift between the v1 permission face and the native one).
+export const MUTATING_TOOLS = ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"] as const
 
 // Built-in role defaults: an explicit def.prompt overrides everything;
 // research/review carry curated defaults; a custom agent without a prompt
