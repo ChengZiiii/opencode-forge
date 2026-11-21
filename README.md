@@ -685,7 +685,86 @@ workspace's pool / the global layer. The `/crew` roster and the
 fallback) and list every other host pool as NOT dispatchable with its
  origin path.
 
+### Native roster compilation (`/forge sync`) — v2 hosts
+
+On **v2 hosts** (opencode 2.x) the roster materializes **natively by
+default** (`materialize: "native"`): forge **compiles** forge.json into
+real host agent files — `.opencode/agent/forge-<ns>-<id>.md` — instead of
+injecting drafts at runtime. The recipe stays the **sole semantic
+authority** (pools, session-domain gating, crew rosters, compliance keep
+reading forge.json); the native files are only its projection. **v1 hosts
+stay on the runtime path forever** (behavior byte-equal — the knob is
+pinned by host generation); on v2, `"materialize": "runtime"` in the
+GLOBAL forge.json is the escape hatch back to draft materialization.
+
+Compilation happens through the **`forge_sync` tool** — the forge agent
+calls it in-band (every effect transcript-visible), it writes atomically
+(temp+rename), garbage-collects files whose entries left the recipe, and
+discloses the full diff (created/updated/GC'd). The host **hot-applies**
+the files — no restart. **Staleness gate**: `crew_begin` refuses
+registration while the compiled artifacts are older than the recipe (or
+missing), with the one-step fix *call forge_sync now*; a plain dispatch
+against a missing worker on a native host surfaces the same guidance.
+`"sync": "auto"` in a pool file opts that pool into silent regeneration
+at session start when stale (disclosed via a console finding); without
+it the plugin never writes files uninvited.
+
+**Recipe field reference** (per agent entry):
+
+| field | meaning | notes |
+| --- | --- | --- |
+| `model` | `"provider/model"` — the pinned brain | pairs with `thoughtLevel`; both absent = Auto worker |
+| `thoughtLevel` | depth word (`none minimal low medium high xhigh max`) | `low`/`medium`/`high` compile into the model string as a variant (`model#low`); the other words ride the per-spawn chat.params injection |
+| `prompt` | role text (1–2 sentences) | defaults: `research`/`review` built-ins, else a generic worker |
+| `shape` | `"readonly"` or `"write"` | **absent = write** (open); readonly compiles to the native tools seal |
+| `permission` | per-tool overrides (`{"edit":"ask"}`) | merges over the shape face; the recursion ban never lifts |
+
+Top-level: `pool` (namespace, required for crew-governed dispatch),
+`shared` (pool-wide prompt base), `materialize` (global layer only),
+`sync` (`"auto"` opt-in).
+
+**Starter recipes** (drop into `.opencode/forge.json`):
+
+```jsonc
+{
+  "pool": "myproj",
+  "agents": {
+    // readonly scout: breadth evidence, no write surface at all
+    "scout":   { "model": "your-provider/your-model", "thoughtLevel": "low",
+                 "shape": "readonly", "prompt": "Search, read, and run read-only checks; report a compact brief with file:line evidence." },
+    // write coder: executes scoped implementation tasks
+    "coder":   { "model": "your-provider/your-model", "thoughtLevel": "high",
+                 "shape": "write", "prompt": "Implement the assigned task exactly as scoped; no refactoring beyond scope." },
+    // readonly reviewer: diff/file review with prioritized findings
+    "reviewer":{ "model": "your-provider/your-model", "thoughtLevel": "medium",
+                 "shape": "readonly", "prompt": "Read the diff or files under review; report prioritized findings with file:line evidence and a fix suggestion." }
+  }
+}
+```
+
+**Hand-writing native agent files? Two traps.** (1) Always write
+`mode: subagent` — the default is `primary`, and a primary worker makes
+task dispatch **silently fall back to a general dispatch** with no error.
+(2) The **host tool vocabulary drifts**: on 2.3.2 the shell channel is
+`execute` (not bash) and the dispatch tool is `subagent` (a
+`tools.task:false` key is host-mapped onto it). The compiler emits from
+one locked vocabulary constant; after a host rename, re-run
+`/forge sync` to re-emit the current names.
+
+**Cross-machine story (lockfile pattern).** Commit the generated
+`.opencode/agent/forge-*.md` files next to the recipe. A fresh machine
+pulling the workspace needs **zero initialization** — the artifacts
+arrive with the recipe in the same pull, and the staleness check passes
+because both files travelled together (the check is content-based: a
+touched-but-identical recipe is not stale). **Upgrade recipe**:
+`opencode plugin remove opencode-forge` → clear the plugin store
+(`~/.cache/opencode/packages/`) → `opencode plugin "git+file:///<abs
+repo path>" --global` (or the github: form) → `/forge sync` once per
+workspace if the compiled format changed.
+
 ### task — the single dispatch surface (native name, forge engine)
+
+
 
 The plugin registers its dispatch implementation under the tool name
 **`task`**, shadowing the native task tool host-wide (removed with the whole
