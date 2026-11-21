@@ -19,6 +19,16 @@
       "minLength": 1,
       "description": "Optional pool-level shared prompt segment, written once at the top of the file and inherited by every agent this file materializes. A plain string, no interpolation."
     },
+    "materialize": {
+      "type": "string",
+      "enum": ["native", "runtime"],
+      "description": "Roster materialization mode (GLOBAL layer file only). v2 hosts DEFAULT to \"native\" (the recipe compiles into .opencode/agent/forge-<ns>-<id>.md via /forge sync); \"runtime\" is the escape hatch back to draft materialization. v1 hosts stay runtime-pinned regardless. Any other value is ignored with a warning."
+    },
+    "sync": {
+      "type": "string",
+      "enum": ["auto"],
+      "description": "Roster sync posture. Absent (default): the staleness gate refuses stale crews and the forge agent runs forge_sync in-band. \"auto\": a stale roster for this pool silently regenerates at session start with a disclosed finding. Any other value is ignored with a warning."
+    },
     "agents": {
       "type": "object",
       "description": "Agent id -> definition. An ABSENT shape defaults to WRITE (open permissions). Unknown keys inside an entry are tolerated and ignored.",
