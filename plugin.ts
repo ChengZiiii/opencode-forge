@@ -75,7 +75,7 @@ import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, parseTopLevelKnobs, poolFileCompliance, sanitizeNamespace, type DispatchNodeConfig, type ForgeAgentDef, type ForgeMaterializeKnob, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
-import { compileRosterEntry, executeRosterSync, planRosterSync, staleCheckForPool, type RosterFsDeps } from "./src/roster-compile.ts"
+import { compileRosterEntry, executeRosterSync, globalAgentDirFor, planOverrideSync, planRosterSync, staleCheckForPool, type RosterFsDeps, type SyncPlan } from "./src/roster-compile.ts"
 import type { PoolProvenance } from "./src/dispatch-tiers.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
@@ -213,6 +213,60 @@ export const GOAL_COMMAND_TEMPLATE = [
   "- Any other argument: treat it as a goal statement. Extract contract markers into the structured goal_write fields: --check \"cmd\" becomes a shell verification item, --contains \"file::text\" a file-contract item, --success \"...\" an extra success criterion, --constraint \"...\" goes into constraints, --non-goal \"...\" into nonGoals, --max-turns N and --max-minutes N set budgets. Draft a complete contract (goal, criteria, checks, constraints, non-goals), SHOW the verification items verbatim to the user, then call goal_write with arm=true — a confirmation dialog arms the autonomous loop. If this session already has a live goal, say so and offer revise/queue/discard instead.",
   "",
   "Goal files are host-managed: never edit or create anything under .opencode/goal/ by hand — contract changes go through goal_write (each revision bump invalidates evidence collected under earlier revisions), state changes through the goal_* tools. Likewise never enter the goal loop or call any goal_* tool unless the user ran /goal or explicitly asked for a goal loop.",
+  "",
+].join("\n")
+
+// /forge — the roster levers (change forge-commands, design D1/D2): ONE
+// command routing on $ARGUMENTS (the /plan precedent). Templates instruct,
+// never write: every effect lands in the transcript through the in-band
+// tools (forge_sync / the normal write path on the user's explicit
+// go-ahead). /forge sync is the manual force/debug/fallback lever — the
+// default staleness-gate posture and sync:"auto" are unchanged (D5).
+export const GLOBAL_RECIPE_SCAFFOLD_JSONC = [
+  "{",
+  '  // GLOBAL forge.json — the machine-wide FALLBACK roster (sole ownership:',
+  '  // the nearest .opencode/forge.json walking up from a session\'s worktree',
+  '  // IS that session\'s whole roster when it exists; this layer is a',
+  '  // fallback, never a merge). Agents here materialize as forge-global-<id>',
+  '  // in the host\'s global agent dir once forge_sync runs.',
+  '  "agents": {',
+  '    // "research": { "model": "provider/model", "thoughtLevel": "low",',
+  '    //   "shape": "readonly", "prompt": "short role description" },',
+  "  },",
+  '  // OPTIONAL built-in overrides: uncomment and fill an entry to pin the',
+  '  // host\'s built-in General/Explore subagents machine-wide. Keys are the',
+  '  // built-ins\' exact LOWERCASE ids ("general" / "explore") — capitalized',
+  '  // files create ambiguous duplicates, never overrides. Activating an',
+  '  // entry REPLACES the built-in\'s prompt wholesale (vendor text is never',
+  '  // copied) — write your own general/explore prompt. model+thoughtLevel',
+  '  // pin brain and depth (an ATOMIC pair); leaving both out of an active',
+  '  // entry keeps the Auto worker (inherits the parent session\'s model —',
+  '  // the official default). forge_sync compiles an active entry to',
+  '  // <global agent dir>/general.md|explore.md (GENERATED marker; re-comment',
+  '  // the entry and sync again to garbage-collect it). A hand-written file',
+  '  // of the same name is NEVER overwritten — sync refuses and discloses.',
+  '  // "override": {',
+  '  //   "general": { "model": "provider/model", "thoughtLevel": "low",',
+  '  //     "prompt": "You are my general-purpose worker. ..." },',
+  '  //   "explore": { "model": "provider/model", "thoughtLevel": "low",',
+  '  //     "shape": "readonly", "prompt": "You are my codebase scout. ..." },',
+  '  // },',
+  "}",
+].join("\n")
+
+export const FORGE_COMMAND_TEMPLATE = [
+  '(forge roster levers. Argument: "$ARGUMENTS")',
+  "",
+  "FAMILY GUARD (step 0, before anything else): if you do not have the forge_sync tool in your available tools, you are not in a forge session — STOP now: execute nothing below, and tell the user that /forge belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
+  "",
+  "Route on the argument above (decide silently; do not recite this routing text to the user):",
+  '- Argument "sync": call the forge_sync tool NOW and report its output verbatim to the user — every created/updated/unchanged/gc\'d file and any error line. This is the manual force lever: the default posture (staleness gate + in-band sync; the sync:"auto" opt-in) is unchanged, so report the diff and stop there.',
+  '- Argument "init": draft THIS workspace\'s recipe (.opencode/forge.json) in-band with the user. First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent\'s shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user\'s explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes.',
+  '- Argument "init global": same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in\'s prompt wholesale; the scaffold\'s inline comments say the same). Scaffold shape:',
+  ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split("\n").map((l) => `  ${l}`),
+  '- Argument empty or unknown: tell the user the three forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace\'s forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries) — and stop.',
+  "",
+  "Boundaries: this command never writes anything by itself — every write goes through forge_sync or the normal write tool on the user\'s explicit go-ahead, transcript-visible. The staleness gate, the in-band sync default, and sync:\"auto\" behave exactly as without this command.",
   "",
 ].join("\n")
 
@@ -437,13 +491,23 @@ function readGlobalKnobs(deps?: { readFile?: (path: string) => string }): { mate
 
 // Compile + write every family of the current host resolution; returns
 // the disclosure lines (created/updated/GC'd/errors). Shared by the
-// forge_sync tool and the sync:"auto" session-start path.
+// forge_sync tool and the sync:"auto" session-start path. The GLOBAL
+// recipe's `override` node (builtin-override) rides the same pass: its
+// entries compile into the host's GLOBAL agent dir (globalAgentDirFor —
+// OPENCODE_CONFIG_DIR-aware) as non-namespaced lowercase files.
 function runRosterSync(): { lines: string[]; errorCount: number } {
   const resolution = resolvePools()
-  if (!resolution || resolution.families.length === 0) {
+  const overridePlan = resolution
+    ? planOverrideSync(resolution.overrides ?? {}, {
+        dir: globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR }),
+        recipeFile: globalPoolPathOf(),
+      })
+    : null
+  if (!resolution || (resolution.families.length === 0 && overridePlan === null)) {
     return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection)."], errorCount: 0 }
   }
-  const plans = planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() })
+  const plans: SyncPlan[] = [...planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() })]
+  if (overridePlan !== null) plans.push(overridePlan)
   const outcome = executeRosterSync(plans, realRosterFs())
   const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.length} pool(s):`]
   if (outcome.created.length) lines.push(`  created: ${outcome.created.join(", ")}`)
@@ -4351,6 +4415,7 @@ const crewBeginTool = tool({
         'Template (JSONC): the top-level "pool" field names this file\'s namespace (short stable [a-z0-9-] up to 24 chars — REQUIRED for crew-governed dispatch; every pool materializes as forge-<ns>-<id>, the global fallback materializes as forge-global-<id>); {"pool": "short-stable-namespace", "agents": {"research": {"model": "provider/model", "thoughtLevel": "low", "shape": "readonly", "prompt": "short role description"}}} — an absent shape defaults to WRITE (open permissions); "shape": "readonly" is the explicit seal denying write/edit/bash + the patch family for read-only roles.',
         "Agent ids are plain role words WITHOUT the `forge-` prefix — every pool materializes as `forge-<ns>-<id>` under its `pool` namespace (the global fallback materializes as `forge-global-<id>`); a prefixed id is auto-stripped with a warning.",
         "The user may configure it themselves, or ask you to write the file — only on their explicit go-ahead. When you write it: give every agent a SHORT prompt from the role the user asked for (one or two sentences; long only on explicit request), give every agent an EXPLICIT shape (readonly for read-only roles like reviewer/scout/planner; write for implementers and build drivers), and INCLUDE the top-level `pool` namespace — it is REQUIRED for crew-governed dispatch (the compliance gate refuses a missing or invalid field) and keeps ids stable across directory renames. File edits, creations, and deletions apply at the next config hook — no host restart needed, and a DELETED pool file un-materializes its agents (deletion is real).",
+        "Levers: the user can also run /forge init (draft this workspace's forge.json in-band, refuse-and-review when one exists) or /forge init global (draft the global layer, built-in override entries shipped commented out) — the explicit one-command starters for exactly this setup.",
       ]
       if (sessionLoaded && Object.keys(sessionLoaded.agents).length > 0 && sessionProject && !sessionCovered) {
         lines.push(
@@ -5359,6 +5424,15 @@ export const server: Plugin = async (input, options) => {
         template: GOAL_COMMAND_TEMPLATE,
         description:
           "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)",
+      }
+
+      // /forge command — the roster levers (change forge-commands): one
+      // command routing on its argument (sync / init / init global / help).
+      // Same no-clobber rule as /plan and /goal.
+      cfg.command["forge"] ??= {
+        template: FORGE_COMMAND_TEMPLATE,
+        description:
+          'forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out',
       }
 
       // Gate permission rules (shell-defang-default-open): the 7 doors keep
@@ -6964,6 +7038,14 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
         registrationAgentCount > 0
           ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report"
           : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance",
+      )
+      // /forge — the roster levers (change forge-commands): the SAME
+      // constant template the v1 config hook registers (byte-identical by
+      // construction); routes on $ARGUMENTS at the model layer.
+      addTemplateCommand(
+        "forge",
+        () => FORGE_COMMAND_TEMPLATE,
+        "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out",
       )
     })
   } catch {
