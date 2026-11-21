@@ -297,6 +297,7 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (dispatch records — including async orphans — live in the jobs ledger; this separate file dates from the retired `forge_dispatch` tool) | runtime debris — delete freely |
 | `<project>/.opencode/forge/dispatch-log.jsonl` | dispatch journal (fold E) — append-only per-workspace record of every async dispatch state transition (`dispatched` / `queued` / `started` / `retry-pending` / `terminal`); bounded by `FORGE_DISPATCH_JOURNAL_MAX` (default 200, terminal-first rotation); prompt text retained while a record is non-terminal, redacted on terminal; corrupt lines skipped. This is what restart recovery replays — a live child re-arms, a finished-while-down child wakes its owner exactly once, queued wishes re-enter the queue, retry chains resume | runtime data — deleting it only loses cross-restart recovery for in-flight dispatches; uninstall leaves it behind (add `.opencode/forge/` to your ignore file if you don't want it versioned) |
 | `<project>/.opencode/agent/forge-<ns>-<id>.md` | compiled native agent files — `forge_sync` output on v2 native mode (GENERATED header, `forge-` prefix + marker; GC'd by sync when the recipe entry disappears; a transient `forge-*.md.new` temp lives microseconds during atomic writes and is best-effort cleaned on failure) | compiled artifacts — version them: they travel with the workspace (a fresh machine pulling the project needs no init) |
+| `<home>/.config/opencode/agent/forge-global-<id>.md` | compiled GLOBAL-roster agents — when (and only when) a global `~/.config/opencode/forge.json` exists, `forge_sync` also compiles its fallback family into the host's own global agent dir (same GENERATED header + marker + GC discipline; non-forge files there are never touched) | compiled artifacts — delete freely; with the plugin gone the host simply loses those extra global agents |
 | `.opencode/forge.json` (the NEAREST one walking up from the session's worktree — sole ownership) and `~/.config/opencode/forge.json` (global FALLBACK only, never merged) | your static subagent definitions (JSONC) — the workspace pool IS the session's whole roster; nested forge.json files are ignored. **User data — the plugin only reads them, never writes or migrates them** | yours — version the project ones, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
@@ -693,7 +694,12 @@ fallback) and list every other host pool as NOT dispatchable with its
 On **v2 hosts** (opencode 2.x) the roster materializes **natively by
 default** (`materialize: "native"`): forge **compiles** forge.json into
 real host agent files — `.opencode/agent/forge-<ns>-<id>.md` — instead of
-injecting drafts at runtime. The recipe stays the **sole semantic
+injecting drafts at runtime. The workspace recipe compiles into the
+project's `.opencode/agent/`; the GLOBAL recipe's fallback family
+(`forge-global-*`) compiles into the host's own global agent dir
+(`~/.config/opencode/agent/`) so those workers are machine-wide — a
+write that only ever happens on machines where a global forge.json
+actually exists. The recipe stays the **sole semantic
 authority** (pools, session-domain gating, crew rosters, compliance keep
 reading forge.json); the native files are only its projection. **v1 hosts
 stay on the runtime path forever** (behavior byte-equal — the knob is

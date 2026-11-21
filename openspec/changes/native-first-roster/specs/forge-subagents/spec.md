@@ -5,8 +5,12 @@
 ### Requirement: Native roster compilation and sync
 
 The plugin `SHALL` compile the forge.json recipe into namespaced native
-agent files (`.opencode/agent/forge-<ns>-<id>.md`) through an explicit
-sync operation, and `SHALL` keep the recipe as the sole semantic
+agent files through an explicit sync operation — workspace pools into
+the workspace's `.opencode/agent/forge-<ns>-<id>.md` and the global
+fallback family into the host's global agent directory
+(`<home>/.config/opencode/agent/`, a write that never occurs on
+machines without a global recipe) — and `SHALL` keep the recipe as the
+sole semantic
 authority: pools, session-domain dispatch gating, crew roster
 disclosure, and compliance checks `SHALL` continue reading the recipe
 through the existing pool resolver, with native files serving only as

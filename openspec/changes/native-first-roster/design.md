@@ -24,7 +24,14 @@ project-wins + global permissions spliced, no collision protection;
   a compiled projection, never an authority.
 - **D2 — Compiler output contract.** Pure core
   (`src/roster-compile.ts`, no @opencode-ai imports, injectable fs):
-  recipe → file set. Per entry: `.opencode/agent/forge-<ns>-<id>.md`;
+  recipe → file set. Destinations by family: workspace pools → the
+  workspace's `.opencode/agent/`; the global fallback family → the
+  host's own global agent dir `<home>/.config/opencode/agent/` (owner
+  decision 2026-11-21, ISSUE-2 = accept + document: semantically exact
+  — the host's global agent dir IS the native equivalent of our global
+  roster; the write never happens on machines without a global recipe;
+  load-bearing — the crew gate on global-only hosts heals only when
+  sync lands there). Per entry: `.opencode/agent/forge-<ns>-<id>.md`;
   frontmatter = description (provenance: pool + source path, as today),
   `mode: "subagent"` (always), `model: "provider/model[#variant]"`,
   `tools` face per shape in probe-vocabulary (readonly shape: the
