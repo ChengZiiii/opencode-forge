@@ -2,7 +2,7 @@ import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
 import { execFileSync, spawn } from "node:child_process"
 import { open as fsOpen, readdir as fsReaddir, stat as fsStat } from "node:fs/promises"
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, statSync, writeFileSync } from "node:fs"
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative } from "node:path"
 import { tmpdir, homedir } from "node:os"
 import {
@@ -74,7 +74,9 @@ import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type Crew
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
-import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, poolFileCompliance, sanitizeNamespace, type DispatchNodeConfig, type ForgeAgentDef, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
+import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, parseTopLevelKnobs, poolFileCompliance, sanitizeNamespace, type DispatchNodeConfig, type ForgeAgentDef, type ForgeMaterializeKnob, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
+import { compileRosterEntry, executeRosterSync, planRosterSync, staleCheckForPool, type RosterFsDeps } from "./src/roster-compile.ts"
+import type { PoolProvenance } from "./src/dispatch-tiers.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
 import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, ACTIVE_TEXTFUL_OVERRIDE_NOTE, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
@@ -108,6 +110,9 @@ const FORGE_STATE_TOOLS = [
   "goal_discard",
   "crew_begin",
   "crew_close",
+  // native-first-roster: the in-band roster sync — a coordinator move
+  // (primary-only), same family as the crew tools.
+  "forge_sync",
   // Dispatch is a coordinator move (async-dispatch design D5, task-shadow):
   // forge_dispatch is RETIRED and `task` is NOT listed here — the worker
   // recursion ban rides the materialized `permission: { task: "deny" }`
@@ -371,6 +376,135 @@ const foldPath = (p: string) => (process.platform === "win32" ? p.replace(/\//g,
 function globalPoolPathOf(): string {
   return forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global
 }
+
+// ---------------------------------------------------------------------------
+// native-first-roster (design D4/D5): materialize-mode state + the roster
+// sync primitives. The v1 server() entry NEVER touches these — its
+// behavior is byte-equal to the pre-change build (the 788-test baseline
+// is the regression net). The v2 setup() entry sets v2HostSeen and reads
+// the `materialize` knob (default "native" — owner decision 2026-11-21,
+// no deprecation window; "runtime" stays selectable as the escape hatch).
+// ---------------------------------------------------------------------------
+let v2HostSeen = false
+let v2MaterializeMode: ForgeMaterializeKnob = "native"
+
+function nativeRosterActive(): boolean {
+  return v2HostSeen && v2MaterializeMode === "native"
+}
+
+// Real-fs adapter for the compiler's injectable deps (plugin-side only —
+// the pure core in src/roster-compile.ts stays fs-free).
+function realRosterFs(): RosterFsDeps {
+  return {
+    stat: (path) => {
+      try {
+        const s = statSync(path)
+        return { mtimeMs: s.mtimeMs, size: s.size }
+      } catch {
+        return null
+      }
+    },
+    readFile: (path) => readFileSync(path, "utf8"),
+    writeFile: (path, data) => writeFileSync(path, data),
+    rename: (from, to) => renameSync(from, to),
+    unlink: (path) => unlinkSync(path),
+    readdir: (path) => {
+      try {
+        return readdirSync(path)
+      } catch {
+        return null
+      }
+    },
+    mkdir: (path) => mkdirSync(path, { recursive: true }),
+  }
+}
+
+// The global layer's host knobs (materialize/sync), read fail-soft: an
+// absent/unreadable/broken global file keeps the defaults.
+function readGlobalKnobs(deps?: { readFile?: (path: string) => string }): { materialize: ForgeMaterializeKnob | undefined; syncAuto: boolean } {
+  try {
+    const path = globalPoolPathOf()
+    const text = deps?.readFile ? deps.readFile(path) : readFileSync(path, "utf8")
+    const parsed = parseForgeJsonc(text)
+    if (!parsed.ok) return { materialize: undefined, syncAuto: false }
+    const knobs = parseTopLevelKnobs(parsed.config, "global forge.json")
+    for (const f of knobs.findings) console.warn(`[forge:sync] ${f.level}: ${f.message}`)
+    return { materialize: knobs.materialize, syncAuto: knobs.syncAuto }
+  } catch {
+    return { materialize: undefined, syncAuto: false }
+  }
+}
+
+// Compile + write every family of the current host resolution; returns
+// the disclosure lines (created/updated/GC'd/errors). Shared by the
+// forge_sync tool and the sync:"auto" session-start path.
+function runRosterSync(): { lines: string[]; errorCount: number } {
+  const resolution = resolvePools()
+  if (!resolution || resolution.families.length === 0) {
+    return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection)."], errorCount: 0 }
+  }
+  const plans = planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() })
+  const outcome = executeRosterSync(plans, realRosterFs())
+  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.length} pool(s):`]
+  if (outcome.created.length) lines.push(`  created: ${outcome.created.join(", ")}`)
+  if (outcome.updated.length) lines.push(`  updated: ${outcome.updated.join(", ")}`)
+  if (outcome.unchanged.length) lines.push(`  unchanged: ${outcome.unchanged.length} file(s) already current`)
+  if (outcome.gced.length) lines.push(`  gc'd (entries removed from the recipe): ${outcome.gced.join(", ")}`)
+  if (outcome.errors.length) lines.push(`  errors: ${outcome.errors.join("; ")}`)
+  lines.push("The host hot-applies the files — no restart. Edit the RECIPE (forge.json), never the generated files; /forge sync re-emits.")
+  return { lines, errorCount: outcome.errors.length }
+}
+
+// Content oracle for the staleness gate: compile one entry's expected
+// content on demand (the mtime trigger is cheap; the final verdict is
+// content-based, so a touched-but-identical recipe never dead-ends).
+function rosterContentOf(resolution: PoolResolution): (matId: string) => string {
+  const globalPath = globalPoolPathOf()
+  return (matId) => {
+    const agent = resolution.agents[matId]
+    const provenance: PoolProvenance = foldPath(agent.file) === foldPath(globalPath) ? { global: true } : { ns: agent.ns, file: agent.file }
+    return compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined }).content
+  }
+}
+
+// Staleness refusal for the crew gate (design D4): native mode refuses
+// registration when the session's roster artifacts are stale, with the
+// one-step fix (same gate language family as the compliance refusal).
+function rosterStaleRefusal(anchor: string | null): string | null {
+  const resolution = resolvePools()
+  const poolFile = anchor ? sessionPoolFileOf(anchor) : null
+  const fam = resolution?.families.find((f) => foldPath(f.file) === foldPath(poolFile ?? globalPoolPathOf()))
+  const verdict = staleCheckForPool(fam ? fam.file : poolFile, fam ? fam.materializedIds : [], realRosterFs(), resolution ? rosterContentOf(resolution) : undefined)
+  if (!verdict.stale) return null
+  return (
+    `[forge:crew] Roster stale refused: this session's native roster artifacts are out of date with the recipe — ${verdict.reason}. ` +
+    `One-step fix: call the forge_sync tool NOW (it recompiles .opencode/agent/forge-*.md atomically, in-band, transcript-visible; the host hot-applies without a restart), then retry this registration. ` +
+    `The recipe (forge.json) stays the authority — the gate only refuses dispatching against a stale projection.`
+  )
+}
+
+// Sync hint for the plain dispatch path (design D4): on a native-mode
+// host, a forge-* dispatch that finds no roster must not dead-end at
+// "worker not found" — a fresh workspace after upgrade surfaces the same
+// one-step sync guidance.
+function nativeRosterSyncHint(): string | null {
+  if (!nativeRosterActive()) return null
+  const resolution = resolvePools()
+  if (!resolution) return null
+  const deps = realRosterFs()
+  const contentOf = rosterContentOf(resolution)
+  for (const fam of resolution.families) {
+    const verdict = staleCheckForPool(fam.file, fam.materializedIds, deps, contentOf)
+    if (verdict.stale) {
+      return (
+        ` Native-roster hint: this host materializes workers from compiled .opencode/agent/forge-*.md files and they are stale or missing (${verdict.reason}). ` +
+        `Call the forge_sync tool to regenerate them, then retry.`
+      )
+    }
+  }
+  return null
+}
+
 
 // Anchor normalization: resolved real path, backslashes + case-folding on
 // win32 — "C:/Temp1" and "c:\temp1\" cannot double-add.
@@ -3260,8 +3394,9 @@ const taskDispatchTool = tool({
       const agentId = target.slice("forge-".length)
       const resolution = resolvePools()
       if (!resolution || !resolution.agents[agentId]) {
+        const hint = nativeRosterSyncHint()
         throw new Error(
-          `[forge:dispatch] "${target}" is not a materialized forge subagent on this host. Check the roster in the agent descriptions (or .opencode/forge.json), or dispatch a host agent instead.`,
+          `[forge:dispatch] "${target}" is not a materialized forge subagent on this host. Check the roster in the agent descriptions (or .opencode/forge.json), or dispatch a host agent instead.${hint ?? ""}`,
         )
       }
       // Gate parity with the task belt: the SAME predicates, same copy.
@@ -4315,6 +4450,16 @@ const crewBeginTool = tool({
       const complianceRefusal = crewPoolComplianceRefusal(anchor)
       if (complianceRefusal) throw new Error(complianceRefusal)
     }
+    // Native-roster staleness gate (change native-first-roster, design
+    // D4): on a native-mode host (v2 default), registration refuses while
+    // the session's compiled artifacts are stale — same gate posture as
+    // the compliance pre-flight, one-step in-band recovery via forge_sync.
+    // v1 hosts and the runtime escape hatch never trip it (no artifacts
+    // exist to be stale — byte-equal behavior).
+    if (nativeRosterActive()) {
+      const staleRefusal = rosterStaleRefusal(anchor)
+      if (staleRefusal) throw new Error(staleRefusal)
+    }
     const governed = execution === "waves"
     // lineage (plan-supersession-and-lineage 4.3): recorded ONLY when the
     // caller explicitly passed it — never inferred from a recently-terminal
@@ -4475,6 +4620,26 @@ const crewCloseTool = tool({
   },
 })
 
+// /forge sync (native-first-roster design D2/D4): compile the recipe into
+// native agent files — in-band (the forge agent calls it; every effect is
+// transcript-visible), atomic (temp+rename), with GC and full diff
+// disclosure. Registered on BOTH host generations (v1 tool getter + v2
+// tool domain through the same forgeTools() factory); it only ever WRITES
+// when invoked — absent sync:"auto" the plugin never writes uninvited.
+const forgeSyncTool = tool({
+  description:
+    "Compile the forge.json recipe(s) this host can see into native agent files (.opencode/agent/forge-<ns>-<id>.md): mode:subagent stamped, pinned model with variant where the depth word maps, the shape's tools face, and the dispatch mandates baked into the prompt. Writes are atomic; entries that left the recipe are garbage-collected; the output discloses every created/updated/GC'd file. The host hot-applies without a restart. Call it after ANY recipe edit (the crew gate refuses registration against stale artifacts), or when a dispatch reports a missing forge worker on a native-mode host.",
+  args: {},
+  execute: async (_args, context) => {
+    noteToolAgent(context)
+    const { lines, errorCount } = runRosterSync()
+    return {
+      title: errorCount > 0 ? "forge sync: completed with errors" : "forge sync: roster compiled",
+      output: lines.join("\n"),
+    }
+  },
+})
+
 function forgeTools(): Record<string, ToolDefinition> {
   const tools: Record<string, ToolDefinition> = {
     plan_write: planWriteTool,
@@ -4500,6 +4665,9 @@ function forgeTools(): Record<string, ToolDefinition> {
   if (!forgeDisabled) {
     tools.crew_begin = crewBeginTool
     tools.crew_close = crewCloseTool
+    // native-first-roster: the in-band roster sync tool (both host
+    // generations register it through this one factory).
+    tools.forge_sync = forgeSyncTool
     // task (change task-shadow): the SDK dispatch engine shadows the native
     // task tool under its own NAME — the TUI keys its live subagent panel on
     // `task` (OMO-proven on this stack). Removed with the whole family under
@@ -6104,6 +6272,9 @@ export type V2SetupDeps = {
   homeDir?: string
   stat?: (path: string) => { mtimeMs: number; size: number } | null
   readFile?: (path: string) => string
+  /** Test seam / explicit override for the materialize knob (the real
+   * source is the GLOBAL forge.json layer; default "native"). */
+  materialize?: ForgeMaterializeKnob
 }
 
 // Registry of every workspace anchor this process's v2 entry has been
@@ -7095,6 +7266,54 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
     const first = v2Candidates.find((c) => c && !isRootish(c))
     if (first) hostWorktree = first
   }
+  // ---- native-first-roster (design D5): the materialize knob. The v2
+  // host generation DEFAULTS DIRECTLY to "native" (owner decision
+  // 2026-11-21 — no deprecation window; v1 hosts stay runtime-pinned and
+  // never reach this line, so their behavior is byte-equal). "runtime"
+  // remains selectable as the escape hatch: the draft-materialization
+  // path below then runs exactly as before. Knob resolution: explicit
+  // deps override (test seam) > GLOBAL forge.json layer > default.
+  v2HostSeen = true
+  const globalKnobs = readGlobalKnobs(deps)
+  v2MaterializeMode = deps?.materialize ?? globalKnobs.materialize ?? "native"
+  // ---- sync:"auto" opt-in (design D4): at session start, pools whose
+  // OWN file declares sync:"auto" regenerate silently when stale, with a
+  // disclosed finding (console warn). The default posture (absent knob)
+  // writes NOTHING uninvited — gate + in-band forge_sync only.
+  if (v2MaterializeMode === "native") {
+    try {
+      const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir()
+      const resolver = createPoolResolver({ homeDir, stat: deps?.stat, readFile: deps?.readFile })
+      const seen = new Map<string, string>()
+      for (const cand of [...(deps?.anchors ?? []), ...v2AnchorCandidates(ctx)]) {
+        const key = normalizeAnchorDir(cand)
+        if (key && !seen.has(key)) seen.set(key, cand.trim())
+      }
+      const resolution = resolver.resolve([...seen.values()])
+      const globalPoolFile = forgeConfigPaths({ homeDir }).global
+      const allPlans = planRosterSync(resolution, { globalPoolFile })
+      for (const family of resolution.families) {
+        let auto = false
+        try {
+          const text = deps?.readFile ? deps.readFile(family.file) : readFileSync(family.file, "utf8")
+          const parsed = parseForgeJsonc(text)
+          if (parsed.ok) auto = parseTopLevelKnobs(parsed.config, family.file).syncAuto
+        } catch {
+          // Unreadable pool file: the resolver's findings own that failure.
+        }
+        if (!auto) continue
+        const verdict = staleCheckForPool(family.file, family.materializedIds, realRosterFs(), rosterContentOf(resolution))
+        if (!verdict.stale) continue
+        const plans = allPlans.filter((p) => p.family.file === family.file)
+        const outcome = executeRosterSync(plans, realRosterFs())
+        console.warn(
+          `[forge:sync] warn: sync:"auto" — stale roster regenerated at session start (${verdict.reason}); created ${outcome.created.length}, updated ${outcome.updated.length}, gc'd ${outcome.gced.length}${outcome.errors.length ? `, errors: ${outcome.errors.join("; ")}` : ""}`,
+        )
+      }
+    } catch {
+      // Auto-sync is best-effort: never a throw into the host.
+    }
+  }
   // ---- agent domain: forge primary + full sole-pool-ownership
   // materialization (task 1.2 — parity with the v1 config hook, same
   // createPoolResolver + forgeAgentDef cores).
@@ -7157,6 +7376,16 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
       // workers (MUTATING_TOOLS deny family) and force task: deny always.
       // Findings surface through the diagnostics channel like the v1 config
       // hook; any failure degrades to no subagents, never a throw.
+      // native-first-roster (design D5): on a native-mode v2 host (the
+      // DEFAULT) this draft materialization is SKIPPED — worker identity
+      // comes from the compiled .opencode/agent/forge-<ns>-<id>.md files
+      // (forge_sync tool; host hot-apply). The pool resolver stays the
+      // semantic authority for every gate, unchanged. "runtime" (the
+      // escape hatch) runs the block exactly as before.
+      if (v2MaterializeMode === "native") {
+        // Native mode: no draft materialization. The staleness gate +
+        // forge_sync tool (wiring above) own the projection.
+      } else
       try {
         const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir()
         // Anchor registry: explicit deps.anchors (test seam) plus the
