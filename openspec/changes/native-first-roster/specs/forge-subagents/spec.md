@@ -21,9 +21,10 @@ edits to the recipe. The sync `SHALL` write atomically and `SHALL`
 garbage-collect namespaced files whose entries left the recipe.
 Compilation `SHALL` emit only probe-proven frontmatter keys (unknown
 keys are dropped by the host once `permissions` is present). Before
-crew registration (and before runtime-materialization where that mode
-is active) the plugin `SHALL` check recipe-versus-artifact staleness
-and refuse with a one-step recovery instruction when stale; the sync
+crew registration on a native-mode host the plugin `SHALL` check
+recipe-versus-artifact staleness — mtime-triggered with content
+adjudication (a byte-identical touch is not staleness) — and refuse
+with a one-step recovery instruction when stale; the sync
 operation `SHALL` be agent-invocable so recovery happens in-band and
 transcript-visible, and the host's hot-apply `SHALL` be relied on (no
 restart demanded). A `sync: "auto"` opt-in `SHALL` regenerate on
@@ -84,7 +85,7 @@ cross-machine story.
 
 #### Scenario: Runtime materialization remains available as an escape hatch
 
-- **WHEN** the materialize knob selects the runtime path during the
-  deprecation window
+- **WHEN** the materialize knob selects the runtime path (v1 hosts are
+  pinned to it by generation; v2 hosts may opt in as the escape hatch)
 - **THEN** behavior is byte-equal to today's draft-based
-  materialization, gated by the same staleness check
+  materialization (the staleness gate is a native-mode facility)

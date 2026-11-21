@@ -246,13 +246,14 @@ export function executeRosterSync(plans: FamilySyncPlan[], deps: RosterFsDeps = 
     const wanted = new Set(plan.files.map((f) => f.fileName))
     for (const file of plan.files) {
       const dest = joinPath(plan.dir, file.fileName)
+      let tmp: string | null = null
       try {
         const existing = stat(dest) !== null ? readFile(dest) : null
         if (existing === file.content) {
           out.unchanged.push(dest)
           continue
         }
-        const tmp = `${dest}.new`
+        tmp = `${dest}.new`
         writeFile(tmp, file.content)
         try {
           rename(tmp, dest)
@@ -264,9 +265,18 @@ export function executeRosterSync(plans: FamilySyncPlan[], deps: RosterFsDeps = 
           } catch {}
           rename(tmp, dest)
         }
+        tmp = null // landed — nothing to clean up
         if (existing === null) out.created.push(dest)
         else out.updated.push(dest)
       } catch (err) {
+        // Best-effort temp cleanup: a failed write may leave a partial
+        // `<name>.md.new` behind; the destination itself is never
+        // half-written (atomic rename semantics).
+        if (tmp !== null) {
+          try {
+            unlink(tmp)
+          } catch {}
+        }
         out.errors.push(`${dest}: ${err instanceof Error ? err.message : String(err)}`)
       }
     }

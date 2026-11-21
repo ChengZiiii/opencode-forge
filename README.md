@@ -296,13 +296,16 @@ What this plugin touches, exhaustively:
 | `<tmp>/opencode-forge/session-anchors.jsonl` | session-anchor ledger — persisted evidence of the pooled worktrees where live activity bound sessions (pooled binds only, FIFO-capped to 200, fail-soft IO); a restart-resumed session whose record is pool-less and whose in-memory map is empty re-binds its OWN pool from here, only while the recorded pool file still exists on disk | runtime debris — delete freely; losing it only costs the restart-resume own-pool re-bind (sessions re-learn their pool from live activity) |
 | `<tmp>/opencode-forge/dispatch/ledger.jsonl` | dispatch ledger — **no longer written** (dispatch records — including async orphans — live in the jobs ledger; this separate file dates from the retired `forge_dispatch` tool) | runtime debris — delete freely |
 | `<project>/.opencode/forge/dispatch-log.jsonl` | dispatch journal (fold E) — append-only per-workspace record of every async dispatch state transition (`dispatched` / `queued` / `started` / `retry-pending` / `terminal`); bounded by `FORGE_DISPATCH_JOURNAL_MAX` (default 200, terminal-first rotation); prompt text retained while a record is non-terminal, redacted on terminal; corrupt lines skipped. This is what restart recovery replays — a live child re-arms, a finished-while-down child wakes its owner exactly once, queued wishes re-enter the queue, retry chains resume | runtime data — deleting it only loses cross-restart recovery for in-flight dispatches; uninstall leaves it behind (add `.opencode/forge/` to your ignore file if you don't want it versioned) |
+| `<project>/.opencode/agent/forge-<ns>-<id>.md` | compiled native agent files — `forge_sync` output on v2 native mode (GENERATED header, `forge-` prefix + marker; GC'd by sync when the recipe entry disappears; a transient `forge-*.md.new` temp lives microseconds during atomic writes and is best-effort cleaned on failure) | compiled artifacts — version them: they travel with the workspace (a fresh machine pulling the project needs no init) |
 | `.opencode/forge.json` (the NEAREST one walking up from the session's worktree — sole ownership) and `~/.config/opencode/forge.json` (global FALLBACK only, never merged) | your static subagent definitions (JSONC) — the workspace pool IS the session's whole roster; nested forge.json files are ignored. **User data — the plugin only reads them, never writes or migrates them** | yours — version the project ones, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
 
-The plugin writes no temp files, no logs, nothing outside the table (a
-`FORGE_GOAL_PROBE=1` env opt-in appends continuation diagnostics to the OS
-temp dir for debugging).
+Nothing is written outside the table above, with two disclosed
+transients: the microsecond `forge-*.md.new` temp of an atomic sync
+write (best-effort cleaned on failure — a target file is never
+half-written) and the `FORGE_GOAL_PROBE=1` env opt-in continuation
+diagnostics in the OS temp dir for debugging.
 
 ## Goal mode (autonomous, host-verified objectives)
 
@@ -708,6 +711,12 @@ against a missing worker on a native host surfaces the same guidance.
 `"sync": "auto"` in a pool file opts that pool into silent regeneration
 at session start when stale (disclosed via a console finding); without
 it the plugin never writes files uninvited.
+
+**Visibility note**: native agent scoping is the host's up-tree merge —
+agents in a parent directory's `.opencode/agent/` are also visible from
+nested workspaces. This is a disclosed difference from the recipe's
+nearest-exclusive pool scoping; dispatch gating still follows the
+recipe, so visibility never grants cross-pool dispatch.
 
 **Recipe field reference** (per agent entry):
 

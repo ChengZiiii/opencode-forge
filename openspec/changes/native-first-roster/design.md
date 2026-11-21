@@ -39,18 +39,25 @@ project-wins + global permissions spliced, no collision protection;
   string; the rest (none/minimal/xhigh/max, budget translations) ride
   the existing chat.params name-keyed injection — public API, disclosed
   per spawn. The 7-word dictionary and translation matrix are untouched.
-- **D4 — Staleness gate + agent-layer sync.** crew_begin precheck (and
-  draft materialize precheck): recipe mtime > newest matching artifact
-  mtime → refuse with the one-step fix; the same staleness hint covers
-  the plain dispatch path — on native mode a task dispatch against an
-  empty native roster with a non-empty recipe surfaces the same sync
-  guidance (a fresh workspace after upgrade must not dead-end at
-  "worker not found"). `/forge sync` is a registered tool the forge
-  agent calls in-band (transcript-visible), atomic writes
-  (temp+rename), GC removes orphaned `forge-<ns>-*` files for entries
-  deleted from the recipe (mirror of "删池文件即失池"). Hot-apply
-  picks up changes without restart (probe PASS). `sync:"auto"` opt-in:
-  regenerate on detection at session start, disclosed via finding.
+- **D4 — Staleness gate + agent-layer sync.** crew_begin precheck in
+  NATIVE mode only (the runtime path keeps its existing checks; there
+  is no draft-materialize precheck): recipe mtime > newest matching
+  artifact mtime triggers a **content adjudication** — if every
+  compiled artifact byte-matches what the current recipe compiles to,
+  the verdict is fresh (a touch or clock skew with no real change must
+  not deadlock the gate); any difference → refuse with the one-step
+  fix. The same staleness hint covers the plain dispatch path — on
+  native mode a task dispatch against an empty native roster with a
+  non-empty recipe surfaces the same sync guidance (a fresh workspace
+  after upgrade must not dead-end at "worker not found"). `/forge
+  sync` is a registered tool the forge agent calls in-band
+  (transcript-visible), atomic writes (temp+rename, best-effort temp
+  cleanup on failure), GC removes orphaned `forge-<ns>-*` files for
+  entries deleted from the recipe (mirror of "删池文件即失池").
+  Hot-apply picks up changes without restart (probe PASS).
+  `sync:"auto"` opt-in: regenerate on detection at session start,
+  disclosed via finding (setup-time console warn — no session findings
+  channel exists that early; accepted channel downgrade, recorded).
 - **D5 — Migration knob.** `materialize: "native" | "runtime"`: the knob
   defaults BY HOST GENERATION — v1 hosts pin "runtime" (native agent
   files are a v2 host facility; v1 behavior stays byte-equal forever),

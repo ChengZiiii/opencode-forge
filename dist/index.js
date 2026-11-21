@@ -16352,13 +16352,14 @@ function executeRosterSync(plans, deps = {}) {
     const wanted = new Set(plan.files.map((f) => f.fileName));
     for (const file2 of plan.files) {
       const dest = joinPath(plan.dir, file2.fileName);
+      let tmp = null;
       try {
         const existing = stat(dest) !== null ? readFile(dest) : null;
         if (existing === file2.content) {
           out.unchanged.push(dest);
           continue;
         }
-        const tmp = `${dest}.new`;
+        tmp = `${dest}.new`;
         writeFile(tmp, file2.content);
         try {
           rename(tmp, dest);
@@ -16368,11 +16369,17 @@ function executeRosterSync(plans, deps = {}) {
           } catch {}
           rename(tmp, dest);
         }
+        tmp = null;
         if (existing === null)
           out.created.push(dest);
         else
           out.updated.push(dest);
       } catch (err) {
+        if (tmp !== null) {
+          try {
+            unlink(tmp);
+          } catch {}
+        }
         out.errors.push(`${dest}: ${err instanceof Error ? err.message : String(err)}`);
       }
     }
