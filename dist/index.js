@@ -18708,15 +18708,103 @@ var GATE_PERMISSION_KEYS = [
   "crew_close"
 ];
 var gatePermissionSnapshot = new Map;
-async function forgeShellGate(ask, command) {
-  const explicit = gatePermissionSnapshot.get("forge_shell");
+async function forgeShellGate(ask, command, sessionID) {
+  const explicit = explicitForgeShellPosture();
   if (explicit === "deny") {
     throw new Error(`[forge] forge_shell is explicitly denied by user configuration (permission forge_shell: "deny"). Nothing was executed. Remove or change the deny rule to re-enable the exec surface.`);
   }
   if (explicit === "allow") {
     return;
   }
-  await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`);
+  try {
+    await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`);
+  } catch (err) {
+    if (v2HostSeen && isForgeWorkerSession(sessionID) && err?.message === "Permission denied: forge_shell") {
+      markSessionRescueDisclosed(sessionID);
+      return;
+    }
+    throw err;
+  }
+}
+function resolveForgeShellPosture(documents) {
+  let resolved;
+  for (const text of documents) {
+    if (typeof text !== "string" || !text.trim())
+      continue;
+    const parsed = parseForgeJsonc(text);
+    if (!parsed.ok)
+      continue;
+    const cfg = parsed.config;
+    if (Array.isArray(cfg.permissions)) {
+      let hit;
+      for (const rule of cfg.permissions) {
+        if (rule === null || typeof rule !== "object")
+          continue;
+        const r = rule;
+        if (r.effect !== "allow" && r.effect !== "deny" && r.effect !== "ask")
+          continue;
+        if (!ruleMatchesForgeShellAssert(r.action, r.resource))
+          continue;
+        hit = r.effect;
+      }
+      if (hit !== undefined) {
+        resolved = hit;
+        continue;
+      }
+    }
+    const legacy = cfg.permission;
+    const v = legacy !== null && typeof legacy === "object" ? legacy.forge_shell : undefined;
+    if (v === "allow" || v === "deny" || v === "ask")
+      resolved = v;
+  }
+  return resolved;
+}
+function ruleMatchesForgeShellAssert(action, resource) {
+  return wildcardMatchValue("forge_shell", action) && wildcardMatchValue("*", resource);
+}
+function wildcardMatchValue(value, pattern) {
+  if (typeof pattern !== "string" || pattern === "")
+    return false;
+  const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i");
+  return re.test(value);
+}
+function hostConfigDocumentsFor(homeDir, workspace) {
+  const docs = [];
+  const pushDir = (dir) => {
+    if (!dir)
+      return;
+    let pushed = false;
+    for (const name of ["opencode.json", "opencode.jsonc"]) {
+      try {
+        docs.push(readFileSync9(join6(dir, name), "utf8"));
+        pushed = true;
+        break;
+      } catch {}
+    }
+    if (!pushed)
+      docs.push(null);
+  };
+  const cfgEnv = (process.env.OPENCODE_CONFIG_DIR ?? "").trim();
+  const sep2 = homeDir.includes("\\") && !homeDir.includes("/") ? "\\" : "/";
+  pushDir(cfgEnv || join6(homeDir, ".config", "opencode"));
+  if (workspace) {
+    pushDir(workspace);
+    pushDir(join6(workspace, ".opencode"));
+  }
+  return docs;
+}
+var v2PostureHomeDir = null;
+var v2PostureTestOverride = null;
+function explicitForgeShellPosture() {
+  if (v2PostureTestOverride !== null)
+    return v2PostureTestOverride.value;
+  if (!v2HostSeen)
+    return gatePermissionSnapshot.get("forge_shell");
+  const home = v2PostureHomeDir ?? homedir();
+  const resolved = resolveForgeShellPosture(hostConfigDocumentsFor(home, hostWorktree));
+  if (resolved === "allow" || resolved === "deny")
+    gatePermissionSnapshot.set("forge_shell", resolved);
+  return resolved;
 }
 var planApproveTool = tool({
   description: "Approve the session's draft plan (draft -> approved). Call it ONLY after presenting the plan and receiving the user's explicit go-ahead in chat — never in the same turn that presents the draft. The permission layer pins this call to a confirmation dialog — the user's Allow is the final hard gate and lifts the draft-phase write ban. Optionally pass a one-line summary of what changed since the last revision.",
@@ -19106,7 +19194,12 @@ var forgeShellExecute = async (args, context) => {
     throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.");
   }
   const state = ensureSession(context.sessionID, worktreeFor(context));
-  await forgeShellGate(context.ask, args.command);
+  if (isForgeWorkerSession(context.sessionID))
+    await ensureSessionRescueRule(context.sessionID);
+  await forgeShellGate(context.ask, args.command, context.sessionID);
+  const rescueNote = takeSessionRescueDisclosure(context.sessionID);
+  if (rescueNote)
+    context.metadata({ title: rescueNote });
   const survive = effectiveSurvive(jobsSurviveMode, args.survive);
   let successPattern = null;
   if (args.success_pattern) {
@@ -21281,6 +21374,9 @@ function harvestSessionEnd(sessionID) {
   sessionDepths.delete(sessionID);
   dispatchProgressQueue.delete(sessionID);
   sessionAgents.delete(sessionID);
+  sessionRescueInjected.delete(sessionID);
+  sessionRescueDisclosed.delete(sessionID);
+  sessionRescueAttached.delete(sessionID);
   sessionModels.delete(sessionID);
   sealFindings.delete(sessionID);
   sealUnknownNotes.delete(sessionID);
@@ -21967,6 +22063,88 @@ function wrapV2ToolResult(res) {
   return { content: res };
 }
 var v2PermissionAssertFn = null;
+var v2SessionRuleApi = null;
+var SESSION_RESCUE_RULE = { action: "forge_shell", resource: "*", effect: "allow" };
+var sessionRescueInjected = new Set;
+var sessionRescueDisclosed = new Set;
+function isSessionRescueRule(rule) {
+  if (rule === null || typeof rule !== "object")
+    return false;
+  const o = rule;
+  return o.action === "forge_shell" && o.resource === "*" && o.effect === "allow";
+}
+function isForgeWorkerSession(sessionID) {
+  if (!sessionID)
+    return false;
+  const agent = sessionAgents.get(sessionID);
+  return typeof agent === "string" && agent.startsWith("forge-");
+}
+async function ensureSessionRescueRule(sessionID) {
+  if (!v2SessionRuleApi)
+    return false;
+  if (sessionRescueInjected.has(sessionID))
+    return true;
+  if (explicitForgeShellPosture() === "deny")
+    return false;
+  try {
+    const record2 = await v2SessionRuleApi.get(sessionID);
+    const current = record2 !== null && typeof record2 === "object" ? record2.permissions : undefined;
+    const merged = Array.isArray(current) ? current.slice() : [];
+    if (merged.some(isSessionRescueRule)) {
+      sessionRescueInjected.add(sessionID);
+      return true;
+    }
+    merged.push({ ...SESSION_RESCUE_RULE });
+    await v2SessionRuleApi.update({ sessionID, permissions: merged });
+    sessionRescueInjected.add(sessionID);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function markSessionRescueDisclosed(sessionID) {
+  if (sessionRescueDisclosed.has(sessionID))
+    return;
+  sessionRescueDisclosed.add(sessionID);
+  console.warn(`[forge:session-rescue] warn: worker session ${sessionID} — the host permission assert fell back to deny-all (cross-anchor agent resolution; README "Native mode — worker shell rescue"); the documented session-rule rescue let this call through.`);
+}
+var sessionRescueAttached = new Set;
+function takeSessionRescueDisclosure(sessionID) {
+  if (!sessionRescueDisclosed.has(sessionID) || sessionRescueAttached.has(sessionID))
+    return null;
+  sessionRescueAttached.add(sessionID);
+  return "[forge:session-rescue] cross-anchor deny-all rescued via the session rule (see diagnostics)";
+}
+var __workerShellRescueTestSurface = {
+  setPosture(value) {
+    v2PostureTestOverride = { value };
+  },
+  clearPosture() {
+    v2PostureTestOverride = null;
+  },
+  setHostSeen(value) {
+    v2HostSeen = value;
+  },
+  setSessionRuleApi(api2) {
+    v2SessionRuleApi = api2;
+  },
+  setFamily(sessionID, agent) {
+    if (agent === undefined)
+      sessionAgents.delete(sessionID);
+    else
+      sessionAgents.set(sessionID, agent);
+  },
+  ensure: ensureSessionRescueRule,
+  isWorker: isForgeWorkerSession,
+  gate: forgeShellGate,
+  markDisclosed: markSessionRescueDisclosed,
+  takeDisclosure: takeSessionRescueDisclosure,
+  resetState() {
+    sessionRescueInjected.clear();
+    sessionRescueDisclosed.clear();
+    sessionRescueAttached.clear();
+  }
+};
 function v2ToolContext(raw) {
   const c = raw ?? {};
   const pickStr = (...keys) => {
@@ -22221,6 +22399,8 @@ function v2ContextInjection(raw) {
   const agentName = v2AgentNameOf(o);
   if (agentName)
     sessionAgents.set(sessionID, agentName);
+  if (agentName === FORGE_AGENT)
+    ensureSessionRescueRule(sessionID).catch(() => {});
   {
     const capObj = o.model;
     const capProvider = typeof capObj?.providerID === "string" ? capObj.providerID : "";
@@ -22612,6 +22792,7 @@ async function v2Setup(ctx, deps) {
       hostWorktree = first;
   }
   v2HostSeen = true;
+  v2PostureHomeDir = deps?.homeDir ?? homedir();
   const globalKnobs = readGlobalKnobs(deps);
   v2MaterializeMode = deps?.materialize ?? globalKnobs.materialize ?? "native";
   if (v2MaterializeMode === "native") {
@@ -22741,6 +22922,14 @@ async function v2Setup(ctx, deps) {
   }
   v2RegisterPermissionBelt(ctx);
   v2PermissionAssertFn = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission.assert(input) : null;
+  if (typeof ctx.session?.get === "function" && typeof ctx.session.update === "function") {
+    const rawGet = ctx.session.get.bind(ctx.session);
+    const rawUpdate = ctx.session.update.bind(ctx.session);
+    v2SessionRuleApi = {
+      get: (sessionID) => rawGet({ sessionID }),
+      update: (input) => rawUpdate(input)
+    };
+  }
   const v2Anchor = v2AnchorClient(ctx);
   anchorClientShared = v2Anchor;
   v2RegisterToolHooks(ctx, v2Anchor);
@@ -22765,12 +22954,14 @@ export {
   v2WiringSeam,
   v2Setup,
   server,
+  resolveForgeShellPosture,
   resolveDispatchQueueMax,
   isRootish,
   effectiveWorktree,
   effectiveSurvive,
   plugin_default as default,
   crewOrchestrationTemplate,
+  __workerShellRescueTestSurface,
   TASK_SEAM_DEGRADED_ERROR,
   PLAN_COMMAND_TEMPLATE,
   GOAL_COMMAND_TEMPLATE,
