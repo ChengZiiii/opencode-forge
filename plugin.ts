@@ -451,7 +451,7 @@ function runRosterSync(): { lines: string[]; errorCount: number } {
   if (outcome.unchanged.length) lines.push(`  unchanged: ${outcome.unchanged.length} file(s) already current`)
   if (outcome.gced.length) lines.push(`  gc'd (entries removed from the recipe): ${outcome.gced.join(", ")}`)
   if (outcome.errors.length) lines.push(`  errors: ${outcome.errors.join("; ")}`)
-  lines.push("The host hot-applies the files — no restart. Edit the RECIPE (forge.json), never the generated files; /forge sync re-emits.")
+  lines.push("The host hot-applies the files — no restart. Edit the RECIPE (forge.json), never the generated files; forge_sync re-emits.")
   return { lines, errorCount: outcome.errors.length }
 }
 
@@ -4620,7 +4620,7 @@ const crewCloseTool = tool({
   },
 })
 
-// /forge sync (native-first-roster design D2/D4): compile the recipe into
+// forge_sync (native-first-roster design D2/D4): compile the recipe into
 // native agent files — in-band (the forge agent calls it; every effect is
 // transcript-visible), atomic (temp+rename), with GC and full diff
 // disclosure. Registered on BOTH host generations (v1 tool getter + v2

@@ -14,7 +14,7 @@
 
 ## 2. Sync tool + staleness gate
 
-- [x] 2.1 `/forge sync` registered tool: compile + atomic write +
+- [x] 2.1 `forge_sync` registered tool: compile + atomic write +
   disclosure of the diff (created/updated/GC'd files).
 - [x] 2.2 Staleness precheck in crew_begin (and runtime-materialize
   precheck while that mode exists): refuse-with-guidance when recipe is

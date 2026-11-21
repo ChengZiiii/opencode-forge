@@ -21,10 +21,17 @@ part — same-name override semantics — carried natively by the host.
 
 ## What Changes
 
-- **ADDED — `/forge init`:** an explicit command that writes the
-  default GLOBAL forge.json scaffold. The plugin never writes config
-  uninvited (2026-09-28 lesson: auto-onboarding invited AI to
-  self-write forge.json — observed in the wild, twice).
+- **ADDED — Trigger-driven scaffold, no new command:** the global
+  forge.json scaffold is drafted in-band by the forge agent ONLY on
+  the user's explicit ask — exactly the established
+  unconfigured-crew gate pattern ("ask you to write the file — only
+  on their explicit go-ahead"); the plugin never writes it uninvited
+  and no `/forge init` command exists (owner correction 2026-11-21:
+  project-level init was always trigger-driven — crew fires, finds no
+  recipe, refuses with the template and the drafting affordance; the
+  global layer follows the same shape). The unconfigured-crew refusal
+  text is EXTENDED to name the global layer's override affordance, so
+  the trigger point teaches both layers.
 - **ADDED — Override templates COMMENTED OUT by default:** the
   scaffold ships General/Explore entries in comment form; uncomment +
   fill `model`/`thoughtLevel` to activate. Default-installed state is
@@ -61,7 +68,8 @@ part — same-name override semantics — carried natively by the host.
 ## Authorization note
 
 Owner proposed the direction (2026-11-21); this proposal adds three
-patches: commented defaults, explicit `/forge init`, collision
-redline. Implementation starts only on explicit approval. Foundation:
+patches: trigger-driven scaffolding (no dedicated command — owner
+correction: init follows the unconfigured-crew gate pattern),
+commented defaults, collision redline. Implementation starts only on explicit approval. Foundation:
 native-first-roster (0.30.0) lands first — this change targets
 0.31.0.

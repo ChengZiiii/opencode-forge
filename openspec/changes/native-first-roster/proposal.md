@@ -34,7 +34,7 @@ recipe stays the single human-editable surface.
 
 ## What Changes
 
-- **ADDED — Compiler (`/forge sync` + pure core):** forge.json (unchanged
+- **ADDED — Compiler (`forge_sync` + pure core):** forge.json (unchanged
   format) compiles to namespaced native files
   `.opencode/agent/forge-<ns>-<id>.md`: `mode: subagent` ALWAYS stamped
   (probe trap), `model: provider/model[#variant]`, tools face in current

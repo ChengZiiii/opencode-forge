@@ -508,7 +508,7 @@ export function parseSyncKnob(v: unknown, label: string): { auto: boolean; findi
   if (v === "auto") return { auto: true, findings: [] }
   return {
     auto: false,
-    findings: [{ level: "warn", code: "sync-invalid", message: `${label}.sync must be "auto" (the only opt-in) — field ignored; the default posture applies (staleness gate + in-band /forge sync)` }],
+    findings: [{ level: "warn", code: "sync-invalid", message: `${label}.sync must be "auto" (the only opt-in) — field ignored; the default posture applies (staleness gate + in-band forge_sync)` }],
   }
 }
 

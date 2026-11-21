@@ -22,7 +22,7 @@
     "materialize": {
       "type": "string",
       "enum": ["native", "runtime"],
-      "description": "Roster materialization mode (GLOBAL layer file only). v2 hosts DEFAULT to \"native\" (the recipe compiles into .opencode/agent/forge-<ns>-<id>.md via /forge sync); \"runtime\" is the escape hatch back to draft materialization. v1 hosts stay runtime-pinned regardless. Any other value is ignored with a warning."
+      "description": "Roster materialization mode (GLOBAL layer file only). v2 hosts DEFAULT to \"native\" (the recipe compiles into .opencode/agent/forge-<ns>-<id>.md via forge_sync); \"runtime\" is the escape hatch back to draft materialization. v1 hosts stay runtime-pinned regardless. Any other value is ignored with a warning."
     },
     "sync": {
       "type": "string",

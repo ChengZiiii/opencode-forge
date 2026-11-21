@@ -689,7 +689,11 @@ workspace's pool / the global layer. The `/crew` roster and the
 fallback) and list every other host pool as NOT dispatchable with its
  origin path.
 
-### Native roster compilation (`/forge sync`) — v2 hosts
+### Native roster compilation (`forge_sync`) — v2 hosts
+
+There is no `/forge` command family — the plugin's slash commands are
+exactly `/plan`, `/goal`, and `/crew`; `forge_sync` is a **tool** the
+forge agent calls in-band (every effect lands in the transcript).
 
 On **v2 hosts** (opencode 2.x) the roster materializes **natively by
 default** (`materialize: "native"`): forge **compiles** forge.json into
@@ -764,7 +768,7 @@ task dispatch **silently fall back to a general dispatch** with no error.
 `execute` (not bash) and the dispatch tool is `subagent` (a
 `tools.task:false` key is host-mapped onto it). The compiler emits from
 one locked vocabulary constant; after a host rename, re-run
-`/forge sync` to re-emit the current names.
+`forge_sync` to re-emit the current names.
 
 **Cross-machine story (lockfile pattern).** Commit the generated
 `.opencode/agent/forge-*.md` files next to the recipe. A fresh machine
@@ -774,7 +778,7 @@ because both files travelled together (the check is content-based: a
 touched-but-identical recipe is not stale). **Upgrade recipe**:
 `opencode plugin remove opencode-forge` → clear the plugin store
 (`~/.cache/opencode/packages/`) → `opencode plugin "git+file:///<abs
-repo path>" --global` (or the github: form) → `/forge sync` once per
+repo path>" --global` (or the github: form) → run `forge_sync` once per
 workspace if the compiled format changed.
 
 ### task — the single dispatch surface (native name, forge engine)
