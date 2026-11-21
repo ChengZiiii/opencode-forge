@@ -4,11 +4,10 @@
 
 ### Requirement: Built-in subagent override via the global recipe
 
-Scaffold creation `SHALL` be trigger-driven and in-band: the global
-forge.json `SHALL` be drafted by the forge agent only on the user's
-explicit go-ahead — the same pattern as the unconfigured-crew
-initialization gate — the plugin `SHALL NOT` write that file
-uninvited, and no dedicated init command `SHALL` exist. The scaffold
+Scaffold creation `SHALL` be explicit-only: the global forge.json
+`SHALL` be drafted in-band by the forge agent on the user's explicit
+ask — directly, or via the `/forge init global` lever (forge-commands)
+— and the plugin `SHALL NOT` write that file uninvited. The scaffold
 `SHALL` carry General/Explore
 override entries in comment form — uncommenting and filling an entry
 is the user's act, and the default-installed state `SHALL` be
@@ -27,11 +26,12 @@ result `SHALL` kill the change in propose.
 #### Scenario: The scaffold arrives only on ask, inert by default
 
 - **WHEN** the user asks for global workers or a built-in override
-  and no global forge.json exists
+  (directly, or by running `/forge init global`) and no global
+  forge.json exists
 - **THEN** the forge agent drafts the scaffold in-band with
   General/Explore entries in comment form, the host's built-in
   behavior is unchanged until the user uncomments and fills an entry,
-  and without an ask the plugin writes nothing
+  and without an explicit ask or command the plugin writes nothing
 
 #### Scenario: An activated override pins the built-in machine-wide
 

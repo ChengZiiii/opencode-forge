@@ -12,9 +12,9 @@
 
 ## 1. Implementation
 
-- [ ] 1.1 Unconfigured-crew gate text extension: the no-recipe refusal
-  names the global layer's builtin-override affordance
-  (trigger-driven scaffold — no new command).
+- [ ] 1.1 Global scaffold content (override entries in comment form)
+  delivered through the `/forge init global` lever and the in-band
+  ask (command itself owned by forge-commands).
 - [ ] 1.2 Scaffold content: General/Explore override entries in
   COMMENT form (JSONC), Auto-worker semantics documented inline.
 - [ ] 1.3 Compiler: non-namespaced same-name emission mode for
@@ -27,7 +27,7 @@
 - [ ] 2.1 Test matrix: scaffold shape, commented-by-default,
   collision refusal, marker-keyed GC, unconfigured = no emission.
 - [ ] 2.2 README handbook: the override pattern, the official-default
-  promise, the in-band scaffold ask (no command).
+  promise, the scaffold paths (in-band ask + `/forge init global`).
 
 ## 3. Gate + release
 

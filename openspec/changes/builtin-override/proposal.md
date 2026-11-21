@@ -21,17 +21,15 @@ part — same-name override semantics — carried natively by the host.
 
 ## What Changes
 
-- **ADDED — Trigger-driven scaffold, no new command:** the global
-  forge.json scaffold is drafted in-band by the forge agent ONLY on
-  the user's explicit ask — exactly the established
-  unconfigured-crew gate pattern ("ask you to write the file — only
-  on their explicit go-ahead"); the plugin never writes it uninvited
-  and no `/forge init` command exists (owner correction 2026-11-21:
-  project-level init was always trigger-driven — crew fires, finds no
-  recipe, refuses with the template and the drafting affordance; the
-  global layer follows the same shape). The unconfigured-crew refusal
-  text is EXTENDED to name the global layer's override affordance, so
-  the trigger point teaches both layers.
+- **ADDED — Trigger-driven scaffold with an explicit lever:** the
+  global forge.json scaffold is drafted in-band by the forge agent on
+  the user's explicit ask — the established unconfigured-crew gate
+  pattern ("ask you to write the file — only on their explicit
+  go-ahead") — and gains a direct lever: the `/forge init global`
+  command (forge-commands change; owner direction 2026-11-21 — the
+  gates stay the NET that catches un-init'd sessions, the commands are
+  the explicit user controls). The plugin never writes it uninvited;
+  the scaffold ships the override entries in comment form.
 - **ADDED — Override templates COMMENTED OUT by default:** the
   scaffold ships General/Explore entries in comment form; uncomment +
   fill `model`/`thoughtLevel` to activate. Default-installed state is
@@ -67,9 +65,10 @@ part — same-name override semantics — carried natively by the host.
 
 ## Authorization note
 
-Owner proposed the direction (2026-11-21); this proposal adds three
-patches: trigger-driven scaffolding (no dedicated command — owner
-correction: init follows the unconfigured-crew gate pattern),
-commented defaults, collision redline. Implementation starts only on explicit approval. Foundation:
+Owner proposed the direction (2026-11-21), corrected the init shape
+(trigger-driven, like the unconfigured-crew gate), then confirmed the
+final posture: net (gates) + levers (`/forge init global`, see
+forge-commands). Remaining patches: commented defaults, collision
+redline. Implementation starts only on explicit approval. Foundation:
 native-first-roster (0.30.0) lands first — this change targets
 0.31.0.
