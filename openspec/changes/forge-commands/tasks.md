@@ -31,6 +31,13 @@
   round @92fc059) — reports/e2e-0310-dual-change-report.md (scenarios 1-4
   cover this change: command registration, force sync + contrast,
   refuse-if-exists, global scaffold).
-- [ ] 3.2 Version bump + npm publish — rides the 0.31.0 release train
-  (together with builtin-override + worker-shell-session-allow); owner
-  approval requested 2026-11-21, pending.
+- [x] 3.2 Version bump + npm publish — DONE 2026-11-21: 0.30.0 → 0.31.0
+  (commit 12e97ef), `npm pack --dry-run` clean (4 files: dist + README,
+  224.6 kB), `npm publish` → `+ @sorenllm/opencode-forge@0.31.0` (tag
+  latest). Real-machine verification after cache purge + service restart:
+  registry serves 0.31.0; fresh cache snapshot carries
+  `@sorenllm/opencode-forge version=0.31.0`; host run `0ab78fea` loads it;
+  loaded dist carries both fix markers (empty-plan GC channel, findings
+  disclosure); worker rescue alive on the OFFICIAL package
+  (`OFFICIAL-0310-ALIVE`, exit=0); /forge command family live via
+  /api/command on the production server.

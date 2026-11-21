@@ -47,6 +47,8 @@
   both fixed in 92fc059 and retest-verified PASS (marker-keyed GC spares
   hand-written files; `override-node-ignored-workspace` now disclosed
   in-band + console).
-- [ ] 3.2 Version bump + npm publish — rides the 0.31.0 release train
-  (together with forge-commands + worker-shell-session-allow); owner
-  approval requested 2026-11-21, pending.
+- [x] 3.2 Version bump + npm publish — DONE 2026-11-21 (same train as
+  forge-commands: 0.31.0 published, cache purged, service restarted, host
+  loaded the official package; worker rescue + /forge command family + both
+  fix markers verified on the production server — evidence in
+  forge-commands tasks.md 3.2).
