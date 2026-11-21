@@ -76,6 +76,10 @@
     posture resolver reads real disk and the deny gate short-circuits
     before any injection. Config restored byte-identical afterwards
     (SHA256 prefix 979DA33455822E1E = baseline).
-- [ ] 3.3 Fold into the 0.31.0 release train: unblocks the dual-change sandbox
+- [x] 3.3 Fold into the 0.31.0 release train: unblocks the dual-change sandbox
   E2E (write workers regain command execution); E2E scenario list gains the
-  worker-shell PASS leg.
+  worker-shell PASS leg. (2026-11-21: dual-change E2E relaunched the same
+  evening — 9/9 sandbox scenarios PASS at final tally @92fc059; the
+  production-geometry rescue leg is scenario 10 in
+  reports/e2e-0310-dual-change-report.md. Ships in 0.31.0 — publish pending
+  owner approval.)

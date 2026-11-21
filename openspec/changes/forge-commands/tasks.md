@@ -26,6 +26,11 @@
 
 ## 3. Gate + release
 
-- [ ] 3.1 Full gate (typecheck, suite, validate, bundle) + sandbox
-  E2E (init round-trip, force sync, refuse-if-exists); version bump +
-  npm publish only after owner approval.
+- [x] 3.1 Full gate + sandbox E2E (2026-11-21): typecheck 0, suite 860/860,
+  bundle committed; E2E 9/9 scenarios PASS (final tally after the retest
+  round @92fc059) — reports/e2e-0310-dual-change-report.md (scenarios 1-4
+  cover this change: command registration, force sync + contrast,
+  refuse-if-exists, global scaffold).
+- [ ] 3.2 Version bump + npm publish — rides the 0.31.0 release train
+  (together with builtin-override + worker-shell-session-allow); owner
+  approval requested 2026-11-21, pending.

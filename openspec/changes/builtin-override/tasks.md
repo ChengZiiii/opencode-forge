@@ -39,5 +39,14 @@
 
 ## 3. Gate + release
 
-- [ ] 3.1 Full gate (typecheck, suite, validate, bundle) + sandbox
-  E2E; version bump + npm publish only after owner approval.
+- [x] 3.1 Full gate + sandbox E2E (2026-11-21): typecheck 0, suite 860/860
+  (859 + 1 new deactivation-GC test), bundle committed; E2E scenarios 5-9
+  PASS at final tally @92fc059 — reports/e2e-0310-dual-change-report.md.
+  E2E first round surfaced two spec-promised behaviors the wiring missed
+  (scenario 6 deactivation GC channel; scenario 9 findings disclosure);
+  both fixed in 92fc059 and retest-verified PASS (marker-keyed GC spares
+  hand-written files; `override-node-ignored-workspace` now disclosed
+  in-band + console).
+- [ ] 3.2 Version bump + npm publish — rides the 0.31.0 release train
+  (together with forge-commands + worker-shell-session-allow); owner
+  approval requested 2026-11-21, pending.
