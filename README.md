@@ -288,7 +288,7 @@ What this plugin touches, exhaustively:
 | `<project>/.opencode/plan/*.md` | plan files | user data — kept forever, uninstall never deletes |
 | `<project>/.opencode/goal/*.md` | goal files (contract, Check Log, Turn Ledger) | user data — kept forever, uninstall never deletes |
 | `<project>/.opencode/crew/*.md` | crew records (declared plan + arm/convert/abandon/close history; written at `crew_begin` registration, appended at each transition; record-only — never a resume mechanism) | user data — kept forever, uninstall never deletes |
-| merged config object (RAM only) | forge agent, static `forge-<ns>-<id>` subagents (every pool family namespaced; the global fallback family `forge-global-<id>`), tool-partition injections (forge family shell hide, non-forge forge-tool hide, native build/plan/general/explore minimal entries), `command.plan`, `command.goal`, `command.crew`, goal permission keys, `permission.forge_shell`, `permission.crew_close` | vanishes when the plugin is removed; nothing is written to disk |
+| merged config object (RAM only) | forge agent, static `forge-<ns>-<id>` subagents (every pool family namespaced; the global fallback family `forge-global-<id>`), tool-partition injections (forge family shell hide, non-forge forge-tool hide, native build/plan/general/explore minimal entries), `command.plan`, `command.goal`, `command.crew`, `command.forge`, goal permission keys, `permission.forge_shell`, `permission.crew_close` | vanishes when the plugin is removed; nothing is written to disk |
 | `<tmp>/opencode-forge/jobs/<jobId>.log` | job output tee (full output; oldest rotated out above 50 files) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/ledger.jsonl` | job registry ledger (bounded: 1 MB reset, 200 entries) | runtime debris — delete freely, also after uninstall |
 | `<tmp>/opencode-forge/jobs/registry.json` | persistent survivor registry (bounded: 100 entries) | runtime debris — after uninstall, kill any still-running `survive` jobs yourself first |
@@ -298,6 +298,7 @@ What this plugin touches, exhaustively:
 | `<project>/.opencode/forge/dispatch-log.jsonl` | dispatch journal (fold E) — append-only per-workspace record of every async dispatch state transition (`dispatched` / `queued` / `started` / `retry-pending` / `terminal`); bounded by `FORGE_DISPATCH_JOURNAL_MAX` (default 200, terminal-first rotation); prompt text retained while a record is non-terminal, redacted on terminal; corrupt lines skipped. This is what restart recovery replays — a live child re-arms, a finished-while-down child wakes its owner exactly once, queued wishes re-enter the queue, retry chains resume | runtime data — deleting it only loses cross-restart recovery for in-flight dispatches; uninstall leaves it behind (add `.opencode/forge/` to your ignore file if you don't want it versioned) |
 | `<project>/.opencode/agent/forge-<ns>-<id>.md` | compiled native agent files — `forge_sync` output on v2 native mode (GENERATED header, `forge-` prefix + marker; GC'd by sync when the recipe entry disappears; a transient `forge-*.md.new` temp lives microseconds during atomic writes and is best-effort cleaned on failure) | compiled artifacts — version them: they travel with the workspace (a fresh machine pulling the project needs no init) |
 | `<home>/.config/opencode/agent/forge-global-<id>.md` | compiled GLOBAL-roster agents — when (and only when) a global `~/.config/opencode/forge.json` exists, `forge_sync` also compiles its fallback family into the host's own global agent dir (same GENERATED header + marker + GC discipline; non-forge files there are never touched) | compiled artifacts — delete freely; with the plugin gone the host simply loses those extra global agents |
+| `<global agent dir>/general.md`, `<global agent dir>/explore.md` | built-in override artifacts (0.31.0) — `forge_sync` output when the GLOBAL forge.json's `override` node activates an entry. No `forge-` prefix (the lowercase id stem IS the override key — case-sensitive); GC keys on the in-content GENERATED marker, so re-commenting the entry removes the file; a hand-written file of the same name is never overwritten (sync refuses + discloses). Global agent dir: `OPENCODE_CONFIG_DIR/agent` when set, else `~/.config/opencode/agent/` | compiled artifacts — delete freely; with the plugin gone the built-ins return to official behavior |
 | `.opencode/forge.json` (the NEAREST one walking up from the session's worktree — sole ownership) and `~/.config/opencode/forge.json` (global FALLBACK only, never merged) | your static subagent definitions (JSONC) — the workspace pool IS the session's whole roster; nested forge.json files are ignored. **User data — the plugin only reads them, never writes or migrates them** | yours — version the project ones, keep the global one out of sync tools if it holds machine-specific models |
 | `~/.cache/opencode/packages/...` | installed package copy | written by the `opencode plugin` installer, not the plugin |
 | `~/.config/opencode/opencode.json` | `plugin` array entry | written by the installer |
@@ -691,9 +692,19 @@ fallback) and list every other host pool as NOT dispatchable with its
 
 ### Native roster compilation (`forge_sync`) — v2 hosts
 
-There is no `/forge` command family — the plugin's slash commands are
-exactly `/plan`, `/goal`, and `/crew`; `forge_sync` is a **tool** the
-forge agent calls in-band (every effect lands in the transcript).
+The plugin's slash commands are `/plan`, `/goal`, `/crew`, and the
+**`/forge` roster levers** (0.31.0) — one command routing on its argument:
+
+| form | what it does |
+| --- | --- |
+| `/forge sync` | force an immediate `forge_sync` NOW and report the diff verbatim (created/updated/GC'd/errors) — the manual force/debug/fallback lever; the default staleness-gate posture and the `sync:"auto"` opt-in are unchanged |
+| `/forge init` | draft **this workspace's** `.opencode/forge.json` in-band with the forge agent (brief interview or from project context: pool namespace, roles, shapes); **refuses when a recipe already exists** — it offers a review of the existing one instead, never an overwrite |
+| `/forge init global` | draft the **global** `~/.config/opencode/forge.json` the same way; the scaffold ships the built-in override entries **commented out** (see [Built-in overrides](#built-in-subagent-overrides-general--explore) below) |
+
+All three are family-guarded templates (a non-forge session is told to
+switch to the forge agent and rerun), and the commands themselves write
+nothing — every effect lands in the transcript through the in-band tools;
+`forge_sync` remains a **tool** the forge agent calls.
 
 On **v2 hosts** (opencode 2.x) the roster materializes **natively by
 default** (`materialize: "native"`): forge **compiles** forge.json into
@@ -740,7 +751,8 @@ recipe, so visibility never grants cross-pool dispatch.
 
 Top-level: `pool` (namespace, required for crew-governed dispatch),
 `shared` (pool-wide prompt base), `materialize` (global layer only),
-`sync` (`"auto"` opt-in).
+`sync` (`"auto"` opt-in), and `override` (built-in overrides — **global
+layer file only**, see below).
 
 **Starter recipes** (drop into `.opencode/forge.json`):
 
@@ -780,6 +792,59 @@ touched-but-identical recipe is not stale). **Upgrade recipe**:
 (`~/.cache/opencode/packages/`) → `opencode plugin "git+file:///<abs
 repo path>" --global` (or the github: form) → run `forge_sync` once per
 workspace if the compiled format changed.
+
+### Built-in subagent overrides (`general` / `explore`)
+
+The host ships two built-in subagents — **General** (`general`) and
+**Explore** (`explore`). The **GLOBAL** forge.json can override them
+machine-wide through a top-level `override` node:
+
+```jsonc
+{
+  // ... optional forge-global-* agents ...
+  "override": {
+    "explore": { "model": "your-provider/your-model", "thoughtLevel": "low",
+                 "shape": "readonly", "prompt": "You are my codebase scout. ..." }
+  }
+}
+```
+
+How it works, and the honest disclosures:
+
+- **Identity key = exact LOWERCASE id stem** (probe-verified on 2.3.2,
+  `reports/probe-builtin-override.md`): `forge_sync` compiles an active
+  entry to a same-name, **non-namespaced** file in the host's global agent
+  dir — `general.md` / `explore.md`, GENERATED marker, `mode: subagent`,
+  the same model+variant and tools-face rules as workers. A **capitalized**
+  file (`General.md`) does **not** override — it creates an ambiguous
+  duplicate entry in the agent list; the compiler never emits one, and you
+  should never hand-write one.
+- **Activating an override replaces the built-in's prompt wholesale.** This
+  is not "just pin a model": description/system/model are fully replaced
+  (permissions end up builtin-base ∪ appended). **We never copy the
+  vendor's prompt text** — it drifts every host version — so an active
+  entry without your own `prompt` gets only a minimal generic body.
+  **Write your own general/explore.**
+- **Inert by default.** The `/forge init global` scaffold (and the
+  in-band ask the unconfigured-crew refusal offers) ships the `override`
+  node **fully commented out**; uncommenting and filling an entry is your
+  act. Not configured = official built-in behavior, byte-equal (the Auto
+  worker — no `model` — inherits the parent session's model, which IS the
+  built-in default).
+- **Global layer only.** A `override` node in a workspace pool file is
+  ignored with a warning — workspace agents always compile namespaced
+  (`forge-<ns>-<id>`); per-project built-in overrides are a non-goal.
+  Unknown override ids (anything but `general`/`explore`) warn + skip,
+  fail-soft.
+- **Collision redline.** If a hand-written `general.md` / `explore.md`
+  already exists in the global agent dir, sync **refuses and discloses** —
+  never overwrites (your file stays byte-identical).
+- **GC keys on the GENERATED marker**, not the `forge-` prefix:
+  re-comment or remove the entry and sync again → the compiled file is
+  garbage-collected; a hand-written file of the same name is never touched.
+- **Where is the global agent dir?** It mirrors the host's own resolution:
+  `OPENCODE_CONFIG_DIR` set → `$CONFIG_DIR/agent`; unset →
+  `~/.config/opencode/agent/`.
 
 ### task — the single dispatch surface (native name, forge engine)
 
