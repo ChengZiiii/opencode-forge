@@ -37,6 +37,7 @@
 // or artifacts missing while the recipe is non-empty).
 
 import type { ForgeAgentDef, PoolFamilyOrigin, PoolResolution } from "./forge-config.ts"
+import { BUILTIN_OVERRIDE_IDS } from "./forge-config.ts"
 import { MUTATING_TOOLS, agentDescriptionFor, rolePromptFor, type PoolProvenance } from "./dispatch-tiers.ts"
 import { materializeAgentPrompt } from "./dispatch-prompt.ts"
 
@@ -157,6 +158,44 @@ export function compileRosterEntry(input: {
   }
 }
 
+// ---------------------------------------------------------------------------
+// Built-in override emission (change builtin-override, design D2): the
+// GLOBAL recipe's `override` entries compile to SAME-NAME, NON-NAMESPACED
+// files in the host's global agent dir, case-locked to the built-in's exact
+// LOWERCASE id stem — the probe-established identity key
+// (reports/probe-builtin-override.md): only `general.md` / `explore.md`
+// truly override the built-ins; a capitalized variant creates an ambiguous
+// duplicate entry (the negative form) and is NEVER emitted (compileOverride
+// returns null for any id outside BUILTIN_OVERRIDE_IDS). model+variant and
+// the tools face follow the SAME rules as workers; the GC predicate for
+// override files keys on the in-content GENERATED marker (they carry no
+// `forge-` prefix).
+// ---------------------------------------------------------------------------
+
+// The minimal default body when an activated override entry carries no
+// prompt of its own (D3: activating an override replaces the built-in's
+// prompt wholesale — we never copy vendor text; this is only a floor, the
+// handbook tells the user to write their own).
+const OVERRIDE_DEFAULT_PROMPTS: Record<string, string> = {
+  general: "You are the user-overridden built-in General subagent. Do the dispatched work directly and report a compact result with evidence.",
+  explore: "You are the user-overridden built-in Explore subagent. Search and read the codebase for the dispatched question; report a compact brief with file:line evidence.",
+}
+
+export function compileOverrideEntry(input: { id: string; def: ForgeAgentDef; recipeFile: string }): { fileName: string; content: string } | null {
+  // Case-lock: the exact builtin lowercase id only — a capitalized id
+  // never compiles (never emitted, by construction).
+  if (!(BUILTIN_OVERRIDE_IDS as readonly string[]).includes(input.id)) return null
+  const shape: AgentShapeOrWrite = input.def.shape === "readonly" ? "readonly" : "write"
+  const description = `Built-in ${input.id} override — pinned by the global forge.json "override" node (${input.def.model !== undefined ? "pinned model" : "Auto worker"}).`
+  const model = modelStringFor(input.def)
+  const tools = toolsFaceFor(shape)
+  const body = input.def.prompt !== undefined && input.def.prompt.trim().length > 0 ? input.def.prompt : OVERRIDE_DEFAULT_PROMPTS[input.id]
+  return {
+    fileName: `${input.id}.md`,
+    content: `${frontmatterFor({ description, model, tools })}\n\n${generatedHeader(input.recipeFile)}\n\n${body}\n`,
+  }
+}
+
 // The agent directory holding a pool file's compiled artifacts: the
 // sibling `agent` directory of the `.opencode` (or config) directory the
 // recipe lives in — workspace pools compile into
@@ -172,10 +211,60 @@ export function agentDirFor(poolFile: string): string {
   return `${base}${sep}${dirName}${sep}agent`
 }
 
+// builtin-override D5 (probe correction, reports/probe-builtin-override.md
+// §修正1): the host's GLOBAL agent dir mirrors the host's own resolution —
+// `OPENCODE_CONFIG_DIR` set → `$CONFIG_DIR/agent` (the fake home's
+// `.config` path is NOT read in that mode); unset →
+// `<home>/.config/opencode/agent`. Override artifacts (general.md /
+// explore.md) land HERE, which may differ from agentDirFor(globalPoolFile)
+// on hosts that point OPENCODE_CONFIG_DIR elsewhere.
+export function globalAgentDirFor(opts: { homeDir: string; configDir?: string | null }): string {
+  const cfg = (opts.configDir ?? "").trim()
+  if (cfg) {
+    const sep = cfg.includes("\\") && !cfg.includes("/") ? "\\" : "/"
+    return cfg.endsWith(sep) ? `${cfg}agent` : `${cfg}${sep}agent`
+  }
+  const sep = opts.homeDir.includes("\\") && !opts.homeDir.includes("/") ? "\\" : "/"
+  const base = opts.homeDir.endsWith(sep) ? opts.homeDir : `${opts.homeDir}${sep}`
+  return `${base}.config${sep}opencode${sep}agent`
+}
+
 export type FamilySyncPlan = {
+  kind: "family"
   family: PoolFamilyOrigin
   dir: string
   files: { matId: string; fileName: string; content: string }[]
+}
+
+// builtin-override D2/D4: the override sync plan targets the host's GLOBAL
+// agent dir (globalAgentDirFor) with non-namespaced lowercase files. Two
+// semantic deltas vs a family plan, both keyed on kind:"override":
+//   - collision redline — an existing destination WITHOUT the GENERATED
+//     marker is a HAND-WRITTEN file: sync refuses + discloses, never
+//     overwrites (byte-identical preserved);
+//   - GC keys on the in-content GENERATED marker over the builtin id stems
+//     only (`general.md`/`explore.md`) — no `forge-` prefix exists on these
+//     files, and every other file in the dir (incl. the forge-global-*
+//     artifacts the fallback family owns) is invisible to this plan.
+export type OverrideSyncPlan = {
+  kind: "override"
+  dir: string
+  files: { fileName: string; content: string }[]
+}
+
+export type SyncPlan = FamilySyncPlan | OverrideSyncPlan
+
+// Plan the override sync from a resolution's `overrides` map. Pure: no fs.
+// Returns null when the recipe activates no override entry (zero emission).
+export function planOverrideSync(overrides: Record<string, ForgeAgentDef>, opts: { dir: string; recipeFile: string }): OverrideSyncPlan | null {
+  const files: OverrideSyncPlan["files"] = []
+  for (const id of BUILTIN_OVERRIDE_IDS) {
+    const def = overrides[id]
+    if (def === undefined) continue
+    const compiled = compileOverrideEntry({ id, def, recipeFile: opts.recipeFile })
+    if (compiled !== null) files.push(compiled)
+  }
+  return files.length > 0 ? { kind: "override", dir: opts.dir, files } : null
 }
 
 // Provenance for one family (same rule as the v1 config hook: the global
@@ -196,7 +285,7 @@ export function planRosterSync(resolution: PoolResolution, opts: { globalPoolFil
       const compiled = compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined })
       return { matId, ...compiled }
     })
-    plans.push({ family, dir: agentDirFor(family.file), files })
+    plans.push({ kind: "family", family, dir: agentDirFor(family.file), files })
   }
   return plans
 }
@@ -219,8 +308,10 @@ function joinPath(dir: string, name: string): string {
 // destination — the temp file means a FAILED write never leaves a
 // half-written artifact), plus GC of orphaned generated forge-*.md files.
 // Fail-soft per file: one bad file records an error, its siblings still
-// apply.
-export function executeRosterSync(plans: FamilySyncPlan[], deps: RosterFsDeps = {}): SyncOutcome {
+// apply. Override plans (kind:"override") add the collision redline (a
+// hand-written same-name file is refused + disclosed, never overwritten)
+// and marker-keyed GC over the builtin id stems.
+export function executeRosterSync(plans: SyncPlan[], deps: RosterFsDeps = {}): SyncOutcome {
   const stat = deps.stat ?? (() => null)
   const readFile = deps.readFile ?? (() => {
     throw new Error("readFile unavailable")
@@ -249,6 +340,13 @@ export function executeRosterSync(plans: FamilySyncPlan[], deps: RosterFsDeps = 
       let tmp: string | null = null
       try {
         const existing = stat(dest) !== null ? readFile(dest) : null
+        // Collision redline (builtin-override D4): an existing destination
+        // WITHOUT the GENERATED marker is hand-written — refuse + disclose,
+        // never overwrite (byte-identical preserved), siblings still apply.
+        if (plan.kind === "override" && existing !== null && !existing.includes(GENERATED_MARKER)) {
+          out.errors.push(`${dest}: collision refused — a hand-written file of this exact name already exists; sync never overwrites it. Fold your changes into the global recipe's "override" entry, or rename/remove the hand-written file.`)
+          continue
+        }
         if (existing === file.content) {
           out.unchanged.push(dest)
           continue
@@ -282,12 +380,21 @@ export function executeRosterSync(plans: FamilySyncPlan[], deps: RosterFsDeps = 
     }
     // GC: generated forge-*.md files no longer in the recipe go away
     // ("删池文件即失池" mirror). Only files carrying the GENERATED marker —
-    // hand-written files (marker absent) are never touched.
+    // hand-written files (marker absent) are never touched. Override plans
+    // (kind:"override") key the SAME marker predicate on the builtin id
+    // stems only (no forge- prefix exists on those files); everything else
+    // in the directory — including the forge-global-* artifacts the global
+    // fallback family plan owns — is invisible to this plan.
+    const gcEligible = (name: string): boolean => {
+      if (!name.endsWith(".md")) return false
+      if (plan.kind === "override") return (BUILTIN_OVERRIDE_IDS as readonly string[]).some((id) => name === `${id}.md`)
+      return name.startsWith("forge-")
+    }
     try {
       const listing = readdir(plan.dir)
       if (listing !== null) {
         for (const name of listing) {
-          if (!name.startsWith("forge-") || !name.endsWith(".md")) continue
+          if (!gcEligible(name)) continue
           if (wanted.has(name)) continue
           const dest = joinPath(plan.dir, name)
           try {

@@ -292,16 +292,23 @@ function nonEmptyString(v: unknown): v is string {
   return typeof v === "string" && v.trim().length > 0
 }
 
-export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAgentDef>; findings: ForgeConfigFinding[] } {
+// The host's built-in subagent ids (probe 2026-11-21,
+// reports/probe-builtin-override.md): the agent identity key is the id =
+// filename stem, CASE-SENSITIVE — only the exact lowercase stems
+// `general`/`explore` truly override the built-ins; capitalized variants
+// create ambiguous duplicate entries and are never emitted.
+export const BUILTIN_OVERRIDE_IDS: readonly string[] = ["general", "explore"]
+
+export function validateAgentSet(raw: unknown, labelPrefix = "agents"): { agents: Record<string, ForgeAgentDef>; findings: ForgeConfigFinding[] } {
   const findings: ForgeConfigFinding[] = []
   const agents: Record<string, ForgeAgentDef> = {}
   if (raw === undefined) return { agents, findings }
   if (!isRecord(raw)) {
-    findings.push({ level: "error", code: "agents-not-object", message: 'forge.json "agents" must be an object mapping agent ids to definitions — the agent set is empty' })
+    findings.push({ level: "error", code: "agents-not-object", message: `forge.json "${labelPrefix}" must be an object mapping agent ids to definitions — the agent set is empty` })
     return { agents, findings }
   }
   for (const [rawId, entry] of Object.entries(raw)) {
-    let label = `agents.${rawId}`
+    let label = `${labelPrefix}.${rawId}`
     let id = rawId
     // Reserved-prefix self-heal (change align-forge-config-discovery): the
     // plugin materializes every id as `forge-<id>`, so a `forge-`-prefixed
@@ -393,6 +400,42 @@ export function validateAgentSet(raw: unknown): { agents: Record<string, ForgeAg
   }
   return { agents, findings }
 }
+
+// ---------------------------------------------------------------------------
+// Built-in override node (change builtin-override, design D1): a top-level
+// `override` map on the GLOBAL forge.json — `{"override": {"general": {...},
+// "explore": {...}}}`. GLOBAL layer only: a workspace pool file's override
+// node is ignored with a warn finding (per-project built-in overrides are a
+// non-goal; workspace agents always compile namespaced). Fail-soft exactly
+// like the agent set: unknown ids (and the capitalized negative form) warn +
+// skip, a half-configured entry is skipped with an error finding, siblings
+// still apply. Entries reuse the agent definition shape (model+thoughtLevel
+// atomic pair, prompt, shape).
+// ---------------------------------------------------------------------------
+export function validateOverrideNode(raw: unknown, label: string): { overrides: Record<string, ForgeAgentDef>; findings: ForgeConfigFinding[] } {
+  if (raw === undefined || raw === null) return { overrides: {}, findings: [] }
+  if (!isRecord(raw)) {
+    return {
+      overrides: {},
+      findings: [{ level: "warn", code: "override-node-invalid", message: `${label}: the top-level "override" field must be an object mapping built-in ids ("general", "explore") to definitions — field ignored` }],
+    }
+  }
+  const validated = validateAgentSet(raw, "override")
+  const overrides: Record<string, ForgeAgentDef> = {}
+  for (const [id, def] of Object.entries(validated.agents)) {
+    if (!BUILTIN_OVERRIDE_IDS.includes(id)) {
+      validated.findings.push({
+        level: "warn",
+        code: "override-id-unknown",
+        message: `${label}: override.${id} is not a built-in subagent id — the built-ins are exactly ${BUILTIN_OVERRIDE_IDS.map((i) => `"${i}"`).join(", ")} (lowercase, case-sensitive: a capitalized key creates an ambiguous duplicate, never an override) — entry skipped`,
+      })
+      continue
+    }
+    overrides[id] = def
+  }
+  return { overrides, findings: validated.findings }
+}
+
 
 // ---------------------------------------------------------------------------
 // dispatch node (harden-dispatch-resilience D3): optional per-file top-level
@@ -788,6 +831,9 @@ export type PoolResolution = {
   // Key: materialized id without the `forge-` prefix.
   agents: Record<string, MaterializedPoolAgent>
   findings: ForgeConfigFinding[]
+  // builtin-override D1: the GLOBAL file's validated `override` node (the
+  // only legal layer). Empty when absent/invalid/workspace-only.
+  overrides: Record<string, ForgeAgentDef>
 }
 
 export type PoolResolverDeps = {
@@ -867,7 +913,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
 
   // ---- mtime-cached parsed pool file (includes parse failures; the file
   // identity is the absolute path). `parsed: null` = no file at the path.
-  type ParsedPool = { agents: Record<string, ForgeAgentDef>; declaredPool: unknown; shared: string | null; findings: ForgeConfigFinding[] }
+  type ParsedPool = { agents: Record<string, ForgeAgentDef>; declaredPool: unknown; shared: string | null; overrides: Record<string, ForgeAgentDef> | null; findings: ForgeConfigFinding[] }
   const fileCache = new Map<string, { mtimeMs: number; size: number; parsed: ParsedPool | null }>()
   const readPool = (path: string): ParsedPool | null => {
     const st = stat(path)
@@ -886,6 +932,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
         agents: {},
         declaredPool: null,
         shared: null,
+        overrides: null,
         findings: [
           {
             level: "error",
@@ -895,10 +942,25 @@ export function createPoolResolver(deps: PoolResolverDeps): {
         ],
       }
     } else if (doc.config !== undefined && !isRecord(doc.config)) {
-      parsed = { agents: {}, declaredPool: null, shared: null, findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this pool contributes no agents` }] }
+      parsed = { agents: {}, declaredPool: null, shared: null, overrides: null, findings: [{ level: "error", code: "config-not-object", message: `${path}: top level must be an object — this pool contributes no agents` }] }
     } else {
       const top = doc.config === undefined ? undefined : (doc.config as Record<string, unknown>)
       const validated = validateAgentSet(top === undefined ? undefined : top.agents)
+      // builtin-override D1: the `override` node is GLOBAL-layer-only. On a
+      // workspace pool file it is ignored with a warn finding (workspace
+      // agents always compile namespaced — per-project built-in overrides
+      // are a non-goal); on the global file it validates fail-soft and
+      // surfaces on the resolution.
+      let overrides: Record<string, ForgeAgentDef> | null = null
+      if (top?.override !== undefined && top.override !== null) {
+        if (path === globalPath) {
+          const ov = validateOverrideNode(top.override, path)
+          validated.findings.push(...ov.findings)
+          overrides = ov.overrides
+        } else {
+          validated.findings.push({ level: "warn", code: "override-node-ignored-workspace", message: `${path}: the top-level "override" field is GLOBAL-layer-only (workspace pools always compile namespaced as forge-<ns>-<id>) — field ignored` })
+        }
+      }
       // forge-prompt-shared D2: per-file top-level `shared` — field-level
       // fail-soft exactly like `pool`. undefined/null → absent; a non-string
       // or trim-empty value records exactly ONE warn finding naming the file
@@ -915,7 +977,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
           validated.findings.push({ level: "warn", code: "shared-invalid", message: `${path}: the top-level "shared" field must be a non-empty string — ignored` })
         }
       }
-      parsed = { agents: validated.agents, declaredPool: top === undefined ? null : top.pool, shared, findings: validated.findings }
+      parsed = { agents: validated.agents, declaredPool: top === undefined ? null : top.pool, shared, overrides, findings: validated.findings }
     }
     fileCache.set(path, { mtimeMs: st.mtimeMs, size: st.size, parsed })
     return parsed
@@ -1054,7 +1116,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
         }
         origins.push({ file: f.file, ns: f.ns, declaredPool: f.declaredPool, shared: f.shared, materializedIds: ids })
       }
-      return { families: origins, agents, findings }
+      return { families: origins, agents, overrides: globalParsed?.overrides ?? {}, findings }
     },
   }
 }
