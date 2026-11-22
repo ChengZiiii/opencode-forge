@@ -46,9 +46,15 @@ sessions.clear）保持原样——本轮实锤的破坏只有杀 dispatch 行�
 
 ## D3 — v2 abort 接线（决策依赖 E1 探针，按序取第一个可用）
 
-1. v2 SDK ctx.session 暴露 abort → 直连（V2SessionClient 加 `abort`）。
-2. 宿主 HTTP API 有 session abort 端点（E1 正在 GET /api/doc 探测）→
-   经 service.json HTTP 读写器同款通道（plugin.ts:8646-8670 模式）接线。
+外部调研（E2，reports/research-community-competitors.md）实锤 v2 官方
+会话停止面存在：`ctx.session.interrupt({sessionID, resume:false})` +
+`ctx.session.remove`（opencode 官方 server 文档；v1 的 abort+replay 假设
+在 v2 已死）。决策树按序取第一个可用：
+
+1. **`ctx.session.interrupt`（首选，官方文档钉死）** → v2Setup ctx 传入
+   V2SessionClient 接 `abort`。
+2. 宿主 HTTP API 有 session abort/interrupt 端点（E1 GET /api/doc 探测）
+   → 经 service.json HTTP 读写器同款通道（plugin.ts:8646-8670 模式）。
 3. 都没有 → `abortChild` 开头 `typeof client.session.abort === "function"`
    检测，返回 `{ok:false, error:"abort unavailable on this session
    client"}`；**所有 killTree 调用点**（:3061, 3285, 3319, 3412, 3837,

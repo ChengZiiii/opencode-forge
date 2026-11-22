@@ -2,9 +2,22 @@
 
 ## D0 — 调研加固状态
 
-内部调研（C2 报告，全 file:line 实锤）已折入下列决策；外部竞品调研
-（E2：无模态确认/结构化验证门/plan 生命周期竞品实践）到达后在 crew
-wave 2 启动前复核 D1-D6，发现反例即修订本档再开工。
+内部调研（C2 报告，全 file:line 实锤）已折入下列决策。外部调研
+（E2，reports/research-community-competitors.md）**全部印证设计 A**：
+
+- 完成期模态 ask 不可辩护：opencode 自家 issue 区满是 ask 楔死
+  （#13715 嵌套会话 ask 永悬、#28312/#30136/#55678 TUI 对话框 stale/
+  循环/404），非交互模式 ask 自动拒绝（官方文档）；Claude Code 的答案
+  = 确定性 deny-with-reason，永不挂等人。
+- **插件验证式 close 有直接先例**：spec-kit `/speckit.implement` 只读
+  checkbox 状态、未勾即拒；Claude Code Stop-hook "测试不过不许结束"；
+  社区 opencode 插件在 tool.execute.before 里抛 "先跑测试"。
+- 转换点门保留 = 全行业同构（Claude Code plan mode / goose /plan /
+  Coder propose_plan 都只在计划→执行边界留一道交互）。
+- plan_reopen 平庸且被预期：所有被调查 harness 的 plan 都是文件
+  （spec-kit/OpenSpec/opencode 原生），可编辑可回滚是常态。
+
+无反例。D1-D6 维持原设计。
 
 ## D1 — 结构化 checks：goal 同构，文件即冻结态
 

@@ -2,8 +2,9 @@
 
 ## 1. Specification
 
-- [ ] 1.1 四件套就绪，`npx openspec validate fix-runtime-model-pin-variant
-      --strict` 绿；E2 外部调研（variant/深度钉扎先例）复核折入
+- [x] 1.1 四件套就绪，`npx openspec validate fix-runtime-model-pin-variant
+      --strict` 绿；E2 外部调研（variant/深度钉扎先例）复核折入（见
+      design D0 两个注意点）
 
 ## 2. Implementation（crew wave 3b：coder → test-coder → gate-verifier → spec-reviewer）
 

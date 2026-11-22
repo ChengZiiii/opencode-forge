@@ -2,8 +2,9 @@
 
 ## 1. Specification
 
-- [ ] 1.1 四件套就绪，`npx openspec validate command-surface-v2-cleanup
-      --strict` 绿；E2 外部调研（命令面实践）复核折入
+- [x] 1.1 四件套就绪，`npx openspec validate command-surface-v2-cleanup
+      --strict` 绿；E2 外部调研（命令面实践）复核折入（无反例——见
+      design D0）
 
 ## 2. Implementation（crew wave 3a：coder → test-coder → gate-verifier → spec-reviewer）
 

@@ -14,6 +14,12 @@ dispose) — user abort"`，wake 渲染成 `finished / Final report:
    `jobManager.disposeAll()`。v2 多上下文宿主上任何一处上下文回收都触发，
    **进程内所有会话的在飞派发全部被杀**——而 dispose 钩子无参数
    （`Hooks.dispose?: () => Promise<void>`），根本无法按上下文收敛。
+   外部实证（E2 调研，kimaki v2 迁移指南 + 官方 migrate-v1 文档）：
+   **v2 的 cleanup 在插件 reload 和 location shutdown 时都会触发、且
+   宿主继续活着**——dispose 时点的杀不是边缘场景而是日常时点；官方
+   契约原文 cleanup 只管"插件自有的 timers/subprocesses/sockets"，
+   生态里没有任何插件把杀别家会话在飞工作耦合进 dispose（持久派发
+   插件全部广告"survival + restart recovery"为特性）。
 2. **杀是纯破坏**：dispatch 行没有 pid（无本地进程树），孩子是服务端
    会话，宿主进程死活不影响它；kill 对 dispatch 行只剩两个副作用——
    journal 写 aborted（让重启恢复**跳过**还活着的孩子）+ 丢 wake。连续性

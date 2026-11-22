@@ -2,8 +2,21 @@
 
 ## D0 — 调研加固状态
 
-内部调研（C4 报告）实锤丢失点与测试矛盾；E2 外部调研（Q4 variant/深度
-钉扎社区先例）到达后 wave 3 开工前复核。
+内部调研（C4 报告）实锤丢失点与测试矛盾。外部调研（E2）印证与两个
+注意点：
+
+- variant 在子会话被丢弃是**已知上游 bug 类**（#21632 "subagent model
+  variants are parsed but not applied"；#25126/#18634 UI 显示默认档
+  而非生效档）——我们修的是自己 pin 层的丢失，不是上游的锅。
+- **官方钉死通道**：agent/command 的 `model: provider/model#variant`
+  与 per-model variant 设置；根配置不保留 variant（文档明示）。
+- 注意点 1（D3 已记账）：options 注入的键名要对照 2.3.2 vendored
+  provider 包核实（`thoughtLevel` vs `effort`/`reasoningEffort`——
+  公开 AI SDK 已改名 effort）；本轮不动注入腿，但 coder 落地 D1 时
+  以本地包为准。
+- 注意点 2：生效深度的**显示**是上游未解题（#58809）；我们修 model
+  record 的 variant（UI 读的正是它），若显示仍 Default 则按上游已知
+  限制记录，不硬扛。
 
 ## D1 — pin 重写规则（plugin.ts :8138-8169 段）
 

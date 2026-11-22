@@ -2,8 +2,9 @@
 
 ## 1. Specification
 
-- [ ] 1.1 四件套就绪，`npx openspec validate plan-close-verified
-      --strict` 绿；E2 外部调研结论复核折入（反例即修订 design）
+- [x] 1.1 四件套就绪，`npx openspec validate plan-close-verified
+      --strict` 绿；E2 外部调研结论复核折入（无反例，设计 A 全部获
+      先例印证——见 design D0）
 
 ## 2. Implementation（crew wave 2：coder → test-coder → gate-verifier → spec-reviewer）
 
