@@ -49,7 +49,7 @@
 - [ ] 4.1 Version 0.32.0 → 0.32.1 (`chore: release 0.32.1` commit).
 - [ ] 4.2 `npm pack --dry-run` whitelist check → `npm pack` → publish from
       the tgz → poll `dist-tags` until `latest = 0.32.1`.
-- [ ] 4.3 Quarantine the host cache copy of 0.32.0; config already points
+- [x] 4.3 Quarantine the host cache copy of 0.32.0; config already points
       at the npm specifier (no config surgery needed).
 - [ ] 4.4 User restarts; real pinned dispatch to a pool worker completes
       (drain passes; report arrives). shasum/dist-tags reported for 对账.
