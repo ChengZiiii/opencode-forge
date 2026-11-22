@@ -479,6 +479,7 @@ test("v2 setup: hideNativeAgents JSONC boundary — comments/trailing commas hon
 // ---------------------------------------------------------------------------
 
 import { v2SessionClientForTests, resetServiceHttpDiscoveryForTests } from "../plugin.ts"
+import { fetchFinalMessage } from "../src/dispatch-async.ts"
 
 function svcCtx() {
   return {
@@ -584,6 +585,144 @@ test("v2 adapter messages: no service.json yet — reader wired but capabilityPe
     assert.equal(res.error, undefined, "pending is NOT an error (never counts as view loss)")
     assert.ok(adapter?.session.prompt, "the rest of the adapter is unaffected")
   } finally {
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+// ---------------------------------------------------------------------------
+// 0.32.3 row-shape fix (real-host proven 2026-11-23): the 2.3.2 session-
+// message HTTP surface ships BARE rows — {id, time:{created,...},
+// type:"assistant"|"user"|"idle", content: part[] | text: string, finish?,
+// error?} — NOT the v1-like {info:{role,time},parts} envelope the dispatch
+// core reads. Un-normalized, latestAssistant() filtered EVERY row out and
+// every dispatch-complete wake read "no assistant response found" even
+// though the child's final text was in the store (the earlier tests in this
+// block mocked the enveloped shape and encoded the wrong assumption — they
+// now double as the passthrough contract).
+// ---------------------------------------------------------------------------
+
+function bareRowsFixture() {
+  return [
+    { id: "msg_idle", time: { created: 1795368263098 }, type: "idle", outcome: "success" },
+    {
+      id: "msg_asst",
+      time: { created: 1795368257609, firstToken: 1795368263070, streamed: 1795368263091, completed: 1795368263093 },
+      type: "assistant",
+      agent: "forge-sorenunitylabs-scout",
+      model: { id: "glm-5.3", providerID: "glm-coding-worker" },
+      content: [
+        { type: "reasoning", text: "thinking…" },
+        { type: "text", text: "the final report" },
+      ],
+      finish: "stop",
+      rawFinish: "stop",
+      cost: 0.01,
+      tokens: { input: 10, output: 5 },
+    },
+    { id: "msg_user", time: { created: 1795368257562 }, type: "user", text: "do the thing" },
+  ]
+}
+
+test("v2 adapter messages: BARE 2.3.2 rows (real-host shape) normalize into the v1-like envelope; idle markers drop", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48004", password: "pw" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(bareRowsFixture()) })
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    const res = await adapter.session.messages({ path: { id: "ses_bare" } })
+    assert.equal(res.error, undefined)
+    assert.equal(res.data.length, 2, "the idle bookkeeping marker is dropped, assistant+user remain")
+    const asst = res.data[0]
+    assert.equal(asst.info.role, "assistant")
+    assert.equal(asst.info.id, "msg_asst")
+    assert.equal(asst.info.finish, "stop")
+    assert.equal(asst.info.time.created, 1795368257609)
+    assert.equal(asst.info.time.completed, 1795368263093)
+    assert.deepEqual(asst.parts.filter((p) => p.type === "text").map((p) => p.text), ["the final report"], "assistant content maps 1:1 to parts")
+    const user = res.data[1]
+    assert.equal(user.info.role, "user")
+    assert.deepEqual(user.parts, [{ type: "text", text: "do the thing" }], "a user row's top-level text becomes a text part")
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+test("v2 adapter messages: fetchFinalMessage reads the final text from BARE rows (the real-host wake carrier)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48005", password: "pw" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(bareRowsFixture()) })
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    const client = { session: { messages: adapter.session.messages } }
+    const fin = await fetchFinalMessage(client, "ses_bare")
+    assert.equal(fin.ok, true, "the wake carrier reads the child's real final text from bare rows")
+    assert.equal(fin.ok ? fin.text : "", "the final report")
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+test("v2 adapter messages: enveloped rows pass through untouched (upstream may revert to the info shape)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48006", password: "pw" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  const enveloped = [{ info: { role: "assistant", time: { created: 5 } }, parts: [{ type: "text", text: "already enveloped" }] }]
+  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(enveloped) })
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    const res = await adapter.session.messages({ path: { id: "ses_env" } })
+    assert.deepEqual(res.data, enveloped, "an already-enveloped row is NOT re-wrapped")
+    const fin = await fetchFinalMessage({ session: { messages: adapter.session.messages } }, "ses_env")
+    assert.equal(fin.ok, true)
+    assert.equal(fin.ok ? fin.text : "", "already enveloped")
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+test("v2 adapter messages: numeric time tolerated; an assistant row with no text parts yields the honest empty-text error", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48007", password: "pw" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  globalThis.fetch = async () => ({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify([{ id: "m", time: 1795368257609, type: "assistant", content: [], finish: "stop" }]),
+  })
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    const res = await adapter.session.messages({ path: { id: "ses_num" } })
+    assert.equal(res.data[0].info.time.created, 1795368257609, "numeric epoch time maps to created")
+    const fin = await fetchFinalMessage({ session: { messages: adapter.session.messages } }, "ses_num")
+    assert.equal(fin.ok, false)
+    assert.match(fin.ok ? "" : String(fin.error), /no assistant text output found/, "found-but-textless is its own honest error, distinct from not-found")
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
     delete process.env.FORGE_SERVICE_FILE
     resetServiceHttpDiscoveryForTests()
   }
