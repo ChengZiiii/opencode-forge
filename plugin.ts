@@ -8129,6 +8129,9 @@ function v2ContextInjection(raw: unknown): void {
       if (identity && o.model && typeof o.model === "object") {
         const before = JSON.stringify(o.model)
         const m = o.model as { providerID?: unknown; id?: unknown; modelID?: unknown; variant?: unknown }
+        // Host contract (fix-dispatch-model-pin-shape): the runner composes
+        // providerID + "/" + model.id — `id`/`modelID` stay BARE here, same
+        // as the dispatch-async create seam (guarded by unit tests there).
         m.providerID = identity.provider
         m.id = identity.model
         m.modelID = identity.model

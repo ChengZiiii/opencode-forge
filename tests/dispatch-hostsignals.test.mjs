@@ -25,6 +25,7 @@ process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS = "150"
 process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "forge-hostsignals-home-"))
 
 import { createChildSession } from "../src/dispatch-async.ts"
+import { parseIdentity } from "../src/models-dev.ts"
 import {
   adoptPersistedDispatchRows,
   noteDispatchChildActivity,
@@ -117,7 +118,7 @@ const rowOf = (over) => ({
 // ---------------------------------------------------------------------------
 // ① Create body carries agent/model; read-back assert classifies binding-lost
 
-test("create body: pinned model rides {providerID, modelID, id} and the agent id (host subagent contract shape)", async () => {
+test("create body: pinned model rides {providerID, modelID, id} with a BARE id (host composes providerID + '/' + id at runner select)", async () => {
   const bodies = []
   const client = {
     session: {
@@ -140,9 +141,41 @@ test("create body: pinned model rides {providerID, modelID, id} and the agent id
   assert.equal(body.agent, "forge-ns-worker", "the target agent rides the create body")
   assert.deepEqual(
     body.model,
-    { providerID: "openai", modelID: "gpt-x", id: "openai/gpt-x" },
-    "the pinned model rides the probe-proven {providerID, modelID, id} shape",
+    { providerID: "openai", modelID: "gpt-x", id: "gpt-x" },
+    "the pinned model rides the probe-proven shape with the BARE model id in `id`",
   )
+  assert.ok(
+    !String(body.model.id).includes("/"),
+    "model record id must never contain '/' — the runner composes providerID + '/' + id itself (tripled-key regression guard, fix-dispatch-model-pin-shape)",
+  )
+})
+
+test("create body: a provider-qualified pin string parsed through the identity contract still lands bare (both pin legs share the seam)", async () => {
+  // rosterModelPin (direct dispatch) and the adopted-row re-spawn both feed
+  // the same createChildSession seam with {providerID, modelID} from
+  // parseIdentity — this test pairs the legs on the shared contract.
+  const pin = parseIdentity("glm-coding-worker/glm-5.3")
+  assert.deepEqual(pin, { provider: "glm-coding-worker", model: "glm-5.3" })
+  const bodies = []
+  const client = {
+    session: {
+      create: async (args) => {
+        bodies.push(args.body)
+        return { data: { id: "ses_pin", agent: "forge-ns-worker" } }
+      },
+    },
+  }
+  const res = await createChildSession(client, {
+    parentSessionID: "ses_owner",
+    parentDirectory: "/w",
+    agentID: "forge-ns-worker",
+    description: "d",
+    modelPin: { providerID: pin.provider, modelID: pin.model },
+    assertBinding: true,
+  })
+  assert.equal(res.ok, true)
+  assert.equal(bodies[0].model.id, "glm-5.3", "bare id for the real-world production pin shape")
+  assert.equal(bodies[0].model.providerID, "glm-coding-worker")
 })
 
 test("create body: an Auto worker (no pin) sends NO model key", async () => {

@@ -238,15 +238,18 @@ export async function createChildSession(
         // existence here (task 1.1 probe: a bogus agent is accepted and
         // echoed) — the refusal-not-degrade check lives with the caller.
         agent: input.agentID,
-        // The pinned model rides the roster pin (shape per task 1.1 probe:
-        // {providerID, modelID, id}; the record stores {id, providerID,
-        // variant}). Absent for Auto workers by design.
+        // The pinned model rides the roster pin. Host contract (2.3.2 probe
+        // matrix, fix-dispatch-model-pin-shape design.md): the session model
+        // record stores `id` VERBATIM and the runner composes the select key
+        // as `providerID + "/" + id` — so `id` MUST be the bare model id; a
+        // provider-qualified id yields a tripled key and kills the child at
+        // drain (ModelUnavailableError). Absent for Auto workers by design.
         ...(input.modelPin
           ? {
               model: {
                 providerID: input.modelPin.providerID,
                 modelID: input.modelPin.modelID,
-                id: `${input.modelPin.providerID}/${input.modelPin.modelID}`,
+                id: input.modelPin.modelID,
               },
             }
           : {}),
