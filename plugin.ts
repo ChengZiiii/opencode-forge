@@ -79,7 +79,7 @@ import { compileRosterEntry, executeRosterSync, globalAgentDirFor, planOverrideS
 import type { PoolProvenance } from "./src/dispatch-tiers.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, ACTIVE_TEXTFUL_OVERRIDE_NOTE, type DispatchClient, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
+import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, ACTIVE_TEXTFUL_OVERRIDE_NOTE, type DispatchClient, type SessionMessageLike, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
 import { buildRetryPrompt, classifyDispatchError, resolveMaxAttempts, resolveRetryBackoffMs } from "./src/dispatch-retry.ts"
 import { createDispatchGate, type DispatchGate, type ModelIdentity } from "./src/dispatch-gate.ts"
 import { withReportDelivery } from "./src/dispatch-prompt.ts"
@@ -8658,12 +8658,54 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
       const parsed = JSON.parse(await res.text()) as unknown
       const arr = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === "object" && Array.isArray((parsed as { data?: unknown }).data) ? (parsed as { data: unknown[] }).data : undefined)
       if (!Array.isArray(arr)) return { error: "unexpected message payload shape" }
-      return { data: arr }
+      // 0.32.3: the 2.3.2 surface ships BARE rows (type/content/time at top
+      // level, no info envelope) — translate into the v1-like shape the
+      // dispatch core reads, or latestAssistant() filters everything out
+      // and every wake reads "no assistant response found" (real-host
+      // proven 2026-11-23).
+      return { data: arr.map(normalizeV2MessageRow).filter((x): x is SessionMessageLike => x !== null) }
     } catch (e) {
       return { error: String(e) }
     }
   }
   return Object.keys(out).length > 0 ? { session: out } : null
+}
+
+// 0.32.3 row-shape reality (real-host capture, 2.3.2): the session-message
+// HTTP rows are BARE —
+//   assistant: {id, time:{created,firstToken,streamed,completed}, type:
+//              "assistant", agent, model, content: part[], finish,
+//              rawFinish, cost, tokens}
+//   user:      {id, time:{created}, type: "user", text: string}
+//   idle:      {id, time:{created}, type: "idle", outcome}   ← bookkeeping
+// The dispatch core (fetchFinalMessage/latestAssistant/pollChild) reads the
+// v1-like envelope {info:{role,finish,error,time:{created,completed}},parts}.
+// Translate one row; enveloped rows (info already present) pass through
+// untouched (upstream may revert to the enveloped shape); idle markers and
+// unclassifiable rows return null (dropped). The content array and the
+// v1 parts array share the {type,text} part spelling, so assistant content
+// maps 1:1; a user row's top-level text becomes a single text part.
+export function normalizeV2MessageRow(row: unknown): SessionMessageLike | null {
+  if (row === null || typeof row !== "object") return null
+  const r = row as Record<string, unknown>
+  if (r.info !== undefined && typeof r.info === "object") return r as unknown as SessionMessageLike
+  const type = typeof r.type === "string" ? r.type : undefined
+  if (!type || type === "idle") return null
+  const t = r.time as { created?: unknown; completed?: unknown } | number | undefined
+  const created = typeof t === "number"
+    ? t
+    : (t !== undefined && t !== null && typeof t === "object" && typeof t.created === "number" ? t.created : 0)
+  const parts = Array.isArray(r.parts)
+    ? (r.parts as Array<{ type?: string; text?: string }>)
+    : Array.isArray(r.content)
+      ? (r.content as Array<{ type?: string; text?: string }>)
+      : typeof r.text === "string" && r.text !== "" ? [{ type: "text", text: r.text }] : []
+  const info: NonNullable<SessionMessageLike["info"]> = { role: type, time: { created } }
+  if (typeof r.id === "string") info.id = r.id
+  if (typeof r.finish === "string") info.finish = r.finish
+  if (r.error !== undefined) info.error = r.error
+  if (t !== undefined && t !== null && typeof t === "object" && typeof t.completed === "number") info.time!.completed = t.completed
+  return { info, parts }
 }
 
 // W6a field reality (SDK 2.3.2 @opencode/protocol session-event.d.ts +

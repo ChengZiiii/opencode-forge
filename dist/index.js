@@ -23454,12 +23454,35 @@ function v2SessionClient(ctx) {
       const arr = Array.isArray(parsed) ? parsed : parsed && typeof parsed === "object" && Array.isArray(parsed.data) ? parsed.data : undefined;
       if (!Array.isArray(arr))
         return { error: "unexpected message payload shape" };
-      return { data: arr };
+      return { data: arr.map(normalizeV2MessageRow).filter((x) => x !== null) };
     } catch (e) {
       return { error: String(e) };
     }
   };
   return Object.keys(out).length > 0 ? { session: out } : null;
+}
+function normalizeV2MessageRow(row) {
+  if (row === null || typeof row !== "object")
+    return null;
+  const r = row;
+  if (r.info !== undefined && typeof r.info === "object")
+    return r;
+  const type = typeof r.type === "string" ? r.type : undefined;
+  if (!type || type === "idle")
+    return null;
+  const t = r.time;
+  const created = typeof t === "number" ? t : t !== undefined && t !== null && typeof t === "object" && typeof t.created === "number" ? t.created : 0;
+  const parts = Array.isArray(r.parts) ? r.parts : Array.isArray(r.content) ? r.content : typeof r.text === "string" && r.text !== "" ? [{ type: "text", text: r.text }] : [];
+  const info = { role: type, time: { created } };
+  if (typeof r.id === "string")
+    info.id = r.id;
+  if (typeof r.finish === "string")
+    info.finish = r.finish;
+  if (r.error !== undefined)
+    info.error = r.error;
+  if (t !== undefined && t !== null && typeof t === "object" && typeof t.completed === "number")
+    info.time.completed = t.completed;
+  return { info, parts };
 }
 function v2EventFields(raw) {
   if (raw === null || typeof raw !== "object")
@@ -23822,6 +23845,7 @@ export {
   observedOrphanDispatches,
   noteDispatchTerminalSignal,
   noteDispatchChildActivity,
+  normalizeV2MessageRow,
   isRootish,
   isDispatchCancelled,
   gate,
