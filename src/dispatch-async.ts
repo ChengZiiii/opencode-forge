@@ -7,10 +7,23 @@
 // for the exact verified call shapes):
 //   session.create   POST /session                       body {parentID,title,permission,...} query {directory}
 //   session.promptAsync POST /session/{id}/prompt_async  body {agent,parts:[{type:"text",text}]} → 204 void
+//                     (v1-generation spelling; on host 2.3.2 there is NO
+//                     prompt_async — the host-blessed fire-and-forget is
+//                     POST /api/session/{id}/prompt, durable admission with
+//                     resume:false; the v2 adapter approximates it via the
+//                     blocking prompt send, see plugin.ts v2SessionClient)
 //   session.status   GET  /session/status                → { [sessionID]: {type:"idle"|"busy"|"retry"} }
 //   session.messages GET  /session/{id}/message          → [{info:{role,finish,error,time},parts:[{type,text}]}]
 //   session.get      GET  /session/{id}                  → session record ({time:{updated}}) — fold B probe
-//   session.abort    POST /session/{id}/abort            → boolean
+//   session.abort    OPTIONAL capability (fix-dispatch-dispose-kill D3):
+//                     the v1-generation POST /session/{id}/abort does NOT
+//                     exist on host 2.3.2 (live openapi.json probe
+//                     2026-11-23: 142 paths, zero abort). The 2.3.2 stop
+//                     surface is POST /api/session/{sessionID}/interrupt
+//                     (optional resume query, 200 {interrupted:boolean},
+//                     idle interruption is a no-op); the v2 adapter wires
+//                     that seam as `abort`. Absence → abortChild returns an
+//                     honest unavailable error (never a swallowed TypeError).
 //
 // The clock and sleeper are injectable so tests drive polls
 // deterministically. Wiring (plugin.ts) owns gates, handles, wakes.
@@ -124,7 +137,15 @@ export type DispatchClient = {
       path: { id: string }
       query?: { limit?: number }
     }) => Promise<{ data?: SessionMessageLike[]; error?: unknown; capabilityPending?: boolean }>
-    abort: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<unknown>
+    /**
+     * Stop surface for a child session (v1: POST /session/{id}/abort →
+     * boolean). OPTIONAL by capability (fix-dispatch-dispose-kill D3): the
+     * v2 adapter wires the 2.3.2 interrupt seam (promise-layer
+     * ctx.session.interrupt / HTTP POST /api/session/{id}/interrupt) under
+     * this name; abortChild's typeof guard turns absence into an honest
+     * `{ok:false, error:"abort unavailable on this session client"}`.
+     */
+    abort?: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<unknown>
   }
 }
 
@@ -934,6 +955,12 @@ export async function fetchFinalMessage(
 export type AbortResult = { ok: true } | { ok: false; error: string }
 
 export async function abortChild(client: DispatchClient, sessionID: string): Promise<AbortResult> {
+  // fix-dispatch-dispose-kill D3 branch 3: explicit capability check — an
+  // abort-less client (no v1 abort method, no v2 interrupt seam) returns an
+  // honest unavailable error instead of a swallowed TypeError.
+  if (typeof client.session.abort !== "function") {
+    return { ok: false, error: "abort unavailable on this session client" }
+  }
   try {
     await client.session.abort({ path: { id: sessionID } })
   } catch (e) {

@@ -308,10 +308,26 @@ export function createJobManager(opts: JobManagerOptions = {}) {
   // ledgered), unread terminal completions are ledgered, everything the
   // session owned leaves the registry. Surviving jobs opted out of death
   // entirely — they stay running and in the table.
-  function onSessionEnd(sessionID: string): void {
+  //
+  // fix-dispatch-dispose-kill D2 (wake 必达): `keep` rows (dispatch rows)
+  // are still killed when live — owner death is a LEGAL registry kill — but
+  // are NOT deleted synchronously: markTerminal queues the completion wake,
+  // and deliverWakesFor only traverses the live Map, so the row must stay
+  // for the queued wake to be deliverable. Kept rows self-clear via the
+  // existing read-consumption path (poll on a terminal row) and the
+  // finished-job eviction caps.
+  function onSessionEnd(sessionID: string, keep?: (job: Job) => boolean): void {
     for (const job of [...jobs.values()]) {
       if (job.ownerSession !== sessionID) continue
       if (job.survive) continue
+      if (keep?.(job)) {
+        if (!isTerminal(job)) {
+          if (job.scope === "global") continue
+          kill(job)
+          emit("orphan-job", job, `owner session ended; registry kill issued (row kept for wake delivery — was: ${job.cmd.slice(0, 120)})`)
+        }
+        continue
+      }
       if (!isTerminal(job)) {
         if (job.scope === "global") continue
         kill(job)
@@ -323,9 +339,13 @@ export function createJobManager(opts: JobManagerOptions = {}) {
     }
   }
 
-  function disposeAll(): void {
+  // fix-dispatch-dispose-kill D1: skipped rows (dispatch rows) are neither
+  // killed nor deleted — no state change, no ledger entry. Their settle
+  // loops keep watching and continuity rides the journal + restart recovery.
+  function disposeAll(skip?: (job: Job) => boolean): void {
     for (const job of [...jobs.values()]) {
       if (job.survive) continue
+      if (skip?.(job)) continue
       if (!isTerminal(job)) {
         kill(job)
         emit("orphan-job", job, "plugin dispose; tree killed")

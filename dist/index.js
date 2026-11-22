@@ -13605,12 +13605,21 @@ function createJobManager(opts = {}) {
       job.ownerSession = toSession;
     return job;
   }
-  function onSessionEnd(sessionID) {
+  function onSessionEnd(sessionID, keep) {
     for (const job of [...jobs.values()]) {
       if (job.ownerSession !== sessionID)
         continue;
       if (job.survive)
         continue;
+      if (keep?.(job)) {
+        if (!isTerminal2(job)) {
+          if (job.scope === "global")
+            continue;
+          kill(job);
+          emit("orphan-job", job, `owner session ended; registry kill issued (row kept for wake delivery — was: ${job.cmd.slice(0, 120)})`);
+        }
+        continue;
+      }
       if (!isTerminal2(job)) {
         if (job.scope === "global")
           continue;
@@ -13622,9 +13631,11 @@ function createJobManager(opts = {}) {
       jobs.delete(job.id);
     }
   }
-  function disposeAll() {
+  function disposeAll(skip) {
     for (const job of [...jobs.values()]) {
       if (job.survive)
+        continue;
+      if (skip?.(job))
         continue;
       if (!isTerminal2(job)) {
         kill(job);
@@ -14436,12 +14447,14 @@ function createExitCleanup(manager, opts = {}) {
   const liveTargets = () => {
     const targets = [];
     for (const job of manager.list()) {
-      if (job.state === "running" && !job.survive)
+      if (job.state === "running" && !job.survive && !opts.skip?.(job))
         targets.push(job);
     }
     return targets;
   };
   const killOne = (job, graceful) => {
+    if (opts.skip?.(job))
+      return;
     const pid = job.pid ?? 0;
     if (pid > 0) {
       terminateTreeSync(pid, {
@@ -17406,6 +17419,9 @@ async function fetchFinalMessage(client, sessionID) {
   return { ok: true, text };
 }
 async function abortChild(client, sessionID) {
+  if (typeof client.session.abort !== "function") {
+    return { ok: false, error: "abort unavailable on this session client" };
+  }
   try {
     await client.session.abort({ path: { id: sessionID } });
   } catch (e) {
@@ -18354,6 +18370,7 @@ function ensureJobLifecycle() {
   });
   exitCleanup = createExitCleanup(jobManager, {
     graceMs: 3000,
+    skip: isDispatchRow,
     after: () => {
       jobFence?.dispose();
     }
@@ -18413,6 +18430,27 @@ function sharedAnchorClient() {
   return anchorClientShared;
 }
 var idleJobSessions = new Set;
+function isDispatchRow(job) {
+  return job.dispatch != null;
+}
+var abortUnconfirmedNotes = new Map;
+function dispatchKillTreeHook(client, jobId, childSessionID) {
+  return () => {
+    const job = jobManager.get(jobId);
+    const meta = job ? job.dispatch : undefined;
+    if (meta && meta.outcome !== "stream-lost/unknown") {
+      meta.outcome = "aborted";
+      meta.abortReason = meta.abortReason ?? "registry kill (owner session ended / user cancel)";
+    }
+    const sid = childSessionID();
+    if (!sid)
+      return;
+    abortChild(client, sid).then((res) => {
+      if (!res.ok)
+        abortUnconfirmedNotes.set(jobId, res.error);
+    });
+  };
+}
 function jobWakeText(job) {
   const dispatch = job.dispatch;
   if (dispatch) {
@@ -18422,6 +18460,16 @@ function jobWakeText(job) {
         `Last observation:
 ${job.tail.slice(-2500) || "(no output)"}`,
         `Ground-truth recovery: read reports/${job.id}-report.md in the workspace BEFORE considering a re-dispatch; the child session stays inspectable and natively abortable in the host TUI.`
+      ].join(`
+`);
+    }
+    if (job.state === "killed" || dispatch.outcome === "aborted") {
+      const reason = dispatch.abortReason ?? "registry kill (owner session ended / user cancel)";
+      const unconfirmed = abortUnconfirmedNotes.get(job.id);
+      return [
+        `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — ABORTED (task ${job.id}, child session ${dispatch.childSessionID}): ${reason}.`,
+        unconfirmed ? `abort unconfirmed — child may still be running (${unconfirmed}); inspect or abort it natively in the host TUI.` : `The child session was aborted; this dispatch did NOT finish and produced no final report.`,
+        `Ground truth if needed: reports/${job.id}-report.md in the workspace, or the child transcript in the host TUI.`
       ].join(`
 `);
     }
@@ -19760,9 +19808,7 @@ async function pumpDispatchQueue(client, sessionID) {
       ownerSession: wish.ownerSession,
       logPath: join6(jobLogDir, "dispatch", `${wish.jobId}.txt`),
       notify: true,
-      killTree: () => {
-        abortChild(client, created.sessionID);
-      }
+      killTree: dispatchKillTreeHook(client, wish.jobId, () => created.sessionID)
     });
     job.dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description };
     dispatchTasks.set(wish.jobId, { jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description });
@@ -19896,9 +19942,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
           ownerSession: rec.ownerSession,
           logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
           notify: true,
-          killTree: () => {
-            abortChild(client, childId);
-          }
+          killTree: dispatchKillTreeHook(client, rec.id, () => childId)
         });
         job2.dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" };
         jobManager.appendOutput(job2, fin.text);
@@ -19923,9 +19967,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
       ownerSession: rec.ownerSession,
       logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
       notify: true,
-      killTree: () => {
-        abortChild(client, childId);
-      }
+      killTree: dispatchKillTreeHook(client, rec.id, () => childId)
     });
     job.dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" };
     dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" });
@@ -20000,9 +20042,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
         ownerSession: rec.ownerSession,
         logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
         notify: true,
-        killTree: () => {
-          abortChild(client, respawn.sessionID);
-        }
+        killTree: dispatchKillTreeHook(client, rec.id, () => respawn.sessionID)
       });
       job.dispatch = { agentID: rec.agent, childSessionID: respawn.sessionID, description: rec.description ?? "" };
       dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" });
@@ -20229,9 +20269,7 @@ function rearmDispatchWatch(client, input) {
     ownerSession: input.ownerSession,
     logPath: join6(jobLogDir, "dispatch", `${input.id}.txt`),
     notify: true,
-    killTree: () => {
-      abortChild(client, input.childId);
-    }
+    killTree: dispatchKillTreeHook(client, input.id, () => input.childId)
   });
   job.dispatch = { agentID: input.agent, childSessionID: input.childId, description: input.description };
   dispatchTasks.set(input.id, { jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description });
@@ -20459,7 +20497,8 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
         await new Promise((resolve2) => setTimeout(resolve2, retryBackoffMs));
         if (job.state !== "running") {
           dispatchTasks.delete(job.id);
-          journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", "registry kill during retry backoff (owner session ended / dispose) — user abort, never retried");
+          const unconfirmed1 = abortUnconfirmedNotes.get(job.id);
+          journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", `registry kill during retry backoff (owner session ended / dispose) — user abort, never retried${unconfirmed1 ? ` — abort unconfirmed — child may still be running (${unconfirmed1})` : ""}`);
           return;
         }
         const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID) ?? forgeTargetUnresolved(agentID);
@@ -20527,9 +20566,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           questionDeny: retryCtx.questionDeny,
           description: dispatch?.description ?? ""
         });
-        job.killTree = () => {
-          abortChild(client, childSessionID);
-        };
+        job.killTree = dispatchKillTreeHook(client, job.id, () => childSessionID);
         stability.stableTicks = 0;
         stability.activeTextfulTicks = 0;
         stability.textlessIdleSince = undefined;
@@ -20560,7 +20597,9 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
     }
     if (job.state !== "running") {
       dispatchTasks.delete(job.id);
-      journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", isDispatchCancelled(job.id) ? "cancelled by the user lever (forge-cancel) — the child was aborted and the dispatch is never retried" : "registry kill (owner session ended / dispose) — user abort");
+      const unconfirmed = abortUnconfirmedNotes.get(job.id);
+      const suffix = unconfirmed ? ` — abort unconfirmed — child may still be running (${unconfirmed})` : "";
+      journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", isDispatchCancelled(job.id) ? `cancelled by the user lever (forge-cancel) — the child was aborted and the dispatch is never retried${suffix}` : `registry kill (owner session ended / dispose) — user abort${suffix}`);
       return;
     }
     if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
@@ -21136,9 +21175,7 @@ ${fin.text}`].join(`
           ownerSession: context.sessionID,
           logPath: join6(jobLogDir, "dispatch", `${syncJobId}.txt`),
           notify: true,
-          killTree: () => {
-            abortChild(client, childSessionID);
-          }
+          killTree: dispatchKillTreeHook(client, syncJobId, () => childSessionID)
         });
         job2.dispatch = { agentID: target, childSessionID, description };
         dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description });
@@ -21184,9 +21221,7 @@ ${fin.text}`].join(`
       ownerSession: context.sessionID,
       logPath: join6(jobLogDir, "dispatch", `${jobId}.txt`),
       notify: true,
-      killTree: () => {
-        abortChild(client, created.sessionID);
-      }
+      killTree: dispatchKillTreeHook(client, jobId, () => created.sessionID)
     });
     job.dispatch = { agentID: target, childSessionID: created.sessionID, description };
     dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description });
@@ -22036,7 +22071,7 @@ function scheduleIdleContinuation(client, sessionID) {
   }, IDLE_DEBOUNCE_MS));
 }
 function harvestSessionEnd(sessionID) {
-  jobManager.onSessionEnd(sessionID);
+  jobManager.onSessionEnd(sessionID, isDispatchRow);
   for (const [id, handle] of [...dispatchTasks]) {
     if (handle.ownerSession === sessionID)
       dispatchTasks.delete(id);
@@ -22142,7 +22177,7 @@ var server = async (input, options) => {
     dispose: async () => {
       engineForgetAll();
       exitCleanup?.trigger("dispose");
-      jobManager.disposeAll();
+      jobManager.disposeAll(isDispatchRow);
       watchdog.dispose();
       sessions.clear();
     },
@@ -23457,6 +23492,30 @@ function v2SessionClient(ctx) {
       return { data: arr.map(normalizeV2MessageRow).filter((x) => x !== null) };
     } catch (e) {
       return { error: String(e) };
+    }
+  };
+  const rawInterrupt = typeof s.interrupt === "function" ? s.interrupt.bind(s) : undefined;
+  out.abort = async (args) => {
+    const sid = v2SessionIdOf(args) ?? (args !== null && typeof args === "object" && typeof args.path?.id === "string" ? args.path.id : undefined);
+    if (!sid)
+      throw new Error("abort seam: no session id in args");
+    if (rawInterrupt) {
+      return await rawInterrupt({ sessionID: sid, resume: false });
+    }
+    const svc = discoverServiceHttp();
+    if (!svc) {
+      throw new Error("abort unavailable on this session client (no promise-layer interrupt and service.json discovery failed)");
+    }
+    const res = await fetch(`${svc.url}/api/session/${sid}/interrupt?resume=false`, {
+      method: "POST",
+      headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` }
+    });
+    if (!res.ok)
+      throw new Error(`session interrupt HTTP ${res.status}`);
+    try {
+      return JSON.parse(await res.text());
+    } catch {
+      return;
     }
   };
   return Object.keys(out).length > 0 ? { session: out } : null;

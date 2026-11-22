@@ -1038,6 +1038,11 @@ function ensureJobLifecycle(): { registry: JobRegistry | null; fence: JobFence |
       })
   exitCleanup = createExitCleanup(jobManager, {
     graceMs: 3_000,
+    // fix-dispatch-dispose-kill D1: dispatch rows are exempt from the ENTIRE
+    // exit matrix (dispose + SIGINT/SIGTERM/exit/uncaught) — no kill, no
+    // abort, no journal terminal state; continuity rides the dispatch
+    // journal + restart recovery.
+    skip: isDispatchRow,
     after: () => {
       jobFence?.dispose()
     },
@@ -1149,7 +1154,53 @@ const idleJobSessions = new Set<string>()
 // Dispatch marker riding async-dispatch registry entries (kind=dispatch,
 // async-dispatch design D3): the entry is a job-manager registry row, not a
 // process — the wake text carries the child's final assistant message inline.
-type DispatchJobMeta = { agentID: string; childSessionID: string; description: string; outcome?: string }
+// fix-dispatch-dispose-kill: `outcome` is stamped "aborted" by the kill hook
+// (dispatchKillTreeHook) BEFORE markTerminal queues the wake, so the wake
+// renders the honest aborted branch; `abortReason` carries the kill reason.
+type DispatchJobMeta = { agentID: string; childSessionID: string; description: string; outcome?: string; abortReason?: string }
+
+// fix-dispatch-dispose-kill D1: the single dispatch-row predicate — the
+// dispatch meta is the row's ONLY identity marker. Rows it matches are
+// exempt from the exit matrix (host-exit skip) and disposeAll: no pid (no
+// local process tree — terminateTreeSync is already a no-op for them), the
+// child is a server-side session, and continuity is carried by the dispatch
+// journal + restart recovery. An exit-time kill's only effects are
+// destructive (journal aborted → recovery skips a live child; lost wake).
+function isDispatchRow(job: Job): boolean {
+  return (job as Job & { dispatch?: DispatchJobMeta }).dispatch != null
+}
+
+// fix-dispatch-dispose-kill D2 (abort-unconfirmed disclosure): jobId → the
+// honest error from a failed/unavailable abortChild on a kill path. Read at
+// journal settle (the poller's kill exit appends it to the terminal reason)
+// and at wake delivery (jobWakeText discloses it) — never silently dropped.
+const abortUnconfirmedNotes = new Map<string, string>()
+
+/**
+ * fix-dispatch-dispose-kill D2/D3: the ONE killTree hook factory for
+ * dispatch registry rows — every call site routes here, no `void`-discarded
+ * abortChild results. The aborted outcome is stamped SYNCHRONOUSLY (before
+ * the abort promise settles) because markTerminal fires onWakeQueued
+ * synchronously inside kill() — the queued wake must already render the
+ * honest aborted branch, never "finished / Final report: (no output)". A
+ * failed or unavailable abort lands in abortUnconfirmedNotes for the
+ * journal+wake disclosure; it never blocks the kill itself.
+ */
+function dispatchKillTreeHook(client: DispatchClient, jobId: string, childSessionID: () => string): () => void {
+  return () => {
+    const job = jobManager.get(jobId)
+    const meta = job ? (job as Job & { dispatch?: DispatchJobMeta }).dispatch : undefined
+    if (meta && meta.outcome !== "stream-lost/unknown") {
+      meta.outcome = "aborted"
+      meta.abortReason = meta.abortReason ?? "registry kill (owner session ended / user cancel)"
+    }
+    const sid = childSessionID()
+    if (!sid) return
+    void abortChild(client, sid).then((res) => {
+      if (!res.ok) abortUnconfirmedNotes.set(jobId, res.error)
+    })
+  }
+}
 
 function jobWakeText(job: Job): string {
   const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
@@ -1161,6 +1212,20 @@ function jobWakeText(job: Job): string {
         `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — RESULT STREAM LOST (task ${job.id}, child session ${dispatch.childSessionID}): the dispatch view broke before a final report arrived; child state UNKNOWN (possibly still running).`,
         `Last observation:\n${job.tail.slice(-2500) || "(no output)"}`,
         `Ground-truth recovery: read reports/${job.id}-report.md in the workspace BEFORE considering a re-dispatch; the child session stays inspectable and natively abortable in the host TUI.`,
+      ].join("\n")
+    }
+    // fix-dispatch-dispose-kill D2 (killed wake honesty): a killed/aborted
+    // dispatch is presented AS an abort with its reason — NEVER "finished …
+    // Final report:" with an empty tail faking a report.
+    if (job.state === "killed" || dispatch.outcome === "aborted") {
+      const reason = dispatch.abortReason ?? "registry kill (owner session ended / user cancel)"
+      const unconfirmed = abortUnconfirmedNotes.get(job.id)
+      return [
+        `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — ABORTED (task ${job.id}, child session ${dispatch.childSessionID}): ${reason}.`,
+        unconfirmed
+          ? `abort unconfirmed — child may still be running (${unconfirmed}); inspect or abort it natively in the host TUI.`
+          : `The child session was aborted; this dispatch did NOT finish and produced no final report.`,
+        `Ground truth if needed: reports/${job.id}-report.md in the workspace, or the child transcript in the host TUI.`,
       ].join("\n")
     }
     return [
@@ -3057,9 +3122,7 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       ownerSession: wish.ownerSession,
       logPath: join(jobLogDir, "dispatch", `${wish.jobId}.txt`),
       notify: true,
-      killTree: () => {
-        void abortChild(client, created.sessionID)
-      },
+      killTree: dispatchKillTreeHook(client, wish.jobId, () => created.sessionID),
     })
     ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description }
     dispatchTasks.set(wish.jobId, { jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description })
@@ -3281,9 +3344,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
           ownerSession: rec.ownerSession,
           logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
           notify: true,
-          killTree: () => {
-            void abortChild(client, childId)
-          },
+          killTree: dispatchKillTreeHook(client, rec.id, () => childId),
         })
         ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" }
         jobManager.appendOutput(job, fin.text)
@@ -3315,9 +3376,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
       ownerSession: rec.ownerSession,
       logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
       notify: true,
-      killTree: () => {
-        void abortChild(client, childId)
-      },
+      killTree: dispatchKillTreeHook(client, rec.id, () => childId),
     })
     ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" }
     dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" })
@@ -3408,9 +3467,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
         ownerSession: rec.ownerSession,
         logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
         notify: true,
-        killTree: () => {
-          void abortChild(client, respawn.sessionID)
-        },
+        killTree: dispatchKillTreeHook(client, rec.id, () => respawn.sessionID),
       })
       ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: respawn.sessionID, description: rec.description ?? "" }
       dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" })
@@ -3833,9 +3890,7 @@ function rearmDispatchWatch(
     ownerSession: input.ownerSession,
     logPath: join(jobLogDir, "dispatch", `${input.id}.txt`),
     notify: true,
-    killTree: () => {
-      void abortChild(client, input.childId)
-    },
+    killTree: dispatchKillTreeHook(client, input.id, () => input.childId),
   })
   ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: input.agent, childSessionID: input.childId, description: input.description }
   dispatchTasks.set(input.id, { jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description })
@@ -4166,10 +4221,11 @@ async function runAsyncDispatchPoller(
         await new Promise((resolve) => setTimeout(resolve, retryBackoffMs))
         if (job.state !== "running") {
           dispatchTasks.delete(job.id)
+          const unconfirmed1 = abortUnconfirmedNotes.get(job.id)
           journalTerminalRecord(
             { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
             "aborted",
-            "registry kill during retry backoff (owner session ended / dispose) — user abort, never retried",
+            `registry kill during retry backoff (owner session ended / dispose) — user abort, never retried${unconfirmed1 ? ` — abort unconfirmed — child may still be running (${unconfirmed1})` : ""}`,
           )
           return
         }
@@ -4251,9 +4307,7 @@ async function runAsyncDispatchPoller(
           description: dispatch?.description ?? "",
         })
         // Owner-death harvest must abort the LIVE child — rebind the kill hook.
-        job.killTree = () => {
-          void abortChild(client, childSessionID)
-        }
+        job.killTree = dispatchKillTreeHook(client, job.id, () => childSessionID)
         // Fresh tracking state for the fresh child (stability, floor,
         // progress cadence, and the stale anchor all restart).
         stability.stableTicks = 0
@@ -4305,12 +4359,17 @@ async function runAsyncDispatchPoller(
     // the watch — no wake fires for a killed row (markTerminal first-wins).
     if (job.state !== "running") {
       dispatchTasks.delete(job.id)
+      // fix-dispatch-dispose-kill D2: a kill path whose abort result was not
+      // ok (incl. unavailable) appends the unconfirmed disclosure to the
+      // journal's terminal reason — the wake text discloses the same fact.
+      const unconfirmed = abortUnconfirmedNotes.get(job.id)
+      const suffix = unconfirmed ? ` — abort unconfirmed — child may still be running (${unconfirmed})` : ""
       journalTerminalRecord(
         { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
         "aborted",
         isDispatchCancelled(job.id)
-          ? "cancelled by the user lever (forge-cancel) — the child was aborted and the dispatch is never retried"
-          : "registry kill (owner session ended / dispose) — user abort",
+          ? `cancelled by the user lever (forge-cancel) — the child was aborted and the dispatch is never retried${suffix}`
+          : `registry kill (owner session ended / dispose) — user abort${suffix}`,
       )
       return
     }
@@ -5054,9 +5113,7 @@ const taskDispatchTool = tool({
           notify: true,
           // Owner-death harvest parity: the manager's kill() on session end
           // aborts the child via the SDK and ledgers the orphan.
-          killTree: () => {
-            void abortChild(client, childSessionID)
-          },
+          killTree: dispatchKillTreeHook(client, syncJobId, () => childSessionID),
         })
         ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID, description }
         dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description })
@@ -5110,9 +5167,7 @@ const taskDispatchTool = tool({
       notify: true,
       // Owner-death harvest: the manager's kill() on session end calls this —
       // the child session is aborted via the SDK and the orphan is ledgered.
-      killTree: () => {
-        void abortChild(client, created.sessionID)
-      },
+      killTree: dispatchKillTreeHook(client, jobId, () => created.sessionID),
     })
     ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
     dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description })
@@ -6319,7 +6374,10 @@ function scheduleIdleContinuation(client: GoalClient, sessionID: string): void {
 function harvestSessionEnd(sessionID: string): void {
   // Owner session ended: live session-scoped jobs are killed,
   // unread completions ledgered (job-supervisor spec).
-  jobManager.onSessionEnd(sessionID)
+  // fix-dispatch-dispose-kill D2: dispatch rows are KEPT after the kill —
+  // the queued aborted wake must stay deliverable (deliverWakesFor only
+  // traverses the live Map); the row self-clears via read-consumption.
+  jobManager.onSessionEnd(sessionID, isDispatchRow)
   // Async-dispatch harvest (spec: Async dispatch lifecycle —
   // "Owner death harvests children"): onSessionEnd above killed the
   // session's live dispatch registry rows — each killTree aborted the
@@ -6483,8 +6541,13 @@ export const server: Plugin = async (input, options) => {
       // Exit matrix trigger (idempotent): graceful-then-force every live
       // non-survive job, then end the fence watcher. Survive jobs keep
       // running by contract — their registry entries await the next host.
+      // fix-dispatch-dispose-kill D1: dispatch rows are skipped in BOTH the
+      // exit matrix (createExitCleanup skip) and disposeAll — a v2
+      // multi-context host fires dispose on every context recycle and the
+      // host keeps living; killing in-flight dispatches there is pure
+      // destruction (journal aborted → recovery skips live children).
       exitCleanup?.trigger("dispose")
-      jobManager.disposeAll()
+      jobManager.disposeAll(isDispatchRow)
       watchdog.dispose()
       sessions.clear()
     },
@@ -7533,6 +7596,14 @@ type V2PluginContext = {
     // merges first. Guarded: a drifted host simply disables the rescue's
     // injection channel (the D5 fallback belt still covers workers).
     update?(input: unknown): Promise<unknown>
+    // fix-dispatch-dispose-kill D3 (live-host probe 2026-11-23, host 2.3.2
+    // GET /openapi.json: POST /api/session/{sessionID}/interrupt, optional
+    // resume query, 200 {interrupted:boolean}, idle interruption is a no-op;
+    // SDK v2 gen sdk.gen.d.ts:1743 session.interrupt — "Interrupt active
+    // execution owned by this OpenCode process"): the v2 stop surface. The
+    // adapter wires it as the dispatch `abort` seam (HTTP fallback when the
+    // promise layer does not expose it).
+    interrupt?(input: unknown): Promise<unknown>
   }
   command?: { transform?(cb: (editor: V2CommandEditor) => void | Promise<void>): Promise<unknown> }
   // W6a field realities (SDK 2.3.2 promise/event.d.ts): subscribe(options?)
@@ -8508,6 +8579,13 @@ type V2SessionClient = {
     get?: (opts: unknown) => Promise<unknown>
     create?: (args: { body: Record<string, unknown>; query?: { directory?: string } }) => Promise<{ data?: unknown; error?: unknown }>
     messages?: (args: { path: { id: string }; query?: { limit?: number } }) => Promise<{ data?: unknown[]; error?: unknown }>
+    /**
+     * fix-dispatch-dispose-kill D3: the dispatch abort seam — the 2.3.2
+     * stop surface (interrupt) translated into the v1 abort call shape
+     * ({path:{id}}) abortChild uses. Promise-layer ctx.session.interrupt
+     * where available, service.json HTTP interrupt endpoint otherwise.
+     */
+    abort?: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<unknown>
   }
 }
 
@@ -8666,6 +8744,54 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
       return { data: arr.map(normalizeV2MessageRow).filter((x): x is SessionMessageLike => x !== null) }
     } catch (e) {
       return { error: String(e) }
+    }
+  }
+  // fix-dispatch-dispose-kill D3 (live-host probe 2026-11-23 on host 2.3.2,
+  // GET /openapi.json — 142 paths, ZERO abort anywhere): the sanctioned stop
+  // surface is POST /api/session/{sessionID}/interrupt (operationId
+  // session.interrupt, optional `resume` query param, 200
+  // {interrupted:boolean} — "Whether an active execution owned by this
+  // OpenCode process was interrupted"; idle interruption is a no-op). ONE
+  // seam, two legs in order:
+  //   (1) the promise layer ctx.session.interrupt({sessionID, resume:false})
+  //       where the host exposes it (v2 plugin surface);
+  //   (2) the service.json HTTP channel — the SAME discoverServiceHttp()
+  //       reader the messages reader rides — POST {url}/api/session/{id}/interrupt.
+  // {interrupted:false} on an idle child is success-equivalent (the child
+  // already finished). The response body is parsed defensively (SDK 1.18.32
+  // types claim 204 void and no resume param — code against the LIVE shape).
+  // Future harder mode, deliberately NOT wired: DELETE /api/session/{id}
+  // (session.remove) "stops active execution and recursively deletes child
+  // sessions" — a candidate for a future cancel-hard semantics.
+  const rawInterrupt =
+    typeof (s as { interrupt?: unknown }).interrupt === "function"
+      ? (s as unknown as { interrupt: (input: Record<string, unknown>) => Promise<unknown> }).interrupt.bind(s)
+      : undefined
+  out.abort = async (args) => {
+    const sid =
+      v2SessionIdOf(args) ??
+      (args !== null && typeof args === "object" && typeof (args as { path?: { id?: unknown } }).path?.id === "string"
+        ? (args as { path: { id: string } }).path.id
+        : undefined)
+    if (!sid) throw new Error("abort seam: no session id in args")
+    if (rawInterrupt) {
+      return await rawInterrupt({ sessionID: sid, resume: false })
+    }
+    const svc = discoverServiceHttp()
+    if (!svc) {
+      throw new Error("abort unavailable on this session client (no promise-layer interrupt and service.json discovery failed)")
+    }
+    const res = await fetch(`${svc.url}/api/session/${sid}/interrupt?resume=false`, {
+      method: "POST",
+      headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
+    })
+    if (!res.ok) throw new Error(`session interrupt HTTP ${res.status}`)
+    // Live shape: 200 {interrupted:boolean}. interrupted:false on an idle
+    // child is success-equivalent — resolved (not thrown) either way.
+    try {
+      return JSON.parse(await res.text()) as unknown
+    } catch {
+      return undefined
     }
   }
   return Object.keys(out).length > 0 ? { session: out } : null

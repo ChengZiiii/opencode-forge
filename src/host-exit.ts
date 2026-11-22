@@ -43,6 +43,15 @@ export type ExitCleanupOptions = {
    * the host misses the real process, and the fence was then gone too)
    * would orphan grandchildren. */
   after?: () => void
+  /** fix-dispatch-dispose-kill D1: rows this predicate exempts are NEVER
+   * killed, aborted, or marked killed by the exit matrix (dispose AND every
+   * signal/exit path — the option rides construction so all triggers carry
+   * it). Dispatch rows (job.dispatch != null) have no local pid; their
+   * children are server-side sessions and their continuity is carried by
+   * the dispatch journal + restart recovery, so an exit-time kill is pure
+   * destruction (journal aborted → recovery skips a live child). Process
+   * jobs (pid > 0) keep the current dispose contract. */
+  skip?: (job: Job) => boolean
 }
 
 export type ExitCleanup = {
@@ -62,12 +71,13 @@ export function createExitCleanup(manager: JobManager, opts: ExitCleanupOptions 
   const liveTargets = (): Job[] => {
     const targets: Job[] = []
     for (const job of manager.list()) {
-      if (job.state === "running" && !job.survive) targets.push(job)
+      if (job.state === "running" && !job.survive && !opts.skip?.(job)) targets.push(job)
     }
     return targets
   }
 
   const killOne = (job: Job, graceful: boolean) => {
+    if (opts.skip?.(job)) return // D1: exempt rows are never killed/marked
     const pid = job.pid ?? 0
     if (pid > 0) {
       terminateTreeSync(pid, {

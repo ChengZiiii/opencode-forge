@@ -7,15 +7,41 @@
 
 ## 2. Implementation（crew wave 1：coder → test-coder → gate-verifier → spec-reviewer）
 
-- [ ] 2.1 `isDispatchRow` 谓词 + dispose/出口矩阵/disposeAll 三处 skip
+- [x] 2.1 `isDispatchRow` 谓词 + dispose/出口矩阵/disposeAll 三处 skip
       过滤（host-exit killOne、job-manager disposeAll、dispose 钩子
       trigger 传参）；dispatch 行不被标记 killed、不被删行
-- [ ] 2.2 `jobWakeText` killed/aborted 诚实分支（禁止 finished+空 tail
+      — plugin.ts:1169 谓词；plugin.ts:1045 `skip: isDispatchRow`
+      （createExitCleanup，覆盖 dispose+SIGINT/SIGTERM/exit/uncaught 全部
+      触发路径）；src/host-exit.ts liveTargets+killOne skip 守卫（行号
+      62-88 区）；src/job-manager.ts disposeAll(skip)（行 ~355-366）；
+      plugin.ts:6550 dispose 钩子 `disposeAll(isDispatchRow)`
+- [x] 2.2 `jobWakeText` killed/aborted 诚实分支（禁止 finished+空 tail
       伪报告）；`onSessionEnd` 对 dispatch 行改 terminal-evidence 自清
       （kill 后行留存至 wake 被读）
-- [ ] 2.3 `abortChild` abort-less 显式检测；killTree 调用点全部消灭
+      — plugin.ts:1218-1231 killed/aborted 分支（ABORTED+理由，无
+      "Final report:"、无 "(no output)"）；abort-unconfirmed 披露
+      plugin.ts:1222-1225；src/job-manager.ts onSessionEnd(sessionID,
+      keep)（行 ~311-333：keep 行 kill 后留 Map，read-consumption 自清）；
+      plugin.ts:6380 harvestSessionEnd 传 isDispatchRow；journal 终态
+      reason 附注 plugin.ts:4224-4229、4363-4376
+- [x] 2.3 `abortChild` abort-less 显式检测；killTree 调用点全部消灭
       `void` 丢弃（未证实 → journal reason 附注 + wake 披露）；v2
       abort 接线按 design D3 决策树落地（E1 探针结果落档）
+      — D3 分支 1+2 同缝接线（E1 实锤探针：host 2.3.2 openapi.json
+      142 路径零 abort，官方停止面 = POST /api/session/{id}/interrupt；
+      SDK 1.18.32 v2 gen sdk.gen.d.ts:1743 session.interrupt）：
+      plugin.ts:7537-7548 V2PluginContext.session.interrupt 声明；
+      plugin.ts:8749-8793 v2SessionClient 的 out.abort —— 优先承诺层
+      `ctx.session.interrupt({sessionID, resume:false})`，否则
+      discoverServiceHttp() HTTP `POST {url}/api/session/{id}/interrupt
+      ?resume=false`；`{interrupted:false}`（idle no-op）视为成功等价；
+      分支 3：src/dispatch-async.ts abortChild 开头 typeof 检测 →
+      `{ok:false, error:"abort unavailable on this session client"}`，
+      DispatchClient.abort 改可选；8 个 killTree 调用点全部改走
+      dispatchKillTreeHook（plugin.ts:1189；调用点 3125/3347/3379/
+      3470/3893/4310/5116/5170），abort 失败进 abortUnconfirmedNotes
+      → journal 附注 + wake 披露；stale 头注释修正（v1 prompt_async/
+      abort 代际 → 2.3.2 interrupt 现实，dispatch-async.ts:8-27）
 - [ ] 2.4 测试重议 + 新增全绿（design D4 清单）、typecheck 绿、全量套件
       909+ 绿
 
