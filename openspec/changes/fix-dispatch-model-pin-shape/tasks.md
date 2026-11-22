@@ -51,7 +51,7 @@
       the tgz → poll `dist-tags` until `latest = 0.32.1`.
 - [x] 4.3 Quarantine the host cache copy of 0.32.0; config already points
       at the npm specifier (no config surgery needed).
-- [ ] 4.4 User restarts; real pinned dispatch to a pool worker completes
+- [x] 4.4 User restarts; real pinned dispatch to a pool worker completes
       (drain passes; report arrives). shasum/dist-tags reported for 对账.
 - [ ] 4.5 D6 note: opportunistic adoption-leg re-kill on the real host when
       the next orphan occurs (adoption shares the fixed seam; not
