@@ -71,8 +71,9 @@
       the tgz (shasum a1e21dee3acd3d4d2c594bbce30be178597cc8a1) →
       `dist-tags.latest = 0.32.2` confirmed; 0.32.1 cache copy renamed into
       `_quarantine`. 0.32.3 ladder re-runs this row.
-- [ ] 4.3 0.32.3: pack/publish/poll + shasum report; quarantine the 0.32.2
-      cache copy.
+- [x] 4.3 0.32.3: pack/publish/poll + shasum report (c560a83e0804b4640a7a
+      012bdcb43d13e7051802, latest flipped); quarantine the 0.32.2
+      cache copy (1795368019969 → _quarantine).
 - [ ] 4.4 User restarts; the judgment channel is the PLUGIN wake — an
       `[forge:dispatch-complete]` block whose `Final report:` carries the
       child's final text verbatim (NOT the native task-result text), zero
