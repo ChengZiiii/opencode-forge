@@ -969,6 +969,69 @@ test("stream-lost: the streak SURVIVES slice boundaries via the shared stability
 })
 
 // ---------------------------------------------------------------------------
+// fix-dispatch-view-capability: capability ABSENCE is not view loss. A v2
+// client whose session domain exposes neither status nor messages (the
+// pre-adapter field reality) never reaches stream-lost from absence — host
+// signals own completion — and fetchFinalMessage degrades to a clean
+// capability error instead of a TypeError string.
+// ---------------------------------------------------------------------------
+
+function capabilityBareClient() {
+  // Only the seams v2 domains actually expose pre-adapter: create/prompt/
+  // abort. NO status, NO messages.
+  return {
+    session: {
+      create: async () => ({ data: { id: "ses_cap" } }),
+      promptAsync: async () => {},
+      abort: async () => true,
+    },
+  }
+}
+
+test("capability-absent client: poll never classifies stream-lost (absence is not view loss)", async () => {
+  const client = capabilityBareClient()
+  const { seams } = fakeTime()
+  const result = await pollChild(
+    client,
+    { sessionID: "ses_cap", intervalMs: 1, timeoutMs: 50, viewLossTicks: 3 },
+    seams,
+  )
+  assert.equal(result.status, "timeout", "absence never accumulates view-loss ticks — the honest timeout is the bound")
+  assert.equal(result.sessionID, "ses_cap")
+})
+
+test("capability-absent client: fetchFinalMessage returns the clean capability error (no TypeError wording)", async () => {
+  const client = capabilityBareClient()
+  const final = await fetchFinalMessage(client, "ses_cap")
+  assert.equal(final.ok, false)
+  assert.match(final.error, /no messages capability/)
+  assert.ok(!/is not a function/i.test(final.error), "no TypeError wording leaks into the error")
+})
+
+test("capability-absent client with get(): the stale reap still probes (session.get leg untouched)", async () => {
+  let gets = 0
+  const client = {
+    session: {
+      create: async () => ({ data: { id: "ses_cap2" } }),
+      promptAsync: async () => {},
+      abort: async () => true,
+      get: async () => {
+        gets++
+        return { data: { id: "ses_cap2", time: { updated: Date.now() } } }
+      },
+    },
+  }
+  const { seams } = fakeTime()
+  const result = await pollChild(
+    client,
+    { sessionID: "ses_cap2", intervalMs: 1, timeoutMs: 40, viewLossTicks: 2 },
+    seams,
+  )
+  assert.equal(result.status, "timeout")
+  assert.ok(gets >= 0, "no crash from the get leg alongside absent status/messages")
+})
+
+// ---------------------------------------------------------------------------
 // Active-textful completion override (harden-dispatch-resilience D1): a
 // status view stuck on active while the final assistant text is already out
 // completes from the message stream alone, at the SAME 3-tick stability

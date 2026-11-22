@@ -3246,6 +3246,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
     // final message finished while the host was down → deliver the wake.
     let active = true
     try {
+      if (typeof client.session.status !== "function") throw new Error("no status capability")
       const st = await client.session.status()
       if (st.error === undefined && st.data && typeof st.data === "object") {
         const entry = (st.data as { [sid: string]: { type?: string } | undefined })[childId]
@@ -3277,6 +3278,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
         // when the owner exists and is not mid-turn (lossy single attempt:
         // a failed send re-queues to the standard idle-edge/window path).
         try {
+          if (typeof client.session.status !== "function") throw new Error("no status capability")
           const st2 = await client.session.status()
           const ownerEntry = (st2.data as { [sid: string]: { type?: string } | undefined } | undefined)?.[rec.ownerSession]
           if (!ownerEntry || !["busy", "retry", "running"].includes(ownerEntry?.type ?? "")) {
@@ -3560,6 +3562,7 @@ async function assertChildIdleAfterAbort(client: DispatchClient, childSessionID:
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 400))
     try {
+      if (typeof client.session.status !== "function") return "unresolved"
       const st = await client.session.status()
       const map = (st as { data?: Record<string, unknown> } | undefined)?.data
       if (map && typeof map === "object") {
@@ -3572,6 +3575,7 @@ async function assertChildIdleAfterAbort(client: DispatchClient, childSessionID:
     }
   }
   try {
+    if (typeof client.session.status !== "function") return "unresolved"
     const st = await client.session.status()
     const map = (st as { data?: Record<string, unknown> } | undefined)?.data
     if (!map) return "unresolved"
@@ -3950,6 +3954,7 @@ export async function detectOrphanDispatchChildren(client: DispatchClient, works
   if (listed.length === 0) return 0
   let active: Set<string>
   try {
+    if (typeof client.session.status !== "function") return 0
     const st = await client.session.status()
     const map = (st as { data?: Record<string, unknown> } | undefined)?.data
     if (!map || typeof map !== "object") return 0
@@ -8486,7 +8491,38 @@ type V2SessionClient = {
     promptAsync?: (opts: unknown) => Promise<unknown>
     get?: (opts: unknown) => Promise<unknown>
     create?: (args: { body: Record<string, unknown>; query?: { directory?: string } }) => Promise<{ data?: unknown; error?: unknown }>
+    messages?: (args: { path: { id: string }; query?: { limit?: number } }) => Promise<{ data?: unknown[]; error?: unknown }>
   }
+}
+
+// fix-dispatch-view-capability: HTTP-backed messages reader for the v2
+// adapter. The v2 session domain has no messages method; the host's own
+// HTTP session-message surface is the sanctioned equivalent (upstream
+// #59566), reachable with the service discovery artifact the host itself
+// writes (service.json: {url, password}). Discovered lazily, cached once;
+// a missing/unreadable file simply yields no reader (the core treats that
+// as capability absence, never as a view failure). FORGE_SERVICE_FILE
+// overrides the path (tests).
+type ServiceHttpEndpoint = { url: string; password: string }
+let serviceHttpCache: ServiceHttpEndpoint | null | undefined
+function discoverServiceHttp(): ServiceHttpEndpoint | null {
+  if (serviceHttpCache !== undefined) return serviceHttpCache
+  try {
+    const file = process.env.FORGE_SERVICE_FILE || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode", "service.json")
+    const raw = JSON.parse(readFileSync(file, "utf8"))
+    if (raw && typeof raw.url === "string" && typeof raw.password === "string" && raw.url && raw.password) {
+      serviceHttpCache = { url: raw.url.replace(/\/+$/, ""), password: raw.password }
+    } else {
+      serviceHttpCache = null
+    }
+  } catch {
+    serviceHttpCache = null
+  }
+  return serviceHttpCache
+}
+/** Test seam: forget the cached service discovery (FORGE_SERVICE_FILE env picks the file). */
+export function resetServiceHttpDiscoveryForTests(): void {
+  serviceHttpCache = undefined
 }
 // W6a field reality (live probe 2026-11-19): the v2 promise-layer session
 // domain validates its params against a FLAT {sessionID} key — the v1
@@ -8501,10 +8537,18 @@ function v2SessionIdOf(opts: unknown): string | undefined {
   if (typeof o.sessionID === "string" && o.sessionID) return o.sessionID
   return undefined
 }
+/** Test seam: build the v2 session adapter directly (mock ctx.session domain). */
+export function v2SessionClientForTests(ctx: V2PluginContext): V2SessionClient | null {
+  return v2SessionClient(ctx)
+}
+
 function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
   const s = ctx.session
   if (s === null || typeof s !== "object") return null;
   const out: V2SessionClient["session"] = {}
+  // Per-child directory anchors for the HTTP messages reader (set at create).
+  const childDirs = new Map<string, string>()
+  let lastKnownDir: string | undefined
   if (typeof s.prompt === "function") {
     const send = async (opts: unknown) => {
       const input = v2PromptInputOf(opts)
@@ -8552,10 +8596,43 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
       if (typeof directory === "string" && directory !== "" && flat.directory === undefined) flat.directory = directory
       const record = await rawCreate.call(s, flat)
       // Bare record (observed) → envelope; already-enveloped stays as-is.
-      if (record !== null && typeof record === "object" && ("data" in (record as Record<string, unknown>) || "error" in (record as Record<string, unknown>))) {
-        return record as { data?: unknown; error?: unknown }
+      const envelope = record !== null && typeof record === "object" && ("data" in (record as Record<string, unknown>) || "error" in (record as Record<string, unknown>))
+        ? (record as { data?: unknown; error?: unknown })
+        : { data: record }
+      // fix-dispatch-view-capability: remember the child's directory so the
+      // HTTP messages reader can anchor its location query per child.
+      try {
+        const rec = (envelope.data ?? null) as { id?: unknown } | null
+        if (rec && typeof rec.id === "string" && typeof directory === "string" && directory) {
+          childDirs.set(rec.id, directory)
+          lastKnownDir = directory
+        }
+      } catch {}
+      return envelope
+    }
+  }
+  // fix-dispatch-view-capability: HTTP-backed messages reader (upstream
+  // #59566 sanctions the session-message HTTP surface). Directory anchors
+  // per child (captured at create), falling back to the last known one.
+  const svc = discoverServiceHttp()
+  if (svc) {
+    out.messages = async (args) => {
+      const sid = typeof args?.path?.id === "string" ? args.path.id : undefined
+      if (!sid) return { error: "messages reader: no session id in args" }
+      const dir = childDirs.get(sid) ?? lastKnownDir
+      try {
+        const loc = dir ? `?location%5Bdirectory%5D=${encodeURIComponent(dir)}` : ""
+        const res = await fetch(`${svc.url}/api/session/${sid}/message${loc}`, {
+          headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
+        })
+        if (!res.ok) return { error: `HTTP ${res.status}` }
+        const parsed = JSON.parse(await res.text()) as unknown
+        const arr = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === "object" && Array.isArray((parsed as { data?: unknown }).data) ? (parsed as { data: unknown[] }).data : undefined)
+        if (!Array.isArray(arr)) return { error: "unexpected message payload shape" }
+        return { data: arr }
+      } catch (e) {
+        return { error: String(e) }
       }
-      return { data: record }
     }
   }
   return Object.keys(out).length > 0 ? { session: out } : null

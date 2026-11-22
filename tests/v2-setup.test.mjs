@@ -469,3 +469,119 @@ test("v2 setup: hideNativeAgents JSONC boundary — comments/trailing commas hon
     assert.equal(agents.get("plan").hidden, expectedHidden, `plan hidden=${expectedHidden} for config: ${JSON.stringify(content)}`)
   }
 }))
+
+// ---------------------------------------------------------------------------
+// fix-dispatch-view-capability: the v2 adapter's HTTP-backed messages reader.
+// The v2 session domain has NO messages method (probe: 18 methods, none
+// named messages) — the adapter provides one backed by the host's own HTTP
+// session-message surface, discovered from service.json (FORGE_SERVICE_FILE
+// override here). Absence of the file = capability absence, never a throw.
+// ---------------------------------------------------------------------------
+
+import { v2SessionClientForTests, resetServiceHttpDiscoveryForTests } from "../plugin.ts"
+
+function svcCtx() {
+  return {
+    session: {
+      prompt: async () => {},
+      get: async () => ({}),
+      create: async (flat) => ({ id: flat.id ?? "ses_adapter_child" }),
+    },
+  }
+}
+
+test("v2 adapter messages: service.json discovered — HTTP reader hits the sanctioned surface with Basic auth (array shape)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:47999/", password: "pw123" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  const hits = []
+  globalThis.fetch = async (url, init) => {
+    hits.push({ url: String(url), auth: init?.headers?.authorization })
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify([{ info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: "report" }] }]),
+    }
+  }
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    assert.ok(adapter?.session.messages, "messages reader present when service discovery succeeds")
+    const res = await adapter.session.messages({ path: { id: "ses_adapter_child" } })
+    assert.equal(res.error, undefined, "no error on the happy path")
+    assert.equal(res.data.length, 1)
+    assert.equal(hits.length, 1)
+    assert.equal(hits[0].url, "http://127.0.0.1:47999/api/session/ses_adapter_child/message", "the sanctioned HTTP surface, trailing slash folded")
+    assert.match(hits[0].auth, /^Basic /)
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+test("v2 adapter messages: {data} envelope shape tolerated; create() captures the directory anchor", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48001", password: "pw" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  const hits = []
+  globalThis.fetch = async (url) => {
+    hits.push(String(url))
+    return { ok: true, status: 200, text: async () => JSON.stringify({ data: [{ info: { role: "assistant" }, parts: [] }] }) }
+  }
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    // create with a directory anchor — the adapter must remember it per child
+    await adapter.session.create({ body: { title: "t" }, query: { directory: "C:/some/ws" } })
+    const res = await adapter.session.messages({ path: { id: "ses_adapter_child" } })
+    assert.equal(res.error, undefined)
+    assert.equal(res.data.length, 1)
+    assert.equal(hits.length, 1)
+    assert.ok(hits[0].includes("location%5Bdirectory%5D="), "the directory anchor rides the location query")
+    assert.ok(hits[0].includes("C%3A%2Fsome%2Fws"), "the captured directory is the one used")
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+test("v2 adapter messages: HTTP failure returns {error} (a PROVIDED capability failing — view-loss semantics apply)", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48002", password: "pw" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  globalThis.fetch = async () => ({ ok: false, status: 503, text: async () => "unavailable" })
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    const res = await adapter.session.messages({ path: { id: "ses_x" } })
+    assert.match(String(res.error), /HTTP 503/)
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+test("v2 adapter messages: no service.json — messages omitted (capability absence, never a throw)", async () => {
+  process.env.FORGE_SERVICE_FILE = join(tmpdir(), "forge-svc-nonexistent-", "service.json")
+  resetServiceHttpDiscoveryForTests()
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    assert.equal(adapter?.session.messages, undefined, "no reader when discovery fails")
+    assert.ok(adapter?.session.prompt, "the rest of the adapter is unaffected")
+  } finally {
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})

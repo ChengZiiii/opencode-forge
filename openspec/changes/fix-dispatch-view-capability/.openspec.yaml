@@ -1,0 +1,5 @@
+schema: spec-driven
+created: 2026-11-22
+goal: On the real 2.3.2 host a pinned dispatch completes with its final report
+  text in the wake, zero 'is not a function' errors, zero unreadable-view
+  disclosures

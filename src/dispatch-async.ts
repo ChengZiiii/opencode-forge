@@ -95,7 +95,13 @@ export type DispatchClient = {
       body: Record<string, unknown>
       query?: { directory?: string }
     }) => Promise<unknown>
-    status: (args?: Record<string, never>) => Promise<{ data?: StatusMapLike; error?: unknown }>
+    /**
+     * Status-map reader (GET /session/status). OPTIONAL by capability: v2
+     * session domains expose no status method — absence yields
+     * `statusMap === undefined` (the `active = true` soundness posture)
+     * via a clean guard instead of a swallowed per-tick TypeError.
+     */
+    status?: (args?: Record<string, never>) => Promise<{ data?: StatusMapLike; error?: unknown }>
     /**
      * Session record fetch (GET /session/{id}) — the fold B activity/
      * existence probe. Optional: hosts/clients without the endpoint report
@@ -104,7 +110,14 @@ export type DispatchClient = {
      * {data?, error?} envelope AND a bare session record.
      */
     get?: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<unknown>
-    messages: (args: {
+    /**
+     * Message reader (GET /session/{id}/message). OPTIONAL by capability:
+     * v2 session domains expose no messages method — the v2 adapter provides
+     * an HTTP-backed one when service discovery succeeds (upstream
+     * #59566 sanctions the HTTP session-message surface). Core guards treat
+     * absence as "leg not applicable", never as view loss.
+     */
+    messages?: (args: {
       path: { id: string }
       query?: { limit?: number }
     }) => Promise<{ data?: SessionMessageLike[]; error?: unknown }>
@@ -747,13 +760,19 @@ export async function pollChild(
     //     guards against transient flakes where a running child blinks out
     //     of the map for a tick or two; it re-appears and resets the run).
     let statusMap: StatusMapLike | undefined
-    try {
-      const statusResult = await client.session.status()
-      if (statusResult.error === undefined && statusResult.data && typeof statusResult.data === "object") {
-        statusMap = statusResult.data
+    if (typeof client.session.status !== "function") {
+      // Capability absence (fix-dispatch-view-capability): no status reader
+      // on this client — keep the `active = true` soundness posture without
+      // throwing per tick.
+    } else {
+      try {
+        const statusResult = await client.session.status()
+        if (statusResult.error === undefined && statusResult.data && typeof statusResult.data === "object") {
+          statusMap = statusResult.data
+        }
+      } catch {
+        statusMap = undefined
       }
-    } catch {
-      statusMap = undefined
     }
     let active: boolean
     if (statusMap === undefined) {
@@ -765,19 +784,27 @@ export async function pollChild(
 
     let messages: SessionMessageLike[] = []
     let messagesFailed = false
-    try {
-      const msgResult = await client.session.messages({
-        path: { id: input.sessionID },
-        query: { limit: 100 },
-      })
-      if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
-        messages = msgResult.data
-      } else {
+    if (typeof client.session.messages !== "function") {
+      // Capability absence (fix-dispatch-view-capability): the client does
+      // not provide a messages reader at all (v2 hosts pre-HTTP-adapter).
+      // Absence is NOT failure — the leg is not applicable, host signals
+      // own completion, and view-loss counting must not see this as a
+      // lost view.
+    } else {
+      try {
+        const msgResult = await client.session.messages({
+          path: { id: input.sessionID },
+          query: { limit: 100 },
+        })
+        if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
+          messages = msgResult.data
+        } else {
+          messagesFailed = true
+        }
+      } catch {
+        messages = []
         messagesFailed = true
       }
-    } catch {
-      messages = []
-      messagesFailed = true
     }
 
     // Sustained view loss (dispatch-stream-loss-honesty): the dispatch
@@ -863,6 +890,12 @@ export async function fetchFinalMessage(
   client: DispatchClient,
   sessionID: string,
 ): Promise<FinalMessageResult> {
+  if (typeof client.session.messages !== "function") {
+    // Capability absence (fix-dispatch-view-capability): a clean honest
+    // error instead of a TypeError string — host signals own the wake text
+    // via the terminal event payload.
+    return { ok: false, error: "no messages capability on this dispatch client (signal-core completion owns the wake text)" }
+  }
   let messages: SessionMessageLike[]
   try {
     const result = await client.session.messages({ path: { id: sessionID } })
