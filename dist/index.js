@@ -17067,7 +17067,7 @@ async function createChildSession(client, input) {
           model: {
             providerID: input.modelPin.providerID,
             modelID: input.modelPin.modelID,
-            id: `${input.modelPin.providerID}/${input.modelPin.modelID}`
+            id: input.modelPin.modelID
           }
         } : {},
         ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {},
