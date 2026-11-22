@@ -24,11 +24,20 @@
 
 ## 3. Verify (③ GATE — sandbox, production-identical)
 
-- [ ] 3.1 typecheck + full suite green; bundle.
-- [ ] 3.2 `serve --service` sandbox (isolated XDG so service.json is
+- [x] 3.1 typecheck + full suite green; bundle. (905/905; bundle 914033→914301+probe)
+- [x] 3.2 `serve --service` sandbox (isolated XDG so service.json is
       sandbox-local), git+file plugin, pinned dispatch: wake contains the
       child's final report text; serve log has zero `is not a function`,
       zero unreadable-view disclosures, zero `final message unavailable`.
+      (2026-11-23 run: worker `forge-viewe2e-probe` completed a full GLM
+      round, wrote the marker file, and the wake carried the child's actual
+      final report text verbatim (`VIEW-E2E-OK … No tool refusals.`);
+      log greps 0/0/0. Sandbox layout notes: the host chdirs to USERPROFILE
+      and that directory becomes the anchor — fake home = the workspace
+      itself, boot-time plugin load via config `plugins` (npm-cache layout
+      `@sorenllm/opencode-forge@latest/<ts>` with a file: dep on the repo);
+      dir-scan lazy-loaded plugins register agents that the EXECUTION layer
+      cannot resolve.)
 
 ## 4. Release (④ GATE — npm ladder, user-authorized)
 
