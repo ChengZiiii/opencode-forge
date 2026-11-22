@@ -692,6 +692,14 @@ function normalizeAnchorDir(dir: string): string {
 }
 
 function rememberHostAnchor(dir: string): void {
+  if (process.env.FORGE_ANCHOR_PROBE) {
+    try {
+      appendFileSync(
+        join(tmpdir(), "forge-anchor-probe.log"),
+        `${new Date().toISOString()} rememberHostAnchor(${JSON.stringify(dir)}) cwd=${JSON.stringify(process.cwd())}\n`,
+      )
+    } catch {}
+  }
   const normalized = normalizeAnchorDir(dir)
   if (!normalized) return
   if (!hostAnchors.includes(normalized)) hostAnchors.push(normalized)
@@ -704,6 +712,14 @@ function rememberHostAnchor(dir: string): void {
 // caches make repeat resolves cheap; deletions un-materialize). Null only
 // before the first server() initialization (tests calling tools directly).
 function resolvePools(): PoolResolution | null {
+  if (process.env.FORGE_ANCHOR_PROBE) {
+    try {
+      appendFileSync(
+        join(tmpdir(), "forge-anchor-probe.log"),
+        `${new Date().toISOString()} resolvePools: resolver=${poolResolver ? "set" : "null"} anchors=${JSON.stringify([...hostAnchors])}\n`,
+      )
+    } catch {}
+  }
   if (!poolResolver || hostAnchors.length === 0) return null
   return poolResolver.resolve(hostAnchors)
 }

@@ -18147,6 +18147,12 @@ function normalizeAnchorDir(dir) {
   return p;
 }
 function rememberHostAnchor(dir) {
+  if (process.env.FORGE_ANCHOR_PROBE) {
+    try {
+      appendFileSync2(join6(tmpdir3(), "forge-anchor-probe.log"), `${new Date().toISOString()} rememberHostAnchor(${JSON.stringify(dir)}) cwd=${JSON.stringify(process.cwd())}
+`);
+    } catch {}
+  }
   const normalized = normalizeAnchorDir(dir);
   if (!normalized)
     return;
@@ -18157,6 +18163,12 @@ function rememberHostAnchor(dir) {
   }
 }
 function resolvePools() {
+  if (process.env.FORGE_ANCHOR_PROBE) {
+    try {
+      appendFileSync2(join6(tmpdir3(), "forge-anchor-probe.log"), `${new Date().toISOString()} resolvePools: resolver=${poolResolver ? "set" : "null"} anchors=${JSON.stringify([...hostAnchors])}
+`);
+    } catch {}
+  }
   if (!poolResolver || hostAnchors.length === 0)
     return null;
   return poolResolver.resolve(hostAnchors);
