@@ -51,7 +51,12 @@
       flawed judgment — the verbatim-text evidence came from the parent's
       NATIVE task-result channel and the driver's own `MARKER IN WAKE:
       false` was overlooked; the plugin wake channel was actually
-      scaffolded by the 1.3 row-shape defect. Sandbox layout notes that
+      scaffolded by the 1.3 row-shape defect. RE-RUN with 0.32.3 code and
+      the corrected judgment (scan the parent session for the
+      `[forge:dispatch-complete]` message, bare user-row text field):
+      `Final report:` carried the child's actual final text verbatim
+      (`VIEW-E2E-OK … No tool refusals.`), zero scaffold strings.
+      Sandbox layout notes that
       stand: the host chdirs to USERPROFILE and that directory becomes
       the anchor — fake home = the workspace itself; dir-scan lazy-loaded
       plugins register agents that the EXECUTION layer cannot resolve.
