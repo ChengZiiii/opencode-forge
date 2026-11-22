@@ -19997,7 +19997,10 @@ function dispatchClient() {
   return jobClient;
 }
 var cancelledDispatchIds = new Set;
-var CANCEL_IDLE_ASSERTION_MS = Number(process.env.FORGE_CANCEL_IDLE_ASSERTION_MS ?? 1e4);
+function cancelIdleAssertionMs() {
+  const raw = Number(process.env.FORGE_CANCEL_IDLE_ASSERTION_MS);
+  return Number.isFinite(raw) && raw > 0 ? raw : 1e4;
+}
 function inFlightDispatchList() {
   const rows = [];
   for (const row of dispatchTasks.values()) {
@@ -20046,7 +20049,8 @@ Cancel with /forge-cancel <task-id> or /forge-cancel all. Nothing was cancelled 
   return true;
 }
 async function assertChildIdleAfterAbort(client, childSessionID) {
-  const deadline = Date.now() + CANCEL_IDLE_ASSERTION_MS;
+  const assertionMs = cancelIdleAssertionMs();
+  const deadline = Date.now() + assertionMs;
   while (Date.now() < deadline) {
     await new Promise((resolve2) => setTimeout(resolve2, 400));
     try {
@@ -20083,7 +20087,8 @@ ${formatInFlightDispatchList()}`
   cancelledDispatchIds.add(taskId);
   jobManager.kill(job);
   const idle = await assertChildIdleAfterAbort(client, row.childSessionID);
-  const idleNote = idle === "idle" ? `the child session ${row.childSessionID} is confirmed idle (the cancellation is REAL, not bookkeeping)` : idle === "resisted" ? `the child session ${row.childSessionID} did NOT reach idle within ${Math.round(CANCEL_IDLE_ASSERTION_MS / 1000)}s — it may have resisted cancellation; inspect or abort it natively in the host TUI` : `the child session ${row.childSessionID}'s state could not be read to confirm idle — verify it natively in the host TUI`;
+  const assertionMs = cancelIdleAssertionMs();
+  const idleNote = idle === "idle" ? `the child session ${row.childSessionID} is confirmed idle (the cancellation is REAL, not bookkeeping)` : idle === "resisted" ? `the child session ${row.childSessionID} did NOT reach idle within ${Math.round(assertionMs / 1000)}s — it may have resisted cancellation; inspect or abort it natively in the host TUI` : `the child session ${row.childSessionID}'s state could not be read to confirm idle — verify it natively in the host TUI`;
   return {
     ok: true,
     childSessionID: row.childSessionID,
