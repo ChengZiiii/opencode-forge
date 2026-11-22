@@ -573,14 +573,49 @@ test("v2 adapter messages: HTTP failure returns {error} (a PROVIDED capability f
   }
 })
 
-test("v2 adapter messages: no service.json — messages omitted (capability absence, never a throw)", async () => {
+test("v2 adapter messages: no service.json yet — reader wired but capabilityPending (never a throw, never view loss)", async () => {
   process.env.FORGE_SERVICE_FILE = join(tmpdir(), "forge-svc-nonexistent-", "service.json")
   resetServiceHttpDiscoveryForTests()
   try {
     const adapter = v2SessionClientForTests(svcCtx())
-    assert.equal(adapter?.session.messages, undefined, "no reader when discovery fails")
+    assert.ok(typeof adapter?.session.messages === "function", "the reader is always wired; discovery is lazy")
+    const res = await adapter.session.messages({ path: { id: "ses_yet" } })
+    assert.equal(res.capabilityPending, true, "pending discovery returns capabilityPending, not an error")
+    assert.equal(res.error, undefined, "pending is NOT an error (never counts as view loss)")
     assert.ok(adapter?.session.prompt, "the rest of the adapter is unaffected")
   } finally {
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+test("v2 adapter messages: discovery recovers after a late service.json (fail-then-succeed, 10s throttle bypassed by reset)", async () => {
+  process.env.FORGE_SERVICE_FILE = join(tmpdir(), "forge-svc-nonexistent2-", "service.json")
+  resetServiceHttpDiscoveryForTests()
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  const prevFetch = globalThis.fetch
+  const hits = []
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    const pending = await adapter.session.messages({ path: { id: "ses_late" } })
+    assert.equal(pending.capabilityPending, true, "pending before the file exists")
+    // The file materializes (boot-order reality)…
+    writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48003", password: "pw" }))
+    process.env.FORGE_SERVICE_FILE = svcFile
+    resetServiceHttpDiscoveryForTests()
+    globalThis.fetch = async (url) => {
+      hits.push(String(url))
+      return { ok: true, status: 200, text: async () => JSON.stringify([]) }
+    }
+    const res = await adapter.session.messages({ path: { id: "ses_late" } })
+    assert.equal(res.error, undefined, "the SAME reader recovers once discovery succeeds")
+    assert.deepEqual(res.data, [])
+    assert.equal(hits.length, 1)
+    assert.equal(hits[0], "http://127.0.0.1:48003/api/session/ses_late/message")
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
     delete process.env.FORGE_SERVICE_FILE
     resetServiceHttpDiscoveryForTests()
   }

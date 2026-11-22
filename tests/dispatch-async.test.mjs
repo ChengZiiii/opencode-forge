@@ -1008,6 +1008,30 @@ test("capability-absent client: fetchFinalMessage returns the clean capability e
   assert.ok(!/is not a function/i.test(final.error), "no TypeError wording leaks into the error")
 })
 
+test("capability-PENDING messages reader (capabilityPending: true) is leg-not-applicable — never view loss", async () => {
+  // Boot-order reality: the adapter wires the reader immediately but service
+  // discovery has not succeeded yet. The reader answers {capabilityPending}.
+  const client = {
+    session: {
+      create: async () => ({ data: { id: "ses_pend" } }),
+      promptAsync: async () => {},
+      abort: async () => true,
+      messages: async () => ({ capabilityPending: true }),
+    },
+  }
+  const { seams } = fakeTime()
+  const result = await pollChild(
+    client,
+    { sessionID: "ses_pend", intervalMs: 1, timeoutMs: 50, viewLossTicks: 3 },
+    seams,
+  )
+  assert.equal(result.status, "timeout", "pending never accumulates view-loss ticks")
+  const final = await fetchFinalMessage(client, "ses_pend")
+  assert.equal(final.ok, false)
+  assert.match(final.error, /capability pending/)
+  assert.ok(!/is not a function/i.test(final.error))
+})
+
 test("capability-absent client with get(): the stale reap still probes (session.get leg untouched)", async () => {
   let gets = 0
   const client = {

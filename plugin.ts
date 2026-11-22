@@ -8505,8 +8505,13 @@ type V2SessionClient = {
 // overrides the path (tests).
 type ServiceHttpEndpoint = { url: string; password: string }
 let serviceHttpCache: ServiceHttpEndpoint | null | undefined
+let serviceHttpLastFail = 0
 function discoverServiceHttp(): ServiceHttpEndpoint | null {
-  if (serviceHttpCache !== undefined) return serviceHttpCache
+  // Positive results cache forever; failures retry at most once per 10s —
+  // service.json can materialize shortly AFTER plugin setup (boot ordering),
+  // so a failed discovery must stay retryable, never sticky.
+  if (serviceHttpCache) return serviceHttpCache
+  if (serviceHttpCache === null && Date.now() - serviceHttpLastFail < 10_000) return null
   try {
     const file = process.env.FORGE_SERVICE_FILE || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode", "service.json")
     const raw = JSON.parse(readFileSync(file, "utf8"))
@@ -8514,15 +8519,18 @@ function discoverServiceHttp(): ServiceHttpEndpoint | null {
       serviceHttpCache = { url: raw.url.replace(/\/+$/, ""), password: raw.password }
     } else {
       serviceHttpCache = null
+      serviceHttpLastFail = Date.now()
     }
   } catch {
     serviceHttpCache = null
+    serviceHttpLastFail = Date.now()
   }
   return serviceHttpCache
 }
 /** Test seam: forget the cached service discovery (FORGE_SERVICE_FILE env picks the file). */
 export function resetServiceHttpDiscoveryForTests(): void {
   serviceHttpCache = undefined
+  serviceHttpLastFail = 0
 }
 // W6a field reality (live probe 2026-11-19): the v2 promise-layer session
 // domain validates its params against a FLAT {sessionID} key — the v1
@@ -8612,27 +8620,31 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
     }
   }
   // fix-dispatch-view-capability: HTTP-backed messages reader (upstream
-  // #59566 sanctions the session-message HTTP surface). Directory anchors
-  // per child (captured at create), falling back to the last known one.
-  const svc = discoverServiceHttp()
-  if (svc) {
-    out.messages = async (args) => {
-      const sid = typeof args?.path?.id === "string" ? args.path.id : undefined
-      if (!sid) return { error: "messages reader: no session id in args" }
-      const dir = childDirs.get(sid) ?? lastKnownDir
-      try {
-        const loc = dir ? `?location%5Bdirectory%5D=${encodeURIComponent(dir)}` : ""
-        const res = await fetch(`${svc.url}/api/session/${sid}/message${loc}`, {
-          headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
-        })
-        if (!res.ok) return { error: `HTTP ${res.status}` }
-        const parsed = JSON.parse(await res.text()) as unknown
-        const arr = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === "object" && Array.isArray((parsed as { data?: unknown }).data) ? (parsed as { data: unknown[] }).data : undefined)
-        if (!Array.isArray(arr)) return { error: "unexpected message payload shape" }
-        return { data: arr }
-      } catch (e) {
-        return { error: String(e) }
-      }
+  // #59566 sanctions the session-message HTTP surface). Wired whenever the
+  // adapter builds; discovery happens lazily per call and may still be
+  // PENDING at early boot (service.json can materialize after setup) — a
+  // pending discovery returns {capabilityPending: true}, which the core
+  // treats as leg-not-applicable (never view loss) until discovery
+  // succeeds. Directory anchors per child (captured at create), falling
+  // back to the last known one.
+  out.messages = async (args) => {
+    const sid = typeof args?.path?.id === "string" ? args.path.id : undefined
+    if (!sid) return { error: "messages reader: no session id in args" }
+    const svc = discoverServiceHttp()
+    if (!svc) return { capabilityPending: true }
+    const dir = childDirs.get(sid) ?? lastKnownDir
+    try {
+      const loc = dir ? `?location%5Bdirectory%5D=${encodeURIComponent(dir)}` : ""
+      const res = await fetch(`${svc.url}/api/session/${sid}/message${loc}`, {
+        headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
+      })
+      if (!res.ok) return { error: `HTTP ${res.status}` }
+      const parsed = JSON.parse(await res.text()) as unknown
+      const arr = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === "object" && Array.isArray((parsed as { data?: unknown }).data) ? (parsed as { data: unknown[] }).data : undefined)
+      if (!Array.isArray(arr)) return { error: "unexpected message payload shape" }
+      return { data: arr }
+    } catch (e) {
+      return { error: String(e) }
     }
   }
   return Object.keys(out).length > 0 ? { session: out } : null

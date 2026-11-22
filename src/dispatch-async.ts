@@ -115,12 +115,15 @@ export type DispatchClient = {
      * v2 session domains expose no messages method — the v2 adapter provides
      * an HTTP-backed one when service discovery succeeds (upstream
      * #59566 sanctions the HTTP session-message surface). Core guards treat
-     * absence as "leg not applicable", never as view loss.
+     * absence as "leg not applicable", never as view loss. A reader whose
+     * backend is not READY yet (service discovery pending) returns
+     * `{capabilityPending: true}` — also treated as leg-not-applicable
+     * (never view loss), until discovery succeeds.
      */
     messages?: (args: {
       path: { id: string }
       query?: { limit?: number }
-    }) => Promise<{ data?: SessionMessageLike[]; error?: unknown }>
+    }) => Promise<{ data?: SessionMessageLike[]; error?: unknown; capabilityPending?: boolean }>
     abort: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<unknown>
   }
 }
@@ -796,7 +799,11 @@ export async function pollChild(
           path: { id: input.sessionID },
           query: { limit: 100 },
         })
-        if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
+        if ((msgResult as { capabilityPending?: boolean } | undefined)?.capabilityPending === true) {
+          // Backend not ready yet (service discovery pending) — leg not
+          // applicable this tick; never view loss. Discovery retries lazily.
+          messages = []
+        } else if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
           messages = msgResult.data
         } else {
           messagesFailed = true
@@ -899,6 +906,9 @@ export async function fetchFinalMessage(
   let messages: SessionMessageLike[]
   try {
     const result = await client.session.messages({ path: { id: sessionID } })
+    if ((result as { capabilityPending?: boolean } | undefined)?.capabilityPending === true) {
+      return { ok: false, error: "messages capability pending (service discovery has not succeeded yet)" }
+    }
     if (result.error !== undefined) {
       return { ok: false, error: `session.messages failed: ${String(result.error)}` }
     }

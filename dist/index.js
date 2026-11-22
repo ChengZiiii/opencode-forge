@@ -17324,7 +17324,9 @@ async function pollChild(client, input, seams = {}) {
           path: { id: input.sessionID },
           query: { limit: 100 }
         });
-        if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
+        if (msgResult?.capabilityPending === true) {
+          messages = [];
+        } else if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
           messages = msgResult.data;
         } else {
           messagesFailed = true;
@@ -17382,6 +17384,9 @@ async function fetchFinalMessage(client, sessionID) {
   let messages;
   try {
     const result = await client.session.messages({ path: { id: sessionID } });
+    if (result?.capabilityPending === true) {
+      return { ok: false, error: "messages capability pending (service discovery has not succeeded yet)" };
+    }
     if (result.error !== undefined) {
       return { ok: false, error: `session.messages failed: ${String(result.error)}` };
     }
@@ -23330,9 +23335,12 @@ function v2PromptInputOf(opts) {
   return { sessionID: sid, text };
 }
 var serviceHttpCache;
+var serviceHttpLastFail = 0;
 function discoverServiceHttp() {
-  if (serviceHttpCache !== undefined)
+  if (serviceHttpCache)
     return serviceHttpCache;
+  if (serviceHttpCache === null && Date.now() - serviceHttpLastFail < 1e4)
+    return null;
   try {
     const file2 = process.env.FORGE_SERVICE_FILE || join6(process.env.XDG_STATE_HOME || join6(homedir(), ".local", "state"), "opencode", "service.json");
     const raw = JSON.parse(readFileSync9(file2, "utf8"));
@@ -23340,14 +23348,17 @@ function discoverServiceHttp() {
       serviceHttpCache = { url: raw.url.replace(/\/+$/, ""), password: raw.password };
     } else {
       serviceHttpCache = null;
+      serviceHttpLastFail = Date.now();
     }
   } catch {
     serviceHttpCache = null;
+    serviceHttpLastFail = Date.now();
   }
   return serviceHttpCache;
 }
 function resetServiceHttpDiscoveryForTests() {
   serviceHttpCache = undefined;
+  serviceHttpLastFail = 0;
 }
 function v2SessionIdOf(opts) {
   if (opts === null || typeof opts !== "object")
@@ -23412,30 +23423,30 @@ function v2SessionClient(ctx) {
       return envelope;
     };
   }
-  const svc = discoverServiceHttp();
-  if (svc) {
-    out.messages = async (args) => {
-      const sid = typeof args?.path?.id === "string" ? args.path.id : undefined;
-      if (!sid)
-        return { error: "messages reader: no session id in args" };
-      const dir = childDirs.get(sid) ?? lastKnownDir;
-      try {
-        const loc = dir ? `?location%5Bdirectory%5D=${encodeURIComponent(dir)}` : "";
-        const res = await fetch(`${svc.url}/api/session/${sid}/message${loc}`, {
-          headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` }
-        });
-        if (!res.ok)
-          return { error: `HTTP ${res.status}` };
-        const parsed = JSON.parse(await res.text());
-        const arr = Array.isArray(parsed) ? parsed : parsed && typeof parsed === "object" && Array.isArray(parsed.data) ? parsed.data : undefined;
-        if (!Array.isArray(arr))
-          return { error: "unexpected message payload shape" };
-        return { data: arr };
-      } catch (e) {
-        return { error: String(e) };
-      }
-    };
-  }
+  out.messages = async (args) => {
+    const sid = typeof args?.path?.id === "string" ? args.path.id : undefined;
+    if (!sid)
+      return { error: "messages reader: no session id in args" };
+    const svc = discoverServiceHttp();
+    if (!svc)
+      return { capabilityPending: true };
+    const dir = childDirs.get(sid) ?? lastKnownDir;
+    try {
+      const loc = dir ? `?location%5Bdirectory%5D=${encodeURIComponent(dir)}` : "";
+      const res = await fetch(`${svc.url}/api/session/${sid}/message${loc}`, {
+        headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` }
+      });
+      if (!res.ok)
+        return { error: `HTTP ${res.status}` };
+      const parsed = JSON.parse(await res.text());
+      const arr = Array.isArray(parsed) ? parsed : parsed && typeof parsed === "object" && Array.isArray(parsed.data) ? parsed.data : undefined;
+      if (!Array.isArray(arr))
+        return { error: "unexpected message payload shape" };
+      return { data: arr };
+    } catch (e) {
+      return { error: String(e) };
+    }
+  };
   return Object.keys(out).length > 0 ? { session: out } : null;
 }
 function v2EventFields(raw) {
