@@ -17299,13 +17299,15 @@ async function pollChild(client, input, seams = {}) {
       return { status: "aborted", sessionID: input.sessionID, polls };
     }
     let statusMap;
-    try {
-      const statusResult = await client.session.status();
-      if (statusResult.error === undefined && statusResult.data && typeof statusResult.data === "object") {
-        statusMap = statusResult.data;
+    if (typeof client.session.status !== "function") {} else {
+      try {
+        const statusResult = await client.session.status();
+        if (statusResult.error === undefined && statusResult.data && typeof statusResult.data === "object") {
+          statusMap = statusResult.data;
+        }
+      } catch {
+        statusMap = undefined;
       }
-    } catch {
-      statusMap = undefined;
     }
     let active;
     if (statusMap === undefined) {
@@ -17316,19 +17318,21 @@ async function pollChild(client, input, seams = {}) {
     }
     let messages = [];
     let messagesFailed = false;
-    try {
-      const msgResult = await client.session.messages({
-        path: { id: input.sessionID },
-        query: { limit: 100 }
-      });
-      if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
-        messages = msgResult.data;
-      } else {
+    if (typeof client.session.messages !== "function") {} else {
+      try {
+        const msgResult = await client.session.messages({
+          path: { id: input.sessionID },
+          query: { limit: 100 }
+        });
+        if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
+          messages = msgResult.data;
+        } else {
+          messagesFailed = true;
+        }
+      } catch {
+        messages = [];
         messagesFailed = true;
       }
-    } catch {
-      messages = [];
-      messagesFailed = true;
     }
     const viewLossLimit = input.viewLossTicks ?? DEFAULT_VIEW_LOSS_TICKS;
     if (statusMap === undefined && messagesFailed) {
@@ -17372,6 +17376,9 @@ async function pollChild(client, input, seams = {}) {
   }
 }
 async function fetchFinalMessage(client, sessionID) {
+  if (typeof client.session.messages !== "function") {
+    return { ok: false, error: "no messages capability on this dispatch client (signal-core completion owns the wake text)" };
+  }
   let messages;
   try {
     const result = await client.session.messages({ path: { id: sessionID } });
@@ -19852,6 +19859,8 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
     }
     let active = true;
     try {
+      if (typeof client.session.status !== "function")
+        throw new Error("no status capability");
       const st = await client.session.status();
       if (st.error === undefined && st.data && typeof st.data === "object") {
         const entry = st.data[childId];
@@ -19879,6 +19888,8 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
         jobManager.markTerminal(job2, "exited", 0);
         journalTerminalRecord(base, "completed", `final report recovered after host restart (child session ${childId})`);
         try {
+          if (typeof client.session.status !== "function")
+            throw new Error("no status capability");
           const st2 = await client.session.status();
           const ownerEntry = st2.data?.[rec.ownerSession];
           if (!ownerEntry || !["busy", "retry", "running"].includes(ownerEntry?.type ?? "")) {
@@ -20054,6 +20065,8 @@ async function assertChildIdleAfterAbort(client, childSessionID) {
   while (Date.now() < deadline) {
     await new Promise((resolve2) => setTimeout(resolve2, 400));
     try {
+      if (typeof client.session.status !== "function")
+        return "unresolved";
       const st = await client.session.status();
       const map2 = st?.data;
       if (map2 && typeof map2 === "object") {
@@ -20063,6 +20076,8 @@ async function assertChildIdleAfterAbort(client, childSessionID) {
     } catch {}
   }
   try {
+    if (typeof client.session.status !== "function")
+      return "unresolved";
     const st = await client.session.status();
     const map2 = st?.data;
     if (!map2)
@@ -20296,6 +20311,8 @@ async function detectOrphanDispatchChildren(client, workspace) {
     return 0;
   let active;
   try {
+    if (typeof client.session.status !== "function")
+      return 0;
     const st = await client.session.status();
     const map2 = st?.data;
     if (!map2 || typeof map2 !== "object")
@@ -23312,6 +23329,26 @@ function v2PromptInputOf(opts) {
     return null;
   return { sessionID: sid, text };
 }
+var serviceHttpCache;
+function discoverServiceHttp() {
+  if (serviceHttpCache !== undefined)
+    return serviceHttpCache;
+  try {
+    const file2 = process.env.FORGE_SERVICE_FILE || join6(process.env.XDG_STATE_HOME || join6(homedir(), ".local", "state"), "opencode", "service.json");
+    const raw = JSON.parse(readFileSync9(file2, "utf8"));
+    if (raw && typeof raw.url === "string" && typeof raw.password === "string" && raw.url && raw.password) {
+      serviceHttpCache = { url: raw.url.replace(/\/+$/, ""), password: raw.password };
+    } else {
+      serviceHttpCache = null;
+    }
+  } catch {
+    serviceHttpCache = null;
+  }
+  return serviceHttpCache;
+}
+function resetServiceHttpDiscoveryForTests() {
+  serviceHttpCache = undefined;
+}
 function v2SessionIdOf(opts) {
   if (opts === null || typeof opts !== "object")
     return;
@@ -23322,11 +23359,16 @@ function v2SessionIdOf(opts) {
     return o.sessionID;
   return;
 }
+function v2SessionClientForTests(ctx) {
+  return v2SessionClient(ctx);
+}
 function v2SessionClient(ctx) {
   const s = ctx.session;
   if (s === null || typeof s !== "object")
     return null;
   const out = {};
+  const childDirs = new Map;
+  let lastKnownDir;
   if (typeof s.prompt === "function") {
     const send = async (opts) => {
       const input = v2PromptInputOf(opts);
@@ -23359,10 +23401,39 @@ function v2SessionClient(ctx) {
       if (typeof directory === "string" && directory !== "" && flat.directory === undefined)
         flat.directory = directory;
       const record2 = await rawCreate.call(s, flat);
-      if (record2 !== null && typeof record2 === "object" && (("data" in record2) || ("error" in record2))) {
-        return record2;
+      const envelope = record2 !== null && typeof record2 === "object" && (("data" in record2) || ("error" in record2)) ? record2 : { data: record2 };
+      try {
+        const rec = envelope.data ?? null;
+        if (rec && typeof rec.id === "string" && typeof directory === "string" && directory) {
+          childDirs.set(rec.id, directory);
+          lastKnownDir = directory;
+        }
+      } catch {}
+      return envelope;
+    };
+  }
+  const svc = discoverServiceHttp();
+  if (svc) {
+    out.messages = async (args) => {
+      const sid = typeof args?.path?.id === "string" ? args.path.id : undefined;
+      if (!sid)
+        return { error: "messages reader: no session id in args" };
+      const dir = childDirs.get(sid) ?? lastKnownDir;
+      try {
+        const loc = dir ? `?location%5Bdirectory%5D=${encodeURIComponent(dir)}` : "";
+        const res = await fetch(`${svc.url}/api/session/${sid}/message${loc}`, {
+          headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` }
+        });
+        if (!res.ok)
+          return { error: `HTTP ${res.status}` };
+        const parsed = JSON.parse(await res.text());
+        const arr = Array.isArray(parsed) ? parsed : parsed && typeof parsed === "object" && Array.isArray(parsed.data) ? parsed.data : undefined;
+        if (!Array.isArray(arr))
+          return { error: "unexpected message payload shape" };
+        return { data: arr };
+      } catch (e) {
+        return { error: String(e) };
       }
-      return { data: record2 };
     };
   }
   return Object.keys(out).length > 0 ? { session: out } : null;
@@ -23714,6 +23785,7 @@ var plugin_default = { id: "forge", server, setup: v2Setup };
 export {
   v2WiringSeam,
   v2Setup,
+  v2SessionClientForTests,
   takeDispatchTerminalSignal,
   setDispatchWaitSeamForTests,
   setDispatchStorageForTests,
@@ -23721,6 +23793,7 @@ export {
   resolveGateAskWatchdogMs,
   resolveForgeShellPosture,
   resolveDispatchQueueMax,
+  resetServiceHttpDiscoveryForTests,
   recoverOneDispatchRecord,
   recentDispatchChildActivity,
   observedOrphanDispatches,
