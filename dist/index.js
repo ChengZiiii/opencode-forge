@@ -17170,7 +17170,8 @@ async function createChildSession(client, input) {
           model: {
             providerID: input.modelPin.providerID,
             modelID: input.modelPin.modelID,
-            id: input.modelPin.modelID
+            id: input.modelPin.modelID,
+            ...input.modelPin.variant ? { variant: input.modelPin.variant } : {}
           }
         } : {},
         ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {},
@@ -18005,7 +18006,12 @@ var INIT_WORKSPACE_LEAD = "draft THIS workspace's recipe (.opencode/forge.json) 
 var INIT_FLOW_BODY = "First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent's shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user's explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes.";
 var INIT_GLOBAL_SCAFFOLD_NOTE = "The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in's prompt wholesale; the scaffold's inline comments say the same).";
 var INIT_GLOBAL_BODY = `same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. ${INIT_GLOBAL_SCAFFOLD_NOTE}`;
-var FORGE_HELP_ROUTE_LINE = "- Argument empty or unknown: tell the user the three forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries) — and stop.";
+var FORGE_HELP_ROUTE_LINE = "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (cancel THIS session's in-flight async dispatches) — and stop.";
+var STOP_LEVER_BODY = [
+  '- Argument "stop": call forge_jobs with action "stop" (no other parameters) and relay the tool result verbatim — it cancels every in-flight ASYNC DISPATCH owned by THIS session (each child session is aborted and CONFIRMED idle; each dispatch settles as aborted and is never retried). A dispatch owned by another session is NOT touched: name its task id only if the user asks, and cancel it with the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"}. Then STOP: no re-dispatch, no replacement work.',
+  "Boundaries: cancellation is USER intent only — never stop dispatches on your own initiative; a stopped dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entries and the owner wakes are delivered by the plugin's terminal path, not by you."
+].join(`
+`);
 var FORGE_COMMAND_TEMPLATE = [
   '(forge roster levers. Argument: "$ARGUMENTS")',
   "",
@@ -18017,58 +18023,10 @@ var FORGE_COMMAND_TEMPLATE = [
   `- Argument "init global": ${INIT_GLOBAL_BODY} Scaffold shape:`,
   ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split(`
 `).map((l) => `  ${l}`),
+  `- ${STOP_LEVER_BODY}`,
   FORGE_HELP_ROUTE_LINE,
   "",
   FORGE_BOUNDARIES_TEXT,
-  ""
-].join(`
-`);
-var FORGE_SYNC_LEVER_TEMPLATE = [
-  "(forge roster lever: sync — force a roster sync NOW and show the diff)",
-  "",
-  forgeFamilyGuard("/forge-sync"),
-  "",
-  SYNC_LEVER_BODY,
-  "",
-  FORGE_BOUNDARIES_TEXT,
-  ""
-].join(`
-`);
-var FORGE_INIT_LEVER_TEMPLATE = [
-  "(forge roster lever: init — draft THIS workspace's recipe (.opencode/forge.json) in-band)",
-  "",
-  forgeFamilyGuard("/forge-init"),
-  "",
-  `${INIT_WORKSPACE_LEAD} ${INIT_FLOW_BODY}`,
-  "",
-  FORGE_BOUNDARIES_TEXT,
-  ""
-].join(`
-`);
-var FORGE_INIT_GLOBAL_LEVER_TEMPLATE = [
-  "(forge roster lever: init global — draft the GLOBAL recipe (~/.config/opencode/forge.json))",
-  "",
-  forgeFamilyGuard("/forge-init-global"),
-  "",
-  `Draft the GLOBAL recipe (~/.config/opencode/forge.json) in-band with the user. ${INIT_FLOW_BODY} ${INIT_GLOBAL_SCAFFOLD_NOTE} Scaffold shape:`,
-  ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split(`
-`).map((l) => `  ${l}`),
-  "",
-  FORGE_BOUNDARIES_TEXT,
-  ""
-].join(`
-`);
-var FORGE_CANCEL_LEVER_TEMPLATE = [
-  '(forge dispatch lever: cancel — stop an in-flight async dispatch. Argument: "$ARGUMENTS")',
-  "",
-  forgeFamilyGuard("/forge-cancel"),
-  "",
-  "Route on the argument above (decide silently; do not recite this routing text to the user):",
-  '- No argument: call forge_jobs with action "list" and report ONLY the async dispatches in flight — task id, agent, child session id, age, description — plus the exact cancel invocation for each. Cancel NOTHING on a bare listing.',
-  '- A task id: call forge_jobs {action: "cancel", jobId: "<task-id>"}. Relay the tool result verbatim — it names the confirmed-idle proof or the resisted-cancellation warning. Then STOP: no re-dispatch, no replacement work.',
-  '- "all": call forge_jobs {action: "cancel", jobId: "all"} — every in-flight dispatch cancels under the same confirmed-abort contract; relay each per-task result.',
-  "",
-  "Boundaries: cancellation is USER intent only — never cancel a dispatch on your own initiative; a cancelled dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entry and the owner wake are delivered by the plugin's terminal path, not by you.",
   ""
 ].join(`
 `);
@@ -19674,12 +19632,12 @@ var forgeShellTool = tool({
 ${res.output}` } : res;
   }
 });
-var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "clear", "handoff"];
+var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "stop", "clear", "handoff"];
 var forgeJobsTool = tool({
-  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel an in-flight ASYNC DISPATCH (its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried — the dispatch-specific cancel lever behind /forge-cancel); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel ONE in-flight ASYNC DISPATCH by explicit task id, including one owned by ANOTHER session (the deliberate cross-session escape hatch behind no ownership check; its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried); stop — cancel EVERY in-flight async dispatch owned by THIS session only (the /forge stop lever; session-scoped by construction, other sessions' dispatches are untouched; nothing in flight = honest no-op report); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
-    jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
+    jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list and stop)"),
     waitMs: tool.schema.number().int().nonnegative().optional().describe("poll: bounded in-call wait (clamped to 30000)"),
     offset: tool.schema.number().int().nonnegative().optional().describe("log: first line index; omitted = tail window"),
     limit: tool.schema.number().int().positive().optional().describe("log: max lines (default 200)")
@@ -19697,6 +19655,26 @@ var forgeJobsTool = tool({
       const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.previousRun ? "previous-run" : j.survive ? "survive" : j.scope}  ${j.cmd.slice(0, 60)}`);
       return { title: `jobs (${rows.length})`, output: rows.length > 0 ? rows.join(`
 `) : "(no jobs)" };
+    }
+    if (action === "stop") {
+      const client = dispatchClient();
+      if (!client)
+        throw new Error("[forge] stop: no dispatch client on this host.");
+      const flight = inFlightAsyncDispatches(context.sessionID);
+      if (flight.length === 0) {
+        return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${context.sessionID}) — nothing to stop.` };
+      }
+      const results = [];
+      for (const taskId of flight) {
+        const res = await cancelDispatch(client, taskId);
+        results.push(`- ${res.text}`);
+      }
+      return {
+        title: `${flight.length} dispatch(es) stopped`,
+        output: `[forge:job] Stopped ${flight.length} in-flight dispatch(es) of this session:
+${results.join(`
+`)}`
+      };
     }
     if (!args.jobId)
       throw new Error(`Action "${action}" requires jobId.`);
@@ -19743,16 +19721,7 @@ ${p.newOutput || "(none in this window)"}`,
       if (!client)
         throw new Error("[forge] cancel: no dispatch client on this host.");
       if (String(args.jobId).trim().toLowerCase() === "all") {
-        const { count, results } = await cancelAllDispatches(client);
-        if (count === 0) {
-          return { title: "cancel all", output: "[forge:job] (no async dispatches in flight — nothing to cancel)" };
-        }
-        return {
-          title: `${count} dispatch(es) cancelled`,
-          output: `[forge:job] Cancelled ${count} in-flight dispatch(es):
-${results.join(`
-`)}`
-        };
+        throw new Error(`[forge] cancel "all" is retired — use action "stop" (cancels THIS session's in-flight dispatches) or cancel an explicit task id.`);
       }
       const res = await cancelDispatch(client, args.jobId);
       if (!res.ok)
@@ -19824,7 +19793,10 @@ function rosterModelPin(agentID) {
   if (!def?.model)
     return null;
   const identity = parseIdentity(def.model);
-  return identity ? { providerID: identity.provider, modelID: identity.model } : null;
+  if (!identity)
+    return null;
+  const depth = typeof def.thoughtLevel === "string" ? def.thoughtLevel : "";
+  return VARIANT_DEPTH_WORDS.includes(depth) ? { providerID: identity.provider, modelID: identity.model, variant: depth } : { providerID: identity.provider, modelID: identity.model };
 }
 function forgeTargetUnresolved(agentID) {
   if (!agentID.toLowerCase().startsWith("forge-"))
@@ -19832,7 +19804,7 @@ function forgeTargetUnresolved(agentID) {
   const resolution = resolvePools();
   if (resolution?.agents[agentID.slice("forge-".length)])
     return null;
-  return `"${agentID}" does not resolve in the live roster (pool source: ` + `${resolution ? "the workspace pool resolution" : "none — no forge.json in scope for this host"}); ` + `refusing to spawn a default-agent child — re-sync the roster (/forge-sync) or correct the target`;
+  return `"${agentID}" does not resolve in the live roster (pool source: ` + `${resolution ? "the workspace pool resolution" : "none — no forge.json in scope for this host"}); ` + `refusing to spawn a default-agent child — re-sync the roster (/forge sync) or correct the target`;
 }
 function nestedTaskDenyFor(agentID, ownerSession, childSessionID) {
   const id = agentID.toLowerCase();
@@ -20069,7 +20041,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
   if (dispatchTasks.has(rec.id) || jobManager.get(rec.id))
     return;
   if (isDispatchCancelled(rec.id)) {
-    journalTerminalRecord({ id: rec.id, agent: rec.agent, ownerSession: rec.ownerSession, workspace, description: rec.description ?? "" }, "aborted", "cancelled by the user lever (forge-cancel) — recovery refuses to respawn a cancelled dispatch");
+    journalTerminalRecord({ id: rec.id, agent: rec.agent, ownerSession: rec.ownerSession, workspace, description: rec.description ?? "" }, "aborted", "cancelled by the user lever (/forge stop) — recovery refuses to respawn a cancelled dispatch");
     return;
   }
   const base = {
@@ -20284,7 +20256,7 @@ function discloseInterruptedParent(sessionID) {
   interruptDisclosureSeen.add(key);
   queueDispatchProgress(sessionID, `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):
 ${formatInFlightDispatchList()}
-Cancel with /forge-cancel <task-id> or /forge-cancel all. Nothing was cancelled automatically.`);
+Cancel with /forge stop (cancels every in-flight dispatch of THIS session) or the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"} (the cross-session escape hatch). Nothing was cancelled automatically.`);
   return true;
 }
 async function assertChildIdleAfterAbort(client, childSessionID) {
@@ -20341,15 +20313,6 @@ ${formatInFlightDispatchList()}`
 }
 function isDispatchCancelled(taskId) {
   return cancelledDispatchIds.has(taskId);
-}
-async function cancelAllDispatches(client) {
-  const flight = inFlightDispatchList();
-  const results = [];
-  for (const row of flight) {
-    const res = await cancelDispatch(client, row.taskId);
-    results.push(`- ${res.text}`);
-  }
-  return { count: flight.length, results };
 }
 var dispatchTerminalInbox = new Map;
 var dispatchChildActivityAt = new Map;
@@ -20483,7 +20446,7 @@ async function adoptPersistedDispatchRows(client, workspace) {
         if (!taskId || dispatchTasks.has(taskId))
           continue;
         if (isDispatchCancelled(taskId)) {
-          journalTerminalRecord({ id: taskId, agent: String(row.agent ?? ""), ownerSession: String(row.ownerSession ?? ""), workspace, description: String(row.description ?? "") }, "aborted", "cancelled by the user lever (forge-cancel) — adoption refuses to re-arm a cancelled dispatch");
+          journalTerminalRecord({ id: taskId, agent: String(row.agent ?? ""), ownerSession: String(row.ownerSession ?? ""), workspace, description: String(row.description ?? "") }, "aborted", "cancelled by the user lever (/forge stop) — adoption refuses to re-arm a cancelled dispatch");
           continue;
         }
         const owner = String(row.ownerSession ?? "");
@@ -20566,8 +20529,8 @@ async function detectOrphanDispatchChildren(client, workspace) {
       if (rec)
         taskId = rec.id;
     } catch {}
-    console.warn(`[forge:orphan-dispatch] warn: forge child ${id} (agent ${agent}, parent ${parent}) is STREAMING with no live dispatch row (task id ${taskId}) — adoption gap. Adopt: restart the host or touch the workspace to re-run recovery; Cancel: /forge-cancel <task-id> (or forge_jobs action=cancel).`);
-    queueDispatchProgress(parent, `[forge:dispatch-notice] Orphaned dispatch child detected: forge child ${id} (agent ${agent}, task id ${taskId}) is running with no live dispatch row. It will NOT deliver an outcome on its own — recover it (restart/touch to re-run adoption) or cancel it (/forge-cancel ${taskId === "(unknown)" ? "<task-id>" : taskId}).`);
+    console.warn(`[forge:orphan-dispatch] warn: forge child ${id} (agent ${agent}, parent ${parent}) is STREAMING with no live dispatch row (task id ${taskId}) — adoption gap. Adopt: restart the host or touch the workspace to re-run recovery; Cancel: /forge stop (this session's dispatches) or forge_jobs action=cancel with the task id.`);
+    queueDispatchProgress(parent, `[forge:dispatch-notice] Orphaned dispatch child detected: forge child ${id} (agent ${agent}, task id ${taskId}) is running with no live dispatch row. It will NOT deliver an outcome on its own — recover it (restart/touch to re-run adoption) or cancel it (forge_jobs action=cancel jobId=${taskId === "(unknown)" ? "<task-id>" : taskId}; or /forge stop when it belongs to this session).`);
   }
   return found;
 }
@@ -20770,7 +20733,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
       dispatchTasks.delete(job.id);
       const unconfirmed = abortUnconfirmedNotes.get(job.id);
       const suffix = unconfirmed ? ` — abort unconfirmed — child may still be running (${unconfirmed})` : "";
-      journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", isDispatchCancelled(job.id) ? `cancelled by the user lever (forge-cancel) — the child was aborted and the dispatch is never retried${suffix}` : `registry kill (owner session ended / dispose) — user abort${suffix}`);
+      journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", isDispatchCancelled(job.id) ? `cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried${suffix}` : `registry kill (owner session ended / dispose) — user abort${suffix}`);
       return;
     }
     if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
@@ -22383,23 +22346,7 @@ var server = async (input, options) => {
       };
       cfg.command["forge"] ??= {
         template: FORGE_COMMAND_TEMPLATE,
-        description: "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out"
-      };
-      cfg.command["forge-sync"] ??= {
-        template: FORGE_SYNC_LEVER_TEMPLATE,
-        description: "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff"
-      };
-      cfg.command["forge-init"] ??= {
-        template: FORGE_INIT_LEVER_TEMPLATE,
-        description: "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)"
-      };
-      cfg.command["forge-init-global"] ??= {
-        template: FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
-        description: "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out"
-      };
-      cfg.command["forge-cancel"] ??= {
-        template: FORGE_CANCEL_LEVER_TEMPLATE,
-        description: 'forge dispatch lever: cancel an in-flight async dispatch by task id (or "all"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried'
+        description: "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight async dispatches"
       };
       const perm = cfg.permission;
       const permSection = perm ?? (cfg.permission = {});
@@ -23325,10 +23272,17 @@ function v2ContextInjection(raw) {
       if (identity && o.model && typeof o.model === "object") {
         const before = JSON.stringify(o.model);
         const m = o.model;
+        const resolvedModel = typeof m.modelID === "string" ? m.modelID : typeof m.id === "string" ? m.id : "";
+        const identityEquals = m.providerID === identity.provider && resolvedModel === identity.model;
+        const recipeDepth = typeof pinnedDef.thoughtLevel === "string" ? pinnedDef.thoughtLevel : "";
         m.providerID = identity.provider;
         m.id = identity.model;
         m.modelID = identity.model;
-        delete m.variant;
+        if (identityEquals) {} else if (VARIANT_DEPTH_WORDS.includes(recipeDepth)) {
+          m.variant = recipeDepth;
+        } else {
+          delete m.variant;
+        }
         if (process.env.FORGE_MODEL_PROBE) {
           try {
             appendFileSync2(join6(tmpdir3(), "forge-model-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} rewrite ${before} -> ${JSON.stringify(o.model)}
@@ -23518,11 +23472,7 @@ async function v2RegisterCommands(ctx) {
 `));
       };
       addTemplateCommand("crew", crewTemplate, registrationAgentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance");
-      addTemplateCommand("forge", () => FORGE_COMMAND_TEMPLATE, "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out");
-      addTemplateCommand("forge-sync", () => FORGE_SYNC_LEVER_TEMPLATE, "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff");
-      addTemplateCommand("forge-init", () => FORGE_INIT_LEVER_TEMPLATE, "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)");
-      addTemplateCommand("forge-init-global", () => FORGE_INIT_GLOBAL_LEVER_TEMPLATE, "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out");
-      addTemplateCommand("forge-cancel", () => FORGE_CANCEL_LEVER_TEMPLATE, 'forge dispatch lever: cancel an in-flight async dispatch by task id (or "all"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried');
+      addTemplateCommand("forge", () => FORGE_COMMAND_TEMPLATE, "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight async dispatches");
     });
   } catch (e) {
     const head = e instanceof Error ? e.message : String(e);
@@ -24091,11 +24041,11 @@ export {
   crewOrchestrationTemplate,
   composeCommandPrompt,
   cancelDispatch,
-  cancelAllDispatches,
   adoptPersistedDispatchRows,
   __workerShellRescueTestSurface,
   TASK_SEAM_DEGRADED_ERROR,
   SYNC_LEVER_BODY,
+  STOP_LEVER_BODY,
   PLAN_COMMAND_TEMPLATE,
   INIT_WORKSPACE_LEAD,
   INIT_GLOBAL_SCAFFOLD_NOTE,
@@ -24103,12 +24053,8 @@ export {
   INIT_FLOW_BODY,
   GOAL_COMMAND_TEMPLATE,
   GLOBAL_RECIPE_SCAFFOLD_JSONC,
-  FORGE_SYNC_LEVER_TEMPLATE,
-  FORGE_INIT_LEVER_TEMPLATE,
-  FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
   FORGE_HELP_ROUTE_LINE,
   FORGE_COMMAND_TEMPLATE,
-  FORGE_CANCEL_LEVER_TEMPLATE,
   FORGE_BOUNDARIES_TEXT,
   DEFAULT_DISPATCH_QUEUE_MAX,
   CREW_INIT_TEMPLATE,

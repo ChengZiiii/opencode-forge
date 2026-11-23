@@ -8,9 +8,13 @@
 
 ## 2. Implementation（crew wave 3b：coder → test-coder → gate-verifier → spec-reviewer）
 
-- [ ] 2.1 pin 重写规则（同身份保 variant / 换模型按深度词派生 / 无深度
+- [x] 2.1 pin 重写规则（同身份保 variant / 换模型按深度词派生 / 无深度
       才删）+ `VARIANT_DEPTH_WORDS` import
-- [ ] 2.2 rosterModelPin variant 腿 + create seam 注释契约更新
+      （plugin.ts:8280-8302：identityEquals 同身份保 variant、深度词派生、
+      否则 delete；import 见 :81）
+- [x] 2.2 rosterModelPin variant 腿 + create seam 注释契约更新
+      （plugin.ts:2950-2969 深度词→{id,providerID,variant}；src/dispatch-async.ts
+      modelPin 类型 :182 + 裸 id 或 id+variant 双形状注释 :278-296）
 - [ ] 2.3 测试翻转+新增全绿（design D4）、typecheck 绿、全量套件绿；
       roster-compile / builtin-override 套件零改动验证
 

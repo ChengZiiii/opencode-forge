@@ -179,7 +179,7 @@ export type CreateChildInput = {
    * workers: no model key, the host's own precedence applies
    * (agent's configured model, else the inherited parent model).
    */
-  modelPin?: { providerID: string; modelID: string } | null
+  modelPin?: { providerID: string; modelID: string; variant?: string } | null
   /**
    * Read-back assertion (task 2.3): when true, the created record's `agent`
    * is asserted against `agentID` — a mismatch or missing binding fails the
@@ -281,12 +281,19 @@ export async function createChildSession(
         // as `providerID + "/" + id` — so `id` MUST be the bare model id; a
         // provider-qualified id yields a tripled key and kills the child at
         // drain (ModelUnavailableError). Absent for Auto workers by design.
+        // Variant shape (fix-runtime-model-pin-variant D2): the pin is the
+        // bare identity {providerID, modelID} when the recipe carries no
+        // variant-word depth, or {providerID, modelID, variant} when its
+        // thoughtLevel is low/medium/high — `id`/`modelID` stay BARE in
+        // both shapes; the variant rides its own key, never inside the id
+        // string.
         ...(input.modelPin
           ? {
               model: {
                 providerID: input.modelPin.providerID,
                 modelID: input.modelPin.modelID,
                 id: input.modelPin.modelID,
+                ...(input.modelPin.variant ? { variant: input.modelPin.variant } : {}),
               },
             }
           : {}),
