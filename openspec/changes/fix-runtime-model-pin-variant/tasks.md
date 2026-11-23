@@ -15,8 +15,15 @@
 - [x] 2.2 rosterModelPin variant 腿 + create seam 注释契约更新
       （plugin.ts:2950-2969 深度词→{id,providerID,variant}；src/dispatch-async.ts
       modelPin 类型 :182 + 裸 id 或 id+variant 双形状注释 :278-296）
-- [ ] 2.3 测试翻转+新增全绿（design D4）、typecheck 绿、全量套件绿；
+- [x] 2.3 测试翻转+新增全绿（design D4）、typecheck 绿、全量套件绿；
       roster-compile / builtin-override 套件零改动验证
+      （v2-session-commands 15/15：同身份保 variant "low"、switch+high 派生
+      "high"、switch+xhigh 删除；rosterModelPin variant 腿新增于
+      dispatch-wiring 45/45：low → {zai, glm, id:glm, variant:"low"}、
+      xhigh → 裸 pin（create body 实证）；roster-compile 15/15 与
+      builtin-override 19/19 零改动原样通过——端到端矛盾已消；
+      typecheck 绿。全量套件 deferred：crew-continue 并行波次占用
+      plugin.ts/src，单文件门通过即记账）
 
 ## 3. Verification（GATE）
 

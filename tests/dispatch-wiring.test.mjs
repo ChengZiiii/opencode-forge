@@ -248,6 +248,39 @@ test("sync dispatch: parentID + NO question-deny create body, agent identity + c
 // ---------------------------------------------------------------------------
 // Gate matrix (spec: Task shadow surface — the forge gate chain)
 
+test("create body model pin: rosterModelPin derives the variant leg — a variant-word depth rides `variant`, a non-variant word stays bare", async (t) => {
+  // fix-runtime-model-pin-variant D2: the create-seam pin is {providerID,
+  // modelID, id} bare OR with `variant` when the recipe's thoughtLevel is a
+  // variant word (low/medium/high). "xhigh" is a depth but NOT a variant
+  // word -> the bare shape (the compiled .md would carry no #variant either).
+  const dir = projectWithForgeJson(
+    t,
+    JSON.stringify({
+      pool: "dpv",
+      agents: {
+        shallow: { model: "zai/glm", thoughtLevel: "low", shape: "readonly" },
+        extreme: { model: "zai/glm", thoughtLevel: "xhigh", shape: "readonly" },
+      },
+    }),
+  )
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir } })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  await h.tool.task.execute({ subagent_type: "forge-dpv-shallow", prompt: "pin me" }, allowCtx("ses_pinvar1", dir))
+  await h.tool.task.execute({ subagent_type: "forge-dpv-extreme", prompt: "pin me too" }, allowCtx("ses_pinvar2", dir))
+  assert.deepEqual(
+    calls.create[0].body.model,
+    { providerID: "zai", modelID: "glm", id: "glm", variant: "low" },
+    "variant-word depth -> the pin carries {id, providerID, variant} (variant on its own key, never inside the id)",
+  )
+  assert.deepEqual(
+    calls.create[1].body.model,
+    { providerID: "zai", modelID: "glm", id: "glm" },
+    "non-variant depth word -> the bare pin shape (no variant key)",
+  )
+})
+
 test("gate: cross-pool target refused with the task belt copy", async (t) => {
   const dirA = projectWithForgeJson(t, JSON.stringify({ pool: "pa", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
   const dirB = projectWithForgeJson(t, JSON.stringify({ pool: "pb", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))

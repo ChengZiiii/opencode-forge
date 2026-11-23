@@ -26,7 +26,7 @@ import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 process.env.FORGE_TEST_NO_FENCE = "1"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 
-import { v2Setup, v2WiringSeam, PLAN_COMMAND_TEMPLATE, GOAL_COMMAND_TEMPLATE } from "../plugin.ts"
+import { v2Setup, v2WiringSeam, PLAN_COMMAND_TEMPLATE, GOAL_COMMAND_TEMPLATE, FORGE_COMMAND_TEMPLATE } from "../plugin.ts"
 
 const HOME = join(tmpdir(), "forge-v2-sess-home")
 process.env.FORGE_TEST_FORGE_HOME = HOME
@@ -160,35 +160,50 @@ test("v2 session: context injects the pinned thoughtLevel onto event.options; fr
 // ---------------------------------------------------------------------------
 // runtime model pin (v2-runtime-model-pin)
 
-test("v2 model pin: context rewrites the payload model to the pinned identity (variant dropped); unpinned/unparsable/missing-model payloads stay untouched", async () => {
+test("v2 model pin: identity-equal rewrite preserves the host variant; a model switch derives variant from a variant-word depth and deletes it otherwise; unpinned/unparsable/missing-model payloads stay untouched", async () => {
   const dir = poolDir("pin", {
     pinned: { model: "glm-coding-worker/glm-5.3", thoughtLevel: "low" },
+    deeper: { model: "glm-coding-worker/glm-5.3", thoughtLevel: "high" },
+    extreme: { model: "glm-coding-worker/glm-5.3", thoughtLevel: "xhigh" },
     auto: {},
     badpin: { model: "noslash", thoughtLevel: "low" },
   })
   const { context } = await setup(dir)
   try {
-    // Wired: the pinned agent's payload model is rewritten; variant dropped.
+    // Identity-equal pin: the rewrite is an invisible no-op — only the
+    // spellings normalize and the host-resolved #variant SURVIVES
+    // (fix-runtime-model-pin-variant D1).
+    const m1 = { providerID: "glm-coding-worker", id: "glm-5.3", variant: "low" }
     const out1 = { options: {} }
-    const m1 = { providerID: "opencode", id: "tidepool-alpha-free", variant: "minimal" }
     await context({ sessionID: "ses_pin1", agent: "forge-pin-pinned", model: m1, ...out1 })
     assert.equal(m1.providerID, "glm-coding-worker", "providerID rewritten to the pin")
     assert.equal(m1.id, "glm-5.3", "id rewritten to the pin")
     assert.equal(m1.modelID, "glm-5.3", "modelID spelling rewritten too")
-    assert.equal("variant" in m1, false, "source variant dropped")
-    // Depth still rides the same payload (pinned model channel or frozen).
+    assert.equal(m1.variant, "low", "SAME identity -> the host-resolved variant survives")
     assert.equal(out1.options.reasoningEffort, "low", "thoughtLevel injection unaffected")
+    // Model switch + variant-word depth: the variant is DERIVED from the
+    // recipe's thoughtLevel (a stale variant of a different model never rides).
+    const m2 = { providerID: "opencode", id: "tidepool-alpha-free", variant: "minimal" }
+    await context({ sessionID: "ses_pin2", agent: "forge-pin-deeper", model: m2 })
+    assert.equal(m2.providerID, "glm-coding-worker", "switch: providerID rewritten")
+    assert.equal(m2.variant, "high", "switch + variant word -> variant derived from the recipe depth")
+    // Model switch + NON-variant depth word (xhigh): the old variant is
+    // deleted (the previous behavior leg).
+    const m3 = { providerID: "opencode", id: "tidepool-alpha-free", variant: "minimal" }
+    await context({ sessionID: "ses_pin3", agent: "forge-pin-extreme", model: m3 })
+    assert.equal(m3.providerID, "glm-coding-worker", "switch: providerID rewritten")
+    assert.equal("variant" in m3, false, "switch without a variant word -> source variant deleted")
     // Auto worker (no pin): payload model untouched.
-    const m2 = { providerID: "opencode", id: "tidepool-alpha-free" }
-    await context({ sessionID: "ses_pin2", agent: "forge-pin-auto", model: m2 })
-    assert.equal(m2.providerID, "opencode", "no pin -> untouched")
-    assert.equal(m2.id, "tidepool-alpha-free", "no pin -> id untouched")
+    const m4 = { providerID: "opencode", id: "tidepool-alpha-free" }
+    await context({ sessionID: "ses_pin4", agent: "forge-pin-auto", model: m4 })
+    assert.equal(m4.providerID, "opencode", "no pin -> untouched")
+    assert.equal(m4.id, "tidepool-alpha-free", "no pin -> id untouched")
     // Unparsable pin: skip silently, no throw.
-    const m3 = { providerID: "opencode", id: "tidepool-alpha-free" }
-    await assert.doesNotReject(context({ sessionID: "ses_pin3", agent: "forge-pin-badpin", model: m3 }))
-    assert.equal(m3.providerID, "opencode", "unparsable pin -> untouched")
+    const m5 = { providerID: "opencode", id: "tidepool-alpha-free" }
+    await assert.doesNotReject(context({ sessionID: "ses_pin5", agent: "forge-pin-badpin", model: m5 }))
+    assert.equal(m5.providerID, "opencode", "unparsable pin -> untouched")
     // Missing payload model: no throw.
-    await assert.doesNotReject(context({ sessionID: "ses_pin4", agent: "forge-pin-pinned" }))
+    await assert.doesNotReject(context({ sessionID: "ses_pin6", agent: "forge-pin-pinned" }))
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -246,25 +261,32 @@ test("v2 session: goal-notice rides the context system injections for the live-g
 // ---------------------------------------------------------------------------
 // Commands (task 4.3)
 
-test("v2 commands: /plan /goal /crew /forge + the dedicated hyphenated family register as execute-based definitions", async () => {
+test("v2 commands: the exact registered set is [crew, forge, goal, plan] — execute-based definitions", async () => {
   const dir = poolDir("cmds", { research: { model: "openai/gpt", thoughtLevel: "low", shape: "readonly" } })
   const { state } = await setup(dir)
   try {
-    assert.deepEqual([...state.commands.keys()].sort(), [
-      "crew",
-      "forge",
-      "forge-cancel",
-      "forge-init",
-      "forge-init-global",
-      "forge-sync",
-      "goal",
-      "plan",
-    ])
-    for (const name of ["plan", "goal", "crew", "forge", "forge-sync", "forge-init", "forge-init-global", "forge-cancel"]) {
+    assert.deepEqual([...state.commands.keys()].sort(), ["crew", "forge", "goal", "plan"])
+    for (const name of ["plan", "goal", "crew", "forge"]) {
       const def = state.commands.get(name)
       assert.equal(typeof def.description, "string", `${name} description`)
       assert.equal(typeof def.execute, "function", `${name} is EXECUTE-based (CommandDefinition.execute)`)
     }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("v2 commands: /forge stop route delivery — typed \"stop\" composes into the router and the stop lever body rides verbatim", async () => {
+  const dir = poolDir("cmdstop", { research: { model: "openai/gpt", thoughtLevel: "low", shape: "readonly" } })
+  const { state } = await setup(dir)
+  try {
+    await state.commands.get("forge").execute({ sessionID: "ses_cmdstop", prompt: { text: "stop" } })
+    const sent = state.prompts.find((p) => p.sessionID === "ses_cmdstop")
+    assert.ok(sent, "the /forge execute delivered a prompt into the invoking session")
+    assert.ok(sent.text.includes('(forge roster levers. Argument: "stop")'), "the typed stop form composed into $ARGUMENTS")
+    assert.ok(sent.text.includes('- Argument "stop":'), "the stop route line rides the delivered template")
+    assert.match(sent.text, /forge_jobs with action "stop"/, "the stop route instructs the session-scoped forge_jobs stop action")
+    assert.equal(sent.text, FORGE_COMMAND_TEMPLATE.replaceAll("$ARGUMENTS", () => "stop"), "byte-identical composition of the router constant")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

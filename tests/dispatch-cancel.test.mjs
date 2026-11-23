@@ -11,10 +11,13 @@ import { setTimeout as sleep } from "node:timers/promises"
 // reply after rejection is harmless); ② the cancel engine (unknown id
 // refuses with the flight list; a real cancel kills the registry job,
 // CONFIRMS the child idle, marks the id never-retried; a resisting child is
-// disclosed; "all" cancels the flight serially); ③ the retry guard
-// (recovery refuses to respawn a cancelled id); ④ parent-interrupt
-// disclosure (disclose-only, deduped per flight composition); ⑤ orphan
-// child disclosure (streaming forge-* child with no row — once per child).
+// disclosed; the session-scoped `stop` action cancels THIS session's flight
+// serially — renegotiated per command-surface-v2-cleanup D2/D4: two-owner
+// fixture + honest no-op + the per-id cross-session escape hatch; "all" is
+// retired); ③ the retry guard (recovery refuses to respawn a cancelled id);
+// ④ parent-interrupt disclosure (disclose-only, deduped per flight
+// composition); ⑤ orphan child disclosure (streaming forge-* child with no
+// row — once per child).
 // (Plain JS — .mjs files are not type-stripped; the imported .ts core is.)
 
 process.env.FORGE_TEST_NO_FENCE = "1"
@@ -31,13 +34,13 @@ import {
   gate,
   resolveGateAskWatchdogMs,
   cancelDispatch,
-  cancelAllDispatches,
   isDispatchCancelled,
   discloseInterruptedParent,
   disclosedInterruptFlights,
   detectOrphanDispatchChildren,
   observedOrphanDispatches,
   recoverOneDispatchRecord,
+  server,
   v2WiringSeam,
 } from "../plugin.ts"
 
@@ -87,6 +90,25 @@ function cleanupDispatch(taskId) {
   if (job && job.state === "running") jobManager.kill(job)
   jobManager.clear(taskId)
   dispatchTasks.delete(taskId)
+}
+
+// Server harness for the forge_jobs tool-face legs (stop is a TOOL-layer
+// action — its session scoping lives in execute, so it must be driven
+// through the tool with a real context.sessionID, never a template).
+const input = (dir, client) => ({
+  client,
+  project: { id: "p" },
+  directory: dir,
+  worktree: dir,
+  serverUrl: new URL("http://127.0.0.1:1"),
+  $: () => {},
+})
+
+let lastHost = null
+async function startServer(inputArg, opts) {
+  if (lastHost) lastHost.__forgeSubagentsTest?.resetAnchors?.()
+  lastHost = await server(inputArg, opts)
+  return lastHost
 }
 
 // A cancel client: the status map is the streaming classifier — by default
@@ -226,22 +248,73 @@ test("cancel: a resisting child is disclosed, not declared dead", async (t) => {
   assert.match(res.text, /host TUI/)
 })
 
-test("cancel all: the whole flight cancels serially, each with the confirmed-abort contract", async (t) => {
-  const a = "task_cancel_all_a"
-  const b = "task_cancel_all_b"
-  seedDispatch(a, "ses_all_child_a", { description: "first" })
-  seedDispatch(b, "ses_all_child_b", { description: "second" })
+test("stop (forge_jobs, session-scoped): two-owner fixture — A owns two rows, B owns one; stop called from A kills A's flight ONLY, B is untouched", async (t) => {
+  const a1 = "task_stop_a1"
+  const a2 = "task_stop_a2"
+  const b = "task_stop_b"
+  seedDispatch(a1, "ses_stop_child_a1", { ownerSession: "ses_owner_A", description: "A first" })
+  seedDispatch(a2, "ses_stop_child_a2", { ownerSession: "ses_owner_A", description: "A second" })
+  seedDispatch(b, "ses_stop_child_b", { ownerSession: "ses_owner_B", description: "B sole" })
   t.after(() => {
-    cleanupDispatch(a)
-    cleanupDispatch(b)
+    for (const id of [a1, a2, b]) cleanupDispatch(id)
   })
-  const { count, results } = await cancelAllDispatches(cancelClient())
-  assert.equal(count, 2, "both in-flight dispatches were cancelled")
-  assert.equal(results.length, 2)
-  assert.match(results[0], /confirmed idle/)
-  assert.match(results[1], /confirmed idle/)
-  assert.equal(isDispatchCancelled(a), true)
-  assert.equal(isDispatchCancelled(b), true)
+  const dir = mkdtempSync(join(tmpdir(), "forge-cancel-stopws-"))
+  tmpDirs.push(dir)
+  const h = await startServer(input(dir, cancelClient()), {})
+  t.after(() => h.dispose?.())
+  await h.config({ agent: {}, command: {}, permission: {} })
+  const res = await h.tool.forge_jobs.execute({ action: "stop" }, { sessionID: "ses_owner_A" })
+  assert.match(res.output, /Stopped 2 in-flight dispatch\(es\) of this session/, "the report names the session-scoped count")
+  assert.match(res.output, /Confirmed idle|confirmed idle/, "each cancel carries the confirmed-abort contract")
+  assert.equal(isDispatchCancelled(a1), true, "A's first dispatch is cancelled")
+  assert.equal(isDispatchCancelled(a2), true, "A's second dispatch is cancelled")
+  assert.equal(jobManager.get(a1)?.state, "killed", "A's first registry job is killed")
+  assert.equal(jobManager.get(a2)?.state, "killed", "A's second registry job is killed")
+  assert.equal(isDispatchCancelled(b), false, "B's dispatch is NOT cancelled by A's stop")
+  assert.equal(jobManager.get(b)?.state, "running", "B's registry job is still running")
+  assert.equal(aborts, 2, "exactly A's two killTrees fired — B's never did")
+})
+
+test("stop: a session with nothing in flight gets the honest no-op report — another session's live row does not widen the blast radius", async (t) => {
+  const b = "task_stop_noop_b"
+  seedDispatch(b, "ses_noop_child_b", { ownerSession: "ses_owner_B", description: "B sole" })
+  t.after(() => cleanupDispatch(b))
+  const dir = mkdtempSync(join(tmpdir(), "forge-cancel-noopws-"))
+  tmpDirs.push(dir)
+  const h = await startServer(input(dir, cancelClient()), {})
+  t.after(() => h.dispose?.())
+  await h.config({ agent: {}, command: {}, permission: {} })
+  const res = await h.tool.forge_jobs.execute({ action: "stop" }, { sessionID: "ses_owner_empty" })
+  assert.match(res.output, /No async dispatches in flight for this session \(ses_owner_empty\) — nothing to stop\./, "the honest no-op report")
+  assert.equal(isDispatchCancelled(b), false, "B's live row is untouched by another session's empty stop")
+  assert.equal(jobManager.get(b)?.state, "running", "B's registry job is still running")
+})
+
+test("cancel per-id: the explicit cross-session escape hatch still works from another session, and the retired \"all\" form refuses loudly", async (t) => {
+  const b = "task_escape_b"
+  seedDispatch(b, "ses_escape_child", { ownerSession: "ses_owner_B", description: "B sole" })
+  t.after(() => cleanupDispatch(b))
+  const dir = mkdtempSync(join(tmpdir(), "forge-cancel-escapews-"))
+  tmpDirs.push(dir)
+  const h = await startServer(input(dir, cancelClient()), {})
+  t.after(() => h.dispose?.())
+  await h.config({ agent: {}, command: {}, permission: {} })
+  // The deliberate no-ownership-check semantics (spec-pinned): an explicit
+  // task id names the intent, so session A may cancel B's dispatch BY ID.
+  const res = await h.tool.forge_jobs.execute({ action: "cancel", jobId: b }, { sessionID: "ses_owner_A" })
+  assert.match(res.output, new RegExp(`Cancelled ${b}`), "the cross-session per-id cancel works")
+  assert.equal(isDispatchCancelled(b), true, "the id is marked never-retried")
+  assert.equal(jobManager.get(b)?.state, "killed", "the registry job is killed")
+  // The retired bulk form refuses with the redirect to the scoped lever.
+  // (The refusal lives INSIDE the cancel branch, after the registry lookup —
+  // so the redirect is only reachable once a row named "all" exists; seed
+  // one to pin the contract string.)
+  seedDispatch("all", "ses_all_child", { ownerSession: "ses_owner_A", description: "retired form probe" })
+  t.after(() => cleanupDispatch("all"))
+  await assert.rejects(
+    () => h.tool.forge_jobs.execute({ action: "cancel", jobId: "all" }, { sessionID: "ses_owner_A" }),
+    /cancel "all" is retired — use action "stop"/,
+  )
 })
 
 // ---------------------------------------------------------------------------
@@ -312,7 +385,7 @@ test("retry guard: recovery terminalizes a cancelled id's record instead of resp
   const last = lines[lines.length - 1]
   assert.equal(last.state, "terminal", "the stale record terminalized")
   assert.equal(last.outcome, "aborted", "the outcome is aborted")
-  assert.match(String(last.reason ?? ""), /forge-cancel|cancelled by the user lever/)
+  assert.match(String(last.reason ?? ""), /\/forge stop|cancelled by the user lever/)
 })
 
 // ---------------------------------------------------------------------------

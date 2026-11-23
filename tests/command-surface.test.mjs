@@ -4,13 +4,14 @@ import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
-// command-surface (change v2-command-surface, tasks 5.1/5.2) — the forge
-// slash-command surface: the single-source lever bodies behind the /forge
-// router (byte-identical extraction), the dedicated hyphenated family
-// (forge-sync / forge-init / forge-init-global) on BOTH host generations,
-// typed-argument composition on the v2 execute path (upstream evaluateTemplate
-// semantics: $ARGUMENTS function-replacement / append-after-blank-line /
-// empty⇒unchanged), delivery passthrough, and DISCLOSED registration drift.
+// command-surface (change v2-command-surface tasks 5.1/5.2, renegotiated by
+// command-surface-v2-cleanup D4) — the forge slash-command surface: the
+// single-source lever bodies behind the /forge router (byte-identical
+// extraction, now FOUR forms: sync / init / init global / stop), the RETIRED
+// hyphenated family (absence pinned on BOTH host generations + no-clobber
+// survival), the exact v2 registered set, typed-argument composition on the
+// v2 execute path (upstream evaluateTemplate semantics), delivery passthrough,
+// and DISCLOSED registration drift.
 
 process.env.FORGE_TEST_NO_FENCE = "1"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
@@ -26,9 +27,8 @@ import {
   server,
   v2Setup,
   FORGE_COMMAND_TEMPLATE,
-  FORGE_SYNC_LEVER_TEMPLATE,
-  FORGE_INIT_LEVER_TEMPLATE,
-  FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
+  FORGE_HELP_ROUTE_LINE,
+  STOP_LEVER_BODY,
   SYNC_LEVER_BODY,
   INIT_WORKSPACE_LEAD,
   INIT_FLOW_BODY,
@@ -65,25 +65,33 @@ test("routing template embeds the single-source lever bodies verbatim (extractio
   assert.ok(FORGE_COMMAND_TEMPLATE.includes(`- Argument "init global": ${INIT_GLOBAL_BODY} Scaffold shape:`), "init-global route line verbatim")
   assert.ok(FORGE_COMMAND_TEMPLATE.includes(forgeFamilyGuard("/forge")), "family guard verbatim")
   assert.ok(FORGE_COMMAND_TEMPLATE.includes(INIT_GLOBAL_SCAFFOLD_NOTE), "scaffold note verbatim")
+  assert.ok(FORGE_COMMAND_TEMPLATE.includes(`- ${STOP_LEVER_BODY}`), "stop route line verbatim")
+  assert.ok(FORGE_COMMAND_TEMPLATE.includes(FORGE_HELP_ROUTE_LINE), "help line verbatim (four forms)")
   assert.ok(FORGE_COMMAND_TEMPLATE.includes("$ARGUMENTS"), "the router still routes on $ARGUMENTS")
 })
 
-test("dedicated levers: own family guard naming the invoked command, shared body text, no argument dependency", () => {
-  for (const [tpl, name, body] of [
-    [FORGE_SYNC_LEVER_TEMPLATE, "/forge-sync", SYNC_LEVER_BODY],
-    [FORGE_INIT_LEVER_TEMPLATE, "/forge-init", `${INIT_WORKSPACE_LEAD} ${INIT_FLOW_BODY}`],
-  ]) {
-    assert.ok(tpl.includes(forgeFamilyGuard(name)), `${name} carries its own family guard`)
-    assert.ok(tpl.includes(body), `${name} embeds the shared route body`)
-    assert.ok(tpl.includes("never writes anything by itself"), `${name} carries the boundaries`)
-    assert.ok(!tpl.includes("$ARGUMENTS"), `${name} never depends on typed arguments for routing`)
+test("retired hyphen family: all four names are absent from BOTH host generations (v1 config hook + v2 command domain)", async (t) => {
+  const RETIRED = ["forge-sync", "forge-init", "forge-init-global", "forge-cancel"]
+  // v2: the command domain registers none of the retired names.
+  const { ctx, state } = createV2MockContext()
+  await v2Setup(ctx, { anchors: [mkdtempSync(join(tmpdir(), "forge-cmdsurf-v2-"))] })
+  for (const name of RETIRED) {
+    assert.equal(state.commands.has(name), false, `v2: ${name} not registered`)
   }
-  // init global is self-contained: full flow + scaffold disclosure + scaffold
-  assert.ok(FORGE_INIT_GLOBAL_LEVER_TEMPLATE.includes(forgeFamilyGuard("/forge-init-global")))
-  assert.ok(FORGE_INIT_GLOBAL_LEVER_TEMPLATE.includes(INIT_FLOW_BODY), "the drafting flow body is shared verbatim")
-  assert.ok(FORGE_INIT_GLOBAL_LEVER_TEMPLATE.includes(INIT_GLOBAL_SCAFFOLD_NOTE))
-  assert.match(FORGE_INIT_GLOBAL_LEVER_TEMPLATE, /^ {4}\/\/ "override": \{$/m, "the commented scaffold ships inside")
-  assert.ok(!FORGE_INIT_GLOBAL_LEVER_TEMPLATE.includes("$ARGUMENTS"))
+  // v1: the config hook registers none of the retired names either.
+  const dir = mkdtempSync(join(tmpdir(), "forge-cmdsurf-v1-"))
+  t.after(() => {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {}
+  })
+  const h = await startServer(input(dir), {})
+  t.after(() => h.dispose?.())
+  const cfg = { agent: {}, command: {}, permission: {} }
+  await h.config(cfg)
+  for (const name of RETIRED) {
+    assert.equal(name in cfg.command, false, `v1: ${name} not registered`)
+  }
 })
 
 // ---------------------------------------------------------------------------
@@ -113,16 +121,16 @@ test("composeCommandPrompt: empty / whitespace / null / undefined typed text lea
 // Task 3.1 + 5.2 — v2 wiring: dedicated family, composition, delivery
 // ---------------------------------------------------------------------------
 
-test("v2 command domain registers the dedicated hyphenated family with per-lever descriptions", async () => {
+test("v2 command domain registers exactly the forge surface: crew / forge / goal / plan (one /forge router, four argument forms)", async () => {
   const { ctx, state } = createV2MockContext()
-  await v2Setup(ctx, { anchors: [mkdtempSync(join(tmpdir(), "forge-cmdsurf-v2-"))] })
-  for (const name of ["forge-sync", "forge-init", "forge-init-global"]) {
+  await v2Setup(ctx, { anchors: [mkdtempSync(join(tmpdir(), "forge-cmdsurf-v2b-"))] })
+  assert.deepEqual([...state.commands.keys()].sort(), ["crew", "forge", "goal", "plan"])
+  for (const name of ["plan", "goal", "crew", "forge"]) {
     const cmd = state.commands.get(name)
-    assert.ok(cmd, `${name} registered on the v2 command domain`)
-    assert.match(cmd.description, /forge roster lever:/, `${name} carries its own description`)
-    assert.equal(typeof cmd.execute, "function")
+    assert.equal(typeof cmd.description, "string", `${name} carries a description`)
+    assert.equal(typeof cmd.execute, "function", `${name} is EXECUTE-based (CommandDefinition.execute)`)
   }
-  assert.ok(state.commands.get("forge"), "the /forge router stays registered")
+  assert.match(state.commands.get("forge").description, /stop/, "the router description names the stop form")
 })
 
 test("v2 execute composes typed arguments: /forge sync delivers the routing template with the argument and the delivery hint", async () => {
@@ -136,15 +144,13 @@ test("v2 execute composes typed arguments: /forge sync delivers the routing temp
   assert.equal(sent.delivery, "steer", "the delivery hint rides the send")
 })
 
-test("v2 execute: no placeholder + typed text appends; empty or missing prompt.text sends the template unchanged", async () => {
+test("v2 execute: whitespace or missing typed text sends the /forge router template unchanged", async () => {
   const { ctx, state } = createV2MockContext()
   await v2Setup(ctx, { anchors: [mkdtempSync(join(tmpdir(), "forge-cmdsurf-v2c-"))] })
-  await state.commands.get("forge-sync").execute({ sessionID: "ses_y", prompt: { text: "and also prune" } })
-  assert.equal(state.prompts.at(-1).text, `${FORGE_SYNC_LEVER_TEMPLATE}\n\nand also prune`)
-  await state.commands.get("forge-init").execute({ sessionID: "ses_z", prompt: { text: "   " } })
-  assert.equal(state.prompts.at(-1).text, FORGE_INIT_LEVER_TEMPLATE)
-  await state.commands.get("forge-init-global").execute({ sessionID: "ses_w" })
-  assert.equal(state.prompts.at(-1).text, FORGE_INIT_GLOBAL_LEVER_TEMPLATE)
+  await state.commands.get("forge").execute({ sessionID: "ses_y", prompt: { text: "   \n\t" } })
+  assert.equal(state.prompts.at(-1).text, FORGE_COMMAND_TEMPLATE, "whitespace typed text leaves the template unchanged")
+  await state.commands.get("forge").execute({ sessionID: "ses_w" })
+  assert.equal(state.prompts.at(-1).text, FORGE_COMMAND_TEMPLATE, "missing prompt.text sends the template unchanged")
   assert.ok(!("delivery" in state.prompts.at(-1)), "no delivery key is fabricated when the invocation has none")
 })
 
@@ -152,8 +158,8 @@ test("v2 execute: no placeholder + typed text appends; empty or missing prompt.t
 // Task 3.2 + 5.2 — v1 wiring: the hyphenated family in the config hook
 // ---------------------------------------------------------------------------
 
-test("v1 config hook registers the hyphenated family (byte-identical templates, no-clobber)", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-cmdsurf-v1-"))
+test("v1 config hook registers command.forge only (byte-identical router template, no-clobber — a user entry of their own is never overwritten)", async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-cmdsurf-v1b-"))
   t.after(() => {
     try {
       rmSync(dir, { recursive: true, force: true })
@@ -163,18 +169,22 @@ test("v1 config hook registers the hyphenated family (byte-identical templates, 
   t.after(() => h.dispose?.())
   const cfg = { agent: {}, command: {}, permission: {} }
   await h.config(cfg)
-  for (const [name, tpl] of [
-    ["forge-sync", FORGE_SYNC_LEVER_TEMPLATE],
-    ["forge-init", FORGE_INIT_LEVER_TEMPLATE],
-    ["forge-init-global", FORGE_INIT_GLOBAL_LEVER_TEMPLATE],
-  ]) {
-    assert.equal(cfg.command[name]?.template, tpl, `${name} template byte-identical`)
-    assert.match(cfg.command[name].description, /forge roster lever:/)
+  assert.equal(cfg.command["forge"]?.template, FORGE_COMMAND_TEMPLATE, "/forge template byte-identical")
+  assert.match(cfg.command["forge"].description, /roster levers/)
+  // no-clobber survival: retirement means "never registered again", never
+  // deleting a user's own entry — user-owned /forge AND a user-owned retired
+  // name both survive verbatim.
+  const cfg2 = {
+    agent: {},
+    command: {
+      forge: { template: "MINE", description: "user owned" },
+      "forge-sync": { template: "USER LEVER", description: "user owned" },
+    },
+    permission: {},
   }
-  // no-clobber: a user-defined entry of their own is never overwritten
-  const cfg2 = { agent: {}, command: { "forge-sync": { template: "MINE", description: "user owned" } }, permission: {} }
   await h.config(cfg2)
-  assert.equal(cfg2.command["forge-sync"].template, "MINE")
+  assert.equal(cfg2.command.forge.template, "MINE", "user-owned /forge untouched")
+  assert.equal(cfg2.command["forge-sync"].template, "USER LEVER", "user-owned retired-name entry untouched")
 })
 
 // ---------------------------------------------------------------------------

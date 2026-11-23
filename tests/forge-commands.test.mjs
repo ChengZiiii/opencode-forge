@@ -51,13 +51,19 @@ async function startServer(inputArg, opts) {
 // Template content (design D1/D2/D3)
 // ---------------------------------------------------------------------------
 
-test("/forge template: one command, $ARGUMENTS routing — all three forms plus the help fallback", () => {
+test("/forge template: one command, $ARGUMENTS routing — all four forms plus the help fallback", () => {
   const t = FORGE_COMMAND_TEMPLATE
   assert.ok(t.includes('$ARGUMENTS'))
   assert.match(t, /Argument "sync"/)
   assert.match(t, /Argument "init global"/)
   assert.match(t, /Argument "init"/)
+  assert.match(t, /Argument "stop"/, "the stop route rides the router (command-surface-v2-cleanup D1)")
   assert.match(t, /Argument empty or unknown/)
+  // The help fallback lists all FOUR forms including /forge stop.
+  assert.match(t, /\/forge sync \(force a roster sync NOW/)
+  assert.match(t, /\/forge init \(draft this workspace's forge\.json/)
+  assert.match(t, /\/forge init global \(draft the global forge\.json/)
+  assert.match(t, /\/forge stop \(cancel THIS session's in-flight async dispatches\)/)
 })
 
 test("/forge template: FAMILY GUARD step-0 names the forge agent and the forge_sync tool", () => {

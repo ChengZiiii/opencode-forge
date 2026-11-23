@@ -22,7 +22,14 @@
 - [x] 2.3 用户可见文案（中断披露/孤儿披露/工具描述/README）
       （中断披露 :3718；孤儿披露 :4134/:4138；forge_jobs 描述 :2727 起；
       README 命令段 :634-659 + Cancellation 段 :1029-1054）
-- [ ] 2.4 测试重议+新增全绿（design D4）、typecheck 绿、全量套件绿
+- [x] 2.4 测试重议+新增全绿（design D4）、typecheck 绿、全量套件绿
+      （command-surface 12/12：四名缺席 v1+v2 + no-clobber 存续 + v2 精确集
+      crew/forge/goal/plan；forge-commands 10/10：help 四形态含 stop；
+      v2-session-commands 15/15：精确键集 + /forge stop 路由投递；
+      dispatch-cancel 16/16：双会话夹具 stop(A) 只杀 A、no-op 诚实报告、
+      per-id 跨会话逃生舱 + "all" 显式拒绝、reason 正则 /forge stop；
+      typecheck 绿。全量套件 deferred：crew-continue-native-child-gate
+      并行波次占用 plugin.ts/src，按波次约束单文件门通过即记账）
 
 ## 3. Verification（GATE）
 
