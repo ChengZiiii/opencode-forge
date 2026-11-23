@@ -60,28 +60,57 @@
   writes in the new code); goal branch (`continueIfEligible` goal leg)
   unmodified.
 
-## 3. Tests (`tests/crew-continue.test.mjs`, stub-client pattern)
+## 3. Tests (stub-client pattern; wiring in tests/native-child-gate-wiring.test.mjs, pure cores in tests/native-child-gate.test.mjs)
 
-- [ ] 3.1 Busy native child suppresses: idle + EXECUTING crew + native
+- [x] 3.1 Busy native child suppresses: idle + EXECUTING crew + native
   child (session.list returns child with matching parentID; status map
   contains it) ⇒ zero briefs, no no-progress increment across repeated
   idle edges.
-- [ ] 3.2 Child terminal ⇒ exactly one brief after debounce (child absent
+  Evidence: tests/native-child-gate-wiring.test.mjs — "busy native child
+  suppresses the crew brief — zero briefs, suppression is not a turn"
+  (4 suppressed idle edges, then gate-open briefs on the very next idle —
+  no stall, no transport cap).
+- [x] 3.2 Child terminal ⇒ exactly one brief after debounce (child absent
   from status map / terminal event; re-arm fires once, not once per
   suppressed edge).
-- [ ] 3.3 Ceiling expiry ⇒ one brief + one bounded disclosure despite the
+  Evidence: tests/native-child-gate-wiring.test.mjs — "last child terminal
+  re-arms exactly ONE brief carrying the digest line" (3 suppressed edges
+  → 1 re-armed brief with the digest; digest cleared on delivery).
+- [x] 3.3 Ceiling expiry ⇒ one brief + one bounded disclosure despite the
   child still "busy" (clock seam advanced past 900_000); fresh crew_begin
   re-arms normal gating.
-- [ ] 3.4 Unreadable status view ⇒ brief sent (fail-open): list throws /
+  Evidence: tests/native-child-gate-wiring.test.mjs — "suppression past
+  the ceiling sends once with ONE bounded disclosure; fresh crew_begin
+  re-arms gating" (setCrewNativeChildClockForTests, warns===1, fresh
+  registration suppresses again).
+- [x] 3.4 Unreadable status view ⇒ brief sent (fail-open): list throws /
   status throws / garbage envelopes each fall through to send.
-- [ ] 3.5 `session.deleted` of the parent evicts gate state (tracker +
+  Evidence: tests/native-child-gate-wiring.test.mjs — "unreadable host
+  view fails OPEN" (5 subcases: list throws, status throws, garbage list
+  envelope, unreadable status body, session.list missing); pure-core
+  fail-open cases in tests/native-child-gate.test.mjs ("walk: … ⇒ fail
+  OPEN" ×6).
+- [x] 3.5 `session.deleted` of the parent evicts gate state (tracker +
   ceiling marker); a later crew starts clean.
-- [ ] 3.6 Regression pin: goal-branch brief path byte-identical (native
+  Evidence: tests/native-child-gate-wiring.test.mjs — "session.deleted
+  evicts tracker rows, ceiling marker and digest; a later crew starts
+  clean" (v2WiringSeam map assertions + a clean-gate brief on a new
+  session).
+- [x] 3.6 Regression pin: goal-branch brief path byte-identical (native
   child in flight does not affect goal continuations).
-- [ ] 3.7 Aborted-child disclosure: child reaches terminal with outcome
+  Evidence: tests/native-child-gate-wiring.test.mjs — "goal-branch brief
+  path unchanged" (busy native child + goal-governed session ⇒ exactly
+  the [forge:goal-continue] brief, no crew brief); baseline
+  tests/crew-continue.test.mjs stays 11/11 green untouched.
+- [x] 3.7 Aborted-child disclosure: child reaches terminal with outcome
   `interrupted` while suppression was active ⇒ re-arm brief fires promptly
   and carries the one-line digest (child id + `interrupted`) — the dead
   child is surfaced, never silently stranded.
+  Evidence: tests/native-child-gate-wiring.test.mjs — "an INTERRUPTED
+  child wakes the crew — re-arm brief names the child dead" (brief names
+  the child id + interrupted + DEAD); digest wording pinned in
+  tests/native-child-gate.test.mjs ("digest line: an INTERRUPTED child is
+  named DEAD …").
 
 ## 4. Verification
 
