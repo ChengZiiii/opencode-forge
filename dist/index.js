@@ -15136,40 +15136,68 @@ function validateCrewReport(report, declared) {
 }
 
 // src/native-child-gate.ts
-async function nativeChildrenInFlight(client, sessionID) {
-  if (!sessionID)
+var unreadable = () => ({ readable: false, inFlight: [], settled: [] });
+function entryInFlight(entry) {
+  if (entry === undefined)
     return false;
+  if (entry !== null && typeof entry === "object" && entry.type === "idle")
+    return false;
+  return true;
+}
+function nativeChildOutcome(value) {
+  return value === "succeeded" || value === "failed" || value === "interrupted" ? value : null;
+}
+async function walkNativeChildren(client, sessionID) {
+  if (!sessionID)
+    return unreadable();
   try {
-    const raw = await client?.session?.list?.({});
+    const raw = await client?.session?.list?.({ parentID: sessionID });
     const body = raw?.data ?? raw;
-    const list = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : [];
-    const children = [];
+    const list = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : null;
+    if (list === null)
+      return unreadable();
+    const rows = [];
     for (const s of list) {
       if (!s || typeof s.id !== "string" || !s.id)
         continue;
       if (s.parentID !== sessionID)
         continue;
-      children.push(s.id);
+      rows.push({ childID: s.id, outcome: nativeChildOutcome(s.outcome) });
     }
-    if (children.length === 0)
-      return false;
+    if (rows.length === 0)
+      return { readable: true, inFlight: [], settled: [] };
     if (typeof client?.session?.status !== "function")
-      return false;
+      return unreadable();
     const st = await client.session.status();
     const map2 = st?.data;
     if (!map2 || typeof map2 !== "object")
-      return false;
-    for (const id of children) {
-      const entry = map2[id];
-      if (entry === undefined)
-        continue;
-      if (entry !== null && typeof entry === "object" && entry.type === "idle")
-        continue;
-      return true;
+      return unreadable();
+    const inFlight = [];
+    const settled = [];
+    for (const row of rows) {
+      if (entryInFlight(map2[row.childID]))
+        inFlight.push(row.childID);
+      else
+        settled.push(row);
     }
-    return false;
+    return { readable: true, inFlight, settled };
   } catch {
-    return false;
+    return unreadable();
+  }
+}
+async function nativeSessionBusy(client, sessionID) {
+  if (!sessionID)
+    return null;
+  try {
+    if (typeof client?.session?.status !== "function")
+      return null;
+    const st = await client.session.status();
+    const map2 = st?.data;
+    if (!map2 || typeof map2 !== "object")
+      return null;
+    return entryInFlight(map2[sessionID]);
+  } catch {
+    return null;
   }
 }
 function createNativeChildTracker() {
@@ -15234,6 +15262,9 @@ function nativeChildEventOutcome(type) {
 function nativeChildDigestLine(childID, outcome) {
   if (outcome === "interrupted") {
     return `native child ${childID} interrupted — DEAD (aborted mid-run; its dispatch sentence timed out or was killed): re-dispatch the subtask or record the loss in the close report`;
+  }
+  if (outcome === null) {
+    return `native child ${childID} is no longer running but the host reports no outcome for it (deleted mid-run, or its row carries none) — treat the subtask as UNVERIFIED: re-dispatch it or record the loss in the close report`;
   }
   return `native child ${childID} ${outcome}`;
 }
@@ -22056,6 +22087,8 @@ function crewEngineForgetSession(sessionID) {
   crewNativeChildren.forgetParent(sessionID);
   crewNativeCeiling.delete(sessionID);
   crewChildDigest.delete(sessionID);
+  crewNativeWatch.delete(sessionID);
+  crewStopNativeRecheck(sessionID);
 }
 var CREW_NATIVE_CHILD_CEILING_MS = Number(process.env.FORGE_CREW_NATIVE_CHILD_CEILING_MS ?? 900000);
 var CREW_CHILD_RESUME_DEBOUNCE_MS = Number(process.env.FORGE_CREW_CHILD_RESUME_DEBOUNCE_MS ?? 500);
@@ -22066,17 +22099,100 @@ var crewGateNow = () => Date.now();
 function setCrewNativeChildClockForTests(now) {
   crewGateNow = typeof now === "function" ? now : () => Date.now();
 }
-function crewNoteNativeChildTerminal(parentID, childID, outcome, lastChildTerminal, client) {
-  const mark = crewNativeCeiling.get(parentID);
-  if (!mark)
+var crewNativeWatch = new Map;
+function crewWatchChild(sessionID, childID) {
+  if (!sessionID || !childID)
     return;
-  const lines = crewChildDigest.get(parentID) ?? [];
-  lines.push(nativeChildDigestLine(childID, outcome));
-  crewChildDigest.set(parentID, lines);
-  goalProbe(`crew native child terminal child=${childID} outcome=${outcome} parent=${parentID} last=${lastChildTerminal}`);
-  if (lastChildTerminal && client) {
-    scheduleIdleContinuation(client, parentID, CREW_CHILD_RESUME_DEBOUNCE_MS);
+  let watched = crewNativeWatch.get(sessionID);
+  if (!watched) {
+    watched = new Set;
+    crewNativeWatch.set(sessionID, watched);
   }
+  watched.add(childID);
+}
+function crewNativeWatchParentOf(childID) {
+  for (const [sessionID, watched] of crewNativeWatch)
+    if (watched.has(childID))
+      return sessionID;
+  return null;
+}
+function crewReportNativeChildTerminal(sessionID, childID, outcome, client) {
+  const watched = crewNativeWatch.get(sessionID);
+  if (!watched || !watched.delete(childID))
+    return;
+  const lines = crewChildDigest.get(sessionID) ?? [];
+  lines.push(nativeChildDigestLine(childID, outcome));
+  crewChildDigest.set(sessionID, lines);
+  goalProbe(`crew native child settled child=${childID} outcome=${outcome ?? "unknown"} parent=${sessionID} stillWaiting=${watched.size}`);
+  if (watched.size > 0)
+    return;
+  crewStopNativeRecheck(sessionID);
+  if (client) {
+    scheduleIdleContinuation(client, sessionID, CREW_CHILD_RESUME_DEBOUNCE_MS);
+  }
+}
+function crewObserveNativeWalk(sessionID, view) {
+  if (!view.readable)
+    return;
+  const busy = new Set(view.inFlight);
+  for (const childID of view.inFlight)
+    crewWatchChild(sessionID, childID);
+  const watched = crewNativeWatch.get(sessionID);
+  if (!watched || watched.size === 0)
+    return;
+  const outcomes = new Map(view.settled.map((row) => [row.childID, row.outcome]));
+  for (const childID of [...watched]) {
+    if (busy.has(childID))
+      continue;
+    crewReportNativeChildTerminal(sessionID, childID, outcomes.get(childID) ?? null, null);
+  }
+}
+var CREW_NATIVE_CHILD_RECHECK_MS = Number(process.env.FORGE_CREW_NATIVE_CHILD_RECHECK_MS ?? 5000);
+var crewNativeRecheck = new Map;
+function crewArmNativeRecheck(sessionID, client) {
+  if (crewNativeRecheck.has(sessionID))
+    return;
+  if (!Number.isFinite(CREW_NATIVE_CHILD_RECHECK_MS) || CREW_NATIVE_CHILD_RECHECK_MS <= 0)
+    return;
+  const timer = setTimeout(() => {
+    crewNativeRecheck.delete(sessionID);
+    crewNativeRecheckTick(sessionID, client);
+  }, CREW_NATIVE_CHILD_RECHECK_MS);
+  if (typeof timer.unref === "function")
+    timer.unref?.();
+  crewNativeRecheck.set(sessionID, { timer, client });
+}
+function crewStopNativeRecheck(sessionID) {
+  const armed = crewNativeRecheck.get(sessionID);
+  if (armed)
+    clearTimeout(armed.timer);
+  crewNativeRecheck.delete(sessionID);
+}
+async function crewNativeRecheckTick(sessionID, client) {
+  try {
+    const crew = crews.get(sessionID);
+    if (!client || !crew || crew.mode !== "executing" || crewStalled.has(sessionID))
+      return;
+    if (continuationInFlight.has(sessionID) || idleTimers.has(sessionID))
+      return;
+    const view = await walkNativeChildren(nativeChildWalkerOf(client), sessionID);
+    crewObserveNativeWalk(sessionID, view);
+    if (!view.readable) {
+      crewArmNativeRecheck(sessionID, client);
+      return;
+    }
+    const mark = crewNativeCeiling.get(sessionID);
+    const expired = mark !== undefined && crewGateNow() - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS;
+    if (view.inFlight.length > 0 && !expired) {
+      crewArmNativeRecheck(sessionID, client);
+      return;
+    }
+    goalProbe(`crew native-child recheck clear session=${sessionID} inFlight=${view.inFlight.length} ceiling=${expired ? "expired" : "none"}`);
+    scheduleIdleContinuation(client, sessionID, CREW_CHILD_RESUME_DEBOUNCE_MS);
+  } catch {}
+}
+function nativeChildWalkerOf(client) {
+  return client.nativeChildWalker ?? client;
 }
 function noteCrewNativeChildEvent(type, fields, client) {
   try {
@@ -22091,8 +22207,12 @@ function noteCrewNativeChildEvent(type, fields, client) {
     if (type === "session.deleted") {
       const info = fields.info;
       const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId");
-      if (id)
-        crewNativeChildren.drop(id);
+      if (!id)
+        return;
+      crewNativeChildren.drop(id);
+      const watchedBy = crewNativeWatchParentOf(id);
+      if (watchedBy)
+        crewReportNativeChildTerminal(watchedBy, id, null, client);
       return;
     }
     const outcome = nativeChildEventOutcome(type);
@@ -22101,8 +22221,9 @@ function noteCrewNativeChildEvent(type, fields, client) {
       if (!id)
         return;
       const note = crewNativeChildren.terminalize(id, outcome);
-      if (note)
-        crewNoteNativeChildTerminal(note.parentID, id, outcome, note.lastChildTerminal, client);
+      const parentID = note?.parentID ?? crewNativeWatchParentOf(id);
+      if (parentID)
+        crewReportNativeChildTerminal(parentID, id, outcome, client);
       return;
     }
     if (type === "session.status" || type === "session.idle") {
@@ -22114,8 +22235,9 @@ function noteCrewNativeChildEvent(type, fields, client) {
       if (!idle)
         return;
       const note = crewNativeChildren.terminalize(id, "succeeded");
-      if (note)
-        crewNoteNativeChildTerminal(note.parentID, id, "succeeded", note.lastChildTerminal, client);
+      const parentID = note?.parentID ?? crewNativeWatchParentOf(id);
+      if (parentID)
+        crewReportNativeChildTerminal(parentID, id, "succeeded", client);
     }
   } catch {}
 }
@@ -22143,7 +22265,10 @@ async function continueCrewIfEligible(client, state, sessionID) {
     goalProbe(`crew skip: agent switched to non-forge before send session=${sessionID}`);
     return;
   }
-  if (await nativeChildrenInFlight(client, sessionID)) {
+  const walker = nativeChildWalkerOf(client);
+  const view = await walkNativeChildren(walker, sessionID);
+  crewObserveNativeWalk(sessionID, view);
+  if (view.inFlight.length > 0) {
     const now = crewGateNow();
     const mark = crewNativeCeiling.get(sessionID);
     if (mark && mark.disclosed) {
@@ -22155,6 +22280,7 @@ async function continueCrewIfEligible(client, state, sessionID) {
     } else {
       if (!mark)
         crewNativeCeiling.set(sessionID, { firstSuppressedAt: now, disclosed: false });
+      crewArmNativeRecheck(sessionID, client);
       goalProbe(`crew skip: native child in flight session=${sessionID}`);
       return;
     }
@@ -22190,6 +22316,12 @@ async function continueCrewIfEligible(client, state, sessionID) {
       goalProbe(`crew skip: status check failed session=${sessionID} err=${String(err)}`);
       return;
     }
+  } else {
+    const busy = await nativeSessionBusy(walker, sessionID);
+    if (busy === true) {
+      goalProbe(`crew skip: session busy again session=${sessionID} status=active`);
+      return;
+    }
   }
   try {
     const childDigest = crewChildDigest.get(sessionID) ?? [];
@@ -22199,6 +22331,7 @@ async function continueCrewIfEligible(client, state, sessionID) {
     });
     if (childDigest.length > 0)
       crewChildDigest.delete(sessionID);
+    crewStopNativeRecheck(sessionID);
     transportFails.delete(sessionID);
     crewPendingTurn.add(sessionID);
     crewTurnActivity.set(sessionID, { dispatches: 0, writes: 0 });
@@ -23695,13 +23828,20 @@ function v2PromptInputOf(opts) {
 }
 var serviceHttpCache;
 var serviceHttpLastFail = 0;
+function defaultServiceFileReachable() {
+  if (process.env.NODE_TEST_CONTEXT)
+    return false;
+  return !process.execArgv.some((a) => a === "--test" || a.startsWith("--test-"));
+}
 function discoverServiceHttp() {
   if (serviceHttpCache)
     return serviceHttpCache;
   if (serviceHttpCache === null && Date.now() - serviceHttpLastFail < 1e4)
     return null;
+  const file2 = process.env.FORGE_SERVICE_FILE || (defaultServiceFileReachable() ? join6(process.env.XDG_STATE_HOME || join6(homedir(), ".local", "state"), "opencode", "service.json") : "");
+  if (!file2)
+    return null;
   try {
-    const file2 = process.env.FORGE_SERVICE_FILE || join6(process.env.XDG_STATE_HOME || join6(homedir(), ".local", "state"), "opencode", "service.json");
     const raw = JSON.parse(readFileSync9(file2, "utf8"));
     if (raw && typeof raw.url === "string" && typeof raw.password === "string" && raw.url && raw.password) {
       serviceHttpCache = { url: raw.url.replace(/\/+$/, ""), password: raw.password };
@@ -23731,6 +23871,36 @@ function v2SessionIdOf(opts) {
 }
 function v2SessionClientForTests(ctx) {
   return v2SessionClient(ctx);
+}
+async function serviceHttpGet(svc, path) {
+  const res = await fetch(`${svc.url}${path}`, {
+    headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` }
+  });
+  if (!res.ok)
+    throw new Error(`service HTTP ${res.status} for ${path}`);
+  return await res.json();
+}
+var NATIVE_CHILD_LIST_LIMIT = 500;
+function v2NativeChildWalker() {
+  return {
+    session: {
+      list: async (args) => {
+        const svc = discoverServiceHttp();
+        if (!svc)
+          throw new Error("native-child walker: service.json discovery failed");
+        const parent = args !== null && typeof args === "object" && typeof args.parentID === "string" ? args.parentID : "";
+        return await serviceHttpGet(svc, parent ? `/api/session?parentID=${encodeURIComponent(parent)}&limit=${NATIVE_CHILD_LIST_LIMIT}` : "/api/session");
+      },
+      status: async () => {
+        const svc = discoverServiceHttp();
+        if (!svc)
+          throw new Error("native-child walker: service.json discovery failed");
+        const body = await serviceHttpGet(svc, "/api/session/active");
+        const map2 = body !== null && typeof body === "object" && !Array.isArray(body) && "data" in body ? body.data : body;
+        return { data: map2 };
+      }
+    }
+  };
 }
 function v2SessionClient(ctx) {
   const s = ctx.session;
@@ -23830,7 +24000,7 @@ function v2SessionClient(ctx) {
       return;
     }
   };
-  return Object.keys(out).length > 0 ? { session: out } : null;
+  return Object.keys(out).length > 0 ? { session: out, nativeChildWalker: v2NativeChildWalker() } : null;
 }
 function normalizeV2MessageRow(row) {
   if (row === null || typeof row !== "object")
@@ -23986,7 +24156,7 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
     return null;
   }
 }
-var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, crewNativeChildren, crewNativeCeiling, crewChildDigest, resetHostAnchors: () => {
+var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, crewNativeChildren, crewNativeCeiling, crewChildDigest, crewNativeWatch, crewNativeRecheckArmed: (sessionID) => crewNativeRecheck.has(sessionID), crewNativeRecheckNow: (sessionID, client) => crewNativeRecheckTick(sessionID, client), resetHostAnchors: () => {
   hostAnchors.length = 0;
   poolResolver = null;
   poolResolution = null;

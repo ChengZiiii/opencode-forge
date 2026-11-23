@@ -74,7 +74,7 @@ import {
 import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
 import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, parseIdentity, type CatalogSnapshot } from "./src/models-dev.ts"
 import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
-import { createNativeChildTracker, nativeChildDigestLine, nativeChildEventOutcome, nativeChildrenInFlight, type NativeChildClient, type NativeChildOutcome } from "./src/native-child-gate.ts"
+import { createNativeChildTracker, nativeChildDigestLine, nativeChildEventOutcome, nativeSessionBusy, walkNativeChildren, type NativeChildClient, type NativeChildOutcome, type NativeChildWalkView } from "./src/native-child-gate.ts"
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
@@ -6100,12 +6100,15 @@ function crewEngineForgetSession(sessionID: string): void {
   crewNoProgress.delete(sessionID)
   crewStalled.delete(sessionID)
   // crew-continue-native-child-gate 2.6: gate state dies with the crew
-  // registration (tracker rows, ceiling marker, pending digest) — zero disk
-  // state. Reached from fresh crew_begin, session.deleted harvest, and the
-  // session-end evictions.
+  // registration (tracker rows, ceiling marker, pending digest, the walked
+  // watch set and any armed suppression re-check) — zero disk state. Reached
+  // from fresh crew_begin, session.deleted harvest, and the session-end
+  // evictions.
   crewNativeChildren.forgetParent(sessionID)
   crewNativeCeiling.delete(sessionID)
   crewChildDigest.delete(sessionID)
+  crewNativeWatch.delete(sessionID)
+  crewStopNativeRecheck(sessionID)
 }
 
 // ---------------------------------------------------------------------------
@@ -6113,7 +6116,7 @@ function crewEngineForgetSession(sessionID: string): void {
 // host-native subagents (task/subagent channel) are invisible to the crew
 // engine's own registry — the gate suppresses the idle continuation while a
 // native child of the orchestrator session is in flight. The WALK
-// (nativeChildrenInFlight, pure core in src/native-child-gate.ts) is
+// (walkNativeChildren, pure core in src/native-child-gate.ts) is
 // authoritative; the tracker below is the ADVISORY warm set fed by the
 // existing v2SubscribeEvents loop. All state in-memory.
 // ---------------------------------------------------------------------------
@@ -6142,24 +6145,147 @@ export function setCrewNativeChildClockForTests(now: (() => number) | null): voi
   crewGateNow = typeof now === "function" ? now : () => Date.now()
 }
 
-/**
- * Task 2.2 wiring — terminal-edge consequence: record the digest line for a
- * suppressed crew's parent, and when the LAST non-terminal native child goes
- * terminal, re-arm scheduleIdleContinuation with the short debounce. Advisory
- * only: the re-armed pass re-runs the full guard chain (the walk re-anchors
- * truth at the decision moment).
- */
-function crewNoteNativeChildTerminal(parentID: string, childID: string, outcome: NativeChildOutcome, lastChildTerminal: boolean, client: GoalClient | null): void {
-  const mark = crewNativeCeiling.get(parentID)
-  if (!mark) return // not a recently suppressed crew session: advisory no-op
-  const lines = crewChildDigest.get(parentID) ?? []
-  lines.push(nativeChildDigestLine(childID, outcome))
-  crewChildDigest.set(parentID, lines)
-  goalProbe(`crew native child terminal child=${childID} outcome=${outcome} parent=${parentID} last=${lastChildTerminal}`)
-  if (lastChildTerminal && client) {
-    // D3 resume edge: never depend on a further idle event to resume.
-    scheduleIdleContinuation(client, parentID, CREW_CHILD_RESUME_DEBOUNCE_MS)
+// ---------------------------------------------------------------------------
+// D8 — walk-authoritative outcomes + suppression re-check (sandbox E2E
+// finding #2, 2026-11-23). The event-fed tracker CANNOT be the digest's
+// source: a fresh crew_begin wipes the parent's tracker rows
+// (crewEngineForgetSession above), so a child created BEFORE the crew was
+// armed — the overnight "stall, re-open the crew, children still running"
+// case — is unknown to the tracker when its terminal edge arrives
+// (terminalize ⇒ null ⇒ no digest; live-verified: the first post-terminal
+// brief carried no outcome line). The event stream is volatile by contract
+// on top of that. So the WALK is the single authority: a child is waited on
+// from the moment the decision-time walk sees it in flight, and its outcome
+// is read off its own session row (live 2.3.2 rows carry outcome
+// succeeded / failed / interrupted). The tracker stays what it was — an
+// advisory accelerator.
+// ---------------------------------------------------------------------------
+
+// Children this crew registration's gate is WAITING ON, keyed by child id.
+// Enters on a walk that saw it in flight; leaves when its outcome line has
+// ridden a brief (or with the registration).
+const crewNativeWatch = new Map<string, Set<string>>()
+
+function crewWatchChild(sessionID: string, childID: string): void {
+  if (!sessionID || !childID) return
+  let watched = crewNativeWatch.get(sessionID)
+  if (!watched) {
+    watched = new Set()
+    crewNativeWatch.set(sessionID, watched)
   }
+  watched.add(childID)
+}
+
+/** The registration still waiting on this child, if any (reverse lookup — few entries). */
+function crewNativeWatchParentOf(childID: string): string | null {
+  for (const [sessionID, watched] of crewNativeWatch) if (watched.has(childID)) return sessionID
+  return null
+}
+
+/**
+ * Terminal-edge consequence for a child the gate waited on: queue the digest
+ * line for the next crew brief and, when nothing is waited on any more,
+ * re-arm scheduleIdleContinuation with the short debounce. Advisory only:
+ * the re-armed pass re-runs the full guard chain (the walk re-anchors truth
+ * at the decision moment).
+ */
+function crewReportNativeChildTerminal(sessionID: string, childID: string, outcome: NativeChildOutcome | null, client: GoalClient | null): void {
+  const watched = crewNativeWatch.get(sessionID)
+  // First report wins: a child leaves the set the moment its line is queued,
+  // so a terminal event and the walk never name one child twice — and a
+  // child the gate never held on is never named at all (its report reached
+  // the parent through the host's own wake).
+  if (!watched || !watched.delete(childID)) return
+  const lines = crewChildDigest.get(sessionID) ?? []
+  lines.push(nativeChildDigestLine(childID, outcome))
+  crewChildDigest.set(sessionID, lines)
+  goalProbe(`crew native child settled child=${childID} outcome=${outcome ?? "unknown"} parent=${sessionID} stillWaiting=${watched.size}`)
+  if (watched.size > 0) return // other children still held
+  crewStopNativeRecheck(sessionID)
+  if (client) {
+    // D3 resume edge: never depend on a further idle event to resume.
+    scheduleIdleContinuation(client, sessionID, CREW_CHILD_RESUME_DEBOUNCE_MS)
+  }
+}
+
+/**
+ * After EVERY walk (decision point and suppression re-check alike): the
+ * children the walk sees in flight are what this registration waits on;
+ * every waited-on child the walk no longer sees in flight has settled — its
+ * outcome is its own row's. An unreadable view observes nothing: unknown is
+ * never "settled".
+ */
+function crewObserveNativeWalk(sessionID: string, view: NativeChildWalkView): void {
+  if (!view.readable) return
+  const busy = new Set(view.inFlight)
+  for (const childID of view.inFlight) crewWatchChild(sessionID, childID)
+  const watched = crewNativeWatch.get(sessionID)
+  if (!watched || watched.size === 0) return
+  const outcomes = new Map(view.settled.map((row) => [row.childID, row.outcome]))
+  for (const childID of [...watched]) {
+    if (busy.has(childID)) continue
+    // Absent from the scoped list altogether (deleted mid-run) ⇒ no row ⇒ no outcome.
+    crewReportNativeChildTerminal(sessionID, childID, outcomes.get(childID) ?? null, null)
+  }
+}
+
+// D8 suppression re-check: while the gate holds a crew on native children, a
+// bounded timer re-walks the view, so the resume never depends on a host
+// idle edge or on a volatile event reaching the plugin — a child deleted
+// mid-run may leave the parent with no idle edge at all, and a subscription
+// gap can swallow the one that comes. It only SCHEDULES the shared
+// continuation: the full guard chain (walk, ceiling, busy re-check,
+// no-progress accounting) re-runs at the decision point.
+const CREW_NATIVE_CHILD_RECHECK_MS = Number(process.env.FORGE_CREW_NATIVE_CHILD_RECHECK_MS ?? 5_000)
+const crewNativeRecheck = new Map<string, { timer: ReturnType<typeof setTimeout>; client: GoalClient | null }>()
+
+function crewArmNativeRecheck(sessionID: string, client: GoalClient | null): void {
+  if (crewNativeRecheck.has(sessionID)) return
+  if (!Number.isFinite(CREW_NATIVE_CHILD_RECHECK_MS) || CREW_NATIVE_CHILD_RECHECK_MS <= 0) return
+  const timer = setTimeout(() => {
+    crewNativeRecheck.delete(sessionID)
+    void crewNativeRecheckTick(sessionID, client)
+  }, CREW_NATIVE_CHILD_RECHECK_MS)
+  if (typeof (timer as { unref?: () => void }).unref === "function") (timer as { unref?: () => void }).unref?.() // never holds the host open
+  crewNativeRecheck.set(sessionID, { timer, client })
+}
+
+function crewStopNativeRecheck(sessionID: string): void {
+  const armed = crewNativeRecheck.get(sessionID)
+  if (armed) clearTimeout(armed.timer)
+  crewNativeRecheck.delete(sessionID)
+}
+
+/** One suppression re-check (exported through v2WiringSeam as the deterministic test seam). */
+async function crewNativeRecheckTick(sessionID: string, client: GoalClient | null): Promise<void> {
+  try {
+    const crew = crews.get(sessionID)
+    if (!client || !crew || crew.mode !== "executing" || crewStalled.has(sessionID)) return
+    // A decision is already pending or running: it re-arms this timer itself
+    // when the crew is still held.
+    if (continuationInFlight.has(sessionID) || idleTimers.has(sessionID)) return
+    const view = await walkNativeChildren(nativeChildWalkerOf(client), sessionID)
+    crewObserveNativeWalk(sessionID, view)
+    if (!view.readable) {
+      crewArmNativeRecheck(sessionID, client) // nothing learned: look again
+      return
+    }
+    const mark = crewNativeCeiling.get(sessionID)
+    const expired = mark !== undefined && crewGateNow() - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS
+    if (view.inFlight.length > 0 && !expired) {
+      crewArmNativeRecheck(sessionID, client) // still held: look again
+      return
+    }
+    goalProbe(`crew native-child recheck clear session=${sessionID} inFlight=${view.inFlight.length} ceiling=${expired ? "expired" : "none"}`)
+    scheduleIdleContinuation(client, sessionID, CREW_CHILD_RESUME_DEBOUNCE_MS)
+  } catch {
+    // Advisory: never a throw into the host.
+  }
+}
+
+/** The gate's host view for this client: a v2 adapter's dedicated HTTP walker, else the client itself. */
+function nativeChildWalkerOf(client: GoalClient): NativeChildClient {
+  return (client as unknown as { nativeChildWalker?: NativeChildClient }).nativeChildWalker ?? (client as unknown as NativeChildClient)
 }
 
 /**
@@ -6183,15 +6309,23 @@ export function noteCrewNativeChildEvent(type: string, fields: Record<string, un
     if (type === "session.deleted") {
       const info = fields.info as { id?: unknown } | undefined
       const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId")
-      if (id) crewNativeChildren.drop(id)
+      if (!id) return
+      crewNativeChildren.drop(id)
+      // D8: a waited-on child deleted mid-run emits no terminal edge — name
+      // it gone the moment the plugin knows (no row ⇒ no outcome).
+      const watchedBy = crewNativeWatchParentOf(id)
+      if (watchedBy) crewReportNativeChildTerminal(watchedBy, id, null, client)
       return
     }
     const outcome = nativeChildEventOutcome(type)
     if (outcome) {
       const id = v2PickStr(fields, "sessionID", "sessionId")
       if (!id) return
+      // D8: the tracker knows the parent only for a child it saw created
+      // after the registration; the walk's watch set covers the rest.
       const note = crewNativeChildren.terminalize(id, outcome)
-      if (note) crewNoteNativeChildTerminal(note.parentID, id, outcome, note.lastChildTerminal, client)
+      const parentID = note?.parentID ?? crewNativeWatchParentOf(id)
+      if (parentID) crewReportNativeChildTerminal(parentID, id, outcome, client)
       return
     }
     if (type === "session.status" || type === "session.idle") {
@@ -6205,7 +6339,8 @@ export function noteCrewNativeChildEvent(type: string, fields: Record<string, un
       const idle = type === "session.idle" || (st !== null && typeof st === "object" && (st as { type?: unknown }).type === "idle")
       if (!idle) return
       const note = crewNativeChildren.terminalize(id, "succeeded")
-      if (note) crewNoteNativeChildTerminal(note.parentID, id, "succeeded", note.lastChildTerminal, client)
+      const parentID = note?.parentID ?? crewNativeWatchParentOf(id)
+      if (parentID) crewReportNativeChildTerminal(parentID, id, "succeeded", client)
     }
   } catch {
     // Advisory warm set: never a throw into the host.
@@ -6264,7 +6399,17 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
   // strands the crew; a false idle costs one redundant brief). Hooked
   // BEFORE the crew no-progress accounting: a suppressed nudge is not a
   // turn (no streak, no transport-failure count, no ledger effect).
-  if (await nativeChildrenInFlight(client as unknown as NativeChildClient, sessionID)) {
+  // Capability path (4.2 sandbox E2E finding): a v2 adapter carries its
+  // DEDICATED HTTP walker — the promise-layer session domain has no
+  // list/status, so walking the bare adapter is a structural no-op. v1
+  // clients (and stubs) without the property fall through to themselves.
+  const walker = nativeChildWalkerOf(client)
+  const view = await walkNativeChildren(walker, sessionID)
+  // D8: one walk feeds both the gate and the outcome digest — children seen
+  // in flight are what this registration waits on; waited-on children the
+  // walk no longer sees in flight are named with their row's outcome.
+  crewObserveNativeWalk(sessionID, view)
+  if (view.inFlight.length > 0) {
     const now = crewGateNow()
     const mark = crewNativeCeiling.get(sessionID)
     if (mark && mark.disclosed) {
@@ -6281,6 +6426,8 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
       goalProbe(`crew native-child ceiling expired session=${sessionID}`)
     } else {
       if (!mark) crewNativeCeiling.set(sessionID, { firstSuppressedAt: now, disclosed: false })
+      // D8: the resume must not depend on a further idle edge or event.
+      crewArmNativeRecheck(sessionID, client)
       goalProbe(`crew skip: native child in flight session=${sessionID}`)
       return // BEFORE crewPendingTurn accounting — not a turn
     }
@@ -6325,6 +6472,20 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
       goalProbe(`crew skip: status check failed session=${sessionID} err=${String(err)}`)
       return
     }
+  } else {
+    // D8 (sandbox E2E finding #3): the production v2 adapter carries no
+    // session.status, so the re-check above NEVER ran on live v2 hosts — and
+    // the terminal re-arm / suppression re-check schedule continuations
+    // OUTSIDE an idle edge, where "the user resumed first" is most likely.
+    // The dedicated walker reads the same active map the gate walks (live
+    // 2.3.2, three measured turns: an idle parent is already absent from the
+    // map when session.execution.succeeded lands). Unreadable ⇒ exactly the
+    // behavior this adapter had before (send).
+    const busy = await nativeSessionBusy(walker, sessionID)
+    if (busy === true) {
+      goalProbe(`crew skip: session busy again session=${sessionID} status=active`)
+      return
+    }
   }
   try {
     // D7 defect-B: the digest collected during the suppression episode rides
@@ -6336,6 +6497,9 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
       body: { parts: [{ type: "text", text: crewContinueBrief(crew, childDigest) }] },
     })
     if (childDigest.length > 0) crewChildDigest.delete(sessionID)
+    // D8: the episode ended with a delivered brief — a later busy child
+    // starts a fresh, fully-ceilinged episode with its own re-check.
+    crewStopNativeRecheck(sessionID)
     transportFails.delete(sessionID)
     crewPendingTurn.add(sessionID)
     crewTurnActivity.set(sessionID, { dispatches: 0, writes: 0 })
@@ -8792,6 +8956,16 @@ type V2SessionClient = {
      */
     abort?: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<unknown>
   }
+  /**
+   * crew-continue-native-child-gate 4.2 (sandbox E2E finding 2026-11-23):
+   * the gate's DEDICATED session-tree walker. The promise-layer session
+   * domain has no list/status, so a walk on `session` itself is a
+   * structural no-op (always empty ⇒ fail-open ⇒ the nudge fires while a
+   * native child runs). The walker rides the host's HTTP surfaces over the
+   * service.json channel. Deliberately NOT `session.list`/`session.status`:
+   * other call sites probe those names with v1-shaped expectations.
+   */
+  nativeChildWalker?: NativeChildClient
 }
 
 // fix-dispatch-view-capability: HTTP-backed messages reader for the v2
@@ -8805,14 +8979,28 @@ type V2SessionClient = {
 type ServiceHttpEndpoint = { url: string; password: string }
 let serviceHttpCache: ServiceHttpEndpoint | null | undefined
 let serviceHttpLastFail = 0
+// Test hermeticity (crew-continue-native-child-gate D8.7; leak scan
+// 2026-11-23: `v2-tools` issued 11 real GETs through this fallback): inside
+// the Node test runner the DEFAULT service.json location is never read, so a
+// test that sets neither FORGE_SERVICE_FILE nor XDG_STATE_HOME can only reach
+// the user's REAL host by pointing at it explicitly. An unisolated test
+// observes "no service" — what a machine without opencode yields. NODE_TEST_CONTEXT
+// covers the default per-file isolation; `--test` in execArgv covers
+// --experimental-test-isolation=none (which sets no NODE_TEST_CONTEXT).
+// Deliberately NO opt-out: diagnostic scripts run under plain `node`.
+function defaultServiceFileReachable(): boolean {
+  if (process.env.NODE_TEST_CONTEXT) return false
+  return !process.execArgv.some((a) => a === "--test" || a.startsWith("--test-"))
+}
 function discoverServiceHttp(): ServiceHttpEndpoint | null {
   // Positive results cache forever; failures retry at most once per 10s —
   // service.json can materialize shortly AFTER plugin setup (boot ordering),
   // so a failed discovery must stay retryable, never sticky.
   if (serviceHttpCache) return serviceHttpCache
   if (serviceHttpCache === null && Date.now() - serviceHttpLastFail < 10_000) return null
+  const file = process.env.FORGE_SERVICE_FILE || (defaultServiceFileReachable() ? join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode", "service.json") : "")
+  if (!file) return null // not cached: a fixture set later in the same process is honored
   try {
-    const file = process.env.FORGE_SERVICE_FILE || join(process.env.XDG_STATE_HOME || join(homedir(), ".local", "state"), "opencode", "service.json")
     const raw = JSON.parse(readFileSync(file, "utf8"))
     if (raw && typeof raw.url === "string" && typeof raw.password === "string" && raw.url && raw.password) {
       serviceHttpCache = { url: raw.url.replace(/\/+$/, ""), password: raw.password }
@@ -8847,6 +9035,67 @@ function v2SessionIdOf(opts: unknown): string | undefined {
 /** Test seam: build the v2 session adapter directly (mock ctx.session domain). */
 export function v2SessionClientForTests(ctx: V2PluginContext): V2SessionClient | null {
   return v2SessionClient(ctx)
+}
+
+/** service.json HTTP GET with the host's Basic auth; non-2xx throws (callers fail soft/open). */
+async function serviceHttpGet(svc: ServiceHttpEndpoint, path: string): Promise<unknown> {
+  const res = await fetch(`${svc.url}${path}`, {
+    headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
+  })
+  if (!res.ok) throw new Error(`service HTTP ${res.status} for ${path}`)
+  return (await res.json()) as unknown
+}
+
+// crew-continue-native-child-gate 4.2 (sandbox E2E finding 2026-11-23 — the
+// gate was a structural NO-OP on live v2 hosts): the walk needs
+// session.list + session.status, but the promise-layer ctx.session domain
+// exposes neither, so the adapter handed to the gate always walked an empty
+// view and failed OPEN — two [forge:crew-continue] briefs landed while a
+// native child was verifiably running. The host's own HTTP surfaces are the
+// sanctioned equivalent, on the SAME service.json channel the messages
+// reader and the interrupt fallback already ride (both real-host proven):
+//   GET /api/session         session.list — every row carries parentID
+//                            (optional ?parentID= server-side filter)
+//   GET /api/session/active  session.active — map sessionID → {type:"running"};
+//                            "sessions absent from the result are inactive"
+// A DEDICATED walker object — deliberately NOT session.list/session.status on
+// the shared adapter: other call sites probe those names with v1-shaped
+// expectations (e.g. the crew send-time idle re-check treats a status throw
+// as "skip the brief"); adding them there would silently change their
+// behavior. Discovery is lazy per call (service.json can materialize after
+// setup); every failure THROWS and the pure core fails OPEN.
+//
+// Page cap (real host, 2026-11-23): the list returns "the newest 50
+// sessions" and that cap applies to a parentID-filtered page TOO — a parent
+// with 85 children answered 50 rows by default and all 85 with ?limit=500.
+// The scoped call therefore asks for the wider page; the client-side
+// parentID filter in the pure core stays the semantic authority.
+const NATIVE_CHILD_LIST_LIMIT = 500
+function v2NativeChildWalker(): NativeChildClient {
+  return {
+    session: {
+      list: async (args) => {
+        const svc = discoverServiceHttp()
+        if (!svc) throw new Error("native-child walker: service.json discovery failed")
+        const parent = args !== null && typeof args === "object" && typeof (args as { parentID?: unknown }).parentID === "string"
+          ? (args as { parentID: string }).parentID
+          : ""
+        return await serviceHttpGet(svc, parent ? `/api/session?parentID=${encodeURIComponent(parent)}&limit=${NATIVE_CHILD_LIST_LIMIT}` : "/api/session")
+      },
+      status: async () => {
+        const svc = discoverServiceHttp()
+        if (!svc) throw new Error("native-child walker: service.json discovery failed")
+        const body = await serviceHttpGet(svc, "/api/session/active")
+        // Live 2.3.2 shape: the BARE map {sessionID:{type}}. Re-wrap into the
+        // {data:map} envelope the pure core unwraps; an already-enveloped
+        // body passes its inner map through.
+        const map = body !== null && typeof body === "object" && !Array.isArray(body) && "data" in (body as Record<string, unknown>)
+          ? (body as { data: unknown }).data
+          : body
+        return { data: map }
+      },
+    },
+  }
 }
 
 function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
@@ -8999,7 +9248,7 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
       return undefined
     }
   }
-  return Object.keys(out).length > 0 ? { session: out } : null
+  return Object.keys(out).length > 0 ? { session: out, nativeChildWalker: v2NativeChildWalker() } : null
 }
 
 // 0.32.3 row-shape reality (real-host capture, 2.3.2): the session-message
@@ -9248,7 +9497,7 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
 // the v1 __forgeSubagentsTest): live references to the module maps the v2
 // handlers share with the v1 hooks, so tests seed and inspect without a
 // host. NOT part of the plugin API surface.
-export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, crewNativeChildren, crewNativeCeiling, crewChildDigest, resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
+export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, crewNativeChildren, crewNativeCeiling, crewChildDigest, crewNativeWatch, crewNativeRecheckArmed: (sessionID: string) => crewNativeRecheck.has(sessionID), crewNativeRecheckNow: (sessionID: string, client: GoalClient | null) => crewNativeRecheckTick(sessionID, client), resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
 
 // ---- v2-single-agent-surface: single-agent-surface primitives (v2Setup
 // only — the v1 config-hook path never uses these) ----
