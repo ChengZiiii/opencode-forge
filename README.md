@@ -633,27 +633,30 @@ subagent behavior is untouched. Onboarding is this README, for you the human.
 
 ### Slash commands — the roster levers
 
-Four commands, registered on every host generation:
+ONE command, registered on every host generation:
 
-- **`/forge-sync`** — force a roster sync NOW (`forge_sync`) and show the full
-  diff. The manual force/debug lever; the default staleness-gate posture and
-  `sync:"auto"` are unchanged.
-- **`/forge-init`** — draft THIS workspace's `.opencode/forge.json` in-band
-  (interview or infer, show, write only on your explicit go-ahead; refuses
-  and reviews when one already exists).
-- **`/forge-init-global`** — same drafting flow for the GLOBAL
-  `~/.config/opencode/forge.json`, with the built-in override entries
-  (`general`/`explore`) shipped commented out (inert until you fill one).
-- **`/forge <argument>`** — the router (`sync` / `init` / `init global`),
-  kept as the fallback entry for muscle memory. On v2 hosts typed arguments
-  are composed into the delivered prompt by the plugin (the host does no
-  `$ARGUMENTS` substitution for plugin commands).
+- **`/forge <argument>`** — the router, four forms:
+  - **`sync`** — force a roster sync NOW (`forge_sync`) and show the full
+    diff. The manual force/debug lever; the default staleness-gate posture
+    and `sync:"auto"` are unchanged.
+  - **`init`** — draft THIS workspace's `.opencode/forge.json` in-band
+    (interview or infer, show, write only on your explicit go-ahead; refuses
+    and reviews when one already exists).
+  - **`init global`** — same drafting flow for the GLOBAL
+    `~/.config/opencode/forge.json`, with the built-in override entries
+    (`general`/`explore`) shipped commented out (inert until you fill one).
+  - **`stop`** — cancel every in-flight async dispatch owned by THIS
+    session (session-scoped by construction; see *Cancellation* below).
 
-The hyphenated family is the primary surface: zero-argument, each with its
-own description in the slash menu — deterministic routing, no argument
-pipeline. All four carry the same family guard (a non-forge session gets a
-"switch to forge (Tab)" pointer instead of acting) and never write anything
-themselves — every write goes through `forge_sync` or the normal write tool
+On v2 hosts typed arguments are composed into the delivered prompt by the
+plugin (the host does no `$ARGUMENTS` substitution for plugin commands).
+The hyphenated family (`/forge-sync`, `/forge-init`, `/forge-init-global`,
+`/forge-cancel`) is RETIRED — one command, four argument forms, the
+smallest collision surface. The plugin registers `/forge` create-only and
+never touches a user's same-named entry (no-clobber). The command carries
+the family guard (a non-forge session gets a
+"switch to forge (Tab)" pointer instead of acting) and never writes anything
+itself — every write goes through `forge_sync` or the normal write tool
 on your explicit go-ahead, transcript-visible.
 
 ### forge.json — the configuration
@@ -1029,12 +1032,15 @@ exactly once; an unreadable row falls back to walking the parent-session
 relationship, and a child that died while nobody watched terminalizes
 honestly without a fabricated wake.
 
-**Cancellation (`/forge-cancel` — a user lever, ESC is not one).** Host
+**Cancellation (`/forge stop` — a user lever, ESC is not one).** Host
 children are independent sessions: since 2.3.0 ESC interrupts the parent
 turn only and a background child keeps running (upstream #64073). The
-`/forge-cancel` command is the lever: no argument lists every in-flight
-dispatch (task id, agent, child session, age); a task id cancels that one;
-`all` cancels every in-flight dispatch. Cancellation aborts the child
+`/forge stop` argument is the lever: it cancels every in-flight async
+dispatch owned by THIS session (other sessions' dispatches are untouched —
+the scope is decided in the tool layer from the host-truth session id, never
+from model-relayed text). Cancelling a specific or foreign dispatch stays
+possible with the explicit per-id escape hatch `forge_jobs` with
+`action: "cancel"` and the task id. Cancellation aborts the child
 through the same engine the owner-death path uses, then PROVES the stop —
 the plugin polls the host's status view until the child reads idle
 (`FORGE_CANCEL_IDLE_ASSERTION_MS`, default 10 s) and the disclosure says
@@ -1046,9 +1052,9 @@ it. Interruptions disclose: an ESC with children in flight surfaces the
 in-flight list with cancel guidance (disclose-only — an interrupt never
 cancels a child); a streaming forge child with no live row (an adoption
 gap) is surfaced as an orphan with the adopt/cancel paths instead of
-running invisibly. The lever is also reachable without the command:
-`forge_jobs` with `action: "cancel"` (and `kill` remains the generic
-process-tree lever for shell jobs).
+running invisibly. `forge_jobs` with `action: "stop"` is the same lever
+without the command (`kill` remains the generic process-tree lever for
+shell jobs).
 
 **Sync handoff presentation.** A sync dispatch whose child outlives the
 wait budget does not fail: the handoff surfaces as a normal informational

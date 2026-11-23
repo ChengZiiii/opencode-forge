@@ -78,7 +78,7 @@ import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, parseTopLevelKnobs, poolFileCompliance, sanitizeNamespace, type DispatchNodeConfig, type ForgeAgentDef, type ForgeMaterializeKnob, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
-import { compileRosterEntry, executeRosterSync, globalAgentDirFor, planOverrideSync, planRosterSync, staleCheckForPool, type RosterFsDeps, type SyncPlan } from "./src/roster-compile.ts"
+import { compileRosterEntry, executeRosterSync, globalAgentDirFor, planOverrideSync, planRosterSync, staleCheckForPool, VARIANT_DEPTH_WORDS, type RosterFsDeps, type SyncPlan } from "./src/roster-compile.ts"
 import type { PoolProvenance } from "./src/dispatch-tiers.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
@@ -259,10 +259,10 @@ export const GLOBAL_RECIPE_SCAFFOLD_JSONC = [
 ].join("\n")
 
 // Per-lever bodies live in single-source constants (change v2-command-surface
-// task 2.1): the /forge router embeds them VERBATIM (byte-identical routing
-// template), and the dedicated hyphenated commands (forge-sync / forge-init /
-// forge-init-global) embed the same text as standalone levers — the two
-// surfaces cannot fork.
+// task 2.1): the /forge router embeds them VERBATIM. The dedicated
+// hyphenated commands are RETIRED (command-surface-v2-cleanup D1) — /forge is
+// the single command surface, routing on its argument (sync / init / init
+// global / stop).
 
 // Step-0 family guard, parameterized by the invoking command's name.
 export function forgeFamilyGuard(command: string): string {
@@ -287,7 +287,18 @@ export const INIT_GLOBAL_BODY =
   `same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. ${INIT_GLOBAL_SCAFFOLD_NOTE}`
 
 export const FORGE_HELP_ROUTE_LINE =
-  "- Argument empty or unknown: tell the user the three forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries) — and stop."
+  "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (cancel THIS session's in-flight async dispatches) — and stop."
+
+// Dispatch stop route body (command-surface-v2-cleanup D1): session-scoped
+// cancellation. Host children are independent sessions — ESC interrupts the
+// parent turn only, so without this lever a runaway worker is unkillable
+// (upstream #64073). The scoping lives in the TOOL layer (forge_jobs stop
+// filters by context.sessionID) — template-layer instructions are routing
+// only, never trust boundaries (design D2).
+export const STOP_LEVER_BODY = [
+  '- Argument "stop": call forge_jobs with action "stop" (no other parameters) and relay the tool result verbatim — it cancels every in-flight ASYNC DISPATCH owned by THIS session (each child session is aborted and CONFIRMED idle; each dispatch settles as aborted and is never retried). A dispatch owned by another session is NOT touched: name its task id only if the user asks, and cancel it with the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"}. Then STOP: no re-dispatch, no replacement work.',
+  "Boundaries: cancellation is USER intent only — never stop dispatches on your own initiative; a stopped dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entries and the owner wakes are delivered by the plugin's terminal path, not by you.",
+].join("\n")
 
 export const FORGE_COMMAND_TEMPLATE = [
   '(forge roster levers. Argument: "$ARGUMENTS")',
@@ -299,67 +310,10 @@ export const FORGE_COMMAND_TEMPLATE = [
   `- Argument "init": ${INIT_WORKSPACE_LEAD} ${INIT_FLOW_BODY}`,
   `- Argument "init global": ${INIT_GLOBAL_BODY} Scaffold shape:`,
   ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split("\n").map((l) => `  ${l}`),
+  `- ${STOP_LEVER_BODY}`,
   FORGE_HELP_ROUTE_LINE,
   "",
   FORGE_BOUNDARIES_TEXT,
-  "",
-].join("\n")
-
-// Dedicated zero-argument levers (change v2-command-surface): the SAME body
-// text as the /forge route, standalone — host-deterministic routing, no
-// argument pipeline, each with its own description (menu-as-documentation).
-export const FORGE_SYNC_LEVER_TEMPLATE = [
-  "(forge roster lever: sync — force a roster sync NOW and show the diff)",
-  "",
-  forgeFamilyGuard("/forge-sync"),
-  "",
-  SYNC_LEVER_BODY,
-  "",
-  FORGE_BOUNDARIES_TEXT,
-  "",
-].join("\n")
-
-export const FORGE_INIT_LEVER_TEMPLATE = [
-  "(forge roster lever: init — draft THIS workspace's recipe (.opencode/forge.json) in-band)",
-  "",
-  forgeFamilyGuard("/forge-init"),
-  "",
-  `${INIT_WORKSPACE_LEAD} ${INIT_FLOW_BODY}`,
-  "",
-  FORGE_BOUNDARIES_TEXT,
-  "",
-].join("\n")
-
-export const FORGE_INIT_GLOBAL_LEVER_TEMPLATE = [
-  "(forge roster lever: init global — draft the GLOBAL recipe (~/.config/opencode/forge.json))",
-  "",
-  forgeFamilyGuard("/forge-init-global"),
-  "",
-  `Draft the GLOBAL recipe (~/.config/opencode/forge.json) in-band with the user. ${INIT_FLOW_BODY} ${INIT_GLOBAL_SCAFFOLD_NOTE} Scaffold shape:`,
-  ...GLOBAL_RECIPE_SCAFFOLD_JSONC.split("\n").map((l) => `  ${l}`),
-  "",
-  FORGE_BOUNDARIES_TEXT,
-  "",
-].join("\n")
-
-// Dedicated dispatch lever (change dispatch-cancel-lifecycle task 1.1): the
-// user-facing cancellation lever for in-flight async dispatches. Host
-// children are independent sessions — ESC interrupts the parent turn only,
-// so without this lever a runaway worker is unkillable (upstream #64073).
-// The lever routes through the forge_jobs cancel action (the plugin's
-// cancel engine: abort + confirmed-idle assertion + aborted settle +
-// never-retried); the AGENT is the router, the PLUGIN is the killer.
-export const FORGE_CANCEL_LEVER_TEMPLATE = [
-  '(forge dispatch lever: cancel — stop an in-flight async dispatch. Argument: "$ARGUMENTS")',
-  "",
-  forgeFamilyGuard("/forge-cancel"),
-  "",
-  "Route on the argument above (decide silently; do not recite this routing text to the user):",
-  '- No argument: call forge_jobs with action "list" and report ONLY the async dispatches in flight — task id, agent, child session id, age, description — plus the exact cancel invocation for each. Cancel NOTHING on a bare listing.',
-  '- A task id: call forge_jobs {action: "cancel", jobId: "<task-id>"}. Relay the tool result verbatim — it names the confirmed-idle proof or the resisted-cancellation warning. Then STOP: no re-dispatch, no replacement work.',
-  '- "all": call forge_jobs {action: "cancel", jobId: "all"} — every in-flight dispatch cancels under the same confirmed-abort contract; relay each per-task result.',
-  "",
-  "Boundaries: cancellation is USER intent only — never cancel a dispatch on your own initiative; a cancelled dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entry and the owner wake are delivered by the plugin's terminal path, not by you.",
   "",
 ].join("\n")
 
@@ -2764,14 +2718,14 @@ const forgeShellTool = tool({
   },
 })
 
-const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "clear", "handoff"]
+const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "stop", "clear", "handoff"]
 
 const forgeJobsTool = tool({
   description:
-    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel an in-flight ASYNC DISPATCH (its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried — the dispatch-specific cancel lever behind /forge-cancel); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel ONE in-flight ASYNC DISPATCH by explicit task id, including one owned by ANOTHER session (the deliberate cross-session escape hatch behind no ownership check; its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried); stop — cancel EVERY in-flight async dispatch owned by THIS session only (the /forge stop lever; session-scoped by construction, other sessions' dispatches are untouched; nothing in flight = honest no-op report); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
-    jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list)"),
+    jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list and stop)"),
     waitMs: tool.schema.number().int().nonnegative().optional().describe("poll: bounded in-call wait (clamped to 30000)"),
     offset: tool.schema.number().int().nonnegative().optional().describe("log: first line index; omitted = tail window"),
     limit: tool.schema.number().int().positive().optional().describe("log: max lines (default 200)"),
@@ -2787,6 +2741,29 @@ const forgeJobsTool = tool({
       ensureJobLifecycle()
       const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.previousRun ? "previous-run" : j.survive ? "survive" : j.scope}  ${j.cmd.slice(0, 60)}`)
       return { title: `jobs (${rows.length})`, output: rows.length > 0 ? rows.join("\n") : "(no jobs)" }
+    }
+    if (action === "stop") {
+      // Session-scoped stop (command-surface-v2-cleanup D2): the scoping
+      // decision lives HERE in the tool execute layer — context.sessionID is
+      // host-truth, never model-relayed. Cancel each of THIS session's
+      // in-flight dispatches SERIALLY (concurrent aborts would race the idle
+      // assertion); nothing in flight = honest no-op report. No jobId: the
+      // scope IS the calling session.
+      const client = dispatchClient()
+      if (!client) throw new Error("[forge] stop: no dispatch client on this host.")
+      const flight = inFlightAsyncDispatches(context.sessionID)
+      if (flight.length === 0) {
+        return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${context.sessionID}) — nothing to stop.` }
+      }
+      const results: string[] = []
+      for (const taskId of flight) {
+        const res = await cancelDispatch(client, taskId)
+        results.push(`- ${res.text}`)
+      }
+      return {
+        title: `${flight.length} dispatch(es) stopped`,
+        output: `[forge:job] Stopped ${flight.length} in-flight dispatch(es) of this session:\n${results.join("\n")}`,
+      }
     }
     if (!args.jobId) throw new Error(`Action "${action}" requires jobId.`)
     const job = jobManager.get(args.jobId)
@@ -2827,23 +2804,17 @@ const forgeJobsTool = tool({
       return { title: `${job.id} killed`, output: `[forge:job] ${job.id}: tree kill issued (state: killed).` }
     }
     if (action === "cancel") {
-      // Dispatch cancellation lever core (dispatch-cancel-lifecycle): the
-      // SAME engine /forge-cancel drives — abort + CONFIRMED-idle assertion
-      // + aborted settle + never-retried. "all" cancels every in-flight
-      // dispatch SERIALLY (concurrent aborts would race the idle
-      // assertion); a non-dispatch job refuses with the in-flight list
-      // (kill stays the generic lever).
+      // Dispatch cancellation engine (dispatch-cancel-lifecycle): abort +
+      // CONFIRMED-idle assertion + aborted settle + never-retried. Per-id
+      // ONLY (command-surface-v2-cleanup D2): the explicit task id is the
+      // deliberate cross-session escape hatch — cancelDispatch performs no
+      // ownership check BY DESIGN (spec-pinned). The session-scoped bulk
+      // form is the `stop` action; "all" is retired. A non-dispatch job
+      // refuses with the in-flight list (kill stays the generic lever).
       const client = dispatchClient()
       if (!client) throw new Error("[forge] cancel: no dispatch client on this host.")
       if (String(args.jobId).trim().toLowerCase() === "all") {
-        const { count, results } = await cancelAllDispatches(client)
-        if (count === 0) {
-          return { title: "cancel all", output: "[forge:job] (no async dispatches in flight — nothing to cancel)" }
-        }
-        return {
-          title: `${count} dispatch(es) cancelled`,
-          output: `[forge:job] Cancelled ${count} in-flight dispatch(es):\n${results.join("\n")}`,
-        }
+        throw new Error('[forge] cancel "all" is retired — use action "stop" (cancels THIS session\'s in-flight dispatches) or cancel an explicit task id.')
       }
       const res = await cancelDispatch(client, args.jobId)
       if (!res.ok) return { title: `${args.jobId} not cancellable`, output: `[forge:job] ${res.text}` }
@@ -2980,13 +2951,22 @@ function dispatchModelIdentity(agentID: string, ownerSession: string, childSessi
  * create body's `model` key binds it at spawn (host precedence: an explicit
  * create model wins). Null for Auto workers and non-forge targets: no model
  * key, the host default applies (agent's configured model, else inherited).
+ * Variant leg (fix-runtime-model-pin-variant D2): when the recipe's
+ * thoughtLevel is a variant word (low/medium/high), the pin carries it as
+ * `variant` — the same value the compiled `.md` model string would carry as
+ * `#<depth>` — so the session's model record (what the UI reads) shows the
+ * real depth even when the host did not pre-resolve the agent file.
  */
-function rosterModelPin(agentID: string): { providerID: string; modelID: string } | null {
+function rosterModelPin(agentID: string): { providerID: string; modelID: string; variant?: string } | null {
   if (!agentID.toLowerCase().startsWith("forge-")) return null
   const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def
   if (!def?.model) return null
   const identity = parseIdentity(def.model)
-  return identity ? { providerID: identity.provider, modelID: identity.model } : null
+  if (!identity) return null
+  const depth = typeof def.thoughtLevel === "string" ? def.thoughtLevel : ""
+  return VARIANT_DEPTH_WORDS.includes(depth)
+    ? { providerID: identity.provider, modelID: identity.model, variant: depth }
+    : { providerID: identity.provider, modelID: identity.model }
 }
 
 /**
@@ -3005,7 +2985,7 @@ function forgeTargetUnresolved(agentID: string): string | null {
   return (
     `"${agentID}" does not resolve in the live roster (pool source: ` +
     `${resolution ? "the workspace pool resolution" : "none — no forge.json in scope for this host"}); ` +
-    `refusing to spawn a default-agent child — re-sync the roster (/forge-sync) or correct the target`
+    `refusing to spawn a default-agent child — re-sync the roster (/forge sync) or correct the target`
   )
 }
 
@@ -3406,7 +3386,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
     journalTerminalRecord(
       { id: rec.id, agent: rec.agent, ownerSession: rec.ownerSession, workspace, description: rec.description ?? "" },
       "aborted",
-      "cancelled by the user lever (forge-cancel) — recovery refuses to respawn a cancelled dispatch",
+      "cancelled by the user lever (/forge stop) — recovery refuses to respawn a cancelled dispatch",
     )
     return
   }
@@ -3658,7 +3638,8 @@ type DispatchRetryContext = {
 // ---------------------------------------------------------------------------
 // User-facing cancellation lever (dispatch-cancel-lifecycle, forge-subagents
 // spec "User-facing dispatch cancellation"): the cancel core behind the
-// dedicated `forge-cancel` command. Cancel = the EXISTING registry kill (the
+// `/forge stop` route (session-scoped bulk) and the explicit per-id
+// forge_jobs cancel action. Cancel = the EXISTING registry kill (the
 // manager's kill fires the row's killTree → abortChild) + the honest
 // settle: the journal records `aborted` with the USER-LEVER reason, the
 // persisted row is removed by the terminal choke point, and the owner gets
@@ -3734,7 +3715,7 @@ export function discloseInterruptedParent(sessionID: string): boolean {
   interruptDisclosureSeen.add(key)
   queueDispatchProgress(
     sessionID,
-    `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):\n${formatInFlightDispatchList()}\nCancel with /forge-cancel <task-id> or /forge-cancel all. Nothing was cancelled automatically.`,
+    `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):\n${formatInFlightDispatchList()}\nCancel with /forge stop (cancels every in-flight dispatch of THIS session) or the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"} (the cross-session escape hatch). Nothing was cancelled automatically.`,
   )
   return true
 }
@@ -3807,17 +3788,6 @@ export async function cancelDispatch(
 /** Retry guard (task 1.4): a cancelled dispatch is never respawned. */
 export function isDispatchCancelled(taskId: string): boolean {
   return cancelledDispatchIds.has(taskId)
-}
-
-/** "all" verb (task 1.1): cancel every in-flight dispatch, SERIALLY. */
-export async function cancelAllDispatches(client: DispatchClient): Promise<{ count: number; results: string[] }> {
-  const flight = inFlightDispatchList()
-  const results: string[] = []
-  for (const row of flight) {
-    const res = await cancelDispatch(client, row.taskId)
-    results.push(`- ${res.text}`)
-  }
-  return { count: flight.length, results }
 }
 
 // ---------------------------------------------------------------------------
@@ -4048,7 +4018,7 @@ export async function adoptPersistedDispatchRows(client: DispatchClient | null, 
           journalTerminalRecord(
             { id: taskId, agent: String(row.agent ?? ""), ownerSession: String(row.ownerSession ?? ""), workspace, description: String(row.description ?? "") },
             "aborted",
-            "cancelled by the user lever (forge-cancel) — adoption refuses to re-arm a cancelled dispatch",
+            "cancelled by the user lever (/forge stop) — adoption refuses to re-arm a cancelled dispatch",
           )
           continue
         }
@@ -4161,11 +4131,11 @@ export async function detectOrphanDispatchChildren(client: DispatchClient, works
       if (rec) taskId = rec.id
     } catch {}
     console.warn(
-      `[forge:orphan-dispatch] warn: forge child ${id} (agent ${agent}, parent ${parent}) is STREAMING with no live dispatch row (task id ${taskId}) — adoption gap. Adopt: restart the host or touch the workspace to re-run recovery; Cancel: /forge-cancel <task-id> (or forge_jobs action=cancel).`,
+      `[forge:orphan-dispatch] warn: forge child ${id} (agent ${agent}, parent ${parent}) is STREAMING with no live dispatch row (task id ${taskId}) — adoption gap. Adopt: restart the host or touch the workspace to re-run recovery; Cancel: /forge stop (this session's dispatches) or forge_jobs action=cancel with the task id.`,
     )
     queueDispatchProgress(
       parent,
-      `[forge:dispatch-notice] Orphaned dispatch child detected: forge child ${id} (agent ${agent}, task id ${taskId}) is running with no live dispatch row. It will NOT deliver an outcome on its own — recover it (restart/touch to re-run adoption) or cancel it (/forge-cancel ${taskId === "(unknown)" ? "<task-id>" : taskId}).`,
+      `[forge:dispatch-notice] Orphaned dispatch child detected: forge child ${id} (agent ${agent}, task id ${taskId}) is running with no live dispatch row. It will NOT deliver an outcome on its own — recover it (restart/touch to re-run adoption) or cancel it (forge_jobs action=cancel jobId=${taskId === "(unknown)" ? "<task-id>" : taskId}; or /forge stop when it belongs to this session).`,
     )
   }
   return found
@@ -4479,7 +4449,7 @@ async function runAsyncDispatchPoller(
         { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
         "aborted",
         isDispatchCancelled(job.id)
-          ? `cancelled by the user lever (forge-cancel) — the child was aborted and the dispatch is never retried${suffix}`
+          ? `cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried${suffix}`
           : `registry kill (owner session ended / dispose) — user abort${suffix}`,
       )
       return
@@ -6736,44 +6706,16 @@ export const server: Plugin = async (input, options) => {
       }
 
       // /forge command — the roster levers (change forge-commands): one
-      // command routing on its argument (sync / init / init global / help).
-      // Same no-clobber rule as /plan and /goal.
+      // command routing on its argument (sync / init / init global / stop /
+      // help). Same no-clobber rule as /plan and /goal. The hyphenated
+      // lever family (forge-sync/forge-init/forge-init-global/forge-cancel)
+      // is RETIRED (command-surface-v2-cleanup D1) — one command, four
+      // argument forms; deletion means "no longer registered", never
+      // touching a user's same-named entry.
       cfg.command["forge"] ??= {
         template: FORGE_COMMAND_TEMPLATE,
         description:
-          'forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out',
-      }
-
-      // Dedicated zero-argument levers (change v2-command-surface task 3.2):
-      // the hyphenated family joins /forge as the DOCUMENTED primary surface —
-      // each with its own template (same route body, standalone) and its own
-      // description. Same no-clobber rule. v1 config commands get $ARGUMENTS
-      // substitution from the host's config-command path; these templates
-      // contain no placeholder, so a user typing trailing text still gets it
-      // delivered by the host's append semantics — the levers never depend on
-      // arguments for routing either way.
-      cfg.command["forge-sync"] ??= {
-        template: FORGE_SYNC_LEVER_TEMPLATE,
-        description: "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff",
-      }
-      cfg.command["forge-init"] ??= {
-        template: FORGE_INIT_LEVER_TEMPLATE,
-        description:
-          "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)",
-      }
-      cfg.command["forge-init-global"] ??= {
-        template: FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
-        description:
-          "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out",
-      }
-      // Dedicated dispatch lever (change dispatch-cancel-lifecycle task 1.1):
-      // the user-facing cancellation lever. Same no-clobber rule; routes on
-      // $ARGUMENTS (empty = list-only, task id = cancel one, "all" = cancel
-      // every in-flight dispatch) through the forge_jobs cancel action.
-      cfg.command["forge-cancel"] ??= {
-        template: FORGE_CANCEL_LEVER_TEMPLATE,
-        description:
-          "forge dispatch lever: cancel an in-flight async dispatch by task id (or \"all\"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried",
+          'forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session\'s in-flight async dispatches',
       }
 
       // Gate permission rules (shell-defang-default-open): the 6 doors keep
@@ -8335,13 +8277,30 @@ function v2ContextInjection(raw: unknown): void {
       if (identity && o.model && typeof o.model === "object") {
         const before = JSON.stringify(o.model)
         const m = o.model as { providerID?: unknown; id?: unknown; modelID?: unknown; variant?: unknown }
-        // Host contract (fix-dispatch-model-pin-shape): the runner composes
-        // providerID + "/" + model.id — `id`/`modelID` stay BARE here, same
-        // as the dispatch-async create seam (guarded by unit tests there).
+        // Variant rewrite rule (fix-runtime-model-pin-variant D1): when the
+        // pinned identity EQUALS the resolved identity, the rewrite is an
+        // invisible no-op — only the spellings are normalized and the
+        // host-resolved #variant (e.g. from a `.md` model string) SURVIVES.
+        // When the pin swaps the model: a variant-word thoughtLevel derives
+        // the new variant; anything else deletes it (a stale variant of a
+        // different model is meaningless). Host contract
+        // (fix-dispatch-model-pin-shape): the runner composes providerID +
+        // "/" + model.id — `id`/`modelID` stay BARE here, same as the
+        // dispatch-async create seam (guarded by unit tests there).
+        const resolvedModel = typeof m.modelID === "string" ? m.modelID : typeof m.id === "string" ? m.id : ""
+        const identityEquals =
+          m.providerID === identity.provider && resolvedModel === identity.model
+        const recipeDepth = typeof pinnedDef.thoughtLevel === "string" ? pinnedDef.thoughtLevel : ""
         m.providerID = identity.provider
         m.id = identity.model
         m.modelID = identity.model
-        delete m.variant
+        if (identityEquals) {
+          // keep m.variant untouched (host-resolved depth survives)
+        } else if (VARIANT_DEPTH_WORDS.includes(recipeDepth)) {
+          m.variant = recipeDepth
+        } else {
+          delete m.variant
+        }
         if (process.env.FORGE_MODEL_PROBE) {
           try {
             appendFileSync(
@@ -8596,39 +8555,13 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
       )
       // /forge — the roster levers (change forge-commands): the SAME
       // constant template the v1 config hook registers (byte-identical by
-      // construction); routes on $ARGUMENTS at the model layer.
+      // construction); routes on $ARGUMENTS at the model layer. The
+      // hyphenated lever family is RETIRED (command-surface-v2-cleanup D1):
+      // one command, four argument forms (sync / init / init global / stop).
       addTemplateCommand(
         "forge",
         () => FORGE_COMMAND_TEMPLATE,
-        "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out",
-      )
-      // Dedicated zero-argument levers (change v2-command-surface task 3.1):
-      // the hyphenated family — host-deterministic routing (the hyphenated
-      // name was probed live in gate task 1.1), the SAME route bodies as
-      // /forge (single-source constants), per-lever descriptions.
-      addTemplateCommand(
-        "forge-sync",
-        () => FORGE_SYNC_LEVER_TEMPLATE,
-        "forge roster lever: force an immediate roster sync (forge_sync) NOW and show the full diff",
-      )
-      addTemplateCommand(
-        "forge-init",
-        () => FORGE_INIT_LEVER_TEMPLATE,
-        "forge roster lever: draft THIS workspace's forge.json in-band (refuses when one exists — review instead of overwrite)",
-      )
-      addTemplateCommand(
-        "forge-init-global",
-        () => FORGE_INIT_GLOBAL_LEVER_TEMPLATE,
-        "forge roster lever: draft the GLOBAL forge.json (~/.config/opencode) with the built-in override entries commented out",
-      )
-      // Dedicated dispatch lever (change dispatch-cancel-lifecycle task 1.1):
-      // the user-facing cancellation lever — same constant the v1 config
-      // hook registers (byte-identical by construction); the typed argument
-      // rides prompt.text via composeCommandPrompt (v2-command-surface 4.1).
-      addTemplateCommand(
-        "forge-cancel",
-        () => FORGE_CANCEL_LEVER_TEMPLATE,
-        "forge dispatch lever: cancel an in-flight async dispatch by task id (or \"all\"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried",
+        "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight async dispatches",
       )
     })
   } catch (e) {
