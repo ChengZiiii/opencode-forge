@@ -96,7 +96,9 @@ test("config: goal permission keys pinned to ask, user deny respected, /goal com
     const cfg = { agent: {}, permission: { goal_write: "deny" } }
     await hooks.config(cfg)
     assert.equal(cfg.permission.plan_approve, "ask")
-    assert.equal(cfg.permission.plan_close, "ask")
+    // plan-close-verified D4: plan_close left the door list — the completion
+    // gate is plugin-verified now, so no permission key is injected for it.
+    assert.equal(cfg.permission.plan_close, undefined)
     assert.equal(cfg.permission.goal_write, "deny") // explicit deny kept
     assert.equal(cfg.permission.goal_complete, "ask")
     assert.equal(cfg.permission.goal_resume, "ask")
@@ -106,8 +108,8 @@ test("config: goal permission keys pinned to ask, user deny respected, /goal com
     const cfg2 = { agent: {}, command: { goal: { template: "mine" } } }
     await hooks.config(cfg2)
     assert.equal(cfg2.command.goal.template, "mine")
-    // All eleven tools registered (5 plan + 6 goal).
-    for (const t of ["plan_write", "plan_tick", "plan_approve", "plan_close", "plan_discard", "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard"]) {
+    // All twelve tools registered (6 plan incl. plan_reopen + 6 goal).
+    for (const t of ["plan_write", "plan_tick", "plan_approve", "plan_close", "plan_reopen", "plan_discard", "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard"]) {
       assert.ok(hooks.tool[t], `missing tool ${t}`)
     }
     // Disable knob removes everything.
@@ -955,7 +957,7 @@ test("plan_discard without supersede stays abandoned; reason survives verbatim; 
   }
 })
 
-test("plan_close appends the dated close section with per-criterion verdicts in the same write as done", async () => {
+test("plan_close (legacy, no declared checks): zero ask events, evidence-summary close section in the same write as done", async () => {
   const wt = mkdtempSync(join(tmpdir(), "plan-close-"))
   try {
     const { serverPromise } = makeHarness({ worktree: wt })
@@ -976,10 +978,11 @@ test("plan_close appends the dated close section with per-criterion verdicts in 
       },
       toolCtx(sid, wt, (req) => {
         asked++
-        assert.equal(req.permission, "plan_close")
       }),
     )
-    assert.equal(asked, 1, "close gate must fire exactly once")
+    // D4: the modal completion gate is gone — a plan_close call must never
+    // create an ask (the plugin verifies; the user reviews asynchronously).
+    assert.equal(asked, 0, "close must fire ZERO ask events")
     const f = planFile(wt)
     assert.equal(parsePlan(f.text).status, "done")
     const updated = f.text.match(/^updated: (.*)$/m)[1]
@@ -989,7 +992,7 @@ test("plan_close appends the dated close section with per-criterion verdicts in 
         transitionStatus(before.text, "done", updated),
         "closed",
         {
-          reason: "completion gate passed (user confirmed)",
+          reason: "completion gate passed (plugin-verified)",
           checks: [
             { criterion: "it works", pass: true, evidence: "node --test: 2 pass" },
             { criterion: "it is fast", pass: true, evidence: "bench p95 12ms" },
@@ -998,10 +1001,12 @@ test("plan_close appends the dated close section with per-criterion verdicts in 
         updated,
       ),
     )
+    assert.ok(f.text.includes("reason: completion gate passed (plugin-verified)"))
     assert.ok(f.text.includes("- PASS — it works"))
     assert.ok(f.text.includes("  evidence: node --test: 2 pass"))
     assert.ok(f.text.includes("- PASS — it is fast"))
     assert.match(out.output, /— closed/, "output names the appended section")
+    assert.match(out.output, /plugin-verified/, "output announces the plugin-verified gate")
     await hooks.dispose?.()
   } finally {
     rmSync(wt, { recursive: true, force: true })
@@ -1062,11 +1067,190 @@ test("terminal outputs relay the exact appended section: discard and close both 
           { criterion: "it is fast", pass: true, evidence: "bench p95 12ms" },
         ],
       },
-      toolCtx(sidB, wt),
+      toolCtx(sidB, wt, () => {
+        throw new Error("plan_close must never ask (D4)")
+      }),
     )
     const fB = planDirEntries(wt).find((e) => e.text.includes("goal: relay the close section"))
     const headingB = fB.text.match(/^## (.+ — closed)$/m)[1]
     assert.ok(outB.output.includes(`## ${headingB}`), "the close output carries the exact dated section heading from disk")
+    // plan-close-verified: the relay carries the evidence-summary content —
+    // plugin-verified verdict plus the per-criterion evidence lines on disk.
+    assert.match(outB.output, /plugin-verified/)
+    assert.ok(fB.text.includes("- PASS — it works"), "evidence summary verdicts live on disk")
+    assert.ok(fB.text.includes("  evidence: node --test: 2 pass"))
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+// ---------------------------------------------------------------------------
+// plan-close-verified: structured Verification Checks — frozen-set close
+// re-run (the FILE is the truth), fail-closed Check Log, plan_reopen.
+// ---------------------------------------------------------------------------
+
+test("plan_write checks: goal-shaped items render into `## Verification Checks` + an empty `## Check Log` and round-trip through parsePlan", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-checks-render-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    const out = await hooks.tool.plan_write.execute(
+      planArgs({
+        goal: "structured checks plan",
+        checks: [
+          { shell: "npm test" },
+          { shell: "echo hi", timeoutSec: 5 },
+          { containsFile: "done.txt", containsText: "done" },
+        ],
+      }),
+      toolCtx(sid, wt),
+    )
+    const f = planFile(wt)
+    assert.ok(f.text.includes("## Verification Checks"), "checks section rendered")
+    assert.ok(f.text.includes("1. shell `npm test` (timeout 120s)"))
+    assert.ok(f.text.includes("2. shell `echo hi` (timeout 5s)"))
+    assert.ok(f.text.includes("3. contains `done.txt` :: `done`"))
+    assert.ok(f.text.includes("## Check Log"), "check log section present from creation")
+    assert.ok(f.text.includes("(no checks recorded yet)"))
+    // Round-trip: the parser recovers exactly the frozen set (file = truth).
+    assert.deepEqual(parsePlan(f.text).checks, [
+      { kind: "shell", cmd: "npm test", timeoutSec: 120 },
+      { kind: "shell", cmd: "echo hi", timeoutSec: 5 },
+      { kind: "contains", file: "done.txt", text: "done" },
+    ])
+    assert.match(out.output, /Verification Checks: 3 items/)
+    await hooks.dispose?.()
+  } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("plan_close (structured): re-runs exactly the FROZEN file set — the file is the truth, close-time args carry no checks-swapping power", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-close-frozen-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    await hooks.tool.plan_write.execute(planArgs({ goal: "frozen set plan", checks: [{ shell: "echo alpha" }] }), toolCtx(sid, wt))
+    await hooks.tool.plan_approve.execute({}, toolCtx(sid, wt))
+    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sid, wt))
+    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sid, wt))
+    // Mutate the file's check set after approval: close re-runs whatever the
+    // FILE carries (the file is the frozen state — there is no separate
+    // approval-time memory to diverge from).
+    const f = planFile(wt)
+    writeFileSync(
+      f.path,
+      f.text.replace("1. shell `echo alpha` (timeout 120s)", "1. shell `echo alpha` (timeout 120s)\n2. shell `echo beta` (timeout 120s)"),
+    )
+    const cmds = []
+    setShellRunnerForTests(async (cmd) => {
+      cmds.push(cmd)
+      return { code: 0, output: `ran ${cmd}`, timedOut: false }
+    })
+    let asked = 0
+    const out = await hooks.tool.plan_close.execute(
+      // The only checks field plan_close accepts is per-criterion self-check
+      // EVIDENCE — no argument can inject or swap verification items.
+      { checks: [{ criterion: "it works", pass: true, evidence: "extra human-readable evidence" }] },
+      toolCtx(sid, wt, () => {
+        asked++
+      }),
+    )
+    assert.equal(asked, 0, "structured close must fire ZERO ask events")
+    assert.deepEqual(cmds, ["echo alpha", "echo beta"], "close re-runs exactly the file's frozen set")
+    const closed = planFile(wt)
+    assert.equal(parsePlan(closed.text).status, "done")
+    assert.ok(closed.text.includes("reason: completion gate passed (plugin-verified)"))
+    // Evidence summary terminal section: one OK (ms) line per re-run check.
+    assert.ok(/- #1 OK \(\d+ms\) `echo alpha`/.test(closed.text))
+    assert.ok(/- #2 OK \(\d+ms\) `echo beta`/.test(closed.text))
+    assert.ok(closed.text.includes("  output: exit=0 ran echo alpha"))
+    // The optional self-check rides along as extra evidence, never as the gate.
+    assert.ok(closed.text.includes("- PASS — it works"))
+    assert.match(out.output, /2 frozen verification items re-run passing/)
+    await hooks.dispose?.()
+  } finally {
+    setShellRunnerForTests(null)
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("plan_close (structured): failing host re-run refuses the close, the failing run lands in the Check Log on disk, status stays approved; a fixed re-run closes", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-close-failclosed-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    await hooks.tool.plan_write.execute(planArgs({ goal: "fail-closed plan", checks: [{ shell: "npm test" }] }), toolCtx(sid, wt))
+    await hooks.tool.plan_approve.execute({}, toolCtx(sid, wt))
+    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sid, wt))
+    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sid, wt))
+    setShellRunnerForTests(fakeRunnerFail)
+    await assert.rejects(
+      () => hooks.tool.plan_close.execute({}, toolCtx(sid, wt, () => {})),
+      (e) => e instanceof Error && /fail-closed/.test(e.message) && /Fix the work and retry/.test(e.message),
+    )
+    const refused = planFile(wt)
+    assert.equal(parsePlan(refused.text).status, "approved", "a refused close leaves the plan approved")
+    const log = refused.text.slice(refused.text.indexOf("## Check Log"))
+    assert.ok(!log.includes("(no checks recorded yet)"), "the placeholder is replaced by the real run")
+    assert.match(log, /- \S+ run=\S+ #1 FAIL \(\d+ms\) `npm test` :: exit=1 boom/, "the failing run is recorded in the Check Log on disk")
+    // Fix the work: the same frozen set re-runs green and the close passes.
+    setShellRunnerForTests(fakeRunnerPass)
+    const out = await hooks.tool.plan_close.execute({}, toolCtx(sid, wt, () => {}))
+    const closed = planFile(wt)
+    assert.equal(parsePlan(closed.text).status, "done")
+    assert.match(out.output, /— closed/)
+    await hooks.dispose?.()
+  } finally {
+    setShellRunnerForTests(null)
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("plan_reopen: done -> approved with a dated `— reopened` section, explicit session rebind, and a second close appends a second dated close section", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "plan-reopen-"))
+  try {
+    const { serverPromise } = makeHarness({ worktree: wt })
+    const hooks = await serverPromise
+    const sid = nextSid()
+    await hooks.tool.plan_write.execute(planArgs({ goal: "reopenable work" }), toolCtx(sid, wt))
+    await hooks.tool.plan_approve.execute({}, toolCtx(sid, wt))
+    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sid, wt))
+    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sid, wt))
+    await hooks.tool.plan_close.execute(
+      { checks: [{ criterion: "it works", pass: true, evidence: "e" }, { criterion: "it is fast", pass: true, evidence: "e" }] },
+      toolCtx(sid, wt),
+    )
+    // A DIFFERENT session reopens: the done plan is terminal, so this only
+    // works through plan_reopen's explicit discovery + rebind wiring.
+    const sid2 = nextSid()
+    const out = await hooks.tool.plan_reopen.execute({ reason: "user read the evidence and asked for more" }, toolCtx(sid2, wt, () => {}))
+    const f = planFile(wt)
+    assert.equal(parsePlan(f.text).status, "approved", "reopen flips done -> approved")
+    assert.ok(f.text.includes("— reopened"), "dated reopened section appended")
+    assert.ok(f.text.includes("reason: user read the evidence and asked for more"), "reopen reason verbatim")
+    assert.match(out.output, /done -> approved/)
+    assert.match(out.output, /2\/2 tasks still ticked/)
+    // The rebind is real: sid2 (which never owned the plan) can close it —
+    // without the explicit state.planPath rewiring resolveActivePlan would
+    // skip the terminal file and refuse with "No plan to close."
+    await hooks.tool.plan_close.execute(
+      { checks: [{ criterion: "it works", pass: true, evidence: "e2" }, { criterion: "it is fast", pass: true, evidence: "e2" }] },
+      toolCtx(sid2, wt, () => {}),
+    )
+    const reclosed = planFile(wt)
+    assert.equal(parsePlan(reclosed.text).status, "done", "frontmatter status is the single current truth")
+    const closeHeadings = reclosed.text.match(/^## .+ — closed$/gm)
+    assert.equal(closeHeadings.length, 2, "a second close appends a SECOND dated close section")
+    // And the cycle holds: the done plan is terminal again for everyone else.
+    await assert.rejects(
+      () => hooks.tool.plan_close.execute({}, toolCtx(nextSid(), wt, () => {})),
+      /No plan to close\./,
+    )
     await hooks.dispose?.()
   } finally {
     rmSync(wt, { recursive: true, force: true })

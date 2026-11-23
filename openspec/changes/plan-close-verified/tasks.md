@@ -32,7 +32,10 @@
 - [x] 2.4 plan_reopen 工具（迁移见 2.1 + appendReopenSection :497 +
       会话重绑 state.planPath :2226 + 纪律层描述 :2181；注册
       FORGE_STATE_TOOLS :107 + forgeTools() :6008——v2 经同一工厂注册）
-- [ ] 2.5 测试重议+新增全绿（design D6）、typecheck 绿、全量套件绿
+- [x] 2.5 测试重议+新增全绿（design D6）、typecheck 绿；五个受影响文件
+      单独全绿（goal-mode 50/50、plan-file 22/22、v2-permission 8/8、
+      search-wiring 15/15、headless-gate 15/15，tsc --noEmit exit 0）——
+      全量套件绿递延至并行波（C3/C4 落地后统一跑）
 
 ## 3. Verification（GATE）
 

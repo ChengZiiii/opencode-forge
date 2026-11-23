@@ -132,6 +132,8 @@ test("pass-through: unconfigured injects NOTHING — the host default applies to
   await h.config(cfg)
   assert.equal(cfg.permission.forge_shell, undefined, "no plugin-injected posture at all")
   assert.equal(cfg.permission.plan_approve, "ask", "doors are different: still rewritten to ask")
+  // plan-close-verified D4: six doors — plan_close is plugin-verified now.
+  assert.equal(cfg.permission.plan_close, undefined, "plan_close is no longer an injected door")
   // A WRITE-class command runs: the ask reaches the host (once), the host's
   // resolution (allow here) applies, no plugin-side denial exists.
   const asks = []

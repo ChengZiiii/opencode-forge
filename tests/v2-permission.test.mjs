@@ -60,7 +60,9 @@ test("v2 permission: drifted domain — missing/not-function register nothing; b
 
 test("v2 permission: doors forced to a REAL ask; explicit deny stands (precedence)", async () => {
   const { cb } = await beltSetup()
-  for (const door of ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard"]) {
+  // plan-close-verified D4: plan_close left the door list (six doors) — the
+  // completion gate is plugin-verified, no host ask anymore.
+  for (const door of ["plan_approve", "goal_write", "goal_complete", "goal_resume", "goal_discard"]) {
     const a = ev({ action: door })
     await cb(a)
     assert.equal(a.effect, "ask", `${door}: allow rewritten to ask`)
@@ -87,7 +89,7 @@ test("v2 permission: name chain — metadata.tool > action (the only fields the 
   const viaMeta = ev({ metadata: { tool: "plan_approve" }, action: "edit" })
   await cb(viaMeta)
   assert.equal(viaMeta.effect, "ask", "metadata.tool wins")
-  const viaAction = ev({ action: "plan_close" })
+  const viaAction = ev({ action: "goal_write" })
   await cb(viaAction)
   assert.equal(viaAction.effect, "ask", "action is the fallback")
   // No name (empty action, no metadata): untouched.

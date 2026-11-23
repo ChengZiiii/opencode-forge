@@ -40,21 +40,23 @@ function inputFor(wt) {
   }
 }
 
-test("registration: both search tools are registered — plugin tool count is 19 (18 forge-family tools + the `task` shadow)", async () => {
+test("registration: both search tools are registered — plugin tool count is 20 (19 forge-family tools + the `task` shadow)", async () => {
   const wt = mkdtempSync(join(tmpdir(), "search-reg-"))
   try {
     const h = await startServer(inputFor(wt), {})
     assert.equal(typeof h.tool.forge_grep.execute, "function", "forge_grep registered")
     assert.equal(typeof h.tool.forge_glob.execute, "function", "forge_glob registered")
     // task-shadow: forge_dispatch is retired and the SDK dispatch engine
-    // takes over the native NAME `task` — the plugin registry stays at 18
+    // takes over the native NAME `task` — the plugin registry stays at 19
     // keys (swap, not add), while the forge-family partition vocabulary
-    // (FORGE_ALL_TOOLS) drops 18 → 17 (asserted in the partition test below).
-    // native-first-roster adds forge_sync (in-band roster compilation).
+    // (FORGE_ALL_TOOLS) drops 19 → 18 (asserted in the partition test below).
+    // native-first-roster adds forge_sync (in-band roster compilation);
+    // plan-close-verified adds plan_reopen (D5 rollback window).
     assert.equal(h.tool.forge_dispatch, undefined, "forge_dispatch is retired")
     assert.equal(typeof h.tool.task?.execute, "function", "task is our dispatch implementation")
     assert.equal(typeof h.tool.forge_sync?.execute, "function", "forge_sync registered")
-    assert.equal(Object.keys(h.tool).length, 19, "15 prior tools + the search pair + forge_sync + the task shadow (forge_dispatch swapped out)")
+    assert.equal(typeof h.tool.plan_reopen?.execute, "function", "plan_reopen registered")
+    assert.equal(Object.keys(h.tool).length, 20, "16 prior tools (incl. plan_reopen) + the search pair + forge_sync + the task shadow (forge_dispatch swapped out)")
     // Descriptions carry the preference line (D7 — teaches the primary,
     // which has no materialized mandate).
     for (const name of ["forge_grep", "forge_glob"]) {
@@ -111,11 +113,12 @@ test("partition: non-forge fallback entries hide both search tools", async () =>
       }
     }
     // task-shadow: the forge-family partition vocabulary (FORGE_ALL_TOOLS)
-    // drops 18 → 17 with forge_dispatch's retirement, then regains one with
-    // forge_sync (native-first-roster) — `mine` (no explicit opt-ins) hides
-    // EXACTLY the 18 forge-family tools, and `task` is NOT among them
+    // drops 19 → 18 with forge_dispatch's retirement, then regains one with
+    // forge_sync (native-first-roster) and one with plan_reopen
+    // (plan-close-verified D5) — `mine` (no explicit opt-ins) hides
+    // EXACTLY the 19 forge-family tools, and `task` is NOT among them
     // (non-forge agents keep the shadowed native surface).
-    assert.equal(Object.keys(cfg.agent.mine.tools).length, 18, "partition vocabulary: 18 forge-family tools (forge_dispatch retired, forge_sync added)")
+    assert.equal(Object.keys(cfg.agent.mine.tools).length, 19, "partition vocabulary: 19 forge-family tools (forge_dispatch retired, forge_sync + plan_reopen added)")
     assert.equal(cfg.agent.mine.tools.forge_dispatch, undefined, "forge_dispatch left the vocabulary")
     assert.equal(cfg.agent.mine.tools.task, undefined, "task is not hidden from non-forge agents")
     await h.dispose?.()
@@ -130,8 +133,11 @@ test("ask-gate: the config hook's permission section rewrites the doors only —
     const h = await startServer(inputFor(wt), {})
     const cfg = { agent: {} }
     await h.config(cfg)
-    const doors = ["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard", "crew_close"]
+    const doors = ["plan_approve", "goal_write", "goal_complete", "goal_resume", "goal_discard", "crew_close"]
     for (const g of doors) assert.equal(cfg.permission[g], "ask", `door key ${g} stands`)
+    // plan-close-verified D4: plan_close is no longer a door (plugin-verified
+    // completion gate) — nothing is injected for it.
+    assert.equal(cfg.permission.plan_close, undefined, "plan_close left the door list (six doors)")
     assert.equal(cfg.permission.forge_shell, undefined, "forge_shell is pass-through — no injected posture (shell-defang-default-open)")
     assert.equal(cfg.permission.forge_grep, undefined, "no ask-gate on forge_grep")
     assert.equal(cfg.permission.forge_glob, undefined, "no ask-gate on forge_glob")

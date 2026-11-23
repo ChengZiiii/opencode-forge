@@ -11,6 +11,8 @@ import {
   tickTask,
   transitionStatus,
   appendTerminalSection,
+  appendReopenSection,
+  appendPlanCheckLog,
   progressOf,
   closeCheckFailures,
   rankActivePlans,
@@ -172,7 +174,11 @@ test("transitionStatus: legal and illegal transitions", () => {
   assert.ok(isTerminal("done") && isTerminal("abandoned"))
   assert.ok(!isTerminal("draft") && !isTerminal("approved"))
   assert.throws(() => transitionStatus(text, "done", NOW), /Illegal/)
-  assert.throws(() => transitionStatus(done, "approved", NOW), /Illegal/)
+  // plan-close-verified D5: done -> approved is now LEGAL — the plan_reopen
+  // rollback window, the ONLY exit from done (everything else stays final).
+  const reopened = transitionStatus(done, "approved", NOW)
+  assert.equal(parsePlan(reopened).status, "approved")
+  assert.ok(canTransition("done", "approved"))
   const abandoned = transitionStatus(text, "abandoned", NOW)
   assert.equal(parsePlan(abandoned).status, "abandoned")
   assert.throws(() => transitionStatus(abandoned, "approved", NOW), /Illegal/)
@@ -393,4 +399,112 @@ test("first-section-wins: a '## Task List' header quoted in the terminal reason 
   assert.deepEqual(progressOf(after), progressOf(before))
   // section structure: same recognized sections, no phantom reopened one
   assert.deepEqual([...after.sections.keys()].sort(), [...before.sections.keys()].sort())
+})
+
+// ---------------------------------------------------------------------------
+// plan-close-verified (D1/D2/D3/D5): checks render/parse round-trip, Check
+// Log append with the 400-char detail cap, evidence-summary outcomes with
+// the 2048-char output cap, reopen migration + narrative.
+// ---------------------------------------------------------------------------
+
+test("checks render/parse round-trip: renderPlan emits `## Verification Checks` + empty Check Log; duplicates rejected; legacy files keep checks=[]", () => {
+  const input = sampleInput({
+    checks: [
+      { kind: "shell", cmd: "npm test" },
+      { kind: "shell", cmd: "echo hi", timeoutSec: 5 },
+      { kind: "contains", file: "done.txt", text: "done" },
+    ],
+  })
+  const text = renderPlan(input, NOW)
+  assert.ok(text.includes("## Verification Checks"))
+  assert.ok(text.includes("1. shell `npm test` (timeout 120s)"))
+  assert.ok(text.includes("2. shell `echo hi` (timeout 5s)"))
+  assert.ok(text.includes("3. contains `done.txt` :: `done`"))
+  assert.ok(text.includes("## Check Log"))
+  assert.ok(text.includes("(no checks recorded yet)"))
+  const doc = parsePlan(text)
+  // NOTE: the rendered "(timeout 120s)" default becomes an EXPLICIT
+  // timeoutSec on the parse round-trip — the file line is the truth.
+  assert.deepEqual(doc.checks, [
+    { kind: "shell", cmd: "npm test", timeoutSec: 120 },
+    { kind: "shell", cmd: "echo hi", timeoutSec: 5 },
+    { kind: "contains", file: "done.txt", text: "done" },
+  ])
+  // The section claims its lines: checks prose never leaks into Acceptance.
+  assert.equal(doc.acceptance.length, 2)
+  // Legacy plans (no checks sections) parse to an empty frozen set.
+  assert.deepEqual(parsePlan(renderPlan(sampleInput(), NOW)).checks, [])
+  // Duplicate item numbers refuse the parse (contract error, no fail-soft).
+  const dup = text.replace("2. shell `echo hi` (timeout 5s)", "2. shell `npm test` (timeout 5s)").replace("3. contains", "4. contains").replace("`done.txt` :: `done`", "`done.txt` :: `done`\n2. shell `x` (timeout 1s)")
+  assert.throws(() => parsePlan(dup), (e) => e instanceof PlanError && /Duplicate verification item number: 2/.test(e.message))
+})
+
+test("appendPlanCheckLog: placeholder replaced, dated FAIL lines appended, idempotent per run, 400-char detail cap", () => {
+  const text = renderPlan(sampleInput({ checks: [{ kind: "shell", cmd: "npm test" }] }), NOW)
+  const long = "x".repeat(500)
+  const outcomes = [
+    { index: 1, ok: false, detail: `exit=1 ${long}`, durationMs: 12, label: "npm test" },
+  ]
+  const logged = appendPlanCheckLog(text, "run-1", outcomes, "2026-09-25T12:00:00+08:00")
+  assert.ok(!logged.slice(logged.indexOf("## Check Log")).includes("(no checks recorded yet)"), "placeholder gone")
+  const cap = `exit=1 ${"x".repeat(400 - "exit=1 ".length)}…`
+  assert.ok(logged.includes(`- 2026-09-25T12:00:00+08:00 run=run-1 #1 FAIL (12ms) \`npm test\` :: ${cap}`), "detail clipped at 400 chars")
+  assert.equal(parsePlan(logged).updated, "2026-09-25T12:00:00+08:00")
+  // Idempotent: re-appending the SAME run adds nothing (updated-only write).
+  const again = appendPlanCheckLog(logged, "run-1", outcomes, "2026-09-25T12:01:00+08:00")
+  assert.equal(again.match(/run=run-1/g).length, 1, "one line per runId+item, never duplicated")
+  assert.equal(parsePlan(again).updated, "2026-09-25T12:01:00+08:00")
+  // A plan without a Check Log section (hand-written) refuses the append.
+  assert.throws(() => appendPlanCheckLog(renderPlan(sampleInput(), NOW), "run-2", outcomes, NOW), /missing section: Check Log/)
+})
+
+test("appendTerminalSection outcomes: one `OK|FAIL (ms)` line per check, output clipped at the plugin-passed limit (2048)", () => {
+  const text = renderPlan(sampleInput(), NOW)
+  const long = "y".repeat(3000)
+  const closed = appendTerminalSection(
+    text,
+    "closed",
+    {
+      reason: "completion gate passed (plugin-verified)",
+      outcomes: [
+        { index: 1, ok: true, label: "npm test", detail: `ok out ${long}`, durationMs: 42 },
+        { index: 2, ok: false, label: "done.txt :: done", detail: "required text not found", durationMs: 7 },
+      ],
+      outcomeOutputLimit: 2048,
+    },
+    "2026-09-25T18:00:00+08:00",
+  )
+  assert.ok(closed.includes("- #1 OK (42ms) `npm test`"))
+  assert.ok(closed.includes("- #2 FAIL (7ms) `done.txt :: done`"))
+  assert.ok(closed.includes(`  output: ok out ${"y".repeat(2048 - "ok out ".length)}…`), "output clipped at exactly 2048 chars + ellipsis")
+  assert.ok(closed.includes("  output: required text not found"))
+  // Multi-line output is flattened before the cap (single line per check).
+  const flat = appendTerminalSection(text, "closed", { outcomes: [{ index: 1, ok: true, label: "l", detail: "a\nb", durationMs: 1 }] }, NOW)
+  assert.ok(flat.includes("  output: a b"))
+})
+
+test("reopen (D5): done -> approved is the only done exit; appendReopenSection is dated, verbatim, parser-inert; other terminal finals stay pinned", () => {
+  const text = renderPlan(sampleInput(), NOW)
+  const approved = transitionStatus(text, "approved", NOW)
+  const done = transitionStatus(approved, "done", "2026-09-25T17:00:00+08:00")
+  // The one legal exit from done.
+  assert.ok(canTransition("done", "approved"))
+  assert.equal(parsePlan(transitionStatus(done, "approved", "2026-09-25T17:30:00+08:00")).status, "approved")
+  // Every OTHER done exit stays illegal (terminal-finality pins unchanged).
+  for (const to of ["abandoned", "superseded", "done"]) {
+    assert.ok(!canTransition("done", to))
+  }
+  // The narrative: dated `— reopened` heading, reason verbatim (or the
+  // explicit (none given) marker), appended at END, parser-inert.
+  const before = parsePlan(done)
+  const reopened = appendReopenSection(done, "2026-09-25T17:30:00+08:00", "user read the close evidence")
+  assert.ok(reopened.includes("## 2026-09-25T17:30:00+08:00 — reopened"))
+  assert.ok(reopened.includes("reason: user read the close evidence"))
+  assert.ok(reopened.startsWith(done.replace(/\n$/, "")))
+  const noReason = appendReopenSection(done, NOW)
+  assert.ok(noReason.includes("reason: (none given)"))
+  const after = parsePlan(appendReopenSection(transitionStatus(done, "approved", "2026-09-25T17:31:00+08:00"), "2026-09-25T17:31:00+08:00", "r"))
+  assert.deepEqual(after.tasks, before.tasks)
+  assert.deepEqual(after.acceptance, before.acceptance)
+  assert.equal(after.goal, before.goal)
 })
