@@ -13925,6 +13925,7 @@ function startJob(manager, opts) {
     stampTerminalEvidence();
     manager.markTerminal(job, "killed", null);
     maxWaitTimer && clearTimeout(maxWaitTimer);
+    job.spawnError = String(err);
     resolveSettle({ status: "exited", exitCode: null, outputTail: "", spawnError: String(err) });
     return { job, settle };
   }
@@ -14020,6 +14021,7 @@ function startJob(manager, opts) {
       settled = true;
       stopTimers();
       manager.markTerminal(job, "killed", null);
+      job.spawnError = err.message;
       resolveSettle({ status: "exited", exitCode: null, outputTail: job.tail, spawnError: err.message });
     }
   });
@@ -14474,6 +14476,9 @@ function writeRaw(path, entries) {
 }
 function createJobRegistry(registryPath) {
   const lockPath = `${registryPath}.lock`;
+  try {
+    mkdirSync2(dirname2(registryPath), { recursive: true });
+  } catch {}
   const mutate = (fn) => {
     const lock = acquireLock(lockPath);
     if (!lock)
@@ -18361,7 +18366,7 @@ function normalizeAnchorDir(dir) {
 function rememberHostAnchor(dir) {
   if (process.env.FORGE_ANCHOR_PROBE) {
     try {
-      appendFileSync2(join6(tmpdir3(), "forge-anchor-probe.log"), `${new Date().toISOString()} rememberHostAnchor(${JSON.stringify(dir)}) cwd=${JSON.stringify(process.cwd())}
+      appendFileSync2(join6(probeTmp(), "forge-anchor-probe.log"), `${new Date().toISOString()} rememberHostAnchor(${JSON.stringify(dir)}) cwd=${JSON.stringify(process.cwd())}
 `);
     } catch {}
   }
@@ -18377,7 +18382,7 @@ function rememberHostAnchor(dir) {
 function resolvePools() {
   if (process.env.FORGE_ANCHOR_PROBE) {
     try {
-      appendFileSync2(join6(tmpdir3(), "forge-anchor-probe.log"), `${new Date().toISOString()} resolvePools: resolver=${poolResolver ? "set" : "null"} anchors=${JSON.stringify([...hostAnchors])}
+      appendFileSync2(join6(probeTmp(), "forge-anchor-probe.log"), `${new Date().toISOString()} resolvePools: resolver=${poolResolver ? "set" : "null"} anchors=${JSON.stringify([...hostAnchors])}
 `);
     } catch {}
   }
@@ -18550,11 +18555,11 @@ function ensureJobLifecycle() {
   if (jobsLifecycleStarted)
     return { registry: jobRegistry, fence: jobFence };
   jobsLifecycleStarted = true;
-  const registry2 = createJobRegistry(registryPathFor(jobLogDir));
+  const registry2 = createJobRegistry(registryPathFor(jobLogDir()));
   jobRegistry = registry2;
   const { adopted, dead } = registry2.rescan(pidAlive, structuralRelocate);
   for (const entry of adopted) {
-    adoptSurvivor(jobManager, entry, { registry: registry2, logDir: jobLogDir, relocate: structuralRelocate });
+    adoptSurvivor(jobManager, entry, { registry: registry2, logDir: jobLogDir(), relocate: structuralRelocate });
   }
   for (const entry of dead) {
     jobLedgerSink({ at: new Date().toISOString(), kind: "orphan-job", jobId: entry.id, session: entry.ownerSession, detail: `previous-run survivor pid ${entry.pid} is dead (cmd: ${entry.cmd.slice(0, 120)})` });
@@ -18579,11 +18584,13 @@ function jobStage() {
     return 2;
   return 0;
 }
-var jobLogDir = jobsLogDir();
-var jobLedgerPath = join6(jobLogDir, "ledger.jsonl");
+function jobLogDir() {
+  return jobsLogDir(forgeRuntimeRoot());
+}
 function jobLedgerSink(entry) {
   try {
-    mkdirSync6(jobLogDir, { recursive: true });
+    mkdirSync6(jobLogDir(), { recursive: true });
+    const jobLedgerPath = join6(jobLogDir(), "ledger.jsonl");
     if (existsSync3(jobLedgerPath) && statSync5(jobLedgerPath).size > 1e6)
       writeFileSync6(jobLedgerPath, "");
     appendFileSync2(jobLedgerPath, `${JSON.stringify(entry)}
@@ -18742,7 +18749,35 @@ async function handoffTarget(sessionID) {
   }
   return current === sessionID ? undefined : current;
 }
-var sessionAnchorLedgerPath = join6(process.env.FORGE_TEST_FORGE_HOME ?? tmpdir3(), "opencode-forge", "session-anchors.jsonl");
+function forgeRuntimeTmp() {
+  return process.env.FORGE_TEST_RUNTIME_DIR || undefined;
+}
+function forgeRuntimeRoot() {
+  return join6(forgeRuntimeTmp() ?? tmpdir3(), "opencode-forge");
+}
+function sessionAnchorLedgerPath() {
+  return join6(process.env.FORGE_TEST_FORGE_HOME ?? forgeRuntimeTmp() ?? tmpdir3(), "opencode-forge", "session-anchors.jsonl");
+}
+function modelsDevCacheRoot() {
+  return forgeRuntimeRoot();
+}
+function watchdogLogHome() {
+  return watchdogLogDir(forgeRuntimeTmp());
+}
+function probeTmp() {
+  return forgeRuntimeTmp() ?? tmpdir3();
+}
+var __runtimeNamespaceTestSurface = {
+  tmp: forgeRuntimeTmp,
+  root: forgeRuntimeRoot,
+  jobLogDir: () => jobLogDir(),
+  jobLedgerPath: () => join6(jobLogDir(), "ledger.jsonl"),
+  modelsDevCacheRoot,
+  modelsDevCacheDir: () => modelsDevCacheDir(modelsDevCacheRoot()),
+  watchdogLogDir: watchdogLogHome,
+  probeTmp,
+  sessionAnchorLedgerPath
+};
 var sessionAnchorLedgerFsFactory = null;
 var sessionAnchorLedgerWarned = false;
 var sessionAnchorLedgerAppends = 0;
@@ -18750,23 +18785,24 @@ var SESSION_ANCHOR_LEDGER_CAP = 200;
 var poolGateLedgerNotes = new Set;
 var sessionAnchorLedgerMemo = new Map;
 function sessionAnchorLedgerFs() {
+  const filePath = sessionAnchorLedgerPath();
   if (sessionAnchorLedgerFsFactory)
-    return sessionAnchorLedgerFsFactory(sessionAnchorLedgerPath);
+    return sessionAnchorLedgerFsFactory(filePath);
   return {
     read: () => {
       try {
-        return readFileSync9(sessionAnchorLedgerPath, "utf8");
+        return readFileSync9(filePath, "utf8");
       } catch {
         return "";
       }
     },
     write: (text) => {
-      mkdirSync6(dirname5(sessionAnchorLedgerPath), { recursive: true });
-      writeFileSync6(sessionAnchorLedgerPath, text, "utf8");
+      mkdirSync6(dirname5(filePath), { recursive: true });
+      writeFileSync6(filePath, text, "utf8");
     },
     append: (text) => {
-      mkdirSync6(dirname5(sessionAnchorLedgerPath), { recursive: true });
-      appendFileSync2(sessionAnchorLedgerPath, text, "utf8");
+      mkdirSync6(dirname5(filePath), { recursive: true });
+      appendFileSync2(filePath, text, "utf8");
     }
   };
 }
@@ -19715,7 +19751,7 @@ var forgeShellExecute = async (args, context) => {
     cwd,
     ownerSession: context.sessionID,
     worktree: state.worktree,
-    logDir: jobLogDir,
+    logDir: jobLogDir(),
     runInBackground: args.run_in_background === true,
     ...args.idle_ms !== undefined ? { idleMs: args.idle_ms } : {},
     ...args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {},
@@ -19746,6 +19782,13 @@ var forgeShellExecute = async (args, context) => {
   }
   const r = await started.settle;
   if (r.status === "exited") {
+    if (r.spawnError) {
+      return {
+        title: `not started`,
+        output: [`[forge:job] NOT STARTED — spawn failed; nothing was executed.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `spawn error: ${r.spawnError}`].join(`
+`)
+      };
+    }
     return {
       title: `exit ${r.exitCode ?? "?"}`,
       output: [
@@ -19866,6 +19909,19 @@ ${results.join(`
       const p = await pollJob(jobManager, args.jobId, args.waitMs ?? 0);
       if (!p)
         throw new Error(`No job ${args.jobId}.`);
+      if (job.spawnError) {
+        return {
+          title: `${job.id}: not started`,
+          output: [
+            `[forge:job] ${job.id}: NOT STARTED — spawn failed; nothing was executed (terminal state: ${p.state}).`,
+            `spawn error: ${job.spawnError}`,
+            `new output:
+${p.newOutput || "(none in this window)"}`,
+            `logPath: ${p.logPath}`
+          ].join(`
+`)
+        };
+      }
       return {
         title: `${job.id}: ${p.state}`,
         output: [
@@ -20005,6 +20061,21 @@ function releaseGateAdmission(jobId) {
   } catch {}
 }
 var dispatchTasks = new Map;
+function bindChildToDirectory(childSessionID, directory) {
+  if (!childSessionID || !directory || isRootish(directory))
+    return;
+  ensureSession(childSessionID, directory);
+}
+async function createChildSessionBound(client, input) {
+  const created = await createChildSession(client, input);
+  if (created.ok)
+    bindChildToDirectory(created.sessionID, input.parentDirectory);
+  return created;
+}
+function registerDispatchTask(handle, directory) {
+  dispatchTasks.set(handle.jobId, handle);
+  bindChildToDirectory(handle.childSessionID, directory);
+}
 function inFlightAsyncDispatches(sessionID) {
   const ids = [];
   for (const [id, handle] of dispatchTasks) {
@@ -20045,7 +20116,7 @@ function failQueuedWishHonestly(wish, reason) {
     cmd: `dispatch ${wish.agentID}: ${wish.description} (queued, refused at spawn)`,
     worktree: wish.directory,
     ownerSession: wish.ownerSession,
-    logPath: join6(jobLogDir, "dispatch", `${wish.jobId}.txt`),
+    logPath: join6(jobLogDir(), "dispatch", `${wish.jobId}.txt`),
     notify: true,
     killTree: () => {}
   });
@@ -20100,7 +20171,7 @@ async function pumpDispatchQueue(client, sessionID) {
       gateProvidersSeen.add(wishIdentity.provider);
       admittedGate.set(wish.jobId, wishIdentity);
     }
-    const created = await createChildSession(client, {
+    const created = await createChildSessionBound(client, {
       parentSessionID: wish.ownerSession,
       parentDirectory: wish.directory,
       agentID: wish.agentID,
@@ -20131,12 +20202,12 @@ async function pumpDispatchQueue(client, sessionID) {
       cmd: `dispatch ${wish.agentID}: ${wish.description}`,
       worktree: wish.directory,
       ownerSession: wish.ownerSession,
-      logPath: join6(jobLogDir, "dispatch", `${wish.jobId}.txt`),
+      logPath: join6(jobLogDir(), "dispatch", `${wish.jobId}.txt`),
       notify: true,
       killTree: dispatchKillTreeHook(client, wish.jobId, () => created.sessionID)
     });
     job.dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description };
-    dispatchTasks.set(wish.jobId, { jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description });
+    registerDispatchTask({ jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description }, wish.directory);
     journalTransition(wish.directory, journalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, questionDeny: wish.questionDeny, description: wish.description, prompt: wish.prompt }, "started", { childSessionId: created.sessionID }));
     announceQueuedStart(wish.ownerSession, `[forge:dispatch-progress] wish ${wish.jobId} spawned from the queue (agent ${wish.agentID}, child session ${created.sessionID}) — tracking as a normal async dispatch; the single [forge:dispatch-complete] wake reports when it finishes.`);
     runAsyncDispatchPoller(client, job, created.sessionID, {
@@ -20265,7 +20336,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
           cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered)`,
           worktree: workspace,
           ownerSession: rec.ownerSession,
-          logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
+          logPath: join6(jobLogDir(), "dispatch", `${rec.id}.txt`),
           notify: true,
           killTree: dispatchKillTreeHook(client, rec.id, () => childId)
         });
@@ -20290,12 +20361,12 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
       cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered, re-armed)`,
       worktree: workspace,
       ownerSession: rec.ownerSession,
-      logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
+      logPath: join6(jobLogDir(), "dispatch", `${rec.id}.txt`),
       notify: true,
       killTree: dispatchKillTreeHook(client, rec.id, () => childId)
     });
     job.dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" };
-    dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" });
+    registerDispatchTask({ jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace);
     journalTransition(workspace, journalRecord(base, "started", { childSessionId: childId, attempts, prompt }));
     runAsyncDispatchPoller(client, job, childId, {
       prompt,
@@ -20336,7 +20407,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
         journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`);
         return;
       }
-      const respawn = await createChildSession(client, {
+      const respawn = await createChildSessionBound(client, {
         parentSessionID: rec.ownerSession,
         parentDirectory: workspace,
         agentID: rec.agent,
@@ -20365,12 +20436,12 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
         cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered retry)`,
         worktree: workspace,
         ownerSession: rec.ownerSession,
-        logPath: join6(jobLogDir, "dispatch", `${rec.id}.txt`),
+        logPath: join6(jobLogDir(), "dispatch", `${rec.id}.txt`),
         notify: true,
         killTree: dispatchKillTreeHook(client, rec.id, () => respawn.sessionID)
       });
       job.dispatch = { agentID: rec.agent, childSessionID: respawn.sessionID, description: rec.description ?? "" };
-      dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" });
+      registerDispatchTask({ jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace);
       const nextAttempt = attempts;
       journalTransition(workspace, journalRecord(base, "started", { childSessionId: respawn.sessionID, attempts: nextAttempt, prompt }));
       announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] task ${rec.id} retry attempt ${nextAttempt}/${maxAttempts} resumed after host restart — child session ${respawn.sessionID}.`);
@@ -20674,12 +20745,12 @@ function rearmDispatchWatch(client, input) {
     cmd: `dispatch ${input.agent}: ${input.description || "(adopted)"} (adopted, re-armed)`,
     worktree: input.workspace,
     ownerSession: input.ownerSession,
-    logPath: join6(jobLogDir, "dispatch", `${input.id}.txt`),
+    logPath: join6(jobLogDir(), "dispatch", `${input.id}.txt`),
     notify: true,
     killTree: dispatchKillTreeHook(client, input.id, () => input.childId)
   });
   job.dispatch = { agentID: input.agent, childSessionID: input.childId, description: input.description };
-  dispatchTasks.set(input.id, { jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description });
+  registerDispatchTask({ jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description }, input.workspace);
   journalTransition(input.workspace, {
     id: input.id,
     agent: input.agent,
@@ -20931,7 +21002,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           exitCode = 1;
           break;
         }
-        const respawn = await createChildSession(client, {
+        const respawn = await createChildSessionBound(client, {
           parentSessionID: job.ownerSession,
           parentDirectory: retryCtx.directory,
           agentID,
@@ -20999,7 +21070,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           updatedAt: Date.now()
         });
         job.dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" };
-        dispatchTasks.set(job.id, { jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" });
+        registerDispatchTask({ jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" }, retryCtx.directory);
         journalTransition(retryCtx.directory, {
           id: job.id,
           agent: agentID,
@@ -21276,7 +21347,7 @@ var taskDispatchTool = tool({
       releaseGateAdmission(dispatchId);
       throw new Error(`[forge:dispatch] target refused: ${rosterRefusal}`);
     }
-    const created = await createChildSession(client, {
+    const created = await createChildSessionBound(client, {
       parentSessionID: context.sessionID,
       parentDirectory: state.worktree,
       agentID: target,
@@ -21443,7 +21514,7 @@ var taskDispatchTool = tool({
                 journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`);
                 throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
               }
-              const respawn = await createChildSession(client, {
+              const respawn = await createChildSessionBound(client, {
                 parentSessionID: context.sessionID,
                 parentDirectory: state.worktree,
                 agentID: target,
@@ -21616,12 +21687,12 @@ ${fin.text}`].join(`
           cmd: `dispatch ${target}: ${description} (sync wait ended, armed)`,
           worktree: state.worktree,
           ownerSession: context.sessionID,
-          logPath: join6(jobLogDir, "dispatch", `${syncJobId}.txt`),
+          logPath: join6(jobLogDir(), "dispatch", `${syncJobId}.txt`),
           notify: true,
           killTree: dispatchKillTreeHook(client, syncJobId, () => childSessionID)
         });
         job2.dispatch = { agentID: target, childSessionID, description };
-        dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description });
+        registerDispatchTask({ jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description }, state.worktree);
         runAsyncDispatchPoller(client, job2, childSessionID, { prompt, directory: state.worktree, questionDeny: false });
         context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
       };
@@ -21662,12 +21733,12 @@ ${fin.text}`].join(`
       cmd: `dispatch ${target}: ${description}`,
       worktree: state.worktree,
       ownerSession: context.sessionID,
-      logPath: join6(jobLogDir, "dispatch", `${jobId}.txt`),
+      logPath: join6(jobLogDir(), "dispatch", `${jobId}.txt`),
       notify: true,
       killTree: dispatchKillTreeHook(client, jobId, () => created.sessionID)
     });
     job.dispatch = { agentID: target, childSessionID: created.sessionID, description };
-    dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description });
+    registerDispatchTask({ jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description }, state.worktree);
     journalTransition(state.worktree, {
       id: jobId,
       agent: target,
@@ -22229,7 +22300,7 @@ var pendingContinuationTurn = new Set;
 function goalProbe(line) {
   if (process.env.FORGE_GOAL_PROBE) {
     try {
-      appendFileSync2(join6(tmpdir3(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
+      appendFileSync2(join6(probeTmp(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
 `);
     } catch {}
   }
@@ -22757,14 +22828,14 @@ var server = async (input, options) => {
   if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
     wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`);
   }
-  const watchdogLedger = createFileLedger(join6(watchdogLogDir(), "log.jsonl"));
+  const watchdogLedger = createFileLedger(join6(watchdogLogHome(), "log.jsonl"));
   const rawLocator = createLocator();
   const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1";
   const probeLine = (text) => {
     if (!probing())
       return;
     try {
-      appendFileSync2(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
+      appendFileSync2(join6(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
 `);
     } catch {}
   };
@@ -22917,7 +22988,7 @@ var server = async (input, options) => {
         modelsDevCatalog = null;
       } else {
         try {
-          const snapshot = await loadModelsDevSnapshot();
+          const snapshot = await loadModelsDevSnapshot({ cacheDir: modelsDevCacheRoot() });
           modelsDevCatalog = snapshot.catalog;
         } catch {
           modelsDevCatalog = null;
@@ -22943,7 +23014,7 @@ var server = async (input, options) => {
     "tool.execute.before": async (input2, output) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync2(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
+          appendFileSync2(join6(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
 `);
         } catch {}
       }
@@ -22953,7 +23024,7 @@ var server = async (input, options) => {
         watchdog.track(input2.callID, input2.sessionID, input2.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync2(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
+            appendFileSync2(join6(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
 `);
           } catch {}
         }
@@ -23089,7 +23160,7 @@ var server = async (input, options) => {
       if (frozen) {
         if (process.env.FORGE_DEPTH_PROBE) {
           try {
-            appendFileSync2(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}
+            appendFileSync2(join6(probeTmp(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}
 `);
           } catch {}
         }
@@ -23115,7 +23186,7 @@ var server = async (input, options) => {
       }
       if (process.env.FORGE_DEPTH_PROBE) {
         try {
-          appendFileSync2(join6(tmpdir3(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}
+          appendFileSync2(join6(probeTmp(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}
 ` + `    input=${JSON.stringify(raw).slice(0, 600)}
 ` + `    optionsAfter=${JSON.stringify(output.options ?? {})}
 `);
@@ -23213,7 +23284,7 @@ var server = async (input, options) => {
       const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync2(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
+          appendFileSync2(join6(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
 `);
         } catch {}
       }
@@ -23288,7 +23359,7 @@ var server = async (input, options) => {
       watchdog.markSeen(input2.callID);
       if (process.env.FORGE_WATCHDOG_PROBE) {
         try {
-          appendFileSync2(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
+          appendFileSync2(join6(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
 `);
         } catch {}
       }
@@ -23298,7 +23369,7 @@ var server = async (input, options) => {
         watchdog.untrack(input2.callID);
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync2(join6(tmpdir3(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
+            appendFileSync2(join6(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
 `);
           } catch {}
         }
@@ -23503,7 +23574,35 @@ var __workerShellRescueTestSurface = {
     sessionRescueAttached.clear();
   }
 };
-function v2ToolContext(raw) {
+var HOST_DIRECTORY_WALK_MAX = 8;
+async function hostSessionDirectory(anchorClient, sessionID) {
+  const get = anchorClient?.session?.get;
+  if (!sessionID || typeof get !== "function")
+    return "";
+  const seen = new Set;
+  let id = sessionID;
+  while (id && seen.size < HOST_DIRECTORY_WALK_MAX) {
+    if (seen.has(id))
+      return "";
+    seen.add(id);
+    let rec;
+    try {
+      rec = await get({ path: { id } });
+    } catch {
+      return "";
+    }
+    if (rec === null || typeof rec !== "object")
+      return "";
+    const r = rec;
+    const str = (v) => typeof v === "string" ? v : "";
+    const here = effectiveWorktree(str(r.worktree), str(r.directory) || str(r.location?.directory));
+    if (here && !isRootish(here))
+      return here;
+    id = typeof r.parentID === "string" ? r.parentID : "";
+  }
+  return "";
+}
+async function v2ToolContext(raw, anchorClient = anchorClientShared) {
   const c = raw ?? {};
   const pickStr = (...keys) => {
     for (const k of keys) {
@@ -23519,7 +23618,15 @@ function v2ToolContext(raw) {
   if (out.worktree === undefined)
     out.worktree = pickStr("worktree", "directory");
   if (out.worktree === undefined && typeof out.sessionID === "string")
-    out.worktree = sessions.get(out.sessionID)?.worktree ?? hostWorktree;
+    out.worktree = sessions.get(out.sessionID)?.worktree;
+  if (out.worktree === undefined && typeof out.sessionID === "string" && out.sessionID)
+    out.worktree = await hostSessionDirectory(anchorClient, out.sessionID) || undefined;
+  let defaultDirectory = null;
+  if (out.worktree === undefined) {
+    out.worktree = hostWorktree;
+    if (typeof out.sessionID === "string" && out.sessionID)
+      defaultDirectory = hostWorktree || null;
+  }
   if (typeof out.ask !== "function" && v2PermissionAssertFn && typeof out.sessionID === "string" && out.sessionID) {
     const sid = out.sessionID;
     const agentId = typeof out.agent === "string" && out.agent ? out.agent : undefined;
@@ -23533,8 +23640,24 @@ function v2ToolContext(raw) {
   }
   if (typeof out.metadata !== "function")
     out.metadata = () => {};
-  return out;
+  return { context: out, defaultDirectory };
 }
+var V2_DEFAULT_DIRECTORY_NOTE = "[forge] The host gave no workspace for this session (no directory in the session record), so this call ran in the plugin's default directory";
+function nameDefaultDirectory(wrapped, defaultDirectory) {
+  if (defaultDirectory === null || typeof wrapped.content !== "string")
+    return wrapped;
+  return { ...wrapped, content: `${wrapped.content}
+
+${V2_DEFAULT_DIRECTORY_NOTE}: ${defaultDirectory}` };
+}
+var __sessionAnchorTestSurface = {
+  hostSessionDirectory,
+  resolveToolContext: (raw, anchorClient) => v2ToolContext(raw, anchorClient ?? undefined),
+  worktreeOf: (sessionID) => sessions.get(sessionID)?.worktree ?? null,
+  bindChildToDirectory,
+  sessionAnchorLedgerPath,
+  noteLedgerBinding: noteSessionAnchorLedgerBinding
+};
 function v2PickStr(src, ...keys) {
   if (src === null || typeof src !== "object")
     return;
@@ -23559,7 +23682,11 @@ function v2AgentNameOf(src) {
   }
   return;
 }
-var V2_PERMISSION_DOORS = new Set(["plan_approve", "goal_write", "goal_complete", "goal_resume", "goal_discard"]);
+var V2_PERMISSION_DOORS = new Set(GATE_PERMISSION_KEYS.filter((key) => key !== "forge_shell"));
+var __permissionDoorsTestSurface = {
+  gateKeys: GATE_PERMISSION_KEYS,
+  v2Doors: V2_PERMISSION_DOORS
+};
 function v2RegisterPermissionBelt(ctx) {
   if (typeof ctx.permission?.hook !== "function")
     return;
@@ -23573,7 +23700,7 @@ function v2RegisterPermissionBelt(ctx) {
         const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof evalInput.action === "string" ? evalInput.action : undefined);
         if (process.env.FORGE_PERM_PROBE) {
           try {
-            appendFileSync2(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}
+            appendFileSync2(join6(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}
 `);
           } catch {}
         }
@@ -23627,7 +23754,7 @@ function v2RegisterToolHooks(ctx, anchorClient) {
         sessionAgents.set(sessionID, evAgent);
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync2(join6(tmpdir3(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool3)} session=${JSON.stringify(sessionID)}
+          appendFileSync2(join6(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool3)} session=${JSON.stringify(sessionID)}
 `);
         } catch {}
       }
@@ -23787,7 +23914,7 @@ function v2ContextInjection(raw) {
         }
         if (process.env.FORGE_MODEL_PROBE) {
           try {
-            appendFileSync2(join6(tmpdir3(), "forge-model-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} rewrite ${before} -> ${JSON.stringify(o.model)}
+            appendFileSync2(join6(probeTmp(), "forge-model-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} rewrite ${before} -> ${JSON.stringify(o.model)}
 `);
           } catch {}
         }
@@ -24488,6 +24615,7 @@ async function v2Setup(ctx, deps) {
     });
   }
   if (typeof ctx.tool?.transform === "function") {
+    const toolAnchor = v2AnchorClient(ctx);
     try {
       await ctx.tool.transform(async (editor) => {
         if (typeof editor?.add !== "function")
@@ -24499,8 +24627,9 @@ async function v2Setup(ctx, deps) {
             description: typeof d.description === "string" ? d.description : name,
             input: v2ToolInputSchema(d.args),
             async execute(args, toolCtx) {
-              const res = await d.execute?.(args, v2ToolContext(toolCtx));
-              return wrapV2ToolResult(res);
+              const { context, defaultDirectory } = await v2ToolContext(toolCtx, toolAnchor);
+              const res = await d.execute?.(args, context);
+              return nameDefaultDirectory(wrapV2ToolResult(res), defaultDirectory);
             }
           });
         }
@@ -24586,6 +24715,9 @@ export {
   cancelDispatch,
   adoptPersistedDispatchRows,
   __workerShellRescueTestSurface,
+  __sessionAnchorTestSurface,
+  __runtimeNamespaceTestSurface,
+  __permissionDoorsTestSurface,
   TASK_SEAM_DEGRADED_ERROR,
   SYNC_LEVER_BODY,
   STOP_LEVER_BODY,
