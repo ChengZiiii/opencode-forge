@@ -69,3 +69,31 @@ regression from this release's five changes. Evidence:**
 Disposition: driver assertion fixed (top-level `text` fallback, same `textOf`
 shape as `4-dispose-driver.mjs` line 34-40) and 3-driver re-run — outcome in
 the next section.
+
+## S2 — 3-driver re-run with the fixed assertion: **PASS**
+
+Fresh parent `ses_df9331c07ffei7WZYf22tE4qRB` (same sandbox host 127.0.0.1:47911,
+agent forge): P1 forge_sync OK → P2 async dispatch. First P2 attempt (r2)
+exercised the PURE NATIVE task lane (no plugin dispatch row in the journal,
+native `<subagent state="completed">` synthetic only — a legal alternative
+channel, not a defect); P2b with an explicit `run_in_background=true`
+instruction armed the PLUGIN lane: task `j-20261123-050908-hmm4hx`, child
+`ses_df931273cffeoNbMU4FUqWgomI` (journal rows 13/14 dispatched→started).
+
+Wake observed in the parent transcript (bare user row, top-level `text`):
+
+```
+[forge:dispatch-complete] task dispatch to forge-viewe2e-probe finished (task j-20261123-050908-hmm4hx, child session ses_df931273cffeoNbMU4FUqWgomI).
+Final report:
+VIEW-E2E-OK
+
+Done: wrote "VIEW-E2E-OK 2026-11-23T05:09:08Z" to reports/view-report.md and delivered the final report to reports/j-20261123-050908-hmm4hx-report.md.
+The dispatch is complete — read the report above; no polling, no re-dispatch needed.
+```
+
+- markerSeen=true, scaffoldSeen=false (zero `final message unavailable` /
+  `is not a function` strings), report file written, exactly one plugin wake.
+- Driver artifact `3-driver.mjs` patched in place (temp sandbox infra, not
+  repo); verdict snapshot `logs/verdict-r2.json`.
+- Confirms the fix-dispatch-view-capability ③ judgment channel AND that C1's
+  wake-path rework left the happy path intact.
