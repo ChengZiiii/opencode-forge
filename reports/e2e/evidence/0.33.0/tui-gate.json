@@ -1,0 +1,47 @@
+{
+  "pass": true,
+  "checkedAt": "2026-11-23T19:27:30.000Z",
+  "hostVersion": "2.4.0",
+  "build": {
+    "distMtime": "2026-11-23T18:20:35.851Z",
+    "distSha256": "00565a61758f74da1669a0a2e875e93d7c57929ed653e04ed30da85e7231c021"
+  },
+  "method": {
+    "terminal": "headed opencode TUI (opencode.exe -s <sid>) on the sandbox host (port 47911, pid 30104, host 2.4.0), launched detached from PowerShell/WMI; hosted in a classic console window (conhost.exe, class ConsoleWindowClass)",
+    "input": "computer-use plugin (opencode-computer-use) -> cua-driver 0.28.2: single-key press_key delivered in the BACKGROUND (PostMessage to the sandbox TUI window only). No foreground delivery was used: the user's desktop foreground was never taken (Steam held it; foreground swap refused by Windows and not retried). Window close via the driver's UIA Invoke on the window's own Close button.",
+    "observation": "screenshots (som capture) read after every step; ground truth re-read from disk/transcript by tui-postcheck.mjs and tui-postcheck-stop.mjs; permission requests observed by tui-askwatch.mjs (500 ms poll of /api/session/<id>/permission) from before the first keystroke until after the window closed",
+    "windowsTouched": ["pid 21240 hwnd 726672 (C2)", "pid 19344 hwnd 5117418 (C3)"]
+  },
+  "items": [
+    {
+      "id": "c2-plan-close-no-dialog",
+      "pass": true,
+      "note": "Session ses_df6391c80ffeGXxjMlwMNAvqmo (plan approved, 2/2 ticked) in the real TUI. 19:18:47Z the TUI submitted the prompt; ONE tool call plan_close:completed; screen showed 'Plan completed and closed (done, plugin-verified): .opencode/plan/2026-11-24-headed-tui-gate-plan-mwtmqni3.md. All 2 frozen verification items re-run passing at the gate.' No confirmation dialog on screen; ask watch for the whole window: 0 asks. Plan file: section '2026-11-23T19:18:51.286Z — closed', checks=2 OK=2 FAIL=0, reason 'completion gate passed (plugin-verified)'."
+    },
+    {
+      "id": "c2-plan-reopen-in-tui",
+      "pass": true,
+      "note": "19:19:34Z in the same real TUI: plan_reopen:completed; screen showed 'Plan reopened (done -> approved) ... (2/2 tasks still ticked) ... Reason: headed gate reopen check'. Plan file: section '2026-11-23T19:19:40.920Z — reopened' with that reason; status approved."
+    },
+    {
+      "id": "c3-command-list",
+      "pass": true,
+      "note": "Session ses_df6258791ffeAR4t9MpLwJdryB in the real TUI. Typed '/' -> command list opened (alphabetical, scrollable). Typed 'forge' -> list showed exactly /forge, /plan, /crew, /goal (fuzzy match on the description); NO hyphenated forge-* command (no /forge-sync, /forge-init, /forge-cancel). '/forge' description starts 'forge roster levers: sync forces an immediate forge_sync ...'."
+    },
+    {
+      "id": "c3-forge-stop-typed",
+      "pass": true,
+      "note": "Typed '/forge stop' + Enter at 19:24:08Z. Transcript: USER '(forge roster levers. Argument: \"stop\")' -> tool forge_jobs {action:'stop'} -> '[forge:job] Stopped 2 in-flight dispatch(es) of this session' -> two 'Subagent cancelled' -> two '[forge:dispatch-complete] ... ABORTED' wakes. Screen showed the model's table: both tasks 'Aborted, no final report, never retried' and 'This session has no in-flight dispatches left'; status bar subagent count went from 2 to none. Journal: j-20261123-192048-pvbygp and -mbim3w both dispatched->started->terminal, outcome aborted, reason 'cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried', 0 rows after terminal; children busy 0."
+    },
+    {
+      "id": "tui-no-permission-asks",
+      "pass": true,
+      "note": "Ask watch c2 (ses_df6391...): watch-start 19:07Z, watch-end after the close, asks 0. Ask watch c3 (ses_df6258...): watch-start 19:21:38Z, watch-end after the close, asks 0. Files: logs/tui-asks-c2.jsonl, logs/tui-asks-c3.jsonl."
+    },
+    {
+      "id": "tui-turned-cleanly",
+      "pass": true,
+      "note": "Both windows closed through their own Close button; processes gone; sessions left idle on the sandbox host; sandbox journal reached terminal for every row (see sbx-ready after the gate)."
+    }
+  ]
+}
