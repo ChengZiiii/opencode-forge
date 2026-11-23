@@ -181,12 +181,22 @@ test("v2 tools: agent materialization and tool registration are independent slic
 test("v2 task dispatch (fix-v2-crew-surface-drift D2): the 2.3.2 promise-layer create seam adapts — FLAT create input, bare record resolved, anchored parent directory", async (t) => {
   process.env.FORGE_DISPATCH_POLL_INTERVAL_MS = "5"
   process.env.FORGE_DISPATCH_POLL_SLICE_MS = "10"
+  // Hermetic tracker teardown (service-discovery-hermetic): on a v2 client the
+  // background tracker is an infinite slice loop — no status reader, and the
+  // HTTP messages reader reports capability-pending when no service is
+  // discovered. It used to end only because the user's REAL host answered 404
+  // to the leaked reads (view-loss). It now ends through the public lever
+  // (`forge_jobs stop` from the owner session); the reconcile floor is dropped
+  // so the tracker observes the kill at its next (10 ms) slice, not 10 s later.
+  process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS = "0"
   const state = await setupTools()
   const dir = mkdtempSync(join(tmpdir(), "forge-v2-task-seam-"))
-  t.after(() => {
+  t.after(async () => {
+    await state.tools.get("forge_jobs").execute({ action: "stop" }, { sessionID: "s-v2-task", worktree: dir, directory: dir, metadata: () => {}, message: async () => {} })
     rmSync(dir, { recursive: true, force: true })
     delete process.env.FORGE_DISPATCH_POLL_INTERVAL_MS
     delete process.env.FORGE_DISPATCH_POLL_SLICE_MS
+    delete process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS
   })
   // The authoritative record for the calling session anchors the child
   // (design D2 2.3): a record pointing at the tool-context workspace makes

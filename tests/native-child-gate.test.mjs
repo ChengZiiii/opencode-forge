@@ -7,7 +7,7 @@ import assert from "node:assert/strict"
 // cross-read + terminal=absent-or-idle + FAIL-OPEN polarity, and the
 // NativeChildTracker mark / terminalize-with-outcome / drop / forgetParent
 // transitions. No plugin.ts import — these cores are pure by contract.
-const { nativeChildrenInFlight, createNativeChildTracker, nativeChildEventOutcome, nativeChildDigestLine } = await import("../src/native-child-gate.ts")
+const { nativeChildrenInFlight, nativeChildOutcome, nativeSessionBusy, walkNativeChildren, createNativeChildTracker, nativeChildEventOutcome, nativeChildDigestLine } = await import("../src/native-child-gate.ts")
 
 const PARENT = "ses_parent-1"
 const CHILD = "ses_child-1"
@@ -55,6 +55,38 @@ test("walk: parentID filter — children of OTHER parents and id-less entries ne
     },
   }
   assert.equal(await nativeChildrenInFlight(client, PARENT), false, "no entry with parentID === sessionID ⇒ gate open")
+})
+
+test("walk: the list call carries the parentID HINT (server-side page scoping seam) — client-side filter stays the authority", async () => {
+  // Live 2.3.2: an unscoped GET /api/session returns only the NEWEST 50
+  // sessions globally, so the hint lets the v2 HTTP walker scope the page to
+  // the orchestrator's own children. A client that honors the hint returns a
+  // page already scoped; one that ignores it returns everything — both paths
+  // must yield the same verdict.
+  const seenArgs = []
+  const scoped = {
+    session: {
+      list: async (args) => {
+        seenArgs.push(args)
+        return [{ id: CHILD, parentID: PARENT }] // server already filtered
+      },
+      status: async () => ({ data: { [CHILD]: { type: "running" } } }),
+    },
+  }
+  assert.equal(await nativeChildrenInFlight(scoped, PARENT), true)
+  assert.deepEqual(seenArgs, [{ parentID: PARENT }], "the walk asks the host for THIS session's children")
+  // Ignoring the hint (a client without server-side filtering) is equivalent.
+  const unscoped = {
+    session: {
+      list: async (args) => {
+        seenArgs.push(args)
+        return [{ id: CHILD, parentID: PARENT }, { id: OTHER_CHILD, parentID: "ses_someone-else" }]
+      },
+      status: async () => ({ data: { [CHILD]: { type: "running" }, [OTHER_CHILD]: { type: "running" } } }),
+    },
+  }
+  assert.equal(await nativeChildrenInFlight(unscoped, PARENT), true)
+  assert.equal(seenArgs.length, 2)
 })
 
 // ---------------------------------------------------------------------------
@@ -223,4 +255,90 @@ test("digest line: an INTERRUPTED child is named DEAD the moment the plugin know
   assert.ok(line.includes(CHILD), "child id named")
   assert.match(line, /interrupted/, "outcome named")
   assert.match(line, /DEAD/, "dead disclosed")
+})
+
+test("digest line: a NULL outcome (row gone / no outcome) is disclosed as UNVERIFIED — never coerced into a success", async () => {
+  const line = nativeChildDigestLine(CHILD, null)
+  assert.ok(line.includes(CHILD), "child id named")
+  assert.match(line, /no outcome/, "the absence of an outcome is what gets reported")
+  assert.match(line, /UNVERIFIED/, "the subtask is flagged, not credited")
+  assert.doesNotMatch(line, /succeeded|DEAD/, "no verdict is invented in either direction")
+})
+
+// ---------------------------------------------------------------------------
+// D8 — walkNativeChildren: ONE read feeds the gate AND the outcome digest.
+// ---------------------------------------------------------------------------
+test("D8 walk view: in-flight children and settled children (with their ROW outcome) come back from one read", async () => {
+  const client = {
+    session: {
+      list: async () => [
+        { id: CHILD, parentID: PARENT, outcome: "succeeded" }, // finished earlier
+        { id: OTHER_CHILD, parentID: PARENT }, // still running (rows carry no outcome while running)
+        { id: STRANGER, parentID: "ses_someone-else", outcome: "failed" }, // not ours
+      ],
+      status: async () => ({ data: { [OTHER_CHILD]: { type: "running" }, [STRANGER]: { type: "running" } } }),
+    },
+  }
+  const view = await walkNativeChildren(client, PARENT)
+  assert.equal(view.readable, true)
+  assert.deepEqual(view.inFlight, [OTHER_CHILD], "only OUR busy child is in flight")
+  assert.deepEqual(view.settled, [{ childID: CHILD, outcome: "succeeded" }], "our settled child carries its row outcome; strangers are excluded on both sides")
+})
+
+test("D8 walk view: a child typed idle in the active map is settled, not in flight", async () => {
+  const client = { session: { list: async () => [{ id: CHILD, parentID: PARENT, outcome: "interrupted" }], status: async () => ({ data: { [CHILD]: { type: "idle" } } }) } }
+  const view = await walkNativeChildren(client, PARENT)
+  assert.deepEqual(view, { readable: true, inFlight: [], settled: [{ childID: CHILD, outcome: "interrupted" }] })
+})
+
+test("D8 walk view: row outcomes are validated — unknown strings and absent outcomes read as null, never as a verdict", async () => {
+  assert.equal(nativeChildOutcome("succeeded"), "succeeded")
+  assert.equal(nativeChildOutcome("failed"), "failed")
+  assert.equal(nativeChildOutcome("interrupted"), "interrupted")
+  assert.equal(nativeChildOutcome(undefined), null)
+  assert.equal(nativeChildOutcome("cancelled"), null, "a value outside the terminal union is unknown, not failed/succeeded")
+  const client = { session: { list: async () => [{ id: CHILD, parentID: PARENT, outcome: "cancelled" }, { id: OTHER_CHILD, parentID: PARENT }], status: async () => ({ data: {} }) } }
+  const view = await walkNativeChildren(client, PARENT)
+  assert.deepEqual(view.settled, [
+    { childID: CHILD, outcome: null },
+    { childID: OTHER_CHILD, outcome: null },
+  ])
+})
+
+test("D8 walk view: an UNREADABLE view reports nothing known — readable:false, nothing in flight, nothing settled (fail-open AND no digest)", async () => {
+  const cases = {
+    "list throws": { session: { list: async () => { throw new Error("boom") } } },
+    "list missing": { session: {} },
+    "garbage list envelope": { session: { list: async () => ({ unexpected: true }) } },
+    "status throws while children are listed": { session: { list: async () => [{ id: CHILD, parentID: PARENT }], status: async () => { throw new Error("boom") } } },
+    "status missing while children are listed": { session: { list: async () => [{ id: CHILD, parentID: PARENT }] } },
+    "garbage status body": { session: { list: async () => [{ id: CHILD, parentID: PARENT }], status: async () => "garbage" } },
+  }
+  for (const [name, client] of Object.entries(cases)) {
+    const view = await walkNativeChildren(client, PARENT)
+    assert.deepEqual(view, { readable: false, inFlight: [], settled: [] }, name)
+    assert.equal(await nativeChildrenInFlight(client, PARENT), false, `${name} ⇒ the gate verdict is still fail-OPEN`)
+  }
+  assert.deepEqual(await walkNativeChildren({ session: { list: async () => [] } }, ""), { readable: false, inFlight: [], settled: [] }, "no session id ⇒ nothing known, no host call")
+})
+
+test("D8 walk view: a readable list with NO children of this session is readable and empty (nothing to wait on)", async () => {
+  const view = await walkNativeChildren({ session: { list: async () => [{ id: STRANGER, parentID: "ses_someone-else" }] } }, PARENT)
+  assert.deepEqual(view, { readable: true, inFlight: [], settled: [] })
+})
+
+// ---------------------------------------------------------------------------
+// D8 — nativeSessionBusy: the orchestrator's own state on the same map.
+// ---------------------------------------------------------------------------
+test("D8 nativeSessionBusy: present+non-idle ⇒ true; absent or idle ⇒ false; unreadable ⇒ null", async () => {
+  const mk = (map) => ({ session: { status: async () => ({ data: map }) } })
+  assert.equal(await nativeSessionBusy(mk({ [PARENT]: { type: "running" } }), PARENT), true)
+  assert.equal(await nativeSessionBusy(mk({ [PARENT]: { type: "retry", attempt: 2 } }), PARENT), true, "retrying = still mid-flight")
+  assert.equal(await nativeSessionBusy(mk({}), PARENT), false, "absent from the map = idle (host contract)")
+  assert.equal(await nativeSessionBusy(mk({ [CHILD]: { type: "running" } }), PARENT), false, "someone else busy says nothing about the parent")
+  assert.equal(await nativeSessionBusy(mk({ [PARENT]: { type: "idle" } }), PARENT), false)
+  assert.equal(await nativeSessionBusy({ session: {} }, PARENT), null, "no status surface ⇒ unknown")
+  assert.equal(await nativeSessionBusy({ session: { status: async () => { throw new Error("boom") } } }, PARENT), null)
+  assert.equal(await nativeSessionBusy({ session: { status: async () => "garbage" } }, PARENT), null)
+  assert.equal(await nativeSessionBusy(mk({}), ""), null)
 })

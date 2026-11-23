@@ -354,3 +354,105 @@ test("native-child gate: an INTERRUPTED child wakes the crew — re-arm brief na
   assert.match(brief, /DEAD/, "the child is disclosed DEAD — never silently stranded")
   await hooks.dispose?.()
 })
+
+// ---------------------------------------------------------------------------
+// D8 (sandbox E2E finding #2, Leg B — 2026-11-23): the tests above all seed
+// the tracker AFTER the arm, the one order that hides the defect. On the
+// live host the child's session.created arrived BEFORE the crew was armed;
+// a fresh crew_begin wipes the parent's tracker rows, so the terminal edge
+// found nothing to name and the first post-terminal brief carried NO outcome
+// line. The walk is the authority now.
+// ---------------------------------------------------------------------------
+test("native-child gate: a child created BEFORE the crew is armed is still named with its outcome when it settles (the live Leg B order)", async (t) => {
+  const sid = nextSid()
+  const { client, view, hooks, prompts } = await crewHarness(t, sid)
+  const child = view.list[0].id
+  childBusy(view, child)
+  // The host announced the child FIRST, in the live 2.3.2 payload shape
+  // (flat data {sessionID, parentID}; sandbox event capture 2026-11-23).
+  noteCrewNativeChildEvent("session.created", { sessionID: child, parentID: sid, slug: "eager-cabin" }, client)
+  assert.equal(v2WiringSeam.crewNativeChildren.runningChildren(sid).length, 1, "tracker row live before the arm")
+  await armCrew(hooks, view.worktree, sid, "pre-arm child", ["one"])
+
+  await idle(hooks, sid) // suppressed ⇒ the walk takes over the watch
+  await sleep(40)
+  assert.equal(prompts.length, 0)
+  assert.ok(v2WiringSeam.crewNativeWatch.get(sid)?.has(child), "the WALK is waiting on the pre-arm child")
+
+  view.status = { data: {} }
+  view.list = [{ id: child, parentID: sid, outcome: "succeeded" }]
+  noteCrewNativeChildEvent("session.execution.succeeded", { sessionID: child }, client) // live terminal payload
+  await sleep(120) // re-arm debounce 10ms + guards
+  assert.equal(prompts.length, 1, "the re-arm still fires — the terminal edge resolves the parent through the walk's watch set")
+  assert.ok(briefText(prompts[0]).includes(`native child ${child} succeeded`), "digest line: child id + outcome")
+  assert.equal(v2WiringSeam.crewNativeWatch.get(sid)?.size ?? 0, 0, "nothing waited on once the brief is delivered")
+  await hooks.dispose?.()
+})
+
+test("native-child gate: NO event reaches the plugin (stream loss) — the next idle edge's walk names the settled child from its ROW outcome", async (t) => {
+  const sid = nextSid()
+  const { view, hooks, prompts } = await crewHarness(t, sid)
+  const child = view.list[0].id
+  childBusy(view, child)
+  await armCrew(hooks, view.worktree, sid, "stream lost", ["one"])
+  await idle(hooks, sid) // suppressed ⇒ watched
+  await sleep(40)
+  assert.equal(prompts.length, 0)
+
+  view.status = { data: {} }
+  view.list = [{ id: child, parentID: sid, outcome: "failed" }] // the row says failed
+  await idle(hooks, sid) // no noteCrewNativeChildEvent at all
+  await sleep(80)
+  assert.equal(prompts.length, 1)
+  assert.ok(briefText(prompts[0]).includes(`native child ${child} failed`), "the ROW's outcome names the child")
+  await hooks.dispose?.()
+})
+
+test("native-child gate: the terminal event AND the walk may both see a child settle — the digest names it exactly ONCE", async (t) => {
+  const sid = nextSid()
+  const { client, view, hooks, prompts } = await crewHarness(t, sid)
+  const child = view.list[0].id
+  childBusy(view, child)
+  await armCrew(hooks, view.worktree, sid, "dedupe me", ["one"])
+  await idle(hooks, sid) // suppressed ⇒ watched
+  await sleep(40)
+  assert.equal(prompts.length, 0)
+
+  view.status = { data: {} }
+  view.list = [{ id: child, parentID: sid, outcome: "interrupted" }]
+  noteCrewNativeChildEvent("session.created", { info: { id: child, parentID: sid } }, client)
+  noteCrewNativeChildEvent("session.execution.interrupted", { sessionID: child }, client) // the event names it first
+  await sleep(120)
+  assert.equal(prompts.length, 1)
+  const brief = briefText(prompts[0])
+  assert.equal(brief.split(`native child ${child}`).length - 1, 1, "named exactly once")
+  assert.match(brief, /interrupted[\s\S]*DEAD/, "with the event's outcome")
+  // The host's own wake turn ends on a later idle edge: the walk sees the
+  // settled row again — the line is never repeated.
+  await idle(hooks, sid)
+  await sleep(80)
+  assert.equal(prompts.length, 2, "the ordinary idle-edge brief still fires")
+  assert.doesNotMatch(briefText(prompts[1]), /native child/, "the digest rode ONE brief")
+  await hooks.dispose?.()
+})
+
+test("native-child gate: a waited-on child DELETED mid-run (no terminal edge) is named UNVERIFIED and the crew is resumed", async (t) => {
+  const sid = nextSid()
+  const { client, view, hooks, prompts } = await crewHarness(t, sid)
+  const child = view.list[0].id
+  childBusy(view, child)
+  await armCrew(hooks, view.worktree, sid, "deleted child", ["one"])
+  await idle(hooks, sid) // suppressed ⇒ watched
+  await sleep(40)
+  assert.equal(prompts.length, 0)
+
+  view.list = [] // the row is gone
+  view.status = { data: {} }
+  noteCrewNativeChildEvent("session.deleted", { sessionID: child }, client) // live payload: flat {sessionID}
+  await sleep(120)
+  assert.equal(prompts.length, 1, "resumed without any idle edge")
+  const brief = briefText(prompts[0])
+  assert.ok(brief.includes(`native child ${child} is no longer running`), "the vanished child is named")
+  assert.match(brief, /UNVERIFIED/, "no verdict is invented for a row that no longer exists")
+  await hooks.dispose?.()
+})
