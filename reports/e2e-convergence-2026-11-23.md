@@ -97,3 +97,72 @@ The dispatch is complete — read the report above; no polling, no re-dispatch n
   repo); verdict snapshot `logs/verdict-r2.json`.
 - Confirms the fix-dispatch-view-capability ③ judgment channel AND that C1's
   wake-path rework left the happy path intact.
+
+## S2 — 4-dispose-driver (C1 fix-dispatch-dispose-kill ③ GATE, D5 scenarios)
+
+Executed leg-by-leg over HTTP against the same sandbox host (the driver's
+`trigger` mode decomposed; every assertion re-verified from the journal file
+and transcripts by this worker):
+
+**TRIGGER B — dispose exemption (D5.1 / tasks 3.1): PASS**
+- Session A `ses_df930bb6affejE7tcBt1M2nlAz` dispatched slow canary
+  `j-20261123-050951-jrt0cj` (child `ses_df93080aeffe81n051LBbH0sze`,
+  agent forge-viewe2e-coder, ~45 s).
+- Second-context session B `ses_df92ffa89ffenxEvTChH4fBVDu` (directory
+  `ws/ctx-b`) created → one turn → `DELETE /api/session/<B>` → **204**
+  (context recycle / dispose trigger).
+- After the dispose: A's dispatch SURVIVED. Wake in A's transcript:
+
+  ```
+  [forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261123-050951-jrt0cj, child session ses_df93080aeffe81n051LBbH0sze).
+  Final report:
+  DISPOSE-E2E-OK-1795410700
+  ...
+  ```
+
+- Journal line 18: `state=terminal, outcome=completed,
+  reason=DISPOSE-E2E-OK-1795410700` — **no aborted terminal**, zero
+  scaffolding. `Final report:` carries the child's own marker verbatim.
+
+**Kill-path honesty (D5.2 / tasks 3.2): PASS (journal + ledger legs)**
+- Session D `ses_df92d3c70ffeuJ930EsTYgDNt0` dispatched
+  `j-20261123-051337-pgvi0g` (child `ses_df92d0de0ffebOssl3yCF0kCiv`,
+  ~90 s); owner session DELETEd mid-flight (204).
+- Journal line 24: `state=terminal, outcome=aborted, reason="registry kill
+  (owner session ended / dispose) — user abort"` — honest aborted wording,
+  no "(no output)", no fake `Final report:`.
+- Ledger (`%TEMP%\opencode-forge\jobs\ledger.jsonl` line 3431):
+  `"owner session ended; registry kill issued (row kept for wake delivery —
+  was: dispatch forge-viewe2e-coder: owner death canary)"` — exactly C1's
+  keep-semantics (the wake row is kept for delivery, not silently dropped).
+- Wake delivery itself is structurally impossible to a deleted owner
+  (promptAsync → gone session); the journal+ledger pair is the honest
+  ground truth, matching the unit-suite owner-death pin semantics.
+
+**Out-of-contract FINDING (recorded, not a gate failure): child session
+deleted by a third party mid-flight**
+- Probe: session C `ses_df92ec41effeBf8zTAAXe2Mp1c` dispatched
+  `j-20261123-051208-w7pr81`; I DELETEd the CHILD
+  `ses_df92e6b3bffebpcSeQT0I79HGO` mid-flight (204).
+- Observed wake (in C): `… finished (task j-…-w7pr81 …).\nFinal report:\n
+  (final message unavailable: session.messages failed: HTTP 404)` and
+  journal line 21 `outcome=completed, reason="(final message unavailable:
+  session.messages failed: HTTP 404)"`.
+- Root cause: plugin.ts:4260-4263 — a host terminal signal of kind
+  `succeeded` settles the dispatch, and an unreadable final-message read
+  degrades to the `(final message unavailable: …)` scaffold text under a
+  "finished" verdict. The native channel reported the child as
+  `state="cancelled"`.
+- Classification: NOT one of the D5 gate scenarios (neither dispose
+  exemption nor plugin-routed kill; a host-side child DELETE never reaches
+  `dispatchKillTreeHook`). It predates-nothing/changes-nothing in this
+  release's five changes' paths, but the wording arguably brushes against
+  fix-dispatch-view-capability's "no `(final message unavailable: …)`
+  scaffolding" intent and C1's "never finished with a fake report"
+  honesty rule. → Logged as a follow-up defect candidate (suggest: a 404
+  on the final-message read after a `succeeded` signal should classify
+  stream-lost/unknown or disclose cancellation, not "finished").
+
+**TRIGGER A (process death + relaunch recovery): executed with the S3
+ceiling relaunch — see S3 section.**
+
