@@ -4,8 +4,9 @@
 
 单一通用 agent **forge** + 双正交 harness 的 opencode 插件。**plan
 harness**（决策优先）：plan 落盘 `.opencode/plan/`、结构由工具校验、
-draft 期写操作权限层硬禁、`plan_approve` / `plan_close` 钉死 ask（用户
-确认框即批准/完成门）、`plan_tick` 打勾带时间戳审计。**goal harness**
+draft 期写操作权限层硬禁、`plan_approve` 钉死 ask（用户
+确认框即批准门）、`plan_close` 插件验证式完成门（冻结 checks 宿主
+重跑，fail-closed，无模态）、`plan_tick` 打勾带时间戳审计。**goal harness**
 （执行优先）：目标契约落盘 `.opencode/goal/`、idle 续跑引擎在
 turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全部验证项**
 （fail-closed）、无进展/传输失败/预算耗尽/草稿冲突自动暂停。三工作流

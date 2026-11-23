@@ -45,9 +45,12 @@
     permission.ask
     侧带**不跟随豁免**（宿主配 task:"ask" 时 readonly 派发仍拒——刻意
     fail-closed 降级，belt 不解析目标形状）。
-3. **双门**：`plan_approve` / `plan_close` / `goal_write(arm)` /
-   `goal_complete` / `goal_resume` 在 permission.ask 里除显式 deny
+3. **门**：`plan_approve` / `goal_write(arm)` / `goal_complete` /
+   `goal_resume` 在 permission.ask 里除显式 deny
    外一律改写为 ask——用户确认框即门，模型无法自翻状态。
+   `plan_close` **不是门**（plan-close-verified）：完成门插件验证——
+   冻结 checks 在宿主重跑（fail-closed，失败 run 入 Check Log、状态留
+   approved），无模态；`plan_reopen`（done→approved）是纯纪律层回滚窗。
 4. **状态机**：plan draft→approved→done；draft/approved→abandoned。goal
    queued→active⇄paused→completed/abandoned（paused 必带 stop_reason；
    迁移非法一律拒绝，`src/*.ts` LEGAL_TRANSITIONS）。

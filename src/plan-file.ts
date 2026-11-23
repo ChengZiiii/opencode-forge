@@ -39,6 +39,9 @@ export type PlanDoc = {
   sections: Map<string, string>
   tasks: PlanTask[]
   acceptance: string[]
+  // Frozen verification checks (empty for legacy plans without the section);
+  // the FILE is the frozen state — plan_close re-runs exactly these.
+  checks: PlanCheck[]
 }
 
 export type PlanInput = {
@@ -49,7 +52,21 @@ export type PlanInput = {
   risks: string
   acceptance: string[]
   nonGoals?: string[]
+  // plan-close-verified D1: optional structured verification checks,
+  // goal-shaped but LOCALLY typed — this module shares nothing with
+  // goal-file/run-check (decoupling red line); plugin.ts coerces the tool
+  // rows and composes the runner. Structurally compatible with the goal
+  // CheckItem so the plugin layer needs no mapping code.
+  checks?: PlanCheck[]
 }
+
+// Rendered as `## Verification Checks` items (goal-file line format, local
+// regex copies — no cross-harness import):
+//   1. shell `npm test` (timeout 120s)
+//   2. contains `src/a.ts` :: `export const A`
+export type PlanCheck =
+  | { kind: "shell"; cmd: string; timeoutSec?: number }
+  | { kind: "contains"; file: string; text: string }
 
 export type CloseCheck = {
   criterion: string
@@ -67,12 +84,14 @@ export class PlanError extends Error {
 const TERMINAL: PlanStatus[] = ["done", "abandoned", "superseded"]
 
 // Legal status transitions. draft -> approved (user gate), approved -> done
-// (user gate after self-check), either active state -> abandoned (discard)
-// or -> superseded (discard {supersede}: the work moved to another harness).
+// (plugin-verified completion gate), either active state -> abandoned
+// (discard) or -> superseded (discard {supersede}: the work moved to another
+// harness). done -> approved is the plan_reopen rollback window (the ONLY
+// done exit; explicit user instruction, discipline layer — no modal).
 const LEGAL_TRANSITIONS: Record<PlanStatus, PlanStatus[]> = {
   draft: ["approved", "abandoned", "superseded"],
   approved: ["done", "abandoned", "superseded"],
-  done: [],
+  done: ["approved"],
   abandoned: [],
   superseded: [],
 }
@@ -97,6 +116,11 @@ const SECTION_ALIASES: Record<string, RegExp> = {
   "Task List": /^(#*)\s*(tasks?|task list|任务清单|任务)\s*$/i,
   Risks: /^(#*)\s*(risks?|风险)\s*$/i,
   "Acceptance Criteria": /^(#*)\s*(acceptance criteria|验收标准|验收)\s*$/i,
+  // plan-close-verified D1: optional sections, NOT in SECTION_ORDER (legacy
+  // plans predate them) — claiming them here keeps their "- <ISO> run=..." /
+  // "1. shell `...`" lines out of Acceptance Criteria (first-section-wins).
+  "Verification Checks": /^(#*)\s*(verification checks|验证检查)\s*$/i,
+  "Check Log": /^(#*)\s*(check log|检查日志)\s*$/i,
 }
 
 export function isTerminal(status: string): boolean {
@@ -209,7 +233,54 @@ export function renderPlan(input: PlanInput, now: string, createdOverride?: stri
     input.acceptance.map((a, i) => `${i + 1}. ${a.trim()}`).join("\n"),
     "",
   ]
+  const checks = input.checks ?? []
+  if (checks.length > 0) {
+    parts.push(
+      "## Verification Checks",
+      "",
+      checks.map((c, i) => `${i + 1}. ${renderPlanCheck(c)}`).join("\n"),
+      "",
+      "## Check Log",
+      "",
+      "(no checks recorded yet)",
+      "",
+    )
+  }
   return parts.join("\n")
+}
+
+// Local render/parse copies of the goal check-line format (the plan core
+// intentionally shares no module with the goal core — decoupling red line).
+function renderPlanCheck(item: PlanCheck): string {
+  if (item.kind === "shell") {
+    const t = item.timeoutSec ?? 120
+    return `shell \`${item.cmd}\` (timeout ${t}s)`
+  }
+  return `contains \`${item.file}\` :: \`${item.text}\``
+}
+
+const PLAN_SHELL_LINE_RE = /^\s*(\d+)[.、)]\s*shell\s+`([^`]*)`(?:\s+\(timeout\s+(\d+)s?\))?$/i
+const PLAN_CONTAINS_LINE_RE = /^\s*(\d+)[.、)]\s*contains\s+`([^`]*)`\s*::\s*`([^`]*)`$/i
+
+function parseChecksSection(section: string): PlanCheck[] {
+  const checks: PlanCheck[] = []
+  const seen = new Set<number>()
+  for (const line of section.split(/\r?\n/)) {
+    const shell = line.match(PLAN_SHELL_LINE_RE)
+    if (shell) {
+      if (seen.has(Number(shell[1]))) throw new PlanError(`Duplicate verification item number: ${shell[1]}`)
+      seen.add(Number(shell[1]))
+      checks.push({ kind: "shell", cmd: shell[2], ...(shell[3] ? { timeoutSec: Number(shell[3]) } : {}) })
+      continue
+    }
+    const contains = line.match(PLAN_CONTAINS_LINE_RE)
+    if (contains) {
+      if (seen.has(Number(contains[1]))) throw new PlanError(`Duplicate verification item number: ${contains[1]}`)
+      seen.add(Number(contains[1]))
+      checks.push({ kind: "contains", file: contains[2], text: contains[3] })
+    }
+  }
+  return checks
 }
 
 function parseFrontmatter(text: string): { fm: Record<string, string>; body: string } {
@@ -299,6 +370,7 @@ export function parsePlan(text: string): PlanDoc {
     const m = line.match(ACCEPT_RE)
     if (m) acceptance.push(m[2].trim())
   }
+  const checks = parseChecksSection(sections.get("Verification Checks") ?? "")
   return {
     status,
     created: fm.created ?? "",
@@ -307,6 +379,7 @@ export function parsePlan(text: string): PlanDoc {
     sections,
     tasks,
     acceptance,
+    checks,
   }
 }
 
@@ -351,7 +424,7 @@ export function transitionStatus(text: string, to: PlanStatus, now: string): str
   if (from === to) throw new PlanError(`Plan is already ${to}`)
   if (!canTransition(from, to)) {
     throw new PlanError(
-      `Illegal status transition: ${from} -> ${to} (legal path: draft -> approved -> done; draft/approved -> abandoned/superseded)`,
+      `Illegal status transition: ${from} -> ${to} (legal path: draft -> approved -> done; done -> approved via plan_reopen; draft/approved -> abandoned/superseded)`,
     )
   }
   const next = text.replace(/^status:.*$/m, `status: ${to}`)
@@ -364,6 +437,11 @@ export type TerminalSectionOptions = {
   reason?: string
   successor?: string
   checks?: CloseCheck[]
+  // plan-close-verified D3: structured-path evidence summary — one
+  // `OK|FAIL (ms)` line per re-run frozen check plus its truncated output
+  // (limit passed by the plugin layer; the pure core imports nothing).
+  outcomes?: Array<{ index: number; ok: boolean; label: string; detail: string; durationMs: number }>
+  outcomeOutputLimit?: number
 }
 
 // Terminal lifecycle narrative (spec: "Terminal lifecycle narrative"): builds
@@ -400,8 +478,75 @@ export function appendTerminalSection(
       lines.push(`  evidence: ${c.evidence.trim() || "(none)"}`)
     }
   }
+  if (opts.outcomes && opts.outcomes.length > 0) {
+    const limit = opts.outcomeOutputLimit ?? 2048
+    lines.push("verification:")
+    for (const o of opts.outcomes) {
+      lines.push(`- #${o.index} ${o.ok ? "OK" : "FAIL"} (${o.durationMs}ms) \`${o.label.replace(/\r?\n/g, " ")}\``)
+      const flat = (o.detail || "(no output)").replace(/\r?\n/g, " ")
+      lines.push(`  output: ${flat.length > limit ? `${flat.slice(0, limit)}…` : flat}`)
+    }
+  }
   const base = text.replace(/\r?\n$/, "")
   return `${base}\n\n${lines.join("\n")}\n`
+}
+
+// plan-close-verified D5: dated reopen narrative — same shape/contract as
+// appendTerminalSection (appended at END, parser-inert, persisted by the
+// caller in the SAME atomic write as the done->approved frontmatter flip).
+export function appendReopenSection(
+  text: string,
+  now: string = new Date().toISOString(),
+  reason?: string,
+): string {
+  const lines: string[] = [`## ${now} — reopened`, ""]
+  const r = (reason ?? "").trim()
+  lines.push(`reason: ${r.length > 0 ? r : "(none given)"}`)
+  const base = text.replace(/\r?\n$/, "")
+  return `${base}\n\n${lines.join("\n")}\n`
+}
+
+// plan-close-verified D2/D3: append one audit line per outcome under the
+// plan's `## Check Log` (the failing-run record of a refused close), the
+// goal-file line format with a LOCAL detail cap — the pure core imports no
+// goal constant. runId makes re-appends of the same run idempotent.
+export function appendPlanCheckLog(
+  text: string,
+  runId: string,
+  outcomes: Array<{ index: number; ok: boolean; detail: string; durationMs?: number; label: string }>,
+  now: string,
+  detailLimit = 400,
+): string {
+  const doc = parsePlan(text)
+  const existing = new Set(
+    (doc.sections.get("Check Log") ?? "")
+      .split(/\r?\n/)
+      .map((l) => l.match(/^-\s*\S+\s+run=(\S+)\s+(#\d+)\s+/))
+      .filter((m): m is RegExpMatchArray => m !== null)
+      .map((m) => `${m[1]} ${m[2]}`),
+  )
+  const add = outcomes
+    .filter((o) => !existing.has(`${runId} #${o.index}`))
+    .map((o) => {
+      const label = o.label.replace(/\r?\n/g, " ")
+      const flat = (o.detail || "(no output)").replace(/\r?\n/g, " ")
+      const detail = flat.length > detailLimit ? `${flat.slice(0, detailLimit)}…` : flat
+      return `- ${now} run=${runId} #${o.index} ${o.ok ? "OK" : "FAIL"} (${o.durationMs ?? 0}ms) \`${label}\` :: ${detail}`
+    })
+  if (add.length === 0) return setUpdated(text, now)
+  const lines = text.split(/\r?\n/)
+  const logHeaderIdx = lines.findIndex((l) => SECTION_ALIASES["Check Log"].test(l.trim()))
+  if (logHeaderIdx === -1) throw new PlanError("Plan is missing section: Check Log")
+  const placeholderIdx = lines.indexOf("(no checks recorded yet)", logHeaderIdx)
+  if (placeholderIdx !== -1 && placeholderIdx < logHeaderIdx + 4) lines.splice(placeholderIdx, 1)
+  let lastLog = -1
+  for (let i = logHeaderIdx + 1; i < lines.length; i++) {
+    if (lines[i].startsWith("- ")) lastLog = i
+    else if (lines[i].trim() !== "") break
+  }
+  const at = lastLog === -1 ? logHeaderIdx + 2 : lastLog + 1
+  lines.splice(at, 0, ...add)
+  return setUpdated(lines.join("\n"), now)
 }
 
 export function progressOf(doc: PlanDoc): { total: number; done: number } {

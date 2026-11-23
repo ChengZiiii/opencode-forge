@@ -7,6 +7,8 @@ import { basename, dirname, isAbsolute, join, relative } from "node:path"
 import { tmpdir, homedir } from "node:os"
 import {
   PlanError,
+  appendPlanCheckLog,
+  appendReopenSection,
   appendTerminalSection,
   closeCheckFailures,
   isTerminal,
@@ -21,6 +23,7 @@ import {
   tickTask,
   transitionStatus,
   type CloseCheck,
+  type PlanCheck,
   type PlanDoc,
 } from "./src/plan-file.ts"
 import {
@@ -50,7 +53,7 @@ import {
   type GoalInput,
   type StopReason,
 } from "./src/goal-file.ts"
-import { formatOutcomes, outcomesAllOk, runChecks } from "./src/run-check.ts"
+import { OUTPUT_LIMIT, formatOutcomes, outcomesAllOk, runChecks } from "./src/run-check.ts"
 import { killTree, pidAlive } from "./src/proc.ts"
 import { setHostShell } from "./src/shell-select.ts"
 import { createJobManager, newJobId, type Job } from "./src/job-manager.ts"
@@ -101,6 +104,7 @@ const FORGE_STATE_TOOLS = [
   "plan_tick",
   "plan_approve",
   "plan_close",
+  "plan_reopen",
   "plan_discard",
   "goal_write",
   "goal_check",
@@ -185,7 +189,7 @@ export const PLAN_COMMAND_TEMPLATE = [
   "2. Draft (plan_write): call plan_write with structured fields; the tool renders and validates the fixed sections, so a malformed plan cannot exist. Quality bar: goal = one line, the outcome not the activity; context = verified findings with file:line evidence, including what you ruled out and why; approach = the chosen approach AND at least one rejected alternative with the reason (a plan with no considered alternative is a guess); tasks = 3-8 concrete, independently verifiable steps, each doable in one sitting ('improve the code' is invalid; 'extract the timeout constant into config.ts and default it to 3000' is valid); risks = what could break, blast radius, rollback path; acceptance = criteria verifiable by a command, a file, or an observable behavior (vague criteria will fail the close); nonGoals = explicit out-of-scope items. To revise after feedback, call plan_write again — while in draft it overwrites the same file.",
   "3. User review, then approval (plan_approve): after plan_write, present the plan in chat — goal, chosen approach with one line why, the numbered task list, the acceptance criteria — then STOP: end your turn and wait. The user owns the review, at their own pace: feedback → revise with plan_write, re-present, and wait again; rejection → /plan discard (or re-plan together); explicit go-ahead (e.g. \"execute\", \"批准\", \"looks good\") → call plan_approve — its confirmation dialog is the final hard gate, and the user's Allow starts execution. Never call plan_approve in the same turn that presents a draft, and never implement before approval succeeds.",
   "4. Execution (tick as you go): work tasks in order; call plan_tick with the task number immediately after EACH task's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected task or ask about revising (/plan with the same goal re-enters planning).",
-  "5. Completion (plan_close): when all tasks are ticked, self-check EVERY acceptance criterion with concrete evidence (file:line, command output, test result), then call plan_close with one check per criterion, pass/fail honest — a failing check refuses the close, and that is the design working, not an inconvenience. The user confirms closure in a dialog.",
+  "5. Completion (plan_close): when all tasks are ticked, self-check EVERY acceptance criterion with concrete evidence (file:line, command output, test result), then call plan_close — NO confirmation dialog appears. If the plan declares Verification Checks, the plugin itself re-runs the frozen check set on the host (fail-closed: a failing check refuses the close, records the run in the plan's Check Log, and the plan stays approved — that is the design working, not an inconvenience); otherwise your per-criterion self-checks gate the close. Either way an evidence summary is written into the plan file for the user to review asynchronously.",
   "",
   "Boundaries: /plan discard abandons the plan (terminal, file kept as history, writes restored) — pass supersede (the successor artifact path) when the work moves to crew/goal rather than ends, marking it superseded; /plan resume continues an unfinished plan from its remaining tasks. Work expected to span multiple sessions or days of multi-file change is spec work (e.g. OpenSpec), not plan work — say so once and let the user choose.",
   "",
@@ -1703,11 +1707,32 @@ const planWriteTool = tool({
     risks: tool.schema.string().describe("Risks: known risks and mitigations"),
     acceptance: tool.schema.array(tool.schema.string()).describe("Acceptance Criteria: verifiable criteria, checked one by one at plan_close"),
     nonGoals: tool.schema.array(tool.schema.string()).optional().describe("Non-Goals: explicit out-of-scope items"),
+    checks: tool.schema
+      .array(
+        tool.schema.object({
+          shell: tool.schema.string().optional().describe("Shell command the plugin itself re-runs on the host at plan_close (fail-closed)"),
+          containsFile: tool.schema.string().optional().describe("File contract: workspace-relative file path"),
+          containsText: tool.schema.string().optional().describe("File contract: required literal text in that file"),
+          timeoutSec: tool.schema.number().int().positive().optional().describe("Shell timeout in seconds (default 120, max 600)"),
+        }),
+      )
+      .optional()
+      .describe(
+        "Verification Checks: optional structured completion gate, goal-harness-shaped. Rendered into the plan file and FROZEN from approval on — plan_close re-runs exactly this set on the host (fail-closed); a plan without checks keeps the per-criterion self-check close instead",
+      ),
   },
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, worktreeFor(context))
     const active = resolveActivePlan(state)
     const now = nowIso()
+    let checks: PlanCheck[] | undefined
+    if (args.checks) {
+      try {
+        checks = coerceChecks(args.checks)
+      } catch (err) {
+        throw new PlanError((err as Error).message)
+      }
+    }
     let path: string
     let created: string | undefined
     let mode: "created" | "revised"
@@ -1725,7 +1750,8 @@ const planWriteTool = tool({
       path = join(dir, planFileName(localDate(), slugify(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md"))))
       mode = "created"
     }
-    const text = renderPlan(args, now, created)
+    const { checks: rawChecks, ...fields } = args
+    const text = renderPlan({ ...fields, ...(checks && checks.length > 0 ? { checks } : {}) }, now, created)
     writeFileSync(path, text)
     state.planPath = path
     const doc = parsePlan(text)
@@ -1735,6 +1761,9 @@ const planWriteTool = tool({
       output: [
         `Plan ${mode === "created" ? "created" : "revised"}: ${relFrom(state.worktree, path)}`,
         `Status: draft (${doc.tasks.length} tasks, ${doc.acceptance.length} acceptance criteria).`,
+        ...(doc.checks.length > 0
+          ? [`Verification Checks: ${doc.checks.length} items frozen into the file — plan_close re-runs them on the host, fail-closed (no close dialog).`]
+          : []),
         "Next: briefly present the goal, chosen approach, and task list to the user, then call plan_approve to request approval (a user confirmation dialog appears). Until approval, all write operations are denied.",
       ].join("\n"),
     }
@@ -1763,7 +1792,7 @@ const planTickTool = tool({
       title: `task ${args.n} done (${p.done}/${p.total})`,
       output:
         p.done === p.total
-          ? `Task ${args.n} done (${p.done}/${p.total}, all complete). Self-check every acceptance criterion with concrete evidence, then call plan_close (a user confirmation dialog appears).`
+          ? `Task ${args.n} done (${p.done}/${p.total}, all complete). Self-check every acceptance criterion with concrete evidence, then call plan_close — it re-runs the plan's frozen verification checks itself on the host (fail-closed; no confirmation dialog).`
           : `Task ${args.n} done and ticked (${p.done}/${p.total}). Continue with the next task.`,
     }
   },
@@ -1778,10 +1807,12 @@ const planTickTool = tool({
 // INVARIANT: the gate() helper itself NEVER auto-resolves. forge_shell is
 // NOT a user-confirmation door — its gate ask is resolved by the HOST
 // against the permission rules (posture pass-through: no plugin-injected
-// rule, no plugin-side classification). The 7 doors — plan_approve,
-// plan_close, goal_write (arm), goal_complete, goal_resume, goal_discard,
-// crew_close; exactly the non-exec gate() permission keys — are never
-// auto-resolved in any mode; they remain real dialogs.
+// rule, no plugin-side classification). The 6 doors — plan_approve,
+// goal_write (arm), goal_complete, goal_resume, goal_discard, crew_close;
+// exactly the non-exec gate() permission keys — are never auto-resolved in
+// any mode; they remain real dialogs. plan_close is NOT a door
+// (plan-close-verified): its completion gate is plugin-verified — the
+// frozen check set re-runs on the host, fail-closed, no modal.
 type AskFn = (input: {
   permission: string
   patterns: string[]
@@ -1865,7 +1896,6 @@ export function resolveGateAskWatchdogMs(env: NodeJS.ProcessEnv = process.env): 
 // posture passes through untouched.
 const GATE_PERMISSION_KEYS = [
   "plan_approve",
-  "plan_close",
   "goal_write",
   "goal_complete",
   "goal_resume",
@@ -2056,14 +2086,14 @@ const planApproveTool = tool({
     context.metadata({ title: `Plan approved: ${active.doc.goal}` })
     return {
       title: "plan approved",
-      output: `Plan approved by the user (approved): ${relFrom(state.worktree, active.path)}. The draft-phase write ban is lifted. Execute tasks one by one, calling plan_tick immediately after each; when all are done, self-check and plan_close.`,
+      output: `Plan approved by the user (approved): ${relFrom(state.worktree, active.path)}. The draft-phase write ban is lifted. Execute tasks one by one, calling plan_tick immediately after each; when all are done, self-check and call plan_close (plugin-verified, no dialog).`,
     }
   },
 })
 
 const planCloseTool = tool({
   description:
-    "Close the session's plan (approved -> done) after self-checking EVERY acceptance criterion. Requires: all tasks ticked, and one check per acceptance criterion with pass and concrete evidence. The permission layer pins this call to a confirmation dialog — the user confirms closure.",
+    "Close the session's plan (approved -> done). The completion gate is PLUGIN-VERIFIED — there is NO confirmation dialog. Plans with declared Verification Checks: the frozen check set is re-executed by the plugin on the host right now, fail-closed (any failing command, timeout, or unmet file contract refuses the close, appends the failing run to the plan's Check Log, and the plan stays approved — fix the work and retry; the model cannot change the checks at close time). Plans without declared checks: pass one self-check entry per acceptance criterion (pass + concrete evidence); a failing or missing check refuses the close. Either way a dated evidence-summary terminal section (per-check OK/FAIL with truncated output, or per-criterion PASS/evidence) is appended in the SAME atomic write as the done flip. The user reviews the evidence asynchronously; plan_reopen rolls back.",
   args: {
     checks: tool.schema
       .array(
@@ -2073,7 +2103,8 @@ const planCloseTool = tool({
           evidence: tool.schema.string().describe("Concrete evidence: file:line, command output, test result"),
         }),
       )
-      .describe("One entry per acceptance criterion, in plan order"),
+      .optional()
+      .describe("Self-checks: one entry per acceptance criterion, in plan order. Required for plans without declared Verification Checks; optional extra evidence otherwise"),
   },
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, worktreeFor(context))
@@ -2082,27 +2113,107 @@ const planCloseTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan (all tasks complete) can be closed.`)
     }
+    const closedAt = nowIso()
+    // plan-close-verified D2: the FROZEN check set lives in the file — close
+    // re-runs exactly it (runChecks imported at this plugin layer only);
+    // close-time arguments can never alter the checks. Fail-closed mirrors
+    // goal_complete: any failing outcome (incl. runner timeout/spawn
+    // failure) appends the failing run to the plan's Check Log and throws;
+    // the status stays approved.
+    if (active.doc.checks.length > 0) {
+      const unticked = active.doc.tasks.filter((t) => !t.done).map((t) => t.n)
+      if (unticked.length > 0) {
+        throw new PlanError(`Completion gate check failed:\n- Unticked tasks remain: ${unticked.join(", ")}\nTick every task before closing.`)
+      }
+      const outcomes = await runChecks(active.doc.checks, state.worktree)
+      if (!outcomesAllOk(outcomes)) {
+        const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`
+        atomicWrite(active.path, appendPlanCheckLog(readFileSync(active.path, "utf8"), runId, outcomes, nowIso()))
+        throw new PlanError(
+          `Completion gate: verification re-run failed (fail-closed). The plan stays approved; the failing run is recorded in the plan's Check Log.\n${formatOutcomes(outcomes.filter((o) => !o.ok))}\nFix the work and retry — the frozen check set is re-run at every close and cannot be changed here.`,
+        )
+      }
+      const selfChecks = (args.checks ?? []) as CloseCheck[]
+      const closed = appendTerminalSection(
+        transitionStatus(readFileSync(active.path, "utf8"), "done", closedAt),
+        "closed",
+        {
+          reason: "completion gate passed (plugin-verified)",
+          ...(selfChecks.length > 0 ? { checks: selfChecks } : {}),
+          outcomes: outcomes.map((o) => ({ index: o.index, ok: o.ok, label: o.label, detail: o.detail, durationMs: o.durationMs })),
+          outcomeOutputLimit: OUTPUT_LIMIT,
+        },
+        closedAt,
+      )
+      atomicWrite(active.path, closed)
+      context.metadata({ title: `Plan done: ${active.doc.goal}` })
+      return {
+        title: "plan done",
+        output: `Plan completed and closed (done, plugin-verified): ${relFrom(state.worktree, active.path)}. All ${outcomes.length} frozen verification items re-run passing at the gate. Terminal section "## ${closedAt} — closed" appended with the per-check evidence summary.`,
+      }
+    }
+    // Legacy path (no declared checks): per-criterion self-check, unchanged
+    // semantics — but the modal gate is gone and the terminal write is atomic.
+    if (!args.checks) {
+      throw new PlanError("Completion gate check failed:\n- This plan declares no verification checks; pass one self-check entry per acceptance criterion (criterion/pass/evidence).")
+    }
     const failures = closeCheckFailures(active.doc, args.checks as CloseCheck[])
     if (failures.length > 0) {
       throw new PlanError(`Completion gate check failed:\n- ${failures.join("\n- ")}\nFix the implementation and retry, or revise the plan first.`)
     }
-    // The completion gate: user confirms closure in the dialog this creates.
-    await gate(context.ask, "plan_close", `Close plan: ${active.doc.goal}`)
-    // Terminal lifecycle narrative (spec): the dated close section carrying
-    // the per-criterion pass/evidence summary the model already submitted
-    // lands in the SAME write as the done flip — one atomic writeFileSync.
-    const closedAt = nowIso()
     const closed = appendTerminalSection(
       transitionStatus(readFileSync(active.path, "utf8"), "done", closedAt),
       "closed",
-      { reason: "completion gate passed (user confirmed)", checks: args.checks as CloseCheck[] },
+      { reason: "completion gate passed (plugin-verified)", checks: args.checks as CloseCheck[] },
       closedAt,
     )
-    writeFileSync(active.path, closed)
+    atomicWrite(active.path, closed)
     context.metadata({ title: `Plan done: ${active.doc.goal}` })
     return {
       title: "plan done",
-      output: `Plan completed and closed (done): ${relFrom(state.worktree, active.path)}. All ${args.checks.length} self-checks passed. Terminal section "## ${closedAt} — closed" appended with the per-criterion verdicts.`,
+      output: `Plan completed and closed (done, plugin-verified): ${relFrom(state.worktree, active.path)}. All ${args.checks.length} self-checks passed. Terminal section "## ${closedAt} — closed" appended with the per-criterion verdicts.`,
+    }
+  },
+})
+
+const planReopenTool = tool({
+  description:
+    "Reopen the session's done plan (done -> approved) — the explicit rollback window after a plugin-verified close. Call it ONLY on the user's explicit instruction (they read the close evidence and asked to reopen); NEVER self-initiate. Appends a dated `— reopened` section (parser-inert), rebinds this session to the plan, and restores the approved workflow: plan_tick / plan_close (a later close re-runs the SAME frozen checks and appends a second dated close section; the frontmatter status is the single current truth). No dialog — this is a discipline-layer tool.",
+  args: {
+    reason: tool.schema.string().optional().describe("Short reason recorded in the reply and in the appended reopened section, verbatim"),
+  },
+  execute: async (args, context) => {
+    const state = ensureSession(context.sessionID, worktreeFor(context))
+    // resolveActivePlan skips terminal files by design, so the done plan is
+    // located explicitly: the session binding first, else the newest done
+    // plan in the worktree's .opencode/plan/.
+    let target: { path: string; doc: PlanDoc } | null = null
+    if (state.planPath && existsSync(state.planPath)) {
+      const doc = parsePlanLoose(readFileSync(state.planPath, "utf8"))
+      if (doc) target = { path: state.planPath, doc }
+    }
+    if (!target || target.doc.status !== "done") {
+      const done = readPlanDir(state.worktree)
+        .map((e) => ({ name: e.name, doc: parsePlanLoose(e.text) }))
+        .filter((e): e is { name: string; doc: PlanDoc } => e.doc !== null && e.doc.status === "done")
+        .sort((a, b) => (a.doc.updated < b.doc.updated ? 1 : a.doc.updated > b.doc.updated ? -1 : a.name.localeCompare(b.name)))[0]
+      if (done) target = { path: join(planDirOf(state.worktree), done.name), doc: done.doc }
+    }
+    if (!target || target.doc.status !== "done") {
+      throw new PlanError("No done plan to reopen in this workspace (only a closed plan can be reopened).")
+    }
+    const now = nowIso()
+    // Same-write contract: the done -> approved flip and the dated reopened
+    // narrative land in ONE atomic write; the session rebind is explicit
+    // afterwards (resolveActivePlan would otherwise skip the terminal file).
+    const next = appendReopenSection(transitionStatus(readFileSync(target.path, "utf8"), "approved", now), now, args.reason)
+    atomicWrite(target.path, next)
+    state.planPath = target.path
+    const p = progressOf(target.doc)
+    context.metadata({ title: `Plan reopened: ${target.doc.goal}` })
+    return {
+      title: "plan reopened",
+      output: `Plan reopened (done -> approved): ${relFrom(state.worktree, target.path)} (${p.done}/${p.total} tasks still ticked). Session rebound to it; continue with plan_tick / plan_close — the frozen verification checks re-run at the next close.${args.reason ? ` Reason: ${args.reason}` : ""}`,
     }
   },
 })
@@ -5894,6 +6005,7 @@ function forgeTools(): Record<string, ToolDefinition> {
     plan_tick: planTickTool,
     plan_approve: planApproveTool,
     plan_close: planCloseTool,
+    plan_reopen: planReopenTool,
     plan_discard: planDiscardTool,
     goal_write: goalWriteTool,
     goal_check: goalCheckTool,
@@ -6581,7 +6693,7 @@ export const server: Plugin = async (input, options) => {
         ...(existing ?? {}),
         description:
           (existing?.description as string | undefined) ??
-          "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer).",
+          "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with an approve confirmation gate, a plugin-verified fail-closed close that re-runs the frozen checks, and tick discipline enforced by tools and the permission layer).",
         mode: (existing?.mode as "primary" | "subagent" | "all" | undefined) ?? "primary",
         prompt:
           (existing?.prompt as string | undefined) ??
@@ -6664,7 +6776,7 @@ export const server: Plugin = async (input, options) => {
           "forge dispatch lever: cancel an in-flight async dispatch by task id (or \"all\"); no argument lists what is in flight — the child session is aborted and CONFIRMED idle, the dispatch settles as aborted and is never retried",
       }
 
-      // Gate permission rules (shell-defang-default-open): the 7 doors keep
+      // Gate permission rules (shell-defang-default-open): the 6 doors keep
       // the full "ask" rewrite — they stay real user confirmations (an
       // explicit allow on a door is still rewritten to ask). forge_shell is
       // NEVER rewritten: its posture passes through untouched — unconfigured
@@ -7261,11 +7373,12 @@ export const server: Plugin = async (input, options) => {
           )
         } catch {}
       }
-      if (name === "plan_approve" || name === "plan_close" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
+      if (name === "plan_approve" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
         // Belt for the DOORS only: if a permission request ever surfaces for
         // them (host starts evaluating plugin tools), keep it a real ask
-        // unless explicitly denied — the 7 user-confirmation doors are never
-        // auto-resolved in any mode. forge_shell is deliberately ABSENT
+        // unless explicitly denied — the 6 user-confirmation doors are never
+        // auto-resolved in any mode (plan_close is plugin-verified, not a
+        // door — plan-close-verified). forge_shell is deliberately ABSENT
         // (pass-through): its request carries whatever the host resolved
         // from the user's verbatim rules — the plugin never rewrites,
         // classifies, or forces it.
@@ -7450,7 +7563,7 @@ export const server: Plugin = async (input, options) => {
         const rule =
           active.doc.status === "draft"
             ? "while in draft, write operations are denied at the tool layer; present the plan then end your turn to await the user's review — on feedback revise via plan_write and re-present; call plan_approve only after the user explicitly approves in chat (their confirmation dialog is the final gate); /plan discard to abandon"
-            : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close"
+            : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close — the plugin re-runs the frozen verification checks itself (fail-closed, no dialog) and writes an evidence summary the user reviews asynchronously"
         output.system.push(
           `[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`,
         )
@@ -7723,7 +7836,7 @@ function wrapV2ToolResult(res: unknown): { content: unknown; title?: unknown } {
 // @opencode/schema tool.d.ts Context): the real context is {sessionID,
 // agent, messageID, signal, progress, ...} — NO `ask`, NO `worktree`, NO
 // `metadata`. The v1 ask-callback DECISION-RETURNING gates
-// (plan_approve/plan_close/goal_write arm/goal_complete/goal_resume/
+// (plan_approve/goal_write arm/goal_complete/goal_resume/
 // goal_discard/crew_close user-confirmation gates inside the tool cores)
 // map to ctx.permission.assert(input) ("evaluates rules and prompts the
 // user, resolves when allowed, rejects with Tool.Error on deny") — the
@@ -7924,10 +8037,11 @@ function v2AgentNameOf(src: unknown): string | undefined {
 // Permission belt (task 3.1) — ctx.permission.hook("evaluate")
 // ---------------------------------------------------------------------------
 
-// The 7-door set EXCLUDING forge_shell, exactly the names the v1
+// The 6-door set EXCLUDING forge_shell, exactly the names the v1
 // permission.ask belt rewrites to ask (crew_close never surfaces a
-// permission request of its own on the ask path — parity kept verbatim).
-const V2_PERMISSION_DOORS = new Set(["plan_approve", "plan_close", "goal_write", "goal_complete", "goal_resume", "goal_discard"])
+// permission request of its own on the ask path — parity kept verbatim;
+// plan_close is plugin-verified, not a door — plan-close-verified).
+const V2_PERMISSION_DOORS = new Set(["plan_approve", "goal_write", "goal_complete", "goal_resume", "goal_discard"])
 
 function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
   if (typeof ctx.permission?.hook !== "function") return
@@ -8292,7 +8406,7 @@ function v2ContextInjection(raw: unknown): void {
     const rule =
       active.doc.status === "draft"
         ? "while in draft, write operations are denied at the tool layer; present the plan then end your turn to await the user's review — on feedback revise via plan_write and re-present; call plan_approve only after the user explicitly approves in chat (their confirmation dialog is the final gate); /plan discard to abandon"
-        : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close"
+        : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close — the plugin re-runs the frozen verification checks itself (fail-closed, no dialog) and writes an evidence summary the user reviews asynchronously"
     system.push(
       `[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`,
     )
@@ -9162,7 +9276,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
       if (draft.get(FORGE_AGENT) === undefined) {
         draft.update(FORGE_AGENT, (agent) => {
           agent.description =
-            "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with approve/close confirmation gates and tick discipline enforced by tools and the permission layer)."
+            "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with an approve confirmation gate, a plugin-verified fail-closed close that re-runs the frozen checks, and tick discipline enforced by tools and the permission layer)."
           agent.system = FORGE_PROMPT
           agent.mode = "primary"
         })
@@ -9337,7 +9451,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // the real PermissionEvaluation shape (effect mutation). The assert
   // seam captured here backs the tool cores' ask adapter
   // (v2ToolContext): the v1 ask-callback decision gates —
-  // plan_approve/plan_close/goal_write(arm)/goal_complete/goal_resume/
+  // plan_approve/goal_write(arm)/goal_complete/goal_resume/
   // goal_discard/crew_close — map to ctx.permission.assert; pure
   // classification/refusal stays evaluate-mutation.
   v2RegisterPermissionBelt(ctx)

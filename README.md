@@ -12,7 +12,7 @@ OpenSpec spec workflows remain a third, separate lane.
                            → plan_approve (user dialog = final gate) on explicit go-ahead
                            → execute task by task, plan_tick on each (timestamped audit)
                            → all ticked → per-criterion self-check → plan_close
-                             (user dialog = completion gate) → done
+                             (plugin re-runs the FROZEN checks, fail-closed, no dialog) → done
 /plan                     → list in-progress plans with progress
 /plan resume              → continue the most recent unfinished plan
 /plan discard             → abandon the current plan (abandoned, writes restored)
@@ -50,10 +50,18 @@ OpenSpec spec workflows remain a third, separate lane.
   effective-readonly forge scout passes, every other target is denied (see
   Design stance). The only exits are approval and discard. This is deliberate;
   see Design stance.
-- `plan_approve` / `plan_close` are pinned to a confirmation dialog: the
-  model can never flip the state itself.
+- `plan_approve` is pinned to a confirmation dialog: the model can never
+  flip itself into execution. `plan_close` has **no dialog** — the
+  completion gate is plugin-verified: plans that declare Verification
+  Checks (`plan_write {checks: [...]}`, goal-harness-shaped) get the frozen
+  set re-executed on the host at close, fail-closed (a failing check
+  refuses the close, records the run in the plan's `## Check Log`, and the
+  plan stays approved); plans without declared checks keep the
+  per-criterion self-check gate. Both paths append an evidence summary the
+  user reviews asynchronously; `plan_reopen` (done → approved, explicit
+  user instruction only) is the rollback window.
 - **Confirmation gates are time-boxed (gated-ask watchdog)**: every
-  confirmation gate (`plan_approve` / `plan_close` / `goal_write` arm /
+  confirmation gate (`plan_approve` / `goal_write` arm /
   `goal_complete` / `goal_resume` / `goal_discard` / `crew_close`) is
   wrapped by a watchdog — when no answer arrives within the window (default
   300 s, `FORGE_GATE_ASK_WATCHDOG_MS`, 0 disables), the gate resolves as a
@@ -1089,10 +1097,11 @@ dialog / run-mode auto-reject / a pending ask on serve that you answer via
 the host API — **if you run serve and want confirmations, answer asks over
 the API or don't configure ask**; the plugin adds no rescue). The
 `readonly-exec-seal` (below) remains the ONLY plugin-side exec refusal and
-is posture-independent. The 7 user-confirmation doors (`plan_approve`,
-`plan_close`, `goal_write (arm)`, `goal_complete`, `goal_resume`,
-`goal_discard`, `crew_close`) are **never** auto-resolved in any mode — they
-remain real dialogs.
+is posture-independent. The 6 user-confirmation doors (`plan_approve`,
+`goal_write (arm)`, `goal_complete`, `goal_resume`, `goal_discard`,
+`crew_close`) are **never** auto-resolved in any mode — they
+remain real dialogs. `plan_close` is not a door: its completion gate is
+plugin-verified (frozen checks re-run on the host, fail-closed, no modal).
 
 **Non-interactive exec hygiene (the omo port, forge-improved).** Every
 `forge_shell` spawn merges a defang env set into the child process —

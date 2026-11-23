@@ -8,15 +8,30 @@
 
 ## 2. Implementation（crew wave 2：coder → test-coder → gate-verifier → spec-reviewer）
 
-- [ ] 2.1 plan-file：checks 节解析/渲染（parse/render，纯
+- [x] 2.1 plan-file：checks 节解析/渲染（parse/render，纯
       string→string）+ Check Log 节渲染 + done→approved 迁移 +
-      reopened 节
-- [ ] 2.2 plan_close verified：冻结集 runChecks fail-closed（失败 run
+      reopened 节（src/plan-file.ts:67 PlanCheck、:94 done:["approved"]、
+      :122-124 节别名、:174-232 renderPlan+renderPlanCheck、
+      :259-273 parseChecksSection、:373 PlanDoc.checks、:497
+      appendReopenSection、:513 appendPlanCheckLog）
+- [x] 2.2 plan_close verified：冻结集 runChecks fail-closed（失败 run
       入 Check Log + throw）+ 证据摘要终节 + 原子写 + reason 新串；
-      legacy 自检路径保持
-- [ ] 2.3 ask 门四层拆除（gate 调用/KEYS/v1 belt/v2 belt，七门→六门）
-      + 全部指引文案同步（design D4 清单）
-- [ ] 2.4 plan_reopen 工具（迁移+节+会话重绑+纪律层描述）
+      legacy 自检路径保持（plugin.ts:2094-2177 planCloseTool：
+      :2121-2133 冻结集 runChecks→appendPlanCheckLog+throw（状态留
+      approved）；:2135-2148 证据摘要 outcomes+OUTPUT_LIMIT+atomicWrite；
+      :2141/:2167 reason "completion gate passed (plugin-verified)"；
+      :2150-2174 legacy closeCheckFailures 路径原样，仅去门+原子写）
+- [x] 2.3 ask 门四层拆除（gate 调用已随 2.2 重写删除（旧 ~2090 行
+      `await gate(context.ask,"plan_close",...)` 不复存在）；
+      GATE_PERMISSION_KEYS :1897-1905 去 plan_close；v1 belt :7376 去
+      plan_close；V2_PERMISSION_DOORS :8044 去 plan_close）+ 文案同步
+      （/plan 模板 step5 :188、plan_tick 输出 :1790、plan_approve 输出
+      :2089、plan_close 描述 :2095-2096、plan-notice v1 :7566/v2 :8409、
+      agent 描述 :6696/:9279、README :14-15/:53-63/:1100-1105、
+      AGENTS.md:7-9、docs/architecture.md:48-54）
+- [x] 2.4 plan_reopen 工具（迁移见 2.1 + appendReopenSection :497 +
+      会话重绑 state.planPath :2226 + 纪律层描述 :2181；注册
+      FORGE_STATE_TOOLS :107 + forgeTools() :6008——v2 经同一工厂注册）
 - [ ] 2.5 测试重议+新增全绿（design D6）、typecheck 绿、全量套件绿
 
 ## 3. Verification（GATE）
