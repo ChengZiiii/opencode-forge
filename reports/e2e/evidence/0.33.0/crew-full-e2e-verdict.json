@@ -1,0 +1,218 @@
+{
+  "verdict": false,
+  "verdictExcludingKnown": true,
+  "result": {
+    "startedAt": "2026-11-23T20:22:40.996Z",
+    "hostPid": 17916,
+    "nonce": "mwtppv1f",
+    "objective": "sandbox e2e full crew mwtppv1f: three file subtasks in dependent waves (A and B first, then C), each run by its own subagent, closed with a verified report. Dispatch protocol: every child prompt MUST start with that subtask's declared title as its first line (verbatim).",
+    "subtasks": [
+      "write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file",
+      "write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file",
+      "join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file"
+    ],
+    "dir": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f",
+    "pollRetries": 0,
+    "sid": "ses_df5ecc997ffeZWA06V0werFnXS",
+    "armParts": [
+      "execute:completed {\"registered\":\"Crew record (inspectable history; NOT a resume mechanism): .opencode/crew/2026-11-24-sandbox-e2e-full-crew-mwtppv1f-t.md\\n[forge:crew] Crew registered PENDING for this session (execution has NOT started). Ob"
+    ],
+    "armPartsFull": [
+      "execute:completed {\"registered\":\"Crew record (inspectable history; NOT a resume mechanism): .opencode/crew/2026-11-24-sandbox-e2e-full-crew-mwtppv1f-t.md\\n[forge:crew] Crew registered PENDING for this session (execution has NOT started). Objective: sandbox e2e full crew mwtppv1f: three file subtasks in dependent waves (A and B first, then C), each run by its own subagent, closed with a verified report. Dispatch protocol: every child prompt MUST start with that subtask's declared title as its first line (verbatim).\\nDeclared plan (3):\\n 1. write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file\\n 2. write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file\\n 3. join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file\\nSession roster origins — sole ownership (dispatch gated to this session's workspace pool / the global fallback); 1 pool materialized on this host:\\n - DISPATCHABLE from this session — workspace pool: c:\\\\users\\\\soren\\\\appdata\\\\local\\\\temp\\\\opencode\\\\view-e2e\\\\ws\\\\.opencode\\\\forge.json — forge-viewe2e-probe, forge-viewe2e-coder\\n[forge:crew] The crew is PENDING — execution has NOT started. Present the execution-mode choice to the user and END YOUR TURN (every task dispatch is refused while the crew pends):\\nRELAY FIRST: tell the user the crew record path (it leads this output) alongside this choice — the record is on disk from the registration moment, and the user must hear it.\\n 1. supervised waves NOW — when the user says go, call crew_begin {execution: \\\"waves\\\"} and run the wave discipline; waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard);\\n 2. convert to a goal contract — call crew_begin {execution: \\\"goal\\\"} (the crew ends as a conversion record; no extra dialog here), then draft goal_write with arm=true folding the declared subtasks into criteria/checks — the arm dialog is the user's gate;\\n 3. standby — no call; the crew waits until armed or abandoned.\",\"armed\":\"[forge:crew] Crew ARMED for supervised waves: sandbox e2e full crew mwtppv1f: three file subtasks in dependent waves (A and B first, then C), each run by its own subagent, closed with a verified report. Dispatch protocol: every child prompt MUST start with that subtask's declared title as its first line (verbatim).\\nWaves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard).\\nDeclared plan (3):\\n 1. write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file\\n 2. write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file\\n 3. join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file\\nProceed with the wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.\\nNative fallback: when the pool offers no forge worker fitting a subtask (or forge-* dispatch is blocked by a degraded pool), dispatch the native general subagent with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native).\"}"
+    ],
+    "pollErrors": 0,
+    "firstEngineRow": null,
+    "capped": false,
+    "recordPath": "2026-11-24-sandbox-e2e-full-crew-mwtppv1f-t.md",
+    "recordSections": [
+      {
+        "at": "2026-11-23T20:22:47.059Z",
+        "title": "registered (pending)"
+      },
+      {
+        "at": "2026-11-23T20:22:47.062Z",
+        "title": "armed (waves)"
+      },
+      {
+        "at": "2026-11-23T20:27:37.273Z",
+        "title": "closed"
+      }
+    ],
+    "briefs": 1,
+    "giveUps": [],
+    "asks": [],
+    "msToClose": 296551,
+    "recordText": "# Crew Record: sandbox e2e full crew mwtppv1f: three file subtasks in dependent waves (A and B first, then C), each run by its own subagent, closed with a verified report. Dispatch protocol: every child prompt MUST start with that subtask's declared title as its first line (verbatim).\n\n- registered: 2026-11-23T20:22:47.058Z\n- anchor: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws\n\n## Declared plan (3)\n1. write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file\n2. write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file\n3. join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file\n\n## 2026-11-23T20:22:47.059Z — registered (pending)\n1. write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file\n2. write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file\n3. join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file\n\n## 2026-11-23T20:22:47.062Z — armed (waves)\nThe user chose supervised waves; the dispatch belt is lifted.\n\n## 2026-11-23T20:27:37.273Z — closed\nsubtasks: 3 (PASS 3, FAIL 0)\n- write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file: PASS — Ran as pool worker forge-viewe2e-coder (child session ses_df5eb9f6fffeqeO44nrGz77AaZ) in wave 1, in parallel with write B; the child prompt's first line was this declared title verbatim. No retry need\n- write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file: PASS — Ran as pool worker forge-viewe2e-coder (child session ses_df5eb9f6dffeYZlyZQFZgqy3s3) in wave 1, in parallel with write A; the child prompt's first line was this declared title verbatim. No retry need\n- join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file: PASS — Ran as pool worker forge-viewe2e-coder (child session ses_df5e9dd02ffeqqWrmO1VIpZF1C) in wave 2, dispatched only after write A and write B had both returned PASS and the coordinator had verified both \n\n",
+    "recordFull": "# Crew Record: sandbox e2e full crew mwtppv1f: three file subtasks in dependent waves (A and B first, then C), each run by its own subagent, closed with a verified report. Dispatch protocol: every child prompt MUST start with that subtask's declared title as its first line (verbatim).\n\n- registered: 2026-11-23T20:22:47.058Z\n- anchor: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws\n\n## Declared plan (3)\n1. write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file\n2. write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file\n3. join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file\n\n## 2026-11-23T20:22:47.059Z — registered (pending)\n1. write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file\n2. write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file\n3. join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file\n\n## 2026-11-23T20:22:47.062Z — armed (waves)\nThe user chose supervised waves; the dispatch belt is lifted.\n\n## 2026-11-23T20:27:37.273Z — closed\nsubtasks: 3 (PASS 3, FAIL 0)\n- write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file: PASS — Ran as pool worker forge-viewe2e-coder (child session ses_df5eb9f6fffeqeO44nrGz77AaZ) in wave 1, in parallel with write B; the child prompt's first line was this declared title verbatim. No retry need\n- write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), then print the file: PASS — Ran as pool worker forge-viewe2e-coder (child session ses_df5eb9f6dffeYZlyZQFZgqy3s3) in wave 1, in parallel with write A; the child prompt's first line was this declared title verbatim. No retry need\n- join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-A-mwtppv1fCREW-B-mwtppv1f), then print the file: PASS — Ran as pool worker forge-viewe2e-coder (child session ses_df5e9dd02ffeqqWrmO1VIpZF1C) in wave 2, dispatched only after write A and write B had both returned PASS and the coordinator had verified both \n\n",
+    "briefsAfterClose": 0,
+    "busyAtEnd": false,
+    "parentRows": 17,
+    "files": {
+      "A": {
+        "content": "CREW-A-mwtppv1f",
+        "mtime": 1795465441893.572
+      },
+      "B": {
+        "content": "CREW-B-mwtppv1f",
+        "mtime": 1795465438397.8845
+      },
+      "C": {
+        "content": "CREW-A-mwtppv1fCREW-B-mwtppv1f",
+        "mtime": 1795465576614.1167
+      }
+    },
+    "children": 3,
+    "childRows": [
+      {
+        "id": "ses_df5e9dd02ffeqqWrmO1VIpZF1C",
+        "which": "C",
+        "promptHasKeys": [
+          "C"
+        ],
+        "score": {
+          "A": 1,
+          "B": 1,
+          "C": 4
+        },
+        "promptHead": "join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder whose entire content is exactly the content of A.txt followed by the content of B.txt (CREW-",
+        "agent": "forge-viewe2e-coder",
+        "first": 1795465552665,
+        "last": 1795465599099,
+        "rows": 6
+      },
+      {
+        "id": "ses_df5eb9f6fffeqeO44nrGz77AaZ",
+        "which": "A",
+        "promptHasKeys": [
+          "A"
+        ],
+        "score": {
+          "A": 5,
+          "B": 0,
+          "C": 0
+        },
+        "promptHead": "write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), t",
+        "agent": "forge-viewe2e-coder",
+        "first": 1795465437390,
+        "last": 1795465488563,
+        "rows": 7
+      },
+      {
+        "id": "ses_df5eb9f6dffeYZlyZQFZgqy3s3",
+        "which": "B",
+        "promptHasKeys": [
+          "B"
+        ],
+        "score": {
+          "A": 0,
+          "B": 5,
+          "C": 0
+        },
+        "promptHead": "write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create B.txt whose entire content is exactly CREW-B-mwtppv1f (no trailing newline), t",
+        "agent": "forge-viewe2e-coder",
+        "first": 1795465437376,
+        "last": 1795465484205,
+        "rows": 7
+      }
+    ],
+    "parentMarks": [
+      "A",
+      "B"
+    ],
+    "parentHasC": true,
+    "parentToolNames": [
+      "execute",
+      "glob"
+    ],
+    "crewCloseParts": [
+      {
+        "status": "completed",
+        "out": "[forge:crew] Crew closed: sandbox e2e full crew mwtppv1f: three file subtasks in dependent waves (A and B first, then C), each run by its own subagent, closed with a verified report. Dispatch protocol: every child prompt MUST start with that subtask's declared title as its first line (verbatim). sub",
+        "closed": true
+      }
+    ],
+    "waveGapMs": 110771.42797851562,
+    "otherAsks": [],
+    "pass": false,
+    "failedChecks": [
+      "closeGateAskedAndApproved"
+    ],
+    "knownDefects": [
+      {
+        "check": "closeGateAskedAndApproved",
+        "note": "F: crew_close executes WITHOUT its user-confirmation ask on the v2 host when no goal governs the session (the v2 permission belt's door set has no crew_close; present since the 2026-11-19 v2 port; reproduced 2026-11-23 19:55Z, logs/probe-crew-close-door.json; tracked as fix-crew-close-ask-door)"
+      }
+    ],
+    "unexpectedFailures": [],
+    "passExcludingKnown": true,
+    "checks": {
+      "registered": {
+        "pass": true,
+        "detail": "header + '## Declared plan (3)' + section registered (pending)"
+      },
+      "declaredAllThree": {
+        "pass": true,
+        "detail": "all three declared titles are in the record"
+      },
+      "armedWaves": {
+        "pass": true,
+        "detail": "sections=[registered (pending) | armed (waves) | closed]"
+      },
+      "engineBriefs": {
+        "pass": true,
+        "detail": "[forge:crew-continue] briefs=1 first=null"
+      },
+      "noEngineGiveUp": {
+        "pass": true,
+        "detail": "stalled/stopped/ceiling briefs=0 []"
+      },
+      "armCallsCompleted": {
+        "pass": true,
+        "detail": "1 crew_begin part(s); completed=1; registered text=true; armed text=true"
+      },
+      "filesOnDisk": {
+        "pass": true,
+        "detail": "A.txt=exact B.txt=exact C.txt=A+B"
+      },
+      "oneChildPerSubtask": {
+        "pass": true,
+        "detail": "children=3 one-per-subtask={\"A\":1,\"B\":1,\"C\":1} prompts=[{\"names\":[\"C\"],\"score\":{\"A\":1,\"B\":1,\"C\":4},\"head\":\"join C mwtppv1f: DEPENDS on write A and write B — only after both are done, create C.txt in the same folder wh\"},{\"names\":[\"A\"],\"score\":{\"A\":5,\"B\":0,\"C\":0},\"head\":\"write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtp\"},{\"names\":[\"B\"],\"score\":{\"A\":0,\"B\":5,\"C\":0},\"head\":\"write B mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtp\"}]"
+      },
+      "parentHoldsRealEvidence": {
+        "pass": true,
+        "detail": "markers in the parent transcript=[\"A\",\"B\"] mentions C.txt=true"
+      },
+      "dependentWaveAfterFirst": {
+        "pass": true,
+        "detail": "C's child started 111s after the later of A.txt/B.txt was written; C.txt written 135s after"
+      },
+      "closeGateAskedAndApproved": {
+        "pass": false,
+        "detail": "crew_close asks=[] permissions=[] other asks=0"
+      },
+      "closedWithVerdicts": {
+        "pass": true,
+        "detail": "## 2026-11-23T20:27:37.273Z — closed subtasks: 3 (PASS 3, FAIL 0) - write A mwtppv1f: in the folder C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws/.opencode/e2e-crew/mwtppv1f create A.txt whose entire content is exactly CREW-A-mwtppv1f (no trailing newline), then print the file: PASS — Ran as pool worker forge-"
+      },
+      "closeToolCompleted": {
+        "pass": true,
+        "detail": "[{\"status\":\"completed\",\"out\":\"[forge:crew] Crew closed: sandbox e2e full crew mwtppv1f: three file subtasks in dependent waves (A and B first, then C), each run by its own subagent, closed with a verified report. Dispatch protocol: every child prompt MUST start with that subtask's declared title as "
+      },
+      "engineSilentAfterClose": {
+        "pass": true,
+        "detail": "briefs in the 25s after the close=0 capped=false"
+      },
+      "sessionIdleAtEnd": {
+        "pass": true,
+        "detail": "busy=false"
+      },
+      "noRunError": {
+        "pass": true,
+        "detail": "no driver error | poll retries=0 sustained=0"
+      }
+    },
+    "finishedAt": "2026-11-23T20:28:02.598Z"
+  },
+  "startedAt": "2026-11-23T20:22:40.996Z",
+  "hostPid": 17916
+}

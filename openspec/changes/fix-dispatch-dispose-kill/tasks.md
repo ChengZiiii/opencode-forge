@@ -141,9 +141,24 @@
 
 ## 4. Release + install verification（GATE）
 
-- [ ] 4.1 并入 0.33.0 合并发版：npm pack --dry-run 白名单核对 →
-      publish → dist-tags 翻牌 → shasum 记录入档
-- [ ] 4.2 旧物化副本隔离（`1795370347623` → `_quarantine` 改名）
+- [x] 4.1 并入 0.33.0 合并发版：npm pack 白名单核对 → publish →
+      dist-tags 翻牌 → shasum 记录入档
+      （2026-11-23：tgz `sorenllm-opencode-forge-0.33.0.tgz` 245225 字节，
+      sha1 `b73f04a57c3154147135d226dff0d3af7c091df6`；包内恰好 4 个文件
+      README.md / dist/index.js / dist/forge.schema.json / package.json，
+      与仓库逐字节一致，`dist/index.js` sha256 `00565a61…`。20:40Z 发布，
+      npm 回报同一 shasum；20:42Z dist-tags.latest → 0.33.0，版本文档
+      shasum 一致，CDN 首次尝试即返回逐字节相同的包体。记录：
+      reports/e2e/evidence/0.33.0/release-record.json）
+- [x] 4.2 旧物化副本隔离（`1795370347623` → `_quarantine` 改名）
+      （2026-11-23T20:56Z：移入
+      `~/.cache/opencode/npm/_quarantine/opencode-forge@latest-1795370347623-0.32.3`
+      ——本机既有惯例的命名；只搬这一个目录，不删任何东西，九项前置 /
+      事后检查全过，回退 = 搬回原位。依据：安装路径实验
+      （reports/e2e/evidence/0.33.0/install-path/，隔离档按用户路径原样走）
+      实测带旧副本重启**沿用 0.32.3、不联网**；移走后冷启动物化
+      0.33.0 `00565a61…`；运行中的宿主不受影响——已加载目录照常，新激活
+      目录自动取到 0.33.0。真机搬移后宿主日志零错误）
 - [ ] 4.3 用户重启后真机终验（Unity 三测金丝雀或探针复跑，判据同 3.1）
 
 ## 5. Wrap-up（用户明示后）

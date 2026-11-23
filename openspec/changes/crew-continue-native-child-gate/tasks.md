@@ -114,16 +114,39 @@
 
 ## 4. Verification
 
-- [ ] 4.1 `bun run typecheck`, full `node --test` suite green, `bun run
+- [x] 4.1 `bun run typecheck`, full `node --test` suite green, `bun run
   bundle`, dist committed.
-- [ ] 4.2 Sandbox E2E (armed crew + native child): (a) native child in
+  （2026-11-23：typecheck 无错；全量 1009/1009（验收门在 1669dc1 上复测：
+  live-typecheck PASS、live-unit-suite 1009/1009）；最终构建
+  dist/index.js 18:20:35.850Z，sha256 `00565a61…`，随 15b21bc 入库）
+- [x] 4.2 Sandbox E2E (armed crew + native child): (a) native child in
   flight ⇒ briefs suppressed across idle edges; (b) child terminal ⇒
   exactly one brief; (c) ceiling ⇒ one brief + the disclosure line in the
   host log; (d) goal branch unaffected alongside.
+  Evidence (host 2.4.0, dist 18:20:35Z; verdicts in
+  reports/e2e/evidence/0.33.0/):
+  - Standard legs A / B / B' / D, host AND driver on the PRODUCTION default
+    ceiling 900000 ms (native-child-gate-e2e-final-standard-verdict.json,
+    18:36:56–18:46:00Z, verdictAll true). A: 3 completed idle edges, 3
+    engine rulings "crew skip: native child in flight", 0 briefs while the
+    child ran. B: the child succeeded at 18:45:30Z → exactly one brief, the
+    first one, naming the child. B': an interrupted (aborted) child → one
+    brief naming it DEAD. D: the child session deleted (204) → settled
+    "interrupted", disclosed, one brief, the parent resumed on its idle edge.
+  - Leg C on the shortened ceiling 240000 ms (…-C-verdict.json,
+    19:27:55–19:32:33Z, C true).
+  - (d): the goal-branch tests are unchanged and green in the 1009 suite;
+    the full-crew run (crew-full-e2e-verdict.json, 20:22:41Z, 15/16 — the
+    one failing check is the crew_close ask-door defect tracked in
+    fix-crew-close-ask-door) drove the same engine begin → briefs → waves →
+    verdicts → close.
 
 ## 5. Release & wrap
 
-- [ ] 5.1 Rides the coordinated 0.33.0 combined release train (no
+- [x] 5.1 Rides the coordinated 0.33.0 combined release train (no
   independent version bump; publish is the owner's authorization domain).
+  （2026-11-23T20:40Z published as part of 0.33.0 — tgz sha1
+  `b73f04a57c3154147135d226dff0d3af7c091df6`, dist-tags.latest → 0.33.0 at
+  20:42Z.）
 - [ ] 5.2 Archive on user instruction (`openspec archive
   crew-continue-native-child-gate --yes`) after the ③/④ gates close.

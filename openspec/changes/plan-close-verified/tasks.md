@@ -67,13 +67,26 @@
       工具调用。判定 `logs/plan-close-headless-e2e-verdict.json`
       （旧构建探路 16:39Z 跑出同样的产品行为，两处“失败”是驱动
       断言看错了层，已修——见 reports/e2e-convergence-2026-11-23.md））
-- [ ] 3.2 有头 TUI 验证（computer use）：plan_close 无确认框、close
+- [x] 3.2 有头 TUI 验证（computer use）：plan_close 无确认框、close
       完成、磁盘证据可读、reopen 可用——原楔死场景不复现
+      （2026-11-23T19:18–19:19Z，沙箱宿主 2.4.0 pid 30104、端口 47911、
+      dist 18:20:35Z；真实 TUI 窗口，单键后台投递，每步截图 + 磁盘/转录
+      复核。会话 `ses_df6391c80…`：19:18:47Z 提交后恰一次
+      `plan_close:completed`，屏上显示 “Plan completed and closed (done,
+      plugin-verified) … All 2 frozen verification items re-run passing at
+      the gate.”，全程确认框 0（ask 监视 0 条）；计划文件出现
+      `— closed` 节，checks=2 OK=2。19:19:34Z `plan_reopen` 完成，
+      done → approved，理由逐字入盘。证据 `tui-gate.json` 6/6）
 
 ## 4. Release（与 C3/C4 协调 0.33.0）
 
-- [ ] 4.1 合并发版：pack 白名单核对 → publish → dist-tags → shasum
+- [x] 4.1 合并发版：pack 白名单核对 → publish → dist-tags → shasum
       入档 → 旧物化副本隔离
+      （2026-11-23：0.33.0 已发布并验证——tgz sha1
+      `b73f04a57c3154147135d226dff0d3af7c091df6`，20:42Z
+      dist-tags.latest → 0.33.0，CDN 包体逐字节一致；20:56Z 旧副本
+      `1795370347623` 移入 `_quarantine`。记录见
+      reports/e2e/evidence/0.33.0/）
 
 ## 5. Wrap-up（用户明示后）
 

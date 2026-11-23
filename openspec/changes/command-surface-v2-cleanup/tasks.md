@@ -76,13 +76,28 @@
       杀路径竞态，已修（见 reports/e2e-convergence-2026-11-23.md）。
       第一次最终构建跑（16:56Z）owner 回合 4 分钟未返回、无任何工具
       调用，属前提未达成，新鲜会话重跑即上述结果）
-- [ ] 3.2 有头 TUI 顺带验证（与 C2 有头窗口同跑）：命令列表、
+- [x] 3.2 有头 TUI 顺带验证（与 C2 有头窗口同跑）：命令列表、
       `/forge stop` 可用
+      （2026-11-23T19:21–19:25Z，同一有头门。会话 `ses_df625879…`：键入
+      `/` → 命令列表弹出；键入 `forge` → 恰好 /forge、/plan、/crew、/goal，
+      无任何连字符 forge-* 命令；19:24:08Z 键入 `/forge stop` + 回车 →
+      转录 `forge_jobs {action:'stop'}` → “Stopped 2 in-flight
+      dispatch(es) of this session” → 两条 `Subagent cancelled`、两条
+      `— ABORTED` 唤醒；journal 两行均到终态、理由逐字
+      `cancelled by the user lever (/forge stop) — …`；状态栏子代理计数
+      2 → 无。另：从 registry 装出来的 0.33.0 副本命令表为
+      `init, review, goal, automation, plan, crew, forge`——发布物本身
+      不含 forge-* 命令）
 
 ## 4. Release（0.33.0 合并）
 
-- [ ] 4.1 并入合并发版梯（pack 白名单 → publish → dist-tags →
+- [x] 4.1 并入合并发版梯（pack 白名单 → publish → dist-tags →
       shasum → 旧副本隔离）
+      （2026-11-23：0.33.0 已发布并验证——tgz sha1
+      `b73f04a57c3154147135d226dff0d3af7c091df6`，20:42Z
+      dist-tags.latest → 0.33.0，CDN 包体逐字节一致；20:56Z 旧副本
+      `1795370347623` 移入 `_quarantine`。记录见
+      reports/e2e/evidence/0.33.0/）
 
 ## 5. Wrap-up（用户明示后）
 

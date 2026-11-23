@@ -1,11 +1,11 @@
 {
   "gate": "acceptance-gate",
-  "generatedAt": "2026-11-23T20:08:09.379Z",
-  "elapsedMs": 27262,
+  "generatedAt": "2026-11-23T20:34:36.144Z",
+  "elapsedMs": 27709,
   "packageVersion": "0.33.0",
   "git": {
-    "head": "9f98f862c446bc32e73ef9871d535c4e41f0a757",
-    "short": "9f98f86",
+    "head": "1669dc151283076282ecaaa2221352cd299984a8",
+    "short": "1669dc1",
     "dirtyFiles": 0,
     "dirty": []
   },
@@ -19,16 +19,31 @@
   "pass": true,
   "hardPass": false,
   "counts": {
-    "pass": 19,
+    "pass": 20,
     "fail": 0,
     "booked": 1,
-    "total": 20
+    "known": 1,
+    "total": 22
   },
   "booked": [
     {
       "id": "e2e-c1-D1",
       "booking": "D6 — the sandbox host (2.4.0) offers no action proven to run the plugin dispose hook while a dispatch is in flight",
       "detail": "the evict did not kill the control process tree of the evicted location - the plugin dispose hook did not run inside the leg window (probe silent): no verdict on the dispatch exemption | dispose hook probe: {\"ranInWindow\":false,\"secondsEvictToHook\":null,\"lines\":[],\"note\":\"probe lines are written by the plugin's dispose hook / exit matrix when they run (build 2026-11-23T16:5xZ+); none = neither ran inside this leg's window\"}"
+    }
+  ],
+  "knownDefects": [
+    {
+      "id": "e2e-crew-full",
+      "failedChecks": [
+        "closeGateAskedAndApproved"
+      ],
+      "defects": [
+        {
+          "check": "closeGateAskedAndApproved",
+          "note": "F: crew_close executes WITHOUT its user-confirmation ask on the v2 host when no goal governs the session (the v2 permission belt's door set has no crew_close; present since the 2026-11-19 v2 port; reproduced 2026-11-23 19:55Z, logs/probe-crew-close-door.json; tracked as fix-crew-close-ask-door)"
+        }
+      ]
     }
   ],
   "failed": [],
@@ -629,6 +644,54 @@
       }
     },
     {
+      "id": "crew-full",
+      "title": "crew-full: measured on THIS build (file and in-file start time both later than dist)",
+      "status": "PASS",
+      "detail": "file 2026-11-23T20:28:02.599Z · startedAt 2026-11-23T20:22:40.996Z · dist 2026-11-23T18:20:35.850Z",
+      "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\crew-full-e2e-verdict.json",
+      "exists": true,
+      "mtime": "2026-11-23T20:28:02.599Z",
+      "sha256": "e8c703bef392833b7c7fc47f67848a00d8563b9923c271fc6bee6bf06763f8c5",
+      "readable": true,
+      "startedAt": "2026-11-23T20:22:40.996Z",
+      "startedKey": "startedAt",
+      "hostPid": 17916
+    },
+    {
+      "id": "e2e-crew-full",
+      "title": "complete crew: begin → waves → verdicts → crew_close on the live host",
+      "status": "KNOWN",
+      "detail": "15/16 checks; KNOWN DEFECT closeGateAskedAndApproved: F: crew_close executes WITHOUT its user-confirmation ask on the v2 host when no goal governs the session (the v2 permission belt's door set has no cre…",
+      "checksTotal": 16,
+      "checksFailed": [
+        "closeGateAskedAndApproved"
+      ],
+      "knownDefects": [
+        {
+          "check": "closeGateAskedAndApproved",
+          "note": "F: crew_close executes WITHOUT its user-confirmation ask on the v2 host when no goal governs the session (the v2 permission belt's door set has no crew_close; present since the 2026-11-19 v2 port; reproduced 2026-11-23 19:55Z, logs/probe-crew-close-door.json; tracked as fix-crew-close-ask-door)"
+        }
+      ],
+      "acceptedKnown": [
+        "closeGateAskedAndApproved"
+      ],
+      "sections": [
+        {
+          "at": "2026-11-23T20:22:47.059Z",
+          "title": "registered (pending)"
+        },
+        {
+          "at": "2026-11-23T20:22:47.062Z",
+          "title": "armed (waves)"
+        },
+        {
+          "at": "2026-11-23T20:27:37.273Z",
+          "title": "closed"
+        }
+      ],
+      "msToClose": 296551
+    },
+    {
       "id": "tui-headed",
       "title": "headed TUI gate: every item observed in a real terminal on THIS build",
       "status": "PASS",
@@ -705,7 +768,7 @@
       "id": "no-secret-in-evidence",
       "title": "no evidence file carries the sandbox host password",
       "status": "PASS",
-      "detail": "checked 7 files"
+      "detail": "checked 8 files"
     }
   ],
   "evidence": [
@@ -774,6 +837,17 @@
       "startedAt": "2026-11-23T19:27:55.361Z",
       "startedKey": "started",
       "hostPid": 19892
+    },
+    {
+      "id": "crew-full",
+      "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\crew-full-e2e-verdict.json",
+      "exists": true,
+      "mtime": "2026-11-23T20:28:02.599Z",
+      "sha256": "e8c703bef392833b7c7fc47f67848a00d8563b9923c271fc6bee6bf06763f8c5",
+      "readable": true,
+      "startedAt": "2026-11-23T20:22:40.996Z",
+      "startedKey": "startedAt",
+      "hostPid": 17916
     },
     {
       "id": "tui-headed",
