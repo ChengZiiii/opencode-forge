@@ -1,7 +1,6 @@
 # Research: opencode v2 plugin QA landscape — how plugin authors ACTUALLY test
 
-> Status: IN PROGRESS (incremental write; sections fill as evidence is verified)
-> Working dir: opencode-forge. Date: 2026-11-23.
+> Status: COMPLETE (2026-11-23). All findings evidence-pinned; see Appendix for fetch method + artifact inventory.
 > Method notes: GitHub raw fetches flaky from this environment — evidence gathered via
 > npm registry tarballs, GitHub REST API (pinned SHAs), jsdelivr, and rendered-page webfetch.
 > Every claim tagged with source URL / file path. Unverified leads marked **[LEAD—UNVERIFIED]**.
@@ -177,13 +176,122 @@ Also notable in tree: `kuitos/opencode-claude-memory` (84★) ships a **test/eva
 - Recorded-fixture culture: `packages/ai/test/fixtures/recordings/**` (hundreds of provider-response JSON recordings, e.g. `alibaba-chat/qwen-3-8-max-*.json`), `packages/core/test/plugin/provider/claude-agent/fixtures/recordings/*.jsonl` — the host replays REAL provider transcripts (incl. `tools-abort.jsonl`, `tools-cancel.jsonl`, `text-resume.jsonl` — cancellation/resume flows tested from recordings).
 
 ## Q3. Version-matrix / drift defense (pinning, contract snapshots, "SDK type lied" precedents)
-(pending)
+
+**The version coupling that makes pinning tractable (npm registry, verified 2026-11-23):**
+- `@opencode/cli` dist-tags: `latest: 2.3.2`, `beta: 0.0.0-beta-19507`, `dev: 0.0.0-dev-1336` (`npm view @opencode/cli dist-tags --json`).
+- `@opencode/plugin` versions run the same 2.x line up to `2.3.2`. **Host CLI and plugin SDK share one version line**, so "pin the SDK" == "pin the host" — both plugins below exploit exactly this.
+
+**Pattern A — goal-plugin: SDK-devDep-as-floor + rolling beta canary.**
+`ci.yml` `v2-smoke` matrix `channel: [pinned, beta]`: `pinned` installs `@opencode/cli@${devDependencies['@opencode/plugin']}` (floor = the SDK the code was typechecked against = 2.3.0); `beta` installs `@opencode/cli@beta` (currently `0.0.0-beta-19507`). The smoke itself carries a **drift shim with a verbatim rationale**: `const commandField = hostVersion.includes("0.0.0-beta-") ? "command" : "name"` — "Stable V2 reads `name`; 0.0.0 beta hosts still read `command`" — i.e. the beta channel has ALREADY broken a request-field shape and their harness adapts per detected host version. This is a live example of the drift class our miss #2 belongs to, caught by CI instead of by users.
+
+**Pattern B — navigator: manifest-derived dual endpoints + CI-that-tests-the-CI.**
+- `scripts/host-versions.mjs`: `minimum` = caret floor of `peerDependencies['@opencode/plugin']` (2.2.6); `latest` = lockfile-resolved version (2.3.2); asserts `engines.opencode === "peer1 || peer2"`.
+- CI runs every host-touching smoke at BOTH endpoints when they differ (`NAVIGATOR_HOST_ENDPOINT=minimum|latest`), and the smoke **installs the exact host binary** (`npm install --no-save @opencode/cli@$host_version`) into the sandbox, double-checking `--version` output — never trusting whatever binary happens to be on PATH.
+- `test/host-versions.test.ts`: asserts devDeps == peerDeps per SDK, both endpoints satisfy engines+peers, betas/other majors rejected ("package admits both stable host endpoints and rejects other major lines").
+- `test/host-matrix.test.ts`: parses `.github/workflows/ci.yml` (Bun.YAML) and **asserts the three host jobs contain both `NAVIGATOR_HOST_ENDPOINT=minimum` and `=latest` runs** — the CI matrix itself is under test so nobody can silently drop an endpoint.
+- HOST_API.md: "The lockfile resolves 1.19.6 and 2.3.2 for reproducible checks. The required CI checks cover both endpoints in each line. **Published SDK declarations and real-host checks define the boundary**" — declarations AND live checks, never declarations alone.
+
+**Pattern C — live-surface contract checks instead of trusting types.**
+- The host publishes its API surface at **`GET /doc` (OpenAPI)**; oh-my-opencode's server-smoke asserts `.paths | length >= 100`, and our own prior probe counted 142 paths on live 2.3.2 (reports/probe-v2-surface-report.md). A `paths+methods+schema` snapshot diff between host versions is a 20-line script on this endpoint — no one in the surveyed community does a full schema-diff yet, but the endpoint is the sanctioned substrate for it.
+- navigator's smoke proves plugin ACTIVATION by calling the plugin's own RPC capability endpoint, tolerating `rpc.unavailable` during async start ("proves activation, not just boot") — a live contract probe, not a type assumption.
+- navigator's `dist/runtime-dependencies.json` pins `@opencode/plugin: 2.3.2` as the verified runtime and `snapshot-verifier.mjs` gates the runtime before load — the shipped artifact records which host runtime it was verified against.
+
+**"SDK type lied" precedents (verbatim, verified):**
+1. **Our own miss #2, now root-caused**: the v2 SDK `@opencode/plugin@2.3.2` `dist/promise/session.d.ts` L210 defines `SessionDomain = Pick<SessionApi, ... "interrupt" ...>` (+ experimental `wait`) — **no `abort` anywhere in the v2 session surface** (checked: only 7 `abort` hits in the whole 185KB v2 test file, all fixture-local). `session.abort` is the **v1 `@opencode-ai/sdk` surface**; the drift was v1-type memory applied to a v2 host. Both SDKs coexist in every dual-support plugin's devDeps (goal-plugin and navigator carry `@opencode-ai/plugin ^1.x` AND `@opencode/plugin ^2.x`), which is precisely how such confusion arises.
+2. goal-plugin beta-vs-stable `command`/`name` field drift (above) — same class (typed assumption vs live host), caught by a matrix smoke.
+3. navigator `smoke-v2-session.mjs`: `const id = session.value.data?.id ?? session.value.id` — shipped code defensively parses BOTH session-create response shapes rather than trusting either SDK shape (our miss #3 exactly).
+4. navigator HOST_API.md documents per-host-line behavioral divergences in a table ("Capability | OpenCode 1.x (from 1.19.5) | OpenCode 2.x (from 2.2.6)") — a maintained, human-written divergence ledger between host versions.
+5. opencode docs themselves warn the object form needs host ≥1.18.29 and tell authors to "test the installed package with the oldest V1 release you intend to support and with V2" — the official acknowledgment that host surface moves under SDK assumptions.
 
 ## Q4. Coverage map: our five misses vs community/official patterns
-(pending)
 
-## Q5. Ranked recommendations (effort vs catch-value) + adoption sketch
-(pending)
+**Miss 1 — dispose-hook collateral kill across sessions (single-context sandbox never triggered it).**
+- **COVERED (twice over).**
+  - Host's own `packages/core/test/plugin-failure.test.ts` tests this exact class in-process: `"removes a failed plugin's hooks and RPC handlers without affecting healthy plugins"`, finalizer-join deadlocks during reload/teardown, failure-state preservation across other plugins' re-activations. Mechanism: real `Plugin.Service` supervisor + multi-plugin activation via `PluginTestLayer`.
+  - goal-plugin: (a) unit level — `test/server-v2.test.ts` has 35 `dispose` mentions incl. `"V2 disposal aborts a pending command wait"`, `"V2 cancelled Shell notification releases only its own deferral"`, `"V2 setup leaves a live foreign process's Shell wait untouched"`; (b) real-host level — smoke:v2 activates the plugin in **a second location on the same server** and asserts no duplicated continuation delivery ("The user's shared server hosts many locations. Activating a second plugin instance must not duplicate continuation delivery for the first location.") — a multi-context sandbox assertion.
+  - What NO ONE does: firing dispose **mid-flight across two concurrently active sessions in one location** on a real host (goal-plugin's second location is sequential, not concurrent). Our crew/dispatch use case is still beyond community precedent — but the two ingredients (multi-location smoke + unit-level finalizer semantics) both exist to copy.
+
+**Miss 2 — SDK-type vs live-host drift (`session.abort` vs `interrupt`).**
+- **COVERED.** Root cause now verified: `abort` is v1-SDK surface; v2 `SessionDomain` (`@opencode/plugin@2.3.2` `session.d.ts` L210) ships only `interrupt`+`wait`. Every surveyed serious plugin (a) pins the host binary to the SDK version and (b) runs a real-host smoke against it — goal-plugin additionally runs the **beta channel** canary and carries a version-conditional request-field shim (`command` vs `name`) proving the class recurs. navigator's dual-endpoint CI + `host-matrix.test.ts` (CI can't silently drop an endpoint) is the structural defense. Also relevant: host exposes `GET /doc` OpenAPI (≥100 paths) — a live method-existence check (`interrupt` present / `abort` absent) is scriptable without any SDK.
+
+**Miss 3 — host message-shape drift (bare rows vs info-wrapped) encoded wrong in unit stubs.**
+- **PARTIALLY COVERED.** navigator's shipped smoke parses both shapes (`session.value.data?.id ?? session.value.id`); goal-plugin's beta shim shows shape drift recurring across channels. The host's own cure for "hand-written mocks hide too much of the real request shape" is **`@opencode/http-recorder`** — record real traffic once, commit JSON cassettes, replay deterministically, `CI=true` fails on missing cassettes — plus hundreds of committed `recordings/*.json(l)` fixture trees in the host repo. **No surveyed plugin records host HTTP/message fixtures via cassettes** (goal-plugin dumps `model-request-N.json` artifacts on failure; navigator uses dual-parse tolerance instead of fixtures). Golden message fixtures recorded from a real host remain **our build, but with an official tool**: `@opencode/http-recorder` is published and Effect-based, and the raw pattern (Bun.serve fixture model + artifact dumps) is goal-plugin's.
+
+**Miss 4 — ask/permission channel untestable without a client.**
+- **COVERED, three sanctioned mechanisms** (none of which we use):
+  1. Config-level: navigator's test `cli.json` sets `"session": {"permissions": "autoaccept"}`; server config can deny-by-policy (`policies: [{action:"provider.use", resource:"*", effect:"deny"}]`) so no provider call can ever fire.
+  2. API-level (docs/server.md Permissions): `ctx.permission.list/get/reply({sessionID, requestID, decision:"once"})` — a **second plugin (or the test harness via RPC) can programmatically answer permission prompts**; `ctx.session.update({permissions:[...]})` pre-arms session-scoped rules (deny/ask/allow per action+resource).
+  3. Host-internals level: core's `PluginTestLayer` replaces `Permission.Service` with a stub whose `ask` auto-succeeds — the host's own tests drive the ask channel in-process.
+  - Community precedent for non-interactive driving: goal-plugin and navigator both drive sessions purely over HTTP (`POST /api/session/{id}/command`, `/api/session/{id}/prompt`-equivalents) in serve mode — the client-less harness pattern we already have; adding a permission-reply leg (2) is the missing piece.
+
+**Miss 5 — plugin-dispatched vs host-native subagent channel semantic differences.**
+- **PARTIALLY COVERED (observation, not equivalence testing).** navigator's HOST_API.md documents the per-host-line subagent capability split (child discovery via public paginated API + "typed execution events"; `SessionInfo.time.busy` for active duration) and its `host-port-contracts.test.ts` runs the real adapter against a `nativeHostFixture` (a synthetic `Plugin.Context` with parent+child sessions, status map, event bus). goal-plugin's TaskTracker unit tests + real-host smoke validate native-child observation (`session.created` w/ `data.parentID`, `session.execution.*`). Prior internal research (reports/research-crew-wave-visibility.md) already verified both plugins' mechanisms against hosts 2.2.6/2.3.2. **No precedent found for an equivalence test that dispatches the same subagent task through BOTH channels (plugin tool vs host-native child) on one live host and compares outcomes** — that would be novel, built on the multi-session smoke pattern from miss 1.
+
+## Q5. Ranked recommendations (catch-value ÷ effort), reusing our sandbox E2E infra
+
+Ranking rationale: weight = which of our five real misses it catches, with community-verified recipes to copy.
+
+**#1 — Multi-context harness: two concurrent sessions/locations + dispose/reload mid-flight (catches miss 1, exercises 5; MED effort, HIGHEST value — it's the only class we actually shipped).**
+Recipe (both halves are proven):
+- Boot ONE server; create `projectA` + `projectB`; wait per-location for `GET /api/plugin?location[directory]=…` → `state.status === "active"` (goal-plugin's exact probe; tolerate `rpc.unavailable` retries — "2.3 starts plugins asynchronously... proves activation, not just boot").
+- Start a long dispatch in A (crew/task), then trigger plugin teardown mid-flight — config file update/removal (the host's supervisor reloads plugins on config change; core's `supervisor-reload.test.ts` drives it with watcher `update` events) — and assert: B's in-flight work unaffected, A's dispatch reaches a terminal state, host process-group survives (goal-plugin asserts cleanup via `taskkill /T`-equivalent group-kill verification).
+- Copy goal-plugin's unit-level finalizer semantics into our node --test suite: `"V2 disposal aborts a pending command wait"`, `"…leaves a live foreign process's wait untouched"` — dispose must release ONLY plugin-owned waits.
+
+**#2 — Live-host contract snapshot: `GET /doc` diff + method-existence assertions (catches miss 2, guards 3; LOW effort — endpoint exists, our probe already counted 142 paths on live 2.3.2).**
+- After sandbox boot: fetch `/doc`, normalize (sorted `path → methods → requestBody/response schema hashes`), snapshot-diff against `test/fixtures/host-contract/<ver>.json`.
+- Assert **required methods**: `interrupt` present, `abort` ABSENT on session routes (locks out the v1-type regression permanently); assert every route template our dist's HTTP client references resolves in the live spec (static scan of our client wrapper vs `/doc` paths — turns "SDK type lied" into a build failure).
+- This is the piece NO surveyed community plugin has — both stop at version pinning + smoke; we get it nearly free because our E2E already boots the host.
+
+**#3 — CI host matrix: floor + latest, exact-version install, version double-check (structural defense for 2/3/5; LOW-MED effort).**
+- Copy navigator verbatim: `minimum` = caret floor of our `peerDependencies['@opencode/plugin']`; `latest` = lockfile version; CI installs `@opencode/cli@$version` into the sandbox (`npm install --no-prefix-save`) and FAILS if `--version` mismatches; add optional `beta` channel leg (goal-plugin pattern) once #2 makes beta drift cheap to diagnose.
+- Add navigator's `host-matrix.test.ts` trick: a unit test parses our CI workflow and asserts both endpoints are still wired — the matrix can't silently rot.
+
+**#4 — Golden message fixtures recorded from real hosts, stubs DERIVED from fixtures (catches miss 3; MED effort).**
+- New `scripts/record-host-fixtures.ts`: against the sandbox host per matrix version, record `POST /api/session` response, `GET /api/session/{id}`, `/api/session/{id}/export`, and an N-second `/api/event` capture → `test/fixtures/host/<ver>/*.json`.
+- Rewrite the unit stubs' message/session shapes to IMPORT these fixtures (table-driven across versions) — the miss-3 failure mode was stubs encoding a shape nobody ever observed; derivation from recordings makes that impossible.
+- Adopt `@opencode/http-recorder` SEMANTICS even without its Effect runtime: record-once, commit cassettes, `CI=true` fails on missing cassette, no overwrite mode (delete-to-refresh), redaction before commit. (The package itself is Effect-transport-bound; our plain-HTTP harness implements the policy, not the dep.)
+
+**#5 — Permission channel: config tier now, scripted-reply tier next (catches miss 4; LOW then MED).**
+- Tier 1 (trivial): sandbox `cli.json` gains `"session": {"permissions": "autoaccept"}` and server config gains the deny-all-provider policy (`policies: [{action:"provider.use", resource:"*", effect:"deny"}]`) — navigator's exact block; our E2E immediately stops needing a client for the happy path.
+- Tier 2: a ~50-line `qa-permission-responder` plugin using the sanctioned API (`ctx.permission.list({sessionID})` → `ctx.permission.reply({sessionID, requestID, decision:"once"})`) so E2E can assert ask→reply flows and our plugin's behavior under "once"/"always"/rejection, in serve mode, no TUI.
+
+**#6 — Dual-channel subagent equivalence test (miss 5; MED-HIGH, NO community precedent — novel).**
+- Once #1's multi-session harness exists: dispatch the SAME subagent task via (a) our plugin-dispatched channel and (b) host-native child creation, on one live host; compare observable outcomes (child sessions visible in `session.list?parentID`, `session.active` status transitions, terminal events on `/api/event`, parent-report wake).navigator's HOST_API.md capability table + goal-plugin's TaskTracker event map (`session.created` w/ `parentID`, `session.execution.*`) document the expected observables; nobody diffs the two channels.
+
+**Process adoptions (near-zero effort, from oh-my-opencode's test-discipline.md):** flaky=failing; subscribe-before-trigger with timeout-as-circuit-breaker; no sleeps; "expected values produced by the code under test" is a junk pattern (this one directly applies to our stub-encoded-shape failure); prose pins banned. Plus navigator's honesty ledger: a HOST_API-style doc recording verified host endpoints + known divergences with dates.
+
+**What NOT to build:** the host's in-process `PluginTestLayer` (we're a plugin — no access to core Effect layers); Playwright GUI legs (not our surface); recorded provider cassettes for model traffic (goal-plugin's scripted Bun.serve fixture is lighter and we have no model-dependence in the classes we missed).
 
 ## Appendix: raw evidence dumps / fetch logs
-(pending)
+
+**Method:** GitHub raw/jsdelivr fetches fail from this environment (`getaddrinfo ENOTFOUND cdn.jsdelivr.net`; raw.githubusercontent transport error). Working channels: GitHub REST API (repo/tree/contents/blob with pinned SHAs — base64 blob decode), npm registry (`npm view`, tarball download + `tar`), opencode.ai docs webfetch. All verbatim quotes above were decoded from pinned blob SHAs or local tarball extraction; nothing is quoted from memory.
+
+**Evidence inventory (primary artifacts read in full):**
+
+| Artifact | How obtained | Pin |
+| --- | --- | --- |
+| goal-plugin `scripts/smoke-v2-lifecycle.ts` (16,581 B) | GitHub blob API | repo gitHead `5f206b2`, blob `28ad7cd7` |
+| goal-plugin `.github/workflows/ci.yml` (6,400 B) | GitHub blob API | blob `74c09573` |
+| goal-plugin `scripts/resolve-ci-version.ts`, `test/setup.ts` | GitHub blob API | blobs `1ba3ba7a`, `632164fb` |
+| goal-plugin repo tree (test corpus sizes: server.test.ts 197KB, server-v2.test.ts 185KB/139 tests) | GitHub tree API | tree @ `5f206b2` |
+| goal-plugin `test/server-v2.test.ts` head + test-name census (139 tests; dispose×35, interrupt×30, mock×1065) | GitHub blob API, sliced | blob `2ba6e7a4` |
+| navigator npm metadata (scripts, engines, devDeps) | `npm view opencode-navigator --json` | 1.1.0, shasum `2a166cd1` |
+| navigator tarball (57 files incl. HOST_API.md, runtime-dependencies.json, snapshot scripts) | registry tarball + `tar` | opencode-navigator-1.1.0.tgz |
+| navigator `.github/workflows/ci.yml` (4,510 B) | GitHub blob API | blob `5eb9f102` |
+| navigator `scripts/smoke-opencode-v2.sh` (13,045 B) | GitHub blob API | blob `29266e08` |
+| navigator `scripts/smoke-v2-session.mjs`, `host-versions.mjs`, `headless-boundaries.ts` | GitHub blob API | blobs `6b60e948`, `13c31688`, `52ab42e0` |
+| navigator `test/host-port-contracts.test.ts`, `test/host-matrix.test.ts`, `test/host-versions.test.ts`, `test/fixtures/native-host.ts`, `test/fixtures/typing-host-v1/v2.mjs` | GitHub blob API | branch `main` tree (pushed 2026-11-20) |
+| oh-my-opencode `testing-harness.md`, `test-discipline.md`, `server-smoke.sh`, `tui-smoke.sh` | GitHub blob API | branch `dev` blobs `fe948356`, `9c1329cc`, `30e873b7`, `1e00bdf7` |
+| awesome-opencode list (1,959 lines; candidate triage of 3 repos) | GitHub contents API | branch `main` |
+| opencode docs: /docs/build/plugins + /docs/build/plugins/server (1,873 lines, read in full) | opencode.ai webfetch | 2026-11-23 |
+| host repo anomalyco/opencode tree (15,501 paths; branch `dev` @ `b705c446`, pushed 2026-11-23) | GitHub tree API | head of `dev` |
+| host `packages/core/test/plugin/fixture.ts` (PluginTestLayer) | GitHub blob API | blob `81063500` |
+| host `packages/core/test/plugin-failure.test.ts` | GitHub blob API | blob `a800b5d8` |
+| host `packages/core/test/plugin/supervisor-reload.test.ts` (test names) | GitHub contents API | ref `dev` |
+| host `packages/http-recorder/README.md` (11,359 B) | GitHub blob API | blob `905b4187` |
+| `@opencode/plugin@2.3.2` tarball → `dist/promise/session.d.ts` L210 (SessionDomain has `interrupt`, not `abort`) | registry tarball + Select-String | plugin-2.3.2.tgz |
+| `@opencode/cli` dist-tags (latest 2.3.2 / beta 0.0.0-beta-19507) | `npm view @opencode/cli dist-tags` | 2026-11-23 |
+
+**Leads not chased (out of scope / low yield):** navigator's GUI harness Dockerfile + Playwright suite details (GUI not our surface); host `packages/simulation` internals; kuitos/opencode-claude-memory eval harness beyond tree listing; @prevalentware smoke for v1 host.
+
+**Honest coverage claims (navigator's discipline, applied to this report):** all quotes verified against pinned artifacts; no claim rests on READMEs alone except where the README IS the artifact (HOST_API.md, test-discipline.md). The one negative claim — "no community plugin diffs /doc schemas between host versions" — is scoped to the four ecosystems examined in depth (goal-plugin, navigator, oh-my-opencode, host repo) plus the awesome-list triage; absence of evidence elsewhere is not asserted.
