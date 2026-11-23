@@ -39,9 +39,34 @@
 
 ## 3. Verification（GATE）
 
-- [ ] 3.1 无头 E2E（沙盒宿主）：失败 check 拒关（状态留 approved +
+- [x] 3.1 无头 E2E（沙盒宿主）：失败 check 拒关（状态留 approved +
       Check Log 落盘）→ 修复 → close 过（证据节落盘、零 ask 事件
       断言）→ reopen 回滚 → 再关
+      （      **最终（门控）构建复验**（2026-11-23T18:25:06 到 18:26:27Z，宿主
+      2.4.0 pid 30104，dist 18:20:35Z；驱动 **11/11**：written /
+      approveAskPinned / ticked / refusedFailClosed / shellCheckRanLive /
+      closePassedVerified / reopened / reclosed / zeroCloseAsks /
+      nothingHung / modelStayedMinimal，判定文件
+      plan-close-headless-e2e-verdict.json）：未修复时 close 被拒
+      （fail-closed）；修复后 close 输出 `Plan completed and closed
+      (done, plugin-verified) … All 2 frozen verification items re-run
+      passing at the gate`，关闭节带两项 OK（`#1 OK (0ms)`、`#2 OK
+      (957ms) node --version`，冻结的 shell 检查真的跑了）；reopen 后
+      再关成功，第二个关闭节 18:26:19Z；全程 plan_close 零 ask
+      （旧构建证据，留档：2026-11-23T17:01:38–17:02:58Z，宿主 2.4.0，最终构建 dist
+      16:55:16Z；驱动 14-plan-close-headless-e2e.mjs **11/11**：
+      plan_write → draft + 2 项冻结；plan_approve 恰 1 次 ask 钉死、
+      驱动回填 204 → approved；未修复时 plan_close 以错误浮出——
+      Code Mode 部件外层 completed 但 `error:true`、内层 toolCalls
+      `plan_close:error`，状态留 approved，Check Log 落
+      `#1 FAIL … ENOENT` 与 `#2 OK (956ms) node --version`（冻结的
+      shell 检查真的跑了）；修复后 close → done，关闭节带
+      `reason: completion gate passed (plugin-verified)` 与两项 OK；
+      reopen done→approved 理由逐字入盘；再关成第二个关闭节；全程
+      ask 仅 approve 1 次、plan_close 0 次，零楔死，模型每步一个
+      工具调用。判定 `logs/plan-close-headless-e2e-verdict.json`
+      （旧构建探路 16:39Z 跑出同样的产品行为，两处“失败”是驱动
+      断言看错了层，已修——见 reports/e2e-convergence-2026-11-23.md））
 - [ ] 3.2 有头 TUI 验证（computer use）：plan_close 无确认框、close
       完成、磁盘证据可读、reopen 可用——原楔死场景不复现
 

@@ -163,6 +163,195 @@ deleted by a third party mid-flight**
   on the final-message read after a `succeeded` signal should classify
   stream-lost/unknown or disclose cancellation, not "finished").
 
-**TRIGGER A (process death + relaunch recovery): executed with the S3
-ceiling relaunch — see S3 section.**
+**TRIGGER A (process death + relaunch recovery): PASS (journal-recovery legs)**
+- Session A dispatched `j-20261123-052623-u9qddc` (child
+  `ses_df9215cc9ffew52hblIbboA2qB`, a deterministic 150 s shell-sleep canary).
+- The sandbox host tree (pid 92516 — the port-47911 sandbox ONLY, killed via a
+  scheduler-launched supervisor reading service.json; the user's real host was
+  never touched) was SIGKILLed at 2026-11-23T05:28:01Z — journal at kill time:
+  rows 31/32 `dispatched`→`started`, NO terminal (mid-flight kill verified:
+  `logs/supervisor2.log` lines 1-5; host down ECONNREFUSED immediately after).
+- Relaunch (same isolation layout + `FORGE_CREW_NATIVE_CHILD_CEILING_MS=60000`,
+  verified live via `$env:FORGE_CREW_NATIVE_CHILD_CEILING_MS` inside the new
+  host's own forge_shell child → `CEIL=[60000]`): new host pid 1912, new
+  service id `16bd24a0-…`.
+- Recovery: journal rows 33/34 (1795411687519) — the NEW host re-armed the
+  non-terminal row watch-only (same task id, same child session id, no
+  re-spawn). Honest settle + wake outcome recorded in the S3 addendum below.
+
+## S3 — C5 crew-continue-native-child-gate sandbox E2E (tasks 4.2)
+
+Setup: parent `ses_df927c9f2ffeZ7enHSURMFsczp`, agent forge; crew registered
+PENDING + ARMED (waves) via two crew_begin calls (the one-call register+arm is
+correctly refused: "cannot self-arm outside a governing goal" — that gate
+works); crew "active … started 2026-11-23T05:20:04" confirmed.
+
+**Leg (a) busy native child suppresses [forge:crew-continue]: FAIL (genuine
+gate defect on live v2 hosts — not a driver artifact).**
+- Deterministic busy child: `ses_df9241dccffeGZsorRvcgVqpwV` (parentID set,
+  created via POST /api/session per the E3-verified surface) running a 75 s
+  shell-sleep; verified executing (no idle row; host `GET /api/session/active`
+  showed the child `{type:"running"}` and the list carries its parentID).
+- During the busy window, TWO `[forge:crew-continue]` briefs were injected
+  into the parent (user rows at 1795411428865 ≈ +25 s and 1795411444054 ≈ +40 s
+  of the child's execution) — the suppression contract of task 3.1/4.2a was
+  violated twice, with runtime proof the child was running.
+- Root cause (code evidence): the gate calls
+  `nativeChildrenInFlight(client, sessionID)` (dist/index.js:22146) which
+  needs `client.session.list` and `client.session.status`
+  (dist/index.js:15143/15158). The idle path passes the v2 goalClient =
+  `v2SessionClient(ctx)` (plugin.ts:9580-9583), whose session domain exposes
+  only prompt/promptAsync/get/create/messages/abort (plugin.ts:8780-8795) —
+  **no `list`, no `status`** → `list?.({})` is undefined → children=[] →
+  returns false (fail-open) → the gate is a structural no-op on live v2 hosts.
+  The wiring tests (3.1-3.7) pass because their fake client stub PROVIDES
+  list+status; the real v2 client never does.
+- Secondary observation: the brief after the first probe child's terminal
+  carried NO "Native child outcomes" digest line — consistent with the design
+  (digest rides only a re-armed brief after active suppression), but it is a
+  cascade of the same dead gate.
+
+**Leg (b) child terminal ⇒ exactly one brief + digest: CASCADE-NA.** The
+"one brief per idle edge" half held (no duplicates), but the digest half is
+untestable because suppression never engages (leg (a) root cause).
+
+**Leg (c) ceiling (60 s, env verified =60000): CASCADE-NA.** The ceiling only
+fires from INSIDE an active suppression streak (`firstSuppressedAt` is set
+only when the gate suppresses, dist:22156-22157) — with the gate no-op, no
+ceiling can ever fire on a live v2 host. (Also D6: the relauncher's stderr
+redirect did not materialize a log file, so the `console.warn` disclosure
+line was not capturable regardless.)
+
+**Leg (d) goal branch unaffected: D6 (blocked by design, not by the gate).**
+`goal_write arm=true` from a plain session prompt is refused by the /goal
+flow gate ("Only used inside the /goal flow … — never self-initiate"); the
+sandbox has no headed /goal command surface, so this leg is unreachable
+here. Backfill: drive `/goal` via the host command API or a goal-delegated
+crew; deterministic coverage of record = tests 3.6 regression pin.
+
+**Verdict: C5 E2E gate 4.2 = FAIL — the native-child gate needs a live v2
+capability path (e.g. service.json HTTP `GET /api/session?parentID=` +
+`GET /api/session/active`, the same discovery the dispatch view already
+uses) or an event-tracker feed; until then suppression/digest/ceiling are
+inert on real hosts. Unit layer (3.1-3.7) stays green — a wiring/capability
+gap the stubs masked.**
+
+## S4 — Final-build E2E (the build that goes to npm)
+
+**Build identity.** `dist/index.js` 2026-11-23T16:55:16Z, newer than every
+source it bundles (`plugin.ts` 16:50:10Z, `src/host-exit.ts` 16:49:51Z).
+Typecheck green; full unit suite **1001/1001** at 16:52Z (996 + the five
+kill-path regression tests of S5). No product code changed after the build.
+Every verdict below was produced on this build by a host 2.4.0 sandbox started
+at 16:55:57Z (pid 38344, port 47911). Evidence from earlier builds is kept
+under the sandbox `logs\pre-final-build\` and is **not** counted. Drivers ran
+strictly one at a time (`chain.mjs`).
+
+| Change | Driver | Window (UTC, 2026-11-23) | Result |
+| --- | --- | --- | --- |
+| C4 fix-runtime-model-pin-variant | 13-pin-variant-e2e.mjs | 17:00:27–17:01:37 | **PASS 6/6** |
+| C2 plan-close-verified | 14-plan-close-headless-e2e.mjs | 17:01:38–17:02:58 | **PASS 11/11** |
+| C3 command-surface-v2-cleanup | 12-command-stop-e2e.mjs | 17:08:44–17:13:27 (run 2) | **PASS 16/16** |
+| C1 fix-dispatch-dispose-kill | 11-dispose-e2e.mjs, legs K1 + K2 | 17:14:07–17:15:40 | **PASS** (both) |
+| C1, leg D1 | 11-dispose-e2e.mjs | 17:16:18–17:19:37 | **BOOKED** — no dispose happened |
+
+### C3 — command-surface-v2-cleanup: 16/16
+
+- `GET /api/command` lists `forge`; no `forge-*` hyphen command exists.
+- `POST /api/session/A/command {name:"forge", text:"stop"}` → 204. The template
+  the host delivered carried `Argument: "stop"`; the model made the code call
+  `tools.forge_jobs({action:"stop"})`; its output ended `… is confirmed idle
+  (the cancellation is REAL, not bookkeeping)`.
+- A's two dispatches: journal terminal `aborted`, reason `cancelled by the user
+  lever (/forge stop) — the child was aborted and the dispatch is never
+  retried` — the same string verbatim in both A wakes (`— ABORTED (task …)`),
+  no "Final report:", no scaffolding, zero re-dispatch after terminal.
+- B: `dispatched → started → terminal (completed)`, wake `Final report:
+  CANARY-B-…`, zero aborted blocks; the children went idle soon after.
+- Observation: `cancel "all"` is refused honestly and points at `stop`.
+
+**Run 1 (16:56:25–17:00:27Z) — premise not met, not a product verdict.**
+Owner A's turn never returned: 240 s, zero tool calls, zero journal rows. B,
+created the same second on the same path, dispatched in 11 s, and C4 / C2
+passed on the same build minutes later. Classified as an upstream model stall
+and re-run on fresh sessions (run 2 above). The stalled session was retired by
+the driver before its state was captured, and 2.4.0 keeps no trace of a
+deleted session, so the stall itself cannot be post-mortemed; the driver now
+snapshots the owner at timeout before retiring it (runbook lesson ⑫).
+
+### C1 — fix-dispatch-dispose-kill: K1 PASS, K2 PASS, D1 BOOKED
+
+- **K1 — owner deleted while the child is busy.** Journal terminal `aborted`,
+  reason `registry kill (owner session ended / dispose) — user abort`; the
+  ledger keeps the row (`owner session ended; registry kill issued (row kept
+  for wake delivery …)`) and records the child's command tree going down
+  (`owner session ended; tree killed …`); child session 404 afterwards. The
+  wake half is not observable on a live host — the owner no longer exists, so
+  the ABORTED wake has no inbox. Its wording is pinned by the dispatch-journal
+  unit test; the same `jobWakeText` branch is observed live by K2.
+- **K2 — the cancel lever.** Cancel output `… is confirmed idle (the
+  cancellation is REAL, not bookkeeping)`; wake `— ABORTED (task …): cancelled
+  by the user lever (/forge stop) — the child was aborted and the dispatch is
+  never retried`; journal `aborted`, its reason verbatim equal to the wake,
+  kill category `cancel` on both sides; no fake report, no scaffolding. This is
+  the leg that fell on the previous build with `error` + `[object Object]`
+  (S5).
+- **D1 — evict the owner location mid-dispatch: the behaviour held, the
+  premise did not.** Evict → 204 at 17:16:22Z. Inside the leg's 195 s window:
+  the control process trees of the evicted location (B) and of another
+  location (C) both ran to their natural end; zero ledger lines since the
+  evict; the dispatch was not disturbed — the wake arrived with
+  `Final report: CANARY-D1…`, journal terminal `completed`, zero scaffolding,
+  `F1_otherLocationTreeKilled: false`. But the plugin's own dispose hook
+  **never ran**: `disposeHookProbe.ranInWindow: false`, zero probe lines — and
+  zero dispose-hook / exit-matrix lines in the whole probe log for the
+  final-build host's lifetime (read at 17:18:39Z). On host 2.4.0 the evict
+  closes the location and re-bootstraps it at once (the owner location was
+  loaded again 11 s later) while the old instance's shutdown stays held by one
+  holder. With no dispose to exempt the row from there is **no verdict on the
+  dispatch exemption: BOOKED** (workspace rule D6) — not a pass.
+
+## S5 — Kill-path rework inside the approved contracts (C1 / C3)
+
+**Symptom (previous build).** A cancelled or killed dispatch ended as `error`
+with the reason `[object Object]`, was fed to the retry breaker, and its wake
+did not name the lever. C3's probe run (16:27Z) fell at
+`aAbortedWithLeverReason`; C1's K2 fell the same way.
+
+**Root cause.** After the plugin aborts the child session, host 2.4.0 emits
+`session.execution.failed` whose `error` is an object without `message`. The
+old poll loop settled on `error` first and handed that object to the breaker;
+`String(object)` rendered `[object Object]`.
+
+**Fix** (`plugin.ts`, `src/host-exit.ts`):
+
+- R1 — the kill ruling wins: `settleKilled()` settles a cancelled / killed
+  dispatch as `aborted` before the poll's error branch can call it `error`.
+- R2 — readable nested errors: `executionErrorDetail()` digs nested error
+  objects (strings pass through, Error-likes read `Name: message`, an empty
+  object yields the caller's fallback).
+- R3 — v2 idle confirmation through the host's active-session view
+  (`GET /api/session/active`; `activeSessionView`,
+  `assertChildIdleAfterAbort`): v2 clients have no `session.status`.
+- R4 — the wake names the lever: `USER_LEVER_ABORT_REASON` /
+  `REGISTRY_KILL_ABORT_REASON`; journal reason and wake share one string.
+- A read-only diagnostic probe, active only with `FORGE_GOAL_PROBE` set: the
+  plugin dispose hook and the exit matrix each leave one line when they run.
+  It produced the direct "the hook never ran" fact of D1 above.
+
+**Tests** (5 new, suite 996 → 1001, all green):
+
+1. cancel engine on a v2 client (no session.status): the idle assertion reads
+   the host's HTTP active-session view — idle / resisted / unresolved
+2. user cancel + the poll reads the child as ERROR: journaled ABORTED with the
+   lever reason (never `error`); the wake names the lever
+3. user cancel + the child looks FINISHED: still journaled ABORTED — a
+   cancelled dispatch never reports completion
+4. host terminal signal with a NESTED error object: the journal reason names
+   the error (never [object Object])
+5. executionErrorDetail: strings pass through, Error-likes read
+   "Name: message", nested objects dig, an empty object yields the fallback
+
+**Live, final build, host 2.4.0:** C3 16/16 and C1 K1 + K2 PASS (S4).
+
 

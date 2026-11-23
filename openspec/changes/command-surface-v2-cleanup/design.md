@@ -76,3 +76,11 @@ C2 有头测试同一会话窗口跑）。
 ## D6 — 版本
 
 并入 0.33.0（与 C1/C2/C4 合并发版，一次重启完成全部验收）。
+
+## D7 — 沙箱返工（2026-11-23；全部在本 change 契约内）
+
+| # | 现场问题 | 处置 | 回归测试（`tests/dispatch-wiring.test.mjs`） |
+| --- | --- | --- | --- |
+| R3 | 活 2.4.0 上每次取消都披露 "state could not be read to confirm idle"——v2 承诺层适配器没有 `session.status`，旧的空闲确认只认 v1 客户端 | `activeSessionView`：优先客户端自带的 `session.status`，否则走宿主 HTTP 的 active-session 视图（`GET /api/session/active`，与 crew 原生子会话门同一通道；用专用对象，不动共享适配器）。两种视图都没有 → 立刻如实 unresolved。回执三态：确认空闲 / 抗拒 / 读不出 | `idle assertion ④…`；E2E 12 腿的 `is confirmed idle` |
+| R3b | 空闲确认的每次读没有上限——HTTP 读挂起会拖住 cancel 与串行的 `/forge stop` | 每次读以断言窗口的剩余时间为上限，收尾再做一次 2 秒有界读；超时按"读不出"计 | 同上（挂起的读 → 限时返回 + 如实 unresolved） |
+| — | `/forge stop` 对**排队中** wish 的处置没有约定：现行为是留着排队、随槽位释放派生，但回执只字未提 | **不改行为**；回执点名未被取消的排队 wish 及其去向。"stop 是否一并清空队列"是行为改动，另立 change 待批 | `queue pump ②…` |

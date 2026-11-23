@@ -107,3 +107,22 @@ fixture，A 会话派发中、B 上下文 dispose）。
 并入 **0.33.0 合并发版**（C1/C2/C3/C4 一轮发布、一次隔离、一次重启完成
 全部验收——用户晨间一次性验）。烧版纪律照旧：已发布版本号永不复用，
 旧物化副本 `_quarantine` 改名隔离。
+
+## D7 — 规约复核返工（2026-11-23 夜；全部在本 change 契约内）
+
+沙箱 E2E 过后做了一轮规约复核，逐条回源码核实。五处返工 + 一处时序
+加固（R5–R9），共同病根只有一个：**同一事实有两个说法，或者有人说
+有人不说**。
+
+| # | 问题（源码核实） | 根因 | 处置 | 回归测试（`tests/dispatch-wiring.test.mjs`，注明者除外） |
+| --- | --- | --- | --- | --- |
+| R5 | journal 终态理由与唤醒理由不是同一句：journal 写 `registry kill (owner session ended / dispose) — user abort`，wake 渲染常量 `(owner session ended / user cancel)`；通用 `forge_jobs kill` 打在派发行上时两边都不属实 | 两处各写各的字面量；旧单测只断言"同一 kill 类"，E2E 的 K1 腿（owner 已删）观测不到唤醒 | 击杀钩子在击杀那一刻把一句话盖在行上（`meta.abortReason`），`settleKilled` 与 `jobWakeText` **都只读这一句**；三种来源各一句常量（owner 终结 / 取消杆 / 显式 kill） | `kill sentence ①…`；`tests/dispatch-journal.test.mjs` 的 owner-death 用例改为逐字钉 |
+| R6 | 击杀结案后不泵该会话的派发队列 | 本 change 的 R1 给 `settleKilled` 加了五个裸 `return`，跳过了循环后的统一收尾（返工前是 `break` 走到收尾再泵）——**本 change 自己引入的回归** | `settleKilled` 结案时泵一次（owner 死亡时队列已被 harvest 清空，泵无可泵） | `queue pump ②…`（变异检查：拆掉这一行即失败） |
+| R7 | 重试重生窗口落下的击杀：新孩子建出来没人管 | 建孩子 / 发提示词两段等待里没有复查 | `settleRespawnKill`：建孩子后、发提示词后各复查一次。建孩子期间落下 → 不发提示词、仅作清理中止、行不改绑（唤醒点名上一次尝试的孩子）；发提示词期间落下 → 行改绑新孩子后中止 | `respawn window ③a…` / `③b…` |
+| R8 | 错误对象含循环引用或 BigInt 时 `executionErrorDetail` 落到 `String(error)`，又渲染成 `[object Object]`；空原型对象直接抛 | JSON 兜底的 catch 分支返回 `String(error)`；读取属性无防护 | 兜底返回 undefined 交调用方自己的诚实措辞；整个函数包在 try/catch 里（敌意 getter / Proxy 不抛进信号路径） | `executionErrorDetail is TOTAL on hostile shapes…` |
+| R9 | abort 未证实的两处时序漏洞：① 中止调用挂起不返回时，结算等满 2 秒就写了光秃秃的 `aborted`——孩子可能还在跑而无人被告知；② owner 已空闲时唤醒在击杀瞬间投递，可能早于 abort 失败渲染，于是唤醒说"已中止"、journal 说"未证实" | 结算与投递两处各自等 / 不等，且都只认"失败"不认"没返回" | 共用 `awaitAbortVerdict`（限时等待；到点仍未返回即记一笔未证实），journal 结算与唤醒投递都走它——谁先写谁后写，结论一致 | `abort-unconfirmed ④b…` / `④c…` |
+
+**明确不在此决定**：`/forge stop` 是否连带清空本会话**排队中**的
+wish。现行为 = 在飞的全停、排队的留着，并在回执里点名（基线 fold D：
+槽位释放即泵，取消腾出的槽位立刻给队首）；本 change 只补了回执
+点名与 R6 的泵。"要不要一并清空"是行为改动，另立 change 待批。

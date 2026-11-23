@@ -27,8 +27,24 @@
 
 ## 3. Verification（GATE）
 
-- [ ] 3.1 沙箱 E2E：钉扎 worker 派发 → 子会话 model record
+- [x] 3.1 沙箱 E2E：钉扎 worker 派发 → 子会话 model record
       `variant === 钉扎深度`
+      （      **最终（门控）构建复验**（2026-11-23T18:24:02 到 18:25:05Z，宿主
+      2.4.0 pid 30104，dist 18:20:35Z；驱动 **6/6**，判定文件
+      pin-variant-e2e-verdict.json）：钉扎 `{glm-coding-worker,
+      glm-5.3-flash, variant:"low"}`；派发 j-20261123-182404-7fsnqj 走
+      插件 task 通道；子会话 ses_df6595f63ffepfOPkwIdwNdnCd 开始、结束
+      两条会话记录的 model 都是 `glm-5.3-flash` + `variant:"low"`；2 条
+      assistant 行全部匹配钉扎、全部带 variant；唤醒带孩子原话
+      （旧构建证据，留档：2026-11-23T17:00:27–17:01:37Z，宿主 2.4.0，最终构建 dist
+      16:55:16Z；驱动 13-pin-variant-e2e.mjs **6/6**：
+      `forge-viewe2e-coder` 钉扎 `{glm-coding-worker, glm-5.3-flash,
+      variant:"low"}`；派发 j-20261123-170033-bru0bc 走插件 task 通道
+      （tools.task 代码调用）；`GET /api/session/{child}` 的 agent 与
+      model 在子会话开始、结束时都是 `variant:"low"`；子会话 2 条
+      assistant 行 model 全是同一钉扎（matchesPin 2/2，带 variant 2/2）；
+      唤醒带子代理原话 `Final report: CANARY-V-…`。旧构建探路 16:34Z
+      的超时是驱动取错 journal 行（见 reports/e2e-convergence））
 - [ ] 3.2 真机终验（晨间）：0.33.0 重启后 UI 思考深度显示真实档位
 
 ## 4. Release（0.33.0 合并）

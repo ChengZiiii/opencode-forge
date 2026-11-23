@@ -7,7 +7,7 @@
 
 | 文件 | 职责 |
 | ---- | ---- |
-| `plugin.ts` | 双入口：`server`（v1 hooks 全功能：config 注册 forge agent + 静态 `forge-<ns>-<id>` 子代理（**全池命名空间化——pool-namespace-contract：无 primary 纯 id 特权**，全局兜底层固定 `forge-global-<id>`，物化 id 跨宿主/初始化序稳定——纯字典序确定性、跨族撞名同序裁决；带钉扎 model、描述带池出处（namespace+来源 forge.json 路径+会话域可派性，全局族名全局兜底层）；**workspace-pool-ownership——sole-pool-ownership**：server() 目录入工作区注册表；物化集=全局兜底层+各已见工作区池（每锚点=向上最近 `.opencode/forge.json`，嵌套子树一律忽略），池归属每次 resolve 从磁盘真值重推——**删池文件即失池**；task 派发护栏含**会话域池闸**：目标池归属非本会话工作区池/全局兜底即拒，拒文案逐字含 `not dispatchable from this session`+来源池路径+三出口，未知会话锚 fail-open+披露）+ `/plan` `/goal` `/crew` 命令、tool 注册 5 个 plan_* + 6 个 goal_* + 2 个 job + 2 个 crew 工具（共 15 个）、permission.ask 禁写+钉门（七门永不自动裁决；forge_shell 姿态直通不设门——shell-defang-default-open：无默认注入、无姿态分类，显式值逐字交宿主，只读形状闸是唯一插件侧执行拒绝）、event 播种会话与 idle 续跑调度+job 唤醒投递+session.deleted 收割（会话深度表+agent 族表逐出）、chat.message/chat.params/工具上下文三源采集 sessionID→agent 族映射、tool.execute.before 活动标记+派发护栏+状态文件边界+draft 会话级写禁（**task 按目标 effectiveReadonlyShape 形状闸豁免：readonly scout 放行，拒文案带名册/空名册指引/双出口——allow-readonly-recon**）+crew pending 闸带（crew-harness：注册未武装即拒一切 task 派发）+**crew 池合规闸**（pool-namespace-contract：工作区池文件缺有效顶层 `pool` 声明→`crew_begin` 预检拒注册+crew 治下 forge-* 派发带复检拒，拒文案含文件/违规/最小修复并声明热应用解除；全局兜底会话豁免、per-agent fail-soft finding 不入合规判；合规检查编在会话域池闸之后，跨池拒文案不被改写）+工人→STATE 工具拒绝（primary-only，R1 第三象限）、chat.params 按 agent 名注入钉扎 thoughtLevel（池集合查表、每次现解析热应用；**形状解析链：anthropic 实证传输矩阵家族门前置（family=anthropic 先于目录：adaptive 世代→adaptive effort 键 `options.effort`→wire `output_config:{effort}`；legacy→budget 档位表——本宿主世代 anthropic 传输丢弃 `reasoningEffort`、改写 `budget_tokens`，目录 effort 声明在该 wire 上不可发声）→ 目录 reasoning_options → provider 前缀回退 → 未知端点默认 effort 词通道透传**）、system transform 全量 forge 注入按族门控（含 forge_shell 通道 mandate：hide 持有时硬命令、keepBuiltinShell 时偏好措辞、native/v2 无 mandate）、compaction 钩子随族门控）+ `setup`（v2 防御式注册 forge agent 与静态子代理（cwd 单工作区池解析），create-only，无 tool 域）。**工具面按 agent 族硬分区**（tool-partition spec）：forge 族 shell/bash 隐藏+forge_shell 强制，forge-* 工人只留执行对（状态工具 primary 专属），非 forge agent 全部 forge 工具隐藏+原生物化，watchdog 管辖收缩至 forge 族。纪律载体：`/plan`、`/goal`、`/crew` 命令模板各自自含全量纪律+族护栏（hermes 式：进入轮即规则书，系统提示词零纪律）；/crew 模板按配置组合（roster 段会话域化：本会话可派池带来源路径在前，他池逐个标 NOT dispatchable from this session 带路径在后）。crew 两段式生命周期（add-crew-execution-mode-gate：`crew_begin` 注册即 PENDING→三选一停点，`{execution:"waves"}` 武装 / `{execution:"goal"}` 转交 goal 契约 / standby；goal 治下（本会话 active goal）一次性 born-armed 合法且 close/abandon 免 ask、转交被拒；`crew_close {abandon}` 弃船口；crew 记录 `.opencode/crew/<date>-<slug>.md` record-only 共用 sessionAnchor 链；注册输出披露会话名册来源+残余 mismatch（宿主未物化→重初始化宿主或移入全局层））。无捆绑 skill |
+| `plugin.ts` | 双入口：`server`（v1 hooks 全功能：config 注册 forge agent + 静态 `forge-<ns>-<id>` 子代理（**全池命名空间化——pool-namespace-contract：无 primary 纯 id 特权**，全局兜底层固定 `forge-global-<id>`，物化 id 跨宿主/初始化序稳定——纯字典序确定性、跨族撞名同序裁决；带钉扎 model、描述带池出处（namespace+来源 forge.json 路径+会话域可派性，全局族名全局兜底层）；**workspace-pool-ownership——sole-pool-ownership**：server() 目录入工作区注册表；物化集=全局兜底层+各已见工作区池（每锚点=向上最近 `.opencode/forge.json`，嵌套子树一律忽略），池归属每次 resolve 从磁盘真值重推——**删池文件即失池**；task 派发护栏含**会话域池闸**：目标池归属非本会话工作区池/全局兜底即拒，拒文案逐字含 `not dispatchable from this session`+来源池路径+三出口，未知会话锚 fail-open+披露）+ `/plan` `/goal` `/crew` 命令、tool 注册 5 个 plan_* + 6 个 goal_* + 2 个 job + 2 个 crew 工具（共 15 个）、permission.ask 禁写+钉门（六门永不自动裁决——plan-close-verified：`plan_close` 不再是门，见下文第 3 条；forge_shell 姿态直通不设门——shell-defang-default-open：无默认注入、无姿态分类，显式值逐字交宿主，只读形状闸是唯一插件侧执行拒绝）、event 播种会话与 idle 续跑调度+job 唤醒投递+session.deleted 收割（会话深度表+agent 族表逐出）、chat.message/chat.params/工具上下文三源采集 sessionID→agent 族映射、tool.execute.before 活动标记+派发护栏+状态文件边界+draft 会话级写禁（**task 按目标 effectiveReadonlyShape 形状闸豁免：readonly scout 放行，拒文案带名册/空名册指引/双出口——allow-readonly-recon**）+crew pending 闸带（crew-harness：注册未武装即拒一切 task 派发）+**crew 池合规闸**（pool-namespace-contract：工作区池文件缺有效顶层 `pool` 声明→`crew_begin` 预检拒注册+crew 治下 forge-* 派发带复检拒，拒文案含文件/违规/最小修复并声明热应用解除；全局兜底会话豁免、per-agent fail-soft finding 不入合规判；合规检查编在会话域池闸之后，跨池拒文案不被改写）+工人→STATE 工具拒绝（primary-only，R1 第三象限）、chat.params 按 agent 名注入钉扎 thoughtLevel（池集合查表、每次现解析热应用；**形状解析链：anthropic 实证传输矩阵家族门前置（family=anthropic 先于目录：adaptive 世代→adaptive effort 键 `options.effort`→wire `output_config:{effort}`；legacy→budget 档位表——本宿主世代 anthropic 传输丢弃 `reasoningEffort`、改写 `budget_tokens`，目录 effort 声明在该 wire 上不可发声）→ 目录 reasoning_options → provider 前缀回退 → 未知端点默认 effort 词通道透传**）、system transform 全量 forge 注入按族门控（含 forge_shell 通道 mandate：hide 持有时硬命令、keepBuiltinShell 时偏好措辞、native/v2 无 mandate）、compaction 钩子随族门控）+ `setup`（v2 防御式注册 forge agent 与静态子代理（cwd 单工作区池解析），create-only，无 tool 域）。**工具面按 agent 族硬分区**（tool-partition spec）：forge 族 shell/bash 隐藏+forge_shell 强制，forge-* 工人只留执行对（状态工具 primary 专属），非 forge agent 全部 forge 工具隐藏+原生物化，watchdog 管辖收缩至 forge 族。纪律载体：`/plan`、`/goal`、`/crew` 命令模板各自自含全量纪律+族护栏（hermes 式：进入轮即规则书，系统提示词零纪律）；/crew 模板按配置组合（roster 段会话域化：本会话可派池带来源路径在前，他池逐个标 NOT dispatchable from this session 带路径在后）。crew 两段式生命周期（add-crew-execution-mode-gate：`crew_begin` 注册即 PENDING→三选一停点，`{execution:"waves"}` 武装 / `{execution:"goal"}` 转交 goal 契约 / standby；goal 治下（本会话 active goal）一次性 born-armed 合法且 close/abandon 免 ask、转交被拒；`crew_close {abandon}` 弃船口；crew 记录 `.opencode/crew/<date>-<slug>.md` record-only 共用 sessionAnchor 链；注册输出披露会话名册来源+残余 mismatch（宿主未物化→重初始化宿主或移入全局层））。无捆绑 skill |
 | `src/forge-config.ts` | forge.json 纯函数核心：JSONC 解析（保留空白/报错定位）、**字段级 fail-soft** 语义校验（坏条目跳过+error finding、坏可选字段忽略+warn、`depths` 弃用告警、坏文档仅清空**本层**+定位错误——另一层照常生效；`forge-` id 前缀自愈剥除+warn、归一后碰撞 latter-skip；`thoughtLevel` 配置边界归一（trim+小写，`High`/`XHigh` 等价小写词；归一改变原值出一次 warn finding）；无 seed、无 recipe）、**opencode 对齐级联**（全局打底 + 锚点向上遍历最近 `.opencode/forge.json` 按 agent id 整体覆盖合并，`project+global` 源 + `projectPath`）、mtime 热应用缓存（发现链每次 load 重走——文件增删也热应用）。**工作区池解析器 `createPoolResolver`**（sole-pool-ownership）：会话工作区归属（自锚点向上最近 `.opencode/forge.json`）——工作区池=该会话全部花名册；全局层仅在**工作区无池时**整体兜底（fallback 不合并：工作区有池→全局层不进该会话 roster，全局族固定 `global` 命名空间物化（`forge-global-<id>`））；嵌套子树 forge.json 一律忽略（无子树扫描）；物化集=全局层+各已见工作区池，全走 mtime 热应用——**删文件即失池**（无 append-only 锚点集）；确定性序=纯池文件路径字典序（无主锚特权）；**全池命名空间化**：每族 `forge-<ns>-<id>`、全局族 `forge-global-<id>`，物化 id 跨宿主/初始化序稳定（ns=可选 `pool` 字段 fail-soft 校验 ≤24 字符 `[a-z0-9-]`，否则池目录名清洗——小写/非法字符段折叠/修剪/`pool` 兜底）；ns 撞名递增后缀+error finding、跨族物化 id 撞名字典序先者胜后者跳+finding；文件级池合规谓词 `poolFileCompliance`（crew 合规闸共用：顶层 `pool` 有效声明判定）；坏池文件仅清空本族；`workspacePoolOf` 会话域归属原语。**无副作用（fs 可注入）** |
 | `src/dispatch-tiers.ts` | 静态子代理物化源：角色 prompt 分层（显式 prompt > research/review 内置默认 > 通用）、形状权限（**absent shape 默认 write——shape-default-open**；显式 readonly 才 deny 完整变异工具族 write/edit/bash/patch/applypatch/apply/multiedit——`MUTATING_TOOLS` 单常量同喂物化 permission 与 `effectiveReadonlyShape` 抬离判定；task: deny 恒强制）、`forgeAgentDef` 物化定义（**写 model**、不 hidden、task 词汇表可见、**描述带池出处**（namespace+来源 forge.json 路径+会话域可派性，全局族名全局兜底层——pool-namespace-contract D3）、**带执行面 tools 隐藏 shell/bash**——tool-partition） |
 | `src/dispatch-prompt.ts` | 常驻纪律 prompt：四条 mandate（相对路径/命令一律 forge_shell/原样上报拒绝/证据结论）+ 形状框架（readonly 报告型 / write 执行型）+ 角色文内嵌组合 |
@@ -19,7 +19,7 @@
 | `src/goal-file.ts` | goal 纯函数核心：契约渲染/解析（frontmatter+7 章节）、Check Log（runId 幂等追加）/Turn Ledger、预算状态、迁移状态机（paused 必带 stop_reason）、`carryHistory`（修订保留审计轨迹）、live/queued 发现排序。**无 @opencode-ai 依赖、无副作用、不 import plan-file（解耦红线）** |
 | `src/run-check.ts` | 宿主验证执行器：shell（tree-kill 超时：win32 taskkill /T、POSIX 进程组）、file-contract（工作区内路径逃逸拒绝）、可注入 runner 测试缝 |
 | `src/proc.ts` | 共享进程肌肉（自 run-check 抽出）：`shellSpawn`（shell:true、env 合并、detached 按 POSIX 默认）、`killTree`/`treeKillPlan`（win32 taskkill /pid /F /T、POSIX 进程组 SIGKILL，pid 缺失/组杀失败回退 child.kill）。**无 @opencode-ai 依赖、spawn 可注入**；run-check 与 job-runner 共用 |
-| `src/job-manager.ts` | job 注册表纯逻辑：job 表/环形 tail/outLen 游标、终态 first-wins + 完成量上限逐出、所有权（session 级创建、session.deleted 杀活 job+账本记 orphan、handoff 转全局+重绑根会话、dispose 全清）、唤醒队列（单次投递、窗口期放弃、notify:false、terminal-evidence 抑制——exit 事件同步交割的 job 不发 wake 且完成即自清理）、有界账本 JSONL。**无 @opencode-ai 依赖、时钟/sink 可注入** |
+| `src/job-manager.ts` | job 注册表纯逻辑：job 表/环形 tail/outLen 游标、终态 first-wins + 完成量上限逐出、所有权（session 级创建、session.deleted 杀活 job+账本记 orphan、handoff 转全局+重绑根会话、dispose 全清——**dispatch 行豁免**：`disposeAll(skip)` 对带 dispatch meta 的行不杀不删，fix-dispatch-dispose-kill）、唤醒队列（单次投递、窗口期放弃、notify:false、terminal-evidence 抑制——exit 事件同步交割的 job 不发 wake 且完成即自清理）、有界账本 JSONL。**无 @opencode-ai 依赖、时钟/sink 可注入** |
 | `src/job-runner.ts` | job 执行器：四条件 race（exit 事件绑定完成——对 stdio-EOF 挂死 #47350 结构免疫；success_pattern；idle_ms 归还 still-running 不杀；max_wait_ms 硬顶不杀）、管道捕获+磁盘 tee+日志轮转（keep 50）、`FORGE_JOB_ID` env 标记（≠ watchdog 的 `FORGE_WATCHDOG_MARK`）、run_in_background 立即返回、pollJob ≤30s 有界等待、terminalEvidence 打标（foregroundWatch && 未 settle 时该次终态即内联交割；后台启动永不打标） |
 | `src/watchdog.ts` | 内置 shell 停滞哨兵引擎（纯逻辑）：计时表（before/after 生命周期、markerSeen 集——shell.env 先于 before 触发也不会误判）、单例 interval 扫描器（off 模式完全惰性）、分级处置（80% warn / 阈值 locate→杀树→账本 / 无进程或击杀后无 after → unresolved 诚实上报 / marker 缺失自动降级 dry-run）、`acted` 单次标志、有界 JSONL 账本（200 条轮转）。**无 @opencode-ai 依赖，时钟/sink/locate/kill 全注入** |
 | `src/proc-locate.ts` | 跨平台进程定位：POSIX `/proc/*/environ` NUL 分隔精确匹配标记；Windows 宿主子孙树闭包 × CreationDate ≥ t0 推算（CIM JSON 注入 fake 可测）；两路统一 `locate(callID, t0)` 接口 |
@@ -79,13 +79,40 @@
     supervisor（隐藏同撤）。
 8. **派发结局诚实**（dispatch-stream-loss-honesty）：每个派发结局恰为
    `completed`（exit 0）/`failed`（exit 1）/`stream-lost/unknown`（exit-null
-   安顿）三类。持续全不可读轮询视图（status+messages 双失败满 streak）或
+   安顿）三类；第四类 `aborted`（注册表击杀）见第 9 条。持续全不可读轮询视图（status+messages 双失败满 streak）或
    结果流无最终报告满一个通知间隔 → `stream-lost/unknown`：措辞固定
    "result stream lost; child state UNKNOWN (possibly still running)"，
    **绝无** exit-1 死亡证明/讣告；台账（dispatch-log.jsonl）记
    `stream-lost/unknown` 带最后活动时间戳。每条派发 prompt 注入 standing
    报告文件契约（`reports/<task-id>-report.md`，幂等
    `withReportDelivery`）——视图丢失后该文件是地面真相恢复通道，重派前必读。
+ 9. **击杀结局与裁定优先**（fix-dispatch-dispose-kill）：派发行的第
+    四类结局是 `aborted`——合法的注册表击杀只有三种来源：owner 会话
+    终结（session.deleted 收割）、用户取消杆（`/forge stop` 与 per-id
+    `cancel`）、对派发行的显式 `forge_jobs kill`；**插件 dispose 不是
+    击杀触发器**（多上下文宿主上别的上下文被回收，在飞的派发照跑）。
+    看守循环在**每一处可能对观测裁决下手之前**先查注册表击杀（切片
+    顶、消费宿主信号前、每次轮询后、收尾 `markTerminal` 前）——2.4.0
+    上被中止的孩子会以 `session.execution.failed` 或"看似跑完"的
+    文本浮现，击杀前这些裁决曾把用户取消记成 `error` 并喂进熔断器；
+    现在击杀裁定一律胜出，journal 记 `aborted`。**理由同源**：击杀钩子
+    在击杀那一刻把一句话盖在行上（`meta.abortReason`），journal 终态
+    与唤醒都渲染这同一句——三种来源各有一句常量（`REGISTRY_KILL_
+    ABORT_REASON` / `USER_LEVER_ABORT_REASON` / `EXPLICIT_KILL_
+    ABORT_REASON`），措辞在单测里逐字钉死。abort 未证实（失败/不可
+    用）→ journal 理由附注 + 唤醒披露"孩子可能还在跑"。击杀结案是
+    一次终态迁移：**照常泵该会话的派发队列**（fold D——曾被提前
+    `return` 跳过，见 `settleKilled`）。重试重生窗口（建新孩子 / 发
+    提示词期间）落下的击杀同样兑现：建孩子期间落下 → 新孩子不发提示
+    词、仅作清理中止，行仍点名上一次尝试的孩子；发提示词期间落下 →
+    行改绑新孩子后中止。宿主执行错误的嵌套对象经
+    `executionErrorDetail` 渲染成可读文本（message/name/error/reason/
+    data → 截断 JSON），**永不** `[object Object]`；无法序列化或读取
+    即抛的对象返回 undefined 交调用方兜底，函数本身全定义、不抛。
+    取消杆的中止后空闲确认（`assertChildIdleAfterAbort`）读 v2 的
+    active-session 视图（`GET /api/session/active`），**每次读都以断言
+    窗口为上限**——读挂起只会得出如实的 unresolved，绝不拖住 cancel
+    或串行的 `/forge stop`；回执三态：确认空闲 / 抗拒 / 读不出。
 
 ## v1 / v2 双入口（全功能对等）
 

@@ -149,19 +149,128 @@ native child was running.
   tracker feed later; the walk itself is host-agnostic and already runs on
   both — v1 adoption is deferred, not designed here.
 
+## D8. Live-host repair of the hollow gate (sandbox E2E 2026-11-23; host 2.3.2 → re-verified on 2.4.0)
 
-## D7 鈥?缂洪櫡 B 瑕嗙洊锛氭浜嗙殑瀛╁瓙蹇呴』鍙啋 crew锛堢敤鎴?2026-11-24 鏅ㄨ鍐筹級
+Task 4.2's first live run failed: two `[forge:crew-continue]` briefs landed
+while a native child was verifiably running, and the brief that did land
+carried no outcome digest. Two independent root causes, both proven on the
+live host before any code moved.
 
-鏄ㄦ櫄 7 灏忔椂鎹熷け = 涓や釜缂洪櫡鍙犲姞锛?
-- **缂洪櫡 A锛堟湰 change 鏍稿績锛?*锛氶棬鐩测啋鐩插偓鈫掓瘡鍙?鍦ㄧ瓑"閮芥槸闆跺姩浣滃洖鍚堚啋
-  鍋?no-progress 璁℃暟鎶婂紩鎿庡偓鍋滐紙stall锛夆啋鍐嶆棤 nudge銆侱1-D5 宸蹭慨
-  锛堟姂鍒朵笉鏄?turn锛岀瓑寰呮案涓嶇Н绱?streak锛夈€?- **缂洪櫡 B**锛歸ave 瀛╁瓙鐨勬淳鍙戝彞鏌勮秴鏃舵妸瀹?*涓€?abort**锛屽畬鎴愰€氱煡鍙?  error锛屽紩鎿庡張宸?stall鈥斺€斾袱鏉″敜閱掗摼鍚屾椂鍝戞帀銆俛bort 鏈韩鏄涓?
-  harness 棰嗗煙锛屾彃浠?*鎷︿笉浣?*锛涙彃浠舵嫢鏈夌殑鏄細**灏镐綋缁濅笉闈欓粯**銆?
-鑼冨洿鍐呬慨澶嶏紙鎶樺叆 2.2 + spec 鏂板満鏅?"An aborted native child wakes
-the crew with its outcome"锛夛細
+### D8.1 The walk was structurally empty — dedicated `nativeChildWalker`
 
-- tracker 璁板綍姣忎釜瀛╁瓙鐨勭粓鎬?**outcome**锛坰ucceeded/failed/
-  interrupted锛涙潵婧愮粓鎬佷簨浠?+ 鍥炴函鏃?Session.Info.outcome锛夈€?- re-arm 鐨?continuation brief 鎼哄甫姣忕粓鎬佸瀛愪竴琛?digest锛堝瀛愪細璇?  id + outcome锛夆€斺€攊nterrupted 鐨勫瀛愬湪鎻掍欢鐭ラ亾鐨勫綋涓嬭鐐瑰悕姝讳骸銆?- 鍑€鏁堟灉锛氶棬鍦ㄥ満鏃讹紝鏄ㄦ櫄鐨勫簭鍒椾互鍒嗛挓璁♀€斺€斿瀛愯 abort 鈫?tracker
-  鐪嬪埌 interrupted 鈫?re-arm brief 鎼?child ses_x interrupted"鈫掍富浼氳瘽
-  閱掓潵閲嶆淳銆俬arness 渚х殑鐪嬮棬鐙?job 閾撅紙浠婃櫒宸叉寕锛変粛鏄旱娣遍槻寰°€?
-鏄庣‘鑼冨洿澶栵細闃绘鍙ユ焺瓒呮椂 abort锛堝涓?harness 鍩燂級锛涢棬鐘舵€佽惤鐩樸€?
+The promise-layer `ctx.session` domain exposes neither `session.list` nor
+`session.status`, so the adapter handed to the gate always walked an empty
+view and failed OPEN (D2). Fix: the v2 adapter carries a DEDICATED walker
+(`nativeChildWalker`) over the host's own HTTP surfaces, on the same
+service.json channel the messages reader and the interrupt fallback already
+ride:
+
+- `GET /api/session?parentID=<id>&limit=500` — `session.list`; every row
+  carries `parentID`. The default page is "the newest 50 sessions" and that
+  cap applies to a parentID-filtered page TOO (a real 85-child parent
+  answered 50 rows by default, all 85 with `limit=500`), hence the wider
+  page; the client-side `parentID` filter in the pure core stays the
+  semantic authority.
+- `GET /api/session/active` — `session.active`: the bare map
+  `{sessionID: {type:"running"}}`; a session absent from it is inactive.
+
+Deliberately NOT `session.list`/`session.status` on the shared adapter:
+other call sites probe those names with v1-shaped expectations, and adding
+them there would silently change their behavior. Discovery is lazy per call
+and every failure THROWS — the pure core fails OPEN (D2).
+
+### D8.2 The digest lost every child created before the crew was armed
+
+The digest authority was the event tracker alone, while a fresh
+`crew_begin` registration wipes that parent's tracker rows
+(`crewEngineForgetSession` → `forgetParent`) — so a child that was already
+running when the crew was armed could never be named (live Leg B, round 1:
+one brief, no digest; the engine log had `crew skip: native child in flight`
+and no terminal line at all). Fix — **the walk is the single authority**:
+
+- at each decision the walked in-flight children enter a per-registration
+  watch set;
+- when a watched child leaves the in-flight view, its outcome is read from
+  its own session row (`outcome`: succeeded / failed / interrupted) and
+  goes into the pending digest — first report wins, so an event and the
+  walk observing the same child never name it twice;
+- a row that is gone or carries no outcome (child deleted mid-run) is
+  disclosed as UNVERIFIED, never given a verdict;
+- terminal events are accelerators only: they can settle a watched child
+  early; they can no longer be the only source.
+
+### D8.3 Suppression re-check (bounded timer)
+
+While the gate holds a crew, an unref'd interval (default
+`FORGE_CREW_NATIVE_CHILD_RECHECK_MS=5000`) re-walks the view and schedules
+the shared continuation when no child is in flight or the ceiling (D4) has
+passed. The resume therefore never depends on a further idle edge or on an
+event reaching the plugin: a child deleted mid-run (no terminal edge, and
+the host need not wake the parent) and the ceiling are both covered. The
+timer is stopped on send and evicted with the rest of the registration.
+
+### D8.4 Send-time busy check on a host without `session.status`
+
+The busy re-check before send used the session status surface, which the v2
+adapter does not have. It now reads the orchestrator's own entry in the
+walker's active map: a brief is never injected into a session that is
+mid-turn; an unreadable map leaves the prior behavior unchanged.
+
+### D8.5 Aborted-child disclosure (defect B — found by the user in the night of 2026-11-23/24)
+
+This section restates and extends the earlier "defect B coverage" note that
+closed D7 (its text had been corrupted by an encoding accident and is
+replaced by this one; nothing of it is dropped).
+
+The 7-hour stall was two defects stacked. Defect A (the core of this
+change): every suppressed nudge counted as a zero-action turn, and the
+no-progress accounting stalled the engine for good (D1–D5). Defect B: a
+wave child whose dispatch frame timed out was **aborted**, the completion
+carried only an error, and the engine stalled again — both dispatch chains
+died at once. The abort itself is host/harness territory the plugin cannot
+prevent; what the plugin owes is that it is **never silent**: detection,
+wake and disclosure. The tracker records each child's terminal **outcome**
+(succeeded / failed / interrupted; terminal event, and the session row's
+`outcome` on re-walk) and the re-armed brief carries one digest line per
+terminal child — an `interrupted` child is named dead the moment the plugin
+knows. Net effect with the gate active: child aborted → child leaves the
+in-flight view → re-arm brief names `child ses_x interrupted — DEAD` → the
+orchestrator re-dispatches. The harness-side visible-job chain remains
+defense in depth. Out of scope: preventing a caller-initiated timeout abort.
+
+### D8.6 Live evidence
+
+Host 2.3.2, final dist, legs on `7-serve-gate.mjs` (ceiling 60 s,
+`FORGE_GOAL_PROBE=1`); every leg uses its own parent and creates its child
+BEFORE the crew is armed (the order that exposed D8.2):
+
+| Leg | Result (2026-11-23 07:25–07:29 UTC) |
+| --- | --- |
+| B' child interrupted | PASS — 0 briefs before the abort; the first brief (33 s later) names `native child ses_… interrupted — DEAD`; exactly one brief names it |
+| C ceiling 60 s | PASS — 8 completed idle edges before the ceiling, 0 briefs; with no further prompt from the driver the re-check resumed the crew 11.9 s after the ceiling; one disclosure in the host log |
+| D child deleted mid-run | PASS — `DELETE` 204, no nudge and no idle edge from the driver; a brief 16.7 s later names the child; the host had woken the parent |
+| A / B | round 1 not evaluable: the driver's arm prompt let the model register with `execution:"waves"` (refused — no governing goal), so no crew existed; re-run with the engine-verified arm on host 2.4.0 — see the task 4.2 evidence |
+
+Host 2.4.0 baseline (2026-11-23): the OpenAPI diff 2.3.2 → 2.4.0 is +5
+operations (job cancel, machine link/list/create/delete), 0 removed, 0
+parameter changes; every route the walker, the messages reader and the E2E
+driver use is unchanged.
+
+### D8.7 Test hermeticity
+
+The suite must never reach the user's real host. `discoverServiceHttp` used
+to fall back to the real `~/.local/state/opencode/service.json` whenever a
+test set neither `FORGE_SERVICE_FILE` nor `XDG_STATE_HOME` — on 2026-11-23
+the full suite issued real GETs through that fallback. Inside the Node test
+runner (`NODE_TEST_CONTEXT`, or `--test` in `execArgv` for
+`--experimental-test-isolation=none`) the default location is now never
+read: an unisolated test observes "no service", exactly what a machine
+without opencode yields. Explicit fixtures stay honored and are never
+shadowed by the refusal (it is not cached). There is deliberately NO
+opt-out switch: a diagnostic that legitimately needs the real host runs
+under plain `node`. Proof: `tests/service-discovery-hermetic.test.mjs` —
+a counting fake host registered at the default location of a temp HOME
+receives ZERO requests from the runner (all three channel users: messages
+reader, walker, interrupt fallback) and exactly ONE from a plain `node`
+child reading the same location — the control that keeps the guard honest
+and confined.

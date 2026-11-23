@@ -2,7 +2,7 @@
 
 ### Requirement: User-facing dispatch cancellation
 
-The plugin `SHALL` expose a session-scoped stop lever for in-flight async dispatches: the stop route `SHALL` cancel every in-flight dispatch owned by the invoking session — and only those; dispatches owned by other sessions `SHALL` never be touched by another session's stop. Invoked for a listing, the lever `SHALL` list every in-flight dispatch on the host with its task id, target agent, child session id, owner session, and age (host-wide visibility, no session scoping on the listing). Invoked with an explicit task id, the lever `SHALL` cancel that dispatch — the explicit-id escape hatch, which MAY target another session's dispatch by explicit intent. No host-wide cancel verb `SHALL` exist: no single lever call cancels every dispatch on the host. Cancellation `SHALL` abort the child session through the existing abort engine, settle the registry row as `aborted`, record the cancellation in the ledger, and deliver a wake disclosing it. A cancelled dispatch `SHALL NOT` be retried by any resilience path.
+The plugin `SHALL` expose a session-scoped stop lever for in-flight async dispatches: the stop route `SHALL` cancel every in-flight dispatch owned by the invoking session — and only those; dispatches owned by other sessions `SHALL` never be touched by another session's stop. Invoked for a listing, the lever `SHALL` list every in-flight dispatch on the host with its task id, target agent, child session id, owner session, and age (host-wide visibility, no session scoping on the listing). Invoked with an explicit task id, the lever `SHALL` cancel that dispatch — the explicit-id escape hatch, which MAY target another session's dispatch by explicit intent. No host-wide cancel verb `SHALL` exist: no single lever call cancels every dispatch on the host. Cancellation `SHALL` abort the child session through the existing abort engine, settle the registry row as `aborted`, record the cancellation in the ledger, and deliver a wake disclosing it. A cancelled dispatch `SHALL NOT` be retried by any resilience path. Each cancellation receipt (the per-id cancel, and every row of a stop) `SHALL` report the post-abort idle confirmation honestly as one of three outcomes: the child is confirmed idle through the host's active-session view; the child did not reach idle within the assertion window (it may have resisted); or the view could not be read, so idle is unconfirmed — a receipt `SHALL` never claim a confirmed idle without a readable view, and no view read `SHALL` hold a receipt past the assertion window. Queued wishes are not in flight, so a stop does not cancel them; its receipt `SHALL` name the queued wishes of the session it did not cancel (their spawning then follows the queue contract — a slot freed by a cancelled dispatch is pumped).
 
 #### Scenario: list in-flight dispatches
 
@@ -13,7 +13,7 @@ The plugin `SHALL` expose a session-scoped stop lever for in-flight async dispat
 #### Scenario: cancel one dispatch
 
 - **WHEN** the cancel lever is invoked with an in-flight task id
-- **THEN** the child session is aborted and reaches an idle/terminal state
+- **THEN** the child session is aborted and the receipt reports the idle-confirmation outcome (confirmed idle, resisted, or unreadable view)
 - **AND** the registry row settles as `aborted` and the ledger records the cancellation
 - **AND** the owner session receives a wake disclosing the cancellation
 
@@ -31,6 +31,16 @@ The plugin `SHALL` expose a session-scoped stop lever for in-flight async dispat
 
 - **WHEN** the lever is asked to cancel `all` dispatches in one call
 - **THEN** the request is refused as an unknown route with guidance to the session-scoped stop and the per-id escape hatch
+
+#### Scenario: An unreadable idle view is disclosed, never claimed
+
+- **WHEN** the active-session view cannot be read (or a read hangs) while a cancellation's idle confirmation is running
+- **THEN** the receipt returns within the assertion window, reports that idle could not be confirmed, and makes no confirmed-idle or resisted claim
+
+#### Scenario: stop names the queued wishes it did not cancel
+
+- **WHEN** a session has queued wishes beyond the concurrency cap and the stop lever fires in that session
+- **THEN** the in-flight dispatches are cancelled, the receipt names the queued wishes as not cancelled, and a queued wish spawns into the slot a cancelled dispatch freed
 
 ### Requirement: Parent-interrupt disclosure
 
