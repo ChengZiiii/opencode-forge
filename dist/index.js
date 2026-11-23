@@ -19781,6 +19781,9 @@ ${results.join(`
     }
     if (!args.jobId)
       throw new Error(`Action "${action}" requires jobId.`);
+    if (action === "cancel" && String(args.jobId).trim().toLowerCase() === "all") {
+      throw new Error(`[forge] cancel "all" is retired — use action "stop" (cancels THIS session's in-flight dispatches) or cancel an explicit task id.`);
+    }
     const job = jobManager.get(args.jobId);
     if (!job) {
       throw new Error(jobManager.consumed(args.jobId) ? `Job ${args.jobId} was already consumed: a terminal-evidence foreground return delivered its complete output inline, so it self-cleared from the registry — no wake fires and no clear is needed.` : `No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`);
@@ -19823,9 +19826,6 @@ ${p.newOutput || "(none in this window)"}`,
       const client = dispatchClient();
       if (!client)
         throw new Error("[forge] cancel: no dispatch client on this host.");
-      if (String(args.jobId).trim().toLowerCase() === "all") {
-        throw new Error(`[forge] cancel "all" is retired — use action "stop" (cancels THIS session's in-flight dispatches) or cancel an explicit task id.`);
-      }
       const res = await cancelDispatch(client, args.jobId);
       if (!res.ok)
         return { title: `${args.jobId} not cancellable`, output: `[forge:job] ${res.text}` };

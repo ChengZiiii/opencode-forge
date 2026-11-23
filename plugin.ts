@@ -2767,6 +2767,13 @@ const forgeJobsTool = tool({
       }
     }
     if (!args.jobId) throw new Error(`Action "${action}" requires jobId.`)
+    // "all" refusal hoisted BEFORE the registry lookup (command-surface
+    // cleanup nit, flagged by the test wave): cancel "all" must always
+    // reach the retirement redirect — never a "No job all in the registry"
+    // miss on a registry that has no such row.
+    if (action === "cancel" && String(args.jobId).trim().toLowerCase() === "all") {
+      throw new Error('[forge] cancel "all" is retired — use action "stop" (cancels THIS session\'s in-flight dispatches) or cancel an explicit task id.')
+    }
     const job = jobManager.get(args.jobId)
     if (!job) {
       throw new Error(
@@ -2814,9 +2821,6 @@ const forgeJobsTool = tool({
       // refuses with the in-flight list (kill stays the generic lever).
       const client = dispatchClient()
       if (!client) throw new Error("[forge] cancel: no dispatch client on this host.")
-      if (String(args.jobId).trim().toLowerCase() === "all") {
-        throw new Error('[forge] cancel "all" is retired — use action "stop" (cancels THIS session\'s in-flight dispatches) or cancel an explicit task id.')
-      }
       const res = await cancelDispatch(client, args.jobId)
       if (!res.ok) return { title: `${args.jobId} not cancellable`, output: `[forge:job] ${res.text}` }
       return { title: `${args.jobId} cancelled (${res.idle})`, output: `[forge:job] ${res.text}` }
