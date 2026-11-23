@@ -13,6 +13,13 @@ Exit code 0 only when no check failed. A leg the sandbox cannot reach shows as
 `BOOKED` (workspace D6 rule): it is listed separately in `booked` and makes
 `hardPass` false — it never counts as a pass.
 
+A product defect the release knowingly ships shows as `KNOWN`. It never counts
+as a pass, it makes `hardPass` false, the header names it (`PASS (1 known
+defect)`), and it only exists when BOTH sides say so: the driver carries the
+failing check as a named known defect (`result.knownDefects`), AND the release
+command names it (`--accept-known <check>`). Unnamed by either side it is an
+ordinary FAIL. Every release decides again, so nothing accumulates silently.
+
 | Check | What it proves | Fails when |
 | --- | --- | --- |
 | `build-fresh` | `dist/index.js` is newer than `plugin.ts`, `src/**`, `schema/` | any source changed after the build |
@@ -22,6 +29,7 @@ Exit code 0 only when no check failed. A leg the sandbox cannot reach shows as
 | `e2e-c1-D1` | dispatch row survives a plugin dispose of the owner location | `pass` false without an inconclusive reason → FAIL; with one → BOOKED |
 | `e2e-c5-standard` | A / B / B' / D pass with host and driver on the production-default ceiling | a leg is not `true`, or the ceiling differs from the default |
 | `e2e-ceiling-C` | leg C passes with host and driver on the raised ceiling (`--ceiling-leg-ms`, default 240000) | as above |
+| `e2e-crew-full` | ONE complete crew on the live host: `crew_begin` → engine briefs → waves → verdicts → `crew_close` (goal criterion 3) | any check not `true`; a check the driver AND the release name is KNOWN, not a pass |
 | `e2e-tui-headed` | headed TUI evidence (below) is complete, on this host version, newer than dist | missing, incomplete or stale |
 | `live-typecheck` | `tsc --noEmit`, measured at gate time | non-zero exit |
 | `live-unit-suite` | `node --test tests/*.test.mjs`, measured at gate time | any fail/cancelled, or fewer than `--min-tests` (default 1001) tests |
@@ -53,8 +61,14 @@ build — an item that could not be observed is `pass: false`, with the reason i
 ## Options
 
 `--evidence <dir>` · `--tui <file>` · `--c1 <file>` · `--c5-standard <file>` ·
-`--c5-ceiling <file>` · `--host <version>` · `--min-tests <n>` ·
-`--ceiling-leg-ms <n>` · `--out <file.json>` · `--snapshot <dir>`
+`--c5-ceiling <file>` · `--crew <file>` · `--host <version>` ·
+`--min-tests <n>` · `--ceiling-leg-ms <n>` ·
+`--accept-known <check[,check]>` · `--out <file.json>` · `--snapshot <dir>`
+
+The unit suite is measured with the runner's reporter PINNED to tap
+(`--test-reporter=tap`); the parser also accepts the spec shape (`ℹ tests N`).
+The first live gate run (2026-11-23 19:59Z) parsed no counts at all — Node 24
+defaults to the spec reporter — and failed closed, as it should have.
 
 `--no-live` is a dry run for testing this script while an E2E chain owns the
 machine: the three live measures are reported as **failed** (not measured), so
