@@ -42,8 +42,29 @@
       3470/3893/4310/5116/5170），abort 失败进 abortUnconfirmedNotes
       → journal 附注 + wake 披露；stale 头注释修正（v1 prompt_async/
       abort 代际 → 2.3.2 interrupt 现实，dispatch-async.ts:8-27）
-- [ ] 2.4 测试重议 + 新增全绿（design D4 清单）、typecheck 绿、全量套件
+- [x] 2.4 测试重议 + 新增全绿（design D4 清单）、typecheck 绿、全量套件
       909+ 绿
+      — D4 五处置全落地：job-manager "dispose kills process-backed jobs
+      only — dispatch rows SURVIVE"（+ owner-end keep 行留存直至 wake 被读
+      + "plugin dispose; tree killed" ledger 类单层钉死）；host-exit
+      "dispatch rows are exempt — never killed, never marked, on dispose
+      AND signal paths"；dispatch-wiring USER ABORT 不重试 pin 保留 +
+      两处挂起修复（owner session.deleted + waitFor tracker 清空显式终
+      态 teardown：ses_caparm/ses_a3/ses_c1/ses_c2）；dispatch-journal
+      owner-death 补 wake 断言（ABORTED 措辞、无 "(no output)"、journal
+      reason 与 wake 同 kill 类）；dispatch-async abort-less client
+      （"abort unavailable on this session client" 逐字）。新增：
+      dispose 豁免 multi-session fixture（dispatch-wiring "dispose
+      exemption: A's dispatch row SURVIVES dispose…B's process job is
+      killed"）；abort-unconfirmed journal+wake 双披露（dispatch-wiring
+      "kill-path abort-unconfirmed…"）；interrupt 缝 5 例（v2-setup：
+      promise 层胜出/{interrupted:false} 成功等价/throw 拒绝/HTTP
+      fallback POST ?resume=false + Basic/双腿皆无 → 不可用文案）。
+      7 个 C1 关联文件逐个全绿（109+40+8+44 含重跑 job-manager 19/19），
+      两个前挂起文件（dispatch-wiring 44/44、dispatch-gate-wiring 8/8）
+      均 COMPLETE（13.4s / 1.0s 退出）；`npm run typecheck` 绿。全量套件
+      909+ 绿 deferred：并行波次正在改 plugin.ts/plan-file，全量跑会撞
+      其在途实现 —— 由后续波次收口（本任务按 C1 文件门收账）
 
 ## 3. Sandbox E2E verification（GATE）
 

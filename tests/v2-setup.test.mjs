@@ -759,3 +759,115 @@ test("v2 adapter messages: discovery recovers after a late service.json (fail-th
     resetServiceHttpDiscoveryForTests()
   }
 })
+
+// ---------------------------------------------------------------------------
+// fix-dispatch-dispose-kill D3: the v2 abort seam = session.interrupt. The
+// 2.3.2 host ships NO abort endpoint (openapi.json probe: 142 paths, zero
+// abort); the sanctioned stop surface is POST /api/session/{id}/interrupt
+// (optional resume param, 200 {interrupted:boolean} — idle interruption is a
+// no-op). The adapter wires it as `abort` with two legs in order: the
+// promise layer ctx.session.interrupt({sessionID, resume:false}) first, the
+// service.json HTTP channel second. {interrupted:false} is
+// success-equivalent (the child already finished).
+// ---------------------------------------------------------------------------
+
+test("v2 adapter abort (interrupt seam): promise-layer interrupt wins — flat {sessionID, resume:false} spelling, {interrupted:true} resolves", async () => {
+  const interrupts = []
+  const ctx = {
+    session: {
+      prompt: async () => {},
+      get: async () => ({}),
+      create: async () => ({ id: "ses_x" }),
+      interrupt: async (input) => {
+        interrupts.push(input)
+        return { interrupted: true }
+      },
+    },
+  }
+  const adapter = v2SessionClientForTests(ctx)
+  assert.ok(typeof adapter?.session.abort === "function", "the interrupt seam is wired as abort")
+  const res = await adapter.session.abort({ path: { id: "ses_child_i" } })
+  assert.equal(interrupts.length, 1, "the promise-layer interrupt fired exactly once")
+  assert.deepEqual(interrupts[0], { sessionID: "ses_child_i", resume: false }, "the live-host flat spelling with resume:false")
+  assert.deepEqual(res, { interrupted: true }, "the interrupt response resolves through")
+})
+
+test("v2 adapter abort (interrupt seam): {interrupted:false} on an idle child is SUCCESS-EQUIVALENT (resolved, never thrown)", async () => {
+  const ctx = {
+    session: {
+      prompt: async () => {},
+      get: async () => ({}),
+      create: async () => ({ id: "ses_x" }),
+      interrupt: async () => ({ interrupted: false }),
+    },
+  }
+  const adapter = v2SessionClientForTests(ctx)
+  const res = await adapter.session.abort({ sessionID: "ses_idle_child" })
+  assert.deepEqual(res, { interrupted: false }, "no throw — the idle no-op is success-equivalent")
+})
+
+test("v2 adapter abort (interrupt seam): interrupt throwing REJECTS the seam (the kill path journals it as abort-unconfirmed)", async () => {
+  const ctx = {
+    session: {
+      prompt: async () => {},
+      get: async () => ({}),
+      create: async () => ({ id: "ses_x" }),
+      interrupt: async () => {
+        throw new Error("interrupt refused")
+      },
+    },
+  }
+  const adapter = v2SessionClientForTests(ctx)
+  await assert.rejects(
+    () => adapter.session.abort({ path: { id: "ses_refused" } }),
+    /interrupt refused/,
+    "a failed interrupt surfaces as a rejection — the caller's unconfirmed disclosure carries it",
+  )
+})
+
+test("v2 adapter abort (interrupt seam): no promise layer → HTTP fallback POSTs the sanctioned interrupt surface with Basic auth", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
+  const svcFile = join(dir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48010", password: "pw9" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  const hits = []
+  globalThis.fetch = async (url, init) => {
+    hits.push({ url: String(url), method: init?.method, auth: init?.headers?.authorization })
+    return { ok: true, status: 200, text: async () => JSON.stringify({ interrupted: true }) }
+  }
+  try {
+    const adapter = v2SessionClientForTests(svcCtx()) // no interrupt on the ctx session domain
+    const res = await adapter.session.abort({ path: { id: "ses_http_child" } })
+    assert.deepEqual(res, { interrupted: true }, "the live-shape 200 body parses through")
+    assert.equal(hits.length, 1)
+    assert.equal(hits[0].url, "http://127.0.0.1:48010/api/session/ses_http_child/interrupt?resume=false", "the sanctioned interrupt endpoint with resume=false")
+    assert.equal(hits[0].method, "POST")
+    assert.match(hits[0].auth, /^Basic /, "Basic auth rides the service channel")
+  } finally {
+    globalThis.fetch = prevFetch
+    rmSync(dir, { recursive: true, force: true })
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})
+
+test("v2 adapter abort (interrupt seam): NO interrupt and NO service discovery → the honest unavailable error (never a swallowed TypeError)", async () => {
+  process.env.FORGE_SERVICE_FILE = join(tmpdir(), "forge-svc-nonexistent3-", "service.json")
+  resetServiceHttpDiscoveryForTests()
+  try {
+    const adapter = v2SessionClientForTests(svcCtx())
+    await assert.rejects(
+      () => adapter.session.abort({ path: { id: "ses_none" } }),
+      (err) => {
+        assert.match(String(err?.message ?? err), /abort unavailable on this session client/, "the stable unavailable contract")
+        assert.match(String(err?.message ?? err), /service\.json discovery failed/, "the missing second leg is named")
+        return true
+      },
+    )
+  } finally {
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
+})

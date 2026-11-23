@@ -111,6 +111,57 @@ test("3.1 exit matrix: 'after' teardown (fence dispose) runs even with zero jobs
   assert.ok(afterRan)
 })
 
+test("3.1 exit matrix: dispatch rows are exempt — never killed, never marked, on dispose AND signal paths", () => {
+  // fix-dispatch-dispose-kill D1: isDispatchRow-filtered rows ride NO exit
+  // path. Their children are server-side sessions (no local pid), and an
+  // exit-time kill is pure destruction (journal aborted → recovery skips a
+  // live child) — so killOne must skip them before killTree AND markTerminal.
+  const manager = createJobManager()
+  const killed = []
+  const dispatchJob = manager.create({
+    id: "j-dispatch",
+    cmd: "dispatch row",
+    worktree: "/w",
+    ownerSession: "s",
+    logPath: "C:/nowhere/d.log",
+    notify: true,
+    killTree: () => killed.push("j-dispatch"),
+    dispatch: { agentID: "forge-dp-research", childSessionID: "ses_child_x", description: "dispatch row" },
+  })
+  jobWith(manager, { pid: 501 })
+  const tk = fakeTaskkill()
+  const skipDispatch = (job) => job.dispatch != null
+  const cleanup = createExitCleanup(manager, { spawnSyncFn: tk, platform: "win32", noWait: true, skip: skipDispatch })
+  cleanup.trigger("dispose")
+  cleanup.uninstall()
+  assert.deepEqual(killed, [], "the dispatch row's killTree NEVER ran")
+  assert.equal(dispatchJob.state, "running", "the dispatch row is never marked killed")
+  assert.ok(manager.get("j-dispatch"), "the dispatch row stays in the registry")
+  assert.deepEqual(
+    tk.calls.map((c) => c.args[1]),
+    ["501", "501"],
+    "the pid-backed process job is still fully killed (graceful pass + force pass)",
+  )
+  // The signal/exit paths carry the same skip (the option rides construction).
+  const manager2 = createJobManager()
+  const killed2 = []
+  const dispatchJob2 = manager2.create({
+    id: "j-dispatch2",
+    cmd: "dispatch row",
+    worktree: "/w",
+    ownerSession: "s",
+    logPath: "C:/nowhere/d2.log",
+    notify: true,
+    killTree: () => killed2.push("j-dispatch2"),
+    dispatch: { agentID: "a", childSessionID: "c", description: "d" },
+  })
+  const cleanup2 = createExitCleanup(manager2, { spawnSyncFn: fakeTaskkill(), platform: "win32", noWait: true, skip: (job) => job.dispatch != null })
+  for (const kind of ["SIGINT", "SIGTERM", "exit", "uncaughtException", "unhandledRejection"]) cleanup2.trigger(kind)
+  cleanup2.uninstall()
+  assert.deepEqual(killed2, [], "no signal/exit path kills the dispatch row")
+  assert.equal(dispatchJob2.state, "running", "state unchanged across the whole matrix")
+})
+
 test("3.1 exit matrix: process listeners are actually installed and removable", () => {
   const manager = createJobManager()
   const before = process.listenerCount("SIGINT")

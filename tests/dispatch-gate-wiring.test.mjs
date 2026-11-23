@@ -234,6 +234,12 @@ test("A (wiring): stuck-active with NO text stays honest — no completion inven
   assert.match(r.output, /Sync wait budget ended/, "the honest wait-budget handoff — NOT a fabricated completion")
   assert.match(r.output, /continues in the background/)
   assert.ok(!r.output.includes(ACTIVE_TEXTFUL_OVERRIDE_NOTE))
+  // fix-dispatch-dispose-kill 2.4: dispose no longer kills dispatch rows (the
+  // exemption is the PRODUCTION contract), so the fixture must terminate its
+  // own armed tracker — end the owner session (the legal registry kill) and
+  // wait for the row to leave the tracker before the test closes.
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_a3" } } } })
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_a3").length === 0, "armed silent tracker drained by the owner-death harvest")
 })
 
 test("A (wiring): a healthy child is unaffected (ordinary completion, no override disclosure)", async (t) => {
@@ -282,6 +288,10 @@ test("C (wiring): the terminal seam feeds the counters — a live child holds th
   assert.equal(rec.outcome, "completed")
   const r3 = await h.tool.task.execute({ subagent_type: "forge-dgw-research", prompt: "p3", run_in_background: true }, allowCtx("ses_c1", dir))
   assert.match(r3.output, /async mode/, "the freed slot re-admits")
+  // Explicit teardown (fix-dispatch-dispose-kill 2.4): dispose spares the
+  // dispatch row, so the busy p3 child is harvested via owner session end.
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_c1" } } } })
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_c1").length === 0, "p3 tracker drained by the owner-death harvest")
 })
 
 test("C (wiring): queued wishes RE-CHECK the gate at dequeue — a hot-applied tightening fails the wish as an honest error wake", async (t) => {
@@ -316,6 +326,10 @@ test("C (wiring): queued wishes RE-CHECK the gate at dequeue — a hot-applied t
   assert.match(rec.reason, /spawn refused at queue pump/)
   assert.match(rec.reason, /provider concurrency gate/)
   assert.match(rec.reason, /2\/1 live dispatch children already run on provider "zai"/, "the counted dimension and its current value are in the wake")
+  // Explicit teardown (fix-dispatch-dispose-kill 2.4): two busy children stay
+  // tracked after the dequeue check — harvest them via owner session end.
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_c2" } } } })
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_c2").length === 0, "busy trackers drained by the owner-death harvest")
 })
 
 test("C (wiring): the breaker opens on consecutive failed terminals and refuses BEFORE child creation (never provider-retry)", async (t) => {

@@ -673,6 +673,12 @@ test("sync timeout arming BYPASSES the async cap (design D3: the cap governs new
   await waitFor(() => wakesTo("ses_caparm").some((a) => String(JSON.stringify(a.body)).includes("report from ses_child_4")), "the armed wake arrives with the final report")
   const syncWakes = wakesTo("ses_caparm").filter((a) => String(JSON.stringify(a.body)).includes("report from ses_child_4"))
   assert.equal(syncWakes.length, 1, "exactly one wake carries the timed-out child's report")
+  // Explicit teardown (fix-dispatch-dispose-kill 2.4): dispose spares dispatch
+  // rows by contract, and the three cap-filling children stay busy forever —
+  // end the owner session (the legal registry kill) so their trackers drain
+  // and no test relies on process-exit cleanup.
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_caparm" } } } })
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_caparm").length === 0, "cap-filling trackers drained by the owner-death harvest")
 })
 
 // Terminal-inference soundness at the wiring layer (sync-timeout-notify):
@@ -1402,4 +1408,114 @@ test("task client guard: child creation parent directory resolves from the AUTHO
   assert.equal(r.metadata.agent, "forge-dp-research")
   assert.equal(calls.create[0].query.directory, dir, "query.directory comes from the authoritative session record, not the tool context")
   assert.equal(calls.create[0].body.parentID, "ses_moved", "parentID is the calling session")
+})
+
+// ---------------------------------------------------------------------------
+// fix-dispatch-dispose-kill 2.4 (design D1 + D4): dispose exempts dispatch
+// rows — a v2 multi-context host fires dispose on every context recycle while
+// the host keeps living, so an in-flight dispatch must survive it. Process
+// jobs keep the old dispose contract (killed). And D2: a kill path whose
+// abort FAILS never silently drops the result — the journal terminal reason
+// and the wake both disclose "abort unconfirmed".
+
+test("dispose exemption: A's dispatch row SURVIVES dispose (intact + still polling, wake still arrives); B's process job is killed", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  await h.config(emptyCfg())
+  // Session A: an in-flight async dispatch (busy child).
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "survive the recycle", run_in_background: true, description: "dispose exempt" },
+    allowCtx("ses_survive", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  // Session B: a real background PROCESS job.
+  const bCtx = { sessionID: "ses_proc", worktree: dir, directory: dir, ask: async () => ({ status: "allow" }), metadata: () => {} }
+  const started = await h.tool.forge_shell.execute({ command: `node -e "setTimeout(()=>console.log('late'),60000)"`, run_in_background: true }, bCtx)
+  const procJobId = /jobId: (j-\S+)/.exec(started.output)?.[1]
+  assert.ok(procJobId, "the process job started")
+  const listBefore = await h.tool.forge_jobs.execute({ action: "list" }, bCtx)
+  assert.ok(listBefore.output.split("\n").some((l) => l.startsWith(procJobId)), "the process job is registered before dispose")
+  // The context recycle: dispose.
+  await h.dispose()
+  // A's dispatch row: intact, state unchanged, still tracked.
+  const rows = h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_survive")
+  assert.equal(rows.length, 1, "the dispatch row survived dispose")
+  assert.equal(rows[0].childSessionID, childID, "the row still points at the live child")
+  // B's process job: the plugin dispose path runs the exit matrix FIRST
+  // (killOne: terminateTreeSync + killTree + markTerminal — no ledger emit),
+  // so the wiring-level observable is the forge_jobs registry: the row is
+  // GONE. (The "plugin dispose; tree killed" orphan ledger class is pinned
+  // at the job-manager unit layer, where disposeAll is the only kill path.)
+  await assert.rejects(
+    () => h.tool.forge_jobs.execute({ action: "poll", jobId: procJobId }, bCtx),
+    (err) => {
+      assert.match(String(err?.message ?? err), new RegExp(`(No job ${procJobId} in the registry|Job ${procJobId} was already consumed)`), "the dispose-killed process job is out of the registry")
+      return true
+    },
+  )
+  // The journal has NO aborted terminal for the spared dispatch.
+  const journalText = readFileSync(join(dir, ".opencode", "forge", "dispatch-log.jsonl"), "utf8")
+  const spared = journalText.split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l)).find((rec) => rec.id === jobId && rec.state === "terminal")
+  assert.equal(spared, undefined, "no aborted journal terminal for the spared dispatch row")
+  // The poller kept watching: the child completes LATE and the wake still
+  // arrives with the real final report.
+  setChildState(childID, "done")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_survive").length === 0, "the spared poller settles on the late completion")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_survive" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_survive")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the completion wake arrives after the dispose")
+  const wake = toOwner().map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.match(wake, /finished \(task /, "the spared dispatch completes NORMALLY (finished, real report)")
+  assert.ok(wake.includes(`report from ${childID}`), "the real final report rides the wake")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_survive" } } } })
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_proc" } } } })
+})
+
+test("kill-path abort-unconfirmed: a FAILED abort on the owner-death kill is disclosed in the journal terminal AND the wake (never void-dropped)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy", abortMode: "throw" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "unabortable child", run_in_background: true, description: "unconfirmed kill" },
+    allowCtx("ses_unconf", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  // Ordering contract: do NOT pre-idle the owner. The kill wake pushes
+  // immediately on queue only for an already-idle owner — but the abort
+  // verdict lands in abortUnconfirmedNotes ASYNC (after the abortChild
+  // promise rejects), and the wake text renders at DELIVERY time. Keeping
+  // the owner non-idle holds the wake queued until the journal proves the
+  // unconfirmed note is in, then the idle event delivers a wake that MUST
+  // carry the disclosure.
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_unconf" } } } })
+  // The journal terminal reason carries the unconfirmed disclosure.
+  const journalText = () => readFileSync(join(dir, ".opencode", "forge", "dispatch-log.jsonl"), "utf8")
+  let terminal = undefined
+  await waitFor(() => {
+    terminal = journalText().split("\n").filter((l) => l.trim()).map((l) => JSON.parse(l)).find((rec) => rec.id === jobId && rec.state === "terminal")
+    return terminal !== undefined && /abort unconfirmed/.test(terminal.reason)
+  }, "the kill terminalized the journal with the unconfirmed disclosure")
+  assert.equal(terminal.outcome, "aborted", "aborted outcome")
+  assert.match(terminal.reason, /registry kill/, "the kill reason leads")
+  assert.match(terminal.reason, /abort unconfirmed — child may still be running/, "the unconfirmed disclosure rides the journal terminal reason")
+  assert.match(terminal.reason, /session\.abort threw/, "the underlying abort failure is named")
+  // NOW deliver the held wake: the idle event renders it with the disclosure.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_unconf" } } })
+  // The wake discloses the same fact — ABORTED, never a fake finished report.
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_unconf")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the killed wake is delivered")
+  const wake = toOwner().map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.match(wake, /— ABORTED \(task /, "the wake presents the kill as an abort")
+  assert.match(wake, /abort unconfirmed — child may still be running \(session\.abort threw/, "the wake discloses the failed abort verbatim")
+  assert.match(wake, /inspect or abort it natively in the host TUI/, "the recovery pointer rides the disclosure")
+  assert.ok(!wake.includes("Final report:"), "no fake-report styling on a killed dispatch")
+  assert.ok(!wake.includes("(no output)"), "no empty-tail fake report")
+  void childID
 })

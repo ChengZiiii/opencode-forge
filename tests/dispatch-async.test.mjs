@@ -391,6 +391,16 @@ test("abortChild: calls session.abort with the child id; failure is honest", asy
   assert.match(rb.error, /threw/)
 })
 
+test("abortChild: abort-less client (no v1 abort, no v2 interrupt seam) returns the EXACT stable unavailable error", async () => {
+  // fix-dispatch-dispose-kill D3 branch 3: a client whose session domain has
+  // no abort method must degrade honestly — the exact contract string the
+  // kill-path unconfirmed disclosure carries, never a swallowed TypeError.
+  const abortLess = { session: {} }
+  const r = await abortChild(abortLess, "ses_child_1")
+  assert.equal(r.ok, false)
+  assert.equal(r.error, "abort unavailable on this session client", "the stable contract string verbatim")
+})
+
 // ---------------------------------------------------------------------------
 // Sync abort parity (task-shadow design D4): pollChild watches the
 // dispatching turn's abort signal and returns `aborted` — the caller aborts

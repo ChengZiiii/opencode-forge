@@ -113,14 +113,54 @@ test("ownership: handoff survives owner end, wake follows the rebound owner", ()
   assert.equal(deliveredOld.length, 0)
 })
 
-test("ownership: dispose kills every running job", () => {
-  const { manager } = makeManager()
+test("ownership: dispose kills process-backed jobs only — dispatch rows SURVIVE (state unchanged, row present)", () => {
+  // fix-dispatch-dispose-kill D1 renegotiation: the old pin ("dispose kills
+  // every running job") rode the dispose crutch the dispatch pollers were
+  // leaning on. Dispose kills PROCESS-backed jobs; dispatch rows (the only
+  // identity marker is the dispatch meta) are skipped by isDispatchRow —
+  // no kill, no delete, no state change: their children are server-side
+  // sessions and continuity rides the dispatch journal + restart recovery.
+  const { manager, sinkEntries } = makeManager()
   const a = makeJob(manager, "j-1")
   const b = makeJob(manager, "j-2", { ownerSession: "ses_b" })
-  manager.disposeAll()
-  assert.deepEqual(a.killed, ["j-1"])
-  assert.deepEqual(b.killed, ["j-2"])
-  assert.equal(manager.size(), 0)
+  const d = makeJob(manager, "j-d", { ownerSession: "ses_d", dispatch: { agentID: "forge-dp-research", childSessionID: "ses_child_9", description: "dispatch row" } })
+  manager.disposeAll((job) => job.dispatch != null)
+  assert.deepEqual(a.killed, ["j-1"], "process job killed by dispose")
+  assert.deepEqual(b.killed, ["j-2"], "second process job killed by dispose")
+  assert.equal(manager.get("j-1"), undefined)
+  assert.equal(manager.get("j-2"), undefined)
+  // The dispose kill class is ledgered (this layer's disposeAll is the only
+  // kill path; the plugin's wiring dispose runs the exit matrix first, so
+  // THIS is where the orphan class is pinned).
+  assert.ok(sinkEntries.some((e) => e.kind === "orphan-job" && e.jobId === "j-1" && /plugin dispose; tree killed/.test(e.detail)), "the dispose kill is ledgered with its class")
+  assert.ok(!sinkEntries.some((e) => e.kind === "orphan-job" && e.jobId === "j-d"), "the spared dispatch row leaves NO ledger entry")
+  assert.deepEqual(d.killed, [], "the dispatch row's killTree NEVER ran")
+  assert.equal(manager.get("j-d"), d.job, "the dispatch row is still present")
+  assert.equal(d.job.state, "running", "the dispatch row's state is unchanged")
+  assert.equal(manager.size(), 1, "only the dispatch row remains")
+})
+
+test("ownership: owner end with keep (dispatch rows) — killed for the wake, row STAYS in the map until read", () => {
+  // fix-dispatch-dispose-kill D2: owner death is still a LEGAL registry kill
+  // for a dispatch row (killTree runs, state flips killed, wake queues), but
+  // the row is NOT deleted synchronously — deliverWakesFor only traverses
+  // the live Map, so the queued wake must stay reachable. The row leaves via
+  // read-consumption (poll on the terminal row).
+  const { manager, sinkEntries } = makeManager()
+  const d = makeJob(manager, "j-keep", { dispatch: { agentID: "forge-dp-research", childSessionID: "ses_child_k", description: "kept row" } })
+  const plain = makeJob(manager, "j-plain")
+  manager.onSessionEnd("ses_a", (job) => job.dispatch != null)
+  assert.deepEqual(d.killed, ["j-keep"], "the dispatch row was killed (owner death is a legal registry kill)")
+  assert.equal(d.job.state, "killed", "killed state stamped")
+  assert.equal(d.job.wakeState, "queued", "the completion wake is queued")
+  assert.ok(manager.get("j-keep"), "the dispatch row STAYS in the map (wake must stay deliverable)")
+  assert.equal(manager.get("j-plain"), undefined, "non-kept rows are deleted as before")
+  assert.ok(sinkEntries.some((e) => e.kind === "orphan-job" && e.jobId === "j-keep" && /row kept for wake delivery/.test(e.detail)), "the kept-row kill is ledgered with the keep disclosure")
+  // The queued wake IS deliverable for the dead owner's session.
+  assert.equal(manager.deliverWakesFor("ses_a").length, 1, "the kept row's wake delivers")
+  // Read-consumption self-clears the terminal row.
+  manager.poll(d.job)
+  assert.equal(manager.get("j-keep"), undefined, "polling the terminal row consumes it")
 })
 
 test("wake: at most one delivery per job, only for the idle owner session", () => {

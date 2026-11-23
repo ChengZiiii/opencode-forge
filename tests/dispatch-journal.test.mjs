@@ -380,12 +380,34 @@ test("recovery: live dispatch transitions journal; the terminal record REDACTS t
   assert.ok(started.prompt?.startsWith("journal me"), "the prompt is RETAINED while non-terminal (recovery's only source; the report-file contract line appends)")
   // Owner death harvest → the record terminalizes with the prompt redacted
   // (the poller observes the registry kill at its next slice boundary).
+  // fix-dispatch-dispose-kill D2 renegotiation: mark the owner idle FIRST so
+  // the queued kill wake is pushed immediately (onWakeQueued's idle push) —
+  // then the wake wording is assertable: ABORTED + reason, never "finished"
+  // with an empty-tail "(no output)" fake report, journal reason in agreement.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_live1" } } })
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_live1" } } } })
   await waitFor(() => latestRecord(dir, started.id)?.state === "terminal", "the harvest terminalized the journal record")
   const terminal = latestRecord(dir, started.id)
   assert.ok(terminal, "a terminal record exists")
   assert.equal(terminal.state, "terminal", "terminal after harvest")
   assert.equal(terminal.prompt, undefined, "the prompt is REDACTED on the terminal record")
+  assert.equal(terminal.outcome, "aborted", "the owner-death kill is journaled as aborted (never a fake completion)")
+  assert.match(terminal.reason, /registry kill/, "the journal terminal reason names the registry kill")
+  // The killed wake: honest aborted wording.
+  const wakeTexts = () =>
+    calls.promptAsync
+      .filter((a) => a.path?.id === "ses_live1")
+      .map((a) => String(a.body?.parts?.[0]?.text ?? ""))
+      .filter((s) => s.startsWith("[forge:dispatch-complete]"))
+  await waitFor(() => wakeTexts().length >= 1, "the killed wake is delivered on the idle push")
+  const wake = wakeTexts()[0]
+  assert.match(wake, /— ABORTED \(task \S+, child session \S+\): /, "the wake presents the dispatch AS aborted with ids")
+  assert.match(wake, /registry kill \(owner session ended/, "the wake carries the kill reason")
+  assert.ok(!/finished/.test(wake), "never the 'finished' wording")
+  assert.ok(!wake.includes("(no output)"), "never an empty-tail '(no output)' fake report")
+  assert.match(wake, /did NOT finish and produced no final report/, "the honest no-report disclosure")
+  // Journal terminal reason and the wake agree on the kill class.
+  assert.match(terminal.reason, /user abort/, "the journal reason carries the same user-abort class as the wake")
   void calls
 })
 
