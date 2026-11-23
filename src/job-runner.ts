@@ -236,6 +236,7 @@ export function startJob(manager: JobManager, opts: StartOptions): StartedJob {
     stampTerminalEvidence()
     manager.markTerminal(job, "killed", null)
     maxWaitTimer && clearTimeout(maxWaitTimer)
+    job.spawnError = String(err)
     resolveSettle({ status: "exited", exitCode: null, outputTail: "", spawnError: String(err) })
     return { job, settle }
   }
@@ -353,6 +354,7 @@ export function startJob(manager: JobManager, opts: StartOptions): StartedJob {
       settled = true
       stopTimers()
       manager.markTerminal(job, "killed", null)
+      job.spawnError = err.message
       resolveSettle({ status: "exited", exitCode: null, outputTail: job.tail, spawnError: err.message })
     }
   })

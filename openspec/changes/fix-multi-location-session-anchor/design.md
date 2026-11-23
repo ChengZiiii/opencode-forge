@@ -1,6 +1,6 @@
 # Design: fix-multi-location-session-anchor
 
-> 草案，待用户批准。未证之处在 D0 明示，实现前先用探针坐实。
+> 用户已批准（2026-11-23「A+B我都批」，方案甲）。实现落地记录见 D7。
 
 ## D0 — 已证 / 未证
 
@@ -13,14 +13,47 @@
 - 后果：goal 契约落错目录、子代理 shell cwd 不存在、会话锚定来回切、
   派发 journal 落到主目录。
 
-未证（实现前的探针）：
+未证（实现前的探针）——**结论（2026-11-23/24 沙箱实证）**：
 
-- 子代理错绑具体走哪一支：`v2ToolContext` 第三级回落，还是 task 建孩子
-  时的锚定解析。时序与前者吻合。
-- 插件手里的 `session.get` 在多目录宿主上能否读到别的目录下会话的
-  `location.directory`——决定“查宿主会话记录”这一级能否成立。真机
-  `GET /api/session/<id>` 能读到（只读探针已证）；插件内部客户端同
-  待证。
+- 子代理错绑具体走哪一支：**`v2ToolContext` 第三级回落**。会话没有内存
+  绑定（新建的孩子、宿主重启后的任何会话）时直接落到 `hostWorktree`
+  ——多目录宿主上即最后初始化的目录。
+- 插件手里的 `session.get` 在多目录宿主上**能**读到别的目录下会话的
+  `location.directory`——「查宿主会话记录」这一级成立（A1–A2 单测 +
+  沙箱多目录腿）。
+
+## D6 — 版本
+
+并入 0.33.0 之后的下一次发版（= 0.33.1）。
+
+## D7 — 实现落地记录（2026-11-24）
+
+- **建出即绑定（一条绑定，三种入口）**：`bindChildToDirectory(id, dir)`
+  （空值 / 根目录值不绑；`ensureSession` 不让退化值覆盖已有绑定）。
+  - 此处新建 → `createChildSessionBound(client, input)`：建完立刻绑到
+    `parentDirectory`；五处新建调用全部改走它；
+  - 收养 / 重新武装 → `registerDispatchTask`（七处登记）：按派发自己的
+    目录绑。
+  - 设计依据：`dispose` 不动派发行（`fix-dispatch-dispose-kill` D1）。
+- **查宿主会话记录**：`hostSessionDirectory(anchorClient, sessionID)` 读
+  `{worktree, directory | location.directory}`，沿 `parentID` 上溯，上限 8
+  层、防环；取不到一律回落。
+- **`v2ToolContext`** 改为 async，返回 `{ context, defaultDirectory }`；
+  解析顺序：入参 / 别名 → 内存绑定 → **宿主会话记录** → 插件级默认
+  （此时 `defaultDirectory` 非空）。工具注册包装器改用
+  `v2AnchorClient(ctx)`；仅文本结果且真的回落时追加点名句
+  （`V2_DEFAULT_DIRECTORY_NOTE`）。
+- **测试面** `__sessionAnchorTestSurface`：`hostSessionDirectory` /
+  `resolveToolContext` / `worktreeOf` / `bindChildToDirectory` /
+  `sessionAnchorLedgerPath` / `noteLedgerBinding`。
+- **测试**：`tests/session-anchor-resolution.test.mjs`，A1–A5 对应 D3 五行。
+- **变异检查**（`mutate-batch.mjs`）：`a-1` 拆掉「查宿主会话记录」一级 →
+  A1、A2 红（A5 也红——它断言的是没用到默认目录，属正当敏感）；`a-2`
+  拆掉建出即绑定 → A4 红；`a-3` 拆掉点名句 → A3 红、A5 仍绿。全部被杀，
+  还原后 SHA256 一致。
+- **顺带加固**（同批，纯测试）：`tests/dispatch-journal.test.mjs` 第 8、9
+  条原先是零余量写法（从 `create` 推断 `started`）；包装函数多一个微任务
+  tick 后偶发红。改为等 `started` 落账 + 文件级收尾排空。
 
 ## D1 — 方案
 
@@ -66,6 +99,3 @@
    `cwd:` 在 ws 下；`goal_write` 落在 ws 的 `.opencode/goal/`。
 3. 真机（用户重启后）：新派发一个子代理，会话锚定台账绑定到本工作区。
 
-## D6 — 版本
-
-并入 0.33.0 之后的下一次发版。

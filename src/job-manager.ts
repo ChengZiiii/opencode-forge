@@ -54,6 +54,8 @@ export type Job = {
   previousRun?: boolean
   /** Terminal evidence (job-terminal-evidence): the foreground invocation that spawned this job resolved on this very transition — the complete output was delivered inline, so no wake fires and the entry self-clears from the registry. Stamped by the runner immediately before markTerminal. */
   terminalEvidence?: boolean
+  /** fix-shell-spawn-error-outcome D2: the process NEVER started (spawn threw, or the child emitted 'error' before running) — this is the spawn error text. Such a job is terminal ("killed", exitCode null); the settle result carries the same text, this field lets a later `poll` name it. */
+  spawnError?: string
 }
 
 export type JobManagerOptions = {

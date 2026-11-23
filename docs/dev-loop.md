@@ -2,7 +2,7 @@
 
 ```powershell
 bun run typecheck
-node --test tests/*.test.mjs
+node --import ./tests/lib/test-runtime-namespace.mjs --test tests/*.test.mjs
 bun run bundle        # dist 自包含重建（严禁 --packages external）
 # 常驻：bun build ./plugin.ts --outfile ./dist/index.js --target node --format esm --watch
 ```

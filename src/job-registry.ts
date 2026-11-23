@@ -183,6 +183,18 @@ function writeRaw(path: string, entries: SurvivorEntry[]): void {
 
 export function createJobRegistry(registryPath: string): JobRegistry {
   const lockPath = `${registryPath}.lock`
+  // The lock file lives BESIDE the registry, so the directory must exist
+  // before the first lock is taken — `writeRaw` creates it, but only after
+  // `acquireLock` already opened (or failed to open) the lock. On a host whose
+  // jobs directory did not exist yet (first run, or after a temp cleanup) the
+  // first job died on `openSync(lock, "wx")` with ENOENT, and since nothing
+  // else ever created the directory, every later job died the same way
+  // (found 2026-11-24 by a unit test using a fresh namespace).
+  try {
+    mkdirSync(dirname(registryPath), { recursive: true })
+  } catch {
+    // Unwritable location: the lock/open below reports it with its own error.
+  }
   // Read-modify-write under the lock; a lock that cannot be acquired inside
   // the bounded window is skipped (another host is mid-write — the next
   // mutation wins, entries are idempotent by id).

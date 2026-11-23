@@ -4,6 +4,10 @@ import { mkdtempSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
+// Direct-run parity with the suite preload (this file starts real jobs and
+// runs the config hook — both must land off the host's directories).
+import "./lib/test-runtime-namespace.mjs"
+
 import { server } from "../plugin.ts"
 
 // No real fence watcher inside wiring tests: its stdin pipe holds the event

@@ -174,6 +174,24 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
   }
 }
 
+// File-level drain. `dispose` deliberately leaves in-flight dispatches alive
+// (fix-dispatch-dispose-kill D1: on a multi-directory host the host outlives a
+// context recycle), so a test that FAILS before its own owner-deletion step
+// leaves an armed poller behind — and with a mock child that stays busy
+// forever the process never exits (2026-11-24: one failed assertion hung the
+// whole suite). Retire whatever is still tracked by the LAST host the way
+// every passing test does: delete its owner session.
+test.after(async () => {
+  const host = lastHost
+  if (!host) return
+  const owners = [...new Set(host.__forgeSubagentsTest.dispatchTasks().map((x) => x.ownerSession))]
+  for (const owner of owners) {
+    try {
+      await host.event({ event: { type: "session.deleted", properties: { info: { id: owner } } } })
+    } catch {}
+  }
+})
+
 const journalPath = (dir) => join(dir, ".opencode", "forge", "dispatch-log.jsonl")
 
 /** Seed the real journal file before boot. */
@@ -327,7 +345,9 @@ test("recovery: a QUEUED wish re-enters the queue for a live owner and SPAWNS; a
   await waitFor(() => calls.promptAsync.length >= 1, "the spawn prompt sent")
   const spawnPrompt = calls.promptAsync.map((a) => a.body?.parts?.[0]?.text ?? "").find((s) => s.includes("queued work"))
   assert.ok(spawnPrompt, "the journal prompt (its only source) rode the spawn")
-  assert.equal(latestRecord(dir, "task_q_live").state, "started", "started transition on spawn")
+  // The journal transition is a separate microtask turn after the prompt send
+  // (see the retry-recovery test below) — wait for it, never infer it.
+  await waitFor(() => latestRecord(dir, "task_q_live")?.state === "started", "started transition on spawn")
   // Dead owner: terminalized without spawning.
   await waitFor(() => latestRecord(dir, "task_q_dead")?.state === "terminal", "the dead owner's wish finalized")
   const dead = latestRecord(dir, "task_q_dead")
@@ -350,10 +370,16 @@ test("recovery: RETRY-PENDING resumes the chain when attempts remain; terminaliz
   // Attempts remain (1 < default max 2): the respawn happens with the
   // journal prompt plus the inspect-then-continue preamble.
   await waitFor(() => calls.create.length >= 1, "the retry respawned")
+  await waitFor(() => calls.promptAsync.length >= 1, "the retry prompt sent")
   const retryPrompt = calls.promptAsync.map((a) => a.body?.parts?.[0]?.text ?? "").find((s) => s.includes("resume the flaky work"))
   assert.ok(retryPrompt, "the journal prompt rode the respawn")
   assert.ok(retryPrompt.startsWith("Note: a previous attempt"), "the resume preamble is prepended")
-  assert.equal(latestRecord(dir, "task_rp1").state, "started", "the respawn journaled started")
+  // The respawn is a fire-and-forget recovery chain: `create`, the prompt and
+  // the `started` transition land on separate microtask turns. How many turns
+  // is an implementation detail (the bind-at-creation wrapper added one,
+  // 2026-11-24), so the journal state is WAITED FOR, never inferred from
+  // `create` having been called — the inferred form had a zero-tick margin.
+  await waitFor(() => latestRecord(dir, "task_rp1")?.state === "started", "the respawn journaled started")
   // Exhausted (3 > default max 2 — a retry-pending record's `attempts` is
   // the attempt SCHEDULED but never confirmed started, so only a count
   // PAST the cap is truly exhausted): honest terminal, no respawn for it.

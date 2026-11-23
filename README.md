@@ -1751,9 +1751,18 @@ resume` re-bind from the plan file on disk, which is the source of truth.
 ```bash
 npm install
 bun run typecheck     # tsc --noEmit
-node --test tests/*.test.mjs
+node --import ./tests/lib/test-runtime-namespace.mjs --test tests/*.test.mjs   # (= npm test; keeps test artifacts off the host's)
 bun run bundle        # rebuild self-contained dist/index.js (committed)
 ```
+
+The preload sets `FORGE_TEST_RUNTIME_DIR` to a private temp directory, so
+job logs, the survivor registry, the models-dev cache and the ledgers a test
+run produces never land in the directory the host's own plugin is using. A
+test file that starts real jobs imports `./lib/test-runtime-namespace.mjs`
+itself, so a direct run of that one file is isolated too. Production never
+sets the variable: every runtime path resolves exactly as before.
+`FORGE_TEST_FORGE_HOME` keeps its meaning (the HOME alias for config
+discovery).
 
 Architecture: `plugin.ts` (dual entry — v1 `server` full-featured + v2
 `setup` defensive forward-compat; the /plan and /goal command templates each

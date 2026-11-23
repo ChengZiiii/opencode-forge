@@ -72,7 +72,7 @@ import {
   type Watchdog,
 } from "./src/watchdog.ts"
 import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
-import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, parseIdentity, type CatalogSnapshot } from "./src/models-dev.ts"
+import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, parseIdentity, modelsDevCacheDir, type CatalogSnapshot } from "./src/models-dev.ts"
 import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
 import { createNativeChildTracker, nativeChildDigestLine, nativeChildEventOutcome, nativeSessionBusy, walkNativeChildren, type NativeChildClient, type NativeChildOutcome, type NativeChildWalkView } from "./src/native-child-gate.ts"
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
@@ -83,7 +83,7 @@ import { compileRosterEntry, executeRosterSync, globalAgentDirFor, planOverrideS
 import type { PoolProvenance } from "./src/dispatch-tiers.ts"
 import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
 import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, ACTIVE_TEXTFUL_OVERRIDE_NOTE, type DispatchClient, type SessionMessageLike, type StaleMode, type StaleSweepState, type TerminalStabilityState } from "./src/dispatch-async.ts"
+import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, ACTIVE_TEXTFUL_OVERRIDE_NOTE, type DispatchClient, type SessionMessageLike, type StaleMode, type StaleSweepState, type TerminalStabilityState, type CreateChildInput, type CreateChildResult } from "./src/dispatch-async.ts"
 import { buildRetryPrompt, classifyDispatchError, resolveMaxAttempts, resolveRetryBackoffMs } from "./src/dispatch-retry.ts"
 import { createDispatchGate, type DispatchGate, type ModelIdentity } from "./src/dispatch-gate.ts"
 import { withReportDelivery } from "./src/dispatch-prompt.ts"
@@ -654,7 +654,7 @@ function rememberHostAnchor(dir: string): void {
   if (process.env.FORGE_ANCHOR_PROBE) {
     try {
       appendFileSync(
-        join(tmpdir(), "forge-anchor-probe.log"),
+        join(probeTmp(), "forge-anchor-probe.log"),
         `${new Date().toISOString()} rememberHostAnchor(${JSON.stringify(dir)}) cwd=${JSON.stringify(process.cwd())}\n`,
       )
     } catch {}
@@ -674,7 +674,7 @@ function resolvePools(): PoolResolution | null {
   if (process.env.FORGE_ANCHOR_PROBE) {
     try {
       appendFileSync(
-        join(tmpdir(), "forge-anchor-probe.log"),
+        join(probeTmp(), "forge-anchor-probe.log"),
         `${new Date().toISOString()} resolvePools: resolver=${poolResolver ? "set" : "null"} anchors=${JSON.stringify([...hostAnchors])}\n`,
       )
     } catch {}
@@ -975,13 +975,13 @@ let jobsLifecycleStarted = false
 function ensureJobLifecycle(): { registry: JobRegistry | null; fence: JobFence | null } {
   if (jobsLifecycleStarted) return { registry: jobRegistry, fence: jobFence }
   jobsLifecycleStarted = true
-  const registry = createJobRegistry(registryPathFor(jobLogDir))
+  const registry = createJobRegistry(registryPathFor(jobLogDir()))
   jobRegistry = registry
   // Previous-run survivors: adopt the alive, ledger the dead (POSIX orphan
   // detection rides the same scan — there is no kernel fence there).
   const { adopted, dead } = registry.rescan(pidAlive, structuralRelocate)
   for (const entry of adopted) {
-    adoptSurvivor(jobManager, entry, { registry, logDir: jobLogDir, relocate: structuralRelocate })
+    adoptSurvivor(jobManager, entry, { registry, logDir: jobLogDir(), relocate: structuralRelocate })
   }
   for (const entry of dead) {
     jobLedgerSink({ at: new Date().toISOString(), kind: "orphan-job", jobId: entry.id, session: entry.ownerSession, detail: `previous-run survivor pid ${entry.pid} is dead (cmd: ${entry.cmd.slice(0, 120)})` })
@@ -1022,14 +1022,20 @@ function jobStage(): 0 | 2 {
   return 0
 }
 
-const jobLogDir = jobsLogDir()
-const jobLedgerPath = join(jobLogDir, "ledger.jsonl")
+// Resolved per call (fix-test-runtime-namespace-isolation): the job home is
+// `<os-tmp>/opencode-forge/jobs` with the `<os-tmp>` level from
+// forgeRuntimeTmp() — never a module-load constant, so a test's redirect is
+// honored wherever in the test body it is set.
+function jobLogDir(): string {
+  return jobsLogDir(forgeRuntimeRoot())
+}
 
 // Diagnostics ledger sink: bounded in memory by the manager; on disk a
 // JSONL file that resets once it passes 1MB.
 function jobLedgerSink(entry: Record<string, unknown>): void {
   try {
-    mkdirSync(jobLogDir, { recursive: true })
+    mkdirSync(jobLogDir(), { recursive: true })
+    const jobLedgerPath = join(jobLogDir(), "ledger.jsonl")
     if (existsSync(jobLedgerPath) && statSync(jobLedgerPath).size > 1_000_000) writeFileSync(jobLedgerPath, "")
     appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}\n`)
   } catch {
@@ -1297,9 +1303,87 @@ async function handoffTarget(sessionID: string): Promise<string | undefined> {
 // ---------------------------------------------------------------------------
 type SessionAnchorLedgerFs = { read: () => string; write: (text: string) => void; append: (text: string) => void }
 // Prod: `<os-tmp>/opencode-forge/…` (the sanctioned runtime-artifact home).
-// Tests redirect the whole namespace into the sandboxed FORGE_TEST_FORGE_HOME
-// (set before the module import) so suite binds never touch the real ledger.
-const sessionAnchorLedgerPath = join(process.env.FORGE_TEST_FORGE_HOME ?? tmpdir(), "opencode-forge", "session-anchors.jsonl")
+// Tests redirect it into the sandboxed FORGE_TEST_FORGE_HOME (the HOME alias —
+// this ledger's historical knob, unchanged) so suite binds never touch the
+// real ledger.
+// fix-session-anchor-ledger-use-time-path: the path is resolved AT USE TIME,
+// never at module load. ESM hoists every `import` above the statements of a
+// test body, so a load-time read here always saw the variable unset and the
+// suite's binds went to the REAL `<os-tmp>/opencode-forge/` ledger (verified
+// 2026-11-23: fixture sessions in that file). Production never sets the
+// variable, so its resolution is byte-identical.
+// ---------------------------------------------------------------------------
+// Runtime-artifact namespace (fix-test-runtime-namespace-isolation).
+// Every per-host runtime artifact lives under `<os-tmp>/opencode-forge/`:
+// job logs + the survivor registry + the jobs ledger, the models-dev cache,
+// the watchdog ledger, the session-anchor ledger. Production's two levels are
+// mirrored by two helpers, both resolved AT USE TIME:
+//   forgeRuntimeTmp()  = the `<os-tmp>` level
+//   forgeRuntimeRoot() = `<os-tmp>/opencode-forge` (jobs/, models-dev/,
+//                        watchdog/, session-anchors.jsonl live under it)
+// and the `<os-tmp>` level is:
+//   production             → undefined → each helper's own default (as ever)
+//   FORGE_TEST_RUNTIME_DIR → a test swaps the `<os-tmp>` level (the suite
+//                            preloads a private temp dir via --import)
+// FORGE_TEST_FORGE_HOME is NOT this axis: it stays exactly what it always was
+// — the HOME alias for config discovery, plus this ledger's historical knob.
+// Why (2026-11-24): the job directory used to be fixed at plugin module load,
+// so every unit test that spawned a real job wrote its logs into the REAL
+// directory shared with the running host plugin, overwrote the host's
+// `registry.json`, and `ensureJobLifecycle` adopted the host's live survivors
+// into the test process; every `config` hook rewrote the host's models-dev
+// snapshot. Production never sets FORGE_TEST_RUNTIME_DIR, so every path is
+// byte-identical.
+// ---------------------------------------------------------------------------
+function forgeRuntimeTmp(): string | undefined {
+  return process.env.FORGE_TEST_RUNTIME_DIR || undefined
+}
+
+function forgeRuntimeRoot(): string {
+  return join(forgeRuntimeTmp() ?? tmpdir(), "opencode-forge")
+}
+
+function sessionAnchorLedgerPath(): string {
+  // HOME alias first (unchanged), then the suite's `<os-tmp>` redirect, then
+  // the production location.
+  return join(process.env.FORGE_TEST_FORGE_HOME ?? forgeRuntimeTmp() ?? tmpdir(), "opencode-forge", "session-anchors.jsonl")
+}
+
+// The production homes, one named function each. The call sites use THESE and
+// the test surface below exposes the same functions — there is no parallel
+// formula that could drift away from what production resolves.
+function modelsDevCacheRoot(): string {
+  // loadModelsDevSnapshot takes the `opencode-forge` ROOT as its `cacheDir`
+  // and appends `models-dev` itself (src/models-dev.ts) — handing it the
+  // already-joined `<root>/models-dev` nests a second `models-dev` level.
+  return forgeRuntimeRoot()
+}
+
+function watchdogLogHome(): string {
+  return watchdogLogDir(forgeRuntimeTmp())
+}
+
+// The env-gated diagnostic probes (FORGE_*_PROBE — off in production) write
+// their logs beside the runtime artifacts, under the same `<os-tmp>` redirect,
+// so a test or a sandbox that probes never writes into the real temp root.
+function probeTmp(): string {
+  return forgeRuntimeTmp() ?? tmpdir()
+}
+
+// Test surface (fix-test-runtime-namespace-isolation D3): the resolved paths
+// of every runtime-artifact home — the production helpers themselves. Nothing
+// here runs in a production path.
+export const __runtimeNamespaceTestSurface = {
+  tmp: forgeRuntimeTmp,
+  root: forgeRuntimeRoot,
+  jobLogDir: (): string => jobLogDir(),
+  jobLedgerPath: (): string => join(jobLogDir(), "ledger.jsonl"),
+  modelsDevCacheRoot,
+  modelsDevCacheDir: (): string => modelsDevCacheDir(modelsDevCacheRoot()),
+  watchdogLogDir: watchdogLogHome,
+  probeTmp,
+  sessionAnchorLedgerPath,
+}
 let sessionAnchorLedgerFsFactory: ((filePath: string) => SessionAnchorLedgerFs) | null = null
 let sessionAnchorLedgerWarned = false
 let sessionAnchorLedgerAppends = 0
@@ -1310,22 +1394,25 @@ const poolGateLedgerNotes = new Set<string>()
 const sessionAnchorLedgerMemo = new Map<string, string>()
 
 function sessionAnchorLedgerFs(): SessionAnchorLedgerFs {
-  if (sessionAnchorLedgerFsFactory) return sessionAnchorLedgerFsFactory(sessionAnchorLedgerPath)
+  // One resolution per call: the read/write/append closures of this handle
+  // share ONE file (a FIFO compaction's read + write cannot straddle two).
+  const filePath = sessionAnchorLedgerPath()
+  if (sessionAnchorLedgerFsFactory) return sessionAnchorLedgerFsFactory(filePath)
   return {
     read: () => {
       try {
-        return readFileSync(sessionAnchorLedgerPath, "utf8")
+        return readFileSync(filePath, "utf8")
       } catch {
         return "" // missing file = no entries; real errors surface at callers
       }
     },
     write: (text) => {
-      mkdirSync(dirname(sessionAnchorLedgerPath), { recursive: true })
-      writeFileSync(sessionAnchorLedgerPath, text, "utf8")
+      mkdirSync(dirname(filePath), { recursive: true })
+      writeFileSync(filePath, text, "utf8")
     },
     append: (text) => {
-      mkdirSync(dirname(sessionAnchorLedgerPath), { recursive: true })
-      appendFileSync(sessionAnchorLedgerPath, text, "utf8")
+      mkdirSync(dirname(filePath), { recursive: true })
+      appendFileSync(filePath, text, "utf8")
     },
   }
 }
@@ -1827,7 +1914,11 @@ type AskFn = (input: {
 
 // Exported for tests (dispatch-cancel-lifecycle 4.2): the watchdog is the
 // gate() choke point itself — every door already awaits it.
-export async function gate(ask: AskFn, permission: string, title: string): Promise<void> {
+// fix-crew-close-ask-door D2: `permission` is narrowed to the gate key list
+// (GatePermissionKey) — a key the list does not carry is a type error here,
+// so a door cannot be added without also joining the list the v2 permission
+// belt derives its doors from.
+export async function gate(ask: AskFn, permission: GatePermissionKey, title: string): Promise<void> {
   const watchdogMs = resolveGateAskWatchdogMs()
   // Gated-ask watchdog (dispatch-cancel-lifecycle, gate-asks spec): every
   // door awaits THIS choke point, so the watchdog is one timed race. When
@@ -1908,6 +1999,9 @@ const GATE_PERMISSION_KEYS = [
   "forge_shell",
   "crew_close",
 ] as const
+
+// Every permission a gate() call may name (fix-crew-close-ask-door D2).
+type GatePermissionKey = (typeof GATE_PERMISSION_KEYS)[number]
 
 // The USER'S OWN explicit permission values for the gate keys, captured in
 // the config hook. The config hook mutates a MERGED config object that the
@@ -2678,7 +2772,7 @@ const forgeShellExecute = async (args: {
       cwd,
       ownerSession: context.sessionID,
       worktree: state.worktree,
-      logDir: jobLogDir,
+      logDir: jobLogDir(),
       runInBackground: args.run_in_background === true,
       ...(args.idle_ms !== undefined ? { idleMs: args.idle_ms } : {}),
       ...(args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {}),
@@ -2707,6 +2801,17 @@ const forgeShellExecute = async (args: {
     }
     const r = await started.settle
     if (r.status === "exited") {
+      // fix-shell-spawn-error-outcome D1: a command that never started is its
+      // own return form (job-supervisor: the spawn-failure form). It used to
+      // share the exited text — "Command finished", "Output was delivered in
+      // full above", "output:" — with the real reason on the fifth line
+      // (2026-11-23 real machine: three worker calls read as finished).
+      if (r.spawnError) {
+        return {
+          title: `not started`,
+          output: [`[forge:job] NOT STARTED — spawn failed; nothing was executed.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `spawn error: ${r.spawnError}`].join("\n"),
+        }
+      }
       return {
         title: `exit ${r.exitCode ?? "?"}`,
         output: [
@@ -2843,6 +2948,21 @@ const forgeJobsTool = tool({
     if (action === "poll") {
       const p = await pollJob(jobManager, args.jobId, args.waitMs ?? 0)
       if (!p) throw new Error(`No job ${args.jobId}.`)
+      // fix-shell-spawn-error-outcome D2: a terminal job whose process never
+      // started says so in its first sentence (it used to read as a plain
+      // "killed" row — indistinguishable from a command that ran and was
+      // stopped).
+      if (job.spawnError) {
+        return {
+          title: `${job.id}: not started`,
+          output: [
+            `[forge:job] ${job.id}: NOT STARTED — spawn failed; nothing was executed (terminal state: ${p.state}).`,
+            `spawn error: ${job.spawnError}`,
+            `new output:\n${p.newOutput || "(none in this window)"}`,
+            `logPath: ${p.logPath}`,
+          ].join("\n"),
+        }
+      }
       return {
         title: `${job.id}: ${p.state}`,
         output: [
@@ -3093,6 +3213,33 @@ type DispatchHandle = { jobId: string; childSessionID: string; agentID: string; 
 // session ends; the cap counts entries whose registry job is still running.
 const dispatchTasks = new Map<string, DispatchHandle>()
 
+// fix-multi-location-session-anchor (design D1 方案甲 item 1): the moment a
+// dispatch child EXISTS it is bound to the owner's resolved directory — the
+// very directory the child was created in — so its first tool call never
+// reaches the plugin-level default. On a multi-directory host that default
+// is the LAST-initialized directory: the 2026-11-23 real-machine incident had
+// a review worker (host record: this workspace) bound to the Unity project,
+// and its three forge_shell calls failed to spawn (cwd did not exist).
+// One binding, three entry shapes:
+//   - created here and now  → createChildSessionBound (parentDirectory)
+//   - adopted / re-armed    → registerDispatchTask (the dispatch's directory)
+// Both are idempotent (ensureSession never lets a degenerate value clobber).
+function bindChildToDirectory(childSessionID: string | undefined, directory: string | undefined): void {
+  if (!childSessionID || !directory || isRootish(directory)) return
+  ensureSession(childSessionID, directory)
+}
+
+async function createChildSessionBound(client: DispatchClient, input: CreateChildInput): Promise<CreateChildResult> {
+  const created = await createChildSession(client, input)
+  if (created.ok) bindChildToDirectory(created.sessionID, input.parentDirectory)
+  return created
+}
+
+function registerDispatchTask(handle: DispatchHandle, directory: string | undefined): void {
+  dispatchTasks.set(handle.jobId, handle)
+  bindChildToDirectory(handle.childSessionID, directory)
+}
+
 function inFlightAsyncDispatches(sessionID: string): string[] {
   const ids: string[] = []
   for (const [id, handle] of dispatchTasks) {
@@ -3166,7 +3313,7 @@ function failQueuedWishHonestly(wish: QueuedDispatchWish, reason: string): void 
     cmd: `dispatch ${wish.agentID}: ${wish.description} (queued, refused at spawn)`,
     worktree: wish.directory,
     ownerSession: wish.ownerSession,
-    logPath: join(jobLogDir, "dispatch", `${wish.jobId}.txt`),
+    logPath: join(jobLogDir(), "dispatch", `${wish.jobId}.txt`),
     notify: true,
     killTree: () => {},
   })
@@ -3243,7 +3390,7 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       admittedGate.set(wish.jobId, wishIdentity)
     }
     // --- spawn: same engine as the direct async path.
-    const created = await createChildSession(client, {
+    const created = await createChildSessionBound(client, {
       parentSessionID: wish.ownerSession,
       parentDirectory: wish.directory,
       agentID: wish.agentID,
@@ -3281,12 +3428,12 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       cmd: `dispatch ${wish.agentID}: ${wish.description}`,
       worktree: wish.directory,
       ownerSession: wish.ownerSession,
-      logPath: join(jobLogDir, "dispatch", `${wish.jobId}.txt`),
+      logPath: join(jobLogDir(), "dispatch", `${wish.jobId}.txt`),
       notify: true,
       killTree: dispatchKillTreeHook(client, wish.jobId, () => created.sessionID),
     })
     ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description }
-    dispatchTasks.set(wish.jobId, { jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description })
+    registerDispatchTask({ jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description }, wish.directory)
     journalTransition(
       wish.directory,
       journalRecord(
@@ -3503,7 +3650,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
           cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered)`,
           worktree: workspace,
           ownerSession: rec.ownerSession,
-          logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
+          logPath: join(jobLogDir(), "dispatch", `${rec.id}.txt`),
           notify: true,
           killTree: dispatchKillTreeHook(client, rec.id, () => childId),
         })
@@ -3535,12 +3682,12 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
       cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered, re-armed)`,
       worktree: workspace,
       ownerSession: rec.ownerSession,
-      logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
+      logPath: join(jobLogDir(), "dispatch", `${rec.id}.txt`),
       notify: true,
       killTree: dispatchKillTreeHook(client, rec.id, () => childId),
     })
     ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" }
-    dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" })
+    registerDispatchTask({ jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace)
     journalTransition(workspace, journalRecord(base, "started", { childSessionId: childId, attempts, prompt }))
     void runAsyncDispatchPoller(client, job, childId, {
       prompt,
@@ -3597,7 +3744,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
         journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`)
         return
       }
-      const respawn = await createChildSession(client, {
+      const respawn = await createChildSessionBound(client, {
         parentSessionID: rec.ownerSession,
         parentDirectory: workspace,
         agentID: rec.agent,
@@ -3626,12 +3773,12 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
         cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered retry)`,
         worktree: workspace,
         ownerSession: rec.ownerSession,
-        logPath: join(jobLogDir, "dispatch", `${rec.id}.txt`),
+        logPath: join(jobLogDir(), "dispatch", `${rec.id}.txt`),
         notify: true,
         killTree: dispatchKillTreeHook(client, rec.id, () => respawn.sessionID),
       })
       ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: respawn.sessionID, description: rec.description ?? "" }
-      dispatchTasks.set(rec.id, { jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" })
+      registerDispatchTask({ jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace)
       const nextAttempt = attempts
       journalTransition(workspace, journalRecord(base, "started", { childSessionId: respawn.sessionID, attempts: nextAttempt, prompt }))
       announceQueuedStart(
@@ -4166,12 +4313,12 @@ function rearmDispatchWatch(
     cmd: `dispatch ${input.agent}: ${input.description || "(adopted)"} (adopted, re-armed)`,
     worktree: input.workspace,
     ownerSession: input.ownerSession,
-    logPath: join(jobLogDir, "dispatch", `${input.id}.txt`),
+    logPath: join(jobLogDir(), "dispatch", `${input.id}.txt`),
     notify: true,
     killTree: dispatchKillTreeHook(client, input.id, () => input.childId),
   })
   ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: input.agent, childSessionID: input.childId, description: input.description }
-  dispatchTasks.set(input.id, { jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description })
+  registerDispatchTask({ jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description }, input.workspace)
   // Fold E continuity: the adopted watch journals a started transition (a
   // missing journal record gets one; an existing one re-affirms).
   journalTransition(input.workspace, {
@@ -4563,7 +4710,7 @@ async function runAsyncDispatchPoller(
           exitCode = 1
           break
         }
-        const respawn = await createChildSession(client, {
+        const respawn = await createChildSessionBound(client, {
           parentSessionID: job.ownerSession,
           parentDirectory: retryCtx.directory,
           agentID,
@@ -4655,7 +4802,7 @@ async function runAsyncDispatchPoller(
           updatedAt: Date.now(),
         })
         ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" }
-        dispatchTasks.set(job.id, { jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" })
+        registerDispatchTask({ jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" }, retryCtx.directory)
         // Fold E: the respawn is a journaled started transition (prompt
         // retained — a crash now recovers as a live running record).
         journalTransition(retryCtx.directory, {
@@ -5065,7 +5212,7 @@ const taskDispatchTool = tool({
       releaseGateAdmission(dispatchId)
       throw new Error(`[forge:dispatch] target refused: ${rosterRefusal}`)
     }
-    const created = await createChildSession(client, {
+    const created = await createChildSessionBound(client, {
       parentSessionID: context.sessionID,
       parentDirectory: state.worktree,
       agentID: target,
@@ -5266,7 +5413,7 @@ const taskDispatchTool = tool({
               journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`)
               throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
             }
-            const respawn = await createChildSession(client, {
+            const respawn = await createChildSessionBound(client, {
               parentSessionID: context.sessionID,
               parentDirectory: state.worktree,
               agentID: target,
@@ -5463,14 +5610,14 @@ const taskDispatchTool = tool({
           cmd: `dispatch ${target}: ${description} (sync wait ended, armed)`,
           worktree: state.worktree,
           ownerSession: context.sessionID,
-          logPath: join(jobLogDir, "dispatch", `${syncJobId}.txt`),
+          logPath: join(jobLogDir(), "dispatch", `${syncJobId}.txt`),
           notify: true,
           // Owner-death harvest parity: the manager's kill() on session end
           // aborts the child via the SDK and ledgers the orphan.
           killTree: dispatchKillTreeHook(client, syncJobId, () => childSessionID),
         })
         ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID, description }
-        dispatchTasks.set(syncJobId, { jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description })
+        registerDispatchTask({ jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description }, state.worktree)
         void runAsyncDispatchPoller(client, job, childSessionID, { prompt, directory: state.worktree, questionDeny: false })
         context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
       }
@@ -5517,14 +5664,14 @@ const taskDispatchTool = tool({
       cmd: `dispatch ${target}: ${description}`,
       worktree: state.worktree,
       ownerSession: context.sessionID,
-      logPath: join(jobLogDir, "dispatch", `${jobId}.txt`),
+      logPath: join(jobLogDir(), "dispatch", `${jobId}.txt`),
       notify: true,
       // Owner-death harvest: the manager's kill() on session end calls this —
       // the child session is aborted via the SDK and the orphan is ledgered.
       killTree: dispatchKillTreeHook(client, jobId, () => created.sessionID),
     })
     ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
-    dispatchTasks.set(jobId, { jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description })
+    registerDispatchTask({ jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description }, state.worktree)
     // Fold E: the started transition (prompt retained — the journal is the
     // only prompt source after a restart).
     journalTransition(state.worktree, {
@@ -6319,7 +6466,7 @@ const pendingContinuationTurn = new Set<string>()
 function goalProbe(line: string): void {
   if (process.env.FORGE_GOAL_PROBE) {
     try {
-      appendFileSync(join(tmpdir(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}\n`)
+      appendFileSync(join(probeTmp(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}\n`)
     } catch {}
   }
 }
@@ -7159,13 +7306,13 @@ export const server: Plugin = async (input, options) => {
     wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`)
   }
 
-  const watchdogLedger = createFileLedger(join(watchdogLogDir(), "log.jsonl"))
+  const watchdogLedger = createFileLedger(join(watchdogLogHome(), "log.jsonl"))
   const rawLocator = createLocator()
   const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1"
   const probeLine = (text: string) => {
     if (!probing()) return
     try {
-      appendFileSync(join(tmpdir(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}\n`)
+      appendFileSync(join(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}\n`)
     } catch {}
   }
   const diagnosticLocate = async (callID: string, t0: number, cmdNeedle?: string, phase2?: boolean) => {
@@ -7427,7 +7574,7 @@ export const server: Plugin = async (input, options) => {
         modelsDevCatalog = null
       } else {
         try {
-          const snapshot = await loadModelsDevSnapshot()
+          const snapshot = await loadModelsDevSnapshot({ cacheDir: modelsDevCacheRoot() })
           modelsDevCatalog = snapshot.catalog
         } catch {
           modelsDevCatalog = null
@@ -7470,7 +7617,7 @@ export const server: Plugin = async (input, options) => {
     "tool.execute.before": async (input, output) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input.tool)} session=${input.sessionID}\n`)
+          appendFileSync(join(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input.tool)} session=${input.sessionID}\n`)
         } catch {}
       }
       // hang-watchdog timing start (both builtin shell names count). The
@@ -7484,7 +7631,7 @@ export const server: Plugin = async (input, options) => {
         watchdog.track(input.callID, input.sessionID, input.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined)
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync(join(tmpdir(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}\n`)
+            appendFileSync(join(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}\n`)
           } catch {}
         }
       }
@@ -7727,7 +7874,7 @@ export const server: Plugin = async (input, options) => {
         if (process.env.FORGE_DEPTH_PROBE) {
           try {
             appendFileSync(
-              join(tmpdir(), "forge-depth-probe.log"),
+              join(probeTmp(), "forge-depth-probe.log"),
               `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}\n`,
             )
           } catch {}
@@ -7772,7 +7919,7 @@ export const server: Plugin = async (input, options) => {
       if (process.env.FORGE_DEPTH_PROBE) {
         try {
           appendFileSync(
-            join(tmpdir(), "forge-depth-probe.log"),
+            join(probeTmp(), "forge-depth-probe.log"),
             `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}\n` +
               `    input=${JSON.stringify(raw).slice(0, 600)}\n` +
               `    optionsAfter=${JSON.stringify(output.options ?? {})}\n`,
@@ -7907,20 +8054,26 @@ export const server: Plugin = async (input, options) => {
       if (process.env.FORGE_PERM_PROBE) {
         try {
           appendFileSync(
-            join(tmpdir(), "forge-perm-probe.log"),
+            join(probeTmp(), "forge-perm-probe.log"),
             `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input.id)} type=${JSON.stringify(input.type)} meta=${JSON.stringify(input.metadata)}\n`,
           )
         } catch {}
       }
       if (name === "plan_approve" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
-        // Belt for the DOORS only: if a permission request ever surfaces for
-        // them (host starts evaluating plugin tools), keep it a real ask
-        // unless explicitly denied — the 6 user-confirmation doors are never
+        // Belt for FIVE of the doors: if a permission request ever surfaces
+        // for them (host starts evaluating plugin tools), keep it a real ask
+        // unless explicitly denied — user-confirmation doors are never
         // auto-resolved in any mode (plan_close is plugin-verified, not a
         // door — plan-close-verified). forge_shell is deliberately ABSENT
         // (pass-through): its request carries whatever the host resolved
         // from the user's verbatim rules — the plugin never rewrites,
         // classifies, or forces it.
+        // crew_close is NOT in this list and never was (v1 logic left
+        // byte-identical by fix-crew-close-ask-door D7): on a v1 host the
+        // door is held by the config hook's "ask" rewrite of
+        // GATE_PERMISSION_KEYS and by the tool's own context.ask — the
+        // host's native dialog. The v2 belt derives its doors from that
+        // same key list (V2_PERMISSION_DOORS), so v2 cannot drift again.
         if (output.status !== "deny") output.status = "ask"
         return
       }
@@ -8029,7 +8182,7 @@ export const server: Plugin = async (input, options) => {
       watchdog.markSeen(input.callID)
       if (process.env.FORGE_WATCHDOG_PROBE) {
         try {
-          appendFileSync(join(tmpdir(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input.callID} hostpid=${process.pid}\n`)
+          appendFileSync(join(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input.callID} hostpid=${process.pid}\n`)
         } catch {}
       }
     },
@@ -8038,7 +8191,7 @@ export const server: Plugin = async (input, options) => {
         watchdog.untrack(input.callID)
         if (process.env.FORGE_WATCHDOG_PROBE) {
           try {
-            appendFileSync(join(tmpdir(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input.callID}\n`)
+            appendFileSync(join(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input.callID}\n`)
           } catch {}
         }
       }
@@ -8498,7 +8651,44 @@ export const __workerShellRescueTestSurface = {
   },
 }
 
-function v2ToolContext(raw: unknown): Record<string, unknown> {
+// fix-multi-location-session-anchor (design D1 方案甲 item 2): the session's
+// directory straight from the HOST's own session record — the record's
+// {worktree, directory | location.directory}, else the same read on each
+// `parentID` up the chain (bounded, cycle-safe). "" when the host gives
+// nothing. Read through the REGISTERING initialization's own client (the
+// tool closure's `ctx`), never a module-level "latest init" seam: on a
+// multi-directory host the latest-initialized directory is another
+// directory's — or already evicted.
+type V2AnchorReader = { session?: { get?: (opts: unknown) => Promise<unknown> } } | null | undefined
+const HOST_DIRECTORY_WALK_MAX = 8
+
+async function hostSessionDirectory(anchorClient: V2AnchorReader, sessionID: string): Promise<string> {
+  const get = anchorClient?.session?.get
+  if (!sessionID || typeof get !== "function") return ""
+  const seen = new Set<string>()
+  let id = sessionID
+  while (id && seen.size < HOST_DIRECTORY_WALK_MAX) {
+    if (seen.has(id)) return ""
+    seen.add(id)
+    let rec: unknown
+    try {
+      rec = await get({ path: { id } })
+    } catch {
+      return ""
+    }
+    if (rec === null || typeof rec !== "object") return ""
+    const r = rec as { worktree?: unknown; directory?: unknown; location?: { worktree?: unknown; directory?: unknown } | null; parentID?: unknown }
+    const str = (v: unknown): string => (typeof v === "string" ? v : "")
+    const here = effectiveWorktree(str(r.worktree), str(r.directory) || str(r.location?.directory))
+    if (here && !isRootish(here)) return here
+    id = typeof r.parentID === "string" ? r.parentID : ""
+  }
+  return ""
+}
+
+type V2ToolContextResolution = { context: Record<string, unknown>; defaultDirectory: string | null }
+
+async function v2ToolContext(raw: unknown, anchorClient: V2AnchorReader = anchorClientShared): Promise<V2ToolContextResolution> {
   const c = (raw ?? {}) as Record<string, unknown>
   const pickStr = (...keys: string[]): string | undefined => {
     for (const k of keys) {
@@ -8510,7 +8700,20 @@ function v2ToolContext(raw: unknown): Record<string, unknown> {
   const out: Record<string, unknown> = { ...c }
   if (out.sessionID === undefined) out.sessionID = pickStr("sessionId", "session_id")
   if (out.worktree === undefined) out.worktree = pickStr("worktree", "directory")
-  if (out.worktree === undefined && typeof out.sessionID === "string") out.worktree = sessions.get(out.sessionID)?.worktree ?? hostWorktree
+  if (out.worktree === undefined && typeof out.sessionID === "string") out.worktree = sessions.get(out.sessionID)?.worktree
+  // fix-multi-location-session-anchor item 2: the host's session record sits
+  // BETWEEN the in-memory binding and the plugin-level default. A session
+  // with no binding yet (a just-created child, anything after a host
+  // restart) used to land on the default — which on a multi-directory host
+  // is the LAST-initialized directory.
+  if (out.worktree === undefined && typeof out.sessionID === "string" && out.sessionID) out.worktree = (await hostSessionDirectory(anchorClient, out.sessionID)) || undefined
+  // Item 3: the plugin-level default is the LAST resort, and a session that
+  // lands on it is TOLD so in the tool result (defaultDirectory).
+  let defaultDirectory: string | null = null
+  if (out.worktree === undefined) {
+    out.worktree = hostWorktree
+    if (typeof out.sessionID === "string" && out.sessionID) defaultDirectory = hostWorktree || null
+  }
   if (typeof out.ask !== "function" && v2PermissionAssertFn && typeof out.sessionID === "string" && out.sessionID) {
     const sid = out.sessionID
     const agentId = typeof out.agent === "string" && out.agent ? out.agent : undefined
@@ -8524,7 +8727,29 @@ function v2ToolContext(raw: unknown): Record<string, unknown> {
       })
   }
   if (typeof out.metadata !== "function") out.metadata = () => {}
-  return out
+  return { context: out, defaultDirectory }
+}
+
+// fix-multi-location-session-anchor item 3: the one sentence that names the
+// default directory a call ran in (appended to a text result only).
+const V2_DEFAULT_DIRECTORY_NOTE = "[forge] The host gave no workspace for this session (no directory in the session record), so this call ran in the plugin's default directory"
+
+function nameDefaultDirectory(wrapped: { content: unknown; title?: unknown }, defaultDirectory: string | null): { content: unknown; title?: unknown } {
+  if (defaultDirectory === null || typeof wrapped.content !== "string") return wrapped
+  return { ...wrapped, content: `${wrapped.content}\n\n${V2_DEFAULT_DIRECTORY_NOTE}: ${defaultDirectory}` }
+}
+
+// Test surface (fix-multi-location-session-anchor D3,
+// fix-session-anchor-ledger-use-time-path D3): the resolver, the in-memory
+// binding and the ledger path, for the unit tests. Nothing here runs in a
+// production path.
+export const __sessionAnchorTestSurface = {
+  hostSessionDirectory,
+  resolveToolContext: (raw: unknown, anchorClient?: V2AnchorReader) => v2ToolContext(raw, anchorClient ?? undefined),
+  worktreeOf: (sessionID: string): string | null => sessions.get(sessionID)?.worktree ?? null,
+  bindChildToDirectory,
+  sessionAnchorLedgerPath,
+  noteLedgerBinding: noteSessionAnchorLedgerBinding,
 }
 
 // ---------------------------------------------------------------------------
@@ -8572,11 +8797,25 @@ function v2AgentNameOf(src: unknown): string | undefined {
 // Permission belt (task 3.1) — ctx.permission.hook("evaluate")
 // ---------------------------------------------------------------------------
 
-// The 6-door set EXCLUDING forge_shell, exactly the names the v1
-// permission.ask belt rewrites to ask (crew_close never surfaces a
-// permission request of its own on the ask path — parity kept verbatim;
-// plan_close is plugin-verified, not a door — plan-close-verified).
-const V2_PERMISSION_DOORS = new Set(["plan_approve", "goal_write", "goal_complete", "goal_resume", "goal_discard"])
+// fix-crew-close-ask-door D2 — DERIVED from GATE_PERMISSION_KEYS, never
+// hand-listed. The user-confirmation doors are exactly the non-exec gate()
+// permission keys (six today: plan_approve, goal_write, goal_complete,
+// goal_resume, goal_discard, crew_close). On a v2 host a tool's ask IS the
+// host's ctx.permission.assert, so the dialog a door needs exists only if
+// THIS belt rewrites the host's "allow" to "ask" on every evaluation. This
+// set used to be a second, hand-copied list without crew_close — which let
+// crew_close end a crew without asking (present since the v2 port).
+// forge_shell is deliberately absent (pass-through, shell-defang-default-
+// open); plan_close is plugin-verified, not a door (plan-close-verified).
+const V2_PERMISSION_DOORS = new Set<string>(GATE_PERMISSION_KEYS.filter((key) => key !== "forge_shell"))
+
+// Test surface (fix-crew-close-ask-door D4): the two lists above are
+// module-level constants production reaches only through gate() and the
+// belt. Nothing here runs in production paths.
+export const __permissionDoorsTestSurface = {
+  gateKeys: GATE_PERMISSION_KEYS,
+  v2Doors: V2_PERMISSION_DOORS,
+}
 
 function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
   if (typeof ctx.permission?.hook !== "function") return
@@ -8596,7 +8835,7 @@ function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
         const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof evalInput.action === "string" ? evalInput.action : undefined)
         if (process.env.FORGE_PERM_PROBE) {
           try {
-            appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}\n`)
+            appendFileSync(join(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}\n`)
           } catch {}
         }
         if (typeof name === "string" && V2_PERMISSION_DOORS.has(name)) {
@@ -8675,7 +8914,7 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
       if (evAgent && sessionID) sessionAgents.set(sessionID, evAgent)
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync(join(tmpdir(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool)} session=${JSON.stringify(sessionID)}\n`)
+          appendFileSync(join(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool)} session=${JSON.stringify(sessionID)}\n`)
         } catch {}
       }
       // Dispatch belt (tool-partition): a non-forge session must not spawn
@@ -8897,7 +9136,7 @@ function v2ContextInjection(raw: unknown): void {
         if (process.env.FORGE_MODEL_PROBE) {
           try {
             appendFileSync(
-              join(tmpdir(), "forge-model-probe.log"),
+              join(probeTmp(), "forge-model-probe.log"),
               `${new Date().toISOString()} sid=${sessionID} agent=${agentName} rewrite ${before} -> ${JSON.stringify(o.model)}\n`,
             )
           } catch {}
@@ -10030,6 +10269,12 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // tool-partition behavior (family-based hiding) is a W4 session-seam
   // concern and is deliberately NOT attempted here — only registration.
   if (typeof ctx.tool?.transform === "function") {
+    // fix-multi-location-session-anchor: the session-record read behind every
+    // tool call goes through THIS initialization's own client — the one bound
+    // to the directory instance whose sessions run these closures. A
+    // module-level "latest init" client belongs to another directory (or to
+    // an evicted instance) on a multi-directory host.
+    const toolAnchor = v2AnchorClient(ctx)
     try {
       await ctx.tool.transform(async (editor) => {
         if (typeof editor?.add !== "function") return
@@ -10044,8 +10289,9 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
             description: typeof d.description === "string" ? d.description : name,
             input: v2ToolInputSchema(d.args),
             async execute(args: unknown, toolCtx: unknown) {
-              const res = await d.execute?.(args, v2ToolContext(toolCtx))
-              return wrapV2ToolResult(res)
+              const { context, defaultDirectory } = await v2ToolContext(toolCtx, toolAnchor)
+              const res = await d.execute?.(args, context)
+              return nameDefaultDirectory(wrapV2ToolResult(res), defaultDirectory)
             },
           })
         }

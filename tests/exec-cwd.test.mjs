@@ -1,6 +1,10 @@
 import test from "node:test"
 import assert from "node:assert/strict"
 
+// Direct-run parity with the suite preload (this file starts real jobs and
+// binds real ledger rows — both must land off the host's directories).
+import "./lib/test-runtime-namespace.mjs"
+
 import { server } from "../plugin.ts"
 
 // No real fence watcher here: its stdin pipe holds the event loop open

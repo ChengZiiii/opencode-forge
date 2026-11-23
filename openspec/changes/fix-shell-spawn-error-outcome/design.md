@@ -1,6 +1,6 @@
 # Design: fix-shell-spawn-error-outcome
 
-> 草案，待用户批准。
+> 用户已批准（2026-11-23「A+B我都批」）。实现落地记录见 D6。
 
 ## D1 — 渲染分支（plugin.ts:2708-2721）
 
@@ -48,4 +48,21 @@ output:
 
 ## D5 — 版本
 
-并入 0.33.0 之后的下一次发版。
+并入 0.33.0 之后的下一次发版（= 0.33.1）。
+
+## D6 — 实现落地记录（2026-11-24）
+
+- **D1 前台分叉**：`forgeShellExecute` 的 `exited` 分支开头按 `r.spawnError`
+  返回 `title: "not started"` + 四行（`NOT STARTED` / `cwd:` / `jobId:` /
+  `spawn error:`）；结算形状不动。正常退出的那段文字里原本就有一句可选的
+  `spawn error:`（此时不可达），逐字节未动。
+- **D2 poll 的实现手段**：`pollJob` 只拿得到作业对象，拿不到结算结果，所以
+  给 `Job` 加了可选字段 `spawnError?: string`（`src/job-manager.ts`），
+  `src/job-runner.ts` 的两处启动失败点在结算的同时赋值。`poll` 首句点名
+  未启动（`<id>: NOT STARTED — spawn failed; nothing was executed (terminal
+  state: …)`），标题 `<id>: not started`。
+- **测试**：`tests/shell-spawn-error-outcome.test.mjs`，B1–B3 对应 D3 三行。
+- **变异检查**（`mutate-batch.mjs`）：`b-1` 拆掉前台 NOT STARTED 分支 → B1
+  红、B2 仍绿；`b-2` 拆掉 poll 首句 → B3 红、B1 仍绿；`b-3` 运行器两处
+  （作业对象 + 结算结果）都不再记录启动失败 → B1、B3 红、B2 仍绿。全部
+  被杀，还原后 SHA256 一致。

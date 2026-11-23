@@ -32,7 +32,7 @@ ordinary FAIL. Every release decides again, so nothing accumulates silently.
 | `e2e-crew-full` | ONE complete crew on the live host: `crew_begin` → engine briefs → waves → verdicts → `crew_close` (goal criterion 3) | any check not `true`; a check the driver AND the release name is KNOWN, not a pass |
 | `e2e-tui-headed` | headed TUI evidence (below) is complete, on this host version, newer than dist | missing, incomplete or stale |
 | `live-typecheck` | `tsc --noEmit`, measured at gate time | non-zero exit |
-| `live-unit-suite` | `node --test tests/*.test.mjs`, measured at gate time | any fail/cancelled, or fewer than `--min-tests` (default 1001) tests |
+| `live-unit-suite` | `node --import ./tests/lib/test-runtime-namespace.mjs --test tests/*.test.mjs` (same preload as `npm test`), measured at gate time | any fail/cancelled, or fewer than `--min-tests` (default 1001) tests |
 | `live-host-version` | `opencode --version` equals `--host` (default 2.4.0) | anything else |
 | `no-secret-in-evidence` | no evidence file contains the sandbox host password | a leak (the file is also refused by the snapshot) |
 

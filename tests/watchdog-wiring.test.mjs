@@ -5,6 +5,10 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { EventEmitter } from "node:events"
 
+// Direct-run parity with the suite preload (this file starts real jobs and
+// writes the watchdog ledger — both must land off the host's directories).
+import "./lib/test-runtime-namespace.mjs"
+
 process.env.FORGE_WATCHDOG_PROBE = "1"
 process.env.TMPDIR = process.env.TEMP // ledger dir follows TMPDIR/TEMP; keep it stable for reads
 
@@ -22,7 +26,10 @@ import { createJobManager } from "../src/job-manager.ts"
 import { startJob } from "../src/job-runner.ts"
 import { createFileLedger, watchdogLogDir } from "../src/watchdog.ts"
 
-const probePath = join(tmpdir(), "forge-watchdog-probe.log")
+// The plugin writes its probe log under the suite's `<os-tmp>` redirect
+// (probeTmp) — the same base here, so this file never lands in (or gets
+// deleted from) the real temp root.
+const probePath = join(process.env.FORGE_TEST_RUNTIME_DIR ?? tmpdir(), "forge-watchdog-probe.log")
 rmSync(probePath, { force: true })
 
 const fakeInput = () => ({
@@ -77,13 +84,18 @@ test("1.2 before/after lifecycle tracks and clears shell/bash calls", async () =
 })
 
 test("3.2 invalid watchdog options fall back to defaults and ledger the fallback", async () => {
-  const ledgerPath = join(watchdogLogDir(), "log.jsonl")
+  // The plugin resolves the watchdog home through the SAME base — the suite's
+  // redirected `<os-tmp>` under test, the helper default in production. Until
+  // 2026-11-24 this test read (and then DELETED) the real host's watchdog
+  // directory (fix-test-runtime-namespace-isolation).
+  const watchdogDir = watchdogLogDir(process.env.FORGE_TEST_RUNTIME_DIR)
+  const ledgerPath = join(watchdogDir, "log.jsonl")
   const before = existsSync(ledgerPath) ? createFileLedger(ledgerPath).entries().filter((e) => e.event === "config-fallback").length : 0
   await server(fakeInput(), { watchdog: { mode: "loud", stallMs: "soon" } })
   const entries = createFileLedger(ledgerPath).entries().filter((e) => e.event === "config-fallback")
   assert.equal(entries.length - before, 2, "one fallback entry per invalid knob")
   assert.ok(entries.slice(-2).every((e) => /watchdog\.(mode|stallMs)/.test(e.reason)))
-  rmSync(join(watchdogLogDir()), { recursive: true, force: true })
+  rmSync(watchdogDir, { recursive: true, force: true })
 })
 
 test("4.2 job-supervisor spawns carry the job marker but never the watchdog mark", async () => {

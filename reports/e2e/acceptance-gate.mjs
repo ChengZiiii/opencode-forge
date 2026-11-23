@@ -376,7 +376,19 @@ add(
         // at all out of it. The parser accepts both shapes anyway so a reporter
         // change can never turn the counts into a silent null again; an
         // unparseable summary is a FAIL that says so.
-        const r = spawnSync(process.execPath, ["--test", "--test-reporter=tap", "tests/*.test.mjs"], { cwd: REPO, env, encoding: "utf8", windowsHide: true, timeout: 30 * 60 * 1000, maxBuffer: 256 * 1024 * 1024 })
+        // The suite runs through the SAME preload as `npm test`
+        // (tests/lib/test-runtime-namespace.mjs): the plugin's runtime
+        // artifacts (job logs, survivor registry, caches, ledgers) must land
+        // in a private temp namespace, never in the directory the REAL host
+        // plugin is using while this gate runs (fix-test-runtime-namespace-
+        // isolation). The timeout is 10 min for a suite that takes ~30-90 s:
+        // a hung test file is a FAIL, not half an hour of silence.
+        const r = spawnSync(
+          process.execPath,
+          ["--import", "./tests/lib/test-runtime-namespace.mjs", "--test", "--test-reporter=tap", "tests/*.test.mjs"],
+          { cwd: REPO, env, encoding: "utf8", windowsHide: true, timeout: 10 * 60 * 1000, maxBuffer: 256 * 1024 * 1024 },
+        )
+        const timedOut = r.status === null && r.error?.code === "ETIMEDOUT"
         const tap = `${r.stdout ?? ""}\n${r.stderr ?? ""}`
         const num = (k) => {
           const m = [...tap.matchAll(new RegExp(`^\\s*(?:#\\s+|ℹ\\s+)?${k}\\s+(\\d+)\\s*$`, "gm"))]
@@ -392,7 +404,9 @@ add(
           status: ok ? "PASS" : "FAIL",
           detail: ok
             ? `${counts.pass}/${counts.tests} pass`
-            : unparsed
+            : timedOut
+              ? `the suite did not finish within 10 minutes (a test file is hanging — see tests/dispatch-journal.test.mjs for the drain pattern) · ${JSON.stringify(counts)}`
+              : unparsed
               ? `exit ${r.status} · the runner's summary lines were not found in its output (counts ${JSON.stringify(counts)}) · tail: ${clip(tap.trim().split(/\r?\n/).slice(-6).join(" | "), 600)}`
               : `exit ${r.status} · ${JSON.stringify(counts)} · ${JSON.stringify(notOk)}`,
           counts,

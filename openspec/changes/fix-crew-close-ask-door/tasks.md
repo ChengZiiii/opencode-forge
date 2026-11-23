@@ -2,16 +2,40 @@
 
 ## 1. Specification
 
-- [ ] 1.1 `openspec validate fix-crew-close-ask-door --strict` 绿
+- [x] 1.1 `openspec validate fix-crew-close-ask-door --strict` 绿
+      （2026-11-24T21:13Z：valid）
 
 ## 2. Implementation（design D2 / D3 / D4）
 
-- [ ] 2.1 `V2_PERMISSION_DOORS` 补 `crew_close`；注释如实
-- [ ] 2.2 单测：六道门逐个（allow→ask、ask 保持、deny 保持）+ 非门工具
+- [x] 2.1 `V2_PERMISSION_DOORS` 补 `crew_close`；注释如实
+      （做法升级为 design D2 的**派生**：`new Set(GATE_PERMISSION_KEYS.filter(k
+      => k !== "forge_shell"))`，不再手抄；`gate()` 的键参数收窄为
+      `GatePermissionKey`——往 `gate()` 传清单外的键直接过不了 typecheck。
+      v2 门集合注释、v1 权限带注释（约 7915 行）一并改实，v1 逻辑逐字节
+      未动（design D7））
+- [x] 2.2 单测：六道门逐个（allow→ask、ask 保持、deny 保持）+ 非门工具
       原样透传
-- [ ] 2.3 核实 design D3（确认框「始终允许」不会永久开门），结论回填
-- [ ] 2.4 typecheck + 全量套件全绿 + 变异检查（拿掉 `crew_close` → 2.2
+      （`tests/v2-permission.test.mjs`：六个名字在测试里写死；另加
+      `crew_close` 经 `metadata.tool` 的名字链；非门工具 8 个 × 3 个方向
+      （经 action 与经 metadata.tool 各一遍）原样透传；派生关系
+      （v2 门 ≡ `gate()` 键去掉 `forge_shell`，恰为六个）；`crew_close`
+      工具链路（两条路径各恰一次 `assert`、拒绝后 crew 仍在、报告不合格
+      在门之前被拒且零 `assert`、有目标管辖时零 `assert`）。该文件 12/12，
+      全量 1013/1013）
+- [x] 2.3 核实 design D3（确认框「始终允许」不会永久开门），结论回填
+      （源码层结论见 design D3：适配器只转
+      `sessionID/agent/action/resources/metadata`，`always` 被丢弃，插件
+      从不请求「始终允许」规则；宿主即便存了 allow 规则，权限带对每次
+      评估都改写回 `ask`。实况腿列入 3.5）
+- [x] 2.4 typecheck + 全量套件全绿 + 变异检查（拿掉 `crew_close` → 2.2
       必须失败；还原后哈希一致）
+      （2026-11-24T21:12Z，`mutate-doors.mjs`：基线 12/12 + typecheck 干净。
+      M1 运行时把 `crew_close` 滤出门集合 → 3 条门测试失败、typecheck 干净；
+      M2 把 `crew_close` 从 `GATE_PERMISSION_KEYS` 删掉 → 同样 3 条失败，
+      **且 tsc 在两处 `gate(context.ask, "crew_close", …)` 报 TS2345**
+      （类型层防漏闸生效）。两次均逐字节还原（plugin.ts sha256
+      `49cebcab7a614347…` 前后一致）。全量 1013/1013。记录
+      `view-e2e\logs\mutate-doors-report.json`）
 
 ## 3. Verification（GATE）
 
@@ -21,6 +45,7 @@
 - [ ] 3.3 完整 crew E2E：`closeGateAskedAndApproved` 通过，判定不再带
       已知缺陷
 - [ ] 3.4 有头 TUI：确认框真实可见、可答复
+- [ ] 3.5 实况核实 D3：代答一次 `always` 之后，再关一个 crew 仍弹确认
 
 ## 4. Release
 
