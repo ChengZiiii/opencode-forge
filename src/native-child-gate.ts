@@ -1,5 +1,5 @@
 // Native-child gate pure cores (change crew-continue-native-child-gate,
-// tasks 2.1/2.2, design D2/D3/D7): host-native subagents dispatched through
+// tasks 2.1/2.2, design D2/D3/D7/D8): host-native subagents dispatched through
 // the task/subagent channel are invisible to the crew-waves engine's own
 // registry — these cores give the engine native-child visibility.
 //
@@ -19,48 +19,125 @@ export type NativeChildClient = {
   }
 }
 
+/** A child of the walked session that is NOT in flight, with its own row outcome. */
+export type NativeChildSettled = {
+  childID: string
+  /** null ⇒ the host row carries no (or no known) outcome — never coerced into a verdict. */
+  outcome: NativeChildOutcome | null
+}
+
 /**
- * Task 2.1 — the decision-time walk (authoritative gate). session.list with
- * the envelope tolerance proven by findChildByParentWalk /
- * detectOrphanDispatchChildren (array | {sessions} | {data}); keep entries
- * with parentID === sessionID; cross-read client.session.status() (unwrap
- * .data, keys = busy session ids). ANY child present in the map with a
- * non-idle type ⇒ in flight. Terminal = absent from the map or type "idle".
- * Any throw / unreadable shape ⇒ false (fail-OPEN: send the nudge).
+ * One decision-time read of a session's native children (design D8 — the
+ * walk is the single authority for BOTH the gate and the outcome digest).
+ *
+ * `readable: false` ⇒ nothing is known: the view failed to read and the
+ * caller must treat it exactly like the fail-OPEN "no children in flight"
+ * (send) — AND must not conclude anything about children it is waiting on.
  */
-export async function nativeChildrenInFlight(client: NativeChildClient, sessionID: string): Promise<boolean> {
-  if (!sessionID) return false
+export type NativeChildWalkView = {
+  readable: boolean
+  /** Children of sessionID present in the active map with a non-idle type. */
+  inFlight: string[]
+  /** Children of sessionID NOT in flight (absent from the map, or idle). */
+  settled: NativeChildSettled[]
+}
+
+const unreadable = (): NativeChildWalkView => ({ readable: false, inFlight: [], settled: [] })
+
+/** Active-map entry ⇒ in flight? Absent or explicit idle = terminal (host contract). */
+function entryInFlight(entry: unknown): boolean {
+  if (entry === undefined) return false // terminal: absent from the active map
+  if (entry !== null && typeof entry === "object" && (entry as { type?: unknown }).type === "idle") return false // terminal: idle
+  return true
+}
+
+/**
+ * A session row's `outcome` validated against the terminal union. Live 2.3.2
+ * census (real host, 100 rows): succeeded / failed / interrupted / absent —
+ * any other value reads as null ("unknown"), never as a coerced verdict.
+ */
+export function nativeChildOutcome(value: unknown): NativeChildOutcome | null {
+  return value === "succeeded" || value === "failed" || value === "interrupted" ? value : null
+}
+
+/**
+ * Task 2.1 / D8 — the decision-time walk. session.list with the parentID
+ * HINT ({parentID: sessionID}) and the envelope tolerance proven by
+ * findChildByParentWalk / detectOrphanDispatchChildren (array | {sessions} |
+ * {data}); keep entries with parentID === sessionID; cross-read
+ * client.session.status() (unwrap .data, keys = busy session ids). A child
+ * present in the map with a non-idle type ⇒ in flight; every other child of
+ * the session ⇒ settled, carrying its row outcome.
+ *
+ * Any throw / unreadable shape ⇒ `readable: false` with nothing in flight
+ * (fail-OPEN, never fail-silent — design D2).
+ *
+ * The hint matters on the live host (2.3.2 OpenAPI, session.list): an
+ * unscoped GET /api/session returns "the newest 50 sessions" GLOBALLY, and
+ * the 50-row cap applies to the parentID-filtered page too (real host,
+ * 2026-11-23: a parent with 85 children — 50 rows by default, 85 with
+ * ?limit=500). Clients that ignore the hint keep working: the client-side
+ * filter below is the semantic authority, the hint only narrows the page.
+ */
+export async function walkNativeChildren(client: NativeChildClient, sessionID: string): Promise<NativeChildWalkView> {
+  if (!sessionID) return unreadable()
   try {
-    const raw = await client?.session?.list?.({})
+    const raw = await client?.session?.list?.({ parentID: sessionID })
     const body = (raw as { data?: unknown } | undefined)?.data ?? raw
     const list = Array.isArray(body)
       ? (body as Array<Record<string, unknown>>)
       : Array.isArray((body as { sessions?: unknown[] } | undefined)?.sessions)
         ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
-        : []
-    const children: string[] = []
+        : null
+    if (list === null) return unreadable() // no readable list at all
+    const rows: NativeChildSettled[] = []
     for (const s of list) {
       if (!s || typeof s.id !== "string" || !s.id) continue
       if (s.parentID !== sessionID) continue
-      children.push(s.id)
+      rows.push({ childID: s.id, outcome: nativeChildOutcome(s.outcome) })
     }
-    if (children.length === 0) return false
+    if (rows.length === 0) return { readable: true, inFlight: [], settled: [] }
     // Status cross-read exactly like detectOrphanDispatchChildren: unwrap
     // .data, keys = busy session ids ("Sessions absent from the result are
     // inactive" — host contract).
-    if (typeof client?.session?.status !== "function") return false // unreadable ⇒ fail-open
+    if (typeof client?.session?.status !== "function") return unreadable()
     const st = await client.session.status()
     const map = (st as { data?: Record<string, unknown> } | undefined)?.data
-    if (!map || typeof map !== "object") return false // unreadable ⇒ fail-open
-    for (const id of children) {
-      const entry = map[id]
-      if (entry === undefined) continue // terminal: absent from the active map
-      if (entry !== null && typeof entry === "object" && (entry as { type?: unknown }).type === "idle") continue // terminal: idle
-      return true // a busy native child ⇒ suppressed
+    if (!map || typeof map !== "object") return unreadable()
+    const inFlight: string[] = []
+    const settled: NativeChildSettled[] = []
+    for (const row of rows) {
+      if (entryInFlight(map[row.childID])) inFlight.push(row.childID)
+      else settled.push(row)
     }
-    return false
+    return { readable: true, inFlight, settled }
   } catch {
-    return false // fail-OPEN, never fail-silent (design D2)
+    return unreadable() // fail-OPEN, never fail-silent (design D2)
+  }
+}
+
+/** Gate verdict of the walk: ANY non-idle/non-terminal native child ⇒ true. */
+export async function nativeChildrenInFlight(client: NativeChildClient, sessionID: string): Promise<boolean> {
+  return (await walkNativeChildren(client, sessionID)).inFlight.length > 0
+}
+
+/**
+ * D8 — the orchestrator's OWN busy state on the same active map the walk
+ * reads (the send-time idle re-check for adapters that carry no
+ * session.status — the production v2 adapter). true ⇒ present and non-idle;
+ * false ⇒ absent or idle; null ⇒ unreadable (callers keep whatever they did
+ * before this read existed).
+ */
+export async function nativeSessionBusy(client: NativeChildClient, sessionID: string): Promise<boolean | null> {
+  if (!sessionID) return null
+  try {
+    if (typeof client?.session?.status !== "function") return null
+    const st = await client.session.status()
+    const map = (st as { data?: Record<string, unknown> } | undefined)?.data
+    if (!map || typeof map !== "object") return null
+    return entryInFlight(map[sessionID])
+  } catch {
+    return null
   }
 }
 
@@ -162,11 +239,16 @@ export function nativeChildEventOutcome(type: string): NativeChildOutcome | null
 
 /**
  * D7 defect-B digest line: one line per terminal child (child id + outcome).
- * An interrupted child is disclosed as DEAD the moment the plugin knows.
+ * An interrupted child is disclosed as DEAD the moment the plugin knows. A
+ * null outcome (the row is gone or carries none) is disclosed as exactly
+ * that — a child the plugin cannot vouch for is never reported as a success.
  */
-export function nativeChildDigestLine(childID: string, outcome: NativeChildOutcome): string {
+export function nativeChildDigestLine(childID: string, outcome: NativeChildOutcome | null): string {
   if (outcome === "interrupted") {
     return `native child ${childID} interrupted — DEAD (aborted mid-run; its dispatch sentence timed out or was killed): re-dispatch the subtask or record the loss in the close report`
+  }
+  if (outcome === null) {
+    return `native child ${childID} is no longer running but the host reports no outcome for it (deleted mid-run, or its row carries none) — treat the subtask as UNVERIFIED: re-dispatch it or record the loss in the close report`
   }
   return `native child ${childID} ${outcome}`
 }
