@@ -10,13 +10,14 @@
 
 ## 2. Implementation
 
-- [ ] 2.1 `nativeChildrenInFlight` pure core (injectable client seam):
+- [x] 2.1 `nativeChildrenInFlight` pure core (injectable client seam):
   session.list with the proven envelope tolerance (array | `{sessions}` |
   `{data}`), keep `parentID === sessionID`; cross-read
   `client.session.status()` (unwrap `.data`, keys = busy ids); any child
   present ⇒ in flight; terminal = absent from map or status type `idle`.
   Fail-OPEN on any throw/unreadable shape (returns "no children in flight").
-- [ ] 2.2 `NativeChildTracker` (pure core + event feed): `session.created`
+  Evidence: src/native-child-gate.ts:31-73 (`nativeChildrenInFlight`).
+- [x] 2.2 `NativeChildTracker` (pure core + event feed): `session.created`
   carrying parentID marks `(childID, parentID)`; terminal edges
   (`session.execution.succeeded|failed|interrupted`, `session.status`
   idle, `session.idle` tolerated alias) terminalize **with the terminal
@@ -26,19 +27,38 @@
   carries a one-line digest per terminal child (child id + outcome) — an
   interrupted child is disclosed as dead the moment the plugin knows**.
   Advisory only.
-- [ ] 2.3 Wire the tracker feed into the existing `v2SubscribeEvents` loop
+  Evidence: src/native-child-gate.ts:76-152 (tracker + outcome
+  classification + digest line); plugin.ts:6148-6209
+  (`crewNoteNativeChildTerminal` re-arm + digest, `noteCrewNativeChildEvent`
+  feed); brief digest plugin.ts:6216-6228 + 6329-6334 (rides the brief,
+  cleared on delivery).
+- [x] 2.3 Wire the tracker feed into the existing `v2SubscribeEvents` loop
   (plugin.ts:8888-9010) — no new subscription, no new stream.
-- [ ] 2.4 Ceiling: `Map<sessionID, firstSuppressedAt>`; past
+  Evidence: plugin.ts:9123-9126 (single `noteCrewNativeChildEvent` call
+  inside the existing event loop, after `v2EventFields`).
+- [x] 2.4 Ceiling: `Map<sessionID, firstSuppressedAt>`; past
   `FORGE_CREW_NATIVE_CHILD_CEILING_MS` (default `900_000`) stop
   suppressing for the registration, send once, one bounded `console.warn`
   disclosure; fresh `crew_begin` clears the marker.
-- [ ] 2.5 Gate hook in `continueCrewIfEligible`: after the `crewStalled`
+  Evidence: plugin.ts:6120+6127 (ceiling const + map), 6263-6287 (expiry →
+  send-once + bounded warn + stop-suppressing); cleared by fresh
+  crew_begin via `crewEngineForgetSession` (plugin.ts:5817 → 6102-6104).
+- [x] 2.5 Gate hook in `continueCrewIfEligible`: after the `crewStalled`
   (plugin.ts:6046) and family re-check (:6053), BEFORE `crewPendingTurn`
   accounting (:6059) — a suppressed nudge is not a turn (no streak, no
   transport-failure count, no ledger effect).
-- [ ] 2.6 Eviction: gate state (tracker entries, ceiling markers) cleared
+  Evidence: plugin.ts:6255-6287 — after the family re-check (6250-6254),
+  before the `crewPendingTurn` block (6288+); the suppressed `return`
+  (6283) precedes all accounting.
+- [x] 2.6 Eviction: gate state (tracker entries, ceiling markers) cleared
   in `crewEngineForget` + `harvestSessionEnd`; zero disk state. Goal
   branch untouched.
+  Evidence: plugin.ts:6093-6105 (`crewEngineForgetSession` clears tracker
+  rows via `forgetParent`, ceiling marker, digest); harvestSessionEnd
+  calls it at plugin.ts:6665; child `session.deleted` drops its tracker
+  row via the feed (plugin.ts:6179-6183). All state in-memory (no fs
+  writes in the new code); goal branch (`continueIfEligible` goal leg)
+  unmodified.
 
 ## 3. Tests (`tests/crew-continue.test.mjs`, stub-client pattern)
 

@@ -74,6 +74,7 @@ import {
 import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
 import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, parseIdentity, type CatalogSnapshot } from "./src/models-dev.ts"
 import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
+import { createNativeChildTracker, nativeChildDigestLine, nativeChildEventOutcome, nativeChildrenInFlight, type NativeChildClient, type NativeChildOutcome } from "./src/native-child-gate.ts"
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
@@ -6094,16 +6095,132 @@ function crewEngineForgetSession(sessionID: string): void {
   crewTurnActivity.delete(sessionID)
   crewNoProgress.delete(sessionID)
   crewStalled.delete(sessionID)
+  // crew-continue-native-child-gate 2.6: gate state dies with the crew
+  // registration (tracker rows, ceiling marker, pending digest) — zero disk
+  // state. Reached from fresh crew_begin, session.deleted harvest, and the
+  // session-end evictions.
+  crewNativeChildren.forgetParent(sessionID)
+  crewNativeCeiling.delete(sessionID)
+  crewChildDigest.delete(sessionID)
+}
+
+// ---------------------------------------------------------------------------
+// Native-child gate (change crew-continue-native-child-gate, design D2-D4):
+// host-native subagents (task/subagent channel) are invisible to the crew
+// engine's own registry — the gate suppresses the idle continuation while a
+// native child of the orchestrator session is in flight. The WALK
+// (nativeChildrenInFlight, pure core in src/native-child-gate.ts) is
+// authoritative; the tracker below is the ADVISORY warm set fed by the
+// existing v2SubscribeEvents loop. All state in-memory.
+// ---------------------------------------------------------------------------
+
+// Bounded ceiling (D4): first suppression timestamp per registration; past
+// FORGE_CREW_NATIVE_CHILD_CEILING_MS the engine sends once, discloses one
+// bounded console.warn, and stops suppressing for this registration.
+const CREW_NATIVE_CHILD_CEILING_MS = Number(process.env.FORGE_CREW_NATIVE_CHILD_CEILING_MS ?? 900_000)
+// Short debounce for the last-child-terminal re-arm (D3 resume edge) —
+// shorter than the idle debounce: a deferral never depends on a further
+// idle event to resume.
+const CREW_CHILD_RESUME_DEBOUNCE_MS = Number(process.env.FORGE_CREW_CHILD_RESUME_DEBOUNCE_MS ?? 500)
+
+const crewNativeChildren = createNativeChildTracker()
+const crewNativeCeiling = new Map<string, { firstSuppressedAt: number; disclosed: boolean }>()
+// D7 defect-B: digest lines (one per terminal child: id + outcome) awaiting
+// the next crew continuation brief — an interrupted child is disclosed as
+// dead the moment the plugin knows, riding the re-armed brief.
+const crewChildDigest = new Map<string, string[]>()
+
+// Clock seam (ceiling tests advance time without waiting).
+let crewGateNow: () => number = () => Date.now()
+
+/** Test seam: inject the gate clock (null restores Date.now). */
+export function setCrewNativeChildClockForTests(now: (() => number) | null): void {
+  crewGateNow = typeof now === "function" ? now : () => Date.now()
+}
+
+/**
+ * Task 2.2 wiring — terminal-edge consequence: record the digest line for a
+ * suppressed crew's parent, and when the LAST non-terminal native child goes
+ * terminal, re-arm scheduleIdleContinuation with the short debounce. Advisory
+ * only: the re-armed pass re-runs the full guard chain (the walk re-anchors
+ * truth at the decision moment).
+ */
+function crewNoteNativeChildTerminal(parentID: string, childID: string, outcome: NativeChildOutcome, lastChildTerminal: boolean, client: GoalClient | null): void {
+  const mark = crewNativeCeiling.get(parentID)
+  if (!mark) return // not a recently suppressed crew session: advisory no-op
+  const lines = crewChildDigest.get(parentID) ?? []
+  lines.push(nativeChildDigestLine(childID, outcome))
+  crewChildDigest.set(parentID, lines)
+  goalProbe(`crew native child terminal child=${childID} outcome=${outcome} parent=${parentID} last=${lastChildTerminal}`)
+  if (lastChildTerminal && client) {
+    // D3 resume edge: never depend on a further idle event to resume.
+    scheduleIdleContinuation(client, parentID, CREW_CHILD_RESUME_DEBOUNCE_MS)
+  }
+}
+
+/**
+ * Task 2.3 — the tracker feed, called from the EXISTING v2SubscribeEvents
+ * loop (no new subscription, no new stream). Classifies the event against
+ * the tracker semantics: session.created with a parentID marks a child;
+ * the durable execution-terminal edges terminalize WITH the outcome;
+ * session.status idle / session.idle (tolerated alias, not emitted on
+ * 2.3.2) terminalize as quiescent; session.deleted drops the child row.
+ * Exported for the stub-client test wave.
+ */
+export function noteCrewNativeChildEvent(type: string, fields: Record<string, unknown>, client: GoalClient | null): void {
+  try {
+    if (type === "session.created") {
+      const info = (fields.info ?? (fields as { session?: unknown }).session) as { id?: unknown; parentID?: unknown } | undefined
+      const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId")
+      const parentID = info !== null && typeof info === "object" && typeof info.parentID === "string" && info.parentID ? info.parentID : v2PickStr(fields, "parentID", "parentId")
+      if (id && parentID) crewNativeChildren.mark(id, parentID)
+      return
+    }
+    if (type === "session.deleted") {
+      const info = fields.info as { id?: unknown } | undefined
+      const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId")
+      if (id) crewNativeChildren.drop(id)
+      return
+    }
+    const outcome = nativeChildEventOutcome(type)
+    if (outcome) {
+      const id = v2PickStr(fields, "sessionID", "sessionId")
+      if (!id) return
+      const note = crewNativeChildren.terminalize(id, outcome)
+      if (note) crewNoteNativeChildTerminal(note.parentID, id, outcome, note.lastChildTerminal, client)
+      return
+    }
+    if (type === "session.status" || type === "session.idle") {
+      // Idle edges: session.idle is the schema-present tolerated alias
+      // (NOT emitted on 2.3.2); session.status carrying type "idle"
+      // terminalizes the child as quiescent (recorded "succeeded" — the
+      // honest outcome for an idle edge; the walk remains authoritative).
+      const id = v2PickStr(fields, "sessionID", "sessionId")
+      if (!id) return
+      const st = fields.status
+      const idle = type === "session.idle" || (st !== null && typeof st === "object" && (st as { type?: unknown }).type === "idle")
+      if (!idle) return
+      const note = crewNativeChildren.terminalize(id, "succeeded")
+      if (note) crewNoteNativeChildTerminal(note.parentID, id, "succeeded", note.lastChildTerminal, client)
+    }
+  } catch {
+    // Advisory warm set: never a throw into the host.
+  }
 }
 
 // D2: the crew continuation brief. Subtask titles come from the in-memory
 // CrewEntry.subtasks — the close gate's own source, so the brief can never
-// drift from what crew_close will demand.
-function crewContinueBrief(crew: CrewEntry): string {
+// drift from what crew_close will demand. The native-child digest (D7
+// defect-B) rides the brief as one line per terminal child (id + outcome)
+// when the gate collected outcomes during a suppression episode.
+function crewContinueBrief(crew: CrewEntry, childDigest: ReadonlyArray<string> = []): string {
   return [
     `[forge:crew-continue] The crew "${crew.objective}" is armed (waves) — continue the wave discipline.`,
     `Declared plan (every subtask needs a verdict at close):`,
     ...crew.subtasks.map((s, i) => `${i + 1}. ${s.title}`),
+    ...(childDigest.length > 0
+      ? [`Native child outcomes since the last brief (one line per child — an interrupted child is DEAD, never silently stranded):`, ...childDigest.map((l) => `- ${l}`)]
+      : []),
     `Next: dispatch the next wave (parallel task calls — forge-* workers from this session's pool, or the native general subagent when no forge worker fits), collect per-subtask evidence verdicts, at most one retry per subtask, then crew_close with the full report. Stalled or wrong decomposition? crew_close {abandon: true, reason} to re-shard.`,
   ].join("\n")
 }
@@ -6135,6 +6252,38 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
   if (!sessionIsForgeFamily(sessionID)) {
     goalProbe(`crew skip: agent switched to non-forge before send session=${sessionID}`)
     return
+  }
+  // Native-child gate (crew-continue-native-child-gate D2/D4/D5): the
+  // decision-time walk is authoritative — ANY non-idle/non-terminal
+  // host-native child of this session suppresses the nudge. Fail-OPEN:
+  // an unreadable view is "no children in flight" (a false in-flight
+  // strands the crew; a false idle costs one redundant brief). Hooked
+  // BEFORE the crew no-progress accounting: a suppressed nudge is not a
+  // turn (no streak, no transport-failure count, no ledger effect).
+  if (await nativeChildrenInFlight(client as unknown as NativeChildClient, sessionID)) {
+    const now = crewGateNow()
+    const mark = crewNativeCeiling.get(sessionID)
+    if (mark && mark.disclosed) {
+      // Past the ceiling for this registration: suppression already
+      // stopped — fall through and send.
+      goalProbe(`crew native-child ceiling already disclosed session=${sessionID}`)
+    } else if (mark && now - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS) {
+      // D4: send ONCE + one bounded disclosure; stop suppressing for this
+      // registration (a listed-but-silent child no longer blocks).
+      crewNativeCeiling.set(sessionID, { firstSuppressedAt: mark.firstSuppressedAt, disclosed: true })
+      console.warn(
+        `[forge:crew-continue] native-child ceiling: crew "${crew.objective.slice(0, 80)}" has been held ≥${CREW_NATIVE_CHILD_CEILING_MS}ms by native children that never report a terminal state — sending once and stopping suppression for this registration (fresh crew_begin re-arms the gate).`,
+      )
+      goalProbe(`crew native-child ceiling expired session=${sessionID}`)
+    } else {
+      if (!mark) crewNativeCeiling.set(sessionID, { firstSuppressedAt: now, disclosed: false })
+      goalProbe(`crew skip: native child in flight session=${sessionID}`)
+      return // BEFORE crewPendingTurn accounting — not a turn
+    }
+  } else {
+    // Gate open: the suppression episode ends (a later busy child starts a
+    // fresh, fully-ceilinged episode).
+    crewNativeCeiling.delete(sessionID)
   }
   // Crew no-progress accounting (D3), only for turns the crew engine itself
   // started: task dispatches and write-family calls count as activity.
@@ -6174,10 +6323,15 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
     }
   }
   try {
+    // D7 defect-B: the digest collected during the suppression episode rides
+    // this brief (one line per terminal child: id + outcome); cleared only
+    // on successful delivery.
+    const childDigest = crewChildDigest.get(sessionID) ?? []
     await client.session.prompt({
       path: { id: sessionID },
-      body: { parts: [{ type: "text", text: crewContinueBrief(crew) }] },
+      body: { parts: [{ type: "text", text: crewContinueBrief(crew, childDigest) }] },
     })
+    if (childDigest.length > 0) crewChildDigest.delete(sessionID)
     transportFails.delete(sessionID)
     crewPendingTurn.add(sessionID)
     crewTurnActivity.set(sessionID, { dispatches: 0, writes: 0 })
@@ -6427,7 +6581,7 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
   }
 }
 
-function scheduleIdleContinuation(client: GoalClient, sessionID: string): void {
+function scheduleIdleContinuation(client: GoalClient, sessionID: string, debounceMs: number = IDLE_DEBOUNCE_MS): void {
   // Belt for the engine guard: a disabled plugin must not even arm a timer.
   if (forgeDisabled) return
   // Family gate at scheduling time (tool-partition): a non-forge session's
@@ -6443,7 +6597,7 @@ function scheduleIdleContinuation(client: GoalClient, sessionID: string): void {
     setTimeout(() => {
       idleTimers.delete(sessionID)
       void continueIfEligible(client, sessionID)
-    }, IDLE_DEBOUNCE_MS),
+    }, Math.max(0, debounceMs)),
   )
 }
 
@@ -8966,6 +9120,10 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
             if (!type) continue
             if (controller.signal.aborted) return
             const fields = v2EventFields(ev)
+            // crew-continue-native-child-gate 2.3: the native-child tracker
+            // feed rides the SAME subscription (advisory warm set — the
+            // decision-time walk stays authoritative). No new stream.
+            noteCrewNativeChildEvent(type, fields, goalClient)
             if (type === "session.deleted") {
               try {
                 const info = fields.info as { id?: unknown } | undefined
@@ -9086,7 +9244,7 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
 // the v1 __forgeSubagentsTest): live references to the module maps the v2
 // handlers share with the v1 hooks, so tests seed and inspect without a
 // host. NOT part of the plugin API surface.
-export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
+export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, crewNativeChildren, crewNativeCeiling, crewChildDigest, resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
 
 // ---- v2-single-agent-surface: single-agent-surface primitives (v2Setup
 // only — the v1 config-hook path never uses these) ----

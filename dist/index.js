@@ -15135,6 +15135,109 @@ function validateCrewReport(report, declared) {
   return { ok: gaps.length === 0, gaps };
 }
 
+// src/native-child-gate.ts
+async function nativeChildrenInFlight(client, sessionID) {
+  if (!sessionID)
+    return false;
+  try {
+    const raw = await client?.session?.list?.({});
+    const body = raw?.data ?? raw;
+    const list = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : [];
+    const children = [];
+    for (const s of list) {
+      if (!s || typeof s.id !== "string" || !s.id)
+        continue;
+      if (s.parentID !== sessionID)
+        continue;
+      children.push(s.id);
+    }
+    if (children.length === 0)
+      return false;
+    if (typeof client?.session?.status !== "function")
+      return false;
+    const st = await client.session.status();
+    const map2 = st?.data;
+    if (!map2 || typeof map2 !== "object")
+      return false;
+    for (const id of children) {
+      const entry = map2[id];
+      if (entry === undefined)
+        continue;
+      if (entry !== null && typeof entry === "object" && entry.type === "idle")
+        continue;
+      return true;
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+function createNativeChildTracker() {
+  const children = new Map;
+  return {
+    mark(childID, parentID) {
+      if (!childID || !parentID)
+        return;
+      const existing = children.get(childID);
+      if (existing && existing.terminal)
+        return;
+      children.set(childID, { childID, parentID, terminal: false });
+    },
+    terminalize(childID, outcome) {
+      const row = children.get(childID);
+      if (!row)
+        return null;
+      if (!row.terminal || row.outcome !== outcome) {
+        row.terminal = true;
+        row.outcome = outcome;
+      }
+      let lastChildTerminal = true;
+      for (const r of children.values()) {
+        if (r.parentID === row.parentID && !r.terminal) {
+          lastChildTerminal = false;
+          break;
+        }
+      }
+      return { parentID: row.parentID, lastChildTerminal };
+    },
+    drop(childID) {
+      children.delete(childID);
+    },
+    forgetParent(parentID) {
+      for (const [id, row] of [...children]) {
+        if (row.parentID === parentID)
+          children.delete(id);
+      }
+    },
+    runningChildren(parentID) {
+      const ids = [];
+      for (const row of children.values()) {
+        if (row.parentID === parentID && !row.terminal)
+          ids.push(row.childID);
+      }
+      return ids;
+    },
+    rows() {
+      return children;
+    }
+  };
+}
+function nativeChildEventOutcome(type) {
+  if (type === "session.execution.succeeded")
+    return "succeeded";
+  if (type === "session.execution.failed")
+    return "failed";
+  if (type === "session.execution.interrupted")
+    return "interrupted";
+  return null;
+}
+function nativeChildDigestLine(childID, outcome) {
+  if (outcome === "interrupted") {
+    return `native child ${childID} interrupted — DEAD (aborted mid-run; its dispatch sentence timed out or was killed): re-dispatch the subtask or record the loss in the close report`;
+  }
+  return `native child ${childID} ${outcome}`;
+}
+
 // src/dispatch-prompt.ts
 var WORKER_MANDATES = [
   "Mandates (non-negotiable):",
@@ -21950,12 +22053,78 @@ function crewEngineForgetSession(sessionID) {
   crewTurnActivity.delete(sessionID);
   crewNoProgress.delete(sessionID);
   crewStalled.delete(sessionID);
+  crewNativeChildren.forgetParent(sessionID);
+  crewNativeCeiling.delete(sessionID);
+  crewChildDigest.delete(sessionID);
 }
-function crewContinueBrief(crew) {
+var CREW_NATIVE_CHILD_CEILING_MS = Number(process.env.FORGE_CREW_NATIVE_CHILD_CEILING_MS ?? 900000);
+var CREW_CHILD_RESUME_DEBOUNCE_MS = Number(process.env.FORGE_CREW_CHILD_RESUME_DEBOUNCE_MS ?? 500);
+var crewNativeChildren = createNativeChildTracker();
+var crewNativeCeiling = new Map;
+var crewChildDigest = new Map;
+var crewGateNow = () => Date.now();
+function setCrewNativeChildClockForTests(now) {
+  crewGateNow = typeof now === "function" ? now : () => Date.now();
+}
+function crewNoteNativeChildTerminal(parentID, childID, outcome, lastChildTerminal, client) {
+  const mark = crewNativeCeiling.get(parentID);
+  if (!mark)
+    return;
+  const lines = crewChildDigest.get(parentID) ?? [];
+  lines.push(nativeChildDigestLine(childID, outcome));
+  crewChildDigest.set(parentID, lines);
+  goalProbe(`crew native child terminal child=${childID} outcome=${outcome} parent=${parentID} last=${lastChildTerminal}`);
+  if (lastChildTerminal && client) {
+    scheduleIdleContinuation(client, parentID, CREW_CHILD_RESUME_DEBOUNCE_MS);
+  }
+}
+function noteCrewNativeChildEvent(type, fields, client) {
+  try {
+    if (type === "session.created") {
+      const info = fields.info ?? fields.session;
+      const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId");
+      const parentID = info !== null && typeof info === "object" && typeof info.parentID === "string" && info.parentID ? info.parentID : v2PickStr(fields, "parentID", "parentId");
+      if (id && parentID)
+        crewNativeChildren.mark(id, parentID);
+      return;
+    }
+    if (type === "session.deleted") {
+      const info = fields.info;
+      const id = info !== null && typeof info === "object" && typeof info.id === "string" && info.id ? info.id : v2PickStr(fields, "sessionID", "sessionId");
+      if (id)
+        crewNativeChildren.drop(id);
+      return;
+    }
+    const outcome = nativeChildEventOutcome(type);
+    if (outcome) {
+      const id = v2PickStr(fields, "sessionID", "sessionId");
+      if (!id)
+        return;
+      const note = crewNativeChildren.terminalize(id, outcome);
+      if (note)
+        crewNoteNativeChildTerminal(note.parentID, id, outcome, note.lastChildTerminal, client);
+      return;
+    }
+    if (type === "session.status" || type === "session.idle") {
+      const id = v2PickStr(fields, "sessionID", "sessionId");
+      if (!id)
+        return;
+      const st = fields.status;
+      const idle = type === "session.idle" || st !== null && typeof st === "object" && st.type === "idle";
+      if (!idle)
+        return;
+      const note = crewNativeChildren.terminalize(id, "succeeded");
+      if (note)
+        crewNoteNativeChildTerminal(note.parentID, id, "succeeded", note.lastChildTerminal, client);
+    }
+  } catch {}
+}
+function crewContinueBrief(crew, childDigest = []) {
   return [
     `[forge:crew-continue] The crew "${crew.objective}" is armed (waves) — continue the wave discipline.`,
     `Declared plan (every subtask needs a verdict at close):`,
     ...crew.subtasks.map((s, i) => `${i + 1}. ${s.title}`),
+    ...childDigest.length > 0 ? [`Native child outcomes since the last brief (one line per child — an interrupted child is DEAD, never silently stranded):`, ...childDigest.map((l) => `- ${l}`)] : [],
     `Next: dispatch the next wave (parallel task calls — forge-* workers from this session's pool, or the native general subagent when no forge worker fits), collect per-subtask evidence verdicts, at most one retry per subtask, then crew_close with the full report. Stalled or wrong decomposition? crew_close {abandon: true, reason} to re-shard.`
   ].join(`
 `);
@@ -21973,6 +22142,24 @@ async function continueCrewIfEligible(client, state, sessionID) {
   if (!sessionIsForgeFamily(sessionID)) {
     goalProbe(`crew skip: agent switched to non-forge before send session=${sessionID}`);
     return;
+  }
+  if (await nativeChildrenInFlight(client, sessionID)) {
+    const now = crewGateNow();
+    const mark = crewNativeCeiling.get(sessionID);
+    if (mark && mark.disclosed) {
+      goalProbe(`crew native-child ceiling already disclosed session=${sessionID}`);
+    } else if (mark && now - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS) {
+      crewNativeCeiling.set(sessionID, { firstSuppressedAt: mark.firstSuppressedAt, disclosed: true });
+      console.warn(`[forge:crew-continue] native-child ceiling: crew "${crew.objective.slice(0, 80)}" has been held ≥${CREW_NATIVE_CHILD_CEILING_MS}ms by native children that never report a terminal state — sending once and stopping suppression for this registration (fresh crew_begin re-arms the gate).`);
+      goalProbe(`crew native-child ceiling expired session=${sessionID}`);
+    } else {
+      if (!mark)
+        crewNativeCeiling.set(sessionID, { firstSuppressedAt: now, disclosed: false });
+      goalProbe(`crew skip: native child in flight session=${sessionID}`);
+      return;
+    }
+  } else {
+    crewNativeCeiling.delete(sessionID);
   }
   if (crewPendingTurn.has(sessionID)) {
     crewPendingTurn.delete(sessionID);
@@ -22005,10 +22192,13 @@ async function continueCrewIfEligible(client, state, sessionID) {
     }
   }
   try {
+    const childDigest = crewChildDigest.get(sessionID) ?? [];
     await client.session.prompt({
       path: { id: sessionID },
-      body: { parts: [{ type: "text", text: crewContinueBrief(crew) }] }
+      body: { parts: [{ type: "text", text: crewContinueBrief(crew, childDigest) }] }
     });
+    if (childDigest.length > 0)
+      crewChildDigest.delete(sessionID);
     transportFails.delete(sessionID);
     crewPendingTurn.add(sessionID);
     crewTurnActivity.set(sessionID, { dispatches: 0, writes: 0 });
@@ -22190,7 +22380,7 @@ async function continueIfEligible(client, sessionID) {
     continuationInFlight.delete(sessionID);
   }
 }
-function scheduleIdleContinuation(client, sessionID) {
+function scheduleIdleContinuation(client, sessionID, debounceMs = IDLE_DEBOUNCE_MS) {
   if (forgeDisabled)
     return;
   if (!sessionIsForgeFamily(sessionID)) {
@@ -22203,7 +22393,7 @@ function scheduleIdleContinuation(client, sessionID) {
   idleTimers.set(sessionID, setTimeout(() => {
     idleTimers.delete(sessionID);
     continueIfEligible(client, sessionID);
-  }, IDLE_DEBOUNCE_MS));
+  }, Math.max(0, debounceMs)));
 }
 function harvestSessionEnd(sessionID) {
   jobManager.onSessionEnd(sessionID, isDispatchRow);
@@ -23720,6 +23910,7 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
             if (controller.signal.aborted)
               return;
             const fields = v2EventFields(ev);
+            noteCrewNativeChildEvent(type, fields, goalClient);
             if (type === "session.deleted") {
               try {
                 const info = fields.info;
@@ -23795,7 +23986,7 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
     return null;
   }
 }
-var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, resetHostAnchors: () => {
+var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, crewNativeChildren, crewNativeCeiling, crewChildDigest, resetHostAnchors: () => {
   hostAnchors.length = 0;
   poolResolver = null;
   poolResolution = null;
@@ -24016,6 +24207,7 @@ export {
   takeDispatchTerminalSignal,
   setDispatchWaitSeamForTests,
   setDispatchStorageForTests,
+  setCrewNativeChildClockForTests,
   server,
   resolveGateAskWatchdogMs,
   resolveForgeShellPosture,
@@ -24026,6 +24218,7 @@ export {
   observedOrphanDispatches,
   noteDispatchTerminalSignal,
   noteDispatchChildActivity,
+  noteCrewNativeChildEvent,
   normalizeV2MessageRow,
   isRootish,
   isDispatchCancelled,
