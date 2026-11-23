@@ -148,3 +148,20 @@ native child was running.
 - The v1 ports (plugin.ts:7299, 7334 v1 handlers) can adopt the same
   tracker feed later; the walk itself is host-agnostic and already runs on
   both — v1 adoption is deferred, not designed here.
+
+
+## D7 鈥?缂洪櫡 B 瑕嗙洊锛氭浜嗙殑瀛╁瓙蹇呴』鍙啋 crew锛堢敤鎴?2026-11-24 鏅ㄨ鍐筹級
+
+鏄ㄦ櫄 7 灏忔椂鎹熷け = 涓や釜缂洪櫡鍙犲姞锛?
+- **缂洪櫡 A锛堟湰 change 鏍稿績锛?*锛氶棬鐩测啋鐩插偓鈫掓瘡鍙?鍦ㄧ瓑"閮芥槸闆跺姩浣滃洖鍚堚啋
+  鍋?no-progress 璁℃暟鎶婂紩鎿庡偓鍋滐紙stall锛夆啋鍐嶆棤 nudge銆侱1-D5 宸蹭慨
+  锛堟姂鍒朵笉鏄?turn锛岀瓑寰呮案涓嶇Н绱?streak锛夈€?- **缂洪櫡 B**锛歸ave 瀛╁瓙鐨勬淳鍙戝彞鏌勮秴鏃舵妸瀹?*涓€?abort**锛屽畬鎴愰€氱煡鍙?  error锛屽紩鎿庡張宸?stall鈥斺€斾袱鏉″敜閱掗摼鍚屾椂鍝戞帀銆俛bort 鏈韩鏄涓?
+  harness 棰嗗煙锛屾彃浠?*鎷︿笉浣?*锛涙彃浠舵嫢鏈夌殑鏄細**灏镐綋缁濅笉闈欓粯**銆?
+鑼冨洿鍐呬慨澶嶏紙鎶樺叆 2.2 + spec 鏂板満鏅?"An aborted native child wakes
+the crew with its outcome"锛夛細
+
+- tracker 璁板綍姣忎釜瀛╁瓙鐨勭粓鎬?**outcome**锛坰ucceeded/failed/
+  interrupted锛涙潵婧愮粓鎬佷簨浠?+ 鍥炴函鏃?Session.Info.outcome锛夈€?- re-arm 鐨?continuation brief 鎼哄甫姣忕粓鎬佸瀛愪竴琛?digest锛堝瀛愪細璇?  id + outcome锛夆€斺€攊nterrupted 鐨勫瀛愬湪鎻掍欢鐭ラ亾鐨勫綋涓嬭鐐瑰悕姝讳骸銆?- 鍑€鏁堟灉锛氶棬鍦ㄥ満鏃讹紝鏄ㄦ櫄鐨勫簭鍒椾互鍒嗛挓璁♀€斺€斿瀛愯 abort 鈫?tracker
+  鐪嬪埌 interrupted 鈫?re-arm brief 鎼?child ses_x interrupted"鈫掍富浼氳瘽
+  閱掓潵閲嶆淳銆俬arness 渚х殑鐪嬮棬鐙?job 閾撅紙浠婃櫒宸叉寕锛変粛鏄旱娣遍槻寰°€?
+鏄庣‘鑼冨洿澶栵細闃绘鍙ユ焺瓒呮椂 abort锛堝涓?harness 鍩燂級锛涢棬鐘舵€佽惤鐩樸€?

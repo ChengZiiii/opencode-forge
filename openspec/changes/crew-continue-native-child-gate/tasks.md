@@ -19,9 +19,13 @@
 - [ ] 2.2 `NativeChildTracker` (pure core + event feed): `session.created`
   carrying parentID marks `(childID, parentID)`; terminal edges
   (`session.execution.succeeded|failed|interrupted`, `session.status`
-  idle, `session.idle` tolerated alias) terminalize; `session.deleted`
+  idle, `session.idle` tolerated alias) terminalize **with the terminal
+  OUTCOME recorded (succeeded/failed/interrupted)**; `session.deleted`
   drops; last-child-terminal of a recently suppressed session re-arms
-  `scheduleIdleContinuation` (short debounce). Advisory only.
+  `scheduleIdleContinuation` (short debounce) **and the re-armed brief
+  carries a one-line digest per terminal child (child id + outcome) — an
+  interrupted child is disclosed as dead the moment the plugin knows**.
+  Advisory only.
 - [ ] 2.3 Wire the tracker feed into the existing `v2SubscribeEvents` loop
   (plugin.ts:8888-9010) — no new subscription, no new stream.
 - [ ] 2.4 Ceiling: `Map<sessionID, firstSuppressedAt>`; past
@@ -54,6 +58,10 @@
   ceiling marker); a later crew starts clean.
 - [ ] 3.6 Regression pin: goal-branch brief path byte-identical (native
   child in flight does not affect goal continuations).
+- [ ] 3.7 Aborted-child disclosure: child reaches terminal with outcome
+  `interrupted` while suppression was active ⇒ re-arm brief fires promptly
+  and carries the one-line digest (child id + `interrupted`) — the dead
+  child is surfaced, never silently stranded.
 
 ## 4. Verification
 
