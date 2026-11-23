@@ -1,11 +1,11 @@
 # Tasks: fix-shell-spawn-error-outcome
 
-> 草案，待用户批准；批准前不勾任何一项。
+> 用户已批准（2026-11-23「A+B我都批」），按草案实施。
 
 ## 1. Specification
 
-- [ ] 1.1 用户批准草案；
-      `npx openspec validate fix-shell-spawn-error-outcome --strict` 绿
+- [x] 1.1 用户批准草案；
+      `openspec validate fix-shell-spawn-error-outcome --strict` 绿
 
 ## 2. Implementation
 

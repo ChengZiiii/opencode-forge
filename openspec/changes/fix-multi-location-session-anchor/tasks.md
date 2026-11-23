@@ -1,11 +1,11 @@
 # Tasks: fix-multi-location-session-anchor
 
-> 草案，待用户批准；批准前不勾任何一项。
+> 用户已批准（2026-11-23「A+B我都批」），按草案（方案甲）实施。
 
 ## 1. Specification
 
-- [ ] 1.1 用户批准草案（含方案甲 / 乙的取舍）；
-      `npx openspec validate fix-multi-location-session-anchor --strict` 绿
+- [x] 1.1 用户批准草案（含方案甲 / 乙的取舍）；
+      `openspec validate fix-multi-location-session-anchor --strict` 绿
 - [ ] 1.2 实现前探针：坐实 design D0 两条未证项
 
 ## 2. Implementation（design D1 方案甲）

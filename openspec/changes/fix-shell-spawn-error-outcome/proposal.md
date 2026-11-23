@@ -1,6 +1,8 @@
 # Proposal: fix-shell-spawn-error-outcome
 
-> **草案，待用户批准。** 过夜自主闭环 2026-11-23 发现；未经批准不改代码。
+> **已批准。** 用户 2026-11-23 睡前批复「A+B我都批」（B = 本 change，
+> A = fix-multi-location-session-anchor）。按草案实施。
+> 过夜自主闭环 2026-11-23 发现。
 
 ## Why
 
