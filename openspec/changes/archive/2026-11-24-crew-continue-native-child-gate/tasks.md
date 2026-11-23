@@ -148,5 +148,11 @@
   （2026-11-23T20:40Z published as part of 0.33.0 — tgz sha1
   `b73f04a57c3154147135d226dff0d3af7c091df6`, dist-tags.latest → 0.33.0 at
   20:42Z.）
-- [ ] 5.2 Archive on user instruction (`openspec archive
+- [x] 5.2 Archive on user instruction (`openspec archive
   crew-continue-native-child-gate --yes`) after the ③/④ gates close.
+  （2026-11-24T21:05Z archived, on the user's standing authorization for the
+  night: the headed gate passed strictly and the acceptance gate reads 20
+  pass / 0 fail / 1 booked / 1 known. What is still open on ④ is the user's
+  own restart test on the real machine — the registry serves the verified
+  bytes and the machine's plugin cache is prepared for it; see the archived
+  fix-dispatch-dispose-kill tasks 4.1 / 4.2.）

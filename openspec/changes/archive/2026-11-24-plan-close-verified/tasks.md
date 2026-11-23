@@ -91,3 +91,6 @@
 ## 5. Wrap-up（用户明示后）
 
 - [ ] 5.1 archive + push；有头测试记录归档
+      （2026-11-24T21:05Z：change 已归档——授权前提均成立；有头测试记录
+      已随证据入库 `reports/e2e/evidence/0.33.0/tui-gate.json`。**未做**：
+      push——用户授权域）

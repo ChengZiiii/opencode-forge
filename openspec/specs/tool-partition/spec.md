@@ -238,29 +238,7 @@ For any session whose running `forge-*` agent has an effective readonly shape (a
 
 ### Requirement: Exec posture pass-through on the exec surface
 
-The forge exec surface (`forge_shell`) SHALL resolve its permission posture
-with NO plugin-injected default and NO plugin-side resolution: the plugin
-SHALL NOT rewrite the posture for unconfigured users (the host's own default
-flows — in practice `"*": allow` — so an unconfigured `forge_shell` executes
-in serve, TUI, and run modes alike, exactly like the native shell tool), and
-SHALL NOT classify commands to resolve any posture. Explicit user values
-(`allow` / `deny` / `ask`) SHALL flow to the host verbatim in every mode: an
-explicit `ask` behaves exactly like the native shell tool's ask in that mode
-(a real dialog in TUI, the host's ask auto-reject semantics in run mode, a
-pending ask on a serve host until answered via the host API — the host's
-business, disclosed, not the plugin's). User-confirmation doors —
-`plan_approve`, `plan_close`, `goal_write (arm)`, `goal_complete`,
-`goal_resume`, `goal_discard`, `crew_close` — exactly the non-exec `gate()`
-permission keys — SHALL NEVER be auto-resolved in any mode; they remain real
-dialogs. The readonly-exec-seal SHALL remain the ONLY plugin-side exec
-refusal: explicit-readonly workers' write-class commands are refused by the
-seal before execution, posture-independently (a pure-function command
-classifier recognizes write-class commands for the seal; that classifier has
-no role on the posture path). Disclosure: with no explicit permission
-configured, ANY command the model issues through `forge_shell` runs without
-confirmation in every mode — this default-open posture is the documented,
-accepted product decision; the safety belt for readonly workers is the seal,
-which is posture-independent.
+The forge exec surface (`forge_shell`) SHALL resolve its permission posture with NO plugin-injected default and NO plugin-side resolution: the plugin SHALL NOT rewrite the posture for unconfigured users (the host's own default flows — in practice `"*": allow` — so an unconfigured `forge_shell` executes in serve, TUI, and run modes alike, exactly like the native shell tool), and SHALL NOT classify commands to resolve any posture. Explicit user values (`allow` / `deny` / `ask`) SHALL flow to the host verbatim in every mode: an explicit `ask` behaves exactly like the native shell tool's ask in that mode (a real dialog in TUI, the host's ask auto-reject semantics in run mode, a pending ask on a serve host until answered via the host API — the host's business, disclosed, not the plugin's). User-confirmation doors — `plan_approve`, `goal_write (arm)`, `goal_complete`, `goal_resume`, `goal_discard`, `crew_close` — exactly the non-exec `gate()` permission keys — SHALL NEVER be auto-resolved in any mode; they remain real dialogs. (plan_close left the door set by plan-close-verified: its completion gate is plugin-verified, no longer an ask door.) The readonly-exec-seal SHALL remain the ONLY plugin-side exec refusal: explicit-readonly workers' write-class commands are refused by the seal before execution, posture-independently (a pure-function command classifier recognizes write-class commands for the seal; that classifier has no role on the posture path). Disclosure: with no explicit permission configured, ANY command the model issues through `forge_shell` runs without confirmation in every mode — this default-open posture is the documented, accepted product decision; the safety belt for readonly workers is the seal, which is posture-independent.
 
 #### Scenario: Unconfigured posture runs everywhere (default-open)
 
@@ -284,7 +262,7 @@ which is posture-independent.
 
 #### Scenario: User-confirmation doors are never auto-resolved
 
-- **WHEN** a `plan_approve` / `plan_close` / `goal_write (arm)` / `goal_complete` / `goal_resume` / `goal_discard` / `crew_close` confirmation door fires in any host mode
+- **WHEN** a `plan_approve` / `goal_write (arm)` / `goal_complete` / `goal_resume` / `goal_discard` / `crew_close` confirmation door fires in any host mode
 - **THEN** the ask remains a real pending dialog and is never resolved by any plugin-side mechanism
 
 #### Scenario: Seal refuses readonly workers' writes as the sole plugin refusal

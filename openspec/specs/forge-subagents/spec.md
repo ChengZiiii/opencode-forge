@@ -342,8 +342,11 @@ cap concurrent running async dispatches per session (default 3); beyond
 the cap, an async dispatch SHALL enter a per-session FIFO queue (bounded,
 default 10) instead of failing — the call SHALL return a queued handle
 immediately (metadata marking it queued until it spawns) and the child
-SHALL be spawned when a slot frees, a `[forge:dispatch-progress]` notice
-announcing the queued wish's start; the checks re-evaluated at spawn time
+SHALL be spawned when a slot frees — any terminal transition of that
+session's dispatches frees a slot, a kill settle included, so a cancelled
+dispatch releases its slot to the queued head — with a
+`[forge:dispatch-progress]` notice announcing the queued wish's start; the
+checks re-evaluated at spawn time
 are the target roster, the draft gate, and the crew belt (a tightening
 between call and spawn fails the wish as an honest error wake, never
 silently); beyond the queue bound the call SHALL be refused with the
@@ -379,9 +382,16 @@ notification interval while its latest finished assistant message
 lacks a truthy `finish` or non-empty text SHALL terminate honestly as
 a no-reportable-final-message finding naming the child session id; any
 busy reading resets that streak, so a running child is never
-terminated by it; the registry kill (owner death, dispose) stops the
-watch at a slice boundary as before. The sync-armed poller shares the
-tracker and inherits never-die tracking. Terminal
+terminated by it; a registry kill (an owner-session end, the user cancel
+lever, or the explicit kill of a dispatch row through the job lever)
+stops the watch at its next kill check — at a slice top, before a
+consumed signal, after every poll, and once more before the exit settle
+— and the kill verdict outranks any verdict the watch observed: the
+dispatch is journaled and surfaced as aborted, never as `error` or
+`completed`, and never feeds the provider breaker as a failure. A
+plugin-instance dispose is not a registry-kill trigger (specified under
+"Dispatch rows survive plugin-instance disposal"). The sync-armed poller
+shares the tracker and inherits never-die tracking. Terminal
 inference SHALL be sound against unreadable readings: a status
 fetch failure SHALL be treated as active (keep polling — never a
 terminal verdict on a signal that could not be read); a session MISSING
@@ -452,6 +462,11 @@ error-classified retry, and restart recovery are specified under
 
 - **WHEN** the dispatching session has an active draft plan
 - **THEN** an effective-readonly forge target passes in either mode and write targets are refused in either mode — identical outcomes to the pre-shadow gates
+
+#### Scenario: A kill outranks the verdict the watch observed
+
+- **WHEN** a dispatch row is killed (owner-session end, the cancel lever, or an explicit kill) and the abort makes the child surface afterwards as a host `session.execution.failed` verdict or as a finished-looking transcript that the watch reads
+- **THEN** the dispatch is journaled and surfaced as aborted with the killer's reason — never as an error that feeds the dispatch breaker, never as a completion — and the slot it held is pumped to the session's queued head like any other terminal transition
 
 ### Requirement: Dispatch resilience (stale reap, retry, restart recovery)
 
@@ -599,9 +614,16 @@ cross-read.
 On a v2 host, a forge-family agent whose pool def pins `model`
 (`"provider/model"`) `SHALL` serve every request on the pinned model:
 the context-injection path `SHALL` rewrite the payload's `model`
-(providerID + id/modelID spellings, variant dropped) to the pinned
-identity, resolved fresh per request (hot-apply contract). The agent
-draft `SHALL` still omit `model` (the host encoder rejects it).
+(providerID + id/modelID spellings) to the pinned identity, resolved fresh
+per request (hot-apply contract). The variant field `SHALL` survive the
+rewrite honestly: when the pinned identity equals the resolved model the
+existing `variant` `SHALL` be preserved (the compiled roster's variant
+channel — e.g. `#low` — reaches the host UI intact); when the pin switches
+to a different model, the variant `SHALL` be derived from the recipe's
+pinned depth when that depth is a variant word (`low`/`medium`/`high`),
+and only otherwise `SHALL` be dropped (a stale variant of a different model
+is meaningless). The agent draft `SHALL` still omit `model` (the host
+encoder rejects it).
 
 #### Scenario: Pinned pool agent serves on the pinned model
 
@@ -620,6 +642,23 @@ draft `SHALL` still omit `model` (the host encoder rejects it).
 
 - WHEN a def's `model` does not parse as `"provider/model"`
 - THEN no rewrite happens and no error surfaces
+
+#### Scenario: Same-identity pin preserves the variant channel
+
+- GIVEN a compiled worker whose `.md` model string carries a variant
+  (e.g. `glm-coding-worker/glm-5.3-flash#low`) and whose recipe pins the
+  same model
+- WHEN the pinned agent's session builds a request
+- THEN the payload model keeps `variant: "low"` — the host UI shows the
+  real depth instead of default
+
+#### Scenario: Model switch derives the variant from the pinned depth
+
+- GIVEN a recipe pinning a different model with
+  `thoughtLevel: "high"`
+- WHEN the context path rewrites the payload model to the pinned identity
+- THEN the variant is set to `"high"`; with no depth word pinned, the
+  stale variant is dropped instead
 
 ### Requirement: Sandbox full-chain proof
 
@@ -1097,51 +1136,54 @@ dispatch `SHALL NOT` be re-dispatched while its child is still observable.
 
 ### Requirement: User-facing dispatch cancellation
 
-The plugin `SHALL` expose a cancellation lever for in-flight async
-dispatches: invoked without arguments it `SHALL` list every in-flight
-dispatch with its task id, target agent, child session id, and age; invoked
-with a task id it `SHALL` cancel that dispatch; invoked with `all` it
-`SHALL` cancel every in-flight dispatch. Cancellation `SHALL` abort the
-child session through the existing abort engine, settle the registry row as
-`aborted`, record the cancellation in the ledger, and deliver a wake
-disclosing it. A cancelled dispatch `SHALL NOT` be retried by any resilience
-path.
+The plugin `SHALL` expose a session-scoped stop lever for in-flight async dispatches: the stop route `SHALL` cancel every in-flight dispatch owned by the invoking session — and only those; dispatches owned by other sessions `SHALL` never be touched by another session's stop. Invoked for a listing, the lever `SHALL` list every in-flight dispatch on the host with its task id, target agent, child session id, owner session, and age (host-wide visibility, no session scoping on the listing). Invoked with an explicit task id, the lever `SHALL` cancel that dispatch — the explicit-id escape hatch, which MAY target another session's dispatch by explicit intent. No host-wide cancel verb `SHALL` exist: no single lever call cancels every dispatch on the host. Cancellation `SHALL` abort the child session through the existing abort engine, settle the registry row as `aborted`, record the cancellation in the ledger, and deliver a wake disclosing it. A cancelled dispatch `SHALL NOT` be retried by any resilience path. Each cancellation receipt (the per-id cancel, and every row of a stop) `SHALL` report the post-abort idle confirmation honestly as one of three outcomes: the child is confirmed idle through the host's active-session view; the child did not reach idle within the assertion window (it may have resisted); or the view could not be read, so idle is unconfirmed — a receipt `SHALL` never claim a confirmed idle without a readable view, and no view read `SHALL` hold a receipt past the assertion window. Queued wishes are not in flight, so a stop does not cancel them; its receipt `SHALL` name the queued wishes of the session it did not cancel (their spawning then follows the queue contract — a slot freed by a cancelled dispatch is pumped).
 
 #### Scenario: list in-flight dispatches
 
-- **WHEN** the cancel lever is invoked with no arguments while dispatches
-  are in flight
-- **THEN** each in-flight dispatch is listed with task id, agent, child
-  session id, and age
+- **WHEN** the cancel lever is invoked for a listing while dispatches are in flight
+- **THEN** each in-flight dispatch is listed with task id, agent, child session id, owner session, and age
 - **AND** no dispatch is cancelled by a bare listing
 
 #### Scenario: cancel one dispatch
 
 - **WHEN** the cancel lever is invoked with an in-flight task id
-- **THEN** the child session is aborted and reaches an idle/terminal state
-- **AND** the registry row settles as `aborted` and the ledger records the
-  cancellation
+- **THEN** the child session is aborted and the receipt reports the idle-confirmation outcome (confirmed idle, resisted, or unreadable view)
+- **AND** the registry row settles as `aborted` and the ledger records the cancellation
 - **AND** the owner session receives a wake disclosing the cancellation
 
 #### Scenario: cancelled dispatch never retries
 
 - **WHEN** a dispatch is cancelled by the user lever
-- **THEN** no resilience path (retry, stale reap, adoption) respawns or
-  resumes it
+- **THEN** no resilience path (retry, stale reap, adoption) respawns or resumes it
+
+#### Scenario: stop scopes to the invoking session
+
+- **WHEN** session A owns two in-flight dispatches, session B owns one, and the stop lever fires in session A
+- **THEN** both of A's dispatches are cancelled with honest aborted wakes and B's dispatch is untouched — it keeps running and delivers its completion wake at true terminal
+
+#### Scenario: No host-wide cancel verb
+
+- **WHEN** the lever is asked to cancel `all` dispatches in one call
+- **THEN** the request is refused as an unknown route with guidance to the session-scoped stop and the per-id escape hatch
+
+#### Scenario: An unreadable idle view is disclosed, never claimed
+
+- **WHEN** the active-session view cannot be read (or a read hangs) while a cancellation's idle confirmation is running
+- **THEN** the receipt returns within the assertion window, reports that idle could not be confirmed, and makes no confirmed-idle or resisted claim
+
+#### Scenario: stop names the queued wishes it did not cancel
+
+- **WHEN** a session has queued wishes beyond the concurrency cap and the stop lever fires in that session
+- **THEN** the in-flight dispatches are cancelled, the receipt names the queued wishes as not cancelled, and a queued wish spawns into the slot a cancelled dispatch freed
 
 ### Requirement: Parent-interrupt disclosure
 
-WHEN the parent session's turn is interrupted while async dispatches are in
-flight, the plugin `SHALL` surface the in-flight dispatch list with
-cancellation guidance in the interruption path. The default posture is
-disclose-only: an interrupt `SHALL NOT` silently cancel running children.
+WHEN the parent session's turn is interrupted while async dispatches are in flight, the plugin `SHALL` surface the in-flight dispatch list with cancellation guidance in the interruption path — naming the session-scoped stop route and the per-id cancel escape hatch. The default posture is disclose-only: an interrupt `SHALL NOT` silently cancel running children.
 
 #### Scenario: ESC with children in flight
 
-- **WHEN** the user interrupts the parent session's turn while dispatches
-  are in flight
-- **THEN** the in-flight dispatch list with cancellation guidance is
-  surfaced to the session
+- **WHEN** the user interrupts the parent session's turn while dispatches are in flight
+- **THEN** the in-flight dispatch list with cancellation guidance is surfaced to the session
 - **AND** the children remain running unless explicitly cancelled
 
 ### Requirement: Orphan-child disclosure
@@ -1156,3 +1198,75 @@ run invisibly.
 - **WHEN** a streaming child session has no live registry row
 - **THEN** the orphan is disclosed with its task id and child session id
 - **AND** the disclosure offers the adopt and cancel paths
+
+### Requirement: Dispatch rows survive plugin-instance disposal
+
+Plugin `dispose` SHALL NOT be a registry-kill trigger for dispatch rows. On any host — single- or multi-context — a plugin dispose that is not the host-process exit SHALL leave every in-flight dispatch row untouched: no kill, no child abort, no journal terminalization; the settle loop keeps watching and the completion wake arrives at true terminal. This supersedes any earlier implication that dispose is a dispatch registry-kill trigger; the remaining legitimate registry-kill triggers are owner-session end and the user cancel lever. A real host-process exit needs no dispatch kill either: dispatch children are server-side sessions unaffected by the plugin process, and their cross-restart continuity is the dispatch journal with restart recovery (probe → re-arm, completed-wake, or honest error per record state).
+
+#### Scenario: Dispose in another context leaves the dispatch running
+
+- **WHEN** a dispatch is in flight and a plugin context (not the whole host process) is disposed
+- **THEN** the dispatch row remains running, its journal record stays non-terminal, and the final wake is delivered on completion
+
+#### Scenario: Host-process exit relies on the journal, not on kills
+
+- **WHEN** the host process exits while dispatches are in flight
+- **THEN** no dispatch journal record is terminalized by the exit itself, and on next host boot restart recovery resolves each live child (re-arm the running, deliver the finished, honestly terminalize the gone)
+
+### Requirement: Honest aborted outcome surfacing
+
+When a dispatch row is legitimately killed (owner-session end or the user cancel lever), the surfaced wake and the journal terminal record SHALL name the outcome as aborted with its reason — never as a completed "finished" report. A killed dispatch's wake SHALL NOT present an empty tail as a final report (no "(no output)" fabrication); the wake SHALL state that the dispatch was aborted, carry the journal reason, and — when the child could not be confirmed idle after the abort attempt — disclose that the child session may still be running (the orphan-disclosure path). The reason SHALL be ONE sentence on both sides — the sentence the kill stamped on the row at kill time — and each lever SHALL have its own sentence: an owner-session end, the user cancel lever (the per-id cancel and the session-scoped stop), and the explicit kill of a dispatch row through the job lever; the owner-death sentence SHALL NOT name any other trigger (a plugin dispose is not one). A host execution error carried as a nested object SHALL be rendered readable (its message, name, error, reason, or data — else a clipped JSON rendering) wherever a journal reason or a wake cites it — never the string `[object Object]`; an error object that cannot be rendered (circular, BigInt-bearing, or throwing when read) SHALL yield to the caller's own honest fallback and SHALL NOT throw into the signal path. A kill that lands while a retry respawns the child SHALL be honored — the fresh child SHALL NOT be left running unwatched: when the kill landed during its creation it is never prompted (aborted as cleanup; the row keeps naming the attempt's real child), and when the kill landed during the prompt send the row is rebound to it and it is aborted. An abort that has not returned within a bounded moment counts as unconfirmed too — a hung host call is not a clean abort — and a wake rendered while the abort is still in flight SHALL wait for that same bounded moment, so the wake discloses exactly what the journal discloses whichever of the two is written first.
+
+#### Scenario: Killed dispatch wakes as aborted, not finished
+
+- **WHEN** an in-flight dispatch row is killed by owner-session end or the cancel lever
+- **THEN** the wake names the dispatch as aborted with its reason, no final-report text is fabricated from the empty tail, and the journal terminal record carries the same reason
+
+#### Scenario: Each lever names itself on both sides
+
+- **WHEN** a dispatch row is killed by the explicit job-lever kill, by the cancel lever, or by an owner-session end
+- **THEN** the journal terminal reason and the wake carry that lever's sentence verbatim and no other lever's — an explicit kill is never reported as an owner death or as a plugin dispose
+
+#### Scenario: Nested error objects render readable
+
+- **WHEN** a host terminal event carries its error as a nested object with no string `message` and the dispatch journals it
+- **THEN** the journal reason names the error's own text (or a clipped JSON rendering of the object) and never contains `[object Object]`
+
+#### Scenario: Unrenderable error objects never throw
+
+- **WHEN** the error object cannot be serialized (circular, BigInt-bearing) or throws when read (a throwing getter, a hostile Proxy)
+- **THEN** the renderer returns no detail, the citing journal reason and wake fall back to their own honest wording, and nothing is thrown into the signal path
+
+#### Scenario: Kill lands in the respawn window
+
+- **WHEN** a dispatch row is killed while its retry child is being created, or while the retry prompt is being sent to it
+- **THEN** the dispatch settles aborted with the killer's sentence, the fresh child is aborted (never prompted when the kill preceded the prompt), and no unwatched child keeps running
+
+#### Scenario: Unconfirmed abort is disclosed
+
+- **WHEN** a kill path's abort attempt fails or cannot be verified (e.g. an abort-less session client)
+- **THEN** the journal and the wake disclose that the abort could not be confirmed and the child may still be running
+
+#### Scenario: An abort that never returns is unconfirmed
+
+- **WHEN** a kill path issues its abort and the host call has not returned within the bounded wait
+- **THEN** the journal terminal reason and the wake both disclose that the abort call had not returned and the child may still be running — never a bare aborted outcome
+
+#### Scenario: An already-idle owner hears what the journal says
+
+- **WHEN** the owning session is already idle when its dispatch row is killed, so the wake is delivered at kill time, and the abort then fails
+- **THEN** the wake waits for the abort verdict and discloses the failed abort with the same wording the journal terminal reason carries
+
+### Requirement: Abort effectiveness on the v2 session client
+
+The session client used for dispatch SHALL provide a real abort on every host generation, or the absence SHALL be disclosed rather than swallowed. On v2 hosts the child-session abort SHALL be wired through an actually available surface (the SDK session abort or the host's HTTP session-abort endpoint) instead of silently no-opping on a missing method; kill paths SHALL NOT discard the abort result silently — a failed or unverifiable abort SHALL be journaled and surfaced per the honest-aborted-outcome requirement.
+
+#### Scenario: v2 kill path aborts the child for real
+
+- **WHEN** a dispatch row is killed on a v2 host and the wired abort surface is available
+- **THEN** the abort is issued through that surface and the child session stops running
+
+#### Scenario: Abort-less client is disclosed, not swallowed
+
+- **WHEN** the session client cannot abort at all (no abort surface on this host generation)
+- **THEN** the kill path records the unverifiable abort in the journal and the wake instead of silently treating the row as cleanly killed
