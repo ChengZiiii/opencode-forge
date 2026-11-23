@@ -52,6 +52,11 @@ export type ExitCleanupOptions = {
    * destruction (journal aborted → recovery skips a live child). Process
    * jobs (pid > 0) keep the current dispose contract. */
   skip?: (job: Job) => boolean
+  /** Diagnostics ONLY: one line per trigger with what the matrix saw and
+   * did, plus one per kill. A kill here writes no ledger line, which cost a
+   * whole sandbox day of guessing whether a plugin dispose had run at all
+   * (2026-11-23). Never throws into the cleanup path. */
+  trace?: (line: string) => void
 }
 
 export type ExitCleanup = {
@@ -76,9 +81,19 @@ export function createExitCleanup(manager: JobManager, opts: ExitCleanupOptions 
     return targets
   }
 
+  const exemptRows = (): number => manager.list().filter((job) => job.state === "running" && Boolean(opts.skip?.(job))).length
+  const trace = (line: string): void => {
+    try {
+      opts.trace?.(line)
+    } catch {
+      // Diagnostics never break cleanup.
+    }
+  }
+
   const killOne = (job: Job, graceful: boolean) => {
     if (opts.skip?.(job)) return // D1: exempt rows are never killed/marked
     const pid = job.pid ?? 0
+    trace(`kill job=${job.id} pid=${pid} owner=${job.ownerSession} graceful=${graceful ? "yes" : "no"}`)
     if (pid > 0) {
       terminateTreeSync(pid, {
         graceMs: graceful ? graceMs : 0,
@@ -103,9 +118,14 @@ export function createExitCleanup(manager: JobManager, opts: ExitCleanupOptions 
 
   const trigger = (kind: string) => {
     if (kind === "dispose") {
-      if (sequenced) return
+      if (sequenced) {
+        trace("dispose: ignored (sequenced latch already set)")
+        return
+      }
       sequenced = true
-      for (const job of liveTargets()) killOne(job, true)
+      const targets = liveTargets()
+      trace(`dispose: live targets=${targets.length} exempt rows=${exemptRows()}`)
+      for (const job of targets) killOne(job, true)
       forcePass()
       if (!afterRan) {
         afterRan = true
@@ -117,6 +137,7 @@ export function createExitCleanup(manager: JobManager, opts: ExitCleanupOptions 
     // complete before the OS terminates the host, and deduplicated with the
     // 'exit' belt via forceIssued. The fence is deliberately left running —
     // its stdin dying with the host is the kernel-level backstop here.
+    if (!forceIssued) trace(`${kind}: live targets=${liveTargets().length} exempt rows=${exemptRows()}`)
     forcePass()
   }
 

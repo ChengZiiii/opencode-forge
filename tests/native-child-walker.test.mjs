@@ -328,11 +328,19 @@ async function realPath(t, adapter, sid, objective) {
   await hooks.tool.crew_begin.execute({ execution: "waves" }, toolCtx(sid, wt))
   return hooks
 }
-/** One idle edge, awaited until its walk actually read the active view. */
-async function walkedIdleEdge(hooks, state, sid) {
+/**
+ * One idle edge, awaited until its walk actually read the active view — and,
+ * when `settled` is given, until that walk's own consequence is observable.
+ * The read being observed does NOT mean the decision ran: the decision (and
+ * the suppression re-check arming) happens a full HTTP round trip LATER, so
+ * under load a test that asserts on it right after the read races the walk
+ * (flaked in a full-suite run on 2026-11-23).
+ */
+async function walkedIdleEdge(hooks, state, sid, settled) {
   const before = activeCalls(state)
   await idleEdge(hooks, sid)
   await until(() => activeCalls(state) > before, "the idle edge walked the active view")
+  if (settled) await until(settled, "the walked idle edge's consequence")
 }
 
 test("REAL PATH — a child created BEFORE the crew is armed is named with its outcome (live Leg B order, live payload shapes)", async (t) => {
@@ -348,7 +356,7 @@ test("REAL PATH — a child created BEFORE the crew is armed is named with its o
   const hooks = await realPath(t, adapter, sid, "pre-arm child")
   assert.equal(v2WiringSeam.crewNativeChildren.rows().has(child), false, "the fresh registration wiped the tracker row (existing semantics — and exactly why the walk must be the authority)")
 
-  await walkedIdleEdge(hooks, state, sid)
+  await walkedIdleEdge(hooks, state, sid, () => v2WiringSeam.crewNativeRecheckArmed(sid))
   await sleep(200)
   assert.equal(prompts.length, 0, "suppressed")
   assert.ok(v2WiringSeam.crewNativeWatch.get(sid)?.has(child), "the WALK is waiting on the pre-arm child")
@@ -402,7 +410,7 @@ test("REAL PATH — a waited-on child DELETED mid-run: the suppression re-check 
   const prompts = []
   const adapter = adapterFor(prompts)
   const hooks = await realPath(t, adapter, sid, "deleted child")
-  await walkedIdleEdge(hooks, state, sid)
+  await walkedIdleEdge(hooks, state, sid, () => v2WiringSeam.crewNativeRecheckArmed(sid))
   assert.equal(v2WiringSeam.crewNativeRecheckArmed(sid), true)
 
   // The child's row disappears (DELETE /api/session/{id} on the live host);
@@ -438,7 +446,7 @@ test("REAL PATH — the re-check keeps the crew HELD while the child is in fligh
     warns++
   }
   try {
-    await walkedIdleEdge(hooks, state, sid)
+    await walkedIdleEdge(hooks, state, sid, () => v2WiringSeam.crewNativeRecheckArmed(sid))
     for (let i = 0; i < 3; i++) {
       await v2WiringSeam.crewNativeRecheckNow(sid, adapter)
       await sleep(60)

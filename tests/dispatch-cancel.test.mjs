@@ -40,6 +40,7 @@ import {
   detectOrphanDispatchChildren,
   observedOrphanDispatches,
   recoverOneDispatchRecord,
+  resetServiceHttpDiscoveryForTests,
   server,
   v2WiringSeam,
 } from "../plugin.ts"
@@ -315,6 +316,68 @@ test("cancel per-id: the explicit cross-session escape hatch still works from an
     () => h.tool.forge_jobs.execute({ action: "cancel", jobId: "all" }, { sessionID: "ses_owner_A" }),
     /cancel "all" is retired — use action "stop"/,
   )
+})
+
+// Live 2.4.0 finding (2026-11-23, sandbox legs K2 + /forge stop): the v2
+// promise-layer session domain exposes no session.status, so EVERY cancel on
+// a real v2 host disclosed "state could not be read to confirm idle" while
+// the host's own HTTP surface (GET /api/session/active) had the answer. The
+// assertion now falls back to that view — a dedicated reader, nothing added
+// to the shared adapter — and stays honest when no view exists at all.
+
+test("cancel engine on a v2 client (no session.status): the idle assertion reads the host's HTTP active-session view — idle / resisted / unresolved", async (t) => {
+  const svcDir = mkdtempSync(join(tmpdir(), "forge-cancel-svc-"))
+  tmpDirs.push(svcDir)
+  const svcFile = join(svcDir, "service.json")
+  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48017", password: "pw" }))
+  process.env.FORGE_SERVICE_FILE = svcFile
+  resetServiceHttpDiscoveryForTests()
+  const prevFetch = globalThis.fetch
+  const hits = []
+  let reads = 0
+  let script = () => ({})
+  globalThis.fetch = async (url, init) => {
+    hits.push({ url: String(url), auth: String(init?.headers?.authorization ?? "") })
+    return { ok: true, status: 200, json: async () => script(++reads) }
+  }
+  // The v2 promise-layer session domain: no status method at all.
+  const v2Client = () => ({ session: { abort: async () => ({ ok: true }) } })
+  const seed = (taskId, child) => {
+    seedDispatch(taskId, child)
+    t.after(() => cleanupDispatch(taskId))
+  }
+  try {
+    // (a) the child winds down on the second read → confirmed idle.
+    script = (n) => (n === 1 ? { ses_v2_idle_child: { type: "running" } } : {})
+    seed("task_cancel_v2_idle", "ses_v2_idle_child")
+    const a = await cancelDispatch(v2Client(), "task_cancel_v2_idle")
+    assert.equal(a.ok, true)
+    assert.equal(a.idle, "idle", "confirmed idle through the HTTP view")
+    assert.match(a.text, /is confirmed idle/, "the cancel output carries the confirmed-abort contract")
+    assert.equal(reads, 2, "first read: still listed; second: gone")
+    assert.equal(hits[0].url, "http://127.0.0.1:48017/api/session/active", "the sanctioned active-session surface")
+    assert.match(hits[0].auth, /^Basic /, "the host's Basic auth rides the read")
+    // (b) a resisting child stays listed → "resisted" once the window closes.
+    reads = 0
+    script = () => ({ ses_v2_resist_child: { type: "running" } })
+    seed("task_cancel_v2_resist", "ses_v2_resist_child")
+    const b = await cancelDispatch(v2Client(), "task_cancel_v2_resist")
+    assert.equal(b.idle, "resisted")
+    assert.match(b.text, /did NOT reach idle/, "a resisting child is disclosed, never reported idle")
+    // (c) no service.json → "unresolved" at once, zero HTTP.
+    process.env.FORGE_SERVICE_FILE = join(svcDir, "missing", "service.json")
+    resetServiceHttpDiscoveryForTests()
+    const hitsBefore = hits.length
+    seed("task_cancel_v2_nosvc", "ses_v2_nosvc_child")
+    const c = await cancelDispatch(v2Client(), "task_cancel_v2_nosvc")
+    assert.equal(c.idle, "unresolved")
+    assert.match(c.text, /could not be read to confirm idle/, "no view → the honest disclosure, never a false idle")
+    assert.equal(hits.length, hitsBefore, "no HTTP without a discovered service")
+  } finally {
+    globalThis.fetch = prevFetch
+    delete process.env.FORGE_SERVICE_FILE
+    resetServiceHttpDiscoveryForTests()
+  }
 })
 
 // ---------------------------------------------------------------------------

@@ -114,6 +114,10 @@ test("journal append: rotation fires through the injectable fs and keeps live st
 // REAL disk before boot; recovery runs through the production fs at init.
 
 const readonlyPool = JSON.stringify({ pool: "dp", agents: { research: { model: "zai/glm", thoughtLevel: "low", shape: "readonly" }, builder: { model: "zai/glm", thoughtLevel: "low", shape: "write" } } })
+// The registry-kill sentence, pinned VERBATIM (spec review 2026-11-23): the
+// journal terminal reason and the wake both render the sentence the kill
+// hook stamped on the row. Its only remaining trigger is an owner death.
+const REGISTRY_REASON = "registry kill (owner session ended) — the child was aborted and the dispatch is never retried"
 
 const input = (dir, client) => ({
   client: client ?? { session: {} },
@@ -392,7 +396,7 @@ test("recovery: live dispatch transitions journal; the terminal record REDACTS t
   assert.equal(terminal.state, "terminal", "terminal after harvest")
   assert.equal(terminal.prompt, undefined, "the prompt is REDACTED on the terminal record")
   assert.equal(terminal.outcome, "aborted", "the owner-death kill is journaled as aborted (never a fake completion)")
-  assert.match(terminal.reason, /registry kill/, "the journal terminal reason names the registry kill")
+  assert.equal(terminal.reason, REGISTRY_REASON, "the journal terminal reason IS the registry-kill sentence, verbatim")
   // The killed wake: honest aborted wording.
   const wakeTexts = () =>
     calls.promptAsync
@@ -402,12 +406,17 @@ test("recovery: live dispatch transitions journal; the terminal record REDACTS t
   await waitFor(() => wakeTexts().length >= 1, "the killed wake is delivered on the idle push")
   const wake = wakeTexts()[0]
   assert.match(wake, /— ABORTED \(task \S+, child session \S+\): /, "the wake presents the dispatch AS aborted with ids")
-  assert.match(wake, /registry kill \(owner session ended/, "the wake carries the kill reason")
+  assert.ok(wake.includes(`): ${REGISTRY_REASON}.`), `the wake carries the SAME sentence verbatim: ${wake}`)
   assert.ok(!/finished/.test(wake), "never the 'finished' wording")
   assert.ok(!wake.includes("(no output)"), "never an empty-tail '(no output)' fake report")
   assert.match(wake, /did NOT finish and produced no final report/, "the honest no-report disclosure")
-  // Journal terminal reason and the wake agree on the kill class.
-  assert.match(terminal.reason, /user abort/, "the journal reason carries the same user-abort class as the wake")
+  // ONE sentence on both sides (spec review 2026-11-23: the journal carried
+  // its own literal — "... / dispose) — user abort" — while the wake carried
+  // the constant; the old assertions matched only the shared "kill" class).
+  for (const stale of ["user cancel", "dispose", "user abort", "/forge stop"]) {
+    assert.ok(!String(terminal.reason).includes(stale), `the journal reason no longer names "${stale}"`)
+    assert.ok(!wake.includes(stale), `the wake no longer names "${stale}"`)
+  }
   void calls
 })
 

@@ -24,7 +24,7 @@ process.env.FORGE_DISPATCH_POLL_SLICE_MS = "20"
 process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "forge-disp-home-"))
 process.env.FORGE_TEST_NO_DISPATCH_FETCH = "1"
 
-import { server, TASK_SEAM_DEGRADED_ERROR } from "../plugin.ts"
+import { server, TASK_SEAM_DEGRADED_ERROR, executionErrorDetail } from "../plugin.ts"
 
 const worktreeRoot = mkdtempSync(join(tmpdir(), "forge-disp-"))
 process.on("exit", () => {
@@ -63,10 +63,15 @@ function makeClient(opts = {}) {
         const id = `ses_child_${++seq}`
         const mode = typeof opts.mode === "function" ? opts.mode(seq) : (opts.mode ?? "done")
         childState.set(id, mode)
+        // Test seam: an event (a kill, a signal) landing WHILE the child is
+        // being created — the create resolves only after the hook returns.
+        if (typeof opts.onCreate === "function") await opts.onCreate(id, seq)
         return { data: { id } }
       },
       promptAsync: async (args) => {
         calls.promptAsync.push(args)
+        // Test seam: an event landing WHILE the prompt is being sent.
+        if (typeof opts.onPromptAsync === "function") await opts.onPromptAsync(args)
         return {}
       },
       prompt: async (args) => {
@@ -99,6 +104,13 @@ function makeClient(opts = {}) {
       },
       abort: async (args) => {
         calls.abort.push(args)
+        // "hang": the host call never returns. "slow-throw": it fails, but
+        // only after a delay — a wake rendered at kill time gets there first.
+        if (abortMode === "hang") return new Promise(() => {})
+        if (abortMode === "slow-throw") {
+          await new Promise((resolve) => setTimeout(resolve, 80))
+          throw new Error("abort endpoint refused (slow)")
+        }
         if (abortMode === "throw") throw new Error("abort endpoint refused")
         childState.set(args.path.id, "done")
         return true
@@ -1551,4 +1563,529 @@ test("kill-path abort-unconfirmed: a FAILED abort on the owner-death kill is dis
   assert.ok(!wake.includes("Final report:"), "no fake-report styling on a killed dispatch")
   assert.ok(!wake.includes("(no output)"), "no empty-tail fake report")
   void childID
+})
+
+// Live 2.4.0 finding (2026-11-23, sandbox legs K2 + /forge stop): the abort a
+// USER cancel issues makes the child surface as a terminal verdict in the
+// watch's view — a durable `session.execution.failed` whose `error` is a
+// nested object (the poll then reads "error"), or a finished-looking
+// transcript. The watch acted on that verdict first and journaled the
+// dispatch as `error`/`completed` BEFORE its quiet-path kill check could run:
+// a user cancel was a provider failure to the breaker, and the wake said
+// "owner session ended / user cancel". The registry's kill verdict now
+// outranks every observed verdict.
+
+test("user cancel + the poll reads the child as ERROR: journaled ABORTED with the lever reason (never `error`); the wake names the lever", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+  })
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "cancelled while busy", run_in_background: true, description: "cancel vs error verdict" },
+    allowCtx("ses_cancel_err", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  const stop = await h.tool.forge_jobs.execute({ action: "stop" }, allowCtx("ses_cancel_err", dir))
+  assert.match(stop.output, /Stopped 1 in-flight dispatch\(es\)/)
+  // 2.4.0 reality: the aborted child's view reads as an error.
+  setChildState(childID, "error")
+  const journalText = () => readFileSync(join(dir, ".opencode", "forge", "dispatch-log.jsonl"), "utf8")
+  const terminals = () =>
+    journalText()
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l))
+      .filter((rec) => rec.id === jobId && rec.state === "terminal")
+  await waitFor(() => terminals().length > 0, "the cancelled dispatch terminalized")
+  assert.equal(terminals().length, 1, "exactly one terminal record")
+  const terminal = terminals()[0]
+  assert.equal(terminal.outcome, "aborted", "a user cancel is an ABORT, never an error")
+  assert.match(terminal.reason, /cancelled by the user lever \(\/forge stop\)/, "the journal names the lever")
+  assert.doesNotMatch(String(terminal.reason), /child session ended in error|\[object Object\]/, "no error verdict leaks into a cancelled dispatch")
+  // The owner's wake: the SAME sentence, presented as an abort.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_cancel_err" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_cancel_err")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the aborted wake is delivered")
+  const wake = toOwner().map(textOf).find((s) => s.startsWith("[forge:dispatch-complete]"))
+  assert.match(wake, /— ABORTED \(task /, "presented as an abort")
+  assert.ok(wake.includes(String(terminal.reason)), "the wake carries the journal reason verbatim")
+  assert.ok(!wake.includes("owner session ended"), "no generic registry-kill disjunction on a user cancel")
+  assert.ok(!wake.includes("Final report:") && !wake.includes("(no output)"), "no fake report")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_cancel_err").length, 0, "the watch ended")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_cancel_err" } } } })
+})
+
+test("user cancel + the child looks FINISHED (a final message is readable): still journaled ABORTED — a cancelled dispatch never reports completion", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  // The fake abort marks the child done: its transcript then reads as a
+  // completed run with a report — exactly the verdict that used to win.
+  const { client } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+  })
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "cancelled, then looks done", run_in_background: true, description: "cancel vs completed verdict" },
+    allowCtx("ses_cancel_done", dir),
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  await h.tool.forge_jobs.execute({ action: "stop" }, allowCtx("ses_cancel_done", dir))
+  const journalText = () => readFileSync(join(dir, ".opencode", "forge", "dispatch-log.jsonl"), "utf8")
+  let terminal
+  await waitFor(() => {
+    terminal = journalText()
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l))
+      .find((rec) => rec.id === jobId && rec.state === "terminal")
+    return terminal !== undefined
+  }, "the cancelled dispatch terminalized")
+  assert.equal(terminal.outcome, "aborted", "the kill verdict outranks the completed-looking child")
+  assert.match(terminal.reason, /cancelled by the user lever \(\/forge stop\)/, "the journal names the lever")
+  assert.ok(!/Final report:|report from/.test(String(terminal.reason)), "no report rides a cancelled dispatch")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_cancel_done" } } } })
+})
+
+test("host terminal signal with a NESTED error object: the journal reason names the error (never [object Object])", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "fails through a host signal", run_in_background: true, description: "nested error signal" },
+    allowCtx("ses_nested_err", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  // 2.4.0 event shape: `error` is a nested object with no string `message`.
+  await h.event({
+    event: {
+      type: "session.execution.failed",
+      properties: { sessionID: childID, error: { name: "ProviderError", data: { message: "no provider available for the pinned model" } } },
+    },
+  })
+  const journalText = () => readFileSync(join(dir, ".opencode", "forge", "dispatch-log.jsonl"), "utf8")
+  let terminal
+  await waitFor(() => {
+    terminal = journalText()
+      .split("\n")
+      .filter((l) => l.trim())
+      .map((l) => JSON.parse(l))
+      .find((rec) => rec.id === jobId && rec.state === "terminal")
+    return terminal !== undefined
+  }, "the failed child terminalized the dispatch")
+  assert.equal(terminal.outcome, "error", "a genuine child failure stays an error")
+  assert.match(String(terminal.reason), /child session ended in error: ProviderError: no provider available for the pinned model/, "the reason names the error")
+  assert.doesNotMatch(String(terminal.reason), /\[object Object\]/)
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_nested_err" } } } })
+})
+
+// ---------------------------------------------------------------------------
+// Spec review 2026-11-23 — kill-path follow-ups, all inside the approved
+// fix-dispatch-dispose-kill / command-surface-v2-cleanup contracts:
+//   ① ONE kill sentence: the journal terminal reason and the wake render the
+//     sentence the kill hook stamped on the ROW (the lever / the explicit
+//     forge_jobs kill / an owner death). The two sides used to carry
+//     different literals, and a generic forge_jobs kill on a dispatch row
+//     was reported as an owner death — or as "dispose" — on both.
+//   ② The kill settle IS a terminal transition: it pumps the session's
+//     dispatch queue like every other terminal path (fold D). The early
+//     returns of the kill settle used to skip it, so a cancelled dispatch
+//     never released its slot to the queued head.
+//   ③ Respawn-window kills: a kill landing while the retry child is created
+//     or prompted must not leave a second, unwatched child behind.
+//   ④ The post-abort idle assertion bounds every view read: a hung read
+//     must not stretch a cancel (or a serial /forge stop) past its window.
+// The three sentences are pinned VERBATIM: a wording change is a deliberate
+// edit of the constant AND of this pin.
+
+const LEVER_REASON = "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+const REGISTRY_REASON = "registry kill (owner session ended) — the child was aborted and the dispatch is never retried"
+const EXPLICIT_KILL_REASON = "killed by the explicit forge_jobs kill action — the child was aborted and the dispatch is never retried"
+
+const journalTerminals = (dir, jobId) =>
+  readFileSync(join(dir, ".opencode", "forge", "dispatch-log.jsonl"), "utf8")
+    .split("\n")
+    .filter((l) => l.trim())
+    .map((l) => JSON.parse(l))
+    .filter((rec) => rec.id === jobId && rec.state === "terminal")
+
+const ownerWakes = (calls, owner) =>
+  calls.promptAsync
+    .filter((a) => a.path?.id === owner)
+    .map((a) => String(a.body?.parts?.[0]?.text ?? ""))
+    .filter((s) => s.startsWith("[forge:dispatch-complete]"))
+
+const tracked = (h, jobId) => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.jobId === jobId).length
+
+/**
+ * Race a PLAIN promise against a deadline that fails the test instead of
+ * hanging the suite. Never wrap a `waitFor` in it: waitFor rejects by itself
+ * at its own `timeoutMs`, while a raced waitFor would lose the race and keep
+ * polling forever in the background (the event loop then never drains).
+ */
+async function within(promise, ms, label) {
+  let timer
+  try {
+    return await Promise.race([promise, new Promise((_, reject) => (timer = setTimeout(() => reject(new Error(label)), ms)))])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+test("kill sentence ①: forge_jobs kill on a dispatch row names THAT lever — one sentence verbatim in the journal AND the wake (never an owner death, never `dispose`)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const ctx = allowCtx("ses_ks_x", dir)
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "killed through the generic lever", run_in_background: true, description: "explicit kill sentence" },
+    ctx,
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const kill = await h.tool.forge_jobs.execute({ action: "kill", jobId }, ctx)
+  assert.match(kill.output, /tree kill issued/, "the generic kill action took the row")
+  await waitFor(() => journalTerminals(dir, jobId).length === 1, "the killed row terminalized")
+  const terminal = journalTerminals(dir, jobId)[0]
+  assert.equal(terminal.outcome, "aborted", "a killed dispatch is an abort")
+  assert.equal(terminal.reason, EXPLICIT_KILL_REASON, "the journal carries the explicit-kill sentence verbatim")
+  assert.equal(tracked(h, jobId), 0, "the watch ended")
+  // The owner goes idle AFTER the settle: the wake is rendered from the row.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_ks_x" } } })
+  await waitFor(() => ownerWakes(calls, "ses_ks_x").length === 1, "the killed wake is delivered")
+  const wake = ownerWakes(calls, "ses_ks_x")[0]
+  assert.ok(
+    wake.includes(`— ABORTED (task ${jobId}, child session ${childID}): ${EXPLICIT_KILL_REASON}.`),
+    `the wake carries the journal sentence verbatim: ${wake}`,
+  )
+  for (const wrong of ["owner session ended", "user cancel", "/forge stop", "dispose"]) {
+    assert.ok(!wake.includes(wrong), `no "${wrong}" on an explicit kill`)
+  }
+  assert.ok(!/Final report:|\(no output\)/.test(wake), "no fake report on a killed dispatch")
+  assert.equal(journalTerminals(dir, jobId).length, 1, "still exactly one terminal")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_ks_x" } } } })
+})
+
+test("queue pump ②: a kill settle releases the slot — the queued head spawns after a per-id cancel, and /forge stop discloses the queued wishes it does NOT cancel", async (t) => {
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const ctx = allowCtx("ses_ks_pump", dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  const ids = []
+  for (let i = 0; i < 3; i++) ids.push(idOf(await dispatch(i)))
+  const queuedId = idOf(await dispatch(3))
+  assert.equal(calls.create.length, 3, "the 4th wish is queued behind the cap")
+  // The per-id lever on ONE in-flight row: its kill settle is the terminal
+  // transition that pumps. (Before the fix the head stayed parked until
+  // some OTHER dispatch of the session completed.)
+  const cancel = await h.tool.forge_jobs.execute({ action: "cancel", jobId: ids[0] }, ctx)
+  assert.ok(cancel.output.includes(`Cancelled ${ids[0]}`), `the cancel receipt names the task: ${cancel.output}`)
+  await waitFor(() => calls.create.length === 4, "the freed slot pumped the queued head", 4000)
+  assert.equal(calls.create[3].body.parentID, "ses_ks_pump", "the queued wish spawned under the same owner")
+  assert.equal(tracked(h, queuedId), 1, "the queued wish is now a tracked dispatch")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_ks_pump").length, 0, "the queue is empty")
+  assert.equal(journalTerminals(dir, ids[0])[0]?.reason, LEVER_REASON, "the cancelled row journaled the lever sentence")
+  // The cap is full again (2 survivors + the spawned wish): the next wish
+  // queues; /forge stop cancels the 3 in flight and SAYS that the queued one
+  // is not cancelled (queued wishes are not in flight — the contract's
+  // whether-stop-also-flushes-them is an open decision, not this behavior).
+  const queuedId2 = idOf(await dispatch(4))
+  const stop = await h.tool.forge_jobs.execute({ action: "stop" }, ctx)
+  assert.match(stop.output, /Stopped 3 in-flight dispatch\(es\)/)
+  assert.ok(
+    stop.output.includes(`1 queued wish(es) of this session were NOT in flight and are not cancelled by stop — they spawn FIFO into the freed slots: ${queuedId2}`),
+    `the stop output discloses the queued wish: ${stop.output}`,
+  )
+  await waitFor(() => calls.create.length === 5, "the stopped rows' settles pumped the second queued wish", 4000)
+  for (const id of [ids[1], ids[2], queuedId]) {
+    await waitFor(() => journalTerminals(dir, id).length === 1, `${id} terminalized`)
+    assert.equal(journalTerminals(dir, id)[0].reason, LEVER_REASON, `${id} journaled the lever sentence`)
+  }
+  assert.equal(tracked(h, queuedId2), 1, "the second queued wish is tracked (it spawned, it was not cancelled)")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_ks_pump" } } } })
+})
+
+test("respawn window ③a: a kill landing WHILE the retry child is CREATED never prompts it — the husk is aborted as cleanup, the row settles ABORTED with the killer's sentence, the wake names the attempt's real child", async (t) => {
+  process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS = "30"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  let duringCreate
+  const { client, calls } = makeClient({
+    record: { directory: dir, worktree: dir },
+    mode: (seq) => (seq === 1 ? "error" : "busy"),
+    errorText: "fetch failed: ECONNRESET mid-stream",
+    onCreate: (id, seq) => (seq === 2 && duringCreate ? duringCreate(id) : undefined),
+  })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const ctx = allowCtx("ses_rsw_a", dir)
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "killed between attempts", run_in_background: true, description: "respawn window: create" },
+    ctx,
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  const child1 = r.output.match(/child session: (ses_child_\d+)/)[1]
+  // The explicit forge_jobs kill lands while the retry child is being
+  // created (after the backoff check, before the create resolves).
+  duringCreate = () => {
+    void h.tool.forge_jobs.execute({ action: "kill", jobId }, ctx).catch(() => {})
+  }
+  await waitFor(() => calls.create.length === 2, "the retry child was created")
+  await waitFor(() => journalTerminals(dir, jobId).length === 1, "the killed row settled", 4000)
+  assert.equal(calls.promptAsync.filter((a) => a.path?.id === "ses_child_2").length, 0, "the husk was NEVER prompted")
+  assert.ok(calls.abort.some((a) => a.path?.id === "ses_child_2"), `the husk was aborted as cleanup: ${JSON.stringify(calls.abort.map((a) => a.path?.id))}`)
+  const terminal = journalTerminals(dir, jobId)[0]
+  assert.equal(terminal.outcome, "aborted", "a killed dispatch is an abort")
+  assert.equal(terminal.reason, EXPLICIT_KILL_REASON, "the journal carries the killer's sentence verbatim")
+  assert.equal(tracked(h, jobId), 0, "the watch ended")
+  await new Promise((res) => setTimeout(res, 150))
+  assert.equal(calls.create.length, 2, "no further attempt after the kill")
+  assert.equal(journalTerminals(dir, jobId).length, 1, "exactly one terminal")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_rsw_a" } } })
+  await waitFor(() => ownerWakes(calls, "ses_rsw_a").length === 1, "the killed wake is delivered")
+  const wake = ownerWakes(calls, "ses_rsw_a")[0]
+  assert.ok(wake.includes(`— ABORTED (task ${jobId}, child session ${child1}): ${EXPLICIT_KILL_REASON}.`), `the wake carries the journal sentence: ${wake}`)
+  assert.ok(!wake.includes("ses_child_2"), "the never-prompted husk is not the named child — the wake points at the transcript that exists")
+  assert.ok(!/Final report:|\(no output\)/.test(wake), "no fake report on a killed dispatch")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rsw_a" } } } })
+})
+
+test("respawn window ③b: a kill landing WHILE the retry prompt is SENT aborts the fresh child, rebinds the row to it and settles ABORTED — no second unwatched child", async (t) => {
+  process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS = "30"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  let duringPrompt
+  const { client, calls } = makeClient({
+    record: { directory: dir, worktree: dir },
+    mode: (seq) => (seq === 1 ? "error" : "busy"),
+    errorText: "fetch failed: ECONNRESET mid-stream",
+    onPromptAsync: (args) => (args.path?.id === "ses_child_2" && duringPrompt ? duringPrompt() : undefined),
+  })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const ctx = allowCtx("ses_rsw_b", dir)
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "killed as the retry starts", run_in_background: true, description: "respawn window: prompt" },
+    ctx,
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  const child2 = "ses_child_2"
+  // The per-id cancel lever lands while the retry prompt is being sent.
+  duringPrompt = () => {
+    void h.tool.forge_jobs.execute({ action: "cancel", jobId }, ctx).catch(() => {})
+  }
+  await waitFor(() => journalTerminals(dir, jobId).length === 1, "the killed row settled", 4000)
+  assert.equal(calls.promptAsync.filter((a) => a.path?.id === child2).length, 1, "the retry was prompted exactly once")
+  assert.ok(calls.abort.some((a) => a.path?.id === child2), `the fresh child was aborted: ${JSON.stringify(calls.abort.map((a) => a.path?.id))}`)
+  const terminal = journalTerminals(dir, jobId)[0]
+  assert.equal(terminal.outcome, "aborted", "a cancelled dispatch is an abort, never an error")
+  assert.equal(terminal.reason, LEVER_REASON, "the journal carries the lever sentence verbatim")
+  assert.equal(tracked(h, jobId), 0, "the watch ended")
+  await new Promise((res) => setTimeout(res, 150))
+  assert.equal(calls.create.length, 2, "no further attempt after the cancel")
+  assert.equal(journalTerminals(dir, jobId).length, 1, "exactly one terminal")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_rsw_b" } } })
+  await waitFor(() => ownerWakes(calls, "ses_rsw_b").length === 1, "the cancelled wake is delivered")
+  const wake = ownerWakes(calls, "ses_rsw_b")[0]
+  assert.ok(wake.includes(`— ABORTED (task ${jobId}, child session ${child2}): ${LEVER_REASON}.`), `the wake names the rebound child with the journal sentence: ${wake}`)
+  assert.ok(!wake.includes("owner session ended"), "no registry-kill wording on a user cancel")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_rsw_b" } } } })
+})
+
+test("idle assertion ④: a HUNG status read is bounded — the cancel returns inside its window with an honest `unresolved` (it used to await the read forever)", async (t) => {
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const ctx = allowCtx("ses_hungview", dir)
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "unreadable after the cancel", run_in_background: true, description: "hung idle view" },
+    ctx,
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  // While `hang` is set every status read parks on a promise the test
+  // resolves afterwards (the watch must resume for the cleanup below).
+  const realStatus = client.session.status
+  const parked = []
+  let hang = true
+  client.session.status = async () => {
+    if (hang) return new Promise((resolve) => parked.push(resolve))
+    return realStatus()
+  }
+  t.after(() => {
+    client.session.status = realStatus
+  })
+  const t0 = Date.now()
+  const stop = await within(h.tool.forge_jobs.execute({ action: "stop" }, ctx), 8_000, "the stop hung on the unreadable view")
+  const elapsed = Date.now() - t0
+  hang = false
+  const settled = await realStatus()
+  for (const resolve of parked) resolve(settled)
+  assert.ok(elapsed < 6_000, `the stop returned in ${elapsed}ms — the 300ms window plus bounded reads, never a hang`)
+  assert.match(stop.output, /Stopped 1 in-flight dispatch\(es\)/)
+  assert.match(stop.output, /state could not be read to confirm idle/, "an unreadable view is disclosed as unresolved")
+  assert.ok(!/confirmed idle|did NOT reach idle/.test(stop.output), "no idle claim is made on an unreadable view")
+  assert.equal(calls.abort.length, 1, "the abort itself was issued before the assertion")
+  await waitFor(() => journalTerminals(dir, jobId).length === 1, "the killed row still settles once the view is readable again")
+  assert.equal(journalTerminals(dir, jobId)[0].reason, LEVER_REASON, "the journal carries the lever sentence verbatim")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_hungview" } } } })
+})
+
+test("abort-unconfirmed ④b: an ALREADY-IDLE owner is woken at kill time — the wake waits for the abort verdict and discloses a FAILED abort exactly like the journal (never a clean `aborted` first)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy", abortMode: "slow-throw" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const ctx = allowCtx("ses_unconf_idle", dir)
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "abort fails after a delay", run_in_background: true, description: "idle owner, slow failed abort" },
+    ctx,
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  // The owner is idle BEFORE the kill: the kill wake is pushed immediately
+  // (onWakeQueued's idle push) — 80 ms before the abort fails.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_unconf_idle" } } })
+  await h.tool.forge_jobs.execute({ action: "kill", jobId }, ctx)
+  const disclosure = "abort unconfirmed — child may still be running (session.abort threw: Error: abort endpoint refused (slow))"
+  await waitFor(() => ownerWakes(calls, "ses_unconf_idle").length === 1, "the killed wake is delivered on the idle push", 6000)
+  const wake = ownerWakes(calls, "ses_unconf_idle")[0]
+  assert.ok(wake.includes(disclosure), `the wake waits for the verdict and discloses the failed abort: ${wake}`)
+  assert.ok(wake.includes(`): ${EXPLICIT_KILL_REASON}.`), `the wake still carries the kill sentence: ${wake}`)
+  await waitFor(() => journalTerminals(dir, jobId).length === 1, "the killed row terminalized", 6000)
+  const terminal = journalTerminals(dir, jobId)[0]
+  assert.ok(String(terminal.reason).includes(disclosure), `the journal discloses the same: ${terminal.reason}`)
+  assert.equal(terminal.outcome, "aborted")
+  assert.equal(tracked(h, jobId), 0, "the watch ended")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_unconf_idle" } } } })
+})
+
+test("abort-unconfirmed ④c: an abort call that never RETURNS is disclosed as unconfirmed in the journal AND the wake (a hung host call is not a clean abort)", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy", abortMode: "hang" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const ctx = allowCtx("ses_unconf_hang", dir)
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "abort never returns", run_in_background: true, description: "hung abort" },
+    ctx,
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  await h.tool.forge_jobs.execute({ action: "kill", jobId }, ctx)
+  await waitFor(() => journalTerminals(dir, jobId).length === 1, "the killed row terminalized after the bounded wait", 6000)
+  const terminal = journalTerminals(dir, jobId)[0]
+  assert.equal(terminal.outcome, "aborted")
+  assert.equal(
+    terminal.reason,
+    `${EXPLICIT_KILL_REASON} — abort unconfirmed — child may still be running (the abort call had not returned within 2 s)`,
+    "the journal says the abort was never confirmed — never a bare `aborted`",
+  )
+  assert.equal(calls.abort.length, 1, "the abort was issued once")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_unconf_hang" } } })
+  await waitFor(() => ownerWakes(calls, "ses_unconf_hang").length === 1, "the killed wake is delivered", 6000)
+  const wake = ownerWakes(calls, "ses_unconf_hang")[0]
+  assert.ok(wake.includes("abort unconfirmed — child may still be running (the abort call had not returned within 2 s)"), `the wake discloses the same: ${wake}`)
+  assert.ok(wake.includes(`): ${EXPLICIT_KILL_REASON}.`), `the wake carries the kill sentence: ${wake}`)
+  assert.equal(tracked(h, jobId), 0, "the watch ended")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_unconf_hang" } } } })
+})
+
+test("executionErrorDetail: strings pass through, Error-likes read \"Name: message\", nested objects dig, an empty object yields the caller's fallback", () => {
+  assert.equal(executionErrorDetail("plain"), "plain")
+  assert.equal(executionErrorDetail(""), undefined)
+  assert.equal(executionErrorDetail(undefined), undefined)
+  assert.equal(executionErrorDetail(null), undefined)
+  assert.equal(executionErrorDetail(new Error("boom")), "Error: boom")
+  assert.equal(executionErrorDetail({ message: "boom" }), "boom")
+  assert.equal(executionErrorDetail({ name: "MessageAbortedError", data: { message: "Aborted" } }), "MessageAbortedError: Aborted")
+  assert.equal(executionErrorDetail({ data: { message: "no provider available" } }), "no provider available")
+  assert.equal(executionErrorDetail({ name: "AbortError" }), "AbortError")
+  assert.equal(executionErrorDetail({ error: { reason: "rate limited" } }), "rate limited")
+  assert.equal(executionErrorDetail({ code: 503 }), '{"code":503}')
+  assert.equal(executionErrorDetail({}), undefined)
+  const deep = String(executionErrorDetail({ a: { b: { c: { d: { e: "deep" } } } } }))
+  assert.ok(deep.includes("deep") && !deep.includes("[object Object]"), `the deep object renders readable: ${deep}`)
+})
+
+test("executionErrorDetail is TOTAL on hostile shapes: unserializable or throwing objects say nothing (the caller's fallback) — never [object Object], never a throw", () => {
+  // Spec review 2026-11-23: the JSON fallback used to end in String(error),
+  // which rendered exactly the "[object Object]" this function prevents (and
+  // throws for a null-prototype object); a throwing getter escaped the
+  // function altogether.
+  const circular = { code: 503 }
+  circular.self = circular
+  const circularArray = [1]
+  circularArray.push(circularArray)
+  const throwing = {
+    get message() {
+      throw new Error("hostile getter")
+    },
+  }
+  const hostileProxy = new Proxy(
+    {},
+    {
+      ownKeys() {
+        throw new Error("hostile ownKeys")
+      },
+      get() {
+        throw new Error("hostile get")
+      },
+    },
+  )
+  // Each entry: [label, value] — the label is static (a hostile value may
+  // throw even on being described).
+  const hostile = [
+    ["a circular object", circular],
+    ["a circular array", circularArray],
+    ["an object with a BigInt", { code: 503n }],
+    ["an array with a BigInt", [503n]],
+    ["a null-prototype empty object", Object.create(null)],
+    ["a throwing getter", throwing],
+    ["a hostile Proxy", hostileProxy],
+    ["a bare BigInt", 503n],
+    ["a Symbol", Symbol("s")],
+  ]
+  for (const [label, bad] of hostile) {
+    let got
+    assert.doesNotThrow(() => (got = executionErrorDetail(bad)), `does not throw for ${label}`)
+    assert.equal(got, undefined, `says nothing for ${label}`)
+  }
+  // Content that CAN be serialized still renders.
+  assert.equal(executionErrorDetail(Object.assign(Object.create(null), { code: 503 })), '{"code":503}', "a null-prototype object with content renders as JSON")
+  assert.equal(executionErrorDetail({ code: 503, extra: "x".repeat(400) }).length, 301, "a long JSON rendering is clipped")
 })

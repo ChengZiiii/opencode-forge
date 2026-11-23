@@ -1002,6 +1002,9 @@ function ensureJobLifecycle(): { registry: JobRegistry | null; fence: JobFence |
     // abort, no journal terminal state; continuity rides the dispatch
     // journal + restart recovery.
     skip: isDispatchRow,
+    // Diagnostics only (the sandbox probe log): the exit matrix leaves a
+    // trace of what each trigger saw and killed.
+    trace: (line) => goalProbe(`exit-cleanup ${line}`),
     after: () => {
       jobFence?.dispose()
     },
@@ -1134,6 +1137,40 @@ function isDispatchRow(job: Job): boolean {
 // journal settle (the poller's kill exit appends it to the terminal reason)
 // and at wake delivery (jobWakeText discloses it) — never silently dropped.
 const abortUnconfirmedNotes = new Map<string, string>()
+// jobId → the abortChild promise a kill hook left in flight. The watcher's
+// kill settle waits (bounded) on it before writing the journal terminal, so
+// an abort that FAILED is disclosed in the journal too — not only in the
+// wake, which is rendered later.
+const abortInFlight = new Map<string, Promise<void>>()
+// How long a kill settle (and a wake rendered at kill time) waits for an
+// in-flight abort before treating it as unconfirmed.
+const KILL_ABORT_VERDICT_WAIT_MS = 2_000
+const KILL_ABORT_PENDING_NOTE = `the abort call had not returned within ${KILL_ABORT_VERDICT_WAIT_MS / 1000} s`
+
+/**
+ * Wait (bounded) for a kill's in-flight abort and make its verdict honest.
+ * A FAILED or unavailable abort is recorded by the kill hook itself; an
+ * abort that has NOT RETURNED within the bound is recorded HERE as
+ * unconfirmed too (spec review 2026-11-23, finding ④): a hung host call is
+ * not a clean abort — the child may still be running — and the journal used
+ * to write a bare "aborted" once its 2 s wait ran out. BOTH readers call
+ * this — the journal settle and the wake delivery — so an already-idle owner
+ * (woken at kill time, before the abort verdict lands) is told exactly what
+ * the journal says, whichever of the two renders first.
+ */
+async function awaitAbortVerdict(jobId: string): Promise<void> {
+  const pending = abortInFlight.get(jobId)
+  if (!pending) return
+  await new Promise<void>((resolve) => {
+    const timer = setTimeout(() => resolve(), KILL_ABORT_VERDICT_WAIT_MS)
+    const done = () => {
+      clearTimeout(timer)
+      resolve()
+    }
+    pending.then(done, done)
+  })
+  if (abortInFlight.get(jobId) === pending) abortUnconfirmedNotes.set(jobId, KILL_ABORT_PENDING_NOTE)
+}
 
 /**
  * fix-dispatch-dispose-kill D2/D3: the ONE killTree hook factory for
@@ -1151,13 +1188,18 @@ function dispatchKillTreeHook(client: DispatchClient, jobId: string, childSessio
     const meta = job ? (job as Job & { dispatch?: DispatchJobMeta }).dispatch : undefined
     if (meta && meta.outcome !== "stream-lost/unknown") {
       meta.outcome = "aborted"
-      meta.abortReason = meta.abortReason ?? "registry kill (owner session ended / user cancel)"
+      meta.abortReason = meta.abortReason ?? REGISTRY_KILL_ABORT_REASON
     }
     const sid = childSessionID()
     if (!sid) return
-    void abortChild(client, sid).then((res) => {
+    const pending = abortChild(client, sid).then((res) => {
       if (!res.ok) abortUnconfirmedNotes.set(jobId, res.error)
     })
+    abortInFlight.set(jobId, pending)
+    const drop = () => {
+      if (abortInFlight.get(jobId) === pending) abortInFlight.delete(jobId)
+    }
+    void pending.then(drop, drop)
   }
 }
 
@@ -1177,7 +1219,7 @@ function jobWakeText(job: Job): string {
     // dispatch is presented AS an abort with its reason — NEVER "finished …
     // Final report:" with an empty tail faking a report.
     if (job.state === "killed" || dispatch.outcome === "aborted") {
-      const reason = dispatch.abortReason ?? "registry kill (owner session ended / user cancel)"
+      const reason = dispatch.abortReason ?? REGISTRY_KILL_ABORT_REASON
       const unconfirmed = abortUnconfirmedNotes.get(job.id)
       return [
         `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — ABORTED (task ${job.id}, child session ${dispatch.childSessionID}): ${reason}.`,
@@ -1210,6 +1252,14 @@ async function deliverJobWakes(sessionID: string): Promise<void> {
   if (forgeDisabled) return
   if (!jobClient || typeof jobClient.session.promptAsync !== "function") return
   for (const job of jobManager.deliverWakesFor(sessionID)) {
+    // A killed dispatch's abort may still be in flight when an ALREADY-IDLE
+    // owner is woken at kill time — before the abort verdict lands. Give it
+    // the same bounded moment the journal settle gets (and the same
+    // unconfirmed note for a hung call), so the wake never says a clean
+    // "aborted" where the journal says "unconfirmed". Rows with no abort in
+    // flight take NO await here: a plain job's wake is delivered
+    // synchronously on the idle edge, as it always was.
+    if (abortInFlight.has(job.id)) await awaitAbortVerdict(job.id)
     try {
       await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: jobWakeText(job) }] } })
     } catch {
@@ -2756,14 +2806,22 @@ const forgeJobsTool = tool({
       if (flight.length === 0) {
         return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${context.sessionID}) — nothing to stop.` }
       }
+      // Queued wishes are NOT in flight, so stop does not cancel them — and
+      // the slots the cancels free are pumped the moment each row settles
+      // (fold D). Read BEFORE the cancels (afterwards the head has spawned).
+      const queuedAtCall = queuedAsyncDispatchIds(context.sessionID)
       const results: string[] = []
       for (const taskId of flight) {
         const res = await cancelDispatch(client, taskId)
         results.push(`- ${res.text}`)
       }
+      const queuedNote =
+        queuedAtCall.length > 0
+          ? `\n[forge:job] ${queuedAtCall.length} queued wish(es) of this session were NOT in flight and are not cancelled by stop — they spawn FIFO into the freed slots: ${queuedAtCall.join(", ")}`
+          : ""
       return {
         title: `${flight.length} dispatch(es) stopped`,
-        output: `[forge:job] Stopped ${flight.length} in-flight dispatch(es) of this session:\n${results.join("\n")}`,
+        output: `[forge:job] Stopped ${flight.length} in-flight dispatch(es) of this session:\n${results.join("\n")}${queuedNote}`,
       }
     }
     if (!args.jobId) throw new Error(`Action "${action}" requires jobId.`)
@@ -2808,6 +2866,13 @@ const forgeJobsTool = tool({
       }
     }
     if (action === "kill") {
+      // A dispatch row killed through the generic action: stamp its reason
+      // BEFORE the kill (the hook keeps an already-stamped reason) so the
+      // journal and the wake name THIS lever — not an owner death.
+      {
+        const meta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
+        if (meta && meta.outcome !== "stream-lost/unknown") meta.abortReason = EXPLICIT_KILL_ABORT_REASON
+      }
       jobManager.kill(job)
       return { title: `${job.id} killed`, output: `[forge:job] ${job.id}: tree kill issued (state: killed).` }
     }
@@ -3658,6 +3723,29 @@ type DispatchRetryContext = {
 
 const cancelledDispatchIds = new Set<string>()
 
+// One source for the user-lever abort reason: stamped on the row's dispatch
+// meta at cancel time (the wake renders it) AND written as the journal
+// terminal reason by the watcher's kill settle — journal and wake carry the
+// same sentence verbatim. (Live 2.4.0 finding 2026-11-23: a /forge stop wake
+// said "registry kill (owner session ended / user cancel)" — a disjunction
+// that names neither what happened nor that the owner is alive and cancelling.)
+const USER_LEVER_ABORT_REASON =
+  "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+// The sentence for a registry kill that is NOT a lever. Since
+// fix-dispatch-dispose-kill its only trigger is the owner session ENDING
+// (a plugin dispose no longer kills dispatch rows) and the user lever has
+// its own sentence above — so the former "(owner session ended / user
+// cancel)" named things that were either no longer true or somebody else's
+// reason. The kill hook stamps ONE sentence on the row and BOTH readers —
+// the journal terminal (settleKilled) and the wake (jobWakeText) — render
+// that stamped sentence (a spec review on 2026-11-23 found the two sides
+// carrying different sentences on the owner-death path: the journal its own
+// literal, the wake this constant).
+const REGISTRY_KILL_ABORT_REASON = "registry kill (owner session ended) — the child was aborted and the dispatch is never retried"
+// The generic forge_jobs kill action applied to a dispatch row: an explicit
+// lever, not an owner death — its reason is stamped before the kill.
+const EXPLICIT_KILL_ABORT_REASON = "killed by the explicit forge_jobs kill action — the child was aborted and the dispatch is never retried"
+
 // Read at CALL time (the poll envs' lazy posture): ESM evaluates imported
 // modules BEFORE the importing test file's env preamble, so a module-level
 // read would freeze the 10 s default into every suite run.
@@ -3725,30 +3813,70 @@ export function discloseInterruptedParent(sessionID: string): boolean {
   return true
 }
 
+/** The active-session view for the post-abort idle assertion.
+ * A v1-style client exposes session.status; the v2 promise-layer adapter
+ * does not — on a live 2.4.0 host every cancel therefore disclosed "state
+ * could not be read to confirm idle" (finding 2026-11-23) while the host's
+ * own HTTP surface (GET /api/session/active — the native-child walker's
+ * channel) had the answer. The walker stays a DEDICATED object (nothing is
+ * added to the shared adapter). Returns null when this host offers no view
+ * (no service.json → "unresolved" at once, exactly as before). */
+function activeSessionView(client: DispatchClient): (() => Promise<Record<string, unknown> | undefined>) | null {
+  const own = client.session?.status
+  if (typeof own === "function") {
+    const read = own as (this: unknown) => Promise<unknown>
+    return async () => {
+      const st = await read.call(client.session)
+      const map = (st as { data?: unknown } | undefined)?.data
+      return map && typeof map === "object" ? (map as Record<string, unknown>) : undefined
+    }
+  }
+  if (!discoverServiceHttp()) return null
+  const walker = v2NativeChildWalker()
+  const status = walker.session?.status
+  if (typeof status !== "function") return null
+  return async () => {
+    const st = await status.call(walker.session)
+    const map = (st as { data?: unknown } | undefined)?.data
+    return map && typeof map === "object" ? (map as Record<string, unknown>) : undefined
+  }
+}
+
 /** Post-abort idle assertion: the child must reach idle within the window. */
 async function assertChildIdleAfterAbort(client: DispatchClient, childSessionID: string): Promise<"idle" | "resisted" | "unresolved"> {
+  const view = activeSessionView(client)
+  if (!view) return "unresolved"
   const assertionMs = cancelIdleAssertionMs()
   const deadline = Date.now() + assertionMs
+  // Every view read is bounded by what is left of the assertion window: a
+  // hung HTTP read (the v2 view rides service.json HTTP) must not stretch a
+  // cancel — or a serial /forge stop over several rows — past the window
+  // the disclosure names. A read that overruns counts as unreadable.
+  const readWithin = async (ms: number): Promise<Record<string, unknown> | undefined | "timeout"> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const cap = new Promise<"timeout">((resolve) => {
+      timer = setTimeout(() => resolve("timeout"), Math.max(1, ms))
+    })
+    try {
+      return await Promise.race([view(), cap])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
   while (Date.now() < deadline) {
     await new Promise((resolve) => setTimeout(resolve, 400))
     try {
-      if (typeof client.session.status !== "function") return "unresolved"
-      const st = await client.session.status()
-      const map = (st as { data?: Record<string, unknown> } | undefined)?.data
-      if (map && typeof map === "object") {
-        // Field reality (soundness, pollChild): the host's status map holds
-        // ONLY active sessions — an absent child IS idle.
-        if (map[childSessionID] === undefined) return "idle"
-      }
+      const map = await readWithin(Math.max(1, deadline - Date.now()))
+      // Field reality (soundness, pollChild): the host's status map holds
+      // ONLY active sessions — an absent child IS idle.
+      if (map !== "timeout" && map && typeof map === "object" && map[childSessionID] === undefined) return "idle"
     } catch {
       // View unreadable: keep trying until the window closes.
     }
   }
   try {
-    if (typeof client.session.status !== "function") return "unresolved"
-    const st = await client.session.status()
-    const map = (st as { data?: Record<string, unknown> } | undefined)?.data
-    if (!map) return "unresolved"
+    const map = await readWithin(2_000)
+    if (!map || map === "timeout") return "unresolved"
     return map[childSessionID] === undefined ? "idle" : "resisted"
   } catch {
     return "unresolved"
@@ -3769,10 +3897,17 @@ export async function cancelDispatch(
     }
   }
   cancelledDispatchIds.add(taskId)
+  // The wake names the lever: stamped BEFORE the registry kill (the kill hook
+  // keeps an abortReason that is already set, jobWakeText renders it).
+  {
+    const meta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
+    if (meta && meta.outcome !== "stream-lost/unknown") meta.abortReason = USER_LEVER_ABORT_REASON
+  }
   // The registry kill fires the row's killTree (abortChild via the SDK) —
   // the SAME engine the owner-death path uses; the watcher settles the row
-  // as aborted at its next slice, the journal choke point removes the
-  // persisted row, and the owner gets the normal aborted wake.
+  // as aborted as soon as it sees the kill (before any poll/signal verdict),
+  // the journal choke point removes the persisted row, and the owner gets
+  // the normal aborted wake.
   jobManager.kill(job)
   const idle = await assertChildIdleAfterAbort(client, row.childSessionID)
   const assertionMs = cancelIdleAssertionMs()
@@ -3817,6 +3952,63 @@ export type DispatchTerminalSignal = {
 
 const dispatchTerminalInbox = new Map<string, DispatchTerminalSignal>()
 const dispatchChildActivityAt = new Map<string, number>()
+
+/** Readable detail of a host execution error carried by a terminal event.
+ * 2.4.0 publishes `error` as a nested object with no string `message` —
+ * `String(obj)` rendered "[object Object]" into the dispatch journal (live
+ * finding 2026-11-23). Digs the first informative string (message / name /
+ * error / reason / data, bounded depth), else a clipped JSON rendering. */
+export function executionErrorDetail(error: unknown): string | undefined {
+  try {
+    return executionErrorDetailInner(error)
+  } catch {
+    // A hostile object (a throwing getter, a null-prototype object, a
+    // Proxy): the caller's own honest fallback — this function is total, it
+    // never throws into the signal path.
+    return undefined
+  }
+}
+
+function executionErrorDetailInner(error: unknown): string | undefined {
+  if (error === undefined || error === null) return undefined
+  if (typeof error === "string") return error || undefined
+  if (typeof error === "number" || typeof error === "boolean") return String(error)
+  if (typeof error !== "object") return undefined
+  const dig = (v: unknown, depth: number): string | undefined => {
+    if (v === undefined || v === null) return undefined
+    if (typeof v === "string") return v || undefined
+    if (typeof v === "number" || typeof v === "boolean") return String(v)
+    if (typeof v !== "object" || depth <= 0) return undefined
+    const o = v as Record<string, unknown>
+    for (const key of ["message", "error", "reason", "data", "name"]) {
+      const got = dig(o[key], depth - 1)
+      if (got) return got
+    }
+    return undefined
+  }
+  const o = error as Record<string, unknown>
+  const name = typeof o.name === "string" && o.name ? o.name : undefined
+  // An Error-like object reads like Error.toString(): "Name: message".
+  const message = dig(o.message, 4) ?? dig(o.data, 4) ?? dig(o.error, 4) ?? dig(o.reason, 4)
+  if (name && message && message !== name) return `${name}: ${message}`
+  if (message) return message
+  if (name) return name
+  const found = dig(error, 4)
+  if (found) return found
+  try {
+    const s = JSON.stringify(error)
+    if (s && s !== "{}") return s.length > 300 ? `${s.slice(0, 300)}…` : s
+    // An empty object says nothing: undefined lets the caller use its own
+    // honest fallback instead of "[object Object]".
+    if (s === "{}") return undefined
+  } catch {
+    // A circular or BigInt-bearing object cannot be serialized: fall to the
+    // same "says nothing" answer — String(obj) would render exactly the
+    // "[object Object]" this function exists to prevent (and throws for a
+    // null-prototype object).
+  }
+  return undefined
+}
 
 /** Route a durable terminal event for a child (first terminal wins). */
 export function noteDispatchTerminalSignal(sessionID: string, kind: DispatchTerminalSignal["kind"], detail?: string): void {
@@ -4239,13 +4431,61 @@ async function runAsyncDispatchPoller(
   // is unreadable but host execution signals keep flowing, the verdict is
   // HELD (disclosed once per hold, not per slice).
   let reconcileHoldNotified = false
+  // fix-dispatch-dispose-kill D2 (live 2.4.0 finding 2026-11-23): the
+  // registry's kill verdict OUTRANKS whatever this watch observes. An abort
+  // issued by a kill makes the child surface as a host `execution.failed`
+  // event on 2.4.0 (not as an interrupted/user signal), so a signal or poll
+  // verdict observed AFTER the kill used to settle the dispatch as `error`:
+  // a user cancel was journaled as a failure and fed the dispatch breaker as
+  // one. The kill is therefore checked BEFORE any verdict is acted upon —
+  // at the slice top, before a consumed signal, after every poll, and once
+  // more before the exit settle — not only on the quiet (still-running) path.
+  const settleKilled = async (): Promise<boolean> => {
+    if (job.state === "running") return false
+    dispatchTasks.delete(job.id)
+    // A kill seen between slices may still have its abort in flight: give it
+    // a bounded moment so a FAILED — or never-RETURNING — abort reaches the
+    // journal disclosure too.
+    await awaitAbortVerdict(job.id)
+    forgetDispatchSignals(childSessionID)
+    // fix-dispatch-dispose-kill D2: a kill path whose abort result was not
+    // ok (incl. unavailable) appends the unconfirmed disclosure to the
+    // terminal reason — the wake text discloses the same fact.
+    const unconfirmed = abortUnconfirmedNotes.get(job.id)
+    const suffix = unconfirmed ? ` — abort unconfirmed — child may still be running (${unconfirmed})` : ""
+    // ONE sentence for both sides (C1 "Honest aborted outcome surfacing": the
+    // wake carries the journal reason): the sentence the kill hook stamped on
+    // the row — the lever sentence for cancelDispatch / stop, the
+    // explicit-kill sentence for forge_jobs kill, the registry sentence for
+    // an owner-session end. Read from the ROW (not the `dispatch` captured
+    // at watch start: a retry respawn replaces the meta object). The lever
+    // fallback covers a row the hook left unstamped (stream-lost/unknown).
+    const stamped = (job as Job & { dispatch?: DispatchJobMeta }).dispatch?.abortReason
+    journalTerminalRecord(
+      { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
+      "aborted",
+      (stamped ?? (isDispatchCancelled(job.id) ? USER_LEVER_ABORT_REASON : REGISTRY_KILL_ABORT_REASON)) + suffix,
+    )
+    // This terminal transition released the session's async slot: pump the
+    // queue head like every other terminal path (fold D — "any terminal
+    // transition of that session's dispatches"). The early returns of this
+    // settle used to skip it (spec review 2026-11-23): after a cancel or a
+    // /forge stop the owner's queued wishes stayed parked until some OTHER
+    // dispatch of that session completed. An owner-death kill pumps nothing
+    // to speak of — harvestSessionEnd flushed that queue without spawning.
+    void pumpDispatchQueue(client, job.ownerSession)
+    return true
+  }
   for (;;) {
+    if (await settleKilled()) return
     // D4 (task 3.1): host-signal first — a durable terminal event settles
     // the dispatch with ZERO REST polls (the spec: "settles from that
     // signal without any status polling"). The final-message read below is
     // the report carrier, not a poll.
     const signal = takeDispatchTerminalSignal(childSessionID)
     if (signal) {
+      // The terminal event may BE the abort a kill just issued.
+      if (await settleKilled()) return
       forgetDispatchSignals(childSessionID)
       if (signal.kind === "failed") {
         text = `(child session ended in error: ${signal.detail ?? "session.execution.failed"})`
@@ -4268,6 +4508,9 @@ async function runAsyncDispatchPoller(
       noteDispatchChildActivity(childSessionID)
     }
     const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability, viewLossTicks })
+    // A verdict the poll observed may be the abort a kill just issued (or
+    // the kill landed during the slice): the registry verdict wins.
+    if (await settleKilled()) return
     if (poll.status === "completed") {
       activeOverride = poll.via === "active-textful"
       const fin = await fetchFinalMessage(client, childSessionID)
@@ -4278,7 +4521,7 @@ async function runAsyncDispatchPoller(
     if (poll.status === "error") {
       // Fold C respawn: retry ONLY transient classes, only while attempts
       // remain, only while the registry row is still alive (a registry kill
-      // — owner death, dispose — is a user abort: never retried).
+      // — the owner session ended — is a user abort: never retried).
       if (attempt < maxAttempts && job.state === "running" && classifyDispatchError(poll.error) === "retryable") {
         const errorHead = poll.error.split("\n")[0].slice(0, 160)
         attempt++
@@ -4306,14 +4549,9 @@ async function runAsyncDispatchPoller(
         )
         await new Promise((resolve) => setTimeout(resolve, retryBackoffMs))
         if (job.state !== "running") {
-          dispatchTasks.delete(job.id)
-          const unconfirmed1 = abortUnconfirmedNotes.get(job.id)
-          journalTerminalRecord(
-            { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
-            "aborted",
-            `registry kill during retry backoff (owner session ended / dispose) — user abort, never retried${unconfirmed1 ? ` — abort unconfirmed — child may still be running (${unconfirmed1})` : ""}`,
-          )
-          return
+          // The same kill settle as the main loop (a USER cancel during the
+          // backoff names the lever; an owner death stays a registry kill).
+          if (await settleKilled()) return
         }
         // Dispatch-time policies are re-applied on the fresh child the same
         // way the original spawn applied them (crew belt + draft gate; the
@@ -4340,6 +4578,44 @@ async function runAsyncDispatchPoller(
           exitCode = 1
           break
         }
+        // Respawn-window kill (spec review 2026-11-23, finding ③): a kill
+        // that lands WHILE the fresh child is being created or prompted (after
+        // the backoff check above) must not leave that child running
+        // unwatched, and the rebind below must not re-arm the watch on a row
+        // the registry already killed. The registry kill fired the row's hook
+        // on the DYING attempt's child and stamped its sentence on the row's
+        // meta; the fresh child is aborted through the same hook (it keeps
+        // the stamped sentence), then the row settles.
+        //   bindFresh=false — the kill landed during the CREATE: the fresh
+        //   child was never prompted. It is an empty husk, aborted as
+        //   cleanup only; the row keeps naming the attempt's real child (the
+        //   transcript that exists), so the wake points there.
+        //   bindFresh=true — the kill landed during the PROMPT SEND: the
+        //   retry DID start in the fresh child; the row is rebound to it
+        //   first (same job row, new child session id), then aborted.
+        const settleRespawnKill = async (bindFresh: boolean): Promise<void> => {
+          const fresh = respawn.sessionID
+          if (bindFresh) {
+            const previousMeta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
+            ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = {
+              ...(previousMeta ?? { agentID, description: dispatch?.description ?? "" }),
+              childSessionID: fresh,
+            }
+            job.killTree = dispatchKillTreeHook(client, job.id, () => fresh)
+            job.killTree()
+          } else {
+            dispatchKillTreeHook(client, job.id, () => fresh)()
+          }
+          // The row is not running, so the settle journals the abort (it
+          // waits a bounded moment for the fresh abort's verdict, so a FAILED
+          // abort is disclosed too) and ends the watch.
+          forgetDispatchSignals(fresh)
+          await settleKilled()
+        }
+        if (job.state !== "running") {
+          await settleRespawnKill(false)
+          return
+        }
         const sent = await sendPrompt(client, {
           sessionID: respawn.sessionID,
           agentID,
@@ -4350,6 +4626,10 @@ async function runAsyncDispatchPoller(
           text = `(retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
           exitCode = 1
           break
+        }
+        if (job.state !== "running") {
+          await settleRespawnKill(true)
+          return
         }
         // Inherit the dying child's registry SLOT: same job row, new child
         // session id — no queue re-entry, no cap interaction (the cap
@@ -4441,24 +4721,9 @@ async function runAsyncDispatchPoller(
         `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`
       break
     }
-    // slice timeout: a registry kill (owner session ended / dispose) stops
-    // the watch — no wake fires for a killed row (markTerminal first-wins).
-    if (job.state !== "running") {
-      dispatchTasks.delete(job.id)
-      // fix-dispatch-dispose-kill D2: a kill path whose abort result was not
-      // ok (incl. unavailable) appends the unconfirmed disclosure to the
-      // journal's terminal reason — the wake text discloses the same fact.
-      const unconfirmed = abortUnconfirmedNotes.get(job.id)
-      const suffix = unconfirmed ? ` — abort unconfirmed — child may still be running (${unconfirmed})` : ""
-      journalTerminalRecord(
-        { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
-        "aborted",
-        isDispatchCancelled(job.id)
-          ? `cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried${suffix}`
-          : `registry kill (owner session ended / dispose) — user abort${suffix}`,
-      )
-      return
-    }
+    // (A registry kill that landed during the slice is already settled by
+    // the settleKilled() check right after the poll — no wake fires for a
+    // killed row beyond the one markTerminal queued; first-wins.)
     // Textless-idle floor (design D6, reclassified by
     // dispatch-stream-loss-honesty): a child continuously not-active for a
     // full notification interval whose latest finished assistant message
@@ -4560,6 +4825,9 @@ async function runAsyncDispatchPoller(
     const meta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
     if (meta) meta.outcome = "stream-lost/unknown"
   }
+  // A kill that landed during the final-message read or the stale reap: the
+  // registry verdict wins (the queued wake already says ABORTED).
+  if (await settleKilled()) return
   jobManager.markTerminal(job, "exited", exitCode)
   dispatchTasks.delete(job.id)
   // Fold D: the terminal transition releases the session's async slot —
@@ -6941,6 +7209,13 @@ export const server: Plugin = async (input, options) => {
   }
   return {
     dispose: async () => {
+      // Diagnostics only: proof that the hook ran on THIS host generation and
+      // what its job table held (2026-11-23: no host action on 2.4.0 could be
+      // PROVEN to reach this point — the E2E had to infer it from a kill).
+      try {
+        const all = jobManager.list()
+        goalProbe(`plugin dispose hook: registry rows=${all.length} running=${all.filter((j) => j.state === "running").length} dispatch rows=${all.filter(isDispatchRow).length}`)
+      } catch {}
       engineForgetAll()
       // Exit matrix trigger (idempotent): graceful-then-force every live
       // non-survive job, then end the fence watcher. Survive jobs keep
@@ -7713,11 +7988,7 @@ export const server: Plugin = async (input, options) => {
           v1Type === "session.execution.succeeded" ? ("succeeded" as const) : v1Type === "session.execution.failed" ? ("failed" as const) : ("interrupted" as const)
         const detail =
           kind === "failed"
-            ? ((v1Props.error as { message?: unknown } | undefined)?.message !== undefined
-                ? String((v1Props.error as { message?: unknown }).message)
-                : v1Props.error !== undefined
-                  ? String(v1Props.error)
-                  : undefined)
+            ? executionErrorDetail(v1Props.error)
             : kind === "interrupted"
               ? v1Props.reason !== undefined
                 ? String(v1Props.reason)
@@ -9408,11 +9679,7 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
                   type === "session.execution.succeeded" ? "succeeded" : type === "session.execution.failed" ? "failed" : "interrupted"
                 const detail =
                   kind === "failed"
-                    ? (fields.error as { message?: unknown } | undefined)?.message !== undefined
-                      ? String((fields.error as { message?: unknown }).message)
-                      : fields.error !== undefined
-                        ? String(fields.error)
-                        : undefined
+                    ? executionErrorDetail(fields.error)
                     : kind === "interrupted"
                       ? fields.reason !== undefined
                         ? String(fields.reason)
