@@ -124,6 +124,20 @@
   （prompt/context/compaction/experimental.idle）、命令域
   （execute 型 /plan /goal /crew）、event 域（AsyncIterable 播种 +
   session.deleted 收割）——**与 v1 全功能对等**。
+- **assert 决策门接口按初始化隔离**（change
+  `fix-ask-door-multi-directory-host`）：v2 宿主一目录一实例，
+  `ctx.permission.assert` 是该实例初始化时定下的闭包，待答请求登记在
+  该实例（该目录）的表里；终端按"请求所属会话"读表与回复
+  （`session.permission.list/get/reply` 一律路由到会话自己目录的
+  实例）。因此注册工具的那次初始化把**自己的** `assert` 交给
+  `v2ToolContext`（与 `toolAnchor` 同做法，第三参数），没有模块级
+  回退——旧的模块级接口会被最后一次初始化覆盖，导致非最后初始化
+  目录里的会话的确认请求落到别的目录的表里：确认框照常弹出（终端靠
+  宿主事件得知新请求），但回答落空（回复 404、框消失），门白等到
+  300 秒看门狗；该目录被宿主收回后，全进程的门与
+  `forge_shell` 进门即 `Tool.Error`。宿主没给接口时 `gate()` 按名拒绝
+  （fail-closed：不批准、不执行）。不做"失效后换实例重试"：宿主的
+  `DeclinedError` 与用户拒绝同类型，重试等于可能把用户的拒绝再问一遍。
 - v2 已知 drift（详见 change design.md W6 field realities）：
   ① ~~池子 model 钉扎不落 v2 draft~~ **已解决**（change
   `v2-runtime-model-pin`：draft 保持无 model，运行时经 session.context

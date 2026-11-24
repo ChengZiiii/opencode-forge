@@ -187,10 +187,18 @@ test("A5: single-directory initialization — resolution and results as before",
   const sid = "ses-a5"
   only.state.sessionRecords.set(sid, { sessionID: sid, location: { directory: dirA } })
 
-  const r = await surface.resolveToolContext(realCtx(sid), { session: only.ctx.session })
+  // fix-ask-door-multi-directory-host: the ask adapter is wired from the
+  // interface the REGISTERING initialization hands in — the registered tools
+  // do exactly this — never from a module-level one.
+  const r = await surface.resolveToolContext(realCtx(sid), { session: only.ctx.session }, only.ctx.permission.assert)
   assert.equal(r.context.worktree, dirA, "the record's directory is the one and only directory")
   assert.equal(r.defaultDirectory, null, "no default was used, nothing is named")
-  assert.equal(typeof r.context.ask, "function", "the ask adapter is wired exactly as before")
+  assert.equal(typeof r.context.ask, "function", "the ask adapter is wired from the interface this initialization handed in")
+  // …and from nowhere else: the same resolver given no interface synthesizes
+  // no ask (there is no module-level interface left to consult).
+  const bare = await surface.resolveToolContext(realCtx(sid), { session: only.ctx.session })
+  assert.equal(bare.context.ask, undefined, "no interface handed in → no ask adapter")
+  assert.equal(bare.context.worktree, dirA, "the directory resolution does not depend on it")
   assert.equal(typeof r.context.metadata, "function")
 
   const res = await only.state.tools.get("forge_jobs").execute({ action: "list" }, realCtx(sid))

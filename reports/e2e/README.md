@@ -6,7 +6,7 @@ the repo live, and ties every piece of evidence to the build it ran on.
 
 ```bat
 cd opencode-forge
-node reports\e2e\acceptance-gate.mjs --snapshot reports\e2e\evidence\0.34.0
+node reports\e2e\acceptance-gate.mjs --snapshot reports\e2e\evidence\0.34.1
 ```
 
 Exit code 0 only when no check failed. A leg the sandbox cannot reach shows as
@@ -24,13 +24,13 @@ ordinary FAIL. Every release decides again, so nothing accumulates silently.
 | --- | --- | --- |
 | `build-fresh` | `dist/index.js` is newer than `plugin.ts`, `src/**`, `schema/` | any source changed after the build |
 | `evidence-fresh-*` | each verdict file is newer than dist **and** carries an in-file start time later than dist | an E2E ran on an older build, or is undated |
-| `e2e-c3-command-stop` / `c4-pin-variant` / `c2-plan-close` / `f-crew-close-door` / `a-anchor-multidir` / `b-spawn-error` / `c-stop-queued` / `e-stale-progress` | `verdict === true`, `result.pass === true`, every `result.checks` true, no `inconclusive`. The 0.33.1 legs: `crew_close` asks before it acts on both paths and "always" does not reopen the door; a `ws` session keeps its own directory after another directory is initialized last; a job whose working directory does not exist returns the not-started form, verbatim. The 0.34.0 legs: `/forge stop` cancels the session's queued wishes too (nothing spawns into the freed slots, the receipt names both groups); a progress notice whose dispatch has already finished is never delivered and never rides the completion wake (that driver only runs on a host with the short notify interval) | any driver check is not `true` |
+| `e2e-c3-command-stop` / `c4-pin-variant` / `c2-plan-close` / `f-crew-close-door` / `a-anchor-multidir` / `b-spawn-error` / `c-stop-queued` / `e-stale-progress` / `md-ask-door-multidir` | `verdict === true`, `result.pass === true`, every `result.checks` true, no `inconclusive`. The 0.33.1 legs: `crew_close` asks before it acts on both paths and "always" does not reopen the door; a `ws` session keeps its own directory after another directory is initialized last; a job whose working directory does not exist returns the not-started form, verbatim. The 0.34.0 legs: `/forge stop` cancels the session's queued wishes too (nothing spawns into the freed slots, the receipt names both groups); a progress notice whose dispatch has already finished is never delivered and never rides the completion wake (that driver only runs on a host with the short notify interval). The 0.34.1 leg (`21-ask-door-multidir-e2e.mjs`, 13 cells over five directory geometries): with two directories loaded, a session in the directory that was **not** initialized last raises its confirmation request in its own directory's pending table (never in another directory's), the request is answered through the session's own route and the door then executes in the session's own directory; after the last-initialized directory is evicted the other directory's `forge_shell` and doors keep working; the same after re-boots in either order, and for a session whose own directory was evicted and comes back on demand. The driver creates every session with the directory in the request **body** and reads it back from the host's record — `POST /api/session?location[directory]=…` is ignored by 2.4.0 (the session lands in the host's cwd) | any driver check is not `true` |
 | `e2e-c1-K1` / `K2` | owner-deleted and cancel-lever legs | `results.<leg>.pass !== true` |
 | `e2e-c1-D1` | dispatch row survives a plugin dispose of the owner location | `pass` false without an inconclusive reason → FAIL; with one → BOOKED |
 | `e2e-c5-standard` | A / B / B' / D pass with host and driver on the production-default ceiling | a leg is not `true`, or the ceiling differs from the default |
 | `e2e-ceiling-C` | leg C passes with host and driver on the raised ceiling (`--ceiling-leg-ms`, default 240000) | as above |
 | `e2e-crew-full` | ONE complete crew on the live host: `crew_begin` → engine briefs → waves → verdicts → `crew_close` (goal criterion 3) | any check not `true`; a check the driver AND the release name is KNOWN, not a pass |
-| `e2e-tui-headed` | headed TUI evidence (below) is complete, on this host version, newer than dist | missing, incomplete or stale |
+| `e2e-tui-headed` | headed TUI evidence (below) is complete, on this host version, newer than dist | missing, incomplete or stale — a required item that is simply absent from the file is a FAILURE |
 | `live-typecheck` | `tsc --noEmit`, measured at gate time | non-zero exit |
 | `live-unit-suite` | `node --import ./tests/lib/test-runtime-namespace.mjs --test tests/*.test.mjs` (same preload as `npm test`), measured at gate time | any fail/cancelled, or fewer than `--min-tests` (default 1001) tests |
 | `live-host-version` | `opencode --version` equals `--host` (default 2.4.0) | anything else |
@@ -57,6 +57,41 @@ directory (`%LOCALAPPDATA%\Temp\opencode\view-e2e\logs\tui-gate.json`), or
 `pass` must be `true`, every item `pass: true`, and `checkedAt` later than the
 build — an item that could not be observed is `pass: false`, with the reason in
 `note`.
+
+**The set is fixed** (`REQUIRED_TUI_ITEMS` in the gate): every id on that list
+must be present AND passing; an id the file leaves out is a failure, never a
+skip. Until 0.34.1 the gate only checked "every item that is in the file
+passed", so a hand-written file that dropped an item passed — and two items
+observed in the 0.33.0 headed gate (`c2-plan-close-no-dialog`,
+`c2-plan-reopen-in-tui`) were absent from the 0.33.1 and 0.34.0 evidence
+without any record of a decision to drop them. They are required again. A
+release that really retires an item edits the list in a commit.
+
+The thirteen ids (0.34.1) and what each one must show in a real terminal:
+
+| id | what it shows |
+| --- | --- |
+| `f-crew-close-abandon-dialog-visible-and-answerable-in-tui` | `crew_close` (abandon) shows its dialog; Allow in the terminal releases the call and the crew is abandoned |
+| `f-crew-close-report-dialog-reject-in-tui-keeps-the-crew` | Reject in the terminal: the call fails, the crew stays as it was |
+| `f-crew-close-report-dialog-allow-in-tui-closes-the-crew` | the same close asked again and allowed: the crew is closed |
+| `c2-plan-close-no-dialog` | `plan_close` in the terminal closes the plan (verified section written) without a permission dialog |
+| `c2-plan-reopen-in-tui` | `plan_reopen` in the terminal reopens that closed plan (dated reopened section; plan file and transcript are the ground truth) |
+| `c3-command-list` | `/` lists `/plan`, `/crew`, `/goal`, `/forge` and no hyphenated forge command |
+| `c-forge-stop-cancels-in-flight-and-queued-in-tui` | `/forge stop` cancels the in-flight and the still-queued dispatches of the session |
+| `a-session-anchor-holds-after-a-third-directory-in-tui` | a session keeps its own directory after another directory was initialized last |
+| `md-ask-door-dialog-visible-and-answerable-in-a-non-last-directory-tui` | in a session whose directory is **not** the host's last-initialized one: the dialog shows, the terminal's answer reaches the request (the request is in the session's own pending table, no 404 reply), and only then does the door execute |
+| `md-ask-door-dialog-reject-in-a-non-last-directory-tui-keeps-the-crew` | the same geometry, Reject: the call fails and the crew stays |
+| `e-stale-progress-notice-is-not-delivered-in-tui` | a progress notice for a dispatch that already finished is never delivered |
+| `tui-no-unexpected-permission-asks` | apart from the dialogs named above, no permission ask was raised in any gated session |
+| `tui-windows-closed-cleanly` | every terminal window was closed with its session idle and nothing was left running |
+
+The two `md-` items are the headed half of `fix-ask-door-multi-directory-host`.
+On the pre-fix build (measured 2026-11-24 on 0.34.0) the dialog in that
+geometry **does** show — a terminal hears of a new request through a host
+event — but the terminal's answer is posted to the session's own directory's
+pending table, where the request is not: the host answers 404, the dialog
+vanishes and the gate waits out its 300 s watchdog. So "answerable" is what
+the first `md-` item proves, not merely "visible".
 
 ## Options
 

@@ -189,9 +189,10 @@ const readVerdict = (id, file) => {
 const simplePass = (j) => j?.verdict === true && j?.result?.pass === true && allTrue(j?.result?.checks) && !j?.inconclusive
 
 // C3 / C4 / C2, the 0.33.1 legs (F crew_close door, A multi-directory
-// anchor, B not-started job) and the 0.34.0 legs (C stop cancels the queued
-// wishes, E stale progress notice) share one verdict shape (verdict +
-// result.pass + result.checks).
+// anchor, B not-started job), the 0.34.0 legs (C stop cancels the queued
+// wishes, E stale progress notice) and the 0.34.1 leg (a confirmation door
+// reaches the session's own directory on a multi-directory host) share one
+// verdict shape (verdict + result.pass + result.checks).
 for (const [id, name] of [
   ["c3-command-stop", "command-stop-e2e-verdict.json"],
   ["c4-pin-variant", "pin-variant-e2e-verdict.json"],
@@ -201,6 +202,7 @@ for (const [id, name] of [
   ["b-spawn-error", "spawn-error-e2e-verdict.json"],
   ["c-stop-queued", "stop-queued-e2e-verdict.json"],
   ["e-stale-progress", "stale-progress-e2e-verdict.json"],
+  ["md-ask-door-multidir", "ask-door-multidir-e2e-verdict.json"],
 ]) {
   const j = readVerdict(id, join(EVIDENCE, name))
   if (!j) continue
@@ -329,6 +331,29 @@ for (const [id, name] of [
 }
 
 // Headed TUI evidence: reports/e2e/README.md documents the shape.
+//
+// The headed gate is a FIXED set. The evidence file is written by hand, so
+// "every item in the file passed" on its own would let a file that simply
+// leaves an item out pass — a release was accepted without that observation.
+// Every id below must be present AND passing; a missing one is a FAILURE,
+// never a skip. A release that drops an item edits this list in a commit.
+const REQUIRED_TUI_ITEMS = [
+  "f-crew-close-abandon-dialog-visible-and-answerable-in-tui",
+  "f-crew-close-report-dialog-reject-in-tui-keeps-the-crew",
+  "f-crew-close-report-dialog-allow-in-tui-closes-the-crew",
+  // observed in the 0.33.0 headed gate, absent from the 0.33.1 and 0.34.0
+  // evidence without any record of a decision to drop them — required again
+  "c2-plan-close-no-dialog",
+  "c2-plan-reopen-in-tui",
+  "c3-command-list",
+  "c-forge-stop-cancels-in-flight-and-queued-in-tui",
+  "a-session-anchor-holds-after-a-third-directory-in-tui",
+  "md-ask-door-dialog-visible-and-answerable-in-a-non-last-directory-tui",
+  "md-ask-door-dialog-reject-in-a-non-last-directory-tui-keeps-the-crew",
+  "e-stale-progress-notice-is-not-delivered-in-tui",
+  "tui-no-unexpected-permission-asks",
+  "tui-windows-closed-cleanly",
+]
 {
   const m = mtime(TUI_FILE)
   const loaded = loadJson(TUI_FILE)
@@ -339,17 +364,21 @@ for (const [id, name] of [
     const j = loaded.value
     const at = Date.parse(String(j.checkedAt ?? ""))
     const items = Array.isArray(j.items) ? j.items : []
+    const present = new Set(items.map((x) => (typeof x?.id === "string" ? x.id : "")))
+    const missing = REQUIRED_TUI_ITEMS.filter((id) => !present.has(id))
     const failed = items.filter((x) => x?.pass !== true).map((x) => x?.id ?? "?")
     const fresh = m !== null && distMs !== null && m >= distMs && Number.isFinite(at) && at >= distMs
-    const ok = j.pass === true && items.length > 0 && failed.length === 0 && j.hostVersion === HOST_VERSION && fresh
+    const ok = j.pass === true && failed.length === 0 && missing.length === 0 && j.hostVersion === HOST_VERSION && fresh
     add({
       id: "e2e-tui-headed",
-      title: "headed TUI gate: every item observed in a real terminal on THIS build",
+      title: "headed TUI gate: every required item observed in a real terminal on THIS build",
       status: ok ? "PASS" : "FAIL",
       detail: ok
-        ? `${items.length} items · checked ${j.checkedAt} · host ${j.hostVersion}`
-        : `pass=${j.pass} · items ${items.length} · failed ${JSON.stringify(failed)} · host ${j.hostVersion} (want ${HOST_VERSION}) · checked ${iso(at)} vs dist ${iso(distMs)}`,
+        ? `${items.length} items (all ${REQUIRED_TUI_ITEMS.length} required present) · checked ${j.checkedAt} · host ${j.hostVersion}`
+        : `pass=${j.pass} · items ${items.length} · failed ${JSON.stringify(failed)} · missing required ${JSON.stringify(missing)} · host ${j.hostVersion} (want ${HOST_VERSION}) · checked ${iso(at)} vs dist ${iso(distMs)}`,
       items,
+      requiredItems: REQUIRED_TUI_ITEMS,
+      missingItems: missing,
       checkedAt: j.checkedAt ?? null,
       hostVersion: j.hostVersion ?? null,
       ...rec,
