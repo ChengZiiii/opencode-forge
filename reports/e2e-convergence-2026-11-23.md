@@ -310,6 +310,32 @@ snapshots the owner at timeout before retiring it (runbook lesson ⑫).
   loaded again 11 s later) while the old instance's shutdown stays held by one
   holder. With no dispose to exempt the row from there is **no verdict on the
   dispatch exemption: BOOKED** (workspace rule D6) — not a pass.
+  **Root cause, settled 2026-11-24 (read against the host 2.4.0 source): the
+  trigger this leg waits for does not exist on a v2 host.** The plugin's
+  default export is `{ id, server, setup: v2Setup }`; `v2Setup` never calls
+  `server()`, and the function it returns only releases the session hooks and
+  stops the event loop — it neither runs the `server` dispose body nor writes
+  the probe line (the line the leg's pass condition needs is written by that
+  body alone). The host (`core_src_plugin_module.ts:81-94`; upstream
+  `packages/plugin/src/promise/adapter.ts`, `fromPromise` — "only a function
+  is a cleanup") treats only the function returned by `setup` as the cleanup,
+  so the v1 dispose body is unreachable on 2.4.0: `disposeFired:false` by
+  construction, not by timing. What an evict really does on 2.4.0: the old
+  location graph stays held by the in-flight drain borrower (`location still
+  held after shutdown … holders=1`) and is closed silently when the last
+  borrower releases it; two plugin activations coexist briefly; **no job is
+  killed by a directory eviction** — trivially safe for in-flight dispatches,
+  but the scenario `job-supervisor/spec.md:133-136` and the comment next to
+  the dispose body describe a trigger that never fires. **Accounting defect:**
+  the acceptance gate reports D1 as BOOKED while `report.pass` looks only at
+  FAIL/MISSING (`hardPass` is false), so 0.33.0, 0.33.1, 0.34.0 and the 0.34.1
+  gate all passed with the same item on the books. Open, for the user to
+  choose: (甲) route the v2 setup cleanup through the same job-cleanup function
+  (two hazards to settle first: `exitCleanup.trigger("dispose")` would also
+  end the job fence, and the module-level singletons are shared by both
+  activations); (乙) correct the comment and the spec and make this leg assert
+  the real 2.4.0 behaviour; (丙) a written waiver for 2.4.0. Not to be carried
+  through another release.
 
 ## S5 — Kill-path rework inside the approved contracts (C1 / C3)
 
