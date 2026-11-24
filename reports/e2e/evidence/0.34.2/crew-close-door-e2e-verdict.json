@@ -1,0 +1,148 @@
+{
+  "verdict": true,
+  "result": {
+    "pass": true,
+    "checks": {
+      "beginRegistersPendingCrew": true,
+      "rejectedAskLeavesCrewActive": true,
+      "abandonAsksThenExecutes": true,
+      "reportAsksThenExecutes": true,
+      "alwaysDoesNotReopenTheDoor": true,
+      "goalGoverningClosesAskFree": true,
+      "governedGoalNotLeftActive": true
+    },
+    "details": {
+      "abandonRejected": {
+        "asks": [
+          {
+            "id": "per_20f46c0e2001sxdrVpjgukFghv",
+            "action": "crew_close",
+            "title": "Abandon crew: door e2e C1 49owze",
+            "decision": "reject",
+            "reply": 204,
+            "at": "2026-11-24T20:37:05.029Z"
+          }
+        ],
+        "toolStatus": "completed",
+        "out": "Tool.Error",
+        "recordSections": [
+          "registered (pending)"
+        ]
+      },
+      "abandon": {
+        "asks": [
+          {
+            "id": "per_20f470f38001zf3Wu2qCZO7EMs",
+            "action": "crew_close",
+            "title": "Abandon crew: door e2e C1 49owze",
+            "decision": "once",
+            "reply": 204,
+            "at": "2026-11-24T20:37:24.948Z"
+          }
+        ],
+        "out": "[forge:crew] Crew ABANDONED: door e2e C1 49owze mode at abandon: pending reason: door e2e The session is free for a fresh crew_begin — register the corrected plan next (it starts PENDING again unless a governing goal arms it in the same call).",
+        "recordSections": [
+          "registered (pending)",
+          "abandoned"
+        ]
+      },
+      "report": {
+        "asks": [
+          {
+            "id": "per_20f475fd9001DaC0Ts5zL6AYye",
+            "action": "crew_close",
+            "title": "Close crew: door e2e C2 49owze",
+            "decision": "once",
+            "reply": 204,
+            "at": "2026-11-24T20:37:45.802Z"
+          }
+        ],
+        "out": "[forge:crew] Crew closed: door e2e C2 49owze subtasks: 1 (PASS 1, FAIL 0) - door e2e B 49owze: PASS — door e2e evidence statement Crew record (history): C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws\\.opencode\\crew\\2026-11-25-door-e2e-c2-49owze.md",
+        "recordSections": [
+          "registered (pending)",
+          "closed"
+        ]
+      },
+      "always": {
+        "asks": [
+          {
+            "id": "per_20f47ab34001RNvoNS7uTmTEal",
+            "action": "crew_close",
+            "title": "Abandon crew: door e2e C3 49owze",
+            "decision": "always",
+            "reply": 204,
+            "at": "2026-11-24T20:38:05.098Z"
+          }
+        ],
+        "savedPermissions": {
+          "status": 200,
+          "count": 0,
+          "sample": "[]"
+        },
+        "nextCloseAsks": [
+          {
+            "id": "per_20f47ed55001teTrSjpklBHIq0",
+            "action": "crew_close",
+            "title": "Abandon crew: door e2e C4 49owze",
+            "decision": "once",
+            "reply": 204,
+            "at": "2026-11-24T20:38:21.918Z"
+          }
+        ],
+        "recordSections": [
+          [
+            "registered (pending)",
+            "abandoned"
+          ],
+          [
+            "registered (pending)",
+            "abandoned"
+          ]
+        ]
+      },
+      "governed": {
+        "asks": [
+          {
+            "id": "per_20f483f67001xdjWlmT1aPEjft",
+            "action": "goal_write",
+            "title": "Arm goal: door e2e governed 49owze",
+            "decision": "once",
+            "reply": 204,
+            "at": "2026-11-24T20:38:42.795Z"
+          },
+          {
+            "id": "per_20f483f7d00184UvvCvtGegd6O",
+            "action": "goal_discard",
+            "title": "Discard goal: door e2e governed 49owze",
+            "decision": "once",
+            "reply": 204,
+            "at": "2026-11-24T20:38:43.098Z"
+          }
+        ],
+        "out": "{}",
+        "toolStatus": "completed",
+        "recordSections": [
+          [
+            "registered (born armed under a governing goal)",
+            "abandoned"
+          ],
+          [
+            "registered (born armed under a governing goal)",
+            "closed"
+          ]
+        ],
+        "goalFiles": [
+          {
+            "file": "2026-11-25-door-e2e-governed-49owze.md",
+            "status": "abandoned"
+          }
+        ],
+        "discardRetry": null,
+        "pauseLastResort": false
+      }
+    },
+    "error": null
+  },
+  "startedAt": "2026-11-24T20:36:40.099Z",
+  "hostPid": 46588
+}

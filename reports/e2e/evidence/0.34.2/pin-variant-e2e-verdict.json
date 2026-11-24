@@ -1,0 +1,128 @@
+{
+  "host": "http://127.0.0.1:47911",
+  "hostPid": 46588,
+  "startedAt": "2026-11-24T20:13:37.005Z",
+  "first": {
+    "nonce": "mwv4u1yl",
+    "agent": "forge-viewe2e-coder",
+    "pin": {
+      "providerID": "glm-coding-worker",
+      "id": "glm-5.3-flash",
+      "variant": "low"
+    },
+    "dispatchId": "j-20261124-201342-8b2ai7",
+    "childSessionId": "ses_df0cea6c5ffeBTwO77ujXcDUST",
+    "ownerTools": [
+      "execute"
+    ],
+    "sessionRecordAtStart": {
+      "status": 200,
+      "agent": "forge-viewe2e-coder",
+      "model": {
+        "id": "glm-5.3-flash",
+        "providerID": "glm-coding-worker",
+        "variant": "low"
+      }
+    },
+    "sessionRecordAtEnd": {
+      "status": 200,
+      "agent": "forge-viewe2e-coder",
+      "model": {
+        "id": "glm-5.3-flash",
+        "providerID": "glm-coding-worker",
+        "variant": "low"
+      }
+    },
+    "assistantRows": {
+      "total": 2,
+      "withModel": 2,
+      "distinct": [
+        "{\"providerID\":\"glm-coding-worker\",\"id\":\"glm-5.3-flash\",\"variant\":\"low\"}"
+      ],
+      "matchesPin": 2,
+      "withVariant": 2
+    },
+    "wake": {
+      "arrived": true,
+      "hasFinalReport": true,
+      "head": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261124-201342-8b2ai7, child session ses_df0cea6c5ffeBTwO77ujXcDUST). Final report: CANARY-V-mwv4u1yl The dispatch is complete — read the report above; no poll"
+    },
+    "journal": {
+      "state": "terminal",
+      "outcome": "completed",
+      "reason": "CANARY-V-mwv4u1yl"
+    },
+    "checks": {
+      "pluginLane": true,
+      "childAnswered": true,
+      "sessionAgent": true,
+      "sessionModelIsPin": true,
+      "everyAssistantRowIsPin": true,
+      "wakeCarriesChildWords": true
+    },
+    "pass": true
+  },
+  "result": {
+    "nonce": "mwv4u1yl",
+    "agent": "forge-viewe2e-coder",
+    "pin": {
+      "providerID": "glm-coding-worker",
+      "id": "glm-5.3-flash",
+      "variant": "low"
+    },
+    "dispatchId": "j-20261124-201342-8b2ai7",
+    "childSessionId": "ses_df0cea6c5ffeBTwO77ujXcDUST",
+    "ownerTools": [
+      "execute"
+    ],
+    "sessionRecordAtStart": {
+      "status": 200,
+      "agent": "forge-viewe2e-coder",
+      "model": {
+        "id": "glm-5.3-flash",
+        "providerID": "glm-coding-worker",
+        "variant": "low"
+      }
+    },
+    "sessionRecordAtEnd": {
+      "status": 200,
+      "agent": "forge-viewe2e-coder",
+      "model": {
+        "id": "glm-5.3-flash",
+        "providerID": "glm-coding-worker",
+        "variant": "low"
+      }
+    },
+    "assistantRows": {
+      "total": 2,
+      "withModel": 2,
+      "distinct": [
+        "{\"providerID\":\"glm-coding-worker\",\"id\":\"glm-5.3-flash\",\"variant\":\"low\"}"
+      ],
+      "matchesPin": 2,
+      "withVariant": 2
+    },
+    "wake": {
+      "arrived": true,
+      "hasFinalReport": true,
+      "head": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261124-201342-8b2ai7, child session ses_df0cea6c5ffeBTwO77ujXcDUST). Final report: CANARY-V-mwv4u1yl The dispatch is complete — read the report above; no poll"
+    },
+    "journal": {
+      "state": "terminal",
+      "outcome": "completed",
+      "reason": "CANARY-V-mwv4u1yl"
+    },
+    "checks": {
+      "pluginLane": true,
+      "childAnswered": true,
+      "sessionAgent": true,
+      "sessionModelIsPin": true,
+      "everyAssistantRowIsPin": true,
+      "wakeCarriesChildWords": true
+    },
+    "pass": true
+  },
+  "verdict": true,
+  "inconclusive": null,
+  "finishedAt": "2026-11-24T20:14:37.788Z"
+}

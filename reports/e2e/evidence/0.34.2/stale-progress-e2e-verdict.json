@@ -1,0 +1,88 @@
+{
+  "verdict": true,
+  "result": {
+    "pass": true,
+    "checks": {
+      "hostRunsTheShortNotifyInterval": true,
+      "premiseLiveOwnerWasBusyPastTheFirstInterval": true,
+      "controlNoticeIsDeliveredWhileTheDispatchIsLive": true,
+      "premiseOwnerWasBusyPastTheFirstInterval": true,
+      "premiseChildFinishedBeforeTheIdleEdge": true,
+      "premiseStaleChildOutlivedTheFirstNoticeSlice": true,
+      "staleProgressIsNotDelivered": true,
+      "staleOwnerGetsOnlyTheWake": true,
+      "completionWakeStillArrives": true,
+      "liveWakeReportHasNoProgressNotice": true,
+      "staleWakeReportHasNoProgressNotice": true
+    },
+    "details": {
+      "live": {
+        "session": "ses_df0a838c8ffeBS32VOnLbx37L3",
+        "jobId": "j-20261124-205547-76mpuz",
+        "taskCallsSeen": 1,
+        "turnStart": 1795553740617,
+        "turnEnd": 1795553820037,
+        "busyMs": 79420,
+        "firstTurnEndSeen": 1795553836050,
+        "dispatchAt": 1795553747779,
+        "childTerminalAt": 1795553855102,
+        "progressDelivered": 7,
+        "firstProgressAt": 1795553820047,
+        "progressTexts": [
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-205547-76mpuz, child session ses_df0a81cb9ffeJ6FvyTScpTKpPD) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-205547-76mpuz, child session ses_df0a81cb9ffeJ6FvyTScpTKpPD) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-205547-76mpuz, child session ses_df0a81cb9ffeJ6FvyTScpTKpPD) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-205547-76mpuz, child session ses_df0a81cb9ffeJ6FvyTScpTKpPD) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-205547-76mpuz, child session ses_df0a81cb9ffeJ6FvyTScpTKpPD) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-205547-76mpuz, child session ses_df0a81cb9ffeJ6FvyTScpTKpPD) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-205547-76mpuz, child session ses_df0a81cb9ffeJ6FvyTScpTKpPD) is still running af…"
+        ],
+        "wakeDelivered": 1,
+        "wakeAt": 1795553864840,
+        "wakeReportFound": true,
+        "wakeReportHasProgress": false,
+        "wakeReportClip": "(final message unavailable: no assistant text output found in child session ses_df0a81cb9ffeJ6FvyTScpTKpPD)",
+        "userRowsAfterPrompt": 8,
+        "childOutcome": "completed",
+        "userTimeline": [
+          "20:57:00 PROGRESS",
+          "20:57:04 PROGRESS",
+          "20:57:04 PROGRESS",
+          "20:57:04 PROGRESS",
+          "20:57:10 PROGRESS",
+          "20:57:25 PROGRESS",
+          "20:57:40 PROGRESS",
+          "20:57:44 WAKE"
+        ]
+      },
+      "stale": {
+        "session": "ses_df0a608beffe94LuEK07cBIHg6",
+        "jobId": "j-20261124-205811-7zhdwq",
+        "taskCallsSeen": 1,
+        "turnStart": 1795553883989,
+        "turnEnd": 1795553963328,
+        "busyMs": 79339,
+        "firstTurnEndSeen": 1795553969138,
+        "dispatchAt": 1795553891489,
+        "childTerminalAt": 1795553936038,
+        "progressDelivered": 0,
+        "firstProgressAt": null,
+        "progressTexts": [],
+        "wakeDelivered": 1,
+        "wakeAt": 1795553963337,
+        "wakeReportFound": true,
+        "wakeReportHasProgress": false,
+        "wakeReportClip": "CANARY-SPstale-b106z0",
+        "userRowsAfterPrompt": 1,
+        "childOutcome": "completed",
+        "userTimeline": [
+          "20:59:23 WAKE"
+        ]
+      },
+      "timelineNote": "the notice is generated at the first poll slice past the interval (≥10 s cadence), i.e. ~15–25 s after dispatch — inside the busy window; its delivery time would have been the owner's first idle edge (firstTurnAssistantAt)."
+    },
+    "error": null
+  },
+  "startedAt": "2026-11-24T20:55:40.593Z",
+  "hostPid": 26680
+}

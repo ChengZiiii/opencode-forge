@@ -1,0 +1,111 @@
+{
+  "host": "http://127.0.0.1:47911",
+  "hostPid": 46588,
+  "started": "2026-11-24T20:26:14.311Z",
+  "legs": "standard (A,B,BI,D — leg C is its own host phase)",
+  "results": {
+    "BI": {
+      "armAttempts": 1,
+      "armDecision": "20:26:29 crew skip: native child in flight session=ses_df0c32c34ffevNa5HFgYVcxHCk",
+      "childSleepS": 480,
+      "interruptStatus": 200,
+      "briefsBeforeAbort": 0,
+      "briefsTotal": 1,
+      "briefsNamingTheChild": 1,
+      "firstBriefNamesItDead": true,
+      "firstBriefIsTheNamingOne": true,
+      "engineSettledLines": [
+        "20:26:30 crew native child settled child=ses_df0c32c26ffeQlB2pMnvYQ3dBb outcome=interrupted parent=ses_df0c32c34ffevNa5HFgYVcxHCk stillWaiting=0"
+      ],
+      "engineBusySkips": 1,
+      "pass": true
+    },
+    "D": {
+      "armAttempts": 1,
+      "armDecision": "20:27:12 crew skip: native child in flight session=ses_df0c27f8fffev33B3dmY78wWCy",
+      "childSleepS": 480,
+      "deleteStatus": 204,
+      "briefsBeforeDelete": 0,
+      "briefsTotal": 1,
+      "briefsNamingTheChild": 1,
+      "firstDigestKind": "interrupted — DEAD",
+      "disclosed": true,
+      "firstBriefIsTheNamingOne": true,
+      "parentTurnsAfterDelete": 2,
+      "resumePath": "host woke the parent; its idle edge carried the brief",
+      "engineSettledLines": [
+        "20:27:13 crew native child settled child=ses_df0c27f81ffeFqv3uW5diPP9tM outcome=interrupted parent=ses_df0c27f8fffev33B3dmY78wWCy stillWaiting=0"
+      ],
+      "engineRecheckClear": 0,
+      "engineBusySkips": 1,
+      "pass": true
+    },
+    "A": {
+      "parent": "ses_df0c32c35ffeBCOEgoASNNjiq4",
+      "child": "ses_df0c32c25ffe0aM9u8otsdzVrN",
+      "armAttempts": 1,
+      "armDecision": "20:26:51 crew skip: native child in flight session=ses_df0c32c35ffeBCOEgoASNNjiq4",
+      "childSleepS": 480,
+      "completedIdleEdges": 3,
+      "edgeRulings": [
+        "20:26:58 crew skip: native child in flight session=ses_df0c32c35ffeBCOEgoASNNjiq4",
+        "20:27:05 crew skip: native child in flight session=ses_df0c32c35ffeBCOEgoASNNjiq4"
+      ],
+      "engineSuppressedEdges": 3,
+      "childBusyAtAssert": true,
+      "briefsWhileBusy": 0,
+      "pass": true
+    },
+    "B": {
+      "briefsTotal": 1,
+      "briefsNamingTheChild": 1,
+      "firstBriefIsTheNamingOne": true,
+      "firstBriefHasSucceeded": true,
+      "engineSettledLines": [
+        "20:34:40 crew native child settled child=ses_df0c32c25ffe0aM9u8otsdzVrN outcome=succeeded parent=ses_df0c32c35ffeBCOEgoASNNjiq4 stillWaiting=0"
+      ],
+      "engineRecheckClear": 0,
+      "engineBusySkips": 1,
+      "engineContinued": 1,
+      "pass": true
+    }
+  },
+  "hostCeiling": {
+    "recordedPid": 46588,
+    "runningPid": 46588,
+    "hostCeilingMs": 900000,
+    "driverCeilingMs": 900000,
+    "productionDefaultMs": 900000
+  },
+  "verdict": {
+    "A": true,
+    "B": true,
+    "BI": true,
+    "D": true
+  },
+  "verdictAll": true,
+  "engineEvidence": [
+    "20:26:29 crew skip: native child in flight session=ses_df0c32c34ffevNa5HFgYVcxHCk",
+    "20:26:30 crew native child settled child=ses_df0c32c26ffeQlB2pMnvYQ3dBb outcome=interrupted parent=ses_df0c32c34ffevNa5HFgYVcxHCk stillWaiting=0",
+    "20:26:31 crew skip: session busy again session=ses_df0c32c34ffevNa5HFgYVcxHCk status=active",
+    "20:26:37 crew continued session=ses_df0c32c34ffevNa5HFgYVcxHCk objective=\"native child gate sandbox E2E\"",
+    "20:26:51 crew skip: native child in flight session=ses_df0c32c35ffeBCOEgoASNNjiq4",
+    "20:26:58 crew skip: native child in flight session=ses_df0c32c35ffeBCOEgoASNNjiq4",
+    "20:27:05 crew skip: native child in flight session=ses_df0c32c35ffeBCOEgoASNNjiq4",
+    "20:27:12 crew skip: native child in flight session=ses_df0c27f8fffev33B3dmY78wWCy",
+    "20:27:13 crew native child settled child=ses_df0c27f81ffeFqv3uW5diPP9tM outcome=interrupted parent=ses_df0c27f8fffev33B3dmY78wWCy stillWaiting=0",
+    "20:27:14 crew skip: session busy again session=ses_df0c27f8fffev33B3dmY78wWCy status=active",
+    "20:27:22 crew continued session=ses_df0c27f8fffev33B3dmY78wWCy objective=\"native child gate sandbox E2E\"",
+    "20:34:40 crew native child settled child=ses_df0c32c25ffe0aM9u8otsdzVrN outcome=succeeded parent=ses_df0c32c35ffeBCOEgoASNNjiq4 stillWaiting=0",
+    "20:34:41 crew skip: session busy again session=ses_df0c32c35ffeBCOEgoASNNjiq4 status=active",
+    "20:34:42 crew skip: no executing crew session=ses_df0c32c25ffe0aM9u8otsdzVrN",
+    "20:34:49 crew continued session=ses_df0c32c35ffeBCOEgoASNNjiq4 objective=\"native child gate sandbox E2E\""
+  ],
+  "cleanup": {
+    "created": 3,
+    "deleted": 0,
+    "alreadyGone": 3,
+    "failed": 0,
+    "stillActive": 0
+  }
+}

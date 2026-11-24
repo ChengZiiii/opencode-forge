@@ -1,0 +1,171 @@
+{
+  "host": "http://127.0.0.1:47911",
+  "hostPid": 46588,
+  "startedAt": "2026-11-24T20:20:55.629Z",
+  "legs": [
+    "K1",
+    "K2",
+    "D1"
+  ],
+  "gateLegs": [
+    "K1",
+    "K2",
+    "D1"
+  ],
+  "ownerLocation": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+  "results": {
+    "K1": {
+      "dispatchId": "j-20261124-202100-iz3igi",
+      "childSessionId": "ses_df0c7f7feffe7JNiE1bu6CpIm1",
+      "ownerTools": [
+        "execute"
+      ],
+      "childBusyBeforeDelete": true,
+      "childProcsBeforeDelete": 2,
+      "ownerDeleteStatus": 204,
+      "journalState": "terminal",
+      "journalOutcome": "aborted",
+      "journalReason": "registry kill (owner session ended) — the child was aborted and the dispatch is never retried",
+      "ledgerKeepRow": [
+        {
+          "at": "2026-11-24T20:21:30.698Z",
+          "jobId": "j-20261124-202100-iz3igi",
+          "detail": "owner session ended; registry kill issued (row kept for wake delivery — was: dispatch forge-viewe2e-coder: dispose e2e canary)"
+        }
+      ],
+      "ledgerChildLines": [
+        {
+          "at": "2026-11-24T20:21:31.099Z",
+          "jobId": "j-20261124-202102-5p311x",
+          "detail": "owner session ended; tree killed (was: powershell -NoProfile -Command \"Start-Sleep -Seconds 90; Write-Output CHILD-DONE # CH-K1mwv53gel\")"
+        }
+      ],
+      "childSessionAfter": 404,
+      "childStillActive": false,
+      "pass": true,
+      "wake": "NOT OBSERVABLE on a live host: the owner session is deleted, so the ABORTED wake has no inbox. Its wording is pinned by the dispatch-journal unit test; the same jobWakeText branch is observed live by leg K2."
+    },
+    "K2": {
+      "dispatchId": "j-20261124-202146-p1egkr",
+      "childSessionId": "ses_df0c740e6ffedUbiGKBnbQ2lAC",
+      "ownerTools": [
+        "execute"
+      ],
+      "childBusyAtCancel": true,
+      "cancelCalled": true,
+      "cancelOutput": "[forge:job] Cancelled j-20261124-202146-p1egkr (agent forge-viewe2e-coder, child session ses_df0c740e6ffedUbiGKBnbQ2lAC) — cancelled by the user lever; never retried. the child session ses_df0c740e6ffedUbiGKBnbQ2lAC is confirmed idle (the cancellation is REAL, not bookke",
+      "wakeArrived": true,
+      "wakeRole": "user",
+      "wakeNamesAborted": true,
+      "wakeHasFinalReport": false,
+      "wakeScaffolding": false,
+      "wakeHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder — ABORTED (task j-20261124-202146-p1egkr, child session ses_df0c740e6ffedUbiGKBnbQ2lAC): cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried. The child session was aborted; this dispatch di",
+      "journalState": "terminal",
+      "journalOutcome": "aborted",
+      "journalReason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried",
+      "wakeCarriesJournalReasonVerbatim": true,
+      "journalKillClass": "cancel",
+      "wakeKillClass": "cancel",
+      "childIdleAfterAbort": true,
+      "childSessionStatus": 200,
+      "sameKillClass": true,
+      "pass": true
+    },
+    "D1": {
+      "variant": "D1",
+      "gate": true,
+      "dispatchId": "j-20261124-202257-1zovtj",
+      "childSessionId": "ses_df0c62d38ffemaH2ABm9M0ZuMY",
+      "ownerTools": [
+        "execute"
+      ],
+      "evictStatus": 204,
+      "trigger": "evict",
+      "procsBeforeEvict": {
+        "B": 2,
+        "C": 2,
+        "CH": 2
+      },
+      "procsRightAfterEvict": {
+        "B": 2,
+        "C": 2,
+        "CH": 2
+      },
+      "journalStateRightAfter": "started",
+      "journalOutcomeRightAfter": null,
+      "childSessionStatusRightAfter": 200,
+      "ownerLocationLoadedRightAfter": false,
+      "disposeHookProbe": {
+        "ranInWindow": false,
+        "secondsEvictToHook": null,
+        "lines": [],
+        "note": "probe lines are written by the plugin's dispose hook / exit matrix when they run (build 2026-11-23T16:5xZ+); none = neither ran inside this leg's window"
+      },
+      "controlB": {
+        "sid": "ses_df0c67d0dffef7e12ADXKJ7Y3x",
+        "marker": "B-D1mwv55cxz",
+        "jobIds": [
+          "j-20261124-202241-y43w62"
+        ],
+        "procsAtStart": 2,
+        "settle": "ran-to-end"
+      },
+      "controlC": {
+        "sid": "ses_df0c6ae2cffecyLwMPcRJKlpdM",
+        "marker": "C-D1mwv55cxz",
+        "jobIds": [
+          "j-20261124-202229-orjlsh"
+        ],
+        "procsAtStart": 2,
+        "settle": "ran-to-end"
+      },
+      "disposeFired": false,
+      "ledgerLinesSinceEvict": [],
+      "ledgerDisposeLines": 0,
+      "wakeArrived": true,
+      "wakes": 1,
+      "wakeCarriesCanary": true,
+      "wakeHasFinalReport": true,
+      "wakeScaffolding": false,
+      "wakeHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261124-202257-1zovtj, child session ses_df0c62d38ffemaH2ABm9M0ZuMY). Final report: CANARY-D1mwv55cxz The dispatch is complete — read the report above; no polling, no re-dispatch needed.",
+      "journalFinalState": "terminal",
+      "journalFinalOutcome": "completed",
+      "journalFinalReason": "CANARY-D1mwv55cxz",
+      "childProcsAtEnd": 0,
+      "childJobLiveBeforeEvict": true,
+      "secondsFromDetectionToEvict": 4,
+      "F1_otherLocationTreeKilled": false,
+      "hostContract": {
+        "evictAccepted": true,
+        "probeLive": true,
+        "controlsAliveRightAfter": true,
+        "controlsRanToEnd": true,
+        "disposeHookRan": false,
+        "dispatchUntouchedRightAfter": true,
+        "controlsStarted": [
+          "B",
+          "C"
+        ],
+        "ownerLocationLoadedRightAfter": false,
+        "ownerLocationLoadedAtEnd": true
+      },
+      "killedByEvict": {
+        "B": false,
+        "C": false
+      },
+      "pass": true
+    }
+  },
+  "verdict": {
+    "K1": true,
+    "K2": true,
+    "D1": true
+  },
+  "inconclusive": [],
+  "verdictAll": true,
+  "cleanup": {
+    "created": 5,
+    "deletedNow": 0,
+    "stillActive": 0
+  }
+}

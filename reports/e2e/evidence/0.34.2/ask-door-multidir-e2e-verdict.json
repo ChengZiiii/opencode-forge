@@ -1,0 +1,735 @@
+{
+  "verdict": true,
+  "result": {
+    "pass": true,
+    "checks": {
+      "premiseOnlyWsLoadedAndBootedLast": true,
+      "premiseThirdBootedAfterWs": true,
+      "lastDirShellRunsInItsOwnDir": true,
+      "lastDirDoorIsRaisedToItsOwnSessionAndExecutes": true,
+      "nonLastDirDoorIsRaisedToItsOwnSessionAndExecutes": true,
+      "nonLastDirDoorNeverLandsInAnotherDirectorysTable": true,
+      "nonLastDirShellRunsInItsOwnDir": true,
+      "premiseLastInitializedDirectoryEvicted": true,
+      "afterEvictionShellStillRunsInTheOtherDirectory": true,
+      "afterEvictionDoorStillWorksInTheOtherDirectory": true,
+      "premiseThirdBootedAgainLast": true,
+      "afterComeBackShellRunsInTheNonLastDir": true,
+      "afterComeBackDoorWorksInTheNonLastDir": true,
+      "afterComeBackLastDirDoorStillWorks": true,
+      "premiseNonLastDirectoryEvictedThenBootedLast": true,
+      "otherDirectoryDoorIsRaisedToItsOwnSession": true,
+      "otherDirectoryShellRunsInItsOwnDir": true,
+      "premiseSessionsOwnDirectoryEvicted": true,
+      "ownDirectoryComesBackOnDemandAndRunsItsShell": true,
+      "ownDirectoryDoorWorksAfterItCameBack": true,
+      "everySessionLivedInTheDirectoryItWasCreatedFor": true
+    },
+    "details": {
+      "startEvictions": [
+        {
+          "dir": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+          "status": 204,
+          "gone": true,
+          "loaded": [
+            "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-md-zxmhqw-1"
+          ]
+        },
+        {
+          "dir": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-md-zxmhqw-1",
+          "status": 204,
+          "gone": true,
+          "loaded": []
+        }
+      ],
+      "wsActivation": {
+        "status": 200,
+        "bootLines": "3 -> 4",
+        "lastBoot": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+        "loaded": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws"
+        ]
+      },
+      "thirdActivation": {
+        "status": 200,
+        "bootLines": "4 -> 5",
+        "lastBoot": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds",
+        "loaded": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds"
+        ]
+      },
+      "C0": {
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "cwd": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds",
+        "cwdIsOwn": true,
+        "toolError": false,
+        "text": "[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds jobId: j-20261124-204021-xcolrf Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed). output: (none)"
+      },
+      "C1GoalFilesRemoved": [
+        "third/.opencode/goal/2026-11-25-door21-c1-fflnds.md"
+      ],
+      "C1": {
+        "tag": "C1",
+        "sid": "ses_df0b628a1ffeFL5Ws83xWZGyfq",
+        "own": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws-door-fflnds",
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "state": "own-answered",
+        "ms": 14751,
+        "asks": [
+          {
+            "id": "per_20f4a0032001I8fJIs8iDtz8Sc",
+            "action": "goal_write",
+            "title": "Arm goal: door21-c1-fflnds",
+            "sessionID": "ses_df0b628a1ffeFL5Ws83xWZGyfq",
+            "firstSeenMs": 10588,
+            "ownReply": 204,
+            "ownReplyText": "",
+            "listedUnder": [
+              "own"
+            ]
+          }
+        ],
+        "leakedTables": [],
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "toolText": "Goal armed: .opencode/goal/2026-11-25-door21-c1-fflnds.md (revision 1, 1 criteria, 1 verification items, budget 25 turns / 60 min). The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker.",
+        "thrown": false,
+        "polls": {
+          "ownList": 47,
+          "tableList": 47,
+          "errors": 0,
+          "firstOwnStatus": null,
+          "firstOwnText": null
+        },
+        "files": {
+          "own": [
+            "2026-11-25-door21-c1-fflnds.md"
+          ],
+          "other": []
+        },
+        "attempt": 1,
+        "attempts": [
+          {
+            "attempt": 1,
+            "sid": "ses_df0b628a1ffeFL5Ws83xWZGyfq",
+            "state": "own-answered",
+            "toolParts": 1,
+            "ms": 14751,
+            "noCall": false
+          }
+        ]
+      },
+      "C2GoalFilesRemoved": [
+        "ws/.opencode/goal/2026-11-25-door21-c2-fflnds.md"
+      ],
+      "C2": {
+        "tag": "C2",
+        "sid": "ses_df0b5eef4ffe48SnccoiShqINz",
+        "own": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws",
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "state": "own-answered",
+        "ms": 13689,
+        "asks": [
+          {
+            "id": "per_20f4a3452001N5UU3zMIpoLDgh",
+            "action": "goal_write",
+            "title": "Arm goal: door21-c2-fflnds",
+            "sessionID": "ses_df0b5eef4ffe48SnccoiShqINz",
+            "firstSeenMs": 9026,
+            "ownReply": 204,
+            "ownReplyText": "",
+            "listedUnder": [
+              "own"
+            ]
+          }
+        ],
+        "leakedTables": [],
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "toolText": "Goal armed: .opencode/goal/2026-11-25-door21-c2-fflnds.md (revision 1, 1 criteria, 1 verification items, budget 25 turns / 60 min). The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker.",
+        "thrown": false,
+        "polls": {
+          "ownList": 44,
+          "tableList": 44,
+          "errors": 0,
+          "firstOwnStatus": null,
+          "firstOwnText": null
+        },
+        "files": {
+          "own": [
+            "2026-11-25-door21-c2-fflnds.md"
+          ],
+          "other": []
+        },
+        "attempt": 1,
+        "attempts": [
+          {
+            "attempt": 1,
+            "sid": "ses_df0b5eef4ffe48SnccoiShqINz",
+            "state": "own-answered",
+            "toolParts": 1,
+            "ms": 13689,
+            "noCall": false
+          }
+        ]
+      },
+      "C3": {
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "cwd": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+        "cwdIsOwn": true,
+        "toolError": false,
+        "text": "[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws jobId: j-20261124-204100-ufjtaz Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed). output: (none)"
+      },
+      "thirdEviction": {
+        "status": 204,
+        "gone": true,
+        "loaded": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws"
+        ]
+      },
+      "E1": {
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "cwd": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+        "cwdIsOwn": true,
+        "toolError": false,
+        "text": "[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws jobId: j-20261124-204110-6pqujo Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed). output: (none)"
+      },
+      "E2GoalFilesRemoved": [
+        "ws/.opencode/goal/2026-11-25-door21-e2-fflnds.md"
+      ],
+      "E2": {
+        "tag": "E2",
+        "sid": "ses_df0b55c0effeTiD92lBEe39S1O",
+        "own": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws",
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "state": "own-answered",
+        "ms": 18350,
+        "asks": [
+          {
+            "id": "per_20f4ad713001eBqDZjqLZKbvZG",
+            "action": "goal_write",
+            "title": "Arm goal: door21-e2-fflnds",
+            "sessionID": "ses_df0b55c0effeTiD92lBEe39S1O",
+            "firstSeenMs": 13377,
+            "ownReply": 204,
+            "ownReplyText": "",
+            "listedUnder": [
+              "own"
+            ]
+          }
+        ],
+        "leakedTables": [],
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "toolText": "Goal armed: .opencode/goal/2026-11-25-door21-e2-fflnds.md (revision 1, 1 criteria, 1 verification items, budget 25 turns / 60 min). The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker.",
+        "thrown": false,
+        "polls": {
+          "ownList": 59,
+          "tableList": 0,
+          "errors": 0,
+          "firstOwnStatus": null,
+          "firstOwnText": null
+        },
+        "files": {
+          "own": [
+            "2026-11-25-door21-e2-fflnds.md"
+          ],
+          "other": []
+        },
+        "attempt": 1,
+        "attempts": [
+          {
+            "attempt": 1,
+            "sid": "ses_df0b55c0effeTiD92lBEe39S1O",
+            "state": "own-answered",
+            "toolParts": 1,
+            "ms": 18350,
+            "noCall": false
+          }
+        ]
+      },
+      "thirdReactivation": {
+        "status": 200,
+        "bootLines": "5 -> 6",
+        "lastBoot": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds",
+        "loaded": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds"
+        ]
+      },
+      "E3": {
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "cwd": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+        "cwdIsOwn": true,
+        "toolError": false,
+        "text": "[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws jobId: j-20261124-204142-sytaer Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed). output: (none)"
+      },
+      "E4GoalFilesRemoved": [
+        "ws/.opencode/goal/2026-11-25-door21-e4-fflnds.md"
+      ],
+      "E4": {
+        "tag": "E4",
+        "sid": "ses_df0b4ec66ffecvjnvwJ68paWox",
+        "own": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws",
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "state": "own-answered",
+        "ms": 7152,
+        "asks": [
+          {
+            "id": "per_20f4b1fdc001vlzvl7wGqs1Xbz",
+            "action": "goal_write",
+            "title": "Arm goal: door21-e4-fflnds",
+            "sessionID": "ses_df0b4ec66ffecvjnvwJ68paWox",
+            "firstSeenMs": 3421,
+            "ownReply": 204,
+            "ownReplyText": "",
+            "listedUnder": [
+              "own"
+            ]
+          }
+        ],
+        "leakedTables": [],
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "toolText": "Goal armed: .opencode/goal/2026-11-25-door21-e4-fflnds.md (revision 1, 1 criteria, 1 verification items, budget 25 turns / 60 min). The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker.",
+        "thrown": false,
+        "polls": {
+          "ownList": 23,
+          "tableList": 23,
+          "errors": 0,
+          "firstOwnStatus": null,
+          "firstOwnText": null
+        },
+        "files": {
+          "own": [
+            "2026-11-25-door21-e4-fflnds.md"
+          ],
+          "other": []
+        },
+        "attempt": 1,
+        "attempts": [
+          {
+            "attempt": 1,
+            "sid": "ses_df0b4ec66ffecvjnvwJ68paWox",
+            "state": "own-answered",
+            "toolParts": 1,
+            "ms": 7152,
+            "noCall": false
+          }
+        ]
+      },
+      "E5GoalFilesRemoved": [
+        "third/.opencode/goal/2026-11-25-door21-e5-fflnds.md"
+      ],
+      "E5": {
+        "tag": "E5",
+        "sid": "ses_df0b4d069ffeosAMjVVCG3RZZO",
+        "own": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws-door-fflnds",
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "state": "own-answered",
+        "ms": 12138,
+        "asks": [
+          {
+            "id": "per_20f4b51e7001Ts9HGAQIV8f9N6",
+            "action": "goal_write",
+            "title": "Arm goal: door21-e5-fflnds",
+            "sessionID": "ses_df0b4d069ffeosAMjVVCG3RZZO",
+            "firstSeenMs": 9028,
+            "ownReply": 204,
+            "ownReplyText": "",
+            "listedUnder": [
+              "own"
+            ]
+          }
+        ],
+        "leakedTables": [],
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "toolText": "Goal armed: .opencode/goal/2026-11-25-door21-e5-fflnds.md (revision 1, 1 criteria, 1 verification items, budget 25 turns / 60 min). The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker.",
+        "thrown": false,
+        "polls": {
+          "ownList": 39,
+          "tableList": 39,
+          "errors": 0,
+          "firstOwnStatus": null,
+          "firstOwnText": null
+        },
+        "files": {
+          "own": [
+            "2026-11-25-door21-e5-fflnds.md"
+          ],
+          "other": []
+        },
+        "attempt": 1,
+        "attempts": [
+          {
+            "attempt": 1,
+            "sid": "ses_df0b4d069ffeosAMjVVCG3RZZO",
+            "state": "own-answered",
+            "toolParts": 1,
+            "ms": 12138,
+            "noCall": false
+          }
+        ]
+      },
+      "wsEviction": {
+        "status": 204,
+        "gone": true,
+        "loaded": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds"
+        ]
+      },
+      "wsReactivation": {
+        "status": 200,
+        "bootLines": "6 -> 7",
+        "lastBoot": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+        "loaded": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds",
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws"
+        ]
+      },
+      "E7GoalFilesRemoved": [
+        "third/.opencode/goal/2026-11-25-door21-e7-fflnds.md"
+      ],
+      "E7": {
+        "tag": "E7",
+        "sid": "ses_df0b49c7dffelG99HWRbS2PxD1",
+        "own": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws-door-fflnds",
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "state": "own-answered",
+        "ms": 13727,
+        "asks": [
+          {
+            "id": "per_20f4b8497001kfIvCeqN7A5KJN",
+            "action": "goal_write",
+            "title": "Arm goal: door21-e7-fflnds",
+            "sessionID": "ses_df0b49c7dffelG99HWRbS2PxD1",
+            "firstSeenMs": 8708,
+            "ownReply": 204,
+            "ownReplyText": "",
+            "listedUnder": [
+              "own"
+            ]
+          }
+        ],
+        "leakedTables": [],
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "toolText": "Goal armed: .opencode/goal/2026-11-25-door21-e7-fflnds.md (revision 1, 1 criteria, 1 verification items, budget 25 turns / 60 min). The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker.",
+        "thrown": false,
+        "polls": {
+          "ownList": 44,
+          "tableList": 44,
+          "errors": 0,
+          "firstOwnStatus": null,
+          "firstOwnText": null
+        },
+        "files": {
+          "own": [
+            "2026-11-25-door21-e7-fflnds.md"
+          ],
+          "other": []
+        },
+        "attempt": 1,
+        "attempts": [
+          {
+            "attempt": 1,
+            "sid": "ses_df0b49c7dffelG99HWRbS2PxD1",
+            "state": "own-answered",
+            "toolParts": 1,
+            "ms": 13727,
+            "noCall": false
+          }
+        ]
+      },
+      "E6": {
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "cwd": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds",
+        "cwdIsOwn": true,
+        "toolError": false,
+        "text": "[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds jobId: j-20261124-204223-2n36ud Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed). output: (none)"
+      },
+      "ownEviction": {
+        "status": 204,
+        "gone": true,
+        "loaded": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws"
+        ]
+      },
+      "E8": {
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "cwd": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds",
+        "cwdIsOwn": true,
+        "toolError": false,
+        "text": "[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds jobId: j-20261124-204232-yq17cf Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed). output: (none)"
+      },
+      "E9GoalFilesRemoved": [
+        "third/.opencode/goal/2026-11-25-door21-e9-fflnds.md"
+      ],
+      "E9": {
+        "tag": "E9",
+        "sid": "ses_df0b4507bffeuj78ILXSLxn1A3",
+        "own": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws-door-fflnds",
+        "turn": {
+          "ended": true,
+          "hung": false,
+          "error": null
+        },
+        "state": "own-answered",
+        "ms": 19026,
+        "asks": [
+          {
+            "id": "per_20f4c1129001fcV32fn1fl2rcl",
+            "action": "goal_write",
+            "title": "Arm goal: door21-e9-fflnds",
+            "sessionID": "ses_df0b4507bffeuj78ILXSLxn1A3",
+            "firstSeenMs": 14343,
+            "ownReply": 204,
+            "ownReplyText": "",
+            "listedUnder": [
+              "own"
+            ]
+          }
+        ],
+        "leakedTables": [],
+        "toolNames": [
+          "execute"
+        ],
+        "toolStatus": [
+          "completed"
+        ],
+        "toolText": "Goal armed: .opencode/goal/2026-11-25-door21-e9-fflnds.md (revision 1, 1 criteria, 1 verification items, budget 25 turns / 60 min). The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker.",
+        "thrown": false,
+        "polls": {
+          "ownList": 61,
+          "tableList": 61,
+          "errors": 0,
+          "firstOwnStatus": null,
+          "firstOwnText": null
+        },
+        "files": {
+          "own": [
+            "2026-11-25-door21-e9-fflnds.md"
+          ],
+          "other": []
+        },
+        "attempt": 1,
+        "attempts": [
+          {
+            "attempt": 1,
+            "sid": "ses_df0b4507bffeuj78ILXSLxn1A3",
+            "state": "own-answered",
+            "toolParts": 1,
+            "ms": 19026,
+            "noCall": false
+          }
+        ]
+      },
+      "sessions": [
+        {
+          "tag": "C0",
+          "own": "third",
+          "recordDirectory": "third"
+        },
+        {
+          "tag": "C1",
+          "own": "third",
+          "recordDirectory": "third"
+        },
+        {
+          "tag": "C2",
+          "own": "ws",
+          "recordDirectory": "ws"
+        },
+        {
+          "tag": "C3",
+          "own": "ws",
+          "recordDirectory": "ws"
+        },
+        {
+          "tag": "E1",
+          "own": "ws",
+          "recordDirectory": "ws"
+        },
+        {
+          "tag": "E2",
+          "own": "ws",
+          "recordDirectory": "ws"
+        },
+        {
+          "tag": "E3",
+          "own": "ws",
+          "recordDirectory": "ws"
+        },
+        {
+          "tag": "E4",
+          "own": "ws",
+          "recordDirectory": "ws"
+        },
+        {
+          "tag": "E5",
+          "own": "third",
+          "recordDirectory": "third"
+        },
+        {
+          "tag": "E7",
+          "own": "third",
+          "recordDirectory": "third"
+        },
+        {
+          "tag": "E6",
+          "own": "third",
+          "recordDirectory": "third"
+        },
+        {
+          "tag": "S5",
+          "own": "third",
+          "recordDirectory": "third"
+        }
+      ],
+      "leftoverGoalFilesRemoved": [],
+      "finalThirdEviction": {
+        "status": 204,
+        "gone": true,
+        "loaded": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws"
+        ]
+      }
+    },
+    "error": null
+  },
+  "startedAt": "2026-11-24T20:40:12.751Z",
+  "hostPid": 46588,
+  "geometry": {
+    "ws": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws",
+    "third": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws-door-fflnds",
+    "loadedAtStart": [
+      "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+      "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-md-zxmhqw-1"
+    ],
+    "loadedBeforeThird": [
+      "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws"
+    ],
+    "lastBootBeforeThird": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+    "loadedAfterThird": [
+      "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+      "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds"
+    ],
+    "afterOwnComeBack": {
+      "loaded": [
+        "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+        "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds"
+      ],
+      "lastBoot": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-door-fflnds"
+    }
+  }
+}

@@ -1,0 +1,40 @@
+{
+  "verdict": true,
+  "result": {
+    "pass": true,
+    "checks": {
+      "fgSaysNotStartedFirst": true,
+      "fgNamesTheMissingDirectory": true,
+      "fgCarriesJobIdAndSpawnError": true,
+      "fgHasNoRanSentences": true,
+      "fgHasNoCommandOutput": true,
+      "fgIsExactlyFourLines": true,
+      "bgStartHandsAJobId": true,
+      "bgPollNamesNotStarted": true,
+      "bgPollHasNoCommandOutput": true,
+      "controlRanFormIntact": true
+    },
+    "details": {
+      "fg": {
+        "turnMs": 10590,
+        "status": "completed",
+        "codeCalled": true,
+        "text": "[forge:job] NOT STARTED — spawn failed; nothing was executed.\ncwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws\\no-such-dir-fg-vurxbq\njobId: j-20261124-203856-27aysg\nspawn error: ENOENT: no such file or directory, uv_spawn 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'"
+      },
+      "bg": {
+        "turnMs": 13605,
+        "status": "completed",
+        "codeCalled": true,
+        "text": "{\"started\":\"[forge:job] Started in background.\\ncwd: C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\opencode\\\\view-e2e\\\\ws\\\\no-such-dir-bg-vurxbq\\njobId: j-20261124-203908-7zvrmm\\nlogPath: C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\opencode\\\\view-e2e\\\\sbx-tmp\\\\opencode-forge\\\\jobs\\\\j-20261124-203908-7zvrmm.log\\nTrack with forge_jobs poll; a [forge:job-complete] message arrives on exit.\",\"id\":\"j-20261124-203908-7zvrmm\",\"polls\":[\"[forge:job] j-20261124-203908-7zvrmm: NOT STARTED — spawn failed; nothing was executed (terminal state: killed).\"],\"final\":\"[forge:job] j-20261124-203908-7zvrmm: NOT STARTED — spawn failed; nothing was executed (terminal state: killed).\\nspawn error: ENOENT: no such file or directory, uv_spawn 'C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe'\\nnew output:\\n(none in this window)\\nlogPath: C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\opencode\\\\view-e2e\\\\sbx-tmp\\\\opencode-forge\\\\jobs\\\\j-20261124-203908-7zvrmm.log\"}"
+      },
+      "control": {
+        "turnMs": 21074,
+        "status": "completed",
+        "text": "[forge:job] Command finished (exit=0).\ncwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws\njobId: j-20261124-203920-4pecre\nOutput was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed).\noutput:\nB-RAN-vurxbq\r\n"
+      }
+    },
+    "error": null
+  },
+  "startedAt": "2026-11-24T20:38:52.349Z",
+  "hostPid": 46588
+}

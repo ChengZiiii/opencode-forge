@@ -1,11 +1,11 @@
 {
   "gate": "acceptance-gate",
-  "generatedAt": "2026-11-24T05:06:34.903Z",
-  "elapsedMs": 90080,
-  "packageVersion": "0.34.0",
+  "generatedAt": "2026-11-24T22:30:09.056Z",
+  "elapsedMs": 44919,
+  "packageVersion": "0.34.1",
   "git": {
-    "head": "4f40a502645961628f27bd959bab1737b3e82f75",
-    "short": "4f40a50",
+    "head": "395ff5dd0046e77585d719f3f2f1ebc3d36d462c",
+    "short": "395ff5d",
     "dirtyFiles": 1,
     "dirty": [
       "M reports/overnight-status.md"
@@ -13,27 +13,21 @@
   },
   "hostVersionWanted": "2.4.0",
   "build": {
-    "distMtime": "2026-11-24T03:18:19.155Z",
-    "distSha256": "8c97c396fb75bcdc60a5475131d0b57ef2b6e442f6945af9b506e0f927f19803",
+    "distMtime": "2026-11-24T18:43:34.008Z",
+    "distSha256": "f767eedbe8015a66bb4678a368ea2f7bde2444c4f713855555ab39db3c5d8821",
     "newestSource": "plugin.ts",
-    "newestSourceMtime": "2026-11-24T03:18:17.267Z"
+    "newestSourceMtime": "2026-11-24T18:38:14.595Z"
   },
   "pass": true,
-  "hardPass": false,
+  "hardPass": true,
   "counts": {
-    "pass": 31,
+    "pass": 34,
     "fail": 0,
-    "booked": 1,
+    "booked": 0,
     "known": 0,
-    "total": 32
+    "total": 34
   },
-  "booked": [
-    {
-      "id": "e2e-c1-D1",
-      "booking": "D6 — the sandbox host (2.4.0) offers no action proven to run the plugin dispose hook while a dispatch is in flight",
-      "detail": "the evict did not kill the control process tree of the evicted location - the plugin dispose hook did not run inside the leg window (probe silent): no verdict on the dispatch exemption | dispose hook probe: {\"ranInWindow\":false,\"secondsEvictToHook\":null,\"lines\":[],\"note\":\"probe lines are written by the plugin's dispose hook / exit matrix when they run (build 2026-11-23T16:5xZ+); none = neither ran inside this leg's window\"}"
-    }
-  ],
+  "booked": [],
   "knownDefects": [],
   "failed": [],
   "checks": [
@@ -41,25 +35,25 @@
       "id": "build-fresh",
       "title": "dist/index.js is newer than every source file",
       "status": "PASS",
-      "detail": "dist 2026-11-24T03:18:19.155Z vs newest source plugin.ts 2026-11-24T03:18:17.267Z",
-      "distMtime": "2026-11-24T03:18:19.155Z",
-      "distSha256": "8c97c396fb75bcdc60a5475131d0b57ef2b6e442f6945af9b506e0f927f19803",
+      "detail": "dist 2026-11-24T18:43:34.008Z vs newest source plugin.ts 2026-11-24T18:38:14.595Z",
+      "distMtime": "2026-11-24T18:43:34.008Z",
+      "distSha256": "f767eedbe8015a66bb4678a368ea2f7bde2444c4f713855555ab39db3c5d8821",
       "newestSource": "plugin.ts",
-      "newestSourceMtime": "2026-11-24T03:18:17.267Z"
+      "newestSourceMtime": "2026-11-24T18:38:14.595Z"
     },
     {
       "id": "c3-command-stop",
       "title": "c3-command-stop: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T03:42:40.159Z · startedAt 2026-11-24T03:37:17.418Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:20:55.406Z · startedAt 2026-11-24T20:16:05.542Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\command-stop-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:42:40.159Z",
-      "sha256": "72df4ca959ea7f0306a514450efbf71b4547e88015db7faac7694da5a3218729",
+      "mtime": "2026-11-24T20:20:55.406Z",
+      "sha256": "08bc1b809879c16571da241674a2e2a9a0956c428d3a231eba46290f20a2611e",
       "readable": true,
-      "startedAt": "2026-11-24T03:37:17.418Z",
+      "startedAt": "2026-11-24T20:16:05.542Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "e2e-c3-command-stop",
@@ -75,15 +69,15 @@
       "id": "c4-pin-variant",
       "title": "c4-pin-variant: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T03:35:07.534Z · startedAt 2026-11-24T03:33:38.443Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:14:37.789Z · startedAt 2026-11-24T20:13:37.005Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\pin-variant-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:35:07.534Z",
-      "sha256": "071087a88aaaf83b3ebd55249f002279535919de6368397e2794319fb901ef07",
+      "mtime": "2026-11-24T20:14:37.789Z",
+      "sha256": "928240ab8dac98e17565402591b590294f8f3cffb8dd18a2a9d678e32b156528",
       "readable": true,
-      "startedAt": "2026-11-24T03:33:38.443Z",
+      "startedAt": "2026-11-24T20:13:37.005Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "e2e-c4-pin-variant",
@@ -99,15 +93,15 @@
       "id": "c2-plan-close",
       "title": "c2-plan-close: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T03:37:17.195Z · startedAt 2026-11-24T03:35:07.747Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:16:05.337Z · startedAt 2026-11-24T20:14:38.001Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\plan-close-headless-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:37:17.195Z",
-      "sha256": "9b0f228655e562331371a79f44a12099538502f0ae5290d0abeca980bebc28f2",
+      "mtime": "2026-11-24T20:16:05.337Z",
+      "sha256": "175bec3d26d665b386343f13811a78ce16edb87a9adb783f5836f82caa6ed852",
       "readable": true,
-      "startedAt": "2026-11-24T03:35:07.747Z",
+      "startedAt": "2026-11-24T20:14:38.001Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "e2e-c2-plan-close",
@@ -123,15 +117,15 @@
       "id": "f-crew-close-door",
       "title": "f-crew-close-door: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T04:03:26.053Z · startedAt 2026-11-24T04:00:45.449Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:38:52.143Z · startedAt 2026-11-24T20:36:40.099Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\crew-close-door-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:03:26.053Z",
-      "sha256": "373990a08652eea5bdace4f7380f188d96ac484de6399279a0a7091a1dd7d6e5",
+      "mtime": "2026-11-24T20:38:52.143Z",
+      "sha256": "fc071a2ba07e9b30ad35041405425fcc3f4456eea6f0522a03a81a2ff0dbb5d4",
       "readable": true,
-      "startedAt": "2026-11-24T04:00:45.449Z",
+      "startedAt": "2026-11-24T20:36:40.099Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "e2e-f-crew-close-door",
@@ -147,15 +141,15 @@
       "id": "a-anchor-multidir",
       "title": "a-anchor-multidir: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T04:05:04.177Z · startedAt 2026-11-24T04:04:07.782Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:40:12.520Z · startedAt 2026-11-24T20:39:37.860Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\anchor-multidir-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:05:04.177Z",
-      "sha256": "960d15c01a26fa751516ba1397c21bb4638bb8e7289fe5448d88d7f0f59f1a04",
+      "mtime": "2026-11-24T20:40:12.520Z",
+      "sha256": "7b2a5eb6320a55963b08d1a945c8488fa12fb152ab2edde6193c585201ad93a3",
       "readable": true,
-      "startedAt": "2026-11-24T04:04:07.782Z",
+      "startedAt": "2026-11-24T20:39:37.860Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "e2e-a-anchor-multidir",
@@ -171,15 +165,15 @@
       "id": "b-spawn-error",
       "title": "b-spawn-error: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T04:04:07.583Z · startedAt 2026-11-24T04:03:26.261Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:39:37.654Z · startedAt 2026-11-24T20:38:52.349Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\spawn-error-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:04:07.583Z",
-      "sha256": "07e5843c6d3066872bcf1e7adac4cdf5cef592ef3456ab2220eb163c0302248a",
+      "mtime": "2026-11-24T20:39:37.654Z",
+      "sha256": "f9738a48d993470950b0a654ce9ac929b0bc409410ef333084834da71529c3b2",
       "readable": true,
-      "startedAt": "2026-11-24T04:03:26.261Z",
+      "startedAt": "2026-11-24T20:38:52.349Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "e2e-b-spawn-error",
@@ -195,15 +189,15 @@
       "id": "c-stop-queued",
       "title": "c-stop-queued: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T04:00:44.774Z · startedAt 2026-11-24T03:58:50.925Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:55:40.324Z · startedAt 2026-11-24T20:54:37.335Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\stop-queued-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:00:44.774Z",
-      "sha256": "9849fdd3c48d39a5cef6537584fd0f47a97f661c9a8bb093e7c62c9502ca3420",
+      "mtime": "2026-11-24T20:55:40.324Z",
+      "sha256": "a5be9f2640f6880fa60279e7911cbd0d9b3c11e3da77c9e9f3e905ce7a5da3bc",
       "readable": true,
-      "startedAt": "2026-11-24T03:58:50.925Z",
+      "startedAt": "2026-11-24T20:54:37.335Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 26680
     },
     {
       "id": "e2e-c-stop-queued",
@@ -219,15 +213,15 @@
       "id": "e-stale-progress",
       "title": "e-stale-progress: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T03:30:39.902Z · startedAt 2026-11-24T03:25:22.511Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:59:31.670Z · startedAt 2026-11-24T20:55:40.593Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\stale-progress-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:30:39.902Z",
-      "sha256": "12eaf2c6a0de409e02a9c6ad3c17550c384fc7444763bb54b350b399bf1e88fe",
+      "mtime": "2026-11-24T20:59:31.670Z",
+      "sha256": "12852c1bbbfbaaa048f56dc5d9f4e0da6897d8a167f189ab67da387c6ba17037",
       "readable": true,
-      "startedAt": "2026-11-24T03:25:22.511Z",
+      "startedAt": "2026-11-24T20:55:40.593Z",
       "startedKey": "startedAt",
-      "hostPid": 10032
+      "hostPid": 26680
     },
     {
       "id": "e2e-e-stale-progress",
@@ -240,18 +234,42 @@
       "inconclusive": null
     },
     {
+      "id": "md-ask-door-multidir",
+      "title": "md-ask-door-multidir: measured on THIS build (file and in-file start time both later than dist)",
+      "status": "PASS",
+      "detail": "file 2026-11-24T20:42:58.014Z · startedAt 2026-11-24T20:40:12.751Z · dist 2026-11-24T18:43:34.008Z",
+      "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\ask-door-multidir-e2e-verdict.json",
+      "exists": true,
+      "mtime": "2026-11-24T20:42:58.014Z",
+      "sha256": "16d2f3a3d7cbd70ce9541491e400506af2b28eb48371876986db7f3e6d03a7f1",
+      "readable": true,
+      "startedAt": "2026-11-24T20:40:12.751Z",
+      "startedKey": "startedAt",
+      "hostPid": 46588
+    },
+    {
+      "id": "e2e-md-ask-door-multidir",
+      "title": "md-ask-door-multidir: every driver check passed on the live host",
+      "status": "PASS",
+      "detail": "21/21 checks",
+      "checksTotal": 21,
+      "checksFailed": [],
+      "retriedOnce": false,
+      "inconclusive": null
+    },
+    {
       "id": "c1-dispose",
       "title": "c1-dispose: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T03:49:28.977Z · startedAt 2026-11-24T03:42:40.403Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:26:14.141Z · startedAt 2026-11-24T20:20:55.629Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\dispose-e2e-K1-K2-D1-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:49:28.977Z",
-      "sha256": "25d5455023181c094112307699ba7d1ca6a7e61a6531413c11284a22c2e42d2d",
+      "mtime": "2026-11-24T20:26:14.141Z",
+      "sha256": "d2383daa173fbf895ca712cb51287438a2da8b2104b665b1314c917390aff140",
       "readable": true,
-      "startedAt": "2026-11-24T03:42:40.403Z",
+      "startedAt": "2026-11-24T20:20:55.629Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "e2e-c1-K1",
@@ -259,8 +277,8 @@
       "status": "PASS",
       "detail": "{}",
       "result": {
-        "dispatchId": "j-20261124-034243-7wfgl5",
-        "childSessionId": "ses_df459ec59ffepGZvu4N1OfSXoU",
+        "dispatchId": "j-20261124-202100-iz3igi",
+        "childSessionId": "ses_df0c7f7feffe7JNiE1bu6CpIm1",
         "ownerTools": [
           "execute"
         ],
@@ -272,16 +290,16 @@
         "journalReason": "registry kill (owner session ended) — the child was aborted and the dispatch is never retried",
         "ledgerKeepRow": [
           {
-            "at": "2026-11-24T03:43:14.030Z",
-            "jobId": "j-20261124-034243-7wfgl5",
+            "at": "2026-11-24T20:21:30.698Z",
+            "jobId": "j-20261124-202100-iz3igi",
             "detail": "owner session ended; registry kill issued (row kept for wake delivery — was: dispatch forge-viewe2e-coder: dispose e2e canary)"
           }
         ],
         "ledgerChildLines": [
           {
-            "at": "2026-11-24T03:43:14.445Z",
-            "jobId": "j-20261124-034252-tjtlh9",
-            "detail": "owner session ended; tree killed (was: powershell -NoProfile -Command \"Start-Sleep -Seconds 90; Write-Output CHILD-DONE # CH-K1mwu5foyc\")"
+            "at": "2026-11-24T20:21:31.099Z",
+            "jobId": "j-20261124-202102-5p311x",
+            "detail": "owner session ended; tree killed (was: powershell -NoProfile -Command \"Start-Sleep -Seconds 90; Write-Output CHILD-DONE # CH-K1mwv53gel\")"
           }
         ],
         "childSessionAfter": 404,
@@ -296,20 +314,20 @@
       "status": "PASS",
       "detail": "{}",
       "result": {
-        "dispatchId": "j-20261124-034339-ktlcvw",
-        "childSessionId": "ses_df4590fcbffexl4AJ4wRAoR2iI",
+        "dispatchId": "j-20261124-202146-p1egkr",
+        "childSessionId": "ses_df0c740e6ffedUbiGKBnbQ2lAC",
         "ownerTools": [
           "execute"
         ],
         "childBusyAtCancel": true,
         "cancelCalled": true,
-        "cancelOutput": "[forge:job] Cancelled j-20261124-034339-ktlcvw (agent forge-viewe2e-coder, child session ses_df4590fcbffexl4AJ4wRAoR2iI) — cancelled by the user lever; never retried. the child session ses_df4590fcbffexl4AJ4wRAoR2iI is confirmed idle (the cancellation is REAL, not bookke",
+        "cancelOutput": "[forge:job] Cancelled j-20261124-202146-p1egkr (agent forge-viewe2e-coder, child session ses_df0c740e6ffedUbiGKBnbQ2lAC) — cancelled by the user lever; never retried. the child session ses_df0c740e6ffedUbiGKBnbQ2lAC is confirmed idle (the cancellation is REAL, not bookke",
         "wakeArrived": true,
         "wakeRole": "user",
         "wakeNamesAborted": true,
         "wakeHasFinalReport": false,
         "wakeScaffolding": false,
-        "wakeHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder — ABORTED (task j-20261124-034339-ktlcvw, child session ses_df4590fcbffexl4AJ4wRAoR2iI): cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried. The child session was aborted; this dispatch di",
+        "wakeHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder — ABORTED (task j-20261124-202146-p1egkr, child session ses_df0c740e6ffedUbiGKBnbQ2lAC): cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried. The child session was aborted; this dispatch di",
         "journalState": "terminal",
         "journalOutcome": "aborted",
         "journalReason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried",
@@ -324,15 +342,14 @@
     },
     {
       "id": "e2e-c1-D1",
-      "title": "c1-dispose D1: a dispatch row survives a plugin dispose of the owner location",
-      "status": "BOOKED",
-      "booking": "D6 — the sandbox host (2.4.0) offers no action proven to run the plugin dispose hook while a dispatch is in flight",
-      "detail": "the evict did not kill the control process tree of the evicted location - the plugin dispose hook did not run inside the leg window (probe silent): no verdict on the dispatch exemption | dispose hook probe: {\"ranInWindow\":false,\"secondsEvictToHook\":null,\"lines\":[],\"note\":\"probe lines are written by the plugin's dispose hook / exit matrix when they run (build 2026-11-23T16:5xZ+); none = neither ran inside this leg's window\"}",
+      "title": "c1-dispose D1: an evict of the owner location mid-dispatch kills nothing and the dispatch completes with one wake (2.4.0 — the plugin unload clears no job)",
+      "status": "PASS",
+      "detail": "evict 204 · child job live before the evict (4 s after it was seen) · probe live · controls [\"B\",\"C\"] alive after the evict and ran to end · dispose hook not run · dispatch untouched right after · journal terminal/completed · wakes 1 · owner location still loaded after the evict: false",
       "result": {
         "variant": "D1",
         "gate": true,
-        "dispatchId": "j-20261124-034612-qn5i1g",
-        "childSessionId": "ses_df456b96dffeZWdvXcl4gdB4KQ",
+        "dispatchId": "j-20261124-202257-1zovtj",
+        "childSessionId": "ses_df0c62d38ffemaH2ABm9M0ZuMY",
         "ownerTools": [
           "execute"
         ],
@@ -341,17 +358,17 @@
         "procsBeforeEvict": {
           "B": 2,
           "C": 2,
-          "CH": 0
+          "CH": 2
         },
         "procsRightAfterEvict": {
           "B": 2,
           "C": 2,
-          "CH": 0
+          "CH": 2
         },
         "journalStateRightAfter": "started",
         "journalOutcomeRightAfter": null,
         "childSessionStatusRightAfter": 200,
-        "ownerLocationLoadedRightAfter": true,
+        "ownerLocationLoadedRightAfter": false,
         "disposeHookProbe": {
           "ranInWindow": false,
           "secondsEvictToHook": null,
@@ -359,19 +376,19 @@
           "note": "probe lines are written by the plugin's dispose hook / exit matrix when they run (build 2026-11-23T16:5xZ+); none = neither ran inside this leg's window"
         },
         "controlB": {
-          "sid": "ses_df457269effes7iAPWRTSJ2FgY",
-          "marker": "B-D1mwu5jcdg",
+          "sid": "ses_df0c67d0dffef7e12ADXKJ7Y3x",
+          "marker": "B-D1mwv55cxz",
           "jobIds": [
-            "j-20261124-034554-vs5wv8"
+            "j-20261124-202241-y43w62"
           ],
           "procsAtStart": 2,
           "settle": "ran-to-end"
         },
         "controlC": {
-          "sid": "ses_df4575d94ffe0YvlrBn4DQfzuK",
-          "marker": "C-D1mwu5jcdg",
+          "sid": "ses_df0c6ae2cffecyLwMPcRJKlpdM",
+          "marker": "C-D1mwv55cxz",
           "jobIds": [
-            "j-20261124-034538-9lwlkf"
+            "j-20261124-202229-orjlsh"
           ],
           "procsAtStart": 2,
           "settle": "ran-to-end"
@@ -384,29 +401,48 @@
         "wakeCarriesCanary": true,
         "wakeHasFinalReport": true,
         "wakeScaffolding": false,
-        "wakeHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261124-034612-qn5i1g, child session ses_df456b96dffeZWdvXcl4gdB4KQ). Final report: CANARY-D1mwu5jcdg The dispatch is complete — read the report above; no polling, no re-dispatch needed.",
+        "wakeHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261124-202257-1zovtj, child session ses_df0c62d38ffemaH2ABm9M0ZuMY). Final report: CANARY-D1mwv55cxz The dispatch is complete — read the report above; no polling, no re-dispatch needed.",
         "journalFinalState": "terminal",
         "journalFinalOutcome": "completed",
-        "journalFinalReason": "CANARY-D1mwu5jcdg",
+        "journalFinalReason": "CANARY-D1mwv55cxz",
         "childProcsAtEnd": 0,
+        "childJobLiveBeforeEvict": true,
+        "secondsFromDetectionToEvict": 4,
         "F1_otherLocationTreeKilled": false,
-        "pass": false,
-        "inconclusive": "the evict did not kill the control process tree of the evicted location - the plugin dispose hook did not run inside the leg window (probe silent): no verdict on the dispatch exemption"
+        "hostContract": {
+          "evictAccepted": true,
+          "probeLive": true,
+          "controlsAliveRightAfter": true,
+          "controlsRanToEnd": true,
+          "disposeHookRan": false,
+          "dispatchUntouchedRightAfter": true,
+          "controlsStarted": [
+            "B",
+            "C"
+          ],
+          "ownerLocationLoadedRightAfter": false,
+          "ownerLocationLoadedAtEnd": true
+        },
+        "killedByEvict": {
+          "B": false,
+          "C": false
+        },
+        "pass": true
       }
     },
     {
       "id": "c5-standard",
       "title": "c5-standard: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T03:58:50.618Z · started 2026-11-24T03:49:29.142Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:35:16.715Z · started 2026-11-24T20:26:14.311Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\native-child-gate-e2e-final-standard-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:58:50.618Z",
-      "sha256": "0fd2e69ad09d9bc16dbd71e72f8771363b529572ce12e9f6cdce8c6a4b3e7c6c",
+      "mtime": "2026-11-24T20:35:16.715Z",
+      "sha256": "6bb712b8052c1168a1f6a957c269adaa385a83dded9e804501fb52d036e6e415",
       "readable": true,
-      "startedAt": "2026-11-24T03:49:29.142Z",
+      "startedAt": "2026-11-24T20:26:14.311Z",
       "startedKey": "started",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "e2e-c5-standard",
@@ -420,8 +456,8 @@
         "D": true
       },
       "hostCeiling": {
-        "recordedPid": 39988,
-        "runningPid": 39988,
+        "recordedPid": 46588,
+        "runningPid": 46588,
         "hostCeilingMs": 900000,
         "driverCeilingMs": 900000,
         "productionDefaultMs": 900000
@@ -431,15 +467,15 @@
       "id": "c5-ceiling-C",
       "title": "c5-ceiling-C: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T04:09:57.537Z · started 2026-11-24T04:05:08.040Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:47:35.613Z · started 2026-11-24T20:43:01.828Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\native-child-gate-e2e-final-C-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:09:57.537Z",
-      "sha256": "1a3583b2ce2d12397c6269849e718d7ea7260ab8daa2199405fb7c8c620d185e",
+      "mtime": "2026-11-24T20:47:35.613Z",
+      "sha256": "7fe6724bd6cde9dd0f84dae3f80a63d706cf75a08e0085b48e92dd5e742e3b32",
       "readable": true,
-      "startedAt": "2026-11-24T04:05:08.040Z",
+      "startedAt": "2026-11-24T20:43:01.828Z",
       "startedKey": "started",
-      "hostPid": 48740
+      "hostPid": 46308
     },
     {
       "id": "e2e-c5-ceiling-C",
@@ -447,193 +483,382 @@
       "status": "PASS",
       "detail": "leg C · ceiling 240000ms",
       "hostCeiling": {
-        "recordedPid": 48740,
-        "runningPid": 48740,
+        "recordedPid": 46308,
+        "runningPid": 46308,
         "hostCeilingMs": 240000,
         "driverCeilingMs": 240000,
         "productionDefaultMs": 900000
       },
       "result": {
         "armAttempts": 1,
-        "armMs": 28741,
+        "armMs": 13670,
         "armSteps": 2,
         "ceilingMs": 240000,
-        "stepBoundMs": 28444,
-        "armDecision": "04:05:37 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+        "stepBoundMs": 20000,
+        "armDecision": "20:43:16 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
         "preCeilingIdleEdges": [
           {
-            "atMs": 10619,
-            "tookMs": 9091,
-            "ruling": "04:05:48 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 6099,
+            "tookMs": 4561,
+            "ruling": "20:43:22 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 2
           },
           {
-            "atMs": 20747,
-            "tookMs": 9093,
-            "ruling": "04:05:58 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 9683,
+            "tookMs": 1534,
+            "ruling": "20:43:25 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 3
           },
           {
-            "atMs": 33887,
-            "tookMs": 12113,
-            "ruling": "04:06:11 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 13267,
+            "tookMs": 1535,
+            "ruling": "20:43:29 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 4
           },
           {
-            "atMs": 45040,
-            "tookMs": 9091,
-            "ruling": "04:06:22 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 19359,
+            "tookMs": 4556,
+            "ruling": "20:43:35 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 5
           },
           {
-            "atMs": 53149,
-            "tookMs": 6072,
-            "ruling": "04:06:30 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 22928,
+            "tookMs": 1542,
+            "ruling": "20:43:39 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 6
           },
           {
-            "atMs": 63267,
-            "tookMs": 9090,
-            "ruling": "04:06:40 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 29032,
+            "tookMs": 4562,
+            "ruling": "20:43:45 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 7
           },
           {
-            "atMs": 69363,
-            "tookMs": 4554,
-            "ruling": "04:06:47 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 32618,
+            "tookMs": 1535,
+            "ruling": "20:43:48 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 8
           },
           {
-            "atMs": 76965,
-            "tookMs": 6064,
-            "ruling": "04:06:54 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 36197,
+            "tookMs": 1545,
+            "ruling": "20:43:52 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 9
           },
           {
-            "atMs": 84569,
-            "tookMs": 6067,
-            "ruling": "04:07:02 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 42295,
+            "tookMs": 4561,
+            "ruling": "20:43:58 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 10
           },
           {
-            "atMs": 91176,
-            "tookMs": 4555,
-            "ruling": "04:07:08 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 45874,
+            "tookMs": 1535,
+            "ruling": "20:44:02 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 11
           },
           {
-            "atMs": 95254,
-            "tookMs": 3044,
-            "ruling": "04:07:12 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 51957,
+            "tookMs": 4555,
+            "ruling": "20:44:08 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 12
           },
           {
-            "atMs": 103367,
-            "tookMs": 6063,
-            "ruling": "04:07:20 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 58062,
+            "tookMs": 4566,
+            "ruling": "20:44:14 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 13
           },
           {
-            "atMs": 109983,
-            "tookMs": 4564,
-            "ruling": "04:07:27 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 64167,
+            "tookMs": 4559,
+            "ruling": "20:44:20 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 14
           },
           {
-            "atMs": 113549,
-            "tookMs": 3053,
-            "ruling": "04:07:31 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 68248,
+            "tookMs": 3052,
+            "ruling": "20:44:24 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 15
           },
           {
-            "atMs": 119649,
-            "tookMs": 4559,
-            "ruling": "04:07:37 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 74867,
+            "tookMs": 4563,
+            "ruling": "20:44:30 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 16
           },
           {
-            "atMs": 127265,
-            "tookMs": 6076,
-            "ruling": "04:07:45 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 78462,
+            "tookMs": 1538,
+            "ruling": "20:44:34 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 17
           },
           {
-            "atMs": 131857,
-            "tookMs": 3052,
-            "ruling": "04:07:49 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 83052,
+            "tookMs": 3051,
+            "ruling": "20:44:39 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 18
           },
           {
-            "atMs": 140970,
-            "tookMs": 7584,
-            "ruling": "04:07:58 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 86652,
+            "tookMs": 1543,
+            "ruling": "20:44:42 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 19
           },
           {
-            "atMs": 149578,
-            "tookMs": 7582,
-            "ruling": "04:08:07 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 90243,
+            "tookMs": 1539,
+            "ruling": "20:44:46 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 20
           },
           {
-            "atMs": 159219,
-            "tookMs": 7583,
-            "ruling": "04:08:16 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 93832,
+            "tookMs": 1538,
+            "ruling": "20:44:50 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 21
           },
           {
-            "atMs": 169865,
-            "tookMs": 9103,
-            "ruling": "04:08:27 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 97409,
+            "tookMs": 1539,
+            "ruling": "20:44:53 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 22
           },
           {
-            "atMs": 179015,
-            "tookMs": 7606,
-            "ruling": "04:08:36 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 101012,
+            "tookMs": 1545,
+            "ruling": "20:44:57 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 23
           },
           {
-            "atMs": 193673,
-            "tookMs": 13629,
-            "ruling": "04:08:51 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 104611,
+            "tookMs": 1543,
+            "ruling": "20:45:00 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 24
           },
           {
-            "atMs": 207328,
-            "tookMs": 12115,
-            "ruling": "04:09:05 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA",
+            "atMs": 108218,
+            "tookMs": 1549,
+            "ruling": "20:45:04 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
             "briefs": 0,
             "engineSuppressedEdges": 25
+          },
+          {
+            "atMs": 112298,
+            "tookMs": 3053,
+            "ruling": "20:45:08 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 26
+          },
+          {
+            "atMs": 115904,
+            "tookMs": 1550,
+            "ruling": "20:45:12 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 27
+          },
+          {
+            "atMs": 119505,
+            "tookMs": 1546,
+            "ruling": "20:45:16 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 28
+          },
+          {
+            "atMs": 123118,
+            "tookMs": 1555,
+            "ruling": "20:45:19 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 29
+          },
+          {
+            "atMs": 129217,
+            "tookMs": 4567,
+            "ruling": "20:45:25 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 30
+          },
+          {
+            "atMs": 132801,
+            "tookMs": 1541,
+            "ruling": "20:45:29 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 31
+          },
+          {
+            "atMs": 137398,
+            "tookMs": 3054,
+            "ruling": "20:45:33 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 32
+          },
+          {
+            "atMs": 140973,
+            "tookMs": 1539,
+            "ruling": "20:45:37 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 33
+          },
+          {
+            "atMs": 144570,
+            "tookMs": 1540,
+            "ruling": "20:45:40 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 34
+          },
+          {
+            "atMs": 148670,
+            "tookMs": 3071,
+            "ruling": "20:45:44 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 35
+          },
+          {
+            "atMs": 152247,
+            "tookMs": 1542,
+            "ruling": "20:45:48 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 36
+          },
+          {
+            "atMs": 156326,
+            "tookMs": 3050,
+            "ruling": "20:45:52 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 37
+          },
+          {
+            "atMs": 160415,
+            "tookMs": 3063,
+            "ruling": "20:45:56 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 38
+          },
+          {
+            "atMs": 164006,
+            "tookMs": 1537,
+            "ruling": "20:46:00 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 39
+          },
+          {
+            "atMs": 167610,
+            "tookMs": 1548,
+            "ruling": "20:46:03 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 40
+          },
+          {
+            "atMs": 171196,
+            "tookMs": 1540,
+            "ruling": "20:46:07 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 41
+          },
+          {
+            "atMs": 174787,
+            "tookMs": 1541,
+            "ruling": "20:46:11 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 42
+          },
+          {
+            "atMs": 178376,
+            "tookMs": 1548,
+            "ruling": "20:46:14 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 43
+          },
+          {
+            "atMs": 181981,
+            "tookMs": 1550,
+            "ruling": "20:46:18 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 44
+          },
+          {
+            "atMs": 188119,
+            "tookMs": 4581,
+            "ruling": "20:46:24 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 45
+          },
+          {
+            "atMs": 191698,
+            "tookMs": 1546,
+            "ruling": "20:46:28 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 46
+          },
+          {
+            "atMs": 195789,
+            "tookMs": 3063,
+            "ruling": "20:46:31 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 47
+          },
+          {
+            "atMs": 199873,
+            "tookMs": 3061,
+            "ruling": "20:46:36 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 48
+          },
+          {
+            "atMs": 203955,
+            "tookMs": 3055,
+            "ruling": "20:46:40 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 49
+          },
+          {
+            "atMs": 207566,
+            "tookMs": 1549,
+            "ruling": "20:46:43 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 50
+          },
+          {
+            "atMs": 211162,
+            "tookMs": 1553,
+            "ruling": "20:46:47 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 51
+          },
+          {
+            "atMs": 214750,
+            "tookMs": 1562,
+            "ruling": "20:46:51 crew skip: native child in flight session=ses_df0b3cc9bffeqLovFd84UfjXpw",
+            "briefs": 0,
+            "engineSuppressedEdges": 52
           }
         ],
         "abandonedNudge": null,
         "briefsBeforeCeiling": 0,
         "driverEdgesAfterCeiling": 0,
-        "briefAfterCeilingMs": 3776,
+        "briefAfterCeilingMs": 3090,
         "childStillBusyAtBrief": true,
         "briefsAfterCeiling": 1,
         "disclosuresThisRun": 1,
@@ -642,7 +867,7 @@
         "engineCeilingAlreadyDisclosed": 0,
         "engineRecheckClear": 1,
         "engineRecheckLines": [
-          "04:09:40 crew native-child recheck clear session=ses_df4456696ffe0MipTvbykDz7qA inFlight=1 ceiling=expired"
+          "20:47:18 crew native-child recheck clear session=ses_df0b3cc9bffeqLovFd84UfjXpw inFlight=1 ceiling=expired"
         ],
         "pass": true
       }
@@ -651,99 +876,135 @@
       "id": "crew-full",
       "title": "crew-full: measured on THIS build (file and in-file start time both later than dist)",
       "status": "PASS",
-      "detail": "file 2026-11-24T04:17:06.396Z · startedAt 2026-11-24T04:10:01.311Z · dist 2026-11-24T03:18:19.155Z",
+      "detail": "file 2026-11-24T20:54:33.486Z · startedAt 2026-11-24T20:47:39.464Z · dist 2026-11-24T18:43:34.008Z",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\crew-full-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:17:06.396Z",
-      "sha256": "4014c72e8a653dcca8a604c926c11a0cf0b20a9545435cd1d44be74edc1dcc59",
+      "mtime": "2026-11-24T20:54:33.486Z",
+      "sha256": "7538d6affccb724e12b9c2e1a607dc31ad3cbaa9f5e1c71e02649fb22ce6f71e",
       "readable": true,
-      "startedAt": "2026-11-24T04:10:01.311Z",
+      "startedAt": "2026-11-24T20:47:39.464Z",
       "startedKey": "startedAt",
-      "hostPid": 45700
+      "hostPid": 29028
     },
     {
       "id": "e2e-crew-full",
       "title": "complete crew: begin → waves → verdicts → crew_close on the live host",
       "status": "PASS",
-      "detail": "16/16 checks · closed after 400s · sections [\"registered (pending)\",\"armed (waves)\",\"closed\"]",
+      "detail": "16/16 checks · closed after 389s · sections [\"registered (pending)\",\"armed (waves)\",\"closed\"]",
       "checksTotal": 16,
       "checksFailed": [],
       "knownDefects": [],
       "acceptedKnown": [],
       "sections": [
         {
-          "at": "2026-11-24T04:10:21.800Z",
+          "at": "2026-11-24T20:47:52.979Z",
           "title": "registered (pending)"
         },
         {
-          "at": "2026-11-24T04:10:21.804Z",
+          "at": "2026-11-24T20:47:52.983Z",
           "title": "armed (waves)"
         },
         {
-          "at": "2026-11-24T04:16:41.327Z",
+          "at": "2026-11-24T20:54:08.420Z",
           "title": "closed"
         }
       ],
-      "msToClose": 400023
+      "msToClose": 388964
     },
     {
       "id": "tui-headed",
-      "title": "headed TUI gate: every item observed in a real terminal on THIS build",
+      "title": "headed TUI gate: every required item observed in a real terminal on THIS build",
       "status": "PASS",
-      "detail": "9 items · checked 2026-11-24T05:04:30.272Z · host 2.4.0",
+      "detail": "13 items (all 13 required present) · checked 2026-11-24T22:28:29.514Z · host 2.4.0",
       "items": [
         {
           "id": "f-crew-close-abandon-dialog-visible-and-answerable-in-tui",
           "pass": true,
-          "note": "Session ses_df4385ed9ffeVhDRpeyace02uL in the real TUI (window 1; 'ws' was the host's last initialized directory). Crew 'headed tui gate crew 5h7z3g' registered PENDING through the API; then typed INTO THE TUI: \"call the crew close tool with abandon set to true and reason set to headed tui gate 0340. make exactly one code call…\". The TUI showed 'Permission required / Call tool crew_close' with 'Allow once' (highlighted) and 'Reject'. Ask watch f1: crew_close \"Abandon crew: headed tui gate crew 5h7z3g\" @2026-11-24T04:26:32.356Z. Answered IN THE TUI (Enter on 'Allow once'); the turn ended with 'ok'. Ground truth: crew record sections [registered (pending), abandoned]; the execute part's output: \"[forge:crew] Crew ABANDONED: headed tui gate crew 5h7z3g mode at abandon: pending reason: headed tui gate 0340 The sessi…\". Screenshot of the dialog: logs/tui-0340-f1-dialog.png (PrintWindow, 993x519)."
+          "note": "Session ses_df07c4309ffeoJe1wyMrhrUNA1 in the real TUI (window 1: hwnd 39259252, opencode.exe pid 47680, opened 21:43:58Z, closed 21:48:31Z; the session sat in 'ws' (at that time the host's last initialized directory)). Crew 'headed tui gate crew phgvbn' registered PENDING through the API; then typed INTO THE TUI, one key at a time in the background: \"call the crew close tool with abandon set to true and reason set to headed tui gate 0342. make exactly one code call…\". The dialog appeared in the session's own terminal window: 'Permission required', 'Call tool crew_close', with the options 'Allow once' (highlighted) and 'Reject' — the highlight was re-read from a zoom crop before Enter. Ask watch f1: crew_close \"Abandon crew: headed tui gate crew phgvbn\" @2026-11-24T21:44:37.834Z — listed by the session's OWN route (the request sat in the session's own pending table). Answered IN THE TUI (Enter on 'Allow once'); the turn ended with 'ok'. Ground truth (logs/tui-postcheck-crew-f1a.json): crew record sections [registered (pending), abandoned]; the execute part's output: \"[forge:crew] Crew ABANDONED: headed tui gate crew phgvbn mode at abandon: pending reason: headed tui gate 0342 The sessi…\". Screenshot of the dialog: logs/tui-0342-f1-dialog.png (PrintWindow)."
         },
         {
           "id": "f-crew-close-report-dialog-reject-in-tui-keeps-the-crew",
           "pass": true,
-          "note": "Second crew 'headed tui gate crew two qkwcnl' registered PENDING in the SAME TUI session; the final-report close was typed into the TUI. crew_close \"Close crew: headed tui gate crew two qkwcnl\" @2026-11-24T04:28:57.481Z the dialog 'Permission required / Call tool crew_close' appeared; REJECTED in the TUI (Right + Enter on 'Reject'; the option was re-read from a zoom crop before Enter). Ground truth right after (logs/tui-postcheck-crew-f2rej.json): crew record sections [registered (pending)] — the crew stayed unclosed; the model's execute part returned the literal 'Tool.Error' and the model's reply said so (the host's code-tool bridge swallows the tool error text — known upstream behaviour, not a plugin defect). The dialog was seen on the driver's screenshot; no PrintWindow file was taken for this one."
+          "note": "Second crew 'headed tui gate crew two 8utgnv' registered PENDING in the SAME TUI session; the final-report close was typed into the TUI. crew_close \"Close crew: headed tui gate crew two 8utgnv\" @2026-11-24T21:46:30.078Z — the dialog appeared again in the same window ('Call tool crew_close'); after Right the highlight sat on 'Reject' (re-read from a zoom crop right after Right and again right before Enter). REJECTED in the TUI (Right + Enter on 'Reject'). Ground truth right after (logs/tui-postcheck-crew-f2rej.json): crew record sections [registered (pending)] — the crew stayed unclosed; the model's execute part returned the literal 'Tool.Error' (what the code tool handed back after the rejection; observed the same on 0.34.0 and 0.34.1 — see scopeNotes). Screenshot of the dialog with 'Reject' highlighted: logs/tui-0342-f2-reject-dialog.png (PrintWindow)."
         },
         {
           "id": "f-crew-close-report-dialog-allow-in-tui-closes-the-crew",
           "pass": true,
-          "note": "The same close typed again into the TUI: crew_close \"Close crew: headed tui gate crew two qkwcnl\" @2026-11-24T04:30:56.343Z the dialog appeared AGAIN (a rejected ask opens nothing); answered IN THE TUI (Enter on 'Allow once'). Ground truth: crew record sections [registered (pending), closed], section '… — closed', 'subtasks: 1 (PASS 1, FAIL 0)'; the execute part's output: \"[forge:crew] Crew closed: headed tui gate crew two qkwcnl subtasks: 1 (PASS 1, FAIL 0) - tui gate subtask two …\"; the turn ended with 'ok'. Ask watch f1 for the whole first window: watch-start 2026-11-24T04:23:09.797Z, watch-end 2026-11-24T04:32:37.354Z, polls 1106, asks 3, poll-errors 0 — exactly the three crew_close dialogs above, nothing else. The dialog was seen on the driver's screenshot; no PrintWindow file was taken for this one."
+          "note": "The same close typed again into the TUI: crew_close \"Close crew: headed tui gate crew two 8utgnv\" @2026-11-24T21:47:50.048Z — the dialog appeared again in the same window (a rejected ask opens nothing); a zoom crop taken in the same driver step as the key press shows 'Allow once' highlighted — the dialog's default option, which the driver looked at only AFTER the Enter had been sent (see scopeNotes, instrument note h). Answered IN THE TUI (Enter on 'Allow once'). Ground truth: crew record sections [registered (pending), closed] — the record now carries a 'closed' section with 'subtasks: 1 (PASS 1, FAIL 0)'; the execute part's output: \"[forge:crew] Crew closed: headed tui gate crew two 8utgnv subtasks: 1 (PASS 1, FAIL 0) - tui gate subtask two …\"; the turn ended with 'ok'. Ask watch f1 for the whole first window: watch-start 2026-11-24T21:44:00.360Z, watch-end 2026-11-24T21:48:18.775Z, polls 504, asks 3, poll-errors 0 — exactly the three crew_close dialogs above, nothing else."
+        },
+        {
+          "id": "c2-plan-close-no-dialog",
+          "pass": true,
+          "note": "Session ses_df0775bd3ffeHCA2sMJgG1pqZG (window 2: hwnd 25430614, opencode.exe pid 8188, opened 21:49:41Z, closed 21:52:15Z; the session sat in 'ws'): the API had the plan approved and both tasks ticked; `plan_close` was then typed INTO THE TUI (one code call). On screen: the turn ran '+ 1 thought, 1 tool' and ended with 'ok' in 9.5 s; the screenshot taken 10 s after Enter (the turn already finished — too short for a mid-turn screenshot) shows no dialog. No permission dialog was raised — a `plan_close` is a plugin-verified completion gate, not a user-confirmation door (ask watch c2 for the whole window: 0 ask). Ground truth (logs/tui-postcheck-plan0341-close.json): plan status done, ticked 2/2, plan_close calls completed 1; the dated section '2026-11-24T21:50:13.224Z — closed' carries 2 check(s), 0 FAIL, reason line written by the plugin: true."
+        },
+        {
+          "id": "c2-plan-reopen-in-tui",
+          "pass": true,
+          "note": "In the SAME TUI session `plan_reopen` was typed (one code call; the reason was given in the typed line). On screen: the turn was captured twice, 4 s after Enter (still running, 'esc interrupt' in the status bar) and 17 s after Enter (finished in 6.1 s: '+ 1 thought, 1 tool', 'ok'); no dialog either time. plan_reopen is not a user-confirmation door — the ask watch c2 shows 0 ask(s) for the whole window. Ground truth (logs/tui-postcheck-plan0341-reopen.json): plan status approved; plan_reopen calls completed 1; the dated section '2026-11-24T21:50:48.471Z — reopened' was appended by the plugin; plan_close calls completed is still 1 (nothing was closed a second time)."
         },
         {
           "id": "c3-command-list",
           "pass": true,
-          "note": "Second TUI window on session ses_df42bf8a9ffe4EDL6j9dQiBtdG. Typed '/' → the command list opened (alphabetical, scrollable: /new, /terminal, /btv, /diff, /cd, /worktrees, /plan, /crew, /goal, /forge … — seen on screen when '/' was typed for this window's '/new' as well). Typed 'forge' → the list showed exactly /forge (highlighted, 'forge goal harness (autonomous, host-verified) …'), /plan, /crew, /goal; NO hyphenated forge-* command (no /forge-sync, /forge-init, /forge-cancel). Screenshot: logs/tui-0340-commands.png."
+          "note": "In window 2 (hwnd 25430614, opencode.exe pid 8188, opened 21:49:41Z, closed 21:52:15Z; the session sat in 'ws'), after the two plan turns: Typed '/' into the TUI: the command palette listed the host's commands (/agents, /auth, /automation, /otw, /cd, /clear, /compact, /connect, /continue, /copy, …). Typed 'forge' to filter: exactly four entries remained — /forge, /plan, /crew and /goal; there is no hyphenated forge-* command. Escape closed the palette and left '/forge' in the input box; six Backspaces removed it (zoom crop: only the cursor); nothing was submitted — the transcript's last user row is still the reopen line. Screenshot: logs/tui-0342-commands.png (PrintWindow)."
         },
         {
           "id": "c-forge-stop-cancels-in-flight-and-queued-in-tui",
           "pass": true,
-          "note": "Five background dispatches prepared through the API (children asleep 540 s): three in flight (journal j-20261124-043307-zp1i7s, j-20261124-043307-pgn1kb, j-20261124-043307-72fgk6, state 'started') and two STILL QUEUED (j-20261124-043307-42ggu2, j-20261124-043307-z4p302); the TUI status bar showed '↓ 3 subagents'. Typed '/forge stop' + Enter at 04:36:46Z (the input was re-read from a screenshot before Enter). The TUI showed three '[forge:dispatch-complete] … ABORTED … cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried' notices, the subagent count left the status bar, and the model's table: Q0–Q2 'aborted, confirmed by dispatch-complete notice', Q3–Q4 'cancelled while queued, never spawned'. Ground truth (logs/tui-postcheck-stop0340.json): exactly ONE forge_jobs {action:\"stop\"} call, completed; its receipt '[forge:job] Stopped 3 in-flight dispatch(es) of this session: - Cancelled j-… (agent forge-viewe2e-coder, child session ses_…) — cancelled by the user lever; never retried. the child session … is confirmed idle (the cancellation is REAL, not bookkeeping). …' AND '[forge:job] Cancelled 2 queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): …'. Journal: the three in flight dispatched→started→terminal, outcome aborted, reason 'cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried'; the two queued queued→terminal, outcome aborted, reason 'cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried'; 0 rows after terminal for all five; children 3 before / 3 after / 0 new / 0 busy (nothing spawned into the freed slots). Ask watch c3q: watch-start 2026-11-24T04:34:08.037Z, watch-end 2026-11-24T04:38:47.815Z, polls 546, asks 0, poll-errors 0 — no dialog. Screenshots: logs/tui-0340-stop.png, logs/tui-0340-stop-final.png."
+          "note": "Session ses_df073f832ffeHdEwF3ECa3b486 (window 3: hwnd 15013218, opencode.exe pid 28028, opened 21:54:00Z, closed 22:01:06Z; the '/forge stop' session and the '/new' anchor session both sat in 'ws'). Five background dispatches prepared through the API (children asleep 540 s): three in flight (journal j-20261124-215301-n57lnk, j-20261124-215301-lregnx, j-20261124-215301-6mhb1z) and two STILL QUEUED (j-20261124-215301-kyz1bl, j-20261124-215301-isielf). Typed '/forge stop' + Enter into the TUI (the input was re-read from a screenshot before Enter). On screen before Enter: the session's own table of the five workers (Q0-Q2 'Running' with task ids and child sessions, Q3 'Queued, position 1', Q4 'Queued, position 2'; status bar '3 subagents'). 11 s after Enter the three running workers read 'cancelled' and the turn was still running; the turn ended at 24.0 s: the three running workers 'Aborted by /forge stop, never retried', the two queued ones 'Removed from the queue before spawning', and the model's summary says it re-dispatched nothing; the input box came back and no dialog appeared at any point. Ground truth (logs/tui-postcheck-stop0340.json): exactly ONE forge_jobs {action:\"stop\"} call, completed; its receipt names BOTH groups (the three in flight and the two queued wishes); journal: the three in flight dispatched→started→terminal, outcome aborted with the lever sentence; the two queued queued→terminal with the queued sentence; 0 rows after terminal for all five; children 3 before / 3 after / 0 new / 0 busy. Ask watch c3q: watch-start 2026-11-24T21:54:02.553Z, watch-end 2026-11-24T21:55:24.661Z, polls 160, asks 0, poll-errors 0 — no dialog. The turn in progress was captured on the driver's screenshots only (11 s after Enter); the PrintWindow file was taken after the turn: logs/tui-0342-stop-final.png. Late check at 2026-11-24T22:22:50.234Z (logs/tui-0342-stoplate.txt): every tool part this session holds since its preparation is still the single stop call, as in the fact file — true; no permission request pending and the session not busy — true."
         },
         {
           "id": "a-session-anchor-holds-after-a-third-directory-in-tui",
           "pass": true,
-          "note": "API activated a brand-new third directory (ws-md-tui-g7qmvm) at 2026-11-24T04:40:33.413Z: plugin load lines since the host boot 2 -> 3, that line being the host's last one; loaded directories = ws + the third. In the real TUI: '/new' (the session ses_df41d5f21ffeTZZkc449EVkl5j was created BY THE TUI at 2026-11-24T04:48:51.431Z; host record directory …\\view-e2e\\ws). The forge_shell 'cd' prompt was typed twice (04:48:51Z and 04:49:57Z): each turn = ONE code call, code exactly 'await tools.forge_shell({command: \"cd\"})', completed, error=false, output '[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws jobId: …'; the assistant line was the canary each time ('tui anchor one ok g7qmvm', 'tui anchor two ok g7qmvm'). No dialog on screen. Plugin load lines after both turns: still 3, last one still 2026-11-24T04:40:33.413Z (the third directory stayed the latest initialization). Ask watch a0340: watch-start 2026-11-24T04:49:37.289Z, watch-end 2026-11-24T04:50:58.308Z, polls 153, asks 0, poll-errors 0 — it covers the second turn; the first turn ran without an API-side watcher because a '/new' session only exists on the host once its first prompt is submitted (the watcher was attached 46 s after the session appeared, before the second submit) — its evidence is the screen + transcript. DRIVER NOTE: a first '/new' session (ses_df4233b9effe5NLVCbTEOgweGu) was abandoned: the prompt said \"the call is the forge shell tool with the command cd\" and the model wrote a lookup for a non-existent sub-tool (tools[\"forge_shell\"].shell) instead of calling forge_shell — a prompt-wording mistake of the test driver, not plugin behaviour; its record is kept in logs/tui-postcheck-anchor-x1.json. Details: logs/tui-postcheck-anchor-a0340.json. Screenshot: logs/tui-0340-anchor.png."
+          "note": "API activated a brand-new third directory (ws-md-tui-8d6snz) at 2026-11-24T21:55:25.751Z: plugin load lines since the host boot 2 -> 3, that line being the host's last one; loaded directories = ws + the third. In the real TUI (window 3): In the same window '/new' opened a fresh, empty tab (the host creates the session only when the first message is sent). Typed into that tab: the session ses_df06dd005ffePfpJP49hzsdMkO was created BY THE TUI at 2026-11-24T21:59:28.518Z when that first line was sent (no parent session; host record directory C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws). The anchor prompt was typed into that tab twice, the second time with 'two' in place of 'one'. On screen: turn one '+ 1 thought, 1 tool' and the reply 'tui anchor one ok 0342' (12.2 s); turn two '+ 1 tool' and the reply 'tui anchor two ok 0342' (10.0 s), also captured while running ('esc interrupt'); no dialog at any point. Ground truth (logs/tui-postcheck-anchor-a0343.json): exactly two execute parts since the activation, both completed without error, code exactly 'return await tools.forge_shell({ command: \"cd\" });'; each output carries one cwd line, both C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws — ws, not the third directory (ws-md-tui-8d6snz); plugin load lines after both turns: still 3, last one still 2026-11-24T21:55:25.751Z (the third directory stayed the latest initialization). Ask watch a0343: watch-start 2026-11-24T21:59:31.623Z, watch-end 2026-11-24T22:00:55.738Z, polls 154, asks 0, poll-errors 0 — no dialog. Screenshot after the second turn: logs/tui-0342-anchor-final.png (PrintWindow). The prompt of this item differs from the 0.34.1 one by one sentence that spells the tool's name in words (see scopeNotes)."
+        },
+        {
+          "id": "md-ask-door-dialog-visible-and-answerable-in-a-non-last-directory-tui",
+          "pass": true,
+          "note": "Session ses_df06a1a57ffeTNSIinKdSbqnuo in the real TUI (window 4: hwnd 13113126, opencode.exe pid 37132, opened 22:04:46Z, closed 22:08:51Z; the session sat in 'ws'), its directory ws, while ANOTHER directory (ws-md-tui-8d6snz) was the host's last-initialized one (boot order since the host's start, at the observer's start: last = that directory; boot changes during the window: 0). Crew 'headed tui gate crew 1mllrt' registered PENDING; the abandon prompt typed INTO THE TUI. Both dialogs appeared in the session's own terminal window ('Permission required', 'Call tool crew_close', 'Tool: crew_close'): the first with 'Allow once' highlighted (re-read from a zoom crop before the PrintWindow and again right before Enter); the second re-read twice from a zoom crop with 'Reject' highlighted after Right, before Enter. The first dialog stayed up while the turn waited for the answer (the turn took 47.9 s, about 40 of them waiting) and the call ran only after it ('+ 1 thought, 1 tool' → 'ok'); after the second answer the dialog was gone ('+ 2 thoughts, 1 tool', 38.9 s) and the model's reply says that the call returned a bare Tool.Error and that it made no further call. In both cases the input box came back and no new dialog appeared. The observer (logs/tui-mdwatch-mdg.jsonl: every 500 ms the session's OWN pending list, every 2 s every OTHER loaded directory's table) saw the request in the session's OWN list at 2026-11-24T22:05:17.591Z and in NO other directory's table (0; other loaded directories whose tables were read: 1). Answered IN THE TUI (Enter on 'Allow once') at 22:05:57.555Z: the request left the session's own list at 2026-11-24T22:05:57.922Z; the host logged no reply line for this session — it does not log a successful reply, it logs a 404 (0 reply lines for this session, 0 of them 404); the turn ended with 'ok' and the call EXECUTED only after that answer — crew record sections [registered (pending), abandoned]; the execute part's output: \"[forge:crew] Crew ABANDONED: headed tui gate crew 1mllrt mode at abandon: pending reason: headed tui gate 0342…\". Ask watch mdg (the session's own route): crew_close \"Abandon crew: headed tui gate crew 1mllrt\" @2026-11-24T22:05:17.935Z. Ground truth: logs/tui-postcheck-md-mdg1.json, logs/tui-postcheck-crew-mdg1.json. Screenshot of the dialog: logs/tui-0342-md-dialog.png (PrintWindow). On the pre-fix build (0.34.0, measured 2026-11-24) the same geometry showed the dialog but the terminal's answer got a 404 and the gate waited out its 300 s watchdog."
+        },
+        {
+          "id": "md-ask-door-dialog-reject-in-a-non-last-directory-tui-keeps-the-crew",
+          "pass": true,
+          "note": "Second crew 'headed tui gate crew two l95v9a' registered PENDING in the SAME TUI session, still with the other directory as the host's last-initialized one; the final-report close was typed into the TUI. The dialog appeared; REJECTED in the TUI (Right + Enter on 'Reject'). The observer saw the request in the session's own list at 2026-11-24T22:07:46.317Z and nowhere else; it left that list at 2026-11-24T22:08:14.179Z, right after the terminal's answer (Enter at 22:08:14.040Z); the host logged no reply line for this session (0 reply lines, of them 404: 0); the ask watch mdg's second ask: crew_close \"Close crew: headed tui gate crew two l95v9a\" @2026-11-24T22:07:46.490Z. Screenshot of the dialog with 'Reject' highlighted: logs/tui-0342-md-reject-dialog.png (PrintWindow). Ground truth right after (logs/tui-postcheck-crew-mdg2.json): crew record sections [registered (pending)] — the crew stayed unclosed; the model's execute part returned the literal 'Tool.Error'. Observer for the whole window: start 2026-11-24T22:04:49.152Z, end 2026-11-24T22:09:05.755Z, polls 497, own-list asks 2, other-table asks 0, poll-errors 0."
         },
         {
           "id": "e-stale-progress-notice-is-not-delivered-in-tui",
           "pass": true,
-          "note": "Host restarted with the shortened notice interval (15000 ms). The API delivered the exact code as an INSTRUCTION and the model only acknowledged (\"ready\", no tool call). In the real TUI (window 3) ONE short line was typed + Enter: \"do it now. make exactly one code call with the code from my first message.\". The turn = ONE code call: one background worker (25 s sleep) + five ~12 s forge_shell calls that keep the owner busy. Timeline (ground truth, logs/tui-postcheck-stale0340.json): typed 04:54:34.696, dispatch 04:54:50.124, child terminal 04:55:35.494, turn end 04:56:13.633 (busy 98937 ms), wake 04:56:13.647. Journal j-20261124-045450-a9waeo: dispatched→started→terminal, outcome completed. User-role rows after the typed line: 1; '[forge:dispatch-progress] … is still running' notices delivered: 0 (the worker finished inside the busy window, so the notice generated at the first interval would have been stale at delivery time); completion wake delivered: 1, its 'Final report:' block free of a progress notice: true. Ask watch e1: watch-start 2026-11-24T04:53:27.391Z, watch-end 2026-11-24T04:57:35.827Z, polls 453, asks 0, poll-errors 0. DRIVER NOTE: the first run of tui-postcheck-stale0340.mjs mis-parsed the journal's epoch-millisecond timestamps as date strings, so its two timing-premise checks came out FAIL with null times while the eight behaviour checks passed; the script was made number-aware and re-run on the same transcript and journal (logs/tui-postcheck-stale0340.txt) — no product change was involved. Screenshot: logs/tui-0340-stale.png."
+          "note": "Host with the shortened notice interval (15000 ms; sandbox host pid 26680). The API delivered the exact code as an INSTRUCTION and the model only acknowledged. In the real TUI (hwnd 48106620, opencode.exe pid 42612, opened 21:31:14Z, closed 21:33:56Z; the session sat in 'ws') ONE short line was typed key by key + Enter: \"do it now. make exactly one code call with the code from my first message.\". The turn = ONE code call: one background worker (25 s) + five ~12 s forge_shell calls that keep the owner busy. Timeline (ground truth, logs/tui-postcheck-stale0340.json): typed 21:31:50.043, dispatch 21:32:04.243, child terminal 21:32:48.573, turn end 21:33:20.566 (busy 90523 ms), wake 21:33:20.576. Journal j-20261124-213204-blln36: dispatched→started→terminal, outcome completed. User-role rows after the typed line: 1; '[forge:dispatch-progress] … is still running' notices delivered: 0; completion wake delivered: 1, its 'Final report:' block free of a progress notice: true. On screen (driver observations recorded in the ledger as 11 s, 55 s and 100 s after Enter): 11 s after Enter 'Thinking' with 'esc interrupt' in the status bar; 55 s after Enter '+ 1 thought, 3 tools' with the status line 'Forge-Viewe2e-Coder finished' while 'esc interrupt' was still shown; 100 s after Enter the code turn was over ('ok'), exactly ONE injected message ('[forge:dispatch-complete] … Final report: CANARY-SPtui-v2w48j') followed by the model's reply without any tool call, and the input box was back. No '[forge:dispatch-progress] … is still running' line was visible and no dialog appeared; rows scrolled out of view are covered by the transcript ground truth. PrintWindow files written during the turn (file times): logs/tui-0342-stale-a.png (21:31:59Z), -b.png (21:32:43Z), -c.png (21:33:41Z)."
         },
         {
           "id": "tui-no-unexpected-permission-asks",
           "pass": true,
-          "note": "Ask watch f1 (ses_df4385ed9ffeVhDRpeyace02uL): watch-start 2026-11-24T04:23:09.797Z, watch-end 2026-11-24T04:32:37.354Z, polls 1106, asks 3, poll-errors 0 — all three are the crew_close dialogs that were answered in the TUI (F). Ask watch c3q (ses_df42bf8a9ffe4EDL6j9dQiBtdG): watch-start 2026-11-24T04:34:08.037Z, watch-end 2026-11-24T04:38:47.815Z, polls 546, asks 0, poll-errors 0. Ask watch a0340 (ses_df41d5f21ffeTZZkc449EVkl5j): watch-start 2026-11-24T04:49:37.289Z, watch-end 2026-11-24T04:50:58.308Z, polls 153, asks 0, poll-errors 0. Ask watch e1 (ses_df4197721ffe7aeO12GmryXgK9): watch-start 2026-11-24T04:53:27.391Z, watch-end 2026-11-24T04:57:35.827Z, polls 453, asks 0, poll-errors 0. Files: logs/tui-asks-f1.jsonl, logs/tui-asks-c3q.jsonl, logs/tui-asks-a0340.jsonl, logs/tui-asks-e1.jsonl."
+          "note": "Ask watch e1 (ses_df087e994ffeK1AN6yR52YIl7s): watch-start 2026-11-24T21:31:16.813Z, watch-end 2026-11-24T21:33:41.544Z, polls 249, asks 0, poll-errors 0. Ask watch f1 (ses_df07c4309ffeoJe1wyMrhrUNA1): watch-start 2026-11-24T21:44:00.360Z, watch-end 2026-11-24T21:48:18.775Z, polls 504, asks 3, poll-errors 0 — all three are the crew_close dialogs answered in the TUI (F). Ask watch c2 (ses_df0775bd3ffeHCA2sMJgG1pqZG): watch-start 2026-11-24T21:49:43.704Z, watch-end 2026-11-24T21:52:05.280Z, polls 276, asks 0, poll-errors 0. Ask watch c3q (ses_df073f832ffeHdEwF3ECa3b486): watch-start 2026-11-24T21:54:02.553Z, watch-end 2026-11-24T21:55:24.661Z, polls 160, asks 0, poll-errors 0. Ask watch a0343 (ses_df06dd005ffePfpJP49hzsdMkO): watch-start 2026-11-24T21:59:31.623Z, watch-end 2026-11-24T22:00:55.738Z, polls 154, asks 0, poll-errors 0. Ask watch a0342, the voided first anchor session (ses_df07078a1ffeXwFaQRKPBNYGMM): watch-start 2026-11-24T21:56:37.390Z, watch-end 2026-11-24T21:58:44.102Z, polls 247, asks 0, poll-errors 0. Ask watch mdg (ses_df06a1a57ffeTNSIinKdSbqnuo): watch-start 2026-11-24T22:04:48.694Z, watch-end 2026-11-24T22:09:06.441Z, polls 503, asks 2, poll-errors 0 — the two crew_close dialogs of the md items; the md observer (logs/tui-mdwatch-mdg.jsonl) additionally watched every OTHER loaded directory's table: 0 request of this session there (geometry held for the whole window: true). Ask watch e1 of the voided first stale window: watch-start 2026-11-24T21:27:29.907Z, watch-end 2026-11-24T21:30:42.611Z, polls 376, asks 0, poll-errors 0. Apart from the five dialogs named in items 1, 2, 3, 9 and 10, no permission ask was raised in any gated session or voided attempt. Files: logs/tui-asks-e1.jsonl, logs/tui-asks-f1.jsonl, logs/tui-asks-c2.jsonl, logs/tui-asks-c3q.jsonl, logs/tui-asks-a0343.jsonl, logs/tui-asks-a0342.jsonl, logs/tui-asks-mdg.jsonl, logs/tui-mdwatch-mdg.jsonl, logs/tui-0342-discarded-stale-1/tui-asks-e1.jsonl. A watcher ends before its window closes, so a request raised afterwards would have been watched by nobody; nothing was typed into any window after its watcher had ended, and a late check at 2026-11-24T22:23:18.756Z (logs/tui-0342-late.txt) asked the host directly for all 8 sessions of the gate: none is busy and none has a permission request pending (pending 0, busy 0). That file also lists each session's tool-part count (voided-stale 0, stale 1, window1 5, window2 5, stop 2, voided-anchor 1, anchor 2, window4 4; every session also holds the API-driven preparation turns of its item)."
         },
         {
           "id": "tui-windows-closed-cleanly",
           "pass": true,
-          "note": "Window 1 (pid 45940, hwnd 0x8513ac) and window 2 (pid 42352, hwnd 0x91153a) were closed through their own Close button (driver UIA click); the session-owning opencode.exe processes and their conhost.exe parents were gone right after (tui-windows.ps1 listed no window for the session id; Get-Process found neither pid). Window 3 (pid 45236, hwnd 0x19e0c7a) was closed the same way after the stale-notice item; its opencode.exe process and its conhost.exe parent (pid 43180) were gone right after (Get-Process found neither pid). At every close the TUI showed its session idle (turn finished, no 'esc interrupt', nothing running). Sandbox dispatch journal, ids created since the gate began (04:19Z): 6, ending in a terminal row: 6 (terminal/aborted ×5, terminal/completed ×1)."
+          "note": "All five TUI windows were closed by the driver's UIA click on each window's own Close button (background delivery, never a process kill), each time with the last turn finished (no 'esc interrupt') and the input box empty: the stale-notice window at 21:33:56Z, window 1 at 21:48:31Z, window 2 at 21:52:15Z, window 3 at 22:01:06Z, window 4 at 22:08:51Z. Right after the close of windows 1, 3 and 4 the read-only probe tui-windows.ps1 printed nothing for the closed session and no sandbox TUI client process was left (recorded in the ledger with each of those windows); no check was taken right after window 2 was closed, so that window rests on the end-of-gate probe: tui-windows.ps1 found no window or launcher process for any session of this gate, 8 sessions, the two voided attempts included (logs/tui-0342-windows.txt), and no watcher, observer, preparation or post-check process and no sandbox TUI client was left (logs/tui-0342-procs.txt). The window of the voided stale attempt was closed the same way at 21:30:25Z. Process counts at 2026-11-24T22:14:52.321Z: tui-askwatch 0, tui-mdwatch 0, tui-findwatch 0, tui-open0340 0, launch-detached 0, tui-prep 0, tui-postcheck 0, tui-stopwatch 0, tui-mdstop 0, sandbox-tui-clients 0. Window counts at 2026-11-24T22:14:57.291Z: 8 sessions, all 0. Sandbox dispatch journal, ids created since the gate began (2026-11-24T21:26:38.200Z): 6, ending in a terminal row: 6 (terminal/completed ×1, terminal/aborted ×5)."
         }
       ],
-      "checkedAt": "2026-11-24T05:04:30.272Z",
+      "requiredItems": [
+        "f-crew-close-abandon-dialog-visible-and-answerable-in-tui",
+        "f-crew-close-report-dialog-reject-in-tui-keeps-the-crew",
+        "f-crew-close-report-dialog-allow-in-tui-closes-the-crew",
+        "c2-plan-close-no-dialog",
+        "c2-plan-reopen-in-tui",
+        "c3-command-list",
+        "c-forge-stop-cancels-in-flight-and-queued-in-tui",
+        "a-session-anchor-holds-after-a-third-directory-in-tui",
+        "md-ask-door-dialog-visible-and-answerable-in-a-non-last-directory-tui",
+        "md-ask-door-dialog-reject-in-a-non-last-directory-tui-keeps-the-crew",
+        "e-stale-progress-notice-is-not-delivered-in-tui",
+        "tui-no-unexpected-permission-asks",
+        "tui-windows-closed-cleanly"
+      ],
+      "missingItems": [],
+      "checkedAt": "2026-11-24T22:28:29.514Z",
       "hostVersion": "2.4.0",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\tui-gate.json",
       "exists": true,
-      "mtime": "2026-11-24T05:04:30.273Z",
-      "sha256": "7aa4f0b235444243ead8ec33d41426f05f50fcb756c9dbc3008419b0897a2783"
+      "mtime": "2026-11-24T22:28:29.518Z",
+      "sha256": "0b390de7f435c78dfbccd90be7e643dbf48b548ac407aa62a5bb9fd93c811dc1"
     },
     {
       "id": "live-typecheck",
@@ -756,10 +1017,10 @@
       "id": "live-unit-suite",
       "title": "full unit suite (measured now; floor 1001 tests)",
       "status": "PASS",
-      "detail": "1047/1047 pass",
+      "detail": "1068/1068 pass",
       "counts": {
-        "tests": 1047,
-        "pass": 1047,
+        "tests": 1068,
+        "pass": 1068,
         "fail": 0,
         "cancelled": 0,
         "skipped": 0,
@@ -778,7 +1039,7 @@
       "id": "no-secret-in-evidence",
       "title": "no evidence file carries the sandbox host password",
       "status": "PASS",
-      "detail": "checked 13 files"
+      "detail": "checked 14 files"
     }
   ],
   "evidence": [
@@ -786,140 +1047,151 @@
       "id": "c3-command-stop",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\command-stop-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:42:40.159Z",
-      "sha256": "72df4ca959ea7f0306a514450efbf71b4547e88015db7faac7694da5a3218729",
+      "mtime": "2026-11-24T20:20:55.406Z",
+      "sha256": "08bc1b809879c16571da241674a2e2a9a0956c428d3a231eba46290f20a2611e",
       "readable": true,
-      "startedAt": "2026-11-24T03:37:17.418Z",
+      "startedAt": "2026-11-24T20:16:05.542Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "c4-pin-variant",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\pin-variant-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:35:07.534Z",
-      "sha256": "071087a88aaaf83b3ebd55249f002279535919de6368397e2794319fb901ef07",
+      "mtime": "2026-11-24T20:14:37.789Z",
+      "sha256": "928240ab8dac98e17565402591b590294f8f3cffb8dd18a2a9d678e32b156528",
       "readable": true,
-      "startedAt": "2026-11-24T03:33:38.443Z",
+      "startedAt": "2026-11-24T20:13:37.005Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "c2-plan-close",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\plan-close-headless-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:37:17.195Z",
-      "sha256": "9b0f228655e562331371a79f44a12099538502f0ae5290d0abeca980bebc28f2",
+      "mtime": "2026-11-24T20:16:05.337Z",
+      "sha256": "175bec3d26d665b386343f13811a78ce16edb87a9adb783f5836f82caa6ed852",
       "readable": true,
-      "startedAt": "2026-11-24T03:35:07.747Z",
+      "startedAt": "2026-11-24T20:14:38.001Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "f-crew-close-door",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\crew-close-door-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:03:26.053Z",
-      "sha256": "373990a08652eea5bdace4f7380f188d96ac484de6399279a0a7091a1dd7d6e5",
+      "mtime": "2026-11-24T20:38:52.143Z",
+      "sha256": "fc071a2ba07e9b30ad35041405425fcc3f4456eea6f0522a03a81a2ff0dbb5d4",
       "readable": true,
-      "startedAt": "2026-11-24T04:00:45.449Z",
+      "startedAt": "2026-11-24T20:36:40.099Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "a-anchor-multidir",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\anchor-multidir-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:05:04.177Z",
-      "sha256": "960d15c01a26fa751516ba1397c21bb4638bb8e7289fe5448d88d7f0f59f1a04",
+      "mtime": "2026-11-24T20:40:12.520Z",
+      "sha256": "7b2a5eb6320a55963b08d1a945c8488fa12fb152ab2edde6193c585201ad93a3",
       "readable": true,
-      "startedAt": "2026-11-24T04:04:07.782Z",
+      "startedAt": "2026-11-24T20:39:37.860Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "b-spawn-error",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\spawn-error-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:04:07.583Z",
-      "sha256": "07e5843c6d3066872bcf1e7adac4cdf5cef592ef3456ab2220eb163c0302248a",
+      "mtime": "2026-11-24T20:39:37.654Z",
+      "sha256": "f9738a48d993470950b0a654ce9ac929b0bc409410ef333084834da71529c3b2",
       "readable": true,
-      "startedAt": "2026-11-24T04:03:26.261Z",
+      "startedAt": "2026-11-24T20:38:52.349Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "c-stop-queued",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\stop-queued-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:00:44.774Z",
-      "sha256": "9849fdd3c48d39a5cef6537584fd0f47a97f661c9a8bb093e7c62c9502ca3420",
+      "mtime": "2026-11-24T20:55:40.324Z",
+      "sha256": "a5be9f2640f6880fa60279e7911cbd0d9b3c11e3da77c9e9f3e905ce7a5da3bc",
       "readable": true,
-      "startedAt": "2026-11-24T03:58:50.925Z",
+      "startedAt": "2026-11-24T20:54:37.335Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 26680
     },
     {
       "id": "e-stale-progress",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\stale-progress-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:30:39.902Z",
-      "sha256": "12eaf2c6a0de409e02a9c6ad3c17550c384fc7444763bb54b350b399bf1e88fe",
+      "mtime": "2026-11-24T20:59:31.670Z",
+      "sha256": "12852c1bbbfbaaa048f56dc5d9f4e0da6897d8a167f189ab67da387c6ba17037",
       "readable": true,
-      "startedAt": "2026-11-24T03:25:22.511Z",
+      "startedAt": "2026-11-24T20:55:40.593Z",
       "startedKey": "startedAt",
-      "hostPid": 10032
+      "hostPid": 26680
+    },
+    {
+      "id": "md-ask-door-multidir",
+      "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\ask-door-multidir-e2e-verdict.json",
+      "exists": true,
+      "mtime": "2026-11-24T20:42:58.014Z",
+      "sha256": "16d2f3a3d7cbd70ce9541491e400506af2b28eb48371876986db7f3e6d03a7f1",
+      "readable": true,
+      "startedAt": "2026-11-24T20:40:12.751Z",
+      "startedKey": "startedAt",
+      "hostPid": 46588
     },
     {
       "id": "c1-dispose",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\dispose-e2e-K1-K2-D1-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:49:28.977Z",
-      "sha256": "25d5455023181c094112307699ba7d1ca6a7e61a6531413c11284a22c2e42d2d",
+      "mtime": "2026-11-24T20:26:14.141Z",
+      "sha256": "d2383daa173fbf895ca712cb51287438a2da8b2104b665b1314c917390aff140",
       "readable": true,
-      "startedAt": "2026-11-24T03:42:40.403Z",
+      "startedAt": "2026-11-24T20:20:55.629Z",
       "startedKey": "startedAt",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "c5-standard",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\native-child-gate-e2e-final-standard-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T03:58:50.618Z",
-      "sha256": "0fd2e69ad09d9bc16dbd71e72f8771363b529572ce12e9f6cdce8c6a4b3e7c6c",
+      "mtime": "2026-11-24T20:35:16.715Z",
+      "sha256": "6bb712b8052c1168a1f6a957c269adaa385a83dded9e804501fb52d036e6e415",
       "readable": true,
-      "startedAt": "2026-11-24T03:49:29.142Z",
+      "startedAt": "2026-11-24T20:26:14.311Z",
       "startedKey": "started",
-      "hostPid": 39988
+      "hostPid": 46588
     },
     {
       "id": "c5-ceiling-C",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\native-child-gate-e2e-final-C-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:09:57.537Z",
-      "sha256": "1a3583b2ce2d12397c6269849e718d7ea7260ab8daa2199405fb7c8c620d185e",
+      "mtime": "2026-11-24T20:47:35.613Z",
+      "sha256": "7fe6724bd6cde9dd0f84dae3f80a63d706cf75a08e0085b48e92dd5e742e3b32",
       "readable": true,
-      "startedAt": "2026-11-24T04:05:08.040Z",
+      "startedAt": "2026-11-24T20:43:01.828Z",
       "startedKey": "started",
-      "hostPid": 48740
+      "hostPid": 46308
     },
     {
       "id": "crew-full",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\crew-full-e2e-verdict.json",
       "exists": true,
-      "mtime": "2026-11-24T04:17:06.396Z",
-      "sha256": "4014c72e8a653dcca8a604c926c11a0cf0b20a9545435cd1d44be74edc1dcc59",
+      "mtime": "2026-11-24T20:54:33.486Z",
+      "sha256": "7538d6affccb724e12b9c2e1a607dc31ad3cbaa9f5e1c71e02649fb22ce6f71e",
       "readable": true,
-      "startedAt": "2026-11-24T04:10:01.311Z",
+      "startedAt": "2026-11-24T20:47:39.464Z",
       "startedKey": "startedAt",
-      "hostPid": 45700
+      "hostPid": 29028
     },
     {
       "id": "tui-headed",
       "file": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\logs\\tui-gate.json",
       "exists": true,
-      "mtime": "2026-11-24T05:04:30.273Z",
-      "sha256": "7aa4f0b235444243ead8ec33d41426f05f50fcb756c9dbc3008419b0897a2783"
+      "mtime": "2026-11-24T22:28:29.518Z",
+      "sha256": "0b390de7f435c78dfbccd90be7e643dbf48b548ac407aa62a5bb9fd93c811dc1"
     }
   ]
 }
