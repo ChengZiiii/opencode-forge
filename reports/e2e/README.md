@@ -6,7 +6,7 @@ the repo live, and ties every piece of evidence to the build it ran on.
 
 ```bat
 cd opencode-forge
-node reports\e2e\acceptance-gate.mjs --snapshot reports\e2e\evidence\0.33.1
+node reports\e2e\acceptance-gate.mjs --snapshot reports\e2e\evidence\0.34.0
 ```
 
 Exit code 0 only when no check failed. A leg the sandbox cannot reach shows as
@@ -24,7 +24,7 @@ ordinary FAIL. Every release decides again, so nothing accumulates silently.
 | --- | --- | --- |
 | `build-fresh` | `dist/index.js` is newer than `plugin.ts`, `src/**`, `schema/` | any source changed after the build |
 | `evidence-fresh-*` | each verdict file is newer than dist **and** carries an in-file start time later than dist | an E2E ran on an older build, or is undated |
-| `e2e-c3-command-stop` / `c4-pin-variant` / `c2-plan-close` / `f-crew-close-door` / `a-anchor-multidir` / `b-spawn-error` | `verdict === true`, `result.pass === true`, every `result.checks` true, no `inconclusive`. The last three (0.33.1): `crew_close` asks before it acts on both paths and "always" does not reopen the door; a `ws` session keeps its own directory after another directory is initialized last; a job whose working directory does not exist returns the not-started form, verbatim | any driver check is not `true` |
+| `e2e-c3-command-stop` / `c4-pin-variant` / `c2-plan-close` / `f-crew-close-door` / `a-anchor-multidir` / `b-spawn-error` / `c-stop-queued` / `e-stale-progress` | `verdict === true`, `result.pass === true`, every `result.checks` true, no `inconclusive`. The 0.33.1 legs: `crew_close` asks before it acts on both paths and "always" does not reopen the door; a `ws` session keeps its own directory after another directory is initialized last; a job whose working directory does not exist returns the not-started form, verbatim. The 0.34.0 legs: `/forge stop` cancels the session's queued wishes too (nothing spawns into the freed slots, the receipt names both groups); a progress notice whose dispatch has already finished is never delivered and never rides the completion wake (that driver only runs on a host with the short notify interval) | any driver check is not `true` |
 | `e2e-c1-K1` / `K2` | owner-deleted and cancel-lever legs | `results.<leg>.pass !== true` |
 | `e2e-c1-D1` | dispatch row survives a plugin dispose of the owner location | `pass` false without an inconclusive reason → FAIL; with one → BOOKED |
 | `e2e-c5-standard` | A / B / B' / D pass with host and driver on the production-default ceiling | a leg is not `true`, or the ceiling differs from the default |
