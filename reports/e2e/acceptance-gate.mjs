@@ -188,11 +188,16 @@ const readVerdict = (id, file) => {
 }
 const simplePass = (j) => j?.verdict === true && j?.result?.pass === true && allTrue(j?.result?.checks) && !j?.inconclusive
 
-// C3 / C4 / C2 share one verdict shape (verdict + result.pass + result.checks).
+// C3 / C4 / C2 and the 0.33.1 legs (F crew_close door, A multi-directory
+// anchor, B not-started job) share one verdict shape (verdict + result.pass +
+// result.checks).
 for (const [id, name] of [
   ["c3-command-stop", "command-stop-e2e-verdict.json"],
   ["c4-pin-variant", "pin-variant-e2e-verdict.json"],
   ["c2-plan-close", "plan-close-headless-e2e-verdict.json"],
+  ["f-crew-close-door", "crew-close-door-e2e-verdict.json"],
+  ["a-anchor-multidir", "anchor-multidir-e2e-verdict.json"],
+  ["b-spawn-error", "spawn-error-e2e-verdict.json"],
 ]) {
   const j = readVerdict(id, join(EVIDENCE, name))
   if (!j) continue
