@@ -1,0 +1,354 @@
+{
+  "at": "2026-11-24T03:02:47.496Z",
+  "repo": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\wt-0340",
+  "pristine": {
+    "plugin.ts": "24ddd4e6e577f9d7c114a570d231d2846b98be2a43b0d0f3694ca7ea96efa743"
+  },
+  "testFiles": {
+    "tests/dispatch-wiring.test.mjs": "8e344e9765645bce43b12711b0f1a186c20df91d806ab5d48027519446e0cd92",
+    "tests/dispatch-journal.test.mjs": "57c98007b46cb02ecceabd48d6241c761b358acd68d5e70d4fa56bf38c68cf41"
+  },
+  "rows": [
+    {
+      "id": "c-1",
+      "what": "stop no longer empties the queue before the in-flight cancels",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 43763,
+      "failed": [
+        "queue pump ②: a kill settle releases the slot — the queued head spawns after a per-id cancel, and /forge stop cancels the queued wishes too (none spawns into the freed slots)",
+        "fix-stop-cancels-queued-wishes: a queued wish cancelled by stop stays cancelled across a restart (journal recovery never re-enters it)",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup"
+      ],
+      "passedCount": 66,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "c-2",
+      "what": "a cancelled queued wish journals the in-flight lever sentence (it has no child)",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 39332,
+      "failed": [
+        "queue pump ②: a kill settle releases the slot — the queued head spawns after a per-id cancel, and /forge stop cancels the queued wishes too (none spawns into the freed slots)",
+        "fix-stop-cancels-queued-wishes: a queued wish cancelled by stop stays cancelled across a restart (journal recovery never re-enters it)",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup"
+      ],
+      "passedCount": 66,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "c-3",
+      "what": "the receipt drops its cancelled-queued line",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 39339,
+      "failed": [
+        "queue pump ②: a kill settle releases the slot — the queued head spawns after a per-id cancel, and /forge stop cancels the queued wishes too (none spawns into the freed slots)",
+        "fix-stop-cancels-queued-wishes: the stop receipt is honest for every group combination (pure)",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup"
+      ],
+      "passedCount": 66,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "c-4",
+      "what": "a wish cancelled in transit (never prompted) journals the still-queued sentence",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 40162,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup"
+      ],
+      "passedCount": 68,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "c-5",
+      "what": "the receipt drops its still-being-started line",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 41869,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: when the lever stops waiting first, a wish that lands afterwards is cancelled by its own pump — never beside the lever's cancels — and the receipt says it was still landing"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-1",
+      "what": "no stop check after the spawn-time crew-belt read",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 41870,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-2",
+      "what": "no stop check after the child session was created",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 41477,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-3",
+      "what": "the lever does not wait for a wish in transit to land",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 39386,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is sending the queued head's prompt waits for it to land, then cancels it like any other in-flight dispatch"
+      ],
+      "passedCount": 67,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-4",
+      "what": "the pump self-cancels even while the lever is still waiting (double cancel)",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 41058,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is sending the queued head's prompt waits for it to land, then cancels it like any other in-flight dispatch"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-5",
+      "what": "the pump's self-cancel bypasses the per-session serial chain",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 41360,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: when the lever stops waiting first, a wish that lands afterwards is cancelled by its own pump — never beside the lever's cancels — and the receipt says it was still landing"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-6",
+      "what": "the lever's own cancels bypass the per-session serial chain",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 41253,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: when the lever stops waiting first, a wish that lands afterwards is cancelled by its own pump — never beside the lever's cancels — and the receipt says it was still landing"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-7",
+      "what": "the concurrency cap ignores a wish that is in transit",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 42499,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: the concurrency cap counts a wish the pump is still spawning — a second pump never over-dispatches behind it"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-8",
+      "what": "a wish the pump just failed or registered stays counted as in transit (the run stops one wish early)",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 45802,
+      "failed": [
+        "queue pump ⑤ (fix-stop-cancels-queued-wishes D5): a queued head whose child session cannot be created hands its slot straight back — the next queued wish spawns in the SAME pump run"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-9",
+      "what": "a wish in transit no longer counts as live (its true notice is dropped)",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 37035,
+      "failed": [
+        "recovery + transit window (fix-stale-progress-notice, fix-stop-cancels-queued-wishes D5): a 're-entered the queue' notice parked WHILE its wish is being spawned is still delivered — a wish in transit is live"
+      ],
+      "passedCount": 12,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-10",
+      "what": "the lever never marks the session as waiting (the pumps' cancelled in-transit wishes never reach the receipt)",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 39453,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is sending the queued head's prompt waits for it to land, then cancels it like any other in-flight dispatch"
+      ],
+      "passedCount": 67,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-11",
+      "what": "the receipt does not include the wishes the pumps cancelled unprompted",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 40140,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created",
+        "fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup"
+      ],
+      "passedCount": 68,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "d5-12",
+      "what": "the receipt does not count the wishes still being started",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 41735,
+      "failed": [
+        "fix-stop-cancels-queued-wishes D5: when the lever stops waiting first, a wish that lands afterwards is cancelled by its own pump — never beside the lever's cancels — and the receipt says it was still landing"
+      ],
+      "passedCount": 69,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "e-1",
+      "what": "delivery no longer checks that the dispatch is still live",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 42034,
+      "failed": [
+        "recovery + /forge stop (fix-stop-cancels-queued-wishes, fix-stale-progress-notice): a queued wish that re-entered the queue at recovery is cancelled by stop, never spawns, and its parked notice is dropped",
+        "never-die (K3 shape): child busy past a notify boundary → the parked notices are DROPPED when the child finishes before the owner idles; exactly ONE report wake with the REAL final report",
+        "fix-stale-progress-notice: an interrupt disclosure parked for a busy owner is DROPPED when nothing is in flight at the idle edge"
+      ],
+      "passedCount": 80,
+      "rc": 1,
+      "timedOut": false
+    },
+    {
+      "id": "e-2",
+      "what": "the completion wake's report block is the raw tail again (progress notices included)",
+      "file": "plugin.ts",
+      "verdict": "KILLED",
+      "restored": true,
+      "applyError": null,
+      "missingFail": [],
+      "missingPass": [],
+      "ms": 41857,
+      "failed": [
+        "never-die (K3 shape): child busy past a notify boundary → the parked notices are DROPPED when the child finishes before the owner idles; exactly ONE report wake with the REAL final report",
+        "fix-stale-progress-notice: a parked notice is delivered while its dispatch is still live — ahead of the completion wake that follows later"
+      ],
+      "passedCount": 68,
+      "rc": 1,
+      "timedOut": false
+    }
+  ]
+}

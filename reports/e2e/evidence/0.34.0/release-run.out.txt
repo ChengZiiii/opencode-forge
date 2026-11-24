@@ -1,0 +1,13 @@
+P P1 OK  tarball sorenllm-opencode-forge-0.34.0.tgz sha1 228419ce339a… contents verified 2026-11-24T05:12:59.444Z
+P P2 OK  {"evidence":"<ws>\\opencode-forge\\reports\\e2e\\evidence\\0.34.0\\acceptance-gate.json","acceptedKnown":[],"pass":31,"fail":0,"bookedLegs":["e2e-c1-D1"],"knownDefects":[],"git":"4f40a50"}
+P P3 OK  {"latest":"0.33.1","publishedVersions":63}
+P P4 OK  {"head":"4f40a50"}
+temp credential file removed: true
+P P5 OK  authenticated as sorenllm
+temp credential file removed: true
+published @sorenllm/opencode-forge@0.34.0: npm shasum 228419ce339aff6920dc6b0c6a078ef1e4b353ea  id @sorenllm/opencode-forge@0.34.0
+tarball shasum agrees with the local file: true
+dist-tags.latest = 0.34.0  (moved)
+version document shasum 228419ce339aff6920dc6b0c6a078ef1e4b353ea  agrees: true
+CDN serves the published bytes: yes (250083 bytes, attempt 1, 2026-11-24T05:17:47.873Z)
+RELEASE_VERIFIED=true

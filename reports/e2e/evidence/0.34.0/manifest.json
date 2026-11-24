@@ -1,0 +1,90 @@
+{
+  "snapshotAt": "2026-11-24T05:06:35.048Z",
+  "git": "4f40a50",
+  "build": {
+    "distMtime": "2026-11-24T03:18:19.155Z",
+    "distSha256": "8c97c396fb75bcdc60a5475131d0b57ef2b6e442f6945af9b506e0f927f19803",
+    "newestSource": "plugin.ts",
+    "newestSourceMtime": "2026-11-24T03:18:17.267Z"
+  },
+  "files": [
+    {
+      "source": "command-stop-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/command-stop-e2e-verdict.json",
+      "sha256": "72df4ca959ea7f0306a514450efbf71b4547e88015db7faac7694da5a3218729"
+    },
+    {
+      "source": "pin-variant-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/pin-variant-e2e-verdict.json",
+      "sha256": "071087a88aaaf83b3ebd55249f002279535919de6368397e2794319fb901ef07"
+    },
+    {
+      "source": "plan-close-headless-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/plan-close-headless-e2e-verdict.json",
+      "sha256": "9b0f228655e562331371a79f44a12099538502f0ae5290d0abeca980bebc28f2"
+    },
+    {
+      "source": "crew-close-door-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/crew-close-door-e2e-verdict.json",
+      "sha256": "373990a08652eea5bdace4f7380f188d96ac484de6399279a0a7091a1dd7d6e5"
+    },
+    {
+      "source": "anchor-multidir-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/anchor-multidir-e2e-verdict.json",
+      "sha256": "960d15c01a26fa751516ba1397c21bb4638bb8e7289fe5448d88d7f0f59f1a04"
+    },
+    {
+      "source": "spawn-error-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/spawn-error-e2e-verdict.json",
+      "sha256": "07e5843c6d3066872bcf1e7adac4cdf5cef592ef3456ab2220eb163c0302248a"
+    },
+    {
+      "source": "stop-queued-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/stop-queued-e2e-verdict.json",
+      "sha256": "9849fdd3c48d39a5cef6537584fd0f47a97f661c9a8bb093e7c62c9502ca3420"
+    },
+    {
+      "source": "stale-progress-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/stale-progress-e2e-verdict.json",
+      "sha256": "12eaf2c6a0de409e02a9c6ad3c17550c384fc7444763bb54b350b399bf1e88fe"
+    },
+    {
+      "source": "dispose-e2e-K1-K2-D1-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/dispose-e2e-K1-K2-D1-verdict.json",
+      "sha256": "25d5455023181c094112307699ba7d1ca6a7e61a6531413c11284a22c2e42d2d"
+    },
+    {
+      "source": "native-child-gate-e2e-final-standard-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/native-child-gate-e2e-final-standard-verdict.json",
+      "sha256": "0fd2e69ad09d9bc16dbd71e72f8771363b529572ce12e9f6cdce8c6a4b3e7c6c"
+    },
+    {
+      "source": "native-child-gate-e2e-final-C-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/native-child-gate-e2e-final-C-verdict.json",
+      "sha256": "1a3583b2ce2d12397c6269849e718d7ea7260ab8daa2199405fb7c8c620d185e"
+    },
+    {
+      "source": "crew-full-e2e-verdict.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/crew-full-e2e-verdict.json",
+      "sha256": "4014c72e8a653dcca8a604c926c11a0cf0b20a9545435cd1d44be74edc1dcc59"
+    },
+    {
+      "source": "tui-gate.json",
+      "copied": true,
+      "file": "reports/e2e/evidence/0.34.0/tui-gate.json",
+      "sha256": "7aa4f0b235444243ead8ec33d41426f05f50fcb756c9dbc3008419b0897a2783"
+    }
+  ]
+}

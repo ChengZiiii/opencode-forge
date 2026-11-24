@@ -1,0 +1,176 @@
+
+== logs\pin-variant-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T03:33:38.443Z hostPid=39988 newerThanDist=true
+  pluginLane=true
+  childAnswered=true
+  sessionAgent=true
+  sessionModelIsPin=true
+  everyAssistantRowIsPin=true
+  wakeCarriesChildWords=true
+
+== logs\plan-close-headless-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T03:35:07.747Z hostPid=39988 newerThanDist=true
+  written=true
+  approveAskPinned=true
+  ticked=true
+  refusedFailClosed=true
+  shellCheckRanLive=true
+  closePassedVerified=true
+  reopened=true
+  reclosed=true
+  zeroCloseAsks=true
+  nothingHung=true
+  modelStayedMinimal=true
+
+== logs\command-stop-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T03:37:17.418Z hostPid=39988 newerThanDist=true
+  commandList=true
+  pluginLane=true
+  dispatchShape=true
+  childrenInFlight=true
+  commandAccepted=true
+  routeDelivered=true
+  stopCalled=true
+  aAbortedWithLeverReason=true
+  aWakesExactlyTwoAborted=true
+  aWakesHonest=true
+  bUntouchedAtStop=true
+  bCompleted=true
+  bWakeCarriesChildWords=true
+  bNeverAborted=true
+  aChildrenIdleSoon=true
+  aNeverRetried=true
+
+== logs\dispose-e2e-K1-K2-D1-verdict.json
+verdict=[object Object] pass=undefined startedAt=2026-11-24T03:42:40.403Z hostPid=39988 newerThanDist=true
+INCONCLUSIVE: ["D1: the evict did not kill the control process tree of the evicted location - the plugin dispose hook did not run inside the leg window (probe silent): no verdict on the dispatch exemption"]
+  host=http://127.0.0.1:47911
+  hostPid=39988
+  startedAt=2026-11-24T03:42:40.403Z
+  legs=["K1","K2","D1"]
+  gateLegs=["K1","K2","D1"]
+  ownerLocation=C:\Users\Soren\AppData\Local\Temp\opencode\view-e2e\ws
+  verdict={"K1":true,"K2":true,"D1":false}
+  inconclusive=["D1: the evict did not kill the control process tree of the evicted location - the plugin dispose hook did no
+  verdictAll=false
+  cleanup={"created":5,"deletedNow":0,"stillActive":0}
+
+== logs\native-child-gate-e2e-final-standard-verdict.json
+verdict=[object Object] pass=undefined startedAt=- hostPid=39988 newerThanDist=true
+  host=http://127.0.0.1:47911
+  hostPid=39988
+  started=2026-11-24T03:49:29.142Z
+  legs=standard (A,B,BI,D — leg C is its own host phase)
+  hostCeiling={"recordedPid":39988,"runningPid":39988,"hostCeilingMs":900000,"driverCeilingMs":900000,"productionDefaultMs":
+  verdict={"A":true,"B":true,"BI":true,"D":true}
+  verdictAll=true
+  engineEvidence=["03:49:57 crew skip: native child in flight session=ses_df453ba24ffewwL6z96GQEghL1","03:49:59 crew native chi
+  cleanup={"created":3,"deleted":0,"alreadyGone":3,"failed":0,"stillActive":0}
+
+== logs\native-child-gate-e2e-final-C-verdict.json
+verdict=[object Object] pass=undefined startedAt=- hostPid=48740 newerThanDist=true
+  host=http://127.0.0.1:47911
+  hostPid=48740
+  started=2026-11-24T04:05:08.040Z
+  legs=C
+  hostCeiling={"recordedPid":48740,"runningPid":48740,"hostCeilingMs":240000,"driverCeilingMs":240000,"productionDefaultMs":
+  verdict={"C":true}
+  verdictAll=true
+  engineEvidence=["04:05:37 crew skip: native child in flight session=ses_df4456696ffe0MipTvbykDz7qA","04:05:48 crew skip: nati
+  cleanup={"created":1,"deleted":0,"alreadyGone":1,"failed":0,"stillActive":0}
+
+== logs\crew-full-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T04:10:01.311Z hostPid=45700 newerThanDist=true
+  registered.pass=true
+  registered.detail=header + '## Declared plan (3)' + section registered (pending)
+  declaredAllThree.pass=true
+  declaredAllThree.detail=all three declared titles are in the record
+  armedWaves.pass=true
+  armedWaves.detail=sections=[registered (pending) | armed (waves) | closed]
+  engineBriefs.pass=true
+  engineBriefs.detail=[forge:crew-continue] briefs=1 first=null
+  noEngineGiveUp.pass=true
+  noEngineGiveUp.detail=stalled/stopped/ceiling briefs=0 []
+  armCallsCompleted.pass=true
+  armCallsCompleted.detail=1 crew_begin part(s); completed=1; registered text=true; armed text=true
+  filesOnDisk.pass=true
+  filesOnDisk.detail=A.txt=exact B.txt=exact C.txt=A+B
+  oneChildPerSubtask.pass=true
+  oneChildPerSubtask.detail=children=3 one-per-subtask={"A":1,"B":1,"C":1} prompts=[{"names":["C"],"score":{"A":1,"B":1,"C":4},"head":"joi
+  parentHoldsRealEvidence.pass=true
+  parentHoldsRealEvidence.detail=markers in the parent transcript=["A","B"] mentions C.txt=true
+  dependentWaveAfterFirst.pass=true
+  dependentWaveAfterFirst.detail=C's child started 94s after the later of A.txt/B.txt was written; C.txt written 102s after
+  closeGateAskedAndApproved.pass=true
+  closeGateAskedAndApproved.detail=crew_close asks=[204] permissions=[null] other asks=0
+  closedWithVerdicts.pass=true
+  closedWithVerdicts.detail=## 2026-11-24T04:16:41.327Z — closed subtasks: 3 (PASS 3, FAIL 0) - write A mwu6ev33: in the folder C:/Users/S
+  closeToolCompleted.pass=true
+  closeToolCompleted.detail=[{"status":"completed","out":"[forge:crew] Crew closed: sandbox e2e full crew mwu6ev33: three file subtasks in
+  engineSilentAfterClose.pass=true
+  engineSilentAfterClose.detail=briefs in the 25s after the close=0 capped=false
+  sessionIdleAtEnd.pass=true
+  sessionIdleAtEnd.detail=busy=false
+  noRunError.pass=true
+  noRunError.detail=no driver error | poll retries=0 sustained=0
+
+== logs\crew-close-door-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T04:00:45.449Z hostPid=39988 newerThanDist=true
+  beginRegistersPendingCrew=true
+  rejectedAskLeavesCrewActive=true
+  abandonAsksThenExecutes=true
+  reportAsksThenExecutes=true
+  alwaysDoesNotReopenTheDoor=true
+  goalGoverningClosesAskFree=true
+  governedGoalNotLeftActive=true
+
+== logs\spawn-error-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T04:03:26.261Z hostPid=39988 newerThanDist=true
+  fgSaysNotStartedFirst=true
+  fgNamesTheMissingDirectory=true
+  fgCarriesJobIdAndSpawnError=true
+  fgHasNoRanSentences=true
+  fgHasNoCommandOutput=true
+  fgIsExactlyFourLines=true
+  bgStartHandsAJobId=true
+  bgPollNamesNotStarted=true
+  bgPollHasNoCommandOutput=true
+  controlRanFormIntact=true
+
+== logs\anchor-multidir-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T04:04:07.782Z hostPid=39988 newerThanDist=true
+  thirdDirectoryIsInitializedLast=true
+  ownerHostRecordNamesWs=true
+  childHostRecordNamesWs=true
+  workerShellCwdIsWs=true
+  workerShellCwdIsNotTheLastInitializedDir=true
+  goalContractLandsInWs=true
+  nothingLandedElsewhere=true
+  dispatchJournalInWs=true
+  thirdStayedTheLatestInitialization=true
+
+== logs\stop-queued-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T03:58:50.925Z hostPid=39988 newerThanDist=true
+  premiseThreeStartedTwoQueued=true
+  stopCalledAfterTheCommand=true
+  receiptNamesTheInFlightGroup=true
+  receiptNamesTheQueuedGroupAsCancelled=true
+  receiptNeverSaysTheQueueSurvivesStop=true
+  queuedNeverSpawned=true
+  queuedRowsTerminalAbortedWithTheQueuedSentence=true
+  flightRowsTerminalAbortedWithTheLeverSentence=true
+  nothingRearmed=true
+
+== logs\stale-progress-e2e-verdict.json
+verdict=true pass=true startedAt=2026-11-24T03:25:22.511Z hostPid=10032 newerThanDist=true
+  hostRunsTheShortNotifyInterval=true
+  premiseLiveOwnerWasBusyPastTheFirstInterval=true
+  controlNoticeIsDeliveredWhileTheDispatchIsLive=true
+  premiseOwnerWasBusyPastTheFirstInterval=true
+  premiseChildFinishedBeforeTheIdleEdge=true
+  premiseStaleChildOutlivedTheFirstNoticeSlice=true
+  staleProgressIsNotDelivered=true
+  staleOwnerGetsOnlyTheWake=true
+  completionWakeStillArrives=true
+  liveWakeReportHasNoProgressNotice=true
+  staleWakeReportHasNoProgressNotice=true

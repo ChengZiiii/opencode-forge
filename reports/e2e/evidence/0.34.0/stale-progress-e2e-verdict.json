@@ -1,0 +1,90 @@
+{
+  "verdict": true,
+  "result": {
+    "pass": true,
+    "checks": {
+      "hostRunsTheShortNotifyInterval": true,
+      "premiseLiveOwnerWasBusyPastTheFirstInterval": true,
+      "controlNoticeIsDeliveredWhileTheDispatchIsLive": true,
+      "premiseOwnerWasBusyPastTheFirstInterval": true,
+      "premiseChildFinishedBeforeTheIdleEdge": true,
+      "premiseStaleChildOutlivedTheFirstNoticeSlice": true,
+      "staleProgressIsNotDelivered": true,
+      "staleOwnerGetsOnlyTheWake": true,
+      "completionWakeStillArrives": true,
+      "liveWakeReportHasNoProgressNotice": true,
+      "staleWakeReportHasNoProgressNotice": true
+    },
+    "details": {
+      "live": {
+        "session": "ses_df469cd2bffe07a3T3KOrbsabm",
+        "jobId": "j-20261124-032532-tgyhd9",
+        "taskCallsSeen": 1,
+        "turnStart": 1795490722536,
+        "turnEnd": 1795490803688,
+        "busyMs": 81152,
+        "firstTurnEndSeen": 1795490855213,
+        "dispatchAt": 1795490732635,
+        "childTerminalAt": 1795490858018,
+        "progressDelivered": 8,
+        "firstProgressAt": 1795490803699,
+        "progressTexts": [
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-032532-tgyhd9, child session ses_df469a5a1ffe2IV8TLcU30e1kt) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-032532-tgyhd9, child session ses_df469a5a1ffe2IV8TLcU30e1kt) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-032532-tgyhd9, child session ses_df469a5a1ffe2IV8TLcU30e1kt) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-032532-tgyhd9, child session ses_df469a5a1ffe2IV8TLcU30e1kt) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-032532-tgyhd9, child session ses_df469a5a1ffe2IV8TLcU30e1kt) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-032532-tgyhd9, child session ses_df469a5a1ffe2IV8TLcU30e1kt) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-032532-tgyhd9, child session ses_df469a5a1ffe2IV8TLcU30e1kt) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-032532-tgyhd9, child session ses_df469a5a1ffe2IV8TLcU30e1kt) is still running af…"
+        ],
+        "wakeDelivered": 1,
+        "wakeAt": 1795490925977,
+        "wakeReportFound": true,
+        "wakeReportHasProgress": false,
+        "wakeReportClip": "CANARY-SPlive-0pvstq",
+        "userRowsAfterPrompt": 9,
+        "childOutcome": "completed",
+        "userTimeline": [
+          "03:26:43 PROGRESS",
+          "03:26:50 PROGRESS",
+          "03:26:50 PROGRESS",
+          "03:26:50 PROGRESS",
+          "03:27:00 PROGRESS",
+          "03:27:11 PROGRESS",
+          "03:27:19 PROGRESS",
+          "03:27:45 PROGRESS",
+          "03:28:45 WAKE"
+        ]
+      },
+      "stale": {
+        "session": "ses_df46693f1ffey1viclcrDw890G",
+        "jobId": "j-20261124-032912-btzj37",
+        "taskCallsSeen": 1,
+        "turnStart": 1795490933792,
+        "turnEnd": 1795491023124,
+        "busyMs": 89332,
+        "firstTurnEndSeen": 1795491037380,
+        "dispatchAt": 1795490952562,
+        "childTerminalAt": 1795490996172,
+        "progressDelivered": 0,
+        "firstProgressAt": null,
+        "progressTexts": [],
+        "wakeDelivered": 1,
+        "wakeAt": 1795491023134,
+        "wakeReportFound": true,
+        "wakeReportHasProgress": false,
+        "wakeReportClip": "CANARY-SPstale-0pvstq",
+        "userRowsAfterPrompt": 1,
+        "childOutcome": "completed",
+        "userTimeline": [
+          "03:30:23 WAKE"
+        ]
+      },
+      "timelineNote": "the notice is generated at the first poll slice past the interval (≥10 s cadence), i.e. ~15–25 s after dispatch — inside the busy window; its delivery time would have been the owner's first idle edge (firstTurnAssistantAt)."
+    },
+    "error": null
+  },
+  "startedAt": "2026-11-24T03:25:22.511Z",
+  "hostPid": 10032
+}

@@ -1,0 +1,53 @@
+{
+  "at": "2026-11-24T05:12:50.967Z",
+  "machine": "the user's own machine (read-only listing)",
+  "latestDir": "~\\.cache\\opencode\\npm\\@sorenllm\\opencode-forge@latest",
+  "liveCopies": [
+    {
+      "id": "1795487595035",
+      "mtime": "2026-11-24T02:33:15.031Z",
+      "version": "0.33.1",
+      "distSha256": "e10722f05a28a87be689c1f74fdad7c542cd3864048ef5c11e912ca42571c313",
+      "distBytes": 953563
+    }
+  ],
+  "liveCopiesCount": 1,
+  "note": "a live materialized copy exists: a host restart REUSES it (it does not take the version the registry serves) — quarantine it first",
+  "quarantinedForgeCopies": [
+    {
+      "name": "forge-0.32.0-1795344630244",
+      "mtime": "2026-11-22T12:41:52.837Z",
+      "version": null,
+      "distSha256": null,
+      "distBytes": null
+    },
+    {
+      "name": "git-opencode-forge-0954a942677a",
+      "mtime": "2026-11-22T10:15:43.550Z",
+      "version": null,
+      "distSha256": null,
+      "distBytes": null
+    },
+    {
+      "name": "opencode-forge@latest-1795352879901-0.32.1",
+      "mtime": "2026-11-22T13:07:59.897Z",
+      "version": "0.32.1",
+      "distSha256": "90a059324d7b5274b5870d91042bd997acc871db9a0ea5553822b8f20b588ae8",
+      "distBytes": 910493
+    },
+    {
+      "name": "opencode-forge@latest-1795368019969-0.32.2",
+      "mtime": "2026-11-22T17:20:19.965Z",
+      "version": "0.32.2",
+      "distSha256": "84853f3f5f5e607084ff1ef02570e0c219e2aafbf806fc648a7cb582b508685f",
+      "distBytes": 914549
+    },
+    {
+      "name": "opencode-forge@latest-1795370347623-0.32.3",
+      "mtime": "2026-11-22T17:59:07.620Z",
+      "version": "0.32.3",
+      "distSha256": "087fb97c39905469cf167c93a3364ba054bfbdd80d2143b166ef657be388cf69",
+      "distBytes": 915662
+    }
+  ]
+}

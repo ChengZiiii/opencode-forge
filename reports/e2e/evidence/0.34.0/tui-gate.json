@@ -1,0 +1,78 @@
+{
+  "pass": true,
+  "checkedAt": "2026-11-24T05:04:30.272Z",
+  "hostVersion": "2.4.0",
+  "build": {
+    "distMtime": "2026-11-24T03:18:19.156Z",
+    "distSha256": "8c97c396fb75bcdc60a5475131d0b57ef2b6e442f6945af9b506e0f927f19803"
+  },
+  "method": {
+    "gate": "0.34.0 headed TUI gate — run 2026-11-24T04:23Z–04:59Z",
+    "terminal": "headed opencode TUI (opencode.exe -s <sid>) on the sandbox host (port 47911, host 2.4.0), launched detached; hosted in a classic console window (conhost.exe, class ConsoleWindowClass). Part 1 (F, command list, /forge stop, anchor) ran on the sandbox host booted 2026-11-24T04:19:04.785Z with production defaults (native-child ceiling 900000, default notice interval); part 2 (stale notice) on a fresh sandbox host started with the 15000 ms notice interval.",
+    "input": "computer-use plugin (opencode-computer-use) -> cua-driver 0.28.2: single-key presses delivered in the BACKGROUND to the sandbox TUI window only (every prompt typed one key at a time: lowercase letters, digits, space, period; the driver delivers shifted symbols unshifted, so no prompt relied on punctuation). Input re-read from a screenshot / zoom crop before every submit. Window close: the driver's UIA click on the window's own Close button. No foreground delivery was used at any point; the user's desktop focus was never taken.",
+    "observation": "driver screenshots after every step + PrintWindow PNG files in logs/ (tui-0340-f1-dialog.png, tui-0340-commands.png, tui-0340-stop.png, tui-0340-stop-final.png, tui-0340-anchor.png, tui-0340-stale.png); ground truth re-read from disk/transcript by tui-postcheck-crew.mjs, tui-postcheck-stop0340.mjs, tui-postcheck-anchor.mjs and tui-postcheck-stale0340.mjs; permission requests observed by tui-askwatch.mjs (500 ms poll of /api/session/<id>/permission)",
+    "windowsTouched": [
+      "pid 45940 hwnd 0x8513ac (F: crew_close dialogs)",
+      "pid 42352 hwnd 0x91153a (command list + /forge stop with queued wishes; /new + forge_shell anchor)",
+      "pid 45236 hwnd 0x19e0c7a (E: stale progress notice)"
+    ],
+    "sessions": [
+      "ses_df4385ed9ffeVhDRpeyace02uL",
+      "ses_df42bf8a9ffe4EDL6j9dQiBtdG",
+      "ses_df41d5f21ffeTZZkc449EVkl5j",
+      "ses_df4197721ffe7aeO12GmryXgK9"
+    ],
+    "driverRecovery": "the real host's computer-use driver session had been reaped as idle by the cua-driver daemon; recovered by ending the plugin's own dead 'cua-driver.exe mcp' child (pid 38456, child of the real host 35748) so that the plugin restarted its driver and called start_session again — no second driver client was started next to the real host's lease"
+  },
+  "scopeNotes": [
+    "F was exercised with 'ws' as the host's last initialized directory (the state in which the confirmation dialog is known to work). The case of a session in a directory that is NOT the last initialized one — the dialog does not pop there — is the known confirmation-door defect; its fix (openspec change fix-ask-door-multi-directory-host, approved by the user on 2026-11-24) is NOT part of 0.34.0 and is NOT covered by this gate.",
+    "The '/new' sessions of the A item were created by the TUI itself, after the third directory had become the host's latest initialization."
+  ],
+  "items": [
+    {
+      "id": "f-crew-close-abandon-dialog-visible-and-answerable-in-tui",
+      "pass": true,
+      "note": "Session ses_df4385ed9ffeVhDRpeyace02uL in the real TUI (window 1; 'ws' was the host's last initialized directory). Crew 'headed tui gate crew 5h7z3g' registered PENDING through the API; then typed INTO THE TUI: \"call the crew close tool with abandon set to true and reason set to headed tui gate 0340. make exactly one code call…\". The TUI showed 'Permission required / Call tool crew_close' with 'Allow once' (highlighted) and 'Reject'. Ask watch f1: crew_close \"Abandon crew: headed tui gate crew 5h7z3g\" @2026-11-24T04:26:32.356Z. Answered IN THE TUI (Enter on 'Allow once'); the turn ended with 'ok'. Ground truth: crew record sections [registered (pending), abandoned]; the execute part's output: \"[forge:crew] Crew ABANDONED: headed tui gate crew 5h7z3g mode at abandon: pending reason: headed tui gate 0340 The sessi…\". Screenshot of the dialog: logs/tui-0340-f1-dialog.png (PrintWindow, 993x519)."
+    },
+    {
+      "id": "f-crew-close-report-dialog-reject-in-tui-keeps-the-crew",
+      "pass": true,
+      "note": "Second crew 'headed tui gate crew two qkwcnl' registered PENDING in the SAME TUI session; the final-report close was typed into the TUI. crew_close \"Close crew: headed tui gate crew two qkwcnl\" @2026-11-24T04:28:57.481Z the dialog 'Permission required / Call tool crew_close' appeared; REJECTED in the TUI (Right + Enter on 'Reject'; the option was re-read from a zoom crop before Enter). Ground truth right after (logs/tui-postcheck-crew-f2rej.json): crew record sections [registered (pending)] — the crew stayed unclosed; the model's execute part returned the literal 'Tool.Error' and the model's reply said so (the host's code-tool bridge swallows the tool error text — known upstream behaviour, not a plugin defect). The dialog was seen on the driver's screenshot; no PrintWindow file was taken for this one."
+    },
+    {
+      "id": "f-crew-close-report-dialog-allow-in-tui-closes-the-crew",
+      "pass": true,
+      "note": "The same close typed again into the TUI: crew_close \"Close crew: headed tui gate crew two qkwcnl\" @2026-11-24T04:30:56.343Z the dialog appeared AGAIN (a rejected ask opens nothing); answered IN THE TUI (Enter on 'Allow once'). Ground truth: crew record sections [registered (pending), closed], section '… — closed', 'subtasks: 1 (PASS 1, FAIL 0)'; the execute part's output: \"[forge:crew] Crew closed: headed tui gate crew two qkwcnl subtasks: 1 (PASS 1, FAIL 0) - tui gate subtask two …\"; the turn ended with 'ok'. Ask watch f1 for the whole first window: watch-start 2026-11-24T04:23:09.797Z, watch-end 2026-11-24T04:32:37.354Z, polls 1106, asks 3, poll-errors 0 — exactly the three crew_close dialogs above, nothing else. The dialog was seen on the driver's screenshot; no PrintWindow file was taken for this one."
+    },
+    {
+      "id": "c3-command-list",
+      "pass": true,
+      "note": "Second TUI window on session ses_df42bf8a9ffe4EDL6j9dQiBtdG. Typed '/' → the command list opened (alphabetical, scrollable: /new, /terminal, /btv, /diff, /cd, /worktrees, /plan, /crew, /goal, /forge … — seen on screen when '/' was typed for this window's '/new' as well). Typed 'forge' → the list showed exactly /forge (highlighted, 'forge goal harness (autonomous, host-verified) …'), /plan, /crew, /goal; NO hyphenated forge-* command (no /forge-sync, /forge-init, /forge-cancel). Screenshot: logs/tui-0340-commands.png."
+    },
+    {
+      "id": "c-forge-stop-cancels-in-flight-and-queued-in-tui",
+      "pass": true,
+      "note": "Five background dispatches prepared through the API (children asleep 540 s): three in flight (journal j-20261124-043307-zp1i7s, j-20261124-043307-pgn1kb, j-20261124-043307-72fgk6, state 'started') and two STILL QUEUED (j-20261124-043307-42ggu2, j-20261124-043307-z4p302); the TUI status bar showed '↓ 3 subagents'. Typed '/forge stop' + Enter at 04:36:46Z (the input was re-read from a screenshot before Enter). The TUI showed three '[forge:dispatch-complete] … ABORTED … cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried' notices, the subagent count left the status bar, and the model's table: Q0–Q2 'aborted, confirmed by dispatch-complete notice', Q3–Q4 'cancelled while queued, never spawned'. Ground truth (logs/tui-postcheck-stop0340.json): exactly ONE forge_jobs {action:\"stop\"} call, completed; its receipt '[forge:job] Stopped 3 in-flight dispatch(es) of this session: - Cancelled j-… (agent forge-viewe2e-coder, child session ses_…) — cancelled by the user lever; never retried. the child session … is confirmed idle (the cancellation is REAL, not bookkeeping). …' AND '[forge:job] Cancelled 2 queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): …'. Journal: the three in flight dispatched→started→terminal, outcome aborted, reason 'cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried'; the two queued queued→terminal, outcome aborted, reason 'cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried'; 0 rows after terminal for all five; children 3 before / 3 after / 0 new / 0 busy (nothing spawned into the freed slots). Ask watch c3q: watch-start 2026-11-24T04:34:08.037Z, watch-end 2026-11-24T04:38:47.815Z, polls 546, asks 0, poll-errors 0 — no dialog. Screenshots: logs/tui-0340-stop.png, logs/tui-0340-stop-final.png."
+    },
+    {
+      "id": "a-session-anchor-holds-after-a-third-directory-in-tui",
+      "pass": true,
+      "note": "API activated a brand-new third directory (ws-md-tui-g7qmvm) at 2026-11-24T04:40:33.413Z: plugin load lines since the host boot 2 -> 3, that line being the host's last one; loaded directories = ws + the third. In the real TUI: '/new' (the session ses_df41d5f21ffeTZZkc449EVkl5j was created BY THE TUI at 2026-11-24T04:48:51.431Z; host record directory …\\view-e2e\\ws). The forge_shell 'cd' prompt was typed twice (04:48:51Z and 04:49:57Z): each turn = ONE code call, code exactly 'await tools.forge_shell({command: \"cd\"})', completed, error=false, output '[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws jobId: …'; the assistant line was the canary each time ('tui anchor one ok g7qmvm', 'tui anchor two ok g7qmvm'). No dialog on screen. Plugin load lines after both turns: still 3, last one still 2026-11-24T04:40:33.413Z (the third directory stayed the latest initialization). Ask watch a0340: watch-start 2026-11-24T04:49:37.289Z, watch-end 2026-11-24T04:50:58.308Z, polls 153, asks 0, poll-errors 0 — it covers the second turn; the first turn ran without an API-side watcher because a '/new' session only exists on the host once its first prompt is submitted (the watcher was attached 46 s after the session appeared, before the second submit) — its evidence is the screen + transcript. DRIVER NOTE: a first '/new' session (ses_df4233b9effe5NLVCbTEOgweGu) was abandoned: the prompt said \"the call is the forge shell tool with the command cd\" and the model wrote a lookup for a non-existent sub-tool (tools[\"forge_shell\"].shell) instead of calling forge_shell — a prompt-wording mistake of the test driver, not plugin behaviour; its record is kept in logs/tui-postcheck-anchor-x1.json. Details: logs/tui-postcheck-anchor-a0340.json. Screenshot: logs/tui-0340-anchor.png."
+    },
+    {
+      "id": "e-stale-progress-notice-is-not-delivered-in-tui",
+      "pass": true,
+      "note": "Host restarted with the shortened notice interval (15000 ms). The API delivered the exact code as an INSTRUCTION and the model only acknowledged (\"ready\", no tool call). In the real TUI (window 3) ONE short line was typed + Enter: \"do it now. make exactly one code call with the code from my first message.\". The turn = ONE code call: one background worker (25 s sleep) + five ~12 s forge_shell calls that keep the owner busy. Timeline (ground truth, logs/tui-postcheck-stale0340.json): typed 04:54:34.696, dispatch 04:54:50.124, child terminal 04:55:35.494, turn end 04:56:13.633 (busy 98937 ms), wake 04:56:13.647. Journal j-20261124-045450-a9waeo: dispatched→started→terminal, outcome completed. User-role rows after the typed line: 1; '[forge:dispatch-progress] … is still running' notices delivered: 0 (the worker finished inside the busy window, so the notice generated at the first interval would have been stale at delivery time); completion wake delivered: 1, its 'Final report:' block free of a progress notice: true. Ask watch e1: watch-start 2026-11-24T04:53:27.391Z, watch-end 2026-11-24T04:57:35.827Z, polls 453, asks 0, poll-errors 0. DRIVER NOTE: the first run of tui-postcheck-stale0340.mjs mis-parsed the journal's epoch-millisecond timestamps as date strings, so its two timing-premise checks came out FAIL with null times while the eight behaviour checks passed; the script was made number-aware and re-run on the same transcript and journal (logs/tui-postcheck-stale0340.txt) — no product change was involved. Screenshot: logs/tui-0340-stale.png."
+    },
+    {
+      "id": "tui-no-unexpected-permission-asks",
+      "pass": true,
+      "note": "Ask watch f1 (ses_df4385ed9ffeVhDRpeyace02uL): watch-start 2026-11-24T04:23:09.797Z, watch-end 2026-11-24T04:32:37.354Z, polls 1106, asks 3, poll-errors 0 — all three are the crew_close dialogs that were answered in the TUI (F). Ask watch c3q (ses_df42bf8a9ffe4EDL6j9dQiBtdG): watch-start 2026-11-24T04:34:08.037Z, watch-end 2026-11-24T04:38:47.815Z, polls 546, asks 0, poll-errors 0. Ask watch a0340 (ses_df41d5f21ffeTZZkc449EVkl5j): watch-start 2026-11-24T04:49:37.289Z, watch-end 2026-11-24T04:50:58.308Z, polls 153, asks 0, poll-errors 0. Ask watch e1 (ses_df4197721ffe7aeO12GmryXgK9): watch-start 2026-11-24T04:53:27.391Z, watch-end 2026-11-24T04:57:35.827Z, polls 453, asks 0, poll-errors 0. Files: logs/tui-asks-f1.jsonl, logs/tui-asks-c3q.jsonl, logs/tui-asks-a0340.jsonl, logs/tui-asks-e1.jsonl."
+    },
+    {
+      "id": "tui-windows-closed-cleanly",
+      "pass": true,
+      "note": "Window 1 (pid 45940, hwnd 0x8513ac) and window 2 (pid 42352, hwnd 0x91153a) were closed through their own Close button (driver UIA click); the session-owning opencode.exe processes and their conhost.exe parents were gone right after (tui-windows.ps1 listed no window for the session id; Get-Process found neither pid). Window 3 (pid 45236, hwnd 0x19e0c7a) was closed the same way after the stale-notice item; its opencode.exe process and its conhost.exe parent (pid 43180) were gone right after (Get-Process found neither pid). At every close the TUI showed its session idle (turn finished, no 'esc interrupt', nothing running). Sandbox dispatch journal, ids created since the gate began (04:19Z): 6, ending in a terminal row: 6 (terminal/aborted ×5, terminal/completed ×1)."
+    }
+  ]
+}

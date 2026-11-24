@@ -1,0 +1,97 @@
+{
+  "repo": "forge",
+  "name": "@sorenllm/opencode-forge",
+  "version": "0.34.0",
+  "startedAt": "2026-11-24T05:14:22.864Z",
+  "preconditions": {
+    "P1": {
+      "ok": true,
+      "detail": "tarball sorenllm-opencode-forge-0.34.0.tgz sha1 228419ce339a… contents verified 2026-11-24T05:12:59.444Z"
+    },
+    "P2": {
+      "ok": true,
+      "detail": {
+        "evidence": "<ws>\\opencode-forge\\reports\\e2e\\evidence\\0.34.0\\acceptance-gate.json",
+        "acceptedKnown": [],
+        "pass": 31,
+        "fail": 0,
+        "bookedLegs": [
+          "e2e-c1-D1"
+        ],
+        "knownDefects": [],
+        "git": "4f40a50"
+      }
+    },
+    "P3": {
+      "ok": true,
+      "detail": {
+        "latest": "0.33.1",
+        "publishedVersions": 63
+      }
+    },
+    "P4": {
+      "ok": true,
+      "detail": {
+        "head": "4f40a50"
+      }
+    },
+    "P5": {
+      "ok": true,
+      "detail": "authenticated as sorenllm"
+    }
+  },
+  "published": true,
+  "publishExit": 0,
+  "publishOutput": [
+    "\"size\": 250083,",
+    "\"unpackedSize\": 1088602,",
+    "\"shasum\": \"228419ce339aff6920dc6b0c6a078ef1e4b353ea\",",
+    "\"integrity\": \"sha512-tAQgrvF8fg6NjOl7Vs1SjU1DKx2dkPfg73RI85Xlag8lEGlEn/walLLhaNY2ALu/Mj4knEtE65aiAzqkaIMXuQ==\",",
+    "\"filename\": \"sorenllm-opencode-forge-0.34.0.tgz\",",
+    "\"files\": [",
+    "{",
+    "\"path\": \"README.md\",",
+    "\"size\": 118274,",
+    "\"mode\": 420",
+    "},",
+    "{",
+    "\"path\": \"dist/forge.schema.json\",",
+    "\"size\": 6662,",
+    "\"mode\": 420",
+    "},",
+    "{",
+    "\"path\": \"dist/index.js\",",
+    "\"size\": 961363,",
+    "\"mode\": 420",
+    "},",
+    "{",
+    "\"path\": \"package.json\",",
+    "\"size\": 2303,",
+    "\"mode\": 420",
+    "}",
+    "],",
+    "\"entryCount\": 4,",
+    "\"bundled\": []",
+    "}"
+  ],
+  "registryShasum": "228419ce339aff6920dc6b0c6a078ef1e4b353ea",
+  "registryIntegrity": "sha512-tAQgrvF8fg6NjOl7Vs1SjU1DKx2dkPfg73RI85Xlag8lEGlEn/walLLhaNY2ALu/Mj4knEtE65aiAzqkaIMXuQ==",
+  "registryId": "@sorenllm/opencode-forge@0.34.0",
+  "distTags": {
+    "latest": "0.34.0",
+    "at": "2026-11-24T05:17:43.597Z"
+  },
+  "versionDoc": {
+    "shasum": "228419ce339aff6920dc6b0c6a078ef1e4b353ea",
+    "tarball": "https://registry.npmjs.org/@sorenllm/opencode-forge/-/opencode-forge-0.34.0.tgz",
+    "integrity": "sha512-tAQgrvF8fg6NjOl7Vs1SjU1DKx2dkPfg73RI85Xlag8lEGlEn/walLLhaNY2ALu/Mj4knEtE65aiAzqkaIMXuQ=="
+  },
+  "cdnServed": {
+    "sha1": "228419ce339aff6920dc6b0c6a078ef1e4b353ea",
+    "bytes": 250083,
+    "at": "2026-11-24T05:17:47.873Z",
+    "attempts": 1
+  },
+  "finishedAt": "2026-11-24T05:17:47.873Z",
+  "verified": true
+}

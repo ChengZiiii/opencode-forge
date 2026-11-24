@@ -1,0 +1,95 @@
+{
+  "verdict": false,
+  "result": {
+    "pass": false,
+    "checks": {
+      "hostRunsTheShortNotifyInterval": true,
+      "premiseLiveOwnerWasBusyPastTheFirstInterval": true,
+      "controlNoticeIsDeliveredWhileTheDispatchIsLive": true,
+      "premiseOwnerWasBusyPastTheFirstInterval": true,
+      "premiseChildFinishedBeforeTheIdleEdge": true,
+      "premiseStaleChildOutlivedTheFirstNoticeSlice": true,
+      "staleProgressIsNotDelivered": false,
+      "staleOwnerGetsOnlyTheWake": false,
+      "completionWakeStillArrives": true,
+      "liveWakeReportHasNoProgressNotice": false,
+      "staleWakeReportHasNoProgressNotice": false
+    },
+    "details": {
+      "live": {
+        "session": "ses_df490641bffeo30C2R7NKTssZq",
+        "jobId": "j-20261124-024329-5n62cx",
+        "taskCallsSeen": 1,
+        "turnStart": 1795488193558,
+        "turnEnd": 1795488306237,
+        "busyMs": 112679,
+        "firstTurnEndSeen": 1795488370983,
+        "dispatchAt": 1795488209044,
+        "childTerminalAt": 1795488316580,
+        "progressDelivered": 8,
+        "firstProgressAt": 1795488306250,
+        "progressTexts": [
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj) is still running af…",
+          "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj). Final rep…"
+        ],
+        "wakeDelivered": 1,
+        "wakeAt": 1795488354694,
+        "wakeReportFound": true,
+        "wakeReportHasProgress": true,
+        "wakeReportClip": "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024329-5n62cx, child session ses_df4902768ffejRuAIq3MIoxixj) is still running after 1 min — tracking continues; the fina…",
+        "userRowsAfterPrompt": 8,
+        "childOutcome": "completed",
+        "userTimeline": [
+          "02:45:06 PROGRESS",
+          "02:45:28 PROGRESS",
+          "02:45:28 PROGRESS",
+          "02:45:28 PROGRESS",
+          "02:45:28 PROGRESS",
+          "02:45:42 PROGRESS",
+          "02:45:54 PROGRESS",
+          "02:45:54 PROGRESS"
+        ]
+      },
+      "stale": {
+        "session": "ses_df48da4f0ffe0FP7FWXyoeu9LN",
+        "jobId": "j-20261124-024626-9p1e3f",
+        "taskCallsSeen": 1,
+        "turnStart": 1795488373538,
+        "turnEnd": 1795488467349,
+        "busyMs": 93811,
+        "firstTurnEndSeen": 1795488491096,
+        "dispatchAt": 1795488386733,
+        "childTerminalAt": 1795488429441,
+        "progressDelivered": 3,
+        "firstProgressAt": 1795488467360,
+        "progressTexts": [
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024626-9p1e3f, child session ses_df48d714fffeHjwW9h9FvgL7nF) is still running af…",
+          "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024626-9p1e3f, child session ses_df48d714fffeHjwW9h9FvgL7nF) is still running af…",
+          "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261124-024626-9p1e3f, child session ses_df48d714fffeHjwW9h9FvgL7nF). Final rep…"
+        ],
+        "wakeDelivered": 1,
+        "wakeAt": 1795488480815,
+        "wakeReportFound": true,
+        "wakeReportHasProgress": true,
+        "wakeReportClip": "[forge:dispatch-progress] task dispatch to forge-viewe2e-coder (task j-20261124-024626-9p1e3f, child session ses_df48d714fffeHjwW9h9FvgL7nF) is still running after 1 min — tracking continues; the fina…",
+        "userRowsAfterPrompt": 3,
+        "childOutcome": "completed",
+        "userTimeline": [
+          "02:47:47 PROGRESS",
+          "02:48:00 PROGRESS",
+          "02:48:00 PROGRESS"
+        ]
+      },
+      "timelineNote": "the notice is generated at the first poll slice past the interval (≥10 s cadence), i.e. ~15–25 s after dispatch — inside the busy window; its delivery time would have been the owner's first idle edge (firstTurnAssistantAt)."
+    },
+    "error": null
+  },
+  "startedAt": "2026-11-24T02:43:13.501Z",
+  "hostPid": 41880
+}

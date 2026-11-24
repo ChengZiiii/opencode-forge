@@ -1,0 +1,154 @@
+{
+  "host": "http://127.0.0.1:47911",
+  "hostPid": 39988,
+  "startedAt": "2026-11-24T03:42:40.403Z",
+  "legs": [
+    "K1",
+    "K2",
+    "D1"
+  ],
+  "gateLegs": [
+    "K1",
+    "K2",
+    "D1"
+  ],
+  "ownerLocation": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+  "results": {
+    "K1": {
+      "dispatchId": "j-20261124-034243-7wfgl5",
+      "childSessionId": "ses_df459ec59ffepGZvu4N1OfSXoU",
+      "ownerTools": [
+        "execute"
+      ],
+      "childBusyBeforeDelete": true,
+      "childProcsBeforeDelete": 2,
+      "ownerDeleteStatus": 204,
+      "journalState": "terminal",
+      "journalOutcome": "aborted",
+      "journalReason": "registry kill (owner session ended) — the child was aborted and the dispatch is never retried",
+      "ledgerKeepRow": [
+        {
+          "at": "2026-11-24T03:43:14.030Z",
+          "jobId": "j-20261124-034243-7wfgl5",
+          "detail": "owner session ended; registry kill issued (row kept for wake delivery — was: dispatch forge-viewe2e-coder: dispose e2e canary)"
+        }
+      ],
+      "ledgerChildLines": [
+        {
+          "at": "2026-11-24T03:43:14.445Z",
+          "jobId": "j-20261124-034252-tjtlh9",
+          "detail": "owner session ended; tree killed (was: powershell -NoProfile -Command \"Start-Sleep -Seconds 90; Write-Output CHILD-DONE # CH-K1mwu5foyc\")"
+        }
+      ],
+      "childSessionAfter": 404,
+      "childStillActive": false,
+      "pass": true,
+      "wake": "NOT OBSERVABLE on a live host: the owner session is deleted, so the ABORTED wake has no inbox. Its wording is pinned by the dispatch-journal unit test; the same jobWakeText branch is observed live by leg K2."
+    },
+    "K2": {
+      "dispatchId": "j-20261124-034339-ktlcvw",
+      "childSessionId": "ses_df4590fcbffexl4AJ4wRAoR2iI",
+      "ownerTools": [
+        "execute"
+      ],
+      "childBusyAtCancel": true,
+      "cancelCalled": true,
+      "cancelOutput": "[forge:job] Cancelled j-20261124-034339-ktlcvw (agent forge-viewe2e-coder, child session ses_df4590fcbffexl4AJ4wRAoR2iI) — cancelled by the user lever; never retried. the child session ses_df4590fcbffexl4AJ4wRAoR2iI is confirmed idle (the cancellation is REAL, not bookke",
+      "wakeArrived": true,
+      "wakeRole": "user",
+      "wakeNamesAborted": true,
+      "wakeHasFinalReport": false,
+      "wakeScaffolding": false,
+      "wakeHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder — ABORTED (task j-20261124-034339-ktlcvw, child session ses_df4590fcbffexl4AJ4wRAoR2iI): cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried. The child session was aborted; this dispatch di",
+      "journalState": "terminal",
+      "journalOutcome": "aborted",
+      "journalReason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried",
+      "wakeCarriesJournalReasonVerbatim": true,
+      "journalKillClass": "cancel",
+      "wakeKillClass": "cancel",
+      "childIdleAfterAbort": true,
+      "childSessionStatus": 200,
+      "sameKillClass": true,
+      "pass": true
+    },
+    "D1": {
+      "variant": "D1",
+      "gate": true,
+      "dispatchId": "j-20261124-034612-qn5i1g",
+      "childSessionId": "ses_df456b96dffeZWdvXcl4gdB4KQ",
+      "ownerTools": [
+        "execute"
+      ],
+      "evictStatus": 204,
+      "trigger": "evict",
+      "procsBeforeEvict": {
+        "B": 2,
+        "C": 2,
+        "CH": 0
+      },
+      "procsRightAfterEvict": {
+        "B": 2,
+        "C": 2,
+        "CH": 0
+      },
+      "journalStateRightAfter": "started",
+      "journalOutcomeRightAfter": null,
+      "childSessionStatusRightAfter": 200,
+      "ownerLocationLoadedRightAfter": true,
+      "disposeHookProbe": {
+        "ranInWindow": false,
+        "secondsEvictToHook": null,
+        "lines": [],
+        "note": "probe lines are written by the plugin's dispose hook / exit matrix when they run (build 2026-11-23T16:5xZ+); none = neither ran inside this leg's window"
+      },
+      "controlB": {
+        "sid": "ses_df457269effes7iAPWRTSJ2FgY",
+        "marker": "B-D1mwu5jcdg",
+        "jobIds": [
+          "j-20261124-034554-vs5wv8"
+        ],
+        "procsAtStart": 2,
+        "settle": "ran-to-end"
+      },
+      "controlC": {
+        "sid": "ses_df4575d94ffe0YvlrBn4DQfzuK",
+        "marker": "C-D1mwu5jcdg",
+        "jobIds": [
+          "j-20261124-034538-9lwlkf"
+        ],
+        "procsAtStart": 2,
+        "settle": "ran-to-end"
+      },
+      "disposeFired": false,
+      "ledgerLinesSinceEvict": [],
+      "ledgerDisposeLines": 0,
+      "wakeArrived": true,
+      "wakes": 1,
+      "wakeCarriesCanary": true,
+      "wakeHasFinalReport": true,
+      "wakeScaffolding": false,
+      "wakeHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261124-034612-qn5i1g, child session ses_df456b96dffeZWdvXcl4gdB4KQ). Final report: CANARY-D1mwu5jcdg The dispatch is complete — read the report above; no polling, no re-dispatch needed.",
+      "journalFinalState": "terminal",
+      "journalFinalOutcome": "completed",
+      "journalFinalReason": "CANARY-D1mwu5jcdg",
+      "childProcsAtEnd": 0,
+      "F1_otherLocationTreeKilled": false,
+      "pass": false,
+      "inconclusive": "the evict did not kill the control process tree of the evicted location - the plugin dispose hook did not run inside the leg window (probe silent): no verdict on the dispatch exemption"
+    }
+  },
+  "verdict": {
+    "K1": true,
+    "K2": true,
+    "D1": false
+  },
+  "inconclusive": [
+    "D1: the evict did not kill the control process tree of the evicted location - the plugin dispose hook did not run inside the leg window (probe silent): no verdict on the dispatch exemption"
+  ],
+  "verdictAll": false,
+  "cleanup": {
+    "created": 5,
+    "deletedNow": 0,
+    "stillActive": 0
+  }
+}

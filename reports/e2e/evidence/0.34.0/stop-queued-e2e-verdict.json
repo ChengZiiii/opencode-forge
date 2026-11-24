@@ -1,0 +1,99 @@
+{
+  "verdict": true,
+  "result": {
+    "pass": true,
+    "checks": {
+      "premiseThreeStartedTwoQueued": true,
+      "stopCalledAfterTheCommand": true,
+      "receiptNamesTheInFlightGroup": true,
+      "receiptNamesTheQueuedGroupAsCancelled": true,
+      "receiptNeverSaysTheQueueSurvivesStop": true,
+      "queuedNeverSpawned": true,
+      "queuedRowsTerminalAbortedWithTheQueuedSentence": true,
+      "flightRowsTerminalAbortedWithTheLeverSentence": true,
+      "nothingRearmed": true
+    },
+    "details": {
+      "stop": {
+        "commandStatus": 204,
+        "called": true,
+        "callCount": 1,
+        "returned": true,
+        "callMs": 22286,
+        "output": "[forge:job] Stopped 3 in-flight dispatch(es) of this session: - Cancelled j-20261124-035926-nnjaqm (agent forge-viewe2e-coder, child session ses_df44a9b2dffehpUtK6TUAUo4G7) — cancelled by the user lever; never retried. the child session ses_df44a9b2dffehpUtK6TUAUo4G7 is confirmed idle (the cancellation is REAL, not bookkeeping). - Cancelled j-20261124-035926-uszlnu (agent forge-viewe2e-coder, child session ses_df44a9b16ffemTg1lLInB0CxOU) — cancelled by the user lever; never retried. the child session ses_df44a9b16ffemTg1lLInB0CxOU is confirmed idle (the cancellation is REAL, not bookkeeping). - Cancelled j-20261124-035926-qy2l12 (agent forge-viewe2e-coder, child session ses_df44a9af2ffe5W6lSyqjw2nF7W) — cancelled by the user lever; never retried. the child session ses_df44a9af2ffe5W6lSyqjw2nF7W is confirmed idle (the cancellation is REAL, not bookkeeping). [forge:job] Cancelled 2 queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): j-20261124-035927-x419qz, j-20261124-035927-c22408"
+      },
+      "premise": {
+        "ids": [
+          "j-20261124-035926-nnjaqm",
+          "j-20261124-035926-uszlnu",
+          "j-20261124-035926-qy2l12",
+          "j-20261124-035927-x419qz",
+          "j-20261124-035927-c22408"
+        ],
+        "states": {
+          "j-20261124-035926-nnjaqm": "started",
+          "j-20261124-035926-uszlnu": "started",
+          "j-20261124-035926-qy2l12": "started",
+          "j-20261124-035927-x419qz": "queued",
+          "j-20261124-035927-c22408": "queued"
+        },
+        "queuedIds": [
+          "j-20261124-035927-x419qz",
+          "j-20261124-035927-c22408"
+        ],
+        "flightIds": [
+          "j-20261124-035926-nnjaqm",
+          "j-20261124-035926-uszlnu",
+          "j-20261124-035926-qy2l12"
+        ],
+        "childrenBefore": 3,
+        "dispatchTurnMs": 66516
+      },
+      "after": {
+        "childrenBefore": [
+          "ses_df44a9af2ffe5W6lSyqjw2nF7W",
+          "ses_df44a9b16ffemTg1lLInB0CxOU",
+          "ses_df44a9b2dffehpUtK6TUAUo4G7"
+        ],
+        "childrenAfter": [
+          "ses_df44a9af2ffe5W6lSyqjw2nF7W",
+          "ses_df44a9b16ffemTg1lLInB0CxOU",
+          "ses_df44a9b2dffehpUtK6TUAUo4G7"
+        ],
+        "newChildren": [],
+        "rows": {
+          "j-20261124-035926-nnjaqm": {
+            "state": "terminal",
+            "outcome": "aborted",
+            "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+          },
+          "j-20261124-035926-uszlnu": {
+            "state": "terminal",
+            "outcome": "aborted",
+            "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+          },
+          "j-20261124-035926-qy2l12": {
+            "state": "terminal",
+            "outcome": "aborted",
+            "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+          },
+          "j-20261124-035927-x419qz": {
+            "state": "terminal",
+            "outcome": "aborted",
+            "reason": "cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried"
+          },
+          "j-20261124-035927-c22408": {
+            "state": "terminal",
+            "outcome": "aborted",
+            "reason": "cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried"
+          }
+        },
+        "childrenStillBusy": []
+      }
+    },
+    "error": null,
+    "premise": null
+  },
+  "startedAt": "2026-11-24T03:58:50.925Z",
+  "hostPid": 39988
+}

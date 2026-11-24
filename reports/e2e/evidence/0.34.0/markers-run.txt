@@ -1,0 +1,43 @@
+PASS  present x1  "cancelled by the user lever (/forge stop) ? the child was aborted and the dispatch is never retried"  ? C1 USER_LEVER_ABORT_REASON (wiring ???b?, E2E 12 + K2)
+PASS  present x1  "registry kill (owner session ended) ? the child was aborted and the dispatch is never retried"  ? C1 REGISTRY_KILL_ABORT_REASON (dispatch-journal, E2E K1)
+PASS  present x1  "killed by the explicit forge_jobs kill action ? the child was aborted and the dispatch is never retried"  ? C1 EXPLICIT_KILL_ABORT_REASON (wiring ??a?b?c)
+PASS  absent  x0  "registry kill (owner session ended / dispose) ? user abort"  ? C1 retired journal literal (the two sides used to differ)
+PASS  absent  x0  "owner session ended / user cancel"  ? C1 retired wake constant
+PASS  present x1  "? ABORTED (task "  ? C1 aborted wake wording (jobWakeText)
+PASS  present x2  "abort unconfirmed ? child may still be running"  ? C1 unconfirmed-abort disclosure (journal + wake)
+PASS  present x1  "the abort call had not returned within "  ? C1 hung-abort note (wiring ?c)
+PASS  present x1  "did NOT finish and produced no final report"  ? C1 no-report disclosure
+PASS  present x2  "No async dispatches in flight for this session"  ? C3 stop no-op receipt
+PASS  present x1  "in-flight dispatch(es) of this session"  ? C3 stop receipt (E2E 12)
+PASS  absent  x0  "queued wish(es) of this session were NOT in flight and are not cancelled by stop"  ? 0.34.0 C retired: stop no longer leaves queued wishes alive (was C3 wiring ?)
+PASS  present x1  "cancel \"all\" is retired ? use action \"stop\""  ? C3 no host-wide cancel verb
+PASS  present x1  "cancels THIS session's in-flight and queued dispatches"  ? 0.34.0 C cancel-all redirect names the queued half too
+PASS  absent  x0  "forge-cancel"  ? C3 retired hyphen command
+PASS  absent  x0  "forge-sync"  ? C3 retired hyphen command
+PASS  absent  x0  "forge-init"  ? C3 retired hyphen command
+PASS  present x1  "is confirmed idle (the cancellation is REAL, not bookkeeping)"  ? cancel receipt: confirmed idle (E2E 12)
+PASS  present x1  "did NOT reach idle within "  ? cancel receipt: resisted
+PASS  present x1  "state could not be read to confirm idle"  ? cancel receipt: unresolved (wiring ?)
+PASS  present x1  "/api/session/active"  ? v2 active-session view (cancel idle assertion + C5 walker)
+PASS  present x2  "completion gate passed (plugin-verified)"  ? C2 close reason on disk (E2E 14, headed TUI)
+PASS  present x1  "frozen verification items re-run passing at the gate"  ? C2 plan_close output (E2E 14)
+PASS  present x1  "FORGE_CREW_NATIVE_CHILD_CEILING_MS"  ? C5 ceiling knob
+PASS  present x1  "FORGE_CREW_NATIVE_CHILD_RECHECK_MS"  ? C5 suppression re-check knob
+PASS  present x14  "[forge:dispatch-complete]"  ? the completion wake header
+PASS  present x2  "QUEUED (queue position "  ? queued handle wording (wiring cap test)
+PASS  absent  x0  "[object Object]"  ? never rendered into a journal reason (executionErrorDetail)
+PASS  present x1  "GATE_PERMISSION_KEYS.filter("  ? F v2 door set derived from GATE_PERMISSION_KEYS (crew_close included)
+PASS  present x1  "Abandon crew: "  ? F crew_close abandon ask title (E2E 16, headed TUI)
+PASS  present x1  "Close crew: "  ? F crew_close report ask title (E2E 16, headed TUI)
+PASS  present x1  "[forge] The host gave no workspace for this session (no directory in the session record), so this call ran in the plugin's default directory"  ? A the default-directory note (a call that fell back is told so; E2E 17)
+PASS  present x1  "[forge:job] NOT STARTED ? spawn failed; nothing was executed."  ? B foreground not-started form (E2E 18)
+PASS  present x1  "NOT STARTED ? spawn failed; nothing was executed (terminal state: "  ? B forge_jobs poll first sentence (E2E 18)
+PASS  present x1  "FORGE_TEST_RUNTIME_DIR"  ? runtime namespace redirect variable (production never sets it)
+PASS  present x1  "queued wish(es) of this session ? removed from the queue before they could spawn (nothing was running for them): "  ? 0.34.0 C receipt: cancelled queued wishes as their own line (E2E 19)
+PASS  present x1  "cancelled by the user lever (/forge stop) ? the wish was still queued: nothing was spawned and the dispatch is never retried"  ? 0.34.0 C STOP_QUEUED_REASON journal sentence (E2E 19)
+PASS  present x1  "cancelled by the user lever (/forge stop) ? the wish was leaving the queue when stop arrived: it was never prompted and the dispatch is never retried"  ? 0.34.0 C D5 STOP_DEQUEUED_REASON journal sentence (a wish cancelled while being spawned)
+PASS  present x1  "queued wish(es) of this session were still being started when the lever stopped waiting"  ? 0.34.0 C D5 the lever's still-being-started line
+PASS  present x1  "FORGE_STOP_SETTLE_MS"  ? 0.34.0 C D5 the lever's bounded wait knob (tests only)
+PASS  present x5  "dispatchProgressDropped"  ? 0.34.0 E the delivery-time liveness filter (drop-side record)
+PASS  present x2  "dispatchReportTail"  ? 0.34.0 E the wake's report block strips progress notices (E2E 20)
+-- 42/42 markers OK in C:\Users\Soren\Desktop\AgentWorkCommon\opencode_plugin_dev\opencode-forge\dist\index.js (944845 chars)

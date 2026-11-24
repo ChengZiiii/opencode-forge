@@ -1,0 +1,56 @@
+{
+  "at": "2026-11-24T05:21:21.370Z",
+  "label": "0340",
+  "stale": {
+    "id": "1795487595035",
+    "version": "0.33.1",
+    "distSha256": "e10722f05a28a87be689c1f74fdad7c542cd3864048ef5c11e912ca42571c313"
+  },
+  "newVersion": "0.34.0",
+  "moved": true,
+  "checks": {
+    "one-live-copy": {
+      "ok": true,
+      "detail": "live dirs under opencode-forge@latest: [\"1795487595035\"]"
+    },
+    "stale-copy-is-the-known-build": {
+      "ok": true,
+      "detail": "version=0.33.1 dist=e10722f05a28a87b"
+    },
+    "registry-latest": {
+      "ok": true,
+      "detail": "dist-tags.latest = 0.34.0"
+    },
+    "cdn-serves-verified-tarball": {
+      "ok": true,
+      "detail": "served sha1 228419ce339a… = packed 228419ce339a…"
+    },
+    "quarantine-dir-exists": {
+      "ok": true,
+      "detail": "C:\\Users\\Soren\\.cache\\opencode\\npm\\_quarantine"
+    },
+    "destination-free": {
+      "ok": true,
+      "detail": "C:\\Users\\Soren\\.cache\\opencode\\npm\\_quarantine\\opencode-forge@latest-1795487595035-0.33.1"
+    },
+    "move": {
+      "ok": true,
+      "detail": "1795487595035 -> _quarantine\\opencode-forge@latest-1795487595035-0.33.1"
+    },
+    "source-gone": {
+      "ok": true,
+      "detail": "C:\\Users\\Soren\\.cache\\opencode\\npm\\@sorenllm\\opencode-forge@latest\\1795487595035"
+    },
+    "destination-intact": {
+      "ok": true,
+      "detail": "version=0.33.1 dist=e10722f05a28a87b"
+    },
+    "latest-now-empty": {
+      "ok": true,
+      "detail": "live dirs now: []"
+    }
+  },
+  "destination": "C:\\Users\\Soren\\.cache\\opencode\\npm\\_quarantine\\opencode-forge@latest-1795487595035-0.33.1",
+  "rollback": "move \"C:\\Users\\Soren\\.cache\\opencode\\npm\\_quarantine\\opencode-forge@latest-1795487595035-0.33.1\" back to \"C:\\Users\\Soren\\.cache\\opencode\\npm\\@sorenllm\\opencode-forge@latest\\1795487595035\" (undo: the host then reuses 0.33.1 again)",
+  "finishedAt": "2026-11-24T05:21:26.143Z"
+}
