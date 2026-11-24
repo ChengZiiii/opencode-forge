@@ -72,6 +72,23 @@ OpenSpec spec workflows remain a third, separate lane.
   stale dialog cannot approve the refused call). The plugin NEVER
   auto-approves. This exists because of a real incident: a TUI wedge where
   the dialog never rendered and `goal_write` hung forever.
+- **A confirmation dialog reaches the session that asked (hosts with more
+  than one directory)**: an opencode v2 host runs one instance per project
+  directory, each with its own pending-permission table, and a terminal
+  reads and answers a session's requests only through that session's own
+  directory. The plugin's tools confirm through the interface of the
+  plugin initialization that registered them — the one of the session's
+  directory — never through a shared one. With several directories loaded
+  at once (several TUI tabs, a pooled worktree, a second project) the
+  dialog shows up where the call was made **and the answer given there
+  reaches it**, and the host evicting one directory's idle instance does
+  not break the gates or `forge_shell` of any other. (Before 0.34.1 one
+  shared interface filed every directory's requests in the table of the
+  directory initialized last: the dialog still popped up — a terminal
+  hears of a new request through a host event — but the answer could not
+  find the request, the dialog vanished and the gate waited out its
+  watchdog.) A door whose directory has no confirmation interface refuses
+  by name (fail-closed: nothing is approved, nothing executes).
 - Goal files: `.opencode/goal/<date>-<slug>.md`, state machine
   `queued → active ⇄ paused → completed / abandoned`, one live goal per
   session plus a workspace queue. Completion is **verified by the plugin**,

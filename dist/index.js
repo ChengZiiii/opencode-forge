@@ -19183,6 +19183,9 @@ var planTickTool = tool({
   }
 });
 async function gate(ask, permission, title) {
+  if (typeof ask !== "function") {
+    throw new Error(`[forge:gate] The ${permission} confirmation gate has no confirmation channel on this host (the plugin's initialization for this directory captured no permission interface), so "${title}" was REFUSED (fail-closed; state is unchanged, nothing was approved).`);
+  }
   const watchdogMs = resolveGateAskWatchdogMs();
   if (watchdogMs <= 0) {
     await ask({ permission, patterns: ["*"], always: [], metadata: { title } });
@@ -23677,7 +23680,6 @@ function wrapV2ToolResult(res) {
   }
   return { content: res };
 }
-var v2PermissionAssertFn = null;
 var v2SessionRuleApi = null;
 var SESSION_RESCUE_RULE = { action: "forge_shell", resource: "*", effect: "allow" };
 var sessionRescueInjected = new Set;
@@ -23788,7 +23790,7 @@ async function hostSessionDirectory(anchorClient, sessionID) {
   }
   return "";
 }
-async function v2ToolContext(raw, anchorClient = anchorClientShared) {
+async function v2ToolContext(raw, anchorClient = anchorClientShared, assertFn = null) {
   const c = raw ?? {};
   const pickStr = (...keys) => {
     for (const k of keys) {
@@ -23813,10 +23815,11 @@ async function v2ToolContext(raw, anchorClient = anchorClientShared) {
     if (typeof out.sessionID === "string" && out.sessionID)
       defaultDirectory = hostWorktree || null;
   }
-  if (typeof out.ask !== "function" && v2PermissionAssertFn && typeof out.sessionID === "string" && out.sessionID) {
+  if (typeof out.ask !== "function" && assertFn && typeof out.sessionID === "string" && out.sessionID) {
     const sid = out.sessionID;
     const agentId = typeof out.agent === "string" && out.agent ? out.agent : undefined;
-    out.ask = (askInput) => v2PermissionAssertFn({
+    const askHost = assertFn;
+    out.ask = (askInput) => askHost({
       sessionID: sid,
       ...agentId !== undefined ? { agent: agentId } : {},
       action: askInput.permission,
@@ -23838,7 +23841,7 @@ ${V2_DEFAULT_DIRECTORY_NOTE}: ${defaultDirectory}` };
 }
 var __sessionAnchorTestSurface = {
   hostSessionDirectory,
-  resolveToolContext: (raw, anchorClient) => v2ToolContext(raw, anchorClient ?? undefined),
+  resolveToolContext: (raw, anchorClient, assertFn) => v2ToolContext(raw, anchorClient ?? undefined, assertFn ?? null),
   worktreeOf: (sessionID) => sessions.get(sessionID)?.worktree ?? null,
   bindChildToDirectory,
   sessionAnchorLedgerPath,
@@ -24802,6 +24805,7 @@ async function v2Setup(ctx, deps) {
   }
   if (typeof ctx.tool?.transform === "function") {
     const toolAnchor = v2AnchorClient(ctx);
+    const toolAssert = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission.assert(input) : null;
     try {
       await ctx.tool.transform(async (editor) => {
         if (typeof editor?.add !== "function")
@@ -24813,7 +24817,7 @@ async function v2Setup(ctx, deps) {
             description: typeof d.description === "string" ? d.description : name,
             input: v2ToolInputSchema(d.args),
             async execute(args, toolCtx) {
-              const { context, defaultDirectory } = await v2ToolContext(toolCtx, toolAnchor);
+              const { context, defaultDirectory } = await v2ToolContext(toolCtx, toolAnchor, toolAssert);
               const res = await d.execute?.(args, context);
               return nameDefaultDirectory(wrapV2ToolResult(res), defaultDirectory);
             }
@@ -24823,7 +24827,6 @@ async function v2Setup(ctx, deps) {
     } catch {}
   }
   v2RegisterPermissionBelt(ctx);
-  v2PermissionAssertFn = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission.assert(input) : null;
   if (typeof ctx.session?.get === "function" && typeof ctx.session.update === "function") {
     const rawGet = ctx.session.get.bind(ctx.session);
     const rawUpdate = ctx.session.update.bind(ctx.session);

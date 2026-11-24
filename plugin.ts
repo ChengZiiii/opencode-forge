@@ -1994,6 +1994,15 @@ type AskFn = (input: {
 // so a door cannot be added without also joining the list the v2 permission
 // belt derives its doors from.
 export async function gate(ask: AskFn, permission: GatePermissionKey, title: string): Promise<void> {
+  // fix-ask-door-multi-directory-host D3: a door with no confirmation
+  // channel — the initialization that registered this tool captured no
+  // host permission interface — refuses by name. Fail-closed: nothing is
+  // approved and nothing executes; never a bare "ask is not a function".
+  if (typeof ask !== "function") {
+    throw new Error(
+      `[forge:gate] The ${permission} confirmation gate has no confirmation channel on this host (the plugin's initialization for this directory captured no permission interface), so "${title}" was REFUSED (fail-closed; state is unchanged, nothing was approved).`,
+    )
+  }
   const watchdogMs = resolveGateAskWatchdogMs()
   // Gated-ask watchdog (dispatch-cancel-lifecycle, gate-asks spec): every
   // door awaits THIS choke point, so the watchdog is one timed race. When
@@ -8873,10 +8882,13 @@ function wrapV2ToolResult(res: unknown): { content: unknown; title?: unknown } {
 // map to ctx.permission.assert(input) ("evaluates rules and prompts the
 // user, resolves when allowed, rejects with Tool.Error on deny") — the
 // adapter below synthesizes the AskFn the shared cores expect from the
-// permission domain captured at setup. worktree falls back to the
+// permission interface of the initialization that REGISTERED the tool
+// (fix-ask-door-multi-directory-host: never a module-level "latest init"
+// seam — on a multi-directory host that is another directory's interface,
+// or an evicted one's). worktree falls back to the
 // session-bound map then the host anchor. metadata defaults to a no-op so
 // ungated cores run.
-let v2PermissionAssertFn: ((input: unknown) => Promise<void>) | null = null
+type V2AssertFn = (input: unknown) => Promise<void>
 
 // worker-shell-session-allow D2/D4 — the documented session-rule rescue.
 // The host's permission assert evaluates the calling agent at the PLUGIN
@@ -9032,7 +9044,7 @@ async function hostSessionDirectory(anchorClient: V2AnchorReader, sessionID: str
 
 type V2ToolContextResolution = { context: Record<string, unknown>; defaultDirectory: string | null }
 
-async function v2ToolContext(raw: unknown, anchorClient: V2AnchorReader = anchorClientShared): Promise<V2ToolContextResolution> {
+async function v2ToolContext(raw: unknown, anchorClient: V2AnchorReader = anchorClientShared, assertFn: V2AssertFn | null = null): Promise<V2ToolContextResolution> {
   const c = (raw ?? {}) as Record<string, unknown>
   const pickStr = (...keys: string[]): string | undefined => {
     for (const k of keys) {
@@ -9058,11 +9070,18 @@ async function v2ToolContext(raw: unknown, anchorClient: V2AnchorReader = anchor
     out.worktree = hostWorktree
     if (typeof out.sessionID === "string" && out.sessionID) defaultDirectory = hostWorktree || null
   }
-  if (typeof out.ask !== "function" && v2PermissionAssertFn && typeof out.sessionID === "string" && out.sessionID) {
+  // fix-ask-door-multi-directory-host D2: the ask behind every door and
+  // behind forge_shell goes through the interface the REGISTERING
+  // initialization handed in — the one bound to the directory whose
+  // sessions run this closure. Given none, no ask is synthesized and the
+  // door refuses by name in gate() (fail-closed). There is deliberately NO
+  // fallback to "the latest initialization's" interface.
+  if (typeof out.ask !== "function" && assertFn && typeof out.sessionID === "string" && out.sessionID) {
     const sid = out.sessionID
     const agentId = typeof out.agent === "string" && out.agent ? out.agent : undefined
+    const askHost = assertFn
     out.ask = (askInput: { permission: string; patterns: string[]; metadata: Record<string, unknown> }) =>
-      v2PermissionAssertFn!({
+      askHost({
         sessionID: sid,
         ...(agentId !== undefined ? { agent: agentId } : {}),
         action: askInput.permission,
@@ -9089,7 +9108,7 @@ function nameDefaultDirectory(wrapped: { content: unknown; title?: unknown }, de
 // production path.
 export const __sessionAnchorTestSurface = {
   hostSessionDirectory,
-  resolveToolContext: (raw: unknown, anchorClient?: V2AnchorReader) => v2ToolContext(raw, anchorClient ?? undefined),
+  resolveToolContext: (raw: unknown, anchorClient?: V2AnchorReader, assertFn?: V2AssertFn | null) => v2ToolContext(raw, anchorClient ?? undefined, assertFn ?? null),
   worktreeOf: (sessionID: string): string | null => sessions.get(sessionID)?.worktree ?? null,
   bindChildToDirectory,
   sessionAnchorLedgerPath,
@@ -10619,6 +10638,15 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
     // module-level "latest init" client belongs to another directory (or to
     // an evicted instance) on a multi-directory host.
     const toolAnchor = v2AnchorClient(ctx)
+    // fix-ask-door-multi-directory-host D2: the ask bridge behind every door
+    // and forge_shell is THIS initialization's own ctx.permission.assert —
+    // the interface bound to the directory instance whose sessions run these
+    // closures. A module-level "latest init" seam sent every directory's
+    // asks to the last-initialized directory's pending table (that other
+    // terminal never saw them), and died for EVERY directory once that one
+    // was evicted. Read exactly as the seam used to be; only the scope
+    // changed — this initialization, never the module.
+    const toolAssert: V2AssertFn | null = typeof ctx.permission?.assert === "function" ? (input: unknown) => ctx.permission!.assert!(input) : null
     try {
       await ctx.tool.transform(async (editor) => {
         if (typeof editor?.add !== "function") return
@@ -10633,7 +10661,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
             description: typeof d.description === "string" ? d.description : name,
             input: v2ToolInputSchema(d.args),
             async execute(args: unknown, toolCtx: unknown) {
-              const { context, defaultDirectory } = await v2ToolContext(toolCtx, toolAnchor)
+              const { context, defaultDirectory } = await v2ToolContext(toolCtx, toolAnchor, toolAssert)
               const res = await d.execute?.(args, context)
               return nameDefaultDirectory(wrapV2ToolResult(res), defaultDirectory)
             },
@@ -10649,14 +10677,13 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // ("evaluate") — doors keep a REAL ask (explicit deny stands), draft
   // write-freeze denies, forge_shell passes through untouched. Same
   // decision table as the v1 permission.ask hook; W6a pinned the event to
-  // the real PermissionEvaluation shape (effect mutation). The assert
-  // seam captured here backs the tool cores' ask adapter
-  // (v2ToolContext): the v1 ask-callback decision gates —
-  // plan_approve/goal_write(arm)/goal_complete/goal_resume/
-  // goal_discard/crew_close — map to ctx.permission.assert; pure
-  // classification/refusal stays evaluate-mutation.
+  // the real PermissionEvaluation shape (effect mutation). The v1
+  // ask-callback decision gates — plan_approve/goal_write(arm)/
+  // goal_complete/goal_resume/goal_discard/crew_close — map to
+  // ctx.permission.assert; that bridge is captured per initialization in
+  // the tool block above (fix-ask-door-multi-directory-host), never here
+  // as module state. Pure classification/refusal stays evaluate-mutation.
   v2RegisterPermissionBelt(ctx)
-  v2PermissionAssertFn = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission!.assert!(input) : null
   // worker-shell-session-allow D2/D4: capture the documented session-rule
   // surface (source-verified on 2.3.2: host.ts routes update.permissions to
   // sessions.setPermissions). The belt's read-back-merge lives in
