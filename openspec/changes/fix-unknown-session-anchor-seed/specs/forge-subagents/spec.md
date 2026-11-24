@@ -74,4 +74,4 @@ The same resolution SHALL hold wherever the plugin applies a rule that depends o
 #### Scenario: The state-file boundary has no base for a session it cannot place
 
 - **WHEN** a non-forge agent's session with no in-memory binding calls `write` or `edit` with a relative path on a host that initialized more than one location, and the host's session record yields no directory for the session
-- **THEN** the path is not resolved against any other directory, and the call is not refused by this check
+- **THEN** the path is not resolved against any other directory: one that would land inside a state directory only when read from some particular working directory is not refused by this check, while one that names a state directory by its own spelling — it lands there from every working directory — is still refused, since that verdict needs no base directory

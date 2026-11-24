@@ -20,16 +20,24 @@ import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 process.env.FORGE_TEST_NO_FENCE = "1"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 
-import { __permissionDoorsTestSurface, v2Setup } from "../plugin.ts"
+import { __permissionDoorsTestSurface, __sessionAnchorTestSurface, v2Setup } from "../plugin.ts"
 
 const HOME = join(tmpdir(), "forge-v2-perm-home")
 process.env.FORGE_TEST_FORGE_HOME = HOME
 
 // One belt setup bound to its own worktree (hostWorktree = anchor ⇒
 // stateForBan binds unknown sessions to this dir, like a v1 host launch).
+// fix-unknown-session-anchor-seed (design D1): the plugin module is shared by
+// every setup in this file, and a process that has initialized TWO
+// directories stops seeding (that seed bound real sessions to another
+// directory's workspace). The reset restores the premise this helper states
+// — each setup is a fresh single-directory process — so the assertions below
+// keep testing what they were written to test. The multi-directory belt is
+// tests/session-anchor-seed-multidir.test.mjs (P1).
 async function beltSetup() {
   const dir = mkdtempSync(join(tmpdir(), "forge-v2-perm-ws-"))
   const { ctx, state } = createV2MockContext()
+  __sessionAnchorTestSurface.resetInitializedDirectories()
   await v2Setup(ctx, { anchors: [dir] })
   return { dir, state, ctx, cb: state.permissionHooks[0]?.cb }
 }

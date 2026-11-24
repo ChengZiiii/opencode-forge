@@ -1747,8 +1747,13 @@ async function crewComplianceRefusalFor(anchorClient: { session?: { get?: (opts:
 // (BOTH dispatch modes, both surfaces); every other target — write-shape
 // workers, native agents, absent/unresolvable targets — is denied with the
 // dispatchable readonly roster and the exits.
-function draftDispatchRefusal(sessionID: string | undefined, target: string | undefined): string | null {
-  const state = stateForBan(sessionID)
+//
+// fix-unknown-session-anchor-seed (design D2): the draft-shape verdict over
+// an ALREADY-RESOLVED state. Async callers resolve the session first
+// (stateForCheck — host record on a multi-directory process) and judge this;
+// the synchronous wrapper below keeps the v1 belt's signature and its
+// single-directory seeding.
+function draftDispatchRefusalForState(state: SessionState | null, target: string | undefined): string | null {
   const active = state ? resolveActivePlan(state) : null
   if (!(active && active.doc.status === "draft")) return null
   const agentId = target !== undefined && target.toLowerCase().startsWith("forge-") ? target.slice("forge-".length) : undefined
@@ -1770,6 +1775,10 @@ function draftDispatchRefusal(sessionID: string | undefined, target: string | un
       : `No readonly worker is configured — define one in forge.json with an explicit "shape": "readonly" to enable draft-phase reconnaissance. `) +
     `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`
   )
+}
+
+function draftDispatchRefusal(sessionID: string | undefined, target: string | undefined): string | null {
+  return draftDispatchRefusalForState(stateForBan(sessionID), target)
 }
 
 const WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"])
@@ -3615,7 +3624,12 @@ async function pumpDequeuedWishes(client: DispatchClient, sessionID: string, run
       cancelDequeuedByStop(client, wish, undefined)
       continue
     }
-    const draftRefusal = draftDispatchRefusal(sessionID, wish.agentID)
+    // fix-unknown-session-anchor-seed D2: resolve the owner (host record on a
+    // multi-directory process) BEFORE the draft verdict — the queued wish's
+    // owner may be a session this process has never bound. Read through the
+    // dispatch's OWN client (the function parameter), never a module-level
+    // "latest init" seam.
+    const draftRefusal = draftDispatchRefusalForState(await stateForCheck(sessionID, anchorReaderOf(client)), wish.agentID)
     if (draftRefusal) {
       failQueuedWishHonestly(wish, draftRefusal)
       continue
@@ -4076,7 +4090,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
       // journal — its ONLY source after a restart — plus the preamble).
       const refusal =
         crewPendingRefusal(rec.ownerSession) ??
-        draftDispatchRefusal(rec.ownerSession, rec.agent) ??
+        draftDispatchRefusalForState(await stateForCheck(rec.ownerSession, anchorReaderOf(client)), rec.agent) ??
         forgeTargetUnresolved(rec.agent)
       if (refusal) {
         journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`)
@@ -5047,7 +5061,9 @@ async function runAsyncDispatchPoller(
         // way the original spawn applied them (crew belt + draft gate; the
         // mode-keyed question deny rides the create body below).
         const refusal =
-          crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID) ?? forgeTargetUnresolved(agentID)
+          crewPendingRefusal(job.ownerSession) ??
+          draftDispatchRefusalForState(await stateForCheck(job.ownerSession, anchorReaderOf(client)), agentID) ??
+          forgeTargetUnresolved(agentID)
         if (refusal) {
           text = `(retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
           exitCode = 1
@@ -5376,6 +5392,15 @@ const taskDispatchTool = tool({
     const prompt = promptRaw ? withReportDelivery(promptRaw, dispatchId) : ""
     const runInBackground = args.run_in_background === true
     if (!target || !prompt) throw new Error("[forge:dispatch] subagent_type and prompt are both required.")
+    // fix-unknown-session-anchor-seed (design D4): the caller's directory is
+    // resolved from the host's session record BEFORE any gate below can
+    // refuse. On a multi-directory process a dispatch refused by any gate
+    // can then only leave the caller bound to its OWN directory — the host
+    // record's — never to the last-initialized one. Single-directory
+    // processes seed exactly as before. The read goes through the rebind
+    // client the accepted path below already uses; with no client, or when
+    // the host gives nothing, the caller stays unbound (fail-open).
+    await stateForCheck(context.sessionID, sharedAnchorClient())
     const forgeTarget = target.toLowerCase().startsWith("forge-")
     // Tool-partition family gates, enforced in-execute (belt parity with
     // tool.execute.before): forge-* workers hit the primary-only refusal
@@ -5423,7 +5448,7 @@ const taskDispatchTool = tool({
         )
       }
     }
-    const draftRefusal = draftDispatchRefusal(context.sessionID, target)
+    const draftRefusal = draftDispatchRefusalForState(await stateForCheck(context.sessionID, sharedAnchorClient()), target)
     if (draftRefusal) throw new Error(draftRefusal)
     // Fold D (cap queueing): at the cap of 3 RUNNING dispatches the wish no
     // longer refuses — it QUEUES (per-session FIFO, bounded
@@ -5754,7 +5779,12 @@ const taskDispatchTool = tool({
             await new Promise((resolve) => setTimeout(resolve, retryBackoffSync))
             const refusal =
               crewPendingRefusal(context.sessionID) ??
-              draftDispatchRefusal(context.sessionID, target) ??
+              // fix-unknown-session-anchor-seed D2: the sync-wait retry's
+              // respawn re-judges the draft through the same resolver as the
+              // async poller's (the caller is normally bound since the
+              // pre-gate resolution above; this covers an owner the host
+              // could only resolve later).
+              draftDispatchRefusalForState(await stateForCheck(context.sessionID, sharedAnchorClient()), target) ??
               forgeTargetUnresolved(target)
             if (refusal) {
               journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`)
@@ -6390,7 +6420,10 @@ const crewBeginTool = tool({
   },
   execute: async (args, context) => {
     noteToolAgent(context)
-    const state = stateForBan(context.sessionID)
+    // fix-unknown-session-anchor-seed D2: an unknown session is judged by
+    // its OWN directory (host record on a multi-directory process) — without
+    // the seed it would otherwise not be judged at all.
+    const state = await stateForCheck(context.sessionID, sharedAnchorClient())
     const active = state ? resolveActivePlan(state) : null
     if (active && active.doc.status === "draft") {
       throw new Error(
@@ -6784,14 +6817,71 @@ function forgeTools(): Record<string, ToolDefinition> {
 // neither field (harmless: belt only).
 let hostWorktree = ""
 
-// Bind a session for ban lookups: known state, or seeded from the launch
-// worktree. Returns null only when nothing is known about the session.
+// fix-unknown-session-anchor-seed (design D1): the directories THIS process
+// has initialized through the v2 setup entry — the same non-root anchor that
+// feeds hostWorktree on every initialization. On a multi-directory host
+// "the last initialized directory" is another directory's, so it must never
+// decide where a session the plugin does not know lives. The set is the ONE
+// switch for launch-directory seeding: empty (a v1 host — v2Setup never runs)
+// or one entry (a single-directory v2 host) seeds exactly as before; two or
+// more never seed. Eviction does not shrink the set: this host generation's
+// eviction signals are unreliable (location.shutdown is not emitted; a
+// healthy location's build.close does not run), so a process that has ever
+// initialized a second directory stays multi-directory for the rest of its
+// life — the fail-safe direction (an unresolved session, never a wrong one).
+const v2InitializedDirs = new Set<string>()
+
+function banSeedAllowed(): boolean {
+  return v2InitializedDirs.size <= 1
+}
+
+// Bind a session for ban lookups: known state, or — on a single-directory
+// process only — seeded from the launch worktree. Returns null only when
+// nothing is known about the session.
 function stateForBan(sessionID: string | undefined): SessionState | null {
   if (!sessionID) return null
   const existing = sessions.get(sessionID)
   if (existing) return existing
-  if (!hostWorktree) return null
+  if (!hostWorktree || !banSeedAllowed()) return null
   return ensureSession(sessionID, hostWorktree)
+}
+
+// fix-unknown-session-anchor-seed (design D2): the async resolver every seam
+// that can await uses BEFORE it judges a session. A known session is
+// returned as is. On a single-directory process an unknown session seeds
+// exactly as stateForBan does. On a multi-directory process an unknown
+// session is resolved from the HOST's own session record (the session's own
+// directory, else the same read on each parentID up the chain — the tool
+// bodies' chain), read through the client the calling seam owns, and bound
+// by the tool bodies' own write path. When the host gives nothing the
+// session stays UNBOUND: null, never a guess, never a default directory.
+async function stateForCheck(sessionID: string | undefined, anchorClient: V2AnchorReader | null | undefined): Promise<SessionState | null> {
+  if (!sessionID) return null
+  const known = stateForBan(sessionID)
+  if (known) return known
+  // Single-directory process (a v1 host included): stateForBan has either
+  // seeded above, or there is no launch directory to seed from. The host
+  // record is not consulted — the pre-change behavior, exactly.
+  if (banSeedAllowed()) return null
+  const directory = await hostSessionDirectory(anchorClient ?? null, sessionID)
+  return directory ? ensureSession(sessionID, directory) : null
+}
+
+// fix-unknown-session-anchor-seed (design D3): the base directory a
+// RELATIVE path is resolved against by the state-file boundary. The launch
+// directory is a base on a single-directory process only — on a
+// multi-directory process an unbound session has no base, and the boundary
+// judges the path by its own spelling (see the seam) instead of joining it
+// onto another directory's.
+function banBaseDirectory(state: SessionState | null): string {
+  return state?.worktree ?? (banSeedAllowed() ? hostWorktree : "")
+}
+
+// A dispatch client's session.get declares its REST-ish argument type; the
+// anchor reader types the same call's parameter as unknown. The runtime call
+// is the same { path: { id } } either way — one cast, in one place.
+function anchorReaderOf(client: unknown): V2AnchorReader {
+  return client as V2AnchorReader
 }
 
 // ---------------------------------------------------------------------------
@@ -9113,6 +9203,17 @@ export const __sessionAnchorTestSurface = {
   bindChildToDirectory,
   sessionAnchorLedgerPath,
   noteLedgerBinding: noteSessionAnchorLedgerBinding,
+  // fix-unknown-session-anchor-seed: the seed switch, the async resolver and
+  // the boundary base, for the unit tests. Nothing here runs in a
+  // production path.
+  initializedDirectories: (): string[] => [...v2InitializedDirs],
+  resetInitializedDirectories: (): void => {
+    v2InitializedDirs.clear()
+  },
+  stateForBan: (sessionID: string | undefined): SessionState | null => stateForBan(sessionID),
+  stateForCheck: (sessionID: string | undefined, anchorClient?: V2AnchorReader | null): Promise<SessionState | null> =>
+    stateForCheck(sessionID, anchorClient ?? null),
+  boundaryBaseOf: (sessionID: string | undefined): string => banBaseDirectory(stateForBan(sessionID)),
 }
 
 // ---------------------------------------------------------------------------
@@ -9211,6 +9312,12 @@ function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
         }
         if (typeof name === "string" && isWriteTool(name)) {
           const sessionID = typeof evalInput.sessionID === "string" ? evalInput.sessionID : undefined
+          // fix-unknown-session-anchor-seed (design D2): a SYNCHRONOUS
+          // lookup that never seeds on a multi-directory process — this belt
+          // signals by mutating evalInput.effect and whether the host waits
+          // for an async hook's mutation is unproven, so it takes no await.
+          // The execute.before seam fires first (host 2.4.0) and is the
+          // authoritative draft gate for sessions this map does not know.
           const state = stateForBan(sessionID)
           const active = state ? resolveActivePlan(state) : null
           if (active && active.doc.status === "draft") {
@@ -9313,9 +9420,20 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
         if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
           const raw = typeof args.filePath === "string" ? args.filePath : typeof args.path === "string" ? args.path : undefined
           if (raw) {
-            const state = stateForBan(sessionID)
-            const base = state?.worktree ?? hostWorktree ?? ""
-            const abs = (isAbsolute(raw) ? raw : join(base, raw)).replaceAll("\\", "/").toLowerCase()
+            // fix-unknown-session-anchor-seed (design D2/D3): the session is
+            // resolved from the host's own record (through THIS
+            // initialization's client) before it is judged; an unresolvable
+            // session has no base directory on a multi-directory process.
+            const state = await stateForCheck(sessionID, anchorClient)
+            const base = banBaseDirectory(state)
+            // No base (an unresolvable session on a multi-directory process):
+            // the relative path is judged by its OWN spelling, normalized
+            // against a neutral root — never joined onto another directory's.
+            // A path that names a state directory relative to ANY working
+            // directory (".opencode/plan/x.md") is still refused; one that
+            // would land there only from some particular directory
+            // ("../plan/y.md") cannot be judged here and passes.
+            const abs = (isAbsolute(raw) ? raw : join(base || "/", raw)).replaceAll("\\", "/").toLowerCase()
             if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
               throw new Error(
                 `[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`,
@@ -9325,13 +9443,20 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
         }
       }
       if (typeof tool === "string" && isWriteTool(tool)) {
-        const state = stateForBan(sessionID)
+        // fix-unknown-session-anchor-seed (design D2): the authoritative
+        // draft gate. It fires BEFORE the permission evaluation (host 2.4.0,
+        // probed 2026-11-24T13:47Z) and resolves an unknown session from the
+        // host's own session record through THIS initialization's client —
+        // the synchronous permission belt no longer seeds, so on a
+        // multi-directory process this seam is where the session's own
+        // directory is established before the verdict.
+        const state = await stateForCheck(sessionID, anchorClient)
         const active = state ? resolveActivePlan(state) : null
         if (active && active.doc.status === "draft") {
           if (tool === "task") {
             // allow-readonly-recon: carve-out keyed on the TARGET's shape.
             const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined
-            const refusal = draftDispatchRefusal(sessionID, target)
+            const refusal = draftDispatchRefusalForState(state, target)
             if (refusal) throw new Error(refusal)
           } else {
             throw new Error(
@@ -10418,10 +10543,15 @@ function v2ReadHideNatives(deps?: V2SetupDeps): boolean {
 
 export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise<void | (() => void)> {
   // ---- host-axis parity (tasks 3.1/4.x): the belts and injections below
-  // share the v1 module state (only ONE entry ever runs per host process),
-  // so seed the workspace registry + launch anchor exactly like server()
-  // does — the shared predicates (resolvePools / stateForBan / the pool
-  // gates) then see the same disk truth as on a v1 host.
+  // share the v1 module state, so seed the workspace registry + launch
+  // anchor exactly like server() does — the shared predicates
+  // (resolvePools / the pool gates) then see the same disk truth as on a v1
+  // host. NOT "only one entry per host process" any more (that v1 fact is
+  // what fix-unknown-session-anchor-seed corrects): a v2 host runs this
+  // setup once PER DIRECTORY over ONE module, so every module-level
+  // "last writer wins" value below — hostWorktree above all — belongs to
+  // whichever directory initialized last, and session-directory decisions
+  // go through stateForCheck (the host's session record) instead.
   {
     const v2Candidates = [...(deps?.anchors ?? []), ...v2AnchorCandidates(ctx)]
     for (const cand of v2Candidates) {
@@ -10429,7 +10559,14 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
       if (t) rememberHostAnchor(t)
     }
     const first = v2Candidates.find((c) => c && !isRootish(c))
-    if (first) hostWorktree = first
+    if (first) {
+      hostWorktree = first
+      // fix-unknown-session-anchor-seed (design D1): remember that THIS
+      // process initialized this directory. From the second distinct
+      // directory on, "the last initialized directory" is no longer any
+      // session's own, and launch-directory seeding stops (stateForBan).
+      v2InitializedDirs.add(normalizeAnchorDir(first) || first)
+    }
   }
   // ---- native-first-roster (design D5): the materialize knob. The v2
   // host generation DEFAULTS DIRECTLY to "native" (owner decision

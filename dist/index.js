@@ -19016,8 +19016,7 @@ async function crewComplianceRefusalFor(anchorClient, sessionID, target) {
   const complianceRefusal = crewPoolComplianceRefusal(anchor);
   return complianceRefusal ? complianceRefusal + CREW_COMPLIANCE_NATIVE_EXIT : null;
 }
-function draftDispatchRefusal(sessionID, target) {
-  const state = stateForBan(sessionID);
+function draftDispatchRefusalForState(state, target) {
   const active = state ? resolveActivePlan(state) : null;
   if (!(active && active.doc.status === "draft"))
     return null;
@@ -19035,6 +19034,9 @@ function draftDispatchRefusal(sessionID, target) {
   }
   roster.sort();
   return `[forge] A plan is in draft; dispatch is denied for this target. ` + (roster.length > 0 ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. ` : `No readonly worker is configured — define one in forge.json with an explicit "shape": "readonly" to enable draft-phase reconnaissance. `) + `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`;
+}
+function draftDispatchRefusal(sessionID, target) {
+  return draftDispatchRefusalForState(stateForBan(sessionID), target);
 }
 var WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"]);
 function isWriteTool(name) {
@@ -20301,7 +20303,7 @@ async function pumpDequeuedWishes(client, sessionID, run) {
       cancelDequeuedByStop(client, wish, undefined);
       continue;
     }
-    const draftRefusal = draftDispatchRefusal(sessionID, wish.agentID);
+    const draftRefusal = draftDispatchRefusalForState(await stateForCheck(sessionID, anchorReaderOf(client)), wish.agentID);
     if (draftRefusal) {
       failQueuedWishHonestly(wish, draftRefusal);
       continue;
@@ -20589,7 +20591,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
   if (rec.state === "retry-pending") {
     const maxAttempts = resolveMaxAttempts();
     if (attempts <= maxAttempts && prompt !== "") {
-      const refusal = crewPendingRefusal(rec.ownerSession) ?? draftDispatchRefusal(rec.ownerSession, rec.agent) ?? forgeTargetUnresolved(rec.agent);
+      const refusal = crewPendingRefusal(rec.ownerSession) ?? draftDispatchRefusalForState(await stateForCheck(rec.ownerSession, anchorReaderOf(client)), rec.agent) ?? forgeTargetUnresolved(rec.agent);
       if (refusal) {
         journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`);
         return;
@@ -21183,7 +21185,7 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
           if (await settleKilled())
             return;
         }
-        const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusal(job.ownerSession, agentID) ?? forgeTargetUnresolved(agentID);
+        const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusalForState(await stateForCheck(job.ownerSession, anchorReaderOf(client)), agentID) ?? forgeTargetUnresolved(agentID);
         if (refusal) {
           text = `(retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
           exitCode = 1;
@@ -21406,6 +21408,7 @@ var taskDispatchTool = tool({
     const runInBackground = args.run_in_background === true;
     if (!target || !prompt)
       throw new Error("[forge:dispatch] subagent_type and prompt are both required.");
+    await stateForCheck(context.sessionID, sharedAnchorClient());
     const forgeTarget = target.toLowerCase().startsWith("forge-");
     const speaker = sessionAgents.get(context.sessionID);
     if (speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT) {
@@ -21435,7 +21438,7 @@ var taskDispatchTool = tool({
         throw new Error(`Agent not found: "${target}" is neither a materialized forge-* subagent nor a configured host agent. Check the agent id against the TUI agent list (or the forge roster in the agent descriptions) and retry.`);
       }
     }
-    const draftRefusal = draftDispatchRefusal(context.sessionID, target);
+    const draftRefusal = draftDispatchRefusalForState(await stateForCheck(context.sessionID, sharedAnchorClient()), target);
     if (draftRefusal)
       throw new Error(draftRefusal);
     let queueAfterCap = false;
@@ -21696,7 +21699,7 @@ var taskDispatchTool = tool({
               });
               queueDispatchProgress(context.sessionID, `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`, () => dispatchStillLive(syncJobId));
               await new Promise((resolve2) => setTimeout(resolve2, retryBackoffSync));
-              const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusal(context.sessionID, target) ?? forgeTargetUnresolved(target);
+              const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusalForState(await stateForCheck(context.sessionID, sharedAnchorClient()), target) ?? forgeTargetUnresolved(target);
               if (refusal) {
                 journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`);
                 throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
@@ -22175,7 +22178,7 @@ var crewBeginTool = tool({
   },
   execute: async (args, context) => {
     noteToolAgent(context);
-    const state = stateForBan(context.sessionID);
+    const state = await stateForCheck(context.sessionID, sharedAnchorClient());
     const active = state ? resolveActivePlan(state) : null;
     if (active && active.doc.status === "draft") {
       throw new Error("[forge:crew] A plan is in draft; crew orchestration is denied during planning. Three exits: " + "plan_approve puts the plan to user approval (an APPROVED plan does not block /crew — only a draft does); " + "/plan discard abandons the plan outright; " + '/plan discard {supersede: "<successor path or id>"} moves the work into this crew (the plan becomes superseded, the successor recorded).');
@@ -22467,15 +22470,36 @@ function forgeTools() {
   return tools;
 }
 var hostWorktree = "";
+var v2InitializedDirs = new Set;
+function banSeedAllowed() {
+  return v2InitializedDirs.size <= 1;
+}
 function stateForBan(sessionID) {
   if (!sessionID)
     return null;
   const existing = sessions.get(sessionID);
   if (existing)
     return existing;
-  if (!hostWorktree)
+  if (!hostWorktree || !banSeedAllowed())
     return null;
   return ensureSession(sessionID, hostWorktree);
+}
+async function stateForCheck(sessionID, anchorClient) {
+  if (!sessionID)
+    return null;
+  const known = stateForBan(sessionID);
+  if (known)
+    return known;
+  if (banSeedAllowed())
+    return null;
+  const directory = await hostSessionDirectory(anchorClient ?? null, sessionID);
+  return directory ? ensureSession(sessionID, directory) : null;
+}
+function banBaseDirectory(state) {
+  return state?.worktree ?? (banSeedAllowed() ? hostWorktree : "");
+}
+function anchorReaderOf(client) {
+  return client;
 }
 var IDLE_DEBOUNCE_MS = Number(process.env.FORGE_GOAL_DEBOUNCE_MS ?? 2000);
 var idleTimers = new Map;
@@ -23845,7 +23869,14 @@ var __sessionAnchorTestSurface = {
   worktreeOf: (sessionID) => sessions.get(sessionID)?.worktree ?? null,
   bindChildToDirectory,
   sessionAnchorLedgerPath,
-  noteLedgerBinding: noteSessionAnchorLedgerBinding
+  noteLedgerBinding: noteSessionAnchorLedgerBinding,
+  initializedDirectories: () => [...v2InitializedDirs],
+  resetInitializedDirectories: () => {
+    v2InitializedDirs.clear();
+  },
+  stateForBan: (sessionID) => stateForBan(sessionID),
+  stateForCheck: (sessionID, anchorClient) => stateForCheck(sessionID, anchorClient ?? null),
+  boundaryBaseOf: (sessionID) => banBaseDirectory(stateForBan(sessionID))
 };
 function v2PickStr(src, ...keys) {
   if (src === null || typeof src !== "object")
@@ -23974,9 +24005,9 @@ function v2RegisterToolHooks(ctx, anchorClient) {
         if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
           const raw2 = typeof args.filePath === "string" ? args.filePath : typeof args.path === "string" ? args.path : undefined;
           if (raw2) {
-            const state = stateForBan(sessionID);
-            const base = state?.worktree ?? hostWorktree ?? "";
-            const abs = (isAbsolute2(raw2) ? raw2 : join6(base, raw2)).replaceAll("\\", "/").toLowerCase();
+            const state = await stateForCheck(sessionID, anchorClient);
+            const base = banBaseDirectory(state);
+            const abs = (isAbsolute2(raw2) ? raw2 : join6(base || "/", raw2)).replaceAll("\\", "/").toLowerCase();
             if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
               throw new Error(`[forge:partition] Write refused: "${raw2}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`);
             }
@@ -23984,12 +24015,12 @@ function v2RegisterToolHooks(ctx, anchorClient) {
         }
       }
       if (typeof tool3 === "string" && isWriteTool(tool3)) {
-        const state = stateForBan(sessionID);
+        const state = await stateForCheck(sessionID, anchorClient);
         const active = state ? resolveActivePlan(state) : null;
         if (active && active.doc.status === "draft") {
           if (tool3 === "task") {
             const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined;
-            const refusal = draftDispatchRefusal(sessionID, target);
+            const refusal = draftDispatchRefusalForState(state, target);
             if (refusal)
               throw new Error(refusal);
           } else {
@@ -24691,8 +24722,10 @@ async function v2Setup(ctx, deps) {
         rememberHostAnchor(t);
     }
     const first = v2Candidates.find((c) => c && !isRootish(c));
-    if (first)
+    if (first) {
       hostWorktree = first;
+      v2InitializedDirs.add(normalizeAnchorDir(first) || first);
+    }
   }
   v2HostSeen = true;
   v2PostureHomeDir = deps?.homeDir ?? homedir();
