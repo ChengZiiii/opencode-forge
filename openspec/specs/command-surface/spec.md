@@ -61,8 +61,8 @@ The plugin `SHALL` register exactly one forge command (`/forge`) on both host ge
 
 #### Scenario: /forge stop routes to the session-scoped stop lever
 
-- **WHEN** the user invokes `/forge stop` in a session with in-flight dispatches
-- **THEN** the delivered prompt directs the session-scoped stop (cancel the invoking session's in-flight dispatches only)
+- **WHEN** the user invokes `/forge stop` in a session with in-flight or queued dispatches
+- **THEN** the delivered prompt directs the session-scoped stop (cancel the invoking session's in-flight and queued dispatches only)
 
 #### Scenario: No hyphenated forge commands in the command list
 
