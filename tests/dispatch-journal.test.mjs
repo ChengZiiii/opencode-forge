@@ -357,6 +357,122 @@ test("recovery: a QUEUED wish re-enters the queue for a live owner and SPAWNS; a
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_owner4" } } } })
 })
 
+test("recovery + /forge stop (fix-stop-cancels-queued-wishes, fix-stale-progress-notice): a queued wish that re-entered the queue at recovery is cancelled by stop, never spawns, and its parked notice is dropped", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  seedJournal(dir, [
+    rec({ id: "task_s1", state: "started", childSessionId: "ses_rec_s1", ownerSession: "ses_owner6", workspace: dir, prompt: "s1", description: "stop recovery 1" }),
+    rec({ id: "task_s2", state: "started", childSessionId: "ses_rec_s2", ownerSession: "ses_owner6", workspace: dir, prompt: "s2", description: "stop recovery 2" }),
+    rec({ id: "task_s3", state: "started", childSessionId: "ses_rec_s3", ownerSession: "ses_owner6", workspace: dir, prompt: "s3", description: "stop recovery 3" }),
+    rec({ id: "task_q_stop", state: "queued", ownerSession: "ses_owner6", workspace: dir, prompt: "queued work to cancel", description: "queued stop" }),
+  ])
+  const { client, calls } = makeRecoveryClient({
+    dir,
+    ownerId: "ses_owner6",
+    children: { ses_rec_s1: { state: "busy" }, ses_rec_s2: { state: "busy" }, ses_rec_s3: { state: "busy" } },
+  })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  // Records recover in journal order: the three running rows re-arm first
+  // and fill the cap, so the queued wish re-enters the queue and STAYS.
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_owner6").length === 3, "the three running records re-armed")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchQueues().some((x) => x.jobId === "task_q_stop"), "the queued wish re-entered the queue")
+  await waitFor(
+    () => h.__forgeSubagentsTest.dispatchProgress("ses_owner6").some((s) => s.includes("queued wish task_q_stop") && s.includes("re-entered the queue")),
+    "the re-entered notice parks",
+  )
+  assert.equal(calls.create.length, 0, "nothing spawned at recovery (the cap is full)")
+  const stop = await h.tool.forge_jobs.execute({ action: "stop" }, allowCtx("ses_owner6", dir))
+  assert.match(stop.output, /Stopped 3 in-flight dispatch\(es\)/, stop.output)
+  assert.ok(
+    stop.output.includes("Cancelled 1 queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): task_q_stop"),
+    `the receipt names the cancelled queued wish: ${stop.output}`,
+  )
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_owner6").length, 0, "the queue is empty the moment stop returns")
+  await waitFor(() => latestRecord(dir, "task_q_stop")?.state === "terminal", "the cancelled queued wish terminalized")
+  const queued = latestRecord(dir, "task_q_stop")
+  assert.equal(queued.outcome, "aborted", `aborted: ${JSON.stringify(queued)}`)
+  assert.match(queued.reason, /the wish was still queued: nothing was spawned and the dispatch is never retried/, "the queued stop sentence")
+  for (const id of ["task_s1", "task_s2", "task_s3"]) {
+    await waitFor(() => latestRecord(dir, id)?.state === "terminal", `${id} terminalized`)
+    assert.match(String(latestRecord(dir, id).reason), /cancelled by the user lever \(\/forge stop\) — the child was aborted/, `${id} journaled the lever sentence`)
+  }
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_owner6").length === 0, "the three in-flight rows settled")
+  // Settle window: three slots freed — none pumped the cancelled wish.
+  await new Promise((r) => setTimeout(r, 400))
+  assert.equal(calls.create.length, 0, "nothing spawned after the stop")
+  // The owner idles: three aborted wakes, and NOT the "re-entered the queue"
+  // notice of a wish that will never spawn.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_owner6" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_owner6").map(textOf)
+  await waitFor(
+    () => toOwner().filter((s) => s.startsWith("[forge:dispatch-complete]")).length === 3,
+    "the three aborted wakes are delivered",
+  )
+  await new Promise((r) => setTimeout(r, 150))
+  const sends = toOwner()
+  assert.equal(sends.length, 3, `only the three wakes: ${JSON.stringify(sends.map((s) => s.slice(0, 80)))}`)
+  assert.equal(sends.filter((s) => s.includes("re-entered the queue")).length, 0, "no notice announces a wish that will never spawn")
+  assert.ok(
+    h.__forgeSubagentsTest.dispatchProgressDropped("ses_owner6").some((s) => s.includes("queued wish task_q_stop") && s.includes("re-entered the queue")),
+    "the dropped notice is recorded on the drop side",
+  )
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_owner6" } } } })
+})
+
+test("recovery + transit window (fix-stale-progress-notice, fix-stop-cancels-queued-wishes D5): a 're-entered the queue' notice parked WHILE its wish is being spawned is still delivered — a wish in transit is live", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  seedJournal(dir, [rec({ id: "task_q_transit", state: "queued", ownerSession: "ses_owner7", workspace: dir, prompt: "queued work", description: "queued transit" })])
+  const { client, calls } = makeRecoveryClient({ dir, ownerId: "ses_owner7", children: {} })
+  // Hold the child CREATE: the wish has left the queue and is not registered
+  // yet — the pump's transit window.
+  let release = () => {}
+  const gate = new Promise((resolve) => {
+    release = resolve
+  })
+  let createEntered = () => {}
+  const inCreate = new Promise((resolve) => {
+    createEntered = resolve
+  })
+  const realCreate = client.session.create
+  client.session.create = async (args) => {
+    createEntered()
+    await gate
+    return realCreate(args)
+  }
+  const h = await startServer(input(dir, client), {})
+  // A failed assertion must not leave the parked pump behind: open the gate,
+  // give the wish a moment to land, end the owner, dispose LAST (a job that
+  // registers after the dispose keeps a poller alive, and a live poller keeps
+  // this file's process alive — node:test has no default timeout).
+  t.after(async () => {
+    release()
+    await new Promise((r) => setTimeout(r, 500))
+    await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_owner7" } } } })
+    h.dispose?.()
+  })
+  await h.config(emptyCfg())
+  await inCreate
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_owner7").length, 0, "the wish left the queue")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.jobId === "task_q_transit").length, 0, "not registered yet")
+  await waitFor(
+    () => h.__forgeSubagentsTest.dispatchProgress("ses_owner7").some((s) => s.includes("queued wish task_q_transit") && s.includes("re-entered the queue")),
+    "the re-entered notice parks",
+  )
+  // The owner idles while the wish is still in transit.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_owner7" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_owner7").map(textOf)
+  await waitFor(() => toOwner().some((s) => s.includes("re-entered the queue")), "the notice is delivered while its wish is in transit")
+  assert.equal(
+    h.__forgeSubagentsTest.dispatchProgressDropped("ses_owner7").some((s) => s.includes("task_q_transit")),
+    false,
+    "a true notice about a wish being spawned is never dropped",
+  )
+  release()
+  await waitFor(() => latestRecord(dir, "task_q_transit")?.state === "started", "the wish spawned once its create returned")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_owner7" } } } })
+})
+
 test("recovery: RETRY-PENDING resumes the chain when attempts remain; terminalizes when exhausted", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
   seedJournal(dir, [

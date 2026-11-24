@@ -63,7 +63,10 @@ test("/forge template: one command, $ARGUMENTS routing — all four forms plus t
   assert.match(t, /\/forge sync \(force a roster sync NOW/)
   assert.match(t, /\/forge init \(draft this workspace's forge\.json/)
   assert.match(t, /\/forge init global \(draft the global forge\.json/)
-  assert.match(t, /\/forge stop \(cancel THIS session's in-flight async dispatches\)/)
+  // fix-stop-cancels-queued-wishes (0.34.0): the help line names the queued
+  // half too, and so does the stop route's own instruction.
+  assert.match(t, /\/forge stop \(cancel THIS session's in-flight and queued async dispatches\)/)
+  assert.match(t, /every QUEUED wish of this session \(removed from the queue before it can spawn/)
 })
 
 test("/forge template: FAMILY GUARD step-0 names the forge agent and the forge_sync tool", () => {

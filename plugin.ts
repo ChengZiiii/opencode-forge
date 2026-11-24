@@ -288,7 +288,7 @@ export const INIT_GLOBAL_BODY =
   `same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. ${INIT_GLOBAL_SCAFFOLD_NOTE}`
 
 export const FORGE_HELP_ROUTE_LINE =
-  "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (cancel THIS session's in-flight async dispatches) — and stop."
+  "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (cancel THIS session's in-flight and queued async dispatches) — and stop."
 
 // Dispatch stop route body (command-surface-v2-cleanup D1): session-scoped
 // cancellation. Host children are independent sessions — ESC interrupts the
@@ -297,7 +297,7 @@ export const FORGE_HELP_ROUTE_LINE =
 // filters by context.sessionID) — template-layer instructions are routing
 // only, never trust boundaries (design D2).
 export const STOP_LEVER_BODY = [
-  '- Argument "stop": call forge_jobs with action "stop" (no other parameters) and relay the tool result verbatim — it cancels every in-flight ASYNC DISPATCH owned by THIS session (each child session is aborted and CONFIRMED idle; each dispatch settles as aborted and is never retried). A dispatch owned by another session is NOT touched: name its task id only if the user asks, and cancel it with the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"}. Then STOP: no re-dispatch, no replacement work.',
+  '- Argument "stop": call forge_jobs with action "stop" (no other parameters) and relay the tool result verbatim — it cancels every in-flight ASYNC DISPATCH owned by THIS session (each child session is aborted and CONFIRMED idle; each dispatch settles as aborted and is never retried) and every QUEUED wish of this session (removed from the queue before it can spawn — nothing was running for it; it is never dispatched). A dispatch owned by another session is NOT touched: name its task id only if the user asks, and cancel it with the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"}. Then STOP: no re-dispatch, no replacement work.',
   "Boundaries: cancellation is USER intent only — never stop dispatches on your own initiative; a stopped dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entries and the owner wakes are delivered by the plugin's terminal path, not by you.",
 ].join("\n")
 
@@ -1066,12 +1066,38 @@ const jobManager = createJobManager({
 // interaction): progress is informational; the terminal
 // [forge:dispatch-complete] wake is the guarantee and never shares this
 // queue or the wake budget.
-const dispatchProgressQueue = new Map<string, string[]>()
+// fix-stale-progress-notice: an entry may carry an `isLive` predicate. The
+// notice is delivered ONLY while it still holds AT DELIVERY TIME — a notice
+// parked for a busy owner whose dispatch finished meanwhile is dropped (the
+// terminal wake is the single carrier of the terminal state; the notice
+// itself stays in the job's output tail). Entries without a predicate (a
+// notice that is not about one dispatch) are delivered as before.
+type DispatchProgressNotice = { text: string; isLive?: () => boolean }
+const dispatchProgressQueue = new Map<string, DispatchProgressNotice[]>()
+// Dropped-as-stale notices per owner session (bounded; the wiring tests'
+// read-only view of the drop side).
+const dispatchProgressDropped = new Map<string, string[]>()
 
-function queueDispatchProgress(sessionID: string, text: string): void {
+/** True while task `jobId` is in flight, between retry attempts, still waiting in a queue, or being spawned from a queue. */
+function dispatchStillLive(jobId: string): boolean {
+  const row = jobManager.get(jobId)
+  if (row) return row.state === "running"
+  // No registry row yet: a wish is live while it is still queued, or while
+  // the queue pump is spawning it (the transit window — see PumpRun).
+  for (const queue of dispatchQueues.values()) {
+    if (queue.some((wish) => wish.jobId === jobId)) return true
+  }
+  for (const pumps of pumpInFlight.values()) {
+    for (const run of pumps) if (run.wishId === jobId) return true
+  }
+  return false
+}
+
+function queueDispatchProgress(sessionID: string, text: string, isLive?: () => boolean): void {
+  const notice: DispatchProgressNotice = isLive ? { text, isLive } : { text }
   const queued = dispatchProgressQueue.get(sessionID)
-  if (queued) queued.push(text)
-  else dispatchProgressQueue.set(sessionID, [text])
+  if (queued) queued.push(notice)
+  else dispatchProgressQueue.set(sessionID, [notice])
 }
 
 async function deliverDispatchProgress(sessionID: string): Promise<void> {
@@ -1080,9 +1106,21 @@ async function deliverDispatchProgress(sessionID: string): Promise<void> {
   if (!pending || pending.length === 0) return
   dispatchProgressQueue.delete(sessionID)
   if (!jobClient || typeof jobClient.session.promptAsync !== "function") return
-  for (const text of pending) {
+  for (const notice of pending) {
+    if (notice.isLive) {
+      // A predicate that throws decides nothing: the notice is delivered as
+      // it always was (never a throw into the idle-edge path).
+      let live = true
+      try {
+        live = notice.isLive()
+      } catch {}
+      if (!live) {
+        dispatchProgressDropped.set(sessionID, [...(dispatchProgressDropped.get(sessionID) ?? []), notice.text].slice(-20))
+        continue
+      }
+    }
     try {
-      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } })
+      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: notice.text }] } })
     } catch {
       // Lossy: the notice is dropped — never requeued, never retried.
     }
@@ -1209,6 +1247,43 @@ function dispatchKillTreeHook(client: DispatchClient, jobId: string, childSessio
   }
 }
 
+// fix-stale-progress-notice: the plugin's own progress notices ride the
+// dispatch job's output tail (the registry row's in-memory tail — `forge_jobs`
+// poll stays readable; a dispatch job writes no log file), but they are
+// timely markers, not report content — the completion wake's "Final report"
+// block never shows a "still running" line above the report. Every notice
+// goes through appendDispatchNotice, so the wake cuts them out by the exact
+// appended text (never by matching a prefix the report itself could
+// legitimately contain). The memo lives on the JOB, not on the dispatch
+// meta: a retry rebinds the meta and must not forget earlier notices.
+const DISPATCH_NOTICE_MEMORY = 30
+
+function appendDispatchNotice(job: Job, notice: string): void {
+  jobManager.appendOutput(job, notice)
+  const memo = job as Job & { progressNotices?: string[] }
+  if (!memo.progressNotices) memo.progressNotices = []
+  memo.progressNotices.push(notice)
+  if (memo.progressNotices.length > DISPATCH_NOTICE_MEMORY) memo.progressNotices.splice(0, memo.progressNotices.length - DISPATCH_NOTICE_MEMORY)
+}
+
+/**
+ * The dispatch job's output AFTER the last plugin notice it still holds.
+ * The poller appends notices first and the final text last, so what follows
+ * the last notice IS the final text. A notice the tail cap truncated away
+ * simply is not found (the cut then sits after a later one, or nowhere — in
+ * which case the tail is returned whole, exactly as before this rule).
+ */
+function dispatchReportTail(job: Job): string {
+  const memo = (job as Job & { progressNotices?: string[] }).progressNotices
+  if (!memo || memo.length === 0) return job.tail
+  let cut = -1
+  for (const notice of memo) {
+    const at = job.tail.lastIndexOf(notice)
+    if (at !== -1) cut = Math.max(cut, at + notice.length)
+  }
+  return cut === -1 ? job.tail : job.tail.slice(cut)
+}
+
 function jobWakeText(job: Job): string {
   const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
   if (dispatch) {
@@ -1237,7 +1312,7 @@ function jobWakeText(job: Job): string {
     }
     return [
       `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
-      `Final report:\n${job.tail.slice(-2500) || "(no output)"}`,
+      `Final report:\n${dispatchReportTail(job).slice(-2500) || "(no output)"}`,
       "The dispatch is complete — read the report above; no polling, no re-dispatch needed.",
     ].join("\n")
   }
@@ -2878,7 +2953,7 @@ const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "stop", "cl
 
 const forgeJobsTool = tool({
   description:
-    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel ONE in-flight ASYNC DISPATCH by explicit task id, including one owned by ANOTHER session (the deliberate cross-session escape hatch behind no ownership check; its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried); stop — cancel EVERY in-flight async dispatch owned by THIS session only (the /forge stop lever; session-scoped by construction, other sessions' dispatches are untouched; nothing in flight = honest no-op report); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel ONE in-flight ASYNC DISPATCH by explicit task id, including one owned by ANOTHER session (the deliberate cross-session escape hatch behind no ownership check; its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried); stop — cancel EVERY in-flight async dispatch AND every queued wish owned by THIS session only (the /forge stop lever; session-scoped by construction, other sessions' dispatches are untouched; the queued wishes leave the queue first, so none spawns into a slot a cancelled dispatch frees; nothing in flight and nothing queued = honest no-op report); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
     jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list and stop)"),
@@ -2903,31 +2978,54 @@ const forgeJobsTool = tool({
       // decision lives HERE in the tool execute layer — context.sessionID is
       // host-truth, never model-relayed. Cancel each of THIS session's
       // in-flight dispatches SERIALLY (concurrent aborts would race the idle
-      // assertion); nothing in flight = honest no-op report. No jobId: the
-      // scope IS the calling session.
+      // assertion); nothing in flight and nothing queued = honest no-op
+      // report. No jobId: the scope IS the calling session.
+      // fix-stop-cancels-queued-wishes D1: the session's queued wishes leave
+      // the queue FIRST. A slot freed by a cancelled dispatch is pumped the
+      // moment that row settles, so a queue still in place would spawn its
+      // head before the last cancel returns — the user would watch new
+      // children start right after asking for everything to stop.
       const client = dispatchClient()
       if (!client) throw new Error("[forge] stop: no dispatch client on this host.")
-      const flight = inFlightAsyncDispatches(context.sessionID)
-      if (flight.length === 0) {
-        return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${context.sessionID}) — nothing to stop.` }
+      const sid = context.sessionID
+      // D5: a wish the queue pump is spawning RIGHT NOW is in neither the
+      // queue nor the registry. Mark the stop (a pump reads the epoch when it
+      // dequeues), empty the queue, then let the pumps that are running land:
+      // a wish whose child is still being created is cancelled unprompted
+      // (the pump journals it and hands it to this receipt); one whose prompt
+      // already went out is a registered in-flight dispatch the loop below
+      // cancels like any other.
+      const epoch = stopEpoch(sid) + 1
+      stopEpochs.set(sid, epoch)
+      stopWaiting.add(sid)
+      let landed: "settled" | "timeout"
+      let stillLanding = 0
+      let flight: string[]
+      let queuedCancelled: string[]
+      try {
+        queuedCancelled = cancelQueuedWishes(sid)
+        landed = await settlePumps(sid)
+        stillLanding = inTransitWishes(sid).length
+        flight = inFlightAsyncDispatches(sid)
+      } finally {
+        // Same sync edge as the registry read above: a wish registered after
+        // this point is cancelled by its own pump.
+        stopWaiting.delete(sid)
       }
-      // Queued wishes are NOT in flight, so stop does not cancel them — and
-      // the slots the cancels free are pumped the moment each row settles
-      // (fold D). Read BEFORE the cancels (afterwards the head has spawned).
-      const queuedAtCall = queuedAsyncDispatchIds(context.sessionID)
+      // Wishes this session's pumps cancelled unprompted while the lever was
+      // waiting. The first lever to resume takes them (a second stop waiting
+      // on the same pumps never reports them twice).
+      queuedCancelled.push(...(stopDequeued.get(sid) ?? []))
+      stopDequeued.delete(sid)
+      if (flight.length === 0 && queuedCancelled.length === 0 && stillLanding === 0) {
+        return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${sid}) — nothing to stop.` }
+      }
       const results: string[] = []
       for (const taskId of flight) {
-        const res = await cancelDispatch(client, taskId)
+        const res = await stopSerialCancel(sid, () => cancelDispatch(client, taskId))
         results.push(`- ${res.text}`)
       }
-      const queuedNote =
-        queuedAtCall.length > 0
-          ? `\n[forge:job] ${queuedAtCall.length} queued wish(es) of this session were NOT in flight and are not cancelled by stop — they spawn FIFO into the freed slots: ${queuedAtCall.join(", ")}`
-          : ""
-      return {
-        title: `${flight.length} dispatch(es) stopped`,
-        output: `[forge:job] Stopped ${flight.length} in-flight dispatch(es) of this session:\n${results.join("\n")}${queuedNote}`,
-      }
+      return stopReceipt(sid, flight.length, results, queuedCancelled, landed === "timeout" ? stillLanding : 0, stopSettleMs())
     }
     if (!args.jobId) throw new Error(`Action "${action}" requires jobId.`)
     // "all" refusal hoisted BEFORE the registry lookup (command-surface
@@ -2935,7 +3033,7 @@ const forgeJobsTool = tool({
     // reach the retirement redirect — never a "No job all in the registry"
     // miss on a registry that has no such row.
     if (action === "cancel" && String(args.jobId).trim().toLowerCase() === "all") {
-      throw new Error('[forge] cancel "all" is retired — use action "stop" (cancels THIS session\'s in-flight dispatches) or cancel an explicit task id.')
+      throw new Error('[forge] cancel "all" is retired — use action "stop" (cancels THIS session\'s in-flight and queued dispatches) or cancel an explicit task id.')
     }
     const job = jobManager.get(args.jobId)
     if (!job) {
@@ -3292,13 +3390,95 @@ type QueuedDispatchWish = {
 // ownerSession → FIFO wishes (queue order = enqueue order).
 const dispatchQueues = new Map<string, QueuedDispatchWish[]>()
 
+// fix-stop-cancels-queued-wishes D5: the queue pump's TRANSIT window. Between
+// `queue.shift()` and `registerDispatchTask` a wish sits in several awaits
+// (the crew-belt read, child creation, prompt send) — in neither the queue
+// nor the registry. A stop that lands inside that window must not miss it, or
+// the wish would start right after the user asked for everything to stop.
+//   stopEpochs   session → bumped by every stop. A pump iteration that
+//                dequeued under an older epoch knows a stop landed while it
+//                was in transit.
+//   stopWaiting  sessions whose stop lever is waiting for their pumps to
+//                land (or is about to read the registry). A wish registered
+//                while its owner is in here is seen by that lever.
+//   PumpRun      one running pump: the wish it holds (null = none) and its
+//                completion. `pumpInFlight` lets the lever wait for a wish in
+//                transit to land on one side or the other, and lets a notice
+//                about such a wish count as live.
+//   stopDequeued wishes a pump cancelled itself because a stop landed while
+//                they were in transit unprompted; a lever that is waiting
+//                folds them into its receipt (a note is left only when one
+//                is, and consumed by the first lever to resume — a second
+//                stop waiting on the same pump never reports it twice).
+const stopEpochs = new Map<string, number>()
+const stopWaiting = new Set<string>()
+type PumpRun = { wishId: string | null; done: Promise<void> }
+const pumpInFlight = new Map<string, Set<PumpRun>>()
+const stopDequeued = new Map<string, string[]>()
+
+const stopEpoch = (sessionID: string): number => stopEpochs.get(sessionID) ?? 0
+const stoppedSince = (sessionID: string, epoch: number): boolean => stopEpoch(sessionID) !== epoch
+
+/** Wishes a pump of `sessionID` holds right now (dequeued, not registered yet). */
+function inTransitWishes(sessionID: string): string[] {
+  const ids: string[] = []
+  for (const run of pumpInFlight.get(sessionID) ?? []) if (run.wishId) ids.push(run.wishId)
+  return ids
+}
+
+/**
+ * How long the stop lever lets a wish in transit land (FORGE_STOP_SETTLE_MS
+ * overrides it for tests). A parked host call is not waited for past this.
+ */
+function stopSettleMs(): number {
+  const raw = Number(process.env.FORGE_STOP_SETTLE_MS)
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 60_000) : 15_000
+}
+
+/** Wait (bounded) for the pumps of `sessionID` that are running right now. */
+async function settlePumps(sessionID: string): Promise<"settled" | "timeout"> {
+  const pumps = [...(pumpInFlight.get(sessionID) ?? [])]
+  if (pumps.length === 0) return "settled"
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      Promise.allSettled(pumps.map((run) => run.done)).then(() => "settled" as const),
+      new Promise<"timeout">((resolve) => {
+        timer = setTimeout(() => resolve("timeout"), stopSettleMs())
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+// Cancels of one session's dispatches run ONE AT A TIME (concurrent aborts
+// would race the idle assertion). The stop lever's cancels and a pump's
+// self-cancel (a wish that landed after its lever stopped waiting) share
+// this per-session chain, so they can never overlap.
+const stopCancelTails = new Map<string, Promise<void>>()
+function stopSerialCancel<T>(sessionID: string, cancel: () => Promise<T>): Promise<T> {
+  const next = (stopCancelTails.get(sessionID) ?? Promise.resolve()).then(cancel)
+  const settled: Promise<void> = next.then(
+    () => undefined,
+    () => undefined,
+  )
+  stopCancelTails.set(sessionID, settled)
+  void settled.then(() => {
+    if (stopCancelTails.get(sessionID) === settled) stopCancelTails.delete(sessionID)
+  })
+  return next
+}
+
 function queuedAsyncDispatchIds(sessionID: string): string[] {
   return (dispatchQueues.get(sessionID) ?? []).map((w) => w.jobId)
 }
 
 /** The queued-start progress notice (spec: "a progress notice announcing the queued wish's start"). */
-function announceQueuedStart(ownerSession: string, notice: string): void {
-  queueDispatchProgress(ownerSession, notice)
+function announceQueuedStart(ownerSession: string, notice: string, jobId: string): void {
+  // Delivered only while the wish is still queued or in flight — never
+  // after it was cancelled or settled (fix-stale-progress-notice).
+  queueDispatchProgress(ownerSession, notice, () => dispatchStillLive(jobId))
   if (idleJobSessions.has(ownerSession)) void deliverDispatchProgress(ownerSession)
 }
 
@@ -3341,14 +3521,67 @@ function failQueuedWishHonestly(wish: QueuedDispatchWish, reason: string): void 
  * pump sees no free slot until the retry chain settles — queued wishes
  * never jump a retry.
  */
-async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Promise<void> {
+function pumpDispatchQueue(client: DispatchClient, sessionID: string): Promise<void> {
+  const run: PumpRun = { wishId: null, done: Promise.resolve() }
+  let pumps = pumpInFlight.get(sessionID)
+  if (!pumps) pumpInFlight.set(sessionID, (pumps = new Set()))
+  pumps.add(run)
+  run.done = pumpDequeuedWishes(client, sessionID, run).finally(() => {
+    // Also on a rejected body: a wish is never left "in transit" for good
+    // (it would hold a cap slot and read as live forever).
+    run.wishId = null
+    const left = pumpInFlight.get(sessionID)
+    if (!left) return
+    left.delete(run)
+    if (left.size === 0) pumpInFlight.delete(sessionID)
+  })
+  return run.done
+}
+
+/**
+ * fix-stop-cancels-queued-wishes D5: a wish the pump had dequeued is
+ * cancelled because a stop landed while it was in transit, BEFORE its prompt
+ * went out. `child` = a child session the pump managed to create (never
+ * prompted): aborted as cleanup only, exactly like the retry respawn
+ * window's "empty husk". No registry row ever existed, so nothing settles
+ * and no wake follows — the stop receipt is the report. When a lever is
+ * waiting for this pump, the wish is handed to its receipt.
+ */
+function cancelDequeuedByStop(client: DispatchClient, wish: QueuedDispatchWish, child: string | undefined): void {
+  releaseGateAdmission(wish.jobId)
+  // The empty child's abort is cleanup, not a cancel: nothing is awaited and
+  // an empty session cannot be running anything (same rule as the retry
+  // respawn window's "empty husk").
+  if (child) dispatchKillTreeHook(client, wish.jobId, () => child)()
+  journalTerminalRecord(
+    { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, description: wish.description, questionDeny: wish.questionDeny },
+    "aborted",
+    STOP_DEQUEUED_REASON,
+  )
+  const sessionID = wish.ownerSession
+  if (!stopWaiting.has(sessionID)) return
+  const notes = stopDequeued.get(sessionID) ?? []
+  notes.push(wish.jobId)
+  stopDequeued.set(sessionID, notes.slice(-50))
+}
+
+async function pumpDequeuedWishes(client: DispatchClient, sessionID: string, run: PumpRun): Promise<void> {
   for (;;) {
+    // Sync edge: the previous iteration's wish has landed (registered, or
+    // terminal) before the next one is dequeued, so it is no longer in transit.
+    run.wishId = null
     const queue = dispatchQueues.get(sessionID)
     if (!queue || queue.length === 0) return
-    if (inFlightAsyncDispatches(sessionID).length >= ASYNC_DISPATCH_CAP) return
+    // A wish another pump is spawning holds its slot already.
+    if (inFlightAsyncDispatches(sessionID).length + inTransitWishes(sessionID).length >= ASYNC_DISPATCH_CAP) return
     const wish = queue.shift()
     if (queue.length === 0) dispatchQueues.delete(sessionID)
     if (!wish) return
+    // fix-stop-cancels-queued-wishes D5: from here until the row is
+    // registered this wish is in transit. A stop that lands meanwhile is
+    // recognised through the session's stop epoch (read at dequeue).
+    run.wishId = wish.jobId
+    const stopEpochAtDequeue = stopEpoch(sessionID)
     // --- spawn-time re-checks (belts evaluated at CALL time; these are the
     // tightening guards). A refusal = honest error wake, never a spawn.
     if (wish.agentID.toLowerCase().startsWith("forge-")) {
@@ -3365,6 +3598,12 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
     const crewRefusal = crewPendingRefusal(sessionID) ?? (await crewComplianceRefusalFor(jobClient, sessionID, wish.agentID))
     if (crewRefusal) {
       failQueuedWishHonestly(wish, crewRefusal)
+      continue
+    }
+    // D5: the belt read above is an await too — a stop that landed during it
+    // cancels the wish before any child session is created.
+    if (stoppedSince(sessionID, stopEpochAtDequeue)) {
+      cancelDequeuedByStop(client, wish, undefined)
       continue
     }
     const draftRefusal = draftDispatchRefusal(sessionID, wish.agentID)
@@ -3412,6 +3651,15 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
       failQueuedWishHonestly(wish, `child session creation failed: ${created.error}`)
       continue
     }
+    if (stoppedSince(sessionID, stopEpochAtDequeue)) {
+      // D5: a stop landed WHILE this child session was being created. The
+      // wish is cancelled like one that was still queued — it is never
+      // prompted. The created-but-empty child is aborted as cleanup only
+      // (the retry respawn window's "empty husk" rule); the stop receipt
+      // folds the wish into its queued group.
+      cancelDequeuedByStop(client, wish, created.sessionID)
+      continue
+    }
     const sent = await sendPrompt(client, {
       sessionID: created.sessionID,
       agentID: wish.agentID,
@@ -3445,12 +3693,23 @@ async function pumpDispatchQueue(client: DispatchClient, sessionID: string): Pro
     announceQueuedStart(
       wish.ownerSession,
       `[forge:dispatch-progress] wish ${wish.jobId} spawned from the queue (agent ${wish.agentID}, child session ${created.sessionID}) — tracking as a normal async dispatch; the single [forge:dispatch-complete] wake reports when it finishes.`,
+      wish.jobId,
     )
     void runAsyncDispatchPoller(client, job, created.sessionID, {
       prompt: wish.prompt,
       directory: wish.directory,
       questionDeny: wish.questionDeny,
     })
+    if (stoppedSince(sessionID, stopEpochAtDequeue) && !stopWaiting.has(sessionID)) {
+      // D5: the prompt was already on its way when a stop landed, and no
+      // lever is waiting to cancel what it started (it gave up waiting, or
+      // already read the registry). The row is a normal in-flight dispatch
+      // now — cancel it through the lever's own path, serially with any
+      // lever cancels still running for this session.
+      void stopSerialCancel(sessionID, () => cancelDispatch(client, wish.jobId)).catch((err: unknown) => {
+        console.warn(`[forge:dispatch] stop: the late-landing task ${wish.jobId} could not be cancelled by its own pump: ${String(err)}`)
+      })
+    }
   }
 }
 
@@ -3468,6 +3727,75 @@ function flushDispatchQueue(sessionID: string): void {
       "aborted",
       `owner session ${sessionID} ended before the queued wish spawned — flushed without spawning`,
     )
+  }
+}
+
+// fix-stop-cancels-queued-wishes D2/D3: the stop lever's queue half. The
+// session's queued wishes leave the queue WITHOUT spawning and their journal
+// records terminalize — there is no child to abort and no registry row to
+// settle, so no wake follows: the stop receipt is the report and the terminal
+// journal record is what restart recovery reads (never re-entered). The
+// sentence keeps the lever prefix the in-flight rows carry, and says what is
+// true here: nothing was spawned.
+export const STOP_QUEUED_REASON =
+  "cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried"
+
+// D5: the same lever, for a wish the queue pump had dequeued and was creating
+// a child session for when stop landed — that child was never prompted.
+export const STOP_DEQUEUED_REASON =
+  "cancelled by the user lever (/forge stop) — the wish was leaving the queue when stop arrived: it was never prompted and the dispatch is never retried"
+
+function cancelQueuedWishes(sessionID: string): string[] {
+  const queue = dispatchQueues.get(sessionID)
+  if (!queue || queue.length === 0) return []
+  dispatchQueues.delete(sessionID)
+  const ids: string[] = []
+  for (const wish of queue) {
+    ids.push(wish.jobId)
+    // Same base the queued record carried (description + question flag), so
+    // the terminal line reads like every other dispatch's.
+    journalTerminalRecord(
+      { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, description: wish.description, questionDeny: wish.questionDeny },
+      "aborted",
+      STOP_QUEUED_REASON,
+    )
+  }
+  return ids
+}
+
+/**
+ * The stop lever's receipt (pure): the in-flight rows first, then the
+ * cancelled queued wishes as their own line, then — only when the lever
+ * stopped waiting while a wish was still being spawned (D5) — a line saying
+ * so. A session with queued wishes and nothing in flight is not reachable
+ * while the queue pump is healthy (a wish queues only behind a full cap) —
+ * the receipt still says exactly that.
+ */
+export function stopReceipt(
+  sessionID: string,
+  flightCount: number,
+  rows: string[],
+  queuedCancelled: string[],
+  stillLanding = 0,
+  settleMs = 0,
+): { title: string; output: string } {
+  const queuedNote =
+    queuedCancelled.length > 0
+      ? `\n[forge:job] Cancelled ${queuedCancelled.length} queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): ${queuedCancelled.join(", ")}`
+      : ""
+  const landingNote =
+    stillLanding > 0
+      ? `\n[forge:job] ${stillLanding} queued wish(es) of this session were still being started when the lever stopped waiting (${Math.max(1, Math.round(settleMs / 1000))} s) — each is cancelled the moment it lands; nothing of them is left running.`
+      : ""
+  if (flightCount === 0) {
+    return {
+      title: queuedCancelled.length > 0 ? `${queuedCancelled.length} queued wish(es) cancelled` : "stop",
+      output: `[forge:job] No async dispatches in flight for this session (${sessionID}).${queuedNote}${landingNote}`,
+    }
+  }
+  return {
+    title: `${flightCount} dispatch(es) stopped`,
+    output: `[forge:job] Stopped ${flightCount} in-flight dispatch(es) of this session:\n${rows.join("\n")}${queuedNote}${landingNote}`,
   }
 }
 
@@ -3719,6 +4047,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
       announceQueuedStart(
         rec.ownerSession,
         `[forge:dispatch-progress] queued wish ${rec.id} (agent ${rec.agent}) re-entered the queue after host restart — it spawns when a slot frees.`,
+        rec.id,
       )
       await pumpDispatchQueue(client, rec.ownerSession)
     } else {
@@ -3784,6 +4113,7 @@ export async function recoverOneDispatchRecord(client: DispatchClient, workspace
       announceQueuedStart(
         rec.ownerSession,
         `[forge:dispatch-progress] task ${rec.id} retry attempt ${nextAttempt}/${maxAttempts} resumed after host restart — child session ${respawn.sessionID}.`,
+        rec.id,
       )
       void runAsyncDispatchPoller(client, job, respawn.sessionID, {
         prompt,
@@ -3953,9 +4283,12 @@ export function discloseInterruptedParent(sessionID: string): boolean {
   const key = `${sessionID}:${flight.slice().sort().join(",")}`
   if (interruptDisclosureSeen.has(key)) return false
   interruptDisclosureSeen.add(key)
+  // Delivered only while dispatches of this session are still in flight
+  // (fix-stale-progress-notice): "REMAIN IN FLIGHT" must be true when read.
   queueDispatchProgress(
     sessionID,
-    `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):\n${formatInFlightDispatchList()}\nCancel with /forge stop (cancels every in-flight dispatch of THIS session) or the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"} (the cross-session escape hatch). Nothing was cancelled automatically.`,
+    `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):\n${formatInFlightDispatchList()}\nCancel with /forge stop (cancels every in-flight and queued dispatch of THIS session) or the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"} (the cross-session escape hatch). Nothing was cancelled automatically.`,
+    () => inFlightAsyncDispatches(sessionID).length > 0,
   )
   return true
 }
@@ -4568,8 +4901,9 @@ async function runAsyncDispatchPoller(
     updatedAt: Date.now(),
   })
   const flushProgress = (notice: string) => {
-    jobManager.appendOutput(job, notice)
-    queueDispatchProgress(job.ownerSession, notice)
+    // Delivered only while this dispatch is still live (fix-stale-progress-notice).
+    appendDispatchNotice(job, notice)
+    queueDispatchProgress(job.ownerSession, notice, () => dispatchStillLive(job.id))
     // D6 parity (enqueue-while-idle): a notice parked while the owner is
     // already idle has no future idle edge to ride — deliver now (lossy).
     if (idleJobSessions.has(job.ownerSession)) void deliverDispatchProgress(job.ownerSession)
@@ -4951,8 +5285,8 @@ async function runAsyncDispatchPoller(
         `[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` +
         `tracking continues; the final [forge:dispatch-complete] wake with the report arrives when it finishes. ` +
         `Inspect/abort in the host TUI if this looks stuck.`
-      jobManager.appendOutput(job, notice)
-      queueDispatchProgress(job.ownerSession, notice)
+      appendDispatchNotice(job, notice)
+      queueDispatchProgress(job.ownerSession, notice, () => dispatchStillLive(job.id))
       // D6 parity (enqueue-while-idle): a notice parked while the owner is
       // already idle has no future idle edge to ride — deliver now (lossy).
       if (idleJobSessions.has(job.ownerSession)) void deliverDispatchProgress(job.ownerSession)
@@ -5403,6 +5737,10 @@ const taskDispatchTool = tool({
             queueDispatchProgress(
               context.sessionID,
               `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`,
+              // Delivered only if this call timed out and armed the tracker
+              // (a registry row is then live); a dispatch that completed
+              // inside the sync wait has no row — its result was returned.
+              () => dispatchStillLive(syncJobId),
             )
             await new Promise((resolve) => setTimeout(resolve, retryBackoffSync))
             const refusal =
@@ -8008,7 +8346,13 @@ export const server: Plugin = async (input, options) => {
       },
       // Pending [forge:dispatch-progress] notices for a session (fold #2
       // wiring tests observe the enqueue side of the lossy queue).
-      dispatchProgress: (sessionID: string) => [...(dispatchProgressQueue.get(sessionID) ?? [])],
+      dispatchProgress: (sessionID: string) => (dispatchProgressQueue.get(sessionID) ?? []).map((notice) => notice.text),
+      // fix-stale-progress-notice: notices dropped at delivery time because
+      // what they reported was no longer true (newest last, bounded).
+      dispatchProgressDropped: (sessionID: string) => [...(dispatchProgressDropped.get(sessionID) ?? [])],
+      // Read-only view of one registry row's in-memory output tail (the
+      // wiring tests check that a dropped notice stays in the job's output).
+      jobTail: (jobId: string): string | null => jobManager.get(jobId)?.tail ?? null,
       // Provider-gate seams (harden-dispatch-resilience D3): observe the
       // host-process gate's counters/breaker, and reset module state for
       // test isolation (server() calls share one process).
@@ -9393,7 +9737,7 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
       addTemplateCommand(
         "forge",
         () => FORGE_COMMAND_TEMPLATE,
-        "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight async dispatches",
+        "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight and queued async dispatches",
       )
     })
   } catch (e) {

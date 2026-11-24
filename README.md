@@ -654,8 +654,9 @@ ONE command, registered on every host generation:
   - **`init global`** — same drafting flow for the GLOBAL
     `~/.config/opencode/forge.json`, with the built-in override entries
     (`general`/`explore`) shipped commented out (inert until you fill one).
-  - **`stop`** — cancel every in-flight async dispatch owned by THIS
-    session (session-scoped by construction; see *Cancellation* below).
+  - **`stop`** — cancel every in-flight async dispatch AND every queued
+    wish owned by THIS session (session-scoped by construction; see
+    *Cancellation* below).
 
 On v2 hosts typed arguments are composed into the delivered prompt by the
 plugin (the host does no `$ARGUMENTS` substitution for plugin commands).
@@ -993,7 +994,11 @@ the single `[forge:dispatch-complete]` wake with the final report arrives at
 true terminal. While the child runs past each notification interval
 (default 10 minutes, tunable — see the env knobs below), a non-terminal
 `[forge:dispatch-progress]` notice keeps the owner informed — informational
-and idle-only, it never replaces or consumes the completion wake.
+and idle-only, it never replaces or consumes the completion wake. A notice
+is delivered only while what it reports is still true: one parked for a
+busy owner whose child finished meanwhile is dropped at the idle edge, not
+delivered stale (the completion wake is the single carrier of the terminal
+state).
 
 **Dispatch outcome honesty (three outcome classes).** Every dispatch
 settles as exactly one of `completed` (exit 0, the real final report),
@@ -1047,7 +1052,14 @@ turn only and a background child keeps running (upstream #64073). The
 `/forge stop` argument is the lever: it cancels every in-flight async
 dispatch owned by THIS session (other sessions' dispatches are untouched —
 the scope is decided in the tool layer from the host-truth session id, never
-from model-relayed text). Cancelling a specific or foreign dispatch stays
+from model-relayed text) AND every wish that session has queued behind the
+concurrency cap: the queue is emptied BEFORE the in-flight cancels, so no
+slot a cancelled dispatch frees is pumped and no cancelled wish ever spawns.
+A wish the queue pump is already spawning when stop arrives is not missed
+either: the lever waits (up to 15 s; `FORGE_STOP_SETTLE_MS` shortens it for
+tests) for it to land — one whose child session is still being created is
+cancelled unprompted, one whose prompt already went out is cancelled like
+any in-flight dispatch. Cancelling a specific or foreign dispatch stays
 possible with the explicit per-id escape hatch `forge_jobs` with
 `action: "cancel"` and the task id. Cancellation aborts the child
 through the same engine the owner-death path uses, then PROVES the stop —
@@ -1067,18 +1079,26 @@ that was deleted — and that verdict outranks whatever the watch observed
 (an aborted child surfacing as a host error or as a finished-looking
 transcript is still reported as aborted, never as a failure that feeds the
 breaker). The slot a cancelled dispatch held is pumped to the session's
-queued head like any other terminal. An abort that fails — or has not
-returned within 2 s — is disclosed in both the journal record and the wake
-as unconfirmed ("the child may still be running; inspect or abort it
-natively in the host TUI"), whichever of the two is written first. Interruptions disclose: an ESC with children in flight surfaces the
+queued head like any other terminal — except under `/forge stop`, which
+empties that queue first, so a stop pumps nothing. An abort that fails — or
+has not returned within 2 s — is disclosed in both the journal record and
+the wake as unconfirmed ("the child may still be running; inspect or abort
+it natively in the host TUI"), whichever of the two is written first.
+Interruptions disclose: an ESC with children in flight surfaces the
 in-flight list with cancel guidance (disclose-only — an interrupt never
 cancels a child); a streaming forge child with no live row (an adoption
 gap) is surfaced as an orphan with the adopt/cancel paths instead of
 running invisibly. `forge_jobs` with `action: "stop"` is the same lever
-without the command; queued wishes are not in flight, so a stop leaves them
-queued and names them in its receipt as not cancelled (`kill` remains the
-generic process-tree lever for shell jobs — issued on a dispatch row it
-aborts the child, and the journal and the wake name that explicit kill).
+without the command. A queued wish cancelled by stop never had a child: its
+journal record terminalizes as `aborted` with a sentence saying it was
+still queued and nothing was spawned (one cancelled while its child session
+was being created says it was never prompted), no wake is delivered for
+it, restart
+recovery never re-enters it, and the stop receipt lists the cancelled
+in-flight dispatches and the cancelled queued wishes separately (`kill`
+remains the generic process-tree lever for shell jobs — issued on a
+dispatch row it aborts the child, and the journal and the wake name that
+explicit kill).
 
 **Sync handoff presentation.** A sync dispatch whose child outlives the
 wait budget does not fail: the handoff surfaces as a normal informational
@@ -1103,14 +1123,14 @@ the default):
 | Knob | Default | Effect |
 | ---- | ------- | ------ |
 | `FORGE_DISPATCH_POLL_TIMEOUT_MS` | `600000` | The SYNC WAIT window in ms — a sync dispatch whose child does not finish within it gets the honest timeout finding with the armed completion wake. It does NOT bound the async/armed completion tracker (never-die tracking — see below). Clamped to `3600000` (1 h). |
-| `FORGE_DISPATCH_NOTIFY_INTERVAL_MS` | `600000` | The `[forge:dispatch-progress]` notification interval for the async/armed completion tracker, in ms — one informational notice per interval while the child runs; also the textless-idle floor window. Clamped to `3600000` (1 h). |
+| `FORGE_DISPATCH_NOTIFY_INTERVAL_MS` | `600000` | The `[forge:dispatch-progress]` notification interval for the async/armed completion tracker, in ms — one informational notice per interval while the child runs; also the textless-idle floor window. A notice parked for a busy owner is delivered at its next idle edge only while the dispatch it reports is still live — otherwise it is dropped, never delivered stale. Clamped to `3600000` (1 h). |
 | `FORGE_DISPATCH_POLL_INTERVAL_MS` | `1000` | Poll interval for the sync loop and the async completion poller's slices, in ms. |
 | `FORGE_DISPATCH_POLL_SLICE_MS` | `5000` | Length of one async poller watch slice, in ms (a registry kill — an owner-session end, the cancel lever, an explicit kill — takes effect at the watch's next check: every slice boundary and before any observed verdict is acted on). |
 | `FORGE_DISPATCH_STALE_MS` | `2700000` | The activity-stale reap threshold, in ms — a RUNNING dispatch child whose `session.get` `time.updated` has not advanced for this long past the 60 s runtime floor is reaped (`kill` mode aborts it with the honest `stale: aborted after N min without activity` wake). Values below the 60 s floor clamp UP to it; invalid values fall back to the default. (The runtime floor itself is fixed at 60 s; `FORGE_DISPATCH_STALE_FLOOR_MS` overrides it for tests.) |
 | `FORGE_DISPATCH_STALE_MODE` | `kill` | `kill` aborts a stale child (honest terminal wake); `observe` emits ONE `[forge:dispatch-progress]` notice per threshold crossing and never aborts. Anything unrecognized falls back to `kill`. |
 | `FORGE_DISPATCH_MAX_ATTEMPTS` | `2` | Total attempts per dispatch (1 original + N-1 automatic retries). A child that dies in a RETRYABLE error (transient transport/5xx/overload/rate-limit) respawns after a fixed 10 s backoff with the original prompt plus an inspect-then-continue resume preamble; deterministic errors (provider config/auth/model-not-supported/contract — and anything unrecognized), stale kills, user aborts, and floor findings NEVER retry. Invalid or sub-1 values fall back to the default; ceiling 10. (`FORGE_DISPATCH_RETRY_BACKOFF_MS` overrides the backoff for tests.) |
 | `FORGE_DISPATCH_DEBUG` | unset | When `1`, the sync dispatch wait emits `[forge-dbg]` diagnostic lines to stderr (slice status, stale probes with anchor values, resolved thresholds and sweep decisions). Diagnostics only — never changes behavior. |
-| `FORGE_DISPATCH_QUEUE_MAX` | `10` | Per-session FIFO queue bound (fold D): a wish that arrives while the dispatch cap (3) is full queues instead of refusing; beyond this bound the call is refused listing every in-flight AND queued task id. Queued wishes spawn FIFO as slots free (a cancelled dispatch frees its slot too — its kill settle pumps the queue head); an owner session that ends flushes its queue without spawning (honest aborted records). Invalid or sub-1 values fall back to the default. |
+| `FORGE_DISPATCH_QUEUE_MAX` | `10` | Per-session FIFO queue bound (fold D): a wish that arrives while the dispatch cap (3) is full queues instead of refusing; beyond this bound the call is refused listing every in-flight AND queued task id. Queued wishes spawn FIFO as slots free (a cancelled dispatch frees its slot too — its kill settle pumps the queue head); `/forge stop` cancels the session's queued wishes as well (removed before the in-flight cancels, so nothing is pumped); an owner session that ends flushes its queue without spawning (honest aborted records). Invalid or sub-1 values fall back to the default. |
 | `FORGE_DISPATCH_JOURNAL_MAX` | `200` | Per-workspace dispatch journal bound (fold E): the append-only `.opencode/forge/dispatch-log.jsonl` rotates by compacting TERMINAL records oldest-first; non-terminal records (running/queued/retry-pending) are never dropped — all-live overflow beats the bound. This journal is what restart recovery replays: a child that finished while the host was down wakes its owner exactly once with the fetched report, a still-running child re-arms, a queued wish re-enters the queue for a live owner, a retry-pending chain resumes while attempts remain. Invalid or sub-1 values fall back to the default. |
 
 **Exec posture pass-through + non-interactive hygiene

@@ -812,7 +812,7 @@ test("soundness (wiring): the async wake path inherits pollChild soundness (comp
 // [forge:dispatch-progress] notice that flushes on the owner idle edge
 // BEFORE the terminal wake.
 
-test("never-die (K3 shape): child busy past a notify boundary → progress notices, then exactly ONE report wake with the REAL final report", async (t) => {
+test("never-die (K3 shape): child busy past a notify boundary → the parked notices are DROPPED when the child finishes before the owner idles; exactly ONE report wake with the REAL final report", async (t) => {
   process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS = "80"
   t.after(() => {
     delete process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS
@@ -833,26 +833,176 @@ test("never-die (K3 shape): child busy past a notify boundary → progress notic
   assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_k3").length, 1, "tracking continues past the notify boundary (never dies)")
   // Nothing delivered while the owner is not idle (idle-only injection).
   const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_k3")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
   assert.equal(toOwner().length, 0, "no sends before the owner idles")
-  // The child completes LATE — the tracker is still alive to see it.
+  // The child completes LATE — the tracker is still alive to see it. The
+  // owner is STILL busy, so the parked notices ("still running") are now
+  // stale by construction.
   setChildState(childID, "done")
   await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_k3").length === 0, "poller settles on real completion")
   await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_k3" } } })
-  // Classify sends by their TEXT PREFIX, not substring: the progress notice
-  // names [forge:dispatch-complete] in its body, and the terminal wake's
-  // tail slice embeds the parked notice text.
-  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
   await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the terminal wake is delivered")
+  // Let any second (stale) send land before counting.
+  await new Promise((res) => setTimeout(res, 150))
   const sends = toOwner().map(textOf)
-  const progress = sends.filter((s) => s.startsWith("[forge:dispatch-progress]"))
-  assert.ok(progress.length >= 1, "at least one progress notice was delivered")
-  assert.match(progress[0], new RegExp(`\\[forge:dispatch-progress\\] task dispatch to forge-dp-research \\(task ${jobId}, child session ${childID}\\) is still running after \\d+ min`), "the exact notice shape (agent, task id, child session, minutes)")
-  for (const p of progress) assert.ok(!p.includes("report from"), "progress notices carry no report content")
+  assert.equal(sends.length, 1, `exactly ONE send — the stale progress notices are dropped at the idle edge: ${JSON.stringify(sends.map((s) => s.slice(0, 90)))}`)
+  assert.ok(sends[0].startsWith("[forge:dispatch-complete]"), "the one send is the terminal wake")
+  assert.ok(sends[0].includes(`report from ${childID}`), "the terminal wake carries the REAL final report (not a timeout string)")
+  assert.ok(!sends[0].includes("is still running after"), `the wake's report block carries no stale progress line: ${sends[0]}`)
+  // The drop side is readable: the dropped notices are exactly the parked ones.
+  const dropped = h.__forgeSubagentsTest.dispatchProgressDropped("ses_k3")
+  assert.ok(dropped.length >= 1, "the dropped notices are recorded")
+  assert.match(dropped[0], new RegExp(`\\[forge:dispatch-progress\\] task dispatch to forge-dp-research \\(task ${jobId}, child session ${childID}\\) is still running after \\d+ min`), "the exact notice shape (agent, task id, child session, minutes)")
+  assert.equal(h.__forgeSubagentsTest.dispatchProgress("ses_k3").length, 0, "the parked queue is drained")
+  // The notices stay readable in the job's own output (the drop is a
+  // delivery decision, not a data loss).
+  assert.ok((h.__forgeSubagentsTest.jobTail(jobId) ?? "").includes("is still running after"), "the notice stays in the dispatch's output tail")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_k3" } } } })
+})
+
+test("fix-stale-progress-notice: a parked notice is delivered while its dispatch is still live — ahead of the completion wake that follows later", async (t) => {
+  process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS = "80"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "long live run", run_in_background: true, description: "live notice" },
+    allowCtx("ses_live1", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_live1")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchProgress("ses_live1").length >= 1, "a progress notice parks while the owner is busy")
+  assert.equal(toOwner().length, 0, "nothing delivered while the owner is busy")
+  // The owner idles while the child is STILL running: what the notice
+  // reports is true → delivered as before.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_live1" } } })
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-progress]")), "the parked notice is delivered at the idle edge")
+  assert.equal(
+    toOwner().filter((a) => textOf(a).startsWith("[forge:dispatch-complete]")).length,
+    0,
+    "no wake yet — the child is still running",
+  )
+  assert.equal(h.__forgeSubagentsTest.dispatchProgressDropped("ses_live1").length, 0, "nothing dropped")
+  // The child finishes later: exactly one wake follows, with the report
+  // and without a stale line above it.
+  setChildState(childID, "done")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_live1").length === 0, "poller settles on real completion")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_live1" } } })
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the terminal wake is delivered")
+  await new Promise((res) => setTimeout(res, 150))
+  const sends = toOwner().map(textOf)
   const wakes = sends.filter((s) => s.startsWith("[forge:dispatch-complete]"))
   assert.equal(wakes.length, 1, "exactly ONE terminal wake")
-  assert.ok(wakes[0].includes(`report from ${childID}`), "the terminal wake carries the REAL final report (not a timeout string)")
-  assert.ok(sends.findIndex((s) => s.startsWith("[forge:dispatch-progress]")) < sends.findIndex((s) => s.startsWith("[forge:dispatch-complete]")), "progress flushes BEFORE the terminal wake")
-  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_k3" } } } })
+  assert.ok(wakes[0].includes(`report from ${childID}`), "the terminal wake carries the REAL final report")
+  assert.ok(!wakes[0].includes("is still running after"), `the wake's report block carries no progress line: ${wakes[0]}`)
+  assert.equal(h.__forgeSubagentsTest.dispatchProgressDropped("ses_live1").length, 0, "still nothing dropped — every delivered notice was true when read")
+  assert.ok((h.__forgeSubagentsTest.jobTail(jobId) ?? "").includes("is still running after"), "the delivered notice also stays in the dispatch's output tail")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_live1" } } } })
+})
+
+test("fix-stale-progress-notice: a retry-attempt notice parked BETWEEN attempts is delivered — the dispatch is still live", async (t) => {
+  process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS = "600"
+  t.after(() => {
+    delete process.env.FORGE_DISPATCH_RETRY_BACKOFF_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  // Child 1 dies in a TRANSIENT error; the retry child (create #2) completes.
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: (seq) => (seq === 1 ? "error" : "done"), errorText: "fetch failed: ECONNRESET mid-stream" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "retry with a live notice", run_in_background: true, description: "retry notice" },
+    allowCtx("ses_live2", dir),
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_live2")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  // The attempt notice parks during the 600 ms backoff — the owner idles
+  // INSIDE that window, with no second child created yet.
+  await waitFor(() => h.__forgeSubagentsTest.dispatchProgress("ses_live2").some((s) => s.includes("attempt 2/2 starting after")), "the attempt notice parks")
+  assert.equal(calls.create.length, 1, "still between attempts (no retry child yet)")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_live2" } } })
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-progress]")), "the attempt notice is delivered between attempts")
+  assert.ok(
+    textOf(toOwner().find((a) => textOf(a).startsWith("[forge:dispatch-progress]"))).includes("attempt 2/2 starting after"),
+    "the delivered notice is the attempt notice",
+  )
+  assert.equal(h.__forgeSubagentsTest.dispatchProgressDropped("ses_live2").length, 0, "nothing dropped — the row stays live across the backoff")
+  // The retry completes: one wake, no stale notice re-sent.
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_live2").length === 0, "the retry settles")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_live2" } } })
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the final wake arrives")
+  await new Promise((res) => setTimeout(res, 150))
+  const sends = toOwner().map(textOf)
+  assert.equal(sends.filter((s) => s.startsWith("[forge:dispatch-complete]")).length, 1, "exactly ONE terminal wake after the retry")
+  assert.equal(sends.filter((s) => s.startsWith("[forge:dispatch-progress]")).length, 1, "the attempt notice was delivered exactly once")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_live2" } } } })
+})
+
+test("fix-stale-progress-notice: an interrupt disclosure parked for a busy owner is DROPPED when nothing is in flight at the idle edge", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "interrupt me", run_in_background: true, description: "interrupt disclosure" },
+    allowCtx("ses_int1", dir),
+  )
+  const childID = r.output.match(/child session: (ses_child_\d+)/)[1]
+  // The owner's turn is interrupted while the child is in flight.
+  await h.event({ event: { type: "session.execution.interrupted", properties: { sessionID: "ses_int1" } } })
+  const parked = h.__forgeSubagentsTest.dispatchProgress("ses_int1")
+  assert.equal(parked.length, 1, `the disclosure parks: ${JSON.stringify(parked)}`)
+  assert.match(parked[0], /REMAIN IN FLIGHT/)
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_int1")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  assert.equal(toOwner().length, 0, "not delivered while the owner is not idle")
+  // The child finishes BEFORE the owner's next idle edge: "REMAIN IN
+  // FLIGHT" is no longer true when the disclosure would be read.
+  setChildState(childID, "done")
+  await waitFor(() => h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_int1").length === 0, "poller settles on real completion")
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_int1" } } })
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-complete]")), "the completion wake is delivered")
+  await new Promise((res) => setTimeout(res, 150))
+  const sends = toOwner().map(textOf)
+  assert.equal(sends.filter((s) => s.startsWith("[forge:dispatch-notice]")).length, 0, `the stale disclosure is NOT delivered: ${JSON.stringify(sends.map((s) => s.slice(0, 80)))}`)
+  assert.equal(sends.length, 1, "only the completion wake")
+  assert.ok(h.__forgeSubagentsTest.dispatchProgressDropped("ses_int1").some((s) => s.includes("REMAIN IN FLIGHT")), "the dropped disclosure is recorded")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_int1" } } } })
+})
+
+test("fix-stale-progress-notice: an interrupt disclosure is DELIVERED while the session still has a dispatch in flight", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  t.after(() => h.dispose?.())
+  await h.config(emptyCfg())
+  const r = await h.tool.task.execute(
+    { subagent_type: "forge-dp-research", prompt: "keep running", run_in_background: true, description: "interrupt live" },
+    allowCtx("ses_int2", dir),
+  )
+  const jobId = r.output.match(/task id: (\S+)/)[1]
+  await h.event({ event: { type: "session.execution.interrupted", properties: { sessionID: "ses_int2" } } })
+  const toOwner = () => calls.promptAsync.filter((a) => a.path?.id === "ses_int2")
+  const textOf = (a) => String(a.body?.parts?.[0]?.text ?? "")
+  assert.equal(toOwner().length, 0, "not delivered while the owner is not idle")
+  // The owner idles while the child is STILL running: true → delivered.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: "ses_int2" } } })
+  await waitFor(() => toOwner().some((a) => textOf(a).startsWith("[forge:dispatch-notice]")), "the disclosure is delivered at the idle edge")
+  const notice = toOwner().map(textOf).find((s) => s.startsWith("[forge:dispatch-notice]"))
+  assert.ok(notice.includes(jobId), "the disclosure names the in-flight task")
+  assert.equal(h.__forgeSubagentsTest.dispatchProgressDropped("ses_int2").length, 0, "nothing dropped")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_int2").length, 1, "the interrupt cancelled nothing (disclose-only)")
+  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_int2" } } } })
 })
 
 test("never-die (K1b shape + knob isolation): completion inside a notify boundary still wakes; FORGE_DISPATCH_POLL_TIMEOUT_MS never kills the tracker", async (t) => {
@@ -1711,6 +1861,10 @@ test("host terminal signal with a NESTED error object: the journal reason names 
 // edit of the constant AND of this pin.
 
 const LEVER_REASON = "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+// fix-stop-cancels-queued-wishes D2: the stop lever's sentence for a wish that was still queued.
+const QUEUED_REASON = "cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried"
+// D5: the same lever, for a wish the queue pump was creating a child for when stop landed.
+const DEQUEUED_REASON = "cancelled by the user lever (/forge stop) — the wish was leaving the queue when stop arrived: it was never prompted and the dispatch is never retried"
 const REGISTRY_REASON = "registry kill (owner session ended) — the child was aborted and the dispatch is never retried"
 const EXPLICIT_KILL_REASON = "killed by the explicit forge_jobs kill action — the child was aborted and the dispatch is never retried"
 
@@ -1780,7 +1934,7 @@ test("kill sentence ①: forge_jobs kill on a dispatch row names THAT lever — 
   await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_ks_x" } } } })
 })
 
-test("queue pump ②: a kill settle releases the slot — the queued head spawns after a per-id cancel, and /forge stop discloses the queued wishes it does NOT cancel", async (t) => {
+test("queue pump ②: a kill settle releases the slot — the queued head spawns after a per-id cancel, and /forge stop cancels the queued wishes too (none spawns into the freed slots)", async (t) => {
   process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
   t.after(() => {
     delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
@@ -1788,7 +1942,7 @@ test("queue pump ②: a kill settle releases the slot — the queued head spawns
   const dir = projectWithForgeJson(t, readonlyPool)
   const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
   const h = await startServer(input(dir, client), {})
-  t.after(() => h.dispose?.())
+  endOwnerAtTeardown(t, () => h, "ses_ks_pump")
   await h.config(emptyCfg())
   const ctx = allowCtx("ses_ks_pump", dir)
   const dispatch = (i) =>
@@ -1809,23 +1963,569 @@ test("queue pump ②: a kill settle releases the slot — the queued head spawns
   assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_ks_pump").length, 0, "the queue is empty")
   assert.equal(journalTerminals(dir, ids[0])[0]?.reason, LEVER_REASON, "the cancelled row journaled the lever sentence")
   // The cap is full again (2 survivors + the spawned wish): the next wish
-  // queues; /forge stop cancels the 3 in flight and SAYS that the queued one
-  // is not cancelled (queued wishes are not in flight — the contract's
-  // whether-stop-also-flushes-them is an open decision, not this behavior).
+  // queues. /forge stop cancels the queued wish TOO
+  // (fix-stop-cancels-queued-wishes — owner decision 2026-11-23): the queue
+  // leaves BEFORE the in-flight cancels, so the freed slots pump nothing.
   const queuedId2 = idOf(await dispatch(4))
+  const createsAtStop = calls.create.length
   const stop = await h.tool.forge_jobs.execute({ action: "stop" }, ctx)
   assert.match(stop.output, /Stopped 3 in-flight dispatch\(es\)/)
   assert.ok(
-    stop.output.includes(`1 queued wish(es) of this session were NOT in flight and are not cancelled by stop — they spawn FIFO into the freed slots: ${queuedId2}`),
-    `the stop output discloses the queued wish: ${stop.output}`,
+    stop.output.includes(`Cancelled 1 queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): ${queuedId2}`),
+    `the stop receipt names the cancelled queued wish: ${stop.output}`,
   )
-  await waitFor(() => calls.create.length === 5, "the stopped rows' settles pumped the second queued wish", 4000)
+  assert.doesNotMatch(stop.output, /were NOT in flight|spawn FIFO/, `no survivor claim any more: ${stop.output}`)
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_ks_pump").length, 0, "the queue is empty the moment stop returns")
   for (const id of [ids[1], ids[2], queuedId]) {
     await waitFor(() => journalTerminals(dir, id).length === 1, `${id} terminalized`)
     assert.equal(journalTerminals(dir, id)[0].reason, LEVER_REASON, `${id} journaled the lever sentence`)
   }
-  assert.equal(tracked(h, queuedId2), 1, "the second queued wish is tracked (it spawned, it was not cancelled)")
-  await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_ks_pump" } } } })
+  const queued2 = journalTerminals(dir, queuedId2)
+  assert.equal(queued2.length, 1, "the cancelled queued wish has exactly ONE terminal journal record")
+  assert.equal(queued2[0].outcome, "aborted", `the cancelled queued wish journaled aborted: ${JSON.stringify(queued2[0])}`)
+  assert.equal(queued2[0].reason, QUEUED_REASON, "the cancelled queued wish journaled the queued stop sentence")
+  // Settle window: three rows settled after the stop — none of them pumped the cancelled wish.
+  await new Promise((r) => setTimeout(r, 800))
+  assert.equal(calls.create.length, createsAtStop, "nothing spawned after the stop")
+  assert.equal(tracked(h, queuedId2), 0, "the cancelled queued wish was never a tracked dispatch")
+  assert.equal(
+    h.__forgeSubagentsTest.dispatchProgress("ses_ks_pump").some((s) => s.includes(`wish ${queuedId2} spawned from the queue`)),
+    false,
+    "no progress notice announces a spawn that never happened",
+  )
+})
+
+test("fix-stop-cancels-queued-wishes: the stop receipt is honest for every group combination (pure)", async () => {
+  const { stopReceipt } = await import("../plugin.ts")
+  const both = stopReceipt("ses_s", 2, ["- row A", "- row B"], ["j-q1", "j-q2"])
+  assert.equal(both.title, "2 dispatch(es) stopped")
+  assert.ok(both.output.startsWith("[forge:job] Stopped 2 in-flight dispatch(es) of this session:\n- row A\n- row B\n"), both.output)
+  assert.ok(both.output.includes("Cancelled 2 queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): j-q1, j-q2"), both.output)
+  const flightOnly = stopReceipt("ses_s", 1, ["- row A"], [])
+  assert.equal(flightOnly.output, "[forge:job] Stopped 1 in-flight dispatch(es) of this session:\n- row A", "no queued line when nothing was queued")
+  assert.equal(flightOnly.title, "1 dispatch(es) stopped")
+  const queuedOnly = stopReceipt("ses_s", 0, [], ["j-q1"])
+  assert.equal(queuedOnly.title, "1 queued wish(es) cancelled")
+  assert.deepEqual(
+    queuedOnly.output.split("\n"),
+    [
+      "[forge:job] No async dispatches in flight for this session (ses_s).",
+      "[forge:job] Cancelled 1 queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): j-q1",
+    ],
+    "queued-only: says nothing was in flight, then the cancelled line",
+  )
+  assert.ok(!queuedOnly.output.includes("j-q2"), "only the cancelled ids are named")
+})
+
+test("fix-stop-cancels-queued-wishes: a queued wish cancelled by stop stays cancelled across a restart (journal recovery never re-enters it)", async (t) => {
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  let h = await startServer(input(dir, client), {})
+  endOwnerAtTeardown(t, () => h, "ses_ks_restart")
+  await h.config(emptyCfg())
+  const ctx = allowCtx("ses_ks_restart", dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  const ids = []
+  for (let i = 0; i < 3; i++) ids.push(idOf(await dispatch(i)))
+  const queuedId = idOf(await dispatch(3))
+  assert.equal(calls.create.length, 3, "the 4th wish is queued behind the cap")
+  await h.tool.forge_jobs.execute({ action: "stop" }, ctx)
+  for (const id of [...ids, queuedId]) await waitFor(() => journalTerminals(dir, id).length === 1, `${id} terminalized`)
+  const createsAfterStop = calls.create.length
+  // Restart: a fresh plugin instance recovers from the SAME on-disk journal.
+  // The journal instances and the recovered-workspace set are module state —
+  // cleared the way a fresh host process starts (otherwise the second boot
+  // would skip recovery and the "nothing spawned" claim would be vacuous).
+  h.dispose?.()
+  await new Promise((r) => setTimeout(r, 300))
+  h.__forgeSubagentsTest.setDispatchJournalFs(null)
+  h = await startServer(input(dir, client), {})
+  await h.config(emptyCfg())
+  assert.ok(h.__forgeSubagentsTest.dispatchRecoveredWorkspaces().includes(dir), "the restarted instance recovered this workspace at init")
+  await new Promise((r) => setTimeout(r, 1200))
+  assert.equal(calls.create.length, createsAfterStop, "nothing was spawned by recovery")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === "ses_ks_restart").length, 0, "nothing re-entered the queue")
+  assert.equal(journalTerminals(dir, queuedId)[0].reason, QUEUED_REASON, "the queued wish's terminal record is untouched by recovery")
+  assert.equal(
+    h.__forgeSubagentsTest.dispatchProgress("ses_ks_restart").some((s) => s.includes(`queued wish ${queuedId}`)),
+    false,
+    "no re-entered-queue notice for a cancelled wish",
+  )
+})
+
+// fix-stop-cancels-queued-wishes D5 — the pump's TRANSIT window. Between
+// `queue.shift()` and registration a wish is in neither the queue nor the
+// registry (several awaits: the crew-belt read, child creation, prompt send).
+// The mock's two seams park the pump INSIDE that window, so nothing below
+// leans on real timing except the lever's own wait bound, which its knob
+// shortens.
+
+// A parked pump must never be able to hang a test: the "the pump reached the
+// window" wait is bounded, and the gate is always opened at teardown.
+const parked = (entered, release, t, label) => {
+  t.after(() => release())
+  let timer
+  return Promise.race([entered, new Promise((_, reject) => (timer = setTimeout(() => reject(new Error(`timed out (20 s): ${label}`)), 20000)))]).finally(() => clearTimeout(timer))
+}
+
+// Teardown of every test that owns dispatched children here. It must run even
+// when an assertion fails half-way, and in THIS order:
+//   1. open the gate a pump may still be parked on, then give that pump a
+//      moment to LAND — an owner that ends while one of its wishes is in
+//      transit misses that wish (the known "owner ends mid-transit" gap);
+//   2. end the owner session, which kills its children;
+//   3. dispose the harness LAST. A job that registers after the dispose (a
+//      pump released afterwards) keeps its poller, and a live poller keeps
+//      this file's process alive for ever — node:test has no default timeout,
+//      so the failure would never be reported.
+// `host` is a thunk: a test may replace its harness (the restart test).
+// Returns `open()`: what the test calls instead of releasing the gate itself.
+const endOwnerAtTeardown = (t, host, sid, release = () => {}) => {
+  let armed = true
+  t.after(async () => {
+    try {
+      if (armed) {
+        release()
+        await new Promise((r) => setTimeout(r, 1200))
+      }
+      await host().event({ event: { type: "session.deleted", properties: { info: { id: sid } } } })
+    } finally {
+      host().dispose?.()
+    }
+  })
+  return () => {
+    armed = false
+    release()
+  }
+}
+
+test("fix-stop-cancels-queued-wishes D5: a stop that lands while the pump is still running the queued head's spawn-time crew-belt read cancels the wish BEFORE any child session is created", async (t) => {
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  let releaseGet = () => {}
+  const gate = new Promise((resolve) => {
+    releaseGet = resolve
+  })
+  let beltEntered = () => {}
+  const entered = new Promise((resolve) => {
+    beltEntered = resolve
+  })
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const sid = "ses_ks_transit0"
+  // The belt read is an await only for a crew-governed session (it re-reads
+  // the session anchor). `hold` is armed AFTER the five dispatches (a queued
+  // dispatch's own gate reads the anchor too); from then on the FIRST anchor
+  // read that happens while the queue head is in transit (queue down to one
+  // wish, no fourth child yet) is the pump's — selected by plugin state,
+  // never by call order.
+  let h = null
+  let hold = false
+  const realGet = client.session.get
+  client.session.get = async (args) => {
+    const headInTransit = () => hold && calls.create.length === 3 && h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === sid).length === 1
+    if (args.path?.id === sid && headInTransit()) {
+      beltEntered()
+      await gate
+    }
+    return realGet(args)
+  }
+  h = await startServer(input(dir, client), {})
+  const open = endOwnerAtTeardown(t, () => h, sid, () => releaseGet())
+  await h.config(emptyCfg())
+  const ctx = allowCtx(sid, dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  for (let i = 0; i < 3; i++) await dispatch(i)
+  const transitId = idOf(await dispatch(3))
+  const queuedId = idOf(await dispatch(4))
+  assert.equal(calls.create.length, 3, "wishes 4 and 5 are queued behind the cap")
+  // An ARMED crew makes the pump's spawn-time belt read the anchor await.
+  await h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, ctx)
+  await h.tool.crew_begin.execute({ execution: "waves" }, ctx)
+  hold = true
+  setChildState("ses_child_1", "done")
+  await parked(entered, releaseGet, t, "the pump parked inside the crew-belt read")
+  assert.equal(calls.create.length, 3, "the head left the queue, but NO child session exists for it yet")
+  assert.equal(tracked(h, transitId), 0, "the head is not registered")
+  const stopping = h.tool.forge_jobs.execute({ action: "stop" }, ctx)
+  open()
+  const stop = await stopping
+  assert.match(stop.output, /Stopped 2 in-flight dispatch\(es\)/, stop.output)
+  assert.match(stop.output, /Cancelled 2 queued wish\(es\) of this session/, stop.output)
+  assert.ok(stop.output.includes(transitId) && stop.output.includes(queuedId), `the receipt names the in-transit wish AND the still-queued one: ${stop.output}`)
+  assert.ok(!stop.output.includes("still being started"), `the lever waited for the in-transit wish: ${stop.output}`)
+  await waitFor(() => journalTerminals(dir, transitId).length === 1, "the in-transit wish terminalized")
+  const transit = journalTerminals(dir, transitId)[0]
+  assert.equal(transit.outcome, "aborted", `aborted: ${JSON.stringify(transit)}`)
+  assert.equal(transit.reason, DEQUEUED_REASON, "the dequeued-by-stop sentence")
+  assert.equal(journalTerminals(dir, queuedId)[0]?.reason, QUEUED_REASON, "the wish that was still queued journaled the queued sentence")
+  // Nothing was ever created for it — so there is no husk to clean up: the
+  // only aborts are the lever's two in-flight cancels.
+  await waitFor(() => calls.abort.length >= 2, "the lever's two cancels ran")
+  await new Promise((r) => setTimeout(r, 800))
+  assert.equal(calls.create.length, 3, "no child session was ever created for the stopped wish")
+  assert.deepEqual(calls.abort.map((a) => a.path?.id), ["ses_child_2", "ses_child_3"], `no husk abort: ${JSON.stringify(calls.abort.map((a) => a.path?.id))}`)
+  assert.equal(tracked(h, transitId), 0, "the in-transit wish was never a tracked dispatch")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === sid).length, 0, "the queue is empty")
+  assert.equal(journalTerminals(dir, transitId).length, 1, "the in-transit wish has exactly ONE terminal journal record")
+  // (No session.idle is fired here: an ARMED crew's wave engine continues on
+  // idle, and the wake behaviour of a cancelled queued wish is the subject
+  // of the next test.)
+})
+
+test("fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is creating the queued head's child never prompts it — the wish is cancelled with the queued group and the empty child is aborted as cleanup", async (t) => {
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  let releaseCreate = () => {}
+  const gate = new Promise((resolve) => {
+    releaseCreate = resolve
+  })
+  let createEntered = () => {}
+  const entered = new Promise((resolve) => {
+    createEntered = resolve
+  })
+  const { client, calls, setChildState } = makeClient({
+    record: { directory: dir, worktree: dir },
+    mode: "busy",
+    onCreate: (_id, seq) => {
+      if (seq !== 4) return
+      createEntered()
+      return gate
+    },
+  })
+  const h = await startServer(input(dir, client), {})
+  await h.config(emptyCfg())
+  const sid = "ses_ks_transit1"
+  const open = endOwnerAtTeardown(t, () => h, sid, () => releaseCreate())
+  const ctx = allowCtx(sid, dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  const ids = []
+  for (let i = 0; i < 3; i++) ids.push(idOf(await dispatch(i)))
+  const transitId = idOf(await dispatch(3))
+  const queuedId = idOf(await dispatch(4))
+  assert.equal(calls.create.length, 3, "wishes 4 and 5 are queued behind the cap")
+  // One row completes → its settle pumps the head → the pump parks inside
+  // the CREATE of the head's child session.
+  setChildState("ses_child_1", "done")
+  await parked(entered, releaseCreate, t, "the pump parked inside the child CREATE")
+  assert.equal(calls.create.length, 4, "the head's child session is being created")
+  assert.equal(tracked(h, transitId), 0, "the head is not registered yet")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === sid).length, 1, "only the second wish is still in the queue")
+  // Stop lands INSIDE the window; the create resolves only afterwards.
+  const stopping = h.tool.forge_jobs.execute({ action: "stop" }, ctx)
+  open()
+  const stop = await stopping
+  assert.match(stop.output, /Stopped 2 in-flight dispatch\(es\)/, stop.output)
+  assert.match(
+    stop.output,
+    /Cancelled 2 queued wish\(es\) of this session — removed from the queue before they could spawn \(nothing was running for them\): /,
+    stop.output,
+  )
+  assert.ok(stop.output.includes(transitId) && stop.output.includes(queuedId), `the receipt names the in-transit wish AND the still-queued one: ${stop.output}`)
+  assert.ok(!stop.output.includes("still being started"), `the lever waited for the in-transit wish: ${stop.output}`)
+  assert.equal(calls.promptAsync.filter((a) => a.path?.id === "ses_child_4").length, 0, "the in-transit wish's child was never prompted")
+  await waitFor(() => calls.abort.some((a) => a.path?.id === "ses_child_4"), "the empty child session is aborted as cleanup")
+  assert.deepEqual(
+    calls.abort.map((a) => a.path?.id),
+    ["ses_child_4", "ses_child_2", "ses_child_3"],
+    `the husk's abort ran first, then the lever's two cancels — once each, none for the row that completed: ${JSON.stringify(calls.abort.map((a) => a.path?.id))}`,
+  )
+  const transit = journalTerminals(dir, transitId)
+  assert.equal(transit.length, 1, "the in-transit wish has exactly ONE terminal journal record")
+  assert.equal(transit[0].outcome, "aborted", `aborted: ${JSON.stringify(transit[0])}`)
+  assert.equal(transit[0].reason, DEQUEUED_REASON, "the dequeued-by-stop sentence")
+  assert.equal(journalTerminals(dir, queuedId)[0]?.reason, QUEUED_REASON, "the wish that was still queued journaled the queued sentence")
+  for (const id of [...ids.slice(1)]) await waitFor(() => journalTerminals(dir, id).length === 1, `${id} terminalized`)
+  // Settle window: two rows settled after the stop — neither wish was pumped.
+  await new Promise((r) => setTimeout(r, 800))
+  assert.equal(calls.create.length, 4, "nothing spawned after the stop")
+  assert.equal(tracked(h, transitId), 0, "the in-transit wish was never a tracked dispatch")
+  assert.equal(tracked(h, queuedId), 0, "the queued wish was never a tracked dispatch")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === sid).length, 0, "the queue is empty")
+  // The owner idles: the completed row's wake and the two aborted wakes — no
+  // wake for either cancelled wish.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+  await waitFor(() => ownerWakes(calls, sid).filter((w) => w.includes("ABORTED")).length === 2, "the two aborted wakes are delivered")
+  const wakes = ownerWakes(calls, sid)
+  assert.ok(wakes.every((w) => !w.includes(transitId) && !w.includes(queuedId)), `no wake for a cancelled queued wish: ${JSON.stringify(wakes.map((w) => w.slice(0, 90)))}`)
+})
+
+test("fix-stop-cancels-queued-wishes D5: a stop that lands WHILE the pump is sending the queued head's prompt waits for it to land, then cancels it like any other in-flight dispatch", async (t) => {
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  let releasePrompt = () => {}
+  const gate = new Promise((resolve) => {
+    releasePrompt = resolve
+  })
+  let promptEntered = () => {}
+  const entered = new Promise((resolve) => {
+    promptEntered = resolve
+  })
+  const { client, calls, setChildState } = makeClient({
+    record: { directory: dir, worktree: dir },
+    mode: "busy",
+    onPromptAsync: (args) => {
+      if (args.path?.id !== "ses_child_4") return
+      promptEntered()
+      return gate
+    },
+  })
+  const h = await startServer(input(dir, client), {})
+  await h.config(emptyCfg())
+  const sid = "ses_ks_transit2"
+  const open = endOwnerAtTeardown(t, () => h, sid, () => releasePrompt())
+  const ctx = allowCtx(sid, dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  const ids = []
+  for (let i = 0; i < 3; i++) ids.push(idOf(await dispatch(i)))
+  const transitId = idOf(await dispatch(3))
+  setChildState("ses_child_1", "done")
+  await parked(entered, releasePrompt, t, "the pump parked inside the prompt SEND")
+  assert.equal(calls.create.length, 4, "the head's child session exists")
+  assert.equal(tracked(h, transitId), 0, "the head is not registered yet — its prompt is being sent")
+  const stopping = h.tool.forge_jobs.execute({ action: "stop" }, ctx)
+  open()
+  const stop = await stopping
+  assert.match(stop.output, /Stopped 3 in-flight dispatch\(es\)/, stop.output)
+  assert.ok(
+    stop.output.includes(`Cancelled ${transitId} (agent forge-dp-research, child session ses_child_4) — cancelled by the user lever`),
+    `the wish the prompt already reached is cancelled as IN FLIGHT: ${stop.output}`,
+  )
+  assert.ok(!stop.output.includes("queued wish(es)"), `nothing is reported as queued or landing: ${stop.output}`)
+  assert.equal(calls.abort.filter((a) => a.path?.id === "ses_child_4").length, 1, `the child is aborted exactly once (the lever OR the pump — never both): ${JSON.stringify(calls.abort.map((a) => a.path?.id))}`)
+  await waitFor(() => journalTerminals(dir, transitId).length === 1, "the transit wish terminalized")
+  const transit = journalTerminals(dir, transitId)[0]
+  assert.equal(transit.outcome, "aborted", `aborted: ${JSON.stringify(transit)}`)
+  assert.equal(transit.reason, LEVER_REASON, "a child that was prompted is cancelled with the lever sentence")
+  await waitFor(() => tracked(h, transitId) === 0, "the transit wish's row settled")
+  await new Promise((r) => setTimeout(r, 800))
+  assert.equal(calls.create.length, 4, "nothing spawned after the stop")
+})
+
+test("fix-stop-cancels-queued-wishes D5: when the lever stops waiting first, a wish that lands afterwards is cancelled by its own pump — never beside the lever's cancels — and the receipt says it was still landing", async (t) => {
+  process.env.FORGE_CANCEL_IDLE_ASSERTION_MS = "300"
+  process.env.FORGE_STOP_SETTLE_MS = "60"
+  t.after(() => {
+    delete process.env.FORGE_CANCEL_IDLE_ASSERTION_MS
+    delete process.env.FORGE_STOP_SETTLE_MS
+  })
+  const dir = projectWithForgeJson(t, readonlyPool)
+  let releasePrompt = () => {}
+  const gate = new Promise((resolve) => {
+    releasePrompt = resolve
+  })
+  let promptEntered = () => {}
+  const entered = new Promise((resolve) => {
+    promptEntered = resolve
+  })
+  const { client, calls, setChildState } = makeClient({
+    record: { directory: dir, worktree: dir },
+    mode: "busy",
+    onPromptAsync: (args) => {
+      if (args.path?.id !== "ses_child_4") return
+      promptEntered()
+      return gate
+    },
+  })
+  // The lever's FIRST cancel is slow, so the late wish lands while that
+  // cancel is still running (whichever row the lever happens to take first).
+  const realAbort = client.session.abort
+  const abortLog = []
+  let first = true
+  client.session.abort = async (args) => {
+    const entry = { id: args.path?.id, start: Date.now(), end: null }
+    abortLog.push(entry)
+    try {
+      if (first) {
+        first = false
+        await new Promise((r) => setTimeout(r, 400))
+      }
+      return await realAbort(args)
+    } finally {
+      entry.end = Date.now()
+    }
+  }
+  const h = await startServer(input(dir, client), {})
+  await h.config(emptyCfg())
+  const sid = "ses_ks_transit3"
+  const open = endOwnerAtTeardown(t, () => h, sid, () => releasePrompt())
+  const ctx = allowCtx(sid, dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  const ids = []
+  for (let i = 0; i < 3; i++) ids.push(idOf(await dispatch(i)))
+  const transitId = idOf(await dispatch(3))
+  setChildState("ses_child_1", "done")
+  await parked(entered, releasePrompt, t, "the pump parked inside the prompt SEND")
+  assert.equal(tracked(h, transitId), 0, "the head is in transit (prompt being sent)")
+  const stopping = h.tool.forge_jobs.execute({ action: "stop" }, ctx)
+  // The lever gives up waiting (its knob: 60 ms) and starts cancelling
+  // WITHOUT the wish — observed, not timed.
+  await waitFor(() => abortLog.length >= 1, "the lever began cancelling while the wish is still in transit", 4000)
+  assert.equal(tracked(h, transitId), 0, "the wish is still in transit when the lever starts cancelling")
+  open()
+  const stop = await stopping
+  assert.match(stop.output, /Stopped 2 in-flight dispatch\(es\)/, stop.output)
+  assert.match(stop.output, /1 queued wish\(es\) of this session were still being started when the lever stopped waiting/, stop.output)
+  assert.ok(!stop.output.includes(`Cancelled ${transitId}`), `the lever did not cancel the late wish itself: ${stop.output}`)
+  await waitFor(() => journalTerminals(dir, transitId).length === 1, "the late wish terminalized", 4000)
+  const transit = journalTerminals(dir, transitId)[0]
+  assert.equal(transit.outcome, "aborted", `aborted: ${JSON.stringify(transit)}`)
+  assert.equal(transit.reason, LEVER_REASON, "a child that was prompted is cancelled with the lever sentence")
+  await waitFor(
+    () => abortLog.filter((e) => e.id === "ses_child_4").length === 1 && abortLog.find((e) => e.id === "ses_child_4").end !== null,
+    "the late wish's child was aborted once",
+    4000,
+  )
+  await waitFor(() => tracked(h, transitId) === 0, "the late wish's row settled", 4000)
+  assert.deepEqual(
+    abortLog.map((e) => e.id).sort(),
+    ["ses_child_2", "ses_child_3", "ses_child_4"],
+    `exactly one abort per child, none for the row that completed: ${JSON.stringify(abortLog)}`,
+  )
+  // One at a time: no abort window overlaps another.
+  const done = abortLog.filter((e) => e.end !== null).sort((a, b) => a.start - b.start)
+  for (let i = 1; i < done.length; i++) {
+    assert.ok(done[i].start >= done[i - 1].end, `abort ${done[i].id} started before abort ${done[i - 1].id} ended: ${JSON.stringify(done)}`)
+  }
+  // The owner is told about the late cancellation the way it is told about
+  // every cancelled in-flight dispatch: the aborted wake.
+  await h.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+  await waitFor(() => ownerWakes(calls, sid).some((w) => w.includes("ABORTED") && w.includes(transitId)), "the late cancellation's aborted wake is delivered", 4000)
+})
+
+test("fix-stop-cancels-queued-wishes D5: the concurrency cap counts a wish the pump is still spawning — a second pump never over-dispatches behind it", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  let releaseCreate = () => {}
+  const gate = new Promise((resolve) => {
+    releaseCreate = resolve
+  })
+  let createEntered = () => {}
+  const entered = new Promise((resolve) => {
+    createEntered = resolve
+  })
+  const { client, calls, setChildState } = makeClient({
+    record: { directory: dir, worktree: dir },
+    mode: "busy",
+    onCreate: (_id, seq) => {
+      // Only the FIRST queued wish's child is held; every later create is free.
+      if (seq !== 4) return
+      createEntered()
+      return gate
+    },
+  })
+  const h = await startServer(input(dir, client), {})
+  await h.config(emptyCfg())
+  const sid = "ses_ks_transit4"
+  const open = endOwnerAtTeardown(t, () => h, sid, () => releaseCreate())
+  const ctx = allowCtx(sid, dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  const ids = []
+  for (let i = 0; i < 6; i++) ids.push(idOf(await dispatch(i)))
+  assert.equal(calls.create.length, 3, "three in flight, three queued behind the cap")
+  // Two rows finish → two free slots → exactly TWO of the queued wishes may
+  // spawn. The first one's create is held, so the second pump runs while the
+  // first wish is in transit.
+  setChildState("ses_child_1", "done")
+  setChildState("ses_child_2", "done")
+  await parked(entered, releaseCreate, t, "a pump parked inside the first queued wish's CREATE")
+  // The second free slot is taken by the next queued wish (its create is free).
+  await waitFor(() => tracked(h, ids[4]) === 1, "the second queued wish registered")
+  await new Promise((r) => setTimeout(r, 700))
+  assert.equal(calls.create.length, 5, `two slots freed, two children created — the third queued wish stays queued while one of the two is still in transit: ${calls.create.length} creates`)
+  assert.equal(tracked(h, ids[3]), 0, "the first queued wish is still in transit")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === sid).length, 1, "the third queued wish is still in the queue")
+  open()
+  await waitFor(() => tracked(h, ids[3]) === 1, "the first queued wish registered after its create returned")
+  await new Promise((r) => setTimeout(r, 500))
+  assert.equal(calls.create.length, 5, "still no third spawn: the cap (3) is reached")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === sid).length, 1, "the third queued wish waits for a real slot")
+})
+
+test("queue pump ③: two rows finishing together spawn two queued wishes in a row — the pump never mistakes the wish it just registered for one still in transit", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({ record: { directory: dir, worktree: dir }, mode: "busy" })
+  const h = await startServer(input(dir, client), {})
+  endOwnerAtTeardown(t, () => h, "ses_ks_pump3")
+  await h.config(emptyCfg())
+  const sid = "ses_ks_pump3"
+  const ctx = allowCtx(sid, dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  const ids = []
+  for (let i = 0; i < 5; i++) ids.push(idOf(await dispatch(i)))
+  assert.equal(calls.create.length, 3, "three in flight, two queued behind the cap")
+  // Both finish before the next poll slice: two slots free up, and BOTH
+  // queued wishes must spawn without waiting for any further settle.
+  setChildState("ses_child_1", "done")
+  setChildState("ses_child_2", "done")
+  await waitFor(() => calls.create.length === 5, "both queued wishes spawned", 6000)
+  for (const id of [ids[3], ids[4]]) await waitFor(() => tracked(h, id) === 1, `${id} registered`)
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === sid).length, 0, "the queue is empty")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === sid).length, 3, "exactly the cap is in flight")
+})
+
+test("queue pump ⑤ (fix-stop-cancels-queued-wishes D5): a queued head whose child session cannot be created hands its slot straight back — the next queued wish spawns in the SAME pump run", async (t) => {
+  const dir = projectWithForgeJson(t, readonlyPool)
+  const { client, calls, setChildState } = makeClient({
+    record: { directory: dir, worktree: dir },
+    mode: "busy",
+    onCreate: (_id, seq) => {
+      // Only the head's create (the 4th) fails; every later one is free.
+      if (seq === 4) throw new Error("host refused the create")
+    },
+  })
+  const h = await startServer(input(dir, client), {})
+  endOwnerAtTeardown(t, () => h, "ses_ks_pump5")
+  await h.config(emptyCfg())
+  const sid = "ses_ks_pump5"
+  const ctx = allowCtx(sid, dir)
+  const dispatch = (i) =>
+    h.tool.task.execute({ subagent_type: "forge-dp-research", prompt: `p${i}`, run_in_background: true, description: `wish${i}` }, ctx)
+  const idOf = (res) => res.output.match(/task id: (\S+)/)[1]
+  const ids = []
+  for (let i = 0; i < 5; i++) ids.push(idOf(await dispatch(i)))
+  assert.equal(calls.create.length, 3, "three in flight, two queued behind the cap")
+  // ONE row completes → ONE pump run. The run takes the head, its create
+  // fails (an honest error — never a retry, never a spawn), and the run must
+  // go straight on to the second wish: the head is terminal now, so the slot
+  // it never used is free. No other row settles afterwards — if the run
+  // counted the head it just failed as "still in transit", the second wish
+  // would see the cap (2 in flight + 1) and wait for a settle that never comes.
+  setChildState("ses_child_1", "done")
+  await waitFor(() => journalTerminals(dir, ids[3]).length === 1, "the refused head terminalized", 6000)
+  const head = journalTerminals(dir, ids[3])[0]
+  assert.equal(head.outcome, "error", `an honest error, not an abort: ${JSON.stringify(head)}`)
+  assert.match(head.reason, /child session creation failed/, `the reason names the failed create: ${JSON.stringify(head)}`)
+  await waitFor(() => calls.create.length === 5, "the next queued wish's child was created by the same pump run", 4000)
+  await waitFor(() => tracked(h, ids[4]) === 1, "the next queued wish registered")
+  assert.equal(h.__forgeSubagentsTest.dispatchQueues().filter((x) => x.ownerSession === sid).length, 0, "the queue is empty")
+  assert.equal(h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === sid).length, 3, "three in flight — the cap is full again (the refused head holds nothing)")
+  assert.equal(tracked(h, ids[3]), 0, "the refused head was never a tracked dispatch")
 })
 
 test("respawn window ③a: a kill landing WHILE the retry child is CREATED never prompts it — the husk is aborted as cleanup, the row settles ABORTED with the killer's sentence, the wake names the attempt's real child", async (t) => {
