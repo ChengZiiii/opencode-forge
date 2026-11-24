@@ -1,0 +1,40 @@
+{
+  "verdict": true,
+  "result": {
+    "pass": true,
+    "checks": {
+      "fgSaysNotStartedFirst": true,
+      "fgNamesTheMissingDirectory": true,
+      "fgCarriesJobIdAndSpawnError": true,
+      "fgHasNoRanSentences": true,
+      "fgHasNoCommandOutput": true,
+      "fgIsExactlyFourLines": true,
+      "bgStartHandsAJobId": true,
+      "bgPollNamesNotStarted": true,
+      "bgPollHasNoCommandOutput": true,
+      "controlRanFormIntact": true
+    },
+    "details": {
+      "fg": {
+        "turnMs": 6064,
+        "status": "completed",
+        "codeCalled": true,
+        "text": "[forge:job] NOT STARTED — spawn failed; nothing was executed.\ncwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws\\no-such-dir-fg-w4socx\njobId: j-20261124-001009-18jo1s\nspawn error: ENOENT: no such file or directory, uv_spawn 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe'"
+      },
+      "bg": {
+        "turnMs": 10614,
+        "status": "completed",
+        "codeCalled": true,
+        "text": "{\"started\":\"[forge:job] Started in background.\\ncwd: C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\opencode\\\\view-e2e\\\\ws\\\\no-such-dir-bg-w4socx\\njobId: j-20261124-001019-sohcv2\\nlogPath: C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\opencode\\\\view-e2e\\\\sbx-tmp\\\\opencode-forge\\\\jobs\\\\j-20261124-001019-sohcv2.log\\nTrack with forge_jobs poll; a [forge:job-complete] message arrives on exit.\",\"id\":\"j-20261124-001019-sohcv2\",\"polls\":[\"[forge:job] j-20261124-001019-sohcv2: NOT STARTED — spawn failed; nothing was executed (terminal state: killed).\"],\"final\":\"[forge:job] j-20261124-001019-sohcv2: NOT STARTED — spawn failed; nothing was executed (terminal state: killed).\\nspawn error: ENOENT: no such file or directory, uv_spawn 'C:\\\\Windows\\\\System32\\\\WindowsPowerShell\\\\v1.0\\\\powershell.exe'\\nnew output:\\n(none in this window)\\nlogPath: C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\opencode\\\\view-e2e\\\\sbx-tmp\\\\opencode-forge\\\\jobs\\\\j-20261124-001019-sohcv2.log\"}"
+      },
+      "control": {
+        "turnMs": 20808,
+        "status": "completed",
+        "text": "[forge:job] Command finished (exit=0).\ncwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws\njobId: j-20261124-001026-2exwmv\nOutput was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed).\noutput:\nB-RAN-w4socx\r\n"
+      }
+    },
+    "error": null
+  },
+  "startedAt": "2026-11-24T00:10:08.101Z",
+  "hostPid": 42396
+}

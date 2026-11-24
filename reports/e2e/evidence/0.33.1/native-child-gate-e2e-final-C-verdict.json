@@ -1,0 +1,321 @@
+{
+  "host": "http://127.0.0.1:47911",
+  "hostPid": 2912,
+  "started": "2026-11-24T00:14:57.543Z",
+  "legs": "C",
+  "results": {
+    "C": {
+      "armAttempts": 1,
+      "armMs": 10631,
+      "armSteps": 2,
+      "ceilingMs": 240000,
+      "stepBoundMs": 28502,
+      "armDecision": "00:15:10 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+      "preCeilingIdleEdges": [
+        {
+          "atMs": 7104,
+          "tookMs": 6089,
+          "ruling": "00:15:16 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 2
+        },
+        {
+          "atMs": 13705,
+          "tookMs": 4555,
+          "ruling": "00:15:23 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 3
+        },
+        {
+          "atMs": 19801,
+          "tookMs": 4572,
+          "ruling": "00:15:30 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 4
+        },
+        {
+          "atMs": 26919,
+          "tookMs": 6085,
+          "ruling": "00:15:36 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 5
+        },
+        {
+          "atMs": 33528,
+          "tookMs": 4559,
+          "ruling": "00:15:43 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 6
+        },
+        {
+          "atMs": 39616,
+          "tookMs": 4566,
+          "ruling": "00:15:49 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 7
+        },
+        {
+          "atMs": 46196,
+          "tookMs": 4562,
+          "ruling": "00:15:56 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 8
+        },
+        {
+          "atMs": 52283,
+          "tookMs": 4557,
+          "ruling": "00:16:02 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 9
+        },
+        {
+          "atMs": 59386,
+          "tookMs": 6082,
+          "ruling": "00:16:09 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 10
+        },
+        {
+          "atMs": 65993,
+          "tookMs": 4579,
+          "ruling": "00:16:15 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 11
+        },
+        {
+          "atMs": 72105,
+          "tookMs": 4566,
+          "ruling": "00:16:22 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 12
+        },
+        {
+          "atMs": 75682,
+          "tookMs": 1543,
+          "ruling": "00:16:25 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 13
+        },
+        {
+          "atMs": 81800,
+          "tookMs": 4579,
+          "ruling": "00:16:31 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 14
+        },
+        {
+          "atMs": 87891,
+          "tookMs": 4569,
+          "ruling": "00:16:38 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 15
+        },
+        {
+          "atMs": 94525,
+          "tookMs": 4573,
+          "ruling": "00:16:44 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 16
+        },
+        {
+          "atMs": 108709,
+          "tookMs": 12141,
+          "ruling": "00:16:58 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 17
+        },
+        {
+          "atMs": 114826,
+          "tookMs": 4574,
+          "ruling": "00:17:04 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 18
+        },
+        {
+          "atMs": 120924,
+          "tookMs": 4569,
+          "ruling": "00:17:11 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 19
+        },
+        {
+          "atMs": 127546,
+          "tookMs": 4580,
+          "ruling": "00:17:17 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 20
+        },
+        {
+          "atMs": 131614,
+          "tookMs": 3053,
+          "ruling": "00:17:21 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 21
+        },
+        {
+          "atMs": 138218,
+          "tookMs": 4571,
+          "ruling": "00:17:28 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 22
+        },
+        {
+          "atMs": 141797,
+          "tookMs": 1544,
+          "ruling": "00:17:31 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 23
+        },
+        {
+          "atMs": 148903,
+          "tookMs": 6079,
+          "ruling": "00:17:38 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 24
+        },
+        {
+          "atMs": 157039,
+          "tookMs": 6089,
+          "ruling": "00:17:47 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 25
+        },
+        {
+          "atMs": 163160,
+          "tookMs": 4579,
+          "ruling": "00:17:53 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 26
+        },
+        {
+          "atMs": 167745,
+          "tookMs": 3067,
+          "ruling": "00:17:57 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 27
+        },
+        {
+          "atMs": 173834,
+          "tookMs": 4569,
+          "ruling": "00:18:04 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 28
+        },
+        {
+          "atMs": 177425,
+          "tookMs": 1547,
+          "ruling": "00:18:07 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 29
+        },
+        {
+          "atMs": 183528,
+          "tookMs": 4577,
+          "ruling": "00:18:13 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 30
+        },
+        {
+          "atMs": 189611,
+          "tookMs": 4560,
+          "ruling": "00:18:19 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 31
+        },
+        {
+          "atMs": 196222,
+          "tookMs": 4578,
+          "ruling": "00:18:26 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 32
+        },
+        {
+          "atMs": 202338,
+          "tookMs": 4584,
+          "ruling": "00:18:32 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 33
+        },
+        {
+          "atMs": 217031,
+          "tookMs": 13668,
+          "ruling": "00:18:46 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+          "briefs": 0,
+          "engineSuppressedEdges": 34
+        }
+      ],
+      "abandonedNudge": null,
+      "briefsBeforeCeiling": 0,
+      "driverEdgesAfterCeiling": 0,
+      "briefAfterCeilingMs": 3399,
+      "childStillBusyAtBrief": true,
+      "briefsAfterCeiling": 1,
+      "disclosuresThisRun": 1,
+      "disclosureWitness": "serve-log (this run's offset)",
+      "engineCeilingExpired": 1,
+      "engineCeilingAlreadyDisclosed": 0,
+      "engineRecheckClear": 1,
+      "engineRecheckLines": [
+        "00:19:12 crew native-child recheck clear session=ses_df51821d8ffev0Xsni7p5Abq8K inFlight=1 ceiling=expired"
+      ],
+      "pass": true
+    }
+  },
+  "hostCeiling": {
+    "recordedPid": 2912,
+    "runningPid": 2912,
+    "hostCeilingMs": 240000,
+    "driverCeilingMs": 240000,
+    "productionDefaultMs": 900000
+  },
+  "verdict": {
+    "C": true
+  },
+  "verdictAll": true,
+  "engineEvidence": [
+    "00:15:10 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:15:16 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:15:23 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:15:30 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:15:36 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:15:43 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:15:49 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:15:56 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:02 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:09 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:15 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:22 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:25 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:31 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:38 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:44 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:16:58 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:04 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:11 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:17 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:21 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:28 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:31 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:38 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:47 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:53 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:17:57 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:18:04 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:18:07 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:18:13 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:18:19 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:18:26 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:18:32 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:18:46 crew skip: native child in flight session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:19:12 crew native-child recheck clear session=ses_df51821d8ffev0Xsni7p5Abq8K inFlight=1 ceiling=expired",
+    "00:19:12 crew native-child ceiling expired session=ses_df51821d8ffev0Xsni7p5Abq8K",
+    "00:19:12 crew continued session=ses_df51821d8ffev0Xsni7p5Abq8K objective=\"native child gate sandbox E2E\""
+  ],
+  "cleanup": {
+    "created": 1,
+    "deleted": 0,
+    "alreadyGone": 1,
+    "failed": 0,
+    "stillActive": 0
+  }
+}

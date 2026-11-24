@@ -1,0 +1,76 @@
+{
+  "verdict": true,
+  "result": {
+    "pass": true,
+    "checks": {
+      "thirdDirectoryIsInitializedLast": true,
+      "ownerHostRecordNamesWs": true,
+      "childHostRecordNamesWs": true,
+      "workerShellCwdIsWs": true,
+      "workerShellCwdIsNotTheLastInitializedDir": true,
+      "goalContractLandsInWs": true,
+      "nothingLandedElsewhere": true,
+      "dispatchJournalInWs": true,
+      "thirdStayedTheLatestInitialization": true
+    },
+    "details": {
+      "child": {
+        "tools": [
+          "execute:completed"
+        ],
+        "cwd": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+        "toolText": "[forge:job] Command finished (exit=0). cwd: C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws jobId: j-20261124-001355-blcphb Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed). output: (none)",
+        "canary": true,
+        "note": null
+      },
+      "goal": {
+        "files": {
+          "ws": [
+            "2026-11-24-anchor-e2e-rwtaet.md"
+          ],
+          "xs": [],
+          "third": []
+        },
+        "out": "Goal queued (inert): .opencode/goal/2026-11-24-anchor-e2e-rwtaet.md. It never runs until promoted via /goal next or goal_resume (user dialog)."
+      },
+      "ownerAsks": [],
+      "ownerLane": {
+        "names": [
+          "execute"
+        ],
+        "taskLane": true,
+        "nativeLane": false
+      },
+      "journal": {
+        "inWs": [
+          "dispatched",
+          "started",
+          "terminal"
+        ],
+        "inThird": 0,
+        "thirdJournalExists": false
+      },
+      "activation": {
+        "status": 200,
+        "loadedAfter": [
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws",
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-md-9q49sw",
+          "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-md-rwtaet-1"
+        ],
+        "pluginLoadLines": "4 -> 5",
+        "thirdKey": "C:\\Users\\Soren\\AppData\\Local\\Temp\\opencode\\view-e2e\\ws-md-rwtaet-1",
+        "pluginLoadLinesAtDispatch": 5,
+        "pluginLoadLinesAtEnd": 5
+      },
+      "dirs": {
+        "ws": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws",
+        "xs": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws-ctx-b",
+        "third": "C:/Users/Soren/AppData/Local/Temp/opencode/view-e2e/ws-md-rwtaet-1"
+      }
+    },
+    "error": null,
+    "premise": null
+  },
+  "startedAt": "2026-11-24T00:13:42.463Z",
+  "hostPid": 42396
+}

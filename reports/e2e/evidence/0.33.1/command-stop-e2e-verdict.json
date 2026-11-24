@@ -1,0 +1,333 @@
+{
+  "host": "http://127.0.0.1:47911",
+  "hostPid": 42396,
+  "ownerLocation": "\\ws",
+  "startedAt": "2026-11-23T23:45:18.834Z",
+  "first": {
+    "nonce": "mwtwyg36",
+    "commandSurface": {
+      "status": 200,
+      "total": 7,
+      "forgePresent": true,
+      "hyphenCommands": [],
+      "retiredAbsent": true,
+      "helpListsStop": false,
+      "description": "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight async dispatches"
+    },
+    "aIds": [
+      "j-20261123-234532-rk9vdt",
+      "j-20261123-234532-kt412t"
+    ],
+    "bIds": [
+      "j-20261123-234523-ypdkv5"
+    ],
+    "aChildren": [
+      "ses_df5330ed1ffePs8BNcU1352S2m",
+      "ses_df5330eb7ffeUTWudHSw8Kv9xA"
+    ],
+    "bChild": "ses_df53333abffeGiEJ04GxeG1lvs",
+    "lane": {
+      "A": {
+        "names": [
+          "execute"
+        ],
+        "taskLane": true,
+        "nativeLane": false
+      },
+      "B": {
+        "names": [
+          "execute"
+        ],
+        "taskLane": true,
+        "nativeLane": false
+      }
+    },
+    "childrenInFlight": true,
+    "childrenBusyBeforeStop": [
+      true,
+      true,
+      true
+    ],
+    "commandStatus": 204,
+    "soon": {
+      "a": [
+        {
+          "id": "j-20261123-234532-rk9vdt",
+          "state": "terminal",
+          "outcome": "aborted",
+          "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+        },
+        {
+          "id": "j-20261123-234532-kt412t",
+          "state": "terminal",
+          "outcome": "aborted",
+          "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+        }
+      ],
+      "b": {
+        "id": "j-20261123-234523-ypdkv5",
+        "state": "started",
+        "outcome": null,
+        "reason": ""
+      },
+      "bChildBusy": true,
+      "aChildrenBusy": [
+        false,
+        false
+      ],
+      "stopTurnMs": 27248
+    },
+    "final": {
+      "a": [
+        {
+          "id": "j-20261123-234532-rk9vdt",
+          "state": "terminal",
+          "outcome": "aborted",
+          "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+        },
+        {
+          "id": "j-20261123-234532-kt412t",
+          "state": "terminal",
+          "outcome": "aborted",
+          "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+        }
+      ],
+      "aRowsAfterTerminal": [
+        [],
+        []
+      ],
+      "aJournalIdCount": 2,
+      "b": {
+        "id": "j-20261123-234523-ypdkv5",
+        "state": "terminal",
+        "outcome": "completed",
+        "reason": "CANARY-B-mwtwyg36"
+      },
+      "bRowStates": [
+        "dispatched",
+        "started",
+        "terminal"
+      ],
+      "aChildrenBusy": [
+        false,
+        false
+      ],
+      "bChildBusy": false
+    },
+    "wakes": {
+      "aAbortedBlocks": 2,
+      "aAbortedNamesEveryDispatch": true,
+      "aScaffolding": false,
+      "aHasFinalReport": false,
+      "aHeads": [
+        "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder — ABORTED (task j-20261123-234532-kt412t, child session ses_df5330eb7ffeUTWudHSw8Kv9xA): cancelled by the user lever (/forge stop) — the child was aborted and the disp",
+        "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder — ABORTED (task j-20261123-234532-rk9vdt, child session ses_df5330ed1ffePs8BNcU1352S2m): cancelled by the user lever (/forge stop) — the child was aborted and the disp"
+      ],
+      "bAbortedBlocks": 0,
+      "bArrived": true,
+      "bHasFinalReport": true,
+      "bScaffolding": false,
+      "bHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261123-234523-ypdkv5, child session ses_df53333abffeGiEJ04GxeG1lvs). Final report: CANARY-B-mwtwyg36 The dispatch is complete — read the report above; no polling, no re-dispatch "
+    },
+    "stop": {
+      "called": true,
+      "callCount": 1,
+      "saidTwo": true,
+      "output": "[forge:job] Stopped 2 in-flight dispatch(es) of this session:\\n- Cancelled j-20261123-234532-rk9vdt (agent forge-viewe2e-coder, child session ses_df5330ed1ffePs8BNcU1352S2m) — cancelled by the user lever; never retried. the child session ses_df5330ed1ffePs8BNcU1352S2m is confirmed idle (the cancellation is REAL, not bookkeeping).\\n- Cancelled j-20261123-234532-kt412t (agent forge-viewe2e-coder, child session ses_df53",
+      "deliveredPromptHead": "(forge roster levers. Argument: \"stop\") FAMILY GUARD (step 0, before anything else): if you do not have the forge_sync tool in your available tools, you are not in a forge session — STOP now: execute nothing below, and tell the user that /forge belongs to the ",
+      "idsKnown": true
+    },
+    "ledgerSinceStop": [],
+    "allRefusal": {
+      "observed": true,
+      "status": "completed",
+      "refused": true,
+      "output": "[forge] cancel \"all\" is retired — use action \"stop\" (cancels THIS session's in-flight dispatches) or cancel an explicit task id. \"\"",
+      "code": "const r = await tools.forge_jobs({ action: \"cancel\", jobId: \"all\" });\nreturn r;"
+    },
+    "checks": {
+      "commandList": true,
+      "pluginLane": true,
+      "dispatchShape": true,
+      "childrenInFlight": true,
+      "commandAccepted": true,
+      "routeDelivered": true,
+      "stopCalled": true,
+      "aAbortedWithLeverReason": true,
+      "aWakesExactlyTwoAborted": true,
+      "aWakesHonest": true,
+      "bUntouchedAtStop": true,
+      "bCompleted": true,
+      "bWakeCarriesChildWords": true,
+      "bNeverAborted": true,
+      "aChildrenIdleSoon": true,
+      "aNeverRetried": true
+    },
+    "pass": true
+  },
+  "result": {
+    "nonce": "mwtwyg36",
+    "commandSurface": {
+      "status": 200,
+      "total": 7,
+      "forgePresent": true,
+      "hyphenCommands": [],
+      "retiredAbsent": true,
+      "helpListsStop": false,
+      "description": "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight async dispatches"
+    },
+    "aIds": [
+      "j-20261123-234532-rk9vdt",
+      "j-20261123-234532-kt412t"
+    ],
+    "bIds": [
+      "j-20261123-234523-ypdkv5"
+    ],
+    "aChildren": [
+      "ses_df5330ed1ffePs8BNcU1352S2m",
+      "ses_df5330eb7ffeUTWudHSw8Kv9xA"
+    ],
+    "bChild": "ses_df53333abffeGiEJ04GxeG1lvs",
+    "lane": {
+      "A": {
+        "names": [
+          "execute"
+        ],
+        "taskLane": true,
+        "nativeLane": false
+      },
+      "B": {
+        "names": [
+          "execute"
+        ],
+        "taskLane": true,
+        "nativeLane": false
+      }
+    },
+    "childrenInFlight": true,
+    "childrenBusyBeforeStop": [
+      true,
+      true,
+      true
+    ],
+    "commandStatus": 204,
+    "soon": {
+      "a": [
+        {
+          "id": "j-20261123-234532-rk9vdt",
+          "state": "terminal",
+          "outcome": "aborted",
+          "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+        },
+        {
+          "id": "j-20261123-234532-kt412t",
+          "state": "terminal",
+          "outcome": "aborted",
+          "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+        }
+      ],
+      "b": {
+        "id": "j-20261123-234523-ypdkv5",
+        "state": "started",
+        "outcome": null,
+        "reason": ""
+      },
+      "bChildBusy": true,
+      "aChildrenBusy": [
+        false,
+        false
+      ],
+      "stopTurnMs": 27248
+    },
+    "final": {
+      "a": [
+        {
+          "id": "j-20261123-234532-rk9vdt",
+          "state": "terminal",
+          "outcome": "aborted",
+          "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+        },
+        {
+          "id": "j-20261123-234532-kt412t",
+          "state": "terminal",
+          "outcome": "aborted",
+          "reason": "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
+        }
+      ],
+      "aRowsAfterTerminal": [
+        [],
+        []
+      ],
+      "aJournalIdCount": 2,
+      "b": {
+        "id": "j-20261123-234523-ypdkv5",
+        "state": "terminal",
+        "outcome": "completed",
+        "reason": "CANARY-B-mwtwyg36"
+      },
+      "bRowStates": [
+        "dispatched",
+        "started",
+        "terminal"
+      ],
+      "aChildrenBusy": [
+        false,
+        false
+      ],
+      "bChildBusy": false
+    },
+    "wakes": {
+      "aAbortedBlocks": 2,
+      "aAbortedNamesEveryDispatch": true,
+      "aScaffolding": false,
+      "aHasFinalReport": false,
+      "aHeads": [
+        "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder — ABORTED (task j-20261123-234532-kt412t, child session ses_df5330eb7ffeUTWudHSw8Kv9xA): cancelled by the user lever (/forge stop) — the child was aborted and the disp",
+        "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder — ABORTED (task j-20261123-234532-rk9vdt, child session ses_df5330ed1ffePs8BNcU1352S2m): cancelled by the user lever (/forge stop) — the child was aborted and the disp"
+      ],
+      "bAbortedBlocks": 0,
+      "bArrived": true,
+      "bHasFinalReport": true,
+      "bScaffolding": false,
+      "bHead": "[forge:dispatch-complete] task dispatch to forge-viewe2e-coder finished (task j-20261123-234523-ypdkv5, child session ses_df53333abffeGiEJ04GxeG1lvs). Final report: CANARY-B-mwtwyg36 The dispatch is complete — read the report above; no polling, no re-dispatch "
+    },
+    "stop": {
+      "called": true,
+      "callCount": 1,
+      "saidTwo": true,
+      "output": "[forge:job] Stopped 2 in-flight dispatch(es) of this session:\\n- Cancelled j-20261123-234532-rk9vdt (agent forge-viewe2e-coder, child session ses_df5330ed1ffePs8BNcU1352S2m) — cancelled by the user lever; never retried. the child session ses_df5330ed1ffePs8BNcU1352S2m is confirmed idle (the cancellation is REAL, not bookkeeping).\\n- Cancelled j-20261123-234532-kt412t (agent forge-viewe2e-coder, child session ses_df53",
+      "deliveredPromptHead": "(forge roster levers. Argument: \"stop\") FAMILY GUARD (step 0, before anything else): if you do not have the forge_sync tool in your available tools, you are not in a forge session — STOP now: execute nothing below, and tell the user that /forge belongs to the ",
+      "idsKnown": true
+    },
+    "ledgerSinceStop": [],
+    "allRefusal": {
+      "observed": true,
+      "status": "completed",
+      "refused": true,
+      "output": "[forge] cancel \"all\" is retired — use action \"stop\" (cancels THIS session's in-flight dispatches) or cancel an explicit task id. \"\"",
+      "code": "const r = await tools.forge_jobs({ action: \"cancel\", jobId: \"all\" });\nreturn r;"
+    },
+    "checks": {
+      "commandList": true,
+      "pluginLane": true,
+      "dispatchShape": true,
+      "childrenInFlight": true,
+      "commandAccepted": true,
+      "routeDelivered": true,
+      "stopCalled": true,
+      "aAbortedWithLeverReason": true,
+      "aWakesExactlyTwoAborted": true,
+      "aWakesHonest": true,
+      "bUntouchedAtStop": true,
+      "bCompleted": true,
+      "bWakeCarriesChildWords": true,
+      "bNeverAborted": true,
+      "aChildrenIdleSoon": true,
+      "aNeverRetried": true
+    },
+    "pass": true
+  },
+  "verdict": true,
+  "inconclusive": null,
+  "finishedAt": "2026-11-23T23:50:02.283Z"
+}
