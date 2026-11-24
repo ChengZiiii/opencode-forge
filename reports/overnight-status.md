@@ -759,9 +759,11 @@ launched them"；我们架构文档第 9 条也写着“插件 dispose 不是击
 | `59eb84f` | plugin: change #1 的实现、单测、构建产物、change 文档 |
 | `45d9ce6` | docs: A 乙——注释、规格 delta、单测、文档（没有运行时代码改动） |
 | `395ff5d` | docs(openspec): D 的 change 草案（提案 + 设计，等你过目） |
-| 本笔 | docs: 0.34.2 的验收门证据（34 / 0 / 0 / 0）与快照、有头 TUI 门证据、两个 change 的 4.3 勾选、状态页 |
+| `c00cf99` | docs: 0.34.2 的验收门证据（34 / 0 / 0 / 0）与快照、有头 TUI 门证据、两个 change 的 4.3 勾选、状态页 |
+| `d4da815` | docs: D 草案按沙箱实测改过一轮（D4 顺序、D5、新增 D6、更正误读），状态页补探针结果 |
+| 本笔 | docs: 状态页的提交账与归档清单（补上 `d4da815`） |
 
-- forge 的 main 领先 origin 83 个提交（含本笔）；`wt-0341` 的 `29fa34d` 已并入 main。
+- forge 的 main 领先 origin 85 个提交（含本笔）；`wt-0341` 的 `29fa34d` 已并入 main。
 - computer-use 的 main 领先 origin 1 个提交（`c112258`）。
 - `openspec validate --all` 现在是 20 过 / 1 败（21 项）。败的是 D 的 change 草案
   `adopt-native-subagent-dispatch`，原因是“还没有规格 delta”——草案阶段有意如此
@@ -787,8 +789,17 @@ launched them"；我们架构文档第 9 条也写着“插件 dispose 不是击
 - 新增归档 `archive/2026-11-25-research-v2-subagent-orchestration/`：调研用的
   脚本、清单，读过的宿主 2.4.0 源码与官方文档、社区设计文档、issue 线程（70 个
   文件；归档前密钥扫描 0 命中，复制后 sha256 逐一相同）。
+- 新增归档 `archive/2026-11-25-d-native-probes/`：D 的沙箱探针驱动、公共库、只读小
+  工具、每份结论文件和日志（45 个文件，另有 README 和清单；归档前密钥扫描 0 命中，
+  复制后 sha256 逐一相同）。原件留在 `view-e2e`，驱动还能从那里重跑。
 
 ## 记账待办（已知、未修）
+
+- （11-25，D 探针里看到，没查）原生派出的子会话，记录里带着一条会话级权限
+  `forge_shell: allow`，`general` 子会话也有（3 次）。插件里的“会话补救规则”按注释
+  只对 forge 会话生效，是谁写进去的没查。
+- （11-25）沙箱宿主里有两个已删除但仍加载的位置（`ws-dir-c4gm53`、`ws-dir-5vkcov`），
+  是探针的临时目录；重启沙箱宿主自然清掉。关联老账“位置被 evict 时不发事件”。
 
 - 宿主与生命周期：`disposeAll` 跨上下文连坐；`exitCleanup.killOne` 不留台账；
   `exitCleanup.trigger("dispose")` 是一次性闩锁；`ensureJobLifecycle` 初始化
