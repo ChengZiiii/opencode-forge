@@ -89,8 +89,10 @@
  9. **击杀结局与裁定优先**（fix-dispatch-dispose-kill）：派发行的第
     四类结局是 `aborted`——合法的注册表击杀只有三种来源：owner 会话
     终结（session.deleted 收割）、用户取消杆（`/forge stop` 与 per-id
-    `cancel`）、对派发行的显式 `forge_jobs kill`；**插件 dispose 不是
-    击杀触发器**（多上下文宿主上别的上下文被回收，在飞的派发照跑）。
+    `cancel`）、对派发行的显式 `forge_jobs kill`；**插件卸载不是
+    击杀触发器**（v1 的 `dispose` 钩子豁免派发行；v2 宿主上这个钩子
+    根本不会被调用——卸载时宿主只跑 `setup` 返回的清理函数，它只拆
+    自己的注册、停自己的事件循环，不碰任何作业）。
     看守循环在**每一处可能对观测裁决下手之前**先查注册表击杀（切片
     顶、消费宿主信号前、每次轮询后、收尾 `markTerminal` 前）——2.4.0
     上被中止的孩子会以 `session.execution.failed` 或"看似跑完"的

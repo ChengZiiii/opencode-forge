@@ -7794,8 +7794,8 @@ export const server: Plugin = async (input, options) => {
   return {
     dispose: async () => {
       // Diagnostics only: proof that the hook ran on THIS host generation and
-      // what its job table held (2026-11-23: no host action on 2.4.0 could be
-      // PROVEN to reach this point — the E2E had to infer it from a kill).
+      // what its job table held. On a v2 host this line never appears — its
+      // absence is the observable half of the fact stated just below.
       try {
         const all = jobManager.list()
         goalProbe(`plugin dispose hook: registry rows=${all.length} running=${all.filter((j) => j.state === "running").length} dispatch rows=${all.filter(isDispatchRow).length}`)
@@ -7805,10 +7805,27 @@ export const server: Plugin = async (input, options) => {
       // non-survive job, then end the fence watcher. Survive jobs keep
       // running by contract — their registry entries await the next host.
       // fix-dispatch-dispose-kill D1: dispatch rows are skipped in BOTH the
-      // exit matrix (createExitCleanup skip) and disposeAll — a v2
-      // multi-context host fires dispose on every context recycle and the
-      // host keeps living; killing in-flight dispatches there is pure
-      // destruction (journal aborted → recovery skips live children).
+      // exit matrix (createExitCleanup skip) and disposeAll — killing an
+      // in-flight dispatch here is pure destruction (journal aborted →
+      // recovery skips live children).
+      //
+      // WHO RUNS THIS (doc-plugin-unload-v2; verified 2026-11-25 against the
+      // opencode 2.4.0 sources): this `dispose` key is the V1 cleanup
+      // contract — `Hooks.dispose` of @opencode-ai/plugin 1.x — and only a
+      // v1 host calls it. A v2 host never does. Its loader reads just
+      // `default.id` and `default.setup` (or `default.effect`) from the
+      // package's ./server entry (packages/core/src/plugin/module.ts), and
+      // the only cleanup it runs on plugin unload is the function `setup`
+      // RESOLVES to — an async setup is first-class there
+      // (packages/plugin/src/promise/plugin.ts; adapter.ts acquireRelease).
+      // That is the cleanup at the end of v2Setup, and it only disposes this
+      // instance's registrations and stops its event loop: it clears no job.
+      // So on a v2 host NO plugin unload terminates a job — the host's own
+      // rule, "Jobs outlive the plugin that launched them". Live on 2.4.0:
+      // an evict of the owner location with live jobs and a dispatch in
+      // flight killed nothing; the dispatch completed with its wake.
+      // The hook stays for v1 hosts. It is not deleted for being
+      // unreachable on v2.
       exitCleanup?.trigger("dispose")
       jobManager.disposeAll(isDispatchRow)
       watchdog.dispose()
@@ -10903,6 +10920,13 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // cleanup aborts the loop; the combined cleanup (hook disposals + loop
   // abort) is the setup Cleanup.
   const v2AbortEvents = v2SubscribeEvents(ctx, goalClient, !sessionHooks.idleHook)
+  // doc-plugin-unload-v2: this combined cleanup is the ONLY cleanup a v2
+  // host runs on plugin unload (2.4.0 registers the function `setup`
+  // resolves to — see the note on the v1 `dispose` hook). It tears down
+  // THIS instance only, and deliberately clears no job: jobs outlive the
+  // plugin instance, exactly as the host's own job table does. Anything
+  // that must happen to jobs at unload belongs here — and today nothing
+  // does (tests/v2-setup-cleanup.test.mjs pins it).
   const disposables = [...sessionHooks.disposables, ...(v2AbortEvents ? [v2AbortEvents] : [])]
   return disposables.length > 0
     ? () => {

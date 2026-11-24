@@ -14,7 +14,9 @@
 //   • typecheck, the unit suite and `opencode --version` are measured NOW;
 //   • a leg the sandbox cannot reach is reported as BOOKED (the workspace
 //     D6 rule) with its reason — it never counts as a pass, and the summary
-//     shows it separately so nobody mistakes it for one;
+//     shows it separately so nobody mistakes it for one (no check uses it
+//     any more: the last booked leg, c1-dispose D1, now asserts the real
+//     2.4.0 behaviour — change doc-plugin-unload-v2);
 //   • a product defect the release knowingly ships is reported KNOWN — never
 //     a pass — and only when the release command NAMES it
 //     (--accept-known <check>): unnamed, it is an ordinary FAIL. Every
@@ -222,8 +224,16 @@ for (const [id, name] of [
   })
 }
 
-// C1: K1 / K2 are gates; D1 may be BOOKED when the host offers no proven
-// dispose trigger (its inconclusive text and the hook probe ride along).
+// C1: K1 / K2 / D1 are all gates. D1 asserts the 2.4.0 behaviour (change
+// doc-plugin-unload-v2, 2026-11-25): an evict of the owner location
+// mid-dispatch kills nothing — the v1 `dispose` hook is never invoked on a
+// v2 host and the v2 cleanup clears no job — and the dispatch completes with
+// exactly one wake. Before that change the leg expected the evict to run the
+// hook and kill a control job, so it was BOOKED at every release gate from
+// 0.33.0 through the 0.34.1 evidence run. There is no BOOKED branch any
+// more: an inconclusive or premise-missed D1 is a FAIL, and a driver `pass`
+// counts only when the verdict carries all seven recorded facts — the six of
+// the host contract plus "the child's job was live right before the evict".
 {
   const j = readVerdict("c1-dispose", C1_FILE)
   if (j) {
@@ -238,13 +248,31 @@ for (const [id, name] of [
       })
     }
     const d1 = j.results?.D1 ?? {}
-    const booked = d1.pass !== true && typeof d1.inconclusive === "string" && d1.inconclusive.length > 0 && !d1.error && !d1.premiseFailed
+    const hc = d1.hostContract ?? {}
+    // The six facts the driver must have RECORDED for its `pass` to count:
+    // a bare `pass: true` from an older driver format carries nothing.
+    const facts = {
+      evictAccepted: hc.evictAccepted === true,
+      probeLive: hc.probeLive === true,
+      controlsAliveRightAfter: hc.controlsAliveRightAfter === true,
+      controlsRanToEnd: hc.controlsRanToEnd === true,
+      disposeHookRan: hc.disposeHookRan === false,
+      dispatchUntouchedRightAfter: hc.dispatchUntouchedRightAfter === true,
+      // Seventh fact (2026-11-24T19:45Z, after the first main chain recorded a
+      // premise miss as a FAIL of "dispatch untouched"): the dispatch must have
+      // been IN FLIGHT when the evict landed — the child session's job a live
+      // process right before it. The driver records it outside `hostContract`;
+      // an older driver's bare `pass` carries nothing and does not count.
+      childJobLiveBeforeEvict: d1.childJobLiveBeforeEvict === true,
+    }
+    const carried = d1.pass === true && Object.values(facts).every(Boolean)
     add({
       id: "e2e-c1-D1",
-      title: "c1-dispose D1: a dispatch row survives a plugin dispose of the owner location",
-      status: d1.pass === true ? "PASS" : booked ? "BOOKED" : "FAIL",
-      booking: booked ? "D6 — the sandbox host (2.4.0) offers no action proven to run the plugin dispose hook while a dispatch is in flight" : null,
-      detail: d1.pass === true ? "exemption observed live" : clip(`${d1.inconclusive ?? d1.error ?? "no result"} | dispose hook probe: ${JSON.stringify(d1.disposeHookProbe ?? null)}`, 700),
+      title: "c1-dispose D1: an evict of the owner location mid-dispatch kills nothing and the dispatch completes with one wake (2.4.0 — the plugin unload clears no job)",
+      status: carried ? "PASS" : "FAIL",
+      detail: carried
+        ? `evict ${d1.evictStatus} · child job live before the evict (${d1.secondsFromDetectionToEvict ?? "?"} s after it was seen) · probe live · controls ${JSON.stringify(hc.controlsStarted ?? null)} alive after the evict and ran to end · dispose hook not run · dispatch untouched right after · journal ${d1.journalFinalState}/${d1.journalFinalOutcome} · wakes ${d1.wakes} · owner location still loaded after the evict: ${hc.ownerLocationLoadedRightAfter}`
+        : clip(`${d1.inconclusive ?? d1.error ?? (d1.premiseFailed ? "premise not met" : "checks not met")} | host contract: ${JSON.stringify(hc)} | child job live before the evict: ${d1.childJobLiveBeforeEvict} | dispose hook probe: ${JSON.stringify(d1.disposeHookProbe ?? null)}`, 700),
       result: d1,
     })
   }

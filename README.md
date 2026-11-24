@@ -489,16 +489,22 @@ completions that were never read.
 
 **Ownership.** Jobs belong to the session that created them. Session
 deleted → its live session-scoped jobs are killed and the event is recorded
-in a bounded ledger (`handoff` beforehand survives). Plugin unload disposes
-the process-backed jobs it still owns — **async dispatch rows are exempt**
-(0.33.0): a dispatch child is a server-side session independent of the
-plugin instance, so a plugin dispose — in any context, on a single- or
-multi-context host — leaves every in-flight dispatch running: no kill, no
-child abort, no journal terminalization; the completion wake still arrives
-at true terminal, and across a host restart the dispatch journal with
-restart recovery carries the row (probe → re-arm, completed-wake, or honest
-error per record state). The only legitimate registry kills of a dispatch
-row are its owner session ending and the user cancel lever.
+in a bounded ledger (`handoff` beforehand survives). On a **v1 host**,
+plugin unload disposes the process-backed jobs it still owns — **async
+dispatch rows are exempt** (0.33.0): a dispatch child is a server-side
+session independent of the plugin instance, so the v1 `dispose` hook leaves
+every in-flight dispatch running: no kill, no child abort, no journal
+terminalization; the completion wake still arrives at true terminal. On a
+**v2 host** (checked against 2.4.0's sources and live) a plugin unload
+terminates no job at all: the host runs only the cleanup that `setup`
+resolves to, and that cleanup just disposes the plugin's own registrations
+and stops its event subscription — the v1 `dispose` hook is never invoked,
+so a location eviction or plugin reload leaves live jobs running (the
+host's own rule: jobs outlive the plugin that launched them). Across a host
+restart the dispatch journal with restart recovery carries the row (probe →
+re-arm, completed-wake, or honest error per record state). The only
+legitimate registry kills of a dispatch row are its owner session ending
+and the user cancel lever.
 
 ### Host exit cleans up on every path (0.3.1)
 

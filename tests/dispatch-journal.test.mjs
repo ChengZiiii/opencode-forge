@@ -175,8 +175,9 @@ async function waitFor(predicate, label, timeoutMs = 5000) {
 }
 
 // File-level drain. `dispose` deliberately leaves in-flight dispatches alive
-// (fix-dispatch-dispose-kill D1: on a multi-directory host the host outlives a
-// context recycle), so a test that FAILS before its own owner-deletion step
+// (fix-dispatch-dispose-kill D1: a plugin unload that is not the host-process
+// exit must not take a dispatch with it), so a test that FAILS before its own
+// owner-deletion step
 // leaves an armed poller behind — and with a mock child that stays busy
 // forever the process never exits (2026-11-24: one failed assertion hung the
 // whole suite). Retire whatever is still tracked by the LAST host the way

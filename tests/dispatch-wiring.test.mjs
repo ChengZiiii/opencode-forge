@@ -1606,12 +1606,13 @@ test("task client guard: child creation parent directory resolves from the AUTHO
 })
 
 // ---------------------------------------------------------------------------
-// fix-dispatch-dispose-kill 2.4 (design D1 + D4): dispose exempts dispatch
-// rows — a v2 multi-context host fires dispose on every context recycle while
-// the host keeps living, so an in-flight dispatch must survive it. Process
-// jobs keep the old dispose contract (killed). And D2: a kill path whose
-// abort FAILS never silently drops the result — the journal terminal reason
-// and the wake both disclose "abort unconfirmed".
+// fix-dispatch-dispose-kill 2.4 (design D1 + D4): the v1 `dispose` hook
+// exempts dispatch rows — a v1 host unloads the plugin while the host
+// process keeps living, so an in-flight dispatch must survive it (on a v2
+// host the hook is never invoked: the unload cleanup clears no job at all).
+// Process jobs keep the old dispose contract (killed). And D2: a kill path
+// whose abort FAILS never silently drops the result — the journal terminal
+// reason and the wake both disclose "abort unconfirmed".
 
 test("dispose exemption: A's dispatch row SURVIVES dispose (intact + still polling, wake still arrives); B's process job is killed", async (t) => {
   const dir = projectWithForgeJson(t, readonlyPool)
@@ -1632,7 +1633,7 @@ test("dispose exemption: A's dispatch row SURVIVES dispose (intact + still polli
   assert.ok(procJobId, "the process job started")
   const listBefore = await h.tool.forge_jobs.execute({ action: "list" }, bCtx)
   assert.ok(listBefore.output.split("\n").some((l) => l.startsWith(procJobId)), "the process job is registered before dispose")
-  // The context recycle: dispose.
+  // The plugin unload that is not the host-process exit: the v1 dispose hook.
   await h.dispose()
   // A's dispatch row: intact, state unchanged, still tracked.
   const rows = h.__forgeSubagentsTest.dispatchTasks().filter((x) => x.ownerSession === "ses_survive")
