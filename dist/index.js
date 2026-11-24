@@ -18158,9 +18158,9 @@ var INIT_WORKSPACE_LEAD = "draft THIS workspace's recipe (.opencode/forge.json) 
 var INIT_FLOW_BODY = "First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent's shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user's explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes.";
 var INIT_GLOBAL_SCAFFOLD_NOTE = "The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in's prompt wholesale; the scaffold's inline comments say the same).";
 var INIT_GLOBAL_BODY = `same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. ${INIT_GLOBAL_SCAFFOLD_NOTE}`;
-var FORGE_HELP_ROUTE_LINE = "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (cancel THIS session's in-flight async dispatches) — and stop.";
+var FORGE_HELP_ROUTE_LINE = "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (cancel THIS session's in-flight and queued async dispatches) — and stop.";
 var STOP_LEVER_BODY = [
-  '- Argument "stop": call forge_jobs with action "stop" (no other parameters) and relay the tool result verbatim — it cancels every in-flight ASYNC DISPATCH owned by THIS session (each child session is aborted and CONFIRMED idle; each dispatch settles as aborted and is never retried). A dispatch owned by another session is NOT touched: name its task id only if the user asks, and cancel it with the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"}. Then STOP: no re-dispatch, no replacement work.',
+  '- Argument "stop": call forge_jobs with action "stop" (no other parameters) and relay the tool result verbatim — it cancels every in-flight ASYNC DISPATCH owned by THIS session (each child session is aborted and CONFIRMED idle; each dispatch settles as aborted and is never retried) and every QUEUED wish of this session (removed from the queue before it can spawn — nothing was running for it; it is never dispatched). A dispatch owned by another session is NOT touched: name its task id only if the user asks, and cancel it with the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"}. Then STOP: no re-dispatch, no replacement work.',
   "Boundaries: cancellation is USER intent only — never stop dispatches on your own initiative; a stopped dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entries and the owner wakes are delivered by the plugin's terminal path, not by you."
 ].join(`
 `);
@@ -18606,12 +18606,29 @@ var jobManager = createJobManager({
   }
 });
 var dispatchProgressQueue = new Map;
-function queueDispatchProgress(sessionID, text) {
+var dispatchProgressDropped = new Map;
+function dispatchStillLive(jobId) {
+  const row = jobManager.get(jobId);
+  if (row)
+    return row.state === "running";
+  for (const queue of dispatchQueues.values()) {
+    if (queue.some((wish) => wish.jobId === jobId))
+      return true;
+  }
+  for (const pumps of pumpInFlight.values()) {
+    for (const run of pumps)
+      if (run.wishId === jobId)
+        return true;
+  }
+  return false;
+}
+function queueDispatchProgress(sessionID, text, isLive) {
+  const notice = isLive ? { text, isLive } : { text };
   const queued = dispatchProgressQueue.get(sessionID);
   if (queued)
-    queued.push(text);
+    queued.push(notice);
   else
-    dispatchProgressQueue.set(sessionID, [text]);
+    dispatchProgressQueue.set(sessionID, [notice]);
 }
 async function deliverDispatchProgress(sessionID) {
   if (forgeDisabled)
@@ -18622,9 +18639,19 @@ async function deliverDispatchProgress(sessionID) {
   dispatchProgressQueue.delete(sessionID);
   if (!jobClient || typeof jobClient.session.promptAsync !== "function")
     return;
-  for (const text of pending) {
+  for (const notice of pending) {
+    if (notice.isLive) {
+      let live = true;
+      try {
+        live = notice.isLive();
+      } catch {}
+      if (!live) {
+        dispatchProgressDropped.set(sessionID, [...dispatchProgressDropped.get(sessionID) ?? [], notice.text].slice(-20));
+        continue;
+      }
+    }
     try {
-      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } });
+      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: notice.text }] } });
     } catch {}
   }
 }
@@ -18679,6 +18706,28 @@ function dispatchKillTreeHook(client, jobId, childSessionID) {
     pending.then(drop, drop);
   };
 }
+var DISPATCH_NOTICE_MEMORY = 30;
+function appendDispatchNotice(job, notice) {
+  jobManager.appendOutput(job, notice);
+  const memo2 = job;
+  if (!memo2.progressNotices)
+    memo2.progressNotices = [];
+  memo2.progressNotices.push(notice);
+  if (memo2.progressNotices.length > DISPATCH_NOTICE_MEMORY)
+    memo2.progressNotices.splice(0, memo2.progressNotices.length - DISPATCH_NOTICE_MEMORY);
+}
+function dispatchReportTail(job) {
+  const memo2 = job.progressNotices;
+  if (!memo2 || memo2.length === 0)
+    return job.tail;
+  let cut = -1;
+  for (const notice of memo2) {
+    const at = job.tail.lastIndexOf(notice);
+    if (at !== -1)
+      cut = Math.max(cut, at + notice.length);
+  }
+  return cut === -1 ? job.tail : job.tail.slice(cut);
+}
 function jobWakeText(job) {
   const dispatch = job.dispatch;
   if (dispatch) {
@@ -18704,7 +18753,7 @@ ${job.tail.slice(-2500) || "(no output)"}`,
     return [
       `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
       `Final report:
-${job.tail.slice(-2500) || "(no output)"}`,
+${dispatchReportTail(job).slice(-2500) || "(no output)"}`,
       "The dispatch is complete — read the report above; no polling, no re-dispatch needed."
     ].join(`
 `);
@@ -19851,7 +19900,7 @@ ${res.output}` } : res;
 });
 var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "stop", "clear", "handoff"];
 var forgeJobsTool = tool({
-  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel ONE in-flight ASYNC DISPATCH by explicit task id, including one owned by ANOTHER session (the deliberate cross-session escape hatch behind no ownership check; its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried); stop — cancel EVERY in-flight async dispatch owned by THIS session only (the /forge stop lever; session-scoped by construction, other sessions' dispatches are untouched; nothing in flight = honest no-op report); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
+  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel ONE in-flight ASYNC DISPATCH by explicit task id, including one owned by ANOTHER session (the deliberate cross-session escape hatch behind no ownership check; its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried); stop — cancel EVERY in-flight async dispatch AND every queued wish owned by THIS session only (the /forge stop lever; session-scoped by construction, other sessions' dispatches are untouched; the queued wishes leave the queue first, so none spawns into a slot a cancelled dispatch frees; nothing in flight and nothing queued = honest no-op report); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
   args: {
     action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
     jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list and stop)"),
@@ -19877,29 +19926,38 @@ var forgeJobsTool = tool({
       const client = dispatchClient();
       if (!client)
         throw new Error("[forge] stop: no dispatch client on this host.");
-      const flight = inFlightAsyncDispatches(context.sessionID);
-      if (flight.length === 0) {
-        return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${context.sessionID}) — nothing to stop.` };
+      const sid = context.sessionID;
+      const epoch = stopEpoch(sid) + 1;
+      stopEpochs.set(sid, epoch);
+      stopWaiting.add(sid);
+      let landed;
+      let stillLanding = 0;
+      let flight;
+      let queuedCancelled;
+      try {
+        queuedCancelled = cancelQueuedWishes(sid);
+        landed = await settlePumps(sid);
+        stillLanding = inTransitWishes(sid).length;
+        flight = inFlightAsyncDispatches(sid);
+      } finally {
+        stopWaiting.delete(sid);
       }
-      const queuedAtCall = queuedAsyncDispatchIds(context.sessionID);
+      queuedCancelled.push(...stopDequeued.get(sid) ?? []);
+      stopDequeued.delete(sid);
+      if (flight.length === 0 && queuedCancelled.length === 0 && stillLanding === 0) {
+        return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${sid}) — nothing to stop.` };
+      }
       const results = [];
       for (const taskId of flight) {
-        const res = await cancelDispatch(client, taskId);
+        const res = await stopSerialCancel(sid, () => cancelDispatch(client, taskId));
         results.push(`- ${res.text}`);
       }
-      const queuedNote = queuedAtCall.length > 0 ? `
-[forge:job] ${queuedAtCall.length} queued wish(es) of this session were NOT in flight and are not cancelled by stop — they spawn FIFO into the freed slots: ${queuedAtCall.join(", ")}` : "";
-      return {
-        title: `${flight.length} dispatch(es) stopped`,
-        output: `[forge:job] Stopped ${flight.length} in-flight dispatch(es) of this session:
-${results.join(`
-`)}${queuedNote}`
-      };
+      return stopReceipt(sid, flight.length, results, queuedCancelled, landed === "timeout" ? stillLanding : 0, stopSettleMs());
     }
     if (!args.jobId)
       throw new Error(`Action "${action}" requires jobId.`);
     if (action === "cancel" && String(args.jobId).trim().toLowerCase() === "all") {
-      throw new Error(`[forge] cancel "all" is retired — use action "stop" (cancels THIS session's in-flight dispatches) or cancel an explicit task id.`);
+      throw new Error(`[forge] cancel "all" is retired — use action "stop" (cancels THIS session's in-flight and queued dispatches) or cancel an explicit task id.`);
     }
     const job = jobManager.get(args.jobId);
     if (!job) {
@@ -20102,11 +20160,60 @@ function resolveDispatchQueueMax(env = process.env) {
   return Math.round(parsed);
 }
 var dispatchQueues = new Map;
+var stopEpochs = new Map;
+var stopWaiting = new Set;
+var pumpInFlight = new Map;
+var stopDequeued = new Map;
+var stopEpoch = (sessionID) => stopEpochs.get(sessionID) ?? 0;
+var stoppedSince = (sessionID, epoch) => stopEpoch(sessionID) !== epoch;
+function inTransitWishes(sessionID) {
+  const ids = [];
+  for (const run of pumpInFlight.get(sessionID) ?? [])
+    if (run.wishId)
+      ids.push(run.wishId);
+  return ids;
+}
+function stopSettleMs() {
+  const raw = Number(process.env.FORGE_STOP_SETTLE_MS);
+  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 60000) : 15000;
+}
+async function settlePumps(sessionID) {
+  const pumps = [...pumpInFlight.get(sessionID) ?? []];
+  if (pumps.length === 0)
+    return "settled";
+  let timer;
+  try {
+    return await Promise.race([
+      Promise.allSettled(pumps.map((run) => run.done)).then(() => "settled"),
+      new Promise((resolve2) => {
+        timer = setTimeout(() => resolve2("timeout"), stopSettleMs());
+      })
+    ]);
+  } finally {
+    if (timer)
+      clearTimeout(timer);
+  }
+}
+var stopCancelTails = new Map;
+function stopSerialCancel(sessionID, cancel) {
+  const next = (stopCancelTails.get(sessionID) ?? Promise.resolve()).then(cancel);
+  const settled = next.then(() => {
+    return;
+  }, () => {
+    return;
+  });
+  stopCancelTails.set(sessionID, settled);
+  settled.then(() => {
+    if (stopCancelTails.get(sessionID) === settled)
+      stopCancelTails.delete(sessionID);
+  });
+  return next;
+}
 function queuedAsyncDispatchIds(sessionID) {
   return (dispatchQueues.get(sessionID) ?? []).map((w) => w.jobId);
 }
-function announceQueuedStart(ownerSession, notice) {
-  queueDispatchProgress(ownerSession, notice);
+function announceQueuedStart(ownerSession, notice, jobId) {
+  queueDispatchProgress(ownerSession, notice, () => dispatchStillLive(jobId));
   if (idleJobSessions.has(ownerSession))
     deliverDispatchProgress(ownerSession);
 }
@@ -20130,18 +20237,50 @@ function failQueuedWishHonestly(wish, reason) {
   jobManager.markTerminal(job, "exited", 1);
   journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory }, "error", text);
 }
-async function pumpDispatchQueue(client, sessionID) {
+function pumpDispatchQueue(client, sessionID) {
+  const run = { wishId: null, done: Promise.resolve() };
+  let pumps = pumpInFlight.get(sessionID);
+  if (!pumps)
+    pumpInFlight.set(sessionID, pumps = new Set);
+  pumps.add(run);
+  run.done = pumpDequeuedWishes(client, sessionID, run).finally(() => {
+    run.wishId = null;
+    const left = pumpInFlight.get(sessionID);
+    if (!left)
+      return;
+    left.delete(run);
+    if (left.size === 0)
+      pumpInFlight.delete(sessionID);
+  });
+  return run.done;
+}
+function cancelDequeuedByStop(client, wish, child) {
+  releaseGateAdmission(wish.jobId);
+  if (child)
+    dispatchKillTreeHook(client, wish.jobId, () => child)();
+  journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, description: wish.description, questionDeny: wish.questionDeny }, "aborted", STOP_DEQUEUED_REASON);
+  const sessionID = wish.ownerSession;
+  if (!stopWaiting.has(sessionID))
+    return;
+  const notes = stopDequeued.get(sessionID) ?? [];
+  notes.push(wish.jobId);
+  stopDequeued.set(sessionID, notes.slice(-50));
+}
+async function pumpDequeuedWishes(client, sessionID, run) {
   for (;; ) {
+    run.wishId = null;
     const queue = dispatchQueues.get(sessionID);
     if (!queue || queue.length === 0)
       return;
-    if (inFlightAsyncDispatches(sessionID).length >= ASYNC_DISPATCH_CAP)
+    if (inFlightAsyncDispatches(sessionID).length + inTransitWishes(sessionID).length >= ASYNC_DISPATCH_CAP)
       return;
     const wish = queue.shift();
     if (queue.length === 0)
       dispatchQueues.delete(sessionID);
     if (!wish)
       return;
+    run.wishId = wish.jobId;
+    const stopEpochAtDequeue = stopEpoch(sessionID);
     if (wish.agentID.toLowerCase().startsWith("forge-")) {
       const agentId = wish.agentID.slice("forge-".length);
       const resolution = resolvePools();
@@ -20153,6 +20292,10 @@ async function pumpDispatchQueue(client, sessionID) {
     const crewRefusal = crewPendingRefusal(sessionID) ?? await crewComplianceRefusalFor(jobClient, sessionID, wish.agentID);
     if (crewRefusal) {
       failQueuedWishHonestly(wish, crewRefusal);
+      continue;
+    }
+    if (stoppedSince(sessionID, stopEpochAtDequeue)) {
+      cancelDequeuedByStop(client, wish, undefined);
       continue;
     }
     const draftRefusal = draftDispatchRefusal(sessionID, wish.agentID);
@@ -20186,6 +20329,10 @@ async function pumpDispatchQueue(client, sessionID) {
       failQueuedWishHonestly(wish, `child session creation failed: ${created.error}`);
       continue;
     }
+    if (stoppedSince(sessionID, stopEpochAtDequeue)) {
+      cancelDequeuedByStop(client, wish, created.sessionID);
+      continue;
+    }
     const sent = await sendPrompt(client, {
       sessionID: created.sessionID,
       agentID: wish.agentID,
@@ -20209,12 +20356,17 @@ async function pumpDispatchQueue(client, sessionID) {
     job.dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description };
     registerDispatchTask({ jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description }, wish.directory);
     journalTransition(wish.directory, journalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, questionDeny: wish.questionDeny, description: wish.description, prompt: wish.prompt }, "started", { childSessionId: created.sessionID }));
-    announceQueuedStart(wish.ownerSession, `[forge:dispatch-progress] wish ${wish.jobId} spawned from the queue (agent ${wish.agentID}, child session ${created.sessionID}) — tracking as a normal async dispatch; the single [forge:dispatch-complete] wake reports when it finishes.`);
+    announceQueuedStart(wish.ownerSession, `[forge:dispatch-progress] wish ${wish.jobId} spawned from the queue (agent ${wish.agentID}, child session ${created.sessionID}) — tracking as a normal async dispatch; the single [forge:dispatch-complete] wake reports when it finishes.`, wish.jobId);
     runAsyncDispatchPoller(client, job, created.sessionID, {
       prompt: wish.prompt,
       directory: wish.directory,
       questionDeny: wish.questionDeny
     });
+    if (stoppedSince(sessionID, stopEpochAtDequeue) && !stopWaiting.has(sessionID)) {
+      stopSerialCancel(sessionID, () => cancelDispatch(client, wish.jobId)).catch((err) => {
+        console.warn(`[forge:dispatch] stop: the late-landing task ${wish.jobId} could not be cancelled by its own pump: ${String(err)}`);
+      });
+    }
   }
 }
 function flushDispatchQueue(sessionID) {
@@ -20225,6 +20377,38 @@ function flushDispatchQueue(sessionID) {
   for (const wish of queue) {
     journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory }, "aborted", `owner session ${sessionID} ended before the queued wish spawned — flushed without spawning`);
   }
+}
+var STOP_QUEUED_REASON = "cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried";
+var STOP_DEQUEUED_REASON = "cancelled by the user lever (/forge stop) — the wish was leaving the queue when stop arrived: it was never prompted and the dispatch is never retried";
+function cancelQueuedWishes(sessionID) {
+  const queue = dispatchQueues.get(sessionID);
+  if (!queue || queue.length === 0)
+    return [];
+  dispatchQueues.delete(sessionID);
+  const ids = [];
+  for (const wish of queue) {
+    ids.push(wish.jobId);
+    journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, description: wish.description, questionDeny: wish.questionDeny }, "aborted", STOP_QUEUED_REASON);
+  }
+  return ids;
+}
+function stopReceipt(sessionID, flightCount, rows, queuedCancelled, stillLanding = 0, settleMs = 0) {
+  const queuedNote = queuedCancelled.length > 0 ? `
+[forge:job] Cancelled ${queuedCancelled.length} queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): ${queuedCancelled.join(", ")}` : "";
+  const landingNote = stillLanding > 0 ? `
+[forge:job] ${stillLanding} queued wish(es) of this session were still being started when the lever stopped waiting (${Math.max(1, Math.round(settleMs / 1000))} s) — each is cancelled the moment it lands; nothing of them is left running.` : "";
+  if (flightCount === 0) {
+    return {
+      title: queuedCancelled.length > 0 ? `${queuedCancelled.length} queued wish(es) cancelled` : "stop",
+      output: `[forge:job] No async dispatches in flight for this session (${sessionID}).${queuedNote}${landingNote}`
+    };
+  }
+  return {
+    title: `${flightCount} dispatch(es) stopped`,
+    output: `[forge:job] Stopped ${flightCount} in-flight dispatch(es) of this session:
+${rows.join(`
+`)}${queuedNote}${landingNote}`
+  };
 }
 var dispatchJournals = new Map;
 var dispatchJournalFsFactory = null;
@@ -20391,7 +20575,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
         enqueuedAt: Date.now()
       });
       dispatchQueues.set(rec.ownerSession, queue);
-      announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] queued wish ${rec.id} (agent ${rec.agent}) re-entered the queue after host restart — it spawns when a slot frees.`);
+      announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] queued wish ${rec.id} (agent ${rec.agent}) re-entered the queue after host restart — it spawns when a slot frees.`, rec.id);
       await pumpDispatchQueue(client, rec.ownerSession);
     } else {
       journalTerminalRecord(base, "aborted", `owner session ${rec.ownerSession} no longer resolves at recovery — queued wish terminalized without spawning`);
@@ -20444,7 +20628,7 @@ async function recoverOneDispatchRecord(client, workspace, rec) {
       registerDispatchTask({ jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace);
       const nextAttempt = attempts;
       journalTransition(workspace, journalRecord(base, "started", { childSessionId: respawn.sessionID, attempts: nextAttempt, prompt }));
-      announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] task ${rec.id} retry attempt ${nextAttempt}/${maxAttempts} resumed after host restart — child session ${respawn.sessionID}.`);
+      announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] task ${rec.id} retry attempt ${nextAttempt}/${maxAttempts} resumed after host restart — child session ${respawn.sessionID}.`, rec.id);
       runAsyncDispatchPoller(client, job, respawn.sessionID, {
         prompt,
         directory: workspace,
@@ -20512,7 +20696,7 @@ function discloseInterruptedParent(sessionID) {
   interruptDisclosureSeen.add(key);
   queueDispatchProgress(sessionID, `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):
 ${formatInFlightDispatchList()}
-Cancel with /forge stop (cancels every in-flight dispatch of THIS session) or the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"} (the cross-session escape hatch). Nothing was cancelled automatically.`);
+Cancel with /forge stop (cancels every in-flight and queued dispatch of THIS session) or the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"} (the cross-session escape hatch). Nothing was cancelled automatically.`, () => inFlightAsyncDispatches(sessionID).length > 0);
   return true;
 }
 function activeSessionView(client) {
@@ -20915,8 +21099,8 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
     updatedAt: Date.now()
   });
   const flushProgress = (notice) => {
-    jobManager.appendOutput(job, notice);
-    queueDispatchProgress(job.ownerSession, notice);
+    appendDispatchNotice(job, notice);
+    queueDispatchProgress(job.ownerSession, notice, () => dispatchStillLive(job.id));
     if (idleJobSessions.has(job.ownerSession))
       deliverDispatchProgress(job.ownerSession);
   };
@@ -21160,8 +21344,8 @@ async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryC
       lastNotifiedMultiple = multiple;
       const minutes = Math.max(1, Math.round((Date.now() - startedAt) / 60000));
       const notice = `[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` + `tracking continues; the final [forge:dispatch-complete] wake with the report arrives when it finishes. ` + `Inspect/abort in the host TUI if this looks stuck.`;
-      jobManager.appendOutput(job, notice);
-      queueDispatchProgress(job.ownerSession, notice);
+      appendDispatchNotice(job, notice);
+      queueDispatchProgress(job.ownerSession, notice, () => dispatchStillLive(job.id));
       if (idleJobSessions.has(job.ownerSession))
         deliverDispatchProgress(job.ownerSession);
     }
@@ -21507,7 +21691,7 @@ var taskDispatchTool = tool({
                 questionDeny: false,
                 description
               });
-              queueDispatchProgress(context.sessionID, `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`);
+              queueDispatchProgress(context.sessionID, `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`, () => dispatchStillLive(syncJobId));
               await new Promise((resolve2) => setTimeout(resolve2, retryBackoffSync));
               const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusal(context.sessionID, target) ?? forgeTargetUnresolved(target);
               if (refusal) {
@@ -23254,7 +23438,9 @@ var server = async (input, options) => {
           return null;
         }
       },
-      dispatchProgress: (sessionID) => [...dispatchProgressQueue.get(sessionID) ?? []],
+      dispatchProgress: (sessionID) => (dispatchProgressQueue.get(sessionID) ?? []).map((notice) => notice.text),
+      dispatchProgressDropped: (sessionID) => [...dispatchProgressDropped.get(sessionID) ?? []],
+      jobTail: (jobId) => jobManager.get(jobId)?.tail ?? null,
       dispatchGateState: () => {
         if (!dispatchGate)
           return null;
@@ -24101,7 +24287,7 @@ async function v2RegisterCommands(ctx) {
 `));
       };
       addTemplateCommand("crew", crewTemplate, registrationAgentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance");
-      addTemplateCommand("forge", () => FORGE_COMMAND_TEMPLATE, "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight async dispatches");
+      addTemplateCommand("forge", () => FORGE_COMMAND_TEMPLATE, "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight and queued async dispatches");
     });
   } catch (e) {
     const head = e instanceof Error ? e.message : String(e);
@@ -24683,6 +24869,7 @@ export {
   v2Setup,
   v2SessionClientForTests,
   takeDispatchTerminalSignal,
+  stopReceipt,
   setDispatchWaitSeamForTests,
   setDispatchStorageForTests,
   setCrewNativeChildClockForTests,
@@ -24720,7 +24907,9 @@ export {
   __permissionDoorsTestSurface,
   TASK_SEAM_DEGRADED_ERROR,
   SYNC_LEVER_BODY,
+  STOP_QUEUED_REASON,
   STOP_LEVER_BODY,
+  STOP_DEQUEUED_REASON,
   PLAN_COMMAND_TEMPLATE,
   INIT_WORKSPACE_LEAD,
   INIT_GLOBAL_SCAFFOLD_NOTE,
