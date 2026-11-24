@@ -21,15 +21,23 @@
 
 ## 3. Verification（GATE）
 
-- [ ] 3.1 多目录沙箱 E2E（design D5 第 2 条）
+- [x] 3.1 多目录沙箱 E2E（design D5 第 2 条）
+      （`17-anchor-multidir-e2e.mjs`，2026-11-24T00:13–00:14Z，9/9；另加
+      有头 TUI 一腿：TUI 里 `/new` 出来的会话，在第三目录最后初始化之后
+      两次 `forge_shell {command:"cd"}`，`cwd` 都是 `ws`——见
+      `reports/e2e/evidence/0.33.1/tui-gate.json`）
 - [ ] 3.2 真机终验（用户重启后，design D5 第 3 条）
+      （待用户重启宿主；0.33.1 已发布，重启即到 0.33.1）
 
 ## 4. Release
 
-- [ ] 4.1 并入 0.33.1
+- [x] 4.1 并入 0.33.1
+      （2026-11-24T00:57Z 发布，sha1 `d53d9e7d7d8f7749…`；验收门
+      27 过 / 0 败 / 1 记账 / 0 已知）
 
 ## 5. Wrap-up（用户明示后）
 
 - [ ] 5.1 archive + push
+      （archive 已做：2026-11-24T01:06Z；push 待用户授权）
 - [ ] 5.2 方案乙（按目录保存初始化接口）另立 change 草案，交用户排序
       ——已另有真机证据坐实其必要（确认门失效），见 overnight-status

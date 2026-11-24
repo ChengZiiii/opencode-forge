@@ -7,7 +7,7 @@ Provide non-blocking shell execution with multi-condition completion semantics, 
 
 ### Requirement: Bounded foreground execution with four completion conditions
 
-The `forge_shell` tool SHALL resolve a foreground invocation on the first of four conditions, and SHALL never leave the calling agent blocked beyond its hard cap: (1) the direct child process exits — completion SHALL be bound to the exit event, not to stdio stream EOF; (2) an opt-in `success_pattern` regular expression matches newly captured output; (3) no new output has arrived for `idle_ms` (default 60000); (4) `max_wait_ms` elapses (default 120000, clamped to at most 600000). Conditions (2)–(4) SHALL return early with a `still-running` or `success` status, an output tail, and a `jobId` for follow-up, while the process remains alive unless explicitly killed. EVERY foreground return form — `exited`, `succeeded`, `still-running`, and the spawn-failure form — SHALL state the absolute working directory the command actually ran in, so a caller (or the user reading the transcript) can verify the execution location against the agent's own narrative of it.
+The `forge_shell` tool SHALL resolve a foreground invocation on the first of four conditions, and SHALL never leave the calling agent blocked beyond its hard cap: (1) the direct child process exits — completion SHALL be bound to the exit event, not to stdio stream EOF; (2) an opt-in `success_pattern` regular expression matches newly captured output; (3) no new output has arrived for `idle_ms` (default 60000); (4) `max_wait_ms` elapses (default 120000, clamped to at most 600000). Conditions (2)–(4) SHALL return early with a `still-running` or `success` status, an output tail, and a `jobId` for follow-up, while the process remains alive unless explicitly killed. EVERY foreground return form — `exited`, `succeeded`, `still-running`, and the spawn-failure form — SHALL state the absolute working directory the command actually ran in, so a caller (or the user reading the transcript) can verify the execution location against the agent's own narrative of it. The spawn-failure form SHALL be its own labeled form: its title and first line SHALL state that the command did NOT start and that nothing was executed, the `cwd:` line and the spawn error SHALL follow, and the form SHALL NOT describe the command as finished or as having delivered output.
 
 #### Scenario: Detached grandchild holding inherited stdio does not hang the call
 
@@ -33,6 +33,16 @@ The `forge_shell` tool SHALL resolve a foreground invocation on the first of fou
 
 - **WHEN** a `forge_shell` call resolves in any form (exit, success match, idle, max-wait, or spawn failure)
 - **THEN** the result states the absolute directory the command ran in, taken from the resolved execution cwd — not from the agent's assumption — so "serving the current directory" claims can be checked against it
+
+#### Scenario: A command that never starts is never reported as finished
+
+- **WHEN** a foreground command fails to spawn (for example its resolved working directory does not exist)
+- **THEN** the result's title and first line say the command did not start and nothing was executed, the `cwd:` line and the spawn error follow, and neither "Command finished" nor "Output was delivered in full above" appears in the result
+
+#### Scenario: A polled spawn failure names it
+
+- **WHEN** the model polls a job whose terminal state carries a spawn error before it was consumed
+- **THEN** the poll result's first line says the command never started, followed by the spawn error
 
 ### Requirement: Background start semantics
 
@@ -331,3 +341,28 @@ The `forge_shell` tool description SHALL state, at interpreter-family granularit
 
 - **WHEN** the `forge_shell` tool description is rendered
 - **THEN** it identifies the Windows interpreter as the PowerShell family and the POSIX interpreter as the login shell with bash preferred, in addition to its existing exec-surface framing
+
+### Requirement: Lifecycle initialization succeeds on a host without a jobs directory
+
+The job supervisor's lifecycle initialization (survivor registry, rescan, fence,
+exit cleanup) SHALL succeed on a host whose jobs directory does not exist yet —
+the first run after an install, or any run after the OS temp directory was
+cleaned. The survivor registry SHALL ensure the directory it lives in exists
+before its first lock is taken, so that the first job of such a host is not
+rejected with a missing-directory error and the fence and exit cleanup are
+installed as on any other host.
+
+#### Scenario: first job on a host with no jobs directory
+
+- **WHEN** the first job is started on a host whose `<os-tmp>/opencode-forge/jobs` directory does not exist
+- **THEN** the job runs and completes like any other job, and the lifecycle initialization reaches its end (registry rescanned, fence and exit cleanup installed)
+
+#### Scenario: a registry opened in a directory that does not exist yet
+
+- **WHEN** a survivor registry is created for a path whose directory does not exist and its first rescan runs
+- **THEN** the rescan does not fail, the directory and the registry file exist afterwards, and no lock file is left behind
+
+#### Scenario: a host whose jobs directory already exists
+
+- **WHEN** the jobs directory already exists
+- **THEN** behavior is unchanged

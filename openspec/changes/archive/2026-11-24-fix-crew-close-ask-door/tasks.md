@@ -39,18 +39,36 @@
 
 ## 3. Verification（GATE）
 
-- [ ] 3.1 `probe-crew-close-door`：放弃 / 交报告两条路径都先弹确认、
+- [x] 3.1 `probe-crew-close-door`：放弃 / 交报告两条路径都先弹确认、
       代答后才执行
-- [ ] 3.2 有活跃目标管辖时两条路径零确认（规范例外保持）
-- [ ] 3.3 完整 crew E2E：`closeGateAskedAndApproved` 通过，判定不再带
+      （`16-crew-close-door-e2e.mjs`，2026-11-24T00:06–00:10Z，7/7：
+      `abandonAsksThenExecutes`、`reportAsksThenExecutes`、
+      `rejectedAskLeavesCrewActive`、`beginRegistersPendingCrew`；
+      判定文件 `reports/e2e/evidence/0.33.1/crew-close-door-e2e-verdict.json`）
+- [x] 3.2 有活跃目标管辖时两条路径零确认（规范例外保持）
+      （同一驱动：`goalGoverningClosesAskFree`、`governedGoalNotLeftActive`）
+- [x] 3.3 完整 crew E2E：`closeGateAskedAndApproved` 通过，判定不再带
       已知缺陷
-- [ ] 3.4 有头 TUI：确认框真实可见、可答复
-- [ ] 3.5 实况核实 D3：代答一次 `always` 之后，再关一个 crew 仍弹确认
+      （`crew-full-e2e-verdict.json`，00:20–00:24Z，16/16，无已知缺陷；
+      验收门 KNOWN = 0）
+- [x] 3.4 有头 TUI：确认框真实可见、可答复
+      （有头 TUI 门 `reports/e2e/evidence/0.33.1/tui-gate.json` 三项：
+      弃用路径——确认框在真实 TUI 里弹出，TUI 内回车允许，记录
+      `registered (pending) → abandoned`；交报告路径——TUI 内选
+      `Reject`，crew 保持未关闭；再发一次确认框再弹，允许后
+      `closed`（PASS 1 / FAIL 0）。askwatch 全程恰 3 条 `crew_close`。
+      截图 `…/0.33.1/tui-shots/tui-f{1,2,3}-dialog.png`）
+- [x] 3.5 实况核实 D3：代答一次 `always` 之后，再关一个 crew 仍弹确认
+      （同一驱动：`alwaysDoesNotReopenTheDoor`）
 
 ## 4. Release
 
-- [ ] 4.1 并入 0.33.0 之后的下一次发版梯
+- [x] 4.1 并入 0.33.0 之后的下一次发版梯
+      （0.33.1：2026-11-24T00:57Z 发布，sha1 `d53d9e7d7d8f7749…`，
+      `dist-tags.latest` 生效后 CDN 逐字节一致；验收门 27 过 / 0 败 /
+      1 记账 / 0 已知；证据 `reports/e2e/evidence/0.33.1`）
 
 ## 5. Wrap-up（用户明示后）
 
 - [ ] 5.1 archive + push
+      （archive 已做：2026-11-24T01:06Z，有头 TUI 门通过后；push 待用户授权）
