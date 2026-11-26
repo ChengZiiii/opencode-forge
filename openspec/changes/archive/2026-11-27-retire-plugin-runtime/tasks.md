@@ -299,8 +299,12 @@ Candidate3 unknown check 正式局部签收（candidate3-goal-check-unknown.log�
 
 ## 12. 收尾（业主明示后）
 
-- [ ] 12.1 归档前重新核对 0.2 全部依赖及 forge-commands 文字冲突解决条件，按归档/撤销各自合法基线核对；已撤销的 D 草案及其它取消 change 不并入主规格，授权范围外 change 不自行处置。
-- [ ] 12.2 业主明示归档本 change；另经授权删除 job-supervisor、hang-watchdog 两份空壳主规格。
-- [ ] 12.3 经业主独立授权直改 7 份 Purpose（crew-harness、command-surface、search-tools、forge-subagents、tool-partition、runtime-artifact-namespace、gate-asks），核查和清理残留旧 task 工具语义（场景标题按基线保留）；AGENTS.md 双 harness 叙述本轮原样，收尾另提授权更新。
-- [ ] 12.4 所有授权主规格清理后全量扫描旧工具与旧 task 语义，逐条区分历史/普通任务用词；最终 `openspec validate --specs --strict` 与 `openspec validate --all --strict` 全绿，未全绿硬阻断；不把已撤销草案当成完成归档或校验豁免。
-- [ ] 12.5 汇总留档：提交账、质量数字、D6 记账、遗留项与回补方式。验证：汇总文件在工作区根 `archive/<日期-retire-plugin-runtime>/` 下。
+本轮收尾授权（2026-11-27）：用户明确批准正式归档 retire-plugin-runtime、删除两退役空壳、直改七份 Purpose/清理旧 task 工具语义、更新 AGENTS、归位证据及补最终汇总后合 main。未覆盖任务与过程偏差保留，不为归档补勾历史任务；git/合并由主控执行。
+
+- [x] 12.1 归档前重新核对 0.2 全部依赖及 forge-commands 文字冲突解决条件，按归档/撤销各自合法基线核对；已撤销的 D 草案及其它取消 change 不并入主规格，授权范围外 change 不自行处置。验证：reviewer6bc 最终 PASS/0 blocker（主控转述）；本工人实际机械核对 12 delta 的 ADDED16/MODIFIED39/REMOVED57 目标合法、208 live scenario 标题完整保留，两退役17/6 requirements全部 REMOVED；六依赖归档与三取消原件目录存在、取消 change 不在活动集、Optional dispatch lanes 未入 live。forge-commands 可靠身份守卫及 stop 例外由本 delta 承接，review 无冲突。OpenSpec1.13.0 status/apply JSON root.path 均为本仓库，未操作其它 change。
+- [x] 12.2 业主明示归档本 change；另经授权删除 job-supervisor、hang-watchdog 两份空壳主规格。
+- [x] 12.3 经业主独立授权直改 7 份 Purpose（crew-harness、command-surface、search-tools、forge-subagents、tool-partition、runtime-artifact-namespace、gate-asks），核查和清理残留旧 task 工具语义（场景标题按基线保留）；AGENTS.md 已依本轮用户明示授权更新为 Plan/Goal/Crew 三 harness、host-native v2 执行，并保留 run-check/proc/shell-select 有限验证解释器链。
+- [x] 12.4 所有授权主规格清理后全量扫描旧工具与旧 task 语义，逐条区分历史/普通任务用词；最终 `openspec validate --specs --strict` 与 `openspec validate --all --strict` 全绿，未全绿硬阻断；不把已撤销草案当成完成归档或校验豁免。
+- [x] 12.5 汇总留档：提交账、质量数字、D6 记账、遗留项与回补方式。验证：既有 audit 已按字节复制至不存在的新建唯一目录，精确归档副本为 `C:/Users/Soren/Desktop/AgentWorkCommon/opencode_plugin_dev/archive/2026-11-26-retire-plugin-runtime/closure-summary-20261126T193959Z-779a3ee7/retire-plugin-runtime-dependency-audit.md`；124005 bytes，源与副本 SHA-256 均为 `4e539aca76a04e8c9ed10d08a08a3ba7583a3169f2c246529370f9304a9732cf`，逐字节复制后实算相等，未覆盖既有文件、未另写报告正文。进度：已把最终提交账0742759/8d86fda/d4da0f2（主控报告均已推）、767/767、最终0.35.0实包局部smoke、npm/本机同字节与用户「全部通过」、永久D6/过程偏差及补跑条件追加既有dependency audit最终汇总。本工人独立Read evidence-relocation-20261126T193252339Z-f79ab1cf/summary.json：verified，333文件/116214328bytes/253目录、四旧tgz941558bytes，manifest/目录match，源无残留。archive首次正常命令因零requirements硬拒绝，原始日志保留；按CLI正常机制仅合并 retire_capabilities:true（schema/created保留）后重跑成功，未skip-specs/no-validate。实际归档为 openspec/changes/archive/2026-11-27-retire-plugin-runtime/；CLI原生删除两退役spec及目录，无空壳可Read，已实核两路径不存在。最终两strict校验各10 passed/0 failed，归档/扫描/汇总证据均已完成，故勾本项；历史未覆盖整项不动。
+
+收尾实测（2026-11-27）：12.2 正常archive成功，+16/~39/-57、两退役capability原生删除；12.3 七Purpose已更新，旧native task工具的现行语义已由delta合入subagent，唯一残留Purpose已改，普通task词不替换；12.4 live task扫描36行：4场景标题（含两Crew历史标题）、9兼容permission键/历史迁移/负向禁令、23普通工作任务用词，无现行task派发面。旧forge工具名仅存不得注册/提示词禁止条款；确认门watchdog保留。两strict命令实际exit0，各10/10；日志及live-task-semantics-20261127.log在workspace证据根。归档移动完成后修改tasks仅记录已做收尾，不补勾49项历史未完任务。

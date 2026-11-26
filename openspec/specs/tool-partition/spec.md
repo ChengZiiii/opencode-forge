@@ -1,81 +1,13 @@
 # tool-partition Specification
 
 ## Purpose
-Hard-partition the tool surface and system injections by agent family: everything the plugin brings (the forge primary agent and forge-* subagents) runs exclusively on the forge exec system, everything else runs purely native, and neither side can see or be influenced by the other's tooling.
+Govern Forge harness access and state boundaries without partitioning native execution: all agents use host-native shell and dispatch, while the fifteen harness state/sync tools remain forge-primary-only and Plan/Goal state-file writes remain tool-mediated. Family-gated system injections and draft write bans coexist with native search availability and session/target dispatch gates; the plugin does not rewrite unrelated agents' tools or permissions.
 
 ## Requirements
 
-### Requirement: Forge family runs exclusively on the forge exec surface
-
-Every agent the plugin brings — the forge primary agent and every forge-* subagent regardless of shape — SHALL have the builtin shell tools (shell/bash) hidden and SHALL execute commands only through forge_shell/forge_jobs. On the v1 loader the hiding SHALL be delivered via runtime config injection; on the v2 loader — where agent records carry no `tools` field and per-agent tool visibility is permission-driven — the hiding SHALL be delivered as a deny permission (`action: "shell"`, `resource: "*"`, `effect: "deny"`) pushed onto the forge agent record and every materialized forge-* record at registration, shaping the model-facing tool surface before any call; the permission-belt refusals SHALL remain in place as belt-in-depth under both loaders. The hiding SHALL hold regardless of any host background capability, SHALL apply to a user-defined `forge` agent entry as a tools merge (builtin shell off, every other field of the entry untouched), and SHALL be withdrawn only by `jobs.keepBuiltinShell: true` or by supervisor retirement (`jobs.mode: "native"`) — both remaining v1-loader mechanisms (documented v2 drift until a readable opencode-config channel exists on v2). Harness state tools (the plan_*/goal_*/crew_* families) SHALL be primary-only: they SHALL be hidden from every forge-* subagent, whose forge toolset is limited to the exec pair (forge_shell and forge_jobs) and the search pair (forge_grep and forge_glob).
-
-#### Scenario: A write-shape forge subagent has no builtin shell
-
-- **WHEN** a forge.json agent with shape "write" is materialized
-- **THEN** the materialized agent entry hides the builtin shell tools while keeping its shape-derived permission map and pinned model
-
-#### Scenario: A forge worker carries only the exec toolset
-
-- **WHEN** a forge-* subagent session assembles its toolset
-- **THEN** the plan_*/goal_*/crew_* harness tools are absent; only forge_shell, forge_jobs, forge_grep, and forge_glob are available alongside the shape's own tools
-
-#### Scenario: A crew wave runs on the forge exec surface
-
-- **WHEN** a /crew orchestration dispatches subtasks to forge-* agents through the native task tool
-- **THEN** the dispatched workers can execute commands only through forge_shell
-
-#### Scenario: Native backgrounding does not restore the builtin shell on the forge family
-
-- **WHEN** the host's builtin shell presents a native run_in_background parameter
-- **THEN** the forge primary agent and all forge-* subagents still exclude the builtin shell tools
-
-#### Scenario: The v2 model surface never offers the builtin shell
-
-- **WHEN** a forge session on a v2 host assembles its model-facing tool list
-- **THEN** the builtin shell tool is absent from the offered surface (deny-shaped via the agent record's permission payload) while forge_shell remains available, and no belt refusal is needed for the model to stay on the forge exec surface
-
-#### Scenario: v2 worker records carry the front door alongside their shape map
-
-- **WHEN** a forge-* subagent record materializes under the v2 loader
-- **THEN** its permission payload carries the shell deny in addition to its shape-derived permission map, for every shape including write
-
-### Requirement: Non-forge agents are isolated from forge tooling
-
-Every agent other than the forge family — the native build, plan, general, and explore agents, and every user-defined agent — SHALL have all plugin-registered forge tools (forge_shell, forge_jobs, forge_grep, forge_glob, crew_begin, crew_close, and the plan_*/goal_* harness tools) hidden via runtime config injection, so no non-forge session can see or invoke forge tooling and the builtin shell remains its exec surface. Because the host's task-tool agent vocabulary is global (forge-* subagents cannot be made invisible to a specific parent agent), a non-forge agent's attempt to dispatch a forge-* subagent SHALL be refused at the tool layer with an explanatory error, and no subagent session SHALL be created. Forge state files are boundary-protected: a non-forge session's attempt to write into `.opencode/plan/` or `.opencode/goal/` SHALL be refused at the tool layer, while reading them stays unrestricted. A user's explicit `tools` entry enabling a forge tool on the user's own agent SHALL be respected and never overwritten. Native agents absent from the user's config SHALL receive the hiding through the same runtime materialization mechanism the plugin uses for its own agent entries.
-
-#### Scenario: The native build agent sees no forge tools
-
-- **WHEN** the user selects the native build agent and its toolset is assembled
-- **THEN** no plugin-registered forge tool is present, and the builtin shell is available as its exec surface
-
-#### Scenario: A non-forge dispatch of a forge worker is refused
-
-- **WHEN** the native build agent calls the task tool with a forge-* subagent as the target
-- **THEN** the call is refused with an error naming the agent-family partition, and no subagent session is created
-
-#### Scenario: A non-forge write into forge state files is refused
-
-- **WHEN** the native build agent attempts to write or edit a file under `.opencode/plan/` or `.opencode/goal/`
-- **THEN** the call is refused with an error naming the forge state boundary, and the file is unchanged
-
-#### Scenario: A task-spawned default subagent inherits the isolation
-
-- **WHEN** a non-forge agent dispatches a subagent through the native task tool with the default general agent
-- **THEN** the spawned session likewise has no forge tools available
-
-#### Scenario: A user-defined agent gets the isolation without losing its own fields
-
-- **WHEN** the user defines their own agent in config and the plugin loads
-- **THEN** only the forge-tool entries are merged into that agent's tools map as disabled, and all other fields of the entry stand unchanged
-
-#### Scenario: Explicit user opt-in is respected
-
-- **WHEN** the user's config explicitly sets tools.forge_shell: true on their own agent entry
-- **THEN** the plugin does not override that entry and the tool remains available there
-
 ### Requirement: Forge system injections are family-gated
 
-All forge-authored system-prompt injections (job guidance, plan/goal/crew notices, the compaction goal brief) SHALL be gated on the session's agent belonging to the forge family, resolved from a session-to-agent mapping built from the host's per-request agent signal; when the agent is unknown the injection SHALL be skipped. The suppression of the host's post-compaction auto-continue SHALL follow the same gate: it applies only while the session's current agent belongs to the forge family. Non-forge sessions SHALL carry no forge-authored system text.
+All forge-authored system-prompt injections (plan/goal/crew notices, the compaction goal brief) SHALL be gated on the session's agent belonging to the forge family, resolved from a session-to-agent mapping built from the host's per-request agent signal; when the agent is unknown the injection SHALL be skipped. The suppression of the host's post-compaction auto-continue SHALL follow the same gate: it applies only while the session's current agent belongs to the forge family. Non-forge sessions SHALL carry no forge-authored system text.
 
 #### Scenario: A build session's system prompt carries no forge text
 
@@ -85,7 +17,7 @@ All forge-authored system-prompt injections (job guidance, plan/goal/crew notice
 #### Scenario: A forge session keeps the full injection set
 
 - **WHEN** a forge-family session builds its system prompt while a plan and a goal are live
-- **THEN** the session receives the job guidance and the plan/goal notices exactly as before this capability existed
+- **THEN** the session receives the plan/goal notices exactly as before this capability existed
 
 #### Scenario: Compaction auto-continue suppression follows the agent family
 
@@ -94,7 +26,7 @@ All forge-authored system-prompt injections (job guidance, plan/goal/crew notice
 
 ### Requirement: Forge command entries redirect non-forge sessions
 
-The plugin-authored /plan, /goal, and /crew command templates SHALL carry a fail-fast guard: when the executing session cannot see the family's entry tool (plan_write, goal_write, or crew_begin respectively — i.e., a non-forge-family session), the template SHALL direct the model to stop immediately, tell the user to switch to the forge agent and rerun the command there, and perform no step of the discipline (no reconnaissance, no file operations, no tool calls beyond that self-check).
+The plugin-authored /plan, /goal, and /crew command templates SHALL carry a fail-fast guard: the command execution SHALL resolve the actual invoking agent independently of tool visibility. Only the forge primary enters; a worker, non-forge agent or unknown identity SHALL be redirected before any discipline prompt or work is initiated. The guard SHALL NOT infer identity from visibility of plan_write, goal_write or crew_begin. The command SHALL stop immediately, tell the user to switch to the forge agent and rerun the command there, and perform no step of the discipline (no reconnaissance, no file operations, no model tool calls to establish identity).
 
 #### Scenario: /plan under a non-forge agent redirects
 
@@ -106,72 +38,10 @@ The plugin-authored /plan, /goal, and /crew command templates SHALL carry a fail
 - **WHEN** the user runs /goal or /crew in a session of a non-forge agent
 - **THEN** the model stops at the guard with the same redirect and nothing of the goal or crew discipline is initiated
 
-### Requirement: Session-scoped safety interop for active drafts
+#### Scenario: Tool visibility does not determine command identity
 
-While a session has an active plan draft, the draft-phase write ban SHALL remain session-scoped: write-class tool calls are denied for every agent in that session, including non-forge agents, because the draft protects shared session state. The task-dispatch shape exemption SHALL follow the same session scope and the plan harness's semantics: a task call whose target resolves to an effective-readonly forge subagent passes during draft regardless of the speaking agent, while every other target stays denied. Non-forge turns SHALL gain no new dispatch capability from the exemption: the family dispatch guard refuses a non-forge agent's forge-* targets before the draft gate is consulted, and native targets are never effective-readonly — so a non-forge agent's dispatch surface during a draft is byte-identical with and without this exemption. Denials SHALL name the way out (plan_approve, or /plan discard). This remains the one deliberate forge constraint that reaches non-forge turns: passive protection of shared state — forge SHALL never actively drive a non-forge turn.
-
-#### Scenario: A non-forge agent is write-blocked during an active draft
-
-- **WHEN** the user switches a draft-bound session to the build agent and it attempts a write
-- **THEN** the write is denied with guidance naming plan approval via forge or /plan discard, and the draft is untouched
-
-#### Scenario: The shape exemption grants non-forge turns nothing
-
-- **WHEN** a draft-bound session is driven by a non-forge agent that dispatches `task {subagent_type: "forge-research"}` (effective readonly) or `task {subagent_type: "general"}`
-- **THEN** the forge-* target is refused by the family dispatch guard and the native target by the draft write ban — identical to the pre-exemption behavior
-
-### Requirement: Fallback enforcement on hosts that ignore injected tools maps
-
-Some host builds assemble agent toolsets without honoring `tools` maps that
-the plugin injected at runtime into agent entries (verified on the owner's
-host build: file-configured entries are honored, hook-injected entries are
-not — for both builtin and plugin tools). On such hosts, every partition
-constraint that would be expressed as tool invisibility SHALL instead be
-enforced as a hard refusal at the tool layer: a forge-family session's
-builtin shell/bash call SHALL be refused with a pointer to `forge_shell`
-(unless `jobs.keepBuiltinShell` or supervisor retirement applies), a
-non-forge session's call of ANY plugin-registered forge tool SHALL be
-refused with the partition guidance, and a forge-family session whose agent
-is not the primary `forge` agent (a `forge-*` worker) calling any harness
-state tool (`plan_*`, `goal_*`, `crew_begin`, `crew_close`) SHALL be refused
-with guidance naming the primary-only partition and the way out: report
-findings back to the orchestrating session — the primary forge agent alone
-calls the state tools. The worker refusal SHALL fire before any execution or
-gate ask, so a worker's state-tool call never reaches a user confirmation
-dialog and never mutates plan/goal/crew state. Unknown sessions SHALL fail
-open. On hosts that honor injected maps the refusals never fire; the refusal
-errors name the partition and the way back, degrading "invisible" to
-"visible but unusable" without changing any other semantics.
-
-#### Scenario: A forge session's builtin shell call is hard-refused on an unfiltered host
-
-- **WHEN** a host ignores hook-injected tools maps and the forge agent calls the builtin shell tool
-- **THEN** the call is refused with guidance to re-issue through forge_shell, and no process is spawned
-
-#### Scenario: A non-forge session's forge tool call is hard-refused on an unfiltered host
-
-- **WHEN** a host ignores hook-injected tools maps and the build agent calls forge_shell
-- **THEN** the call is refused with the partition guidance, and nothing executes
-
-#### Scenario: A forge worker's state-tool call is hard-refused on an unfiltered host
-
-- **WHEN** a host ignores hook-injected tools maps and a task-dispatched `forge-*` worker session calls a harness state tool such as goal_complete
-- **THEN** the call is refused with the primary-only partition guidance before any execution or user gate, no confirmation dialog is presented, and the active goal's state is unchanged
-
-#### Scenario: The primary forge agent's state-tool calls are unaffected by the fallback
-
-- **WHEN** the primary `forge` agent's session calls goal_complete or any other harness state tool
-- **THEN** the fallback belts do not fire and the call proceeds through its own validation and gate
-
-#### Scenario: A forge worker's exec pair is unaffected by the state-tool refusal
-
-- **WHEN** a `forge-*` worker session calls forge_shell or forge_jobs
-- **THEN** the state-tool refusal does not fire and the call executes normally
-
-#### Scenario: The escape hatches still open the builtin shell under the fallback
-
-- **WHEN** `jobs.keepBuiltinShell: true` (or `jobs.mode: "native"`) and a forge-family session calls the builtin shell
-- **THEN** the call passes — the fallback refusal applies only when the hide would
+- **WHEN** a non-forge agent can see an entry tool or a forge primary has a user permission restricting it
+- **THEN** the former redirects before discipline starts and the latter remains subject to normal permission, not misidentified
 
 ### Requirement: The goal loop never continues under a non-forge agent
 
@@ -182,198 +52,120 @@ When the goal continuation engine fires for a session whose current agent resolv
 - **WHEN** the user switches a goal-owning session to a non-forge agent and the session goes idle
 - **THEN** no continuation prompt is sent to the non-forge agent and the goal's turn budget is unchanged
 
-### Requirement: Readonly workers execute on a sealed supervised-exec channel
+### Requirement: Forge family executes on the host's builtin shell
 
-For any session whose running `forge-*` agent has an effective readonly shape (an EXPLICIT `shape: "readonly"`; an absent shape defaults to write and is NOT sealed), the plugin SHALL gate the supervised exec channel (`forge_shell`) for that session: commands classified READ-CLASS (inspection and search — e.g. directory listings, file reads, `rg`/`grep`, `git log`/`git status`/`git diff`, version and help queries, read-only `node`/`python` evals) SHALL flow normally; commands classified WRITE-CLASS SHALL be denied with a bounded finding that names the readonly shape, names the classified write indicator, and points at the remedy (`shape: "write"` on that agent when its job legitimately mutates). Write-class indicators SHALL cover at minimum: output redirection to files (`>` `>>` and their PowerShell equivalents), the known mutating cmdlets and commands (`Set-Content`, `Out-File`, `New-Item` with a file/item type, `Remove-Item`, `Move-Item`, `Copy-Item` writing, `Add-Content`, `Clear-Content`, `Start-Process`-spawning-writers is NOT covered — indirection stays out of scope), `git` mutating subcommands (`add`, `commit`, `push`, `reset`, `checkout`, `rebase`, `merge`, `clean`, `rm`), package-manager publishes/installs mutating the tree (`npm publish`, `npm install`, `bun add`, `pip install`), and any command whose parsed targets write INSIDE the session workspace by explicit path argument. Precision on the short `-o` flag: `-o` SHALL count as an output-target flag ONLY when the command's head binary belongs to the known writer-binary set (binaries whose `-o` denotes an output file — the compiler/linker family, `curl`, `sort`, `psql`, `go`, `dotnet`); on every other binary the short `-o` SHALL flow READ-CLASS (fail-open, disclosed in the README bypass surface). Long-form output flags (`--out`, `--output`, `--out-file`/`--outfile`/`--outFile`, `--dest`, `--destination`) SHALL stay binary-independent. Flag-value binding SHALL be quote-aware — a quoted token immediately following a flag binds as that flag's value, and stripping quoted spans for the other indicator scans SHALL NOT rebind a flag onto a later bare token. The classification SHALL be a pure, injectable function (unit-tested, no fs access at classify time) evaluated on the command string BEFORE spawn; a command that fails to classify SHALL be treated as READ-CLASS (fail-open on the channel — the seal is belt-in-depth on top of the tool-face deny, not a sandbox, and the README SHALL disclose the covered indicators and the known bypass surface verbatim). The seal SHALL compose with, not replace, the existing draft-phase write posture: draft-period ask/deny semantics on the channel are unchanged; a write-shaped worker is never sealed; the primary forge session is never sealed.
+The plugin SHALL register no command-execution tool of its own. For every
+agent — the forge primary, every `forge-*` worker, and every non-forge
+agent — the host's builtin shell tool SHALL be the only exec surface (each
+agent's own permission face still applies): the plugin SHALL NOT hide it,
+SHALL NOT push a deny of it onto any agent record, SHALL NOT refuse a call
+of it, and SHALL offer no option that hides it or restores a plugin exec
+surface. Two things are not the plugin's doing and are not covered by
+that: a deny the user's config or a worker's recipe states explicitly is
+compiled as written, and the plan draft's session-scoped write ban denies
+the builtin shell like every write-class tool (plan-harness 'Hard write ban
+during draft'). Worker shape semantics SHALL govern everything except the
+shell: a worker with an explicit `shape: "readonly"` SHALL keep the
+mutating tool family (write/edit/patch) denied while keeping the builtin
+shell available (the host's shipped `explore` agent makes the same
+choice), with no plugin-side command classification; an absent shape
+(write, the default) leaves the
+shell available as well. The plugin SHALL NOT alter the builtin shell's
+environment, working directory, or permission posture; where a worker runs
+is the host's business (the host creates a native subagent child in its
+parent's directory — forge-subagents 'Session directory resolved per
+session on multi-location hosts'). Harness state tools (the plan_*/goal_*/
+crew_* families and `forge_sync`) SHALL be primary-only: every `forge-*`
+worker's compiled permission face SHALL deny them, so the host offers the
+worker none of them, and a call that reaches the plugin anyway SHALL be
+refused by the plugin's tool-execute interception belt with the
+primary-only guidance. A worker SHALL carry no plugin-registered tool of
+its own.
 
-#### Scenario: Read-class commands flow for an explicit readonly worker
+#### Scenario: No plugin exec tool is registered
 
-- **WHEN** a session runs `forge-reviewer` with explicit `shape: "readonly"` and its dispatch calls `forge_shell` with `rg TODO src/` or `git log --oneline -10`
-- **THEN** the command executes normally and no seal finding is recorded
+- **WHEN** the plugin loads under any configuration
+- **THEN** the host's tool registry holds no `forge_shell` or `forge_jobs`, and no option brings either back
 
-#### Scenario: A redirect is denied with the shape named
+#### Scenario: A write-shape forge subagent executes on the builtin shell
 
-- **WHEN** an explicit readonly worker's `forge_shell` call carries `node build.js > out.txt`
-- **THEN** the spawn is denied, and the bounded finding names the readonly shape, the redirect indicator, and the `shape: "write"` remedy — the worker is told to report the refusal verbatim, not work around it
+- **WHEN** a `forge-*` worker of write shape (explicit, or by the absent-shape default) whose recipe does not deny the shell runs a command
+- **THEN** its tool face turns no shell tool off on account of its shape and the command executes through the host's builtin shell
 
-#### Scenario: A mutating cmdlet is denied
+#### Scenario: A readonly worker keeps the shell and loses the mutating tools
 
-- **WHEN** an explicit readonly worker's `forge_shell` call carries `Set-Content -Path notes.md -Value x`
-- **THEN** the spawn is denied with the same finding shape (mutating-cmdlet indicator)
+- **WHEN** an explicit-readonly `forge-*` worker whose recipe does not deny the shell runs a read-only inspection command and then attempts a file write
+- **THEN** the shell command executes without any plugin classification, and the write-class tool is denied by the shape's tool face
 
-#### Scenario: A workspace-path write is denied
+#### Scenario: A worker's builtin shell call is never refused by the plugin
 
-- **WHEN** an explicit readonly worker's `forge_shell` call carries `node tools/gen.mjs --out src/generated.ts` where the parsed output target resolves inside the workspace
-- **THEN** the spawn is denied (workspace-write indicator) — parsing uses the command string only, at classify time, with no fs access
+- **WHEN** a `forge-*` worker session calls the builtin shell, the session has no active plan draft, and neither the worker's recipe nor the user's config denies the shell
+- **THEN** the call is decided by the host's own permission flow alone — the plugin injects no deny rule, pushes no deny onto the worker's face, and adds no fallback refusal or rescue for the builtin shell
 
-#### Scenario: Short -o on a non-writer binary flows
+#### Scenario: The model surface offers the builtin shell to every agent
 
-- **WHEN** an explicit readonly worker's `forge_shell` call carries `rg -o "v1\.2\.3" package.json` (only-matching with a quoted pattern) or `rg -o needle.v2 src/` (only-matching with a dotted unquoted pattern)
-- **THEN** the command executes normally and no seal finding is recorded — the short `-o` is not an output-target flag outside the writer-binary set, and the quoted pattern binds as the flag's value instead of rebinding the flag onto a later path token
+- **WHEN** a session of any agent — the forge primary, a `forge-*` worker, a non-forge agent — assembles its model-facing tool list, and no recipe or user config denies that agent the shell
+- **THEN** the builtin shell tool is present and carries no deny the plugin added on its own
 
-#### Scenario: Short -o on a writer binary is denied
+#### Scenario: A forge worker is offered no harness tool
 
-- **WHEN** an explicit readonly worker's `forge_shell` call carries `gcc -o out.exe main.c` or `go build -o bin/app ./cmd`
-- **THEN** the spawn is denied (workspace-write indicator) with the detail naming the bound output target
+- **WHEN** a `forge-*` worker's compiled permission face and toolset are inspected
+- **THEN** every harness state tool is denied on the face and absent from the toolset, and a call of one that reaches the plugin anyway is refused with the primary-only guidance
 
-#### Scenario: Quoted output targets bind correctly
+#### Scenario: A crew wave runs on the builtin shell
 
-- **WHEN** an explicit readonly worker's `forge_shell` call carries `curl -o "out.txt" https://example.com`
-- **THEN** the spawn is denied (workspace-write indicator) — the quoted token immediately after the flag is bound as the flag's value
+- **WHEN** a /crew orchestration makes native `subagent` calls for `forge-*` workers
+- **THEN** the workers execute commands through the host's builtin shell
 
-#### Scenario: Write-shaped and absent-shaped workers are never sealed
+#### Scenario: The builtin shell stays host-native
 
-- **WHEN** a session runs a `shape: "write"` agent or an agent with NO shape field (the open default) and calls `forge_shell` with any command
-- **THEN** the exec channel applies no write-class denial — the seal keys on the explicit readonly shape only
+- **WHEN** any forge-family session runs a command through the builtin shell
+- **THEN** the environment, working directory, timeout, and permission handling are the host's own; the plugin sets none of them and classifies no command
 
-#### Scenario: Unclassifiable commands flow and the bypass surface is disclosed
+### Requirement: Non-forge agents are isolated from the forge harness
 
-- **WHEN** a command's write intent hides behind indirection the classifier does not model (a script that writes internally, `Start-Process` writers, encoded payloads, or the short `-o` on a writer binary outside the known set)
-- **THEN** the command flows (fail-open on the channel), and the README discloses this bypass surface verbatim alongside the covered indicator list — the seal is belt-in-depth, not a sandbox
+Every agent other than the forge family — the native build, plan, general, and explore agents, and every user-defined agent — SHALL be kept off the plugin's harness state tools (crew_begin, crew_close, `forge_sync`, and the plan_*/goal_* families): a call of one from such an agent SHALL be refused by the plugin's tool-execute interception belt before the tool executes, with the partition guidance naming the forge agent as the way in, and nothing of the plan/goal/crew state SHALL change. Nothing else is partitioned. The plugin's search override rides the builtin `grep` / `glob` tools and is available to every agent; the builtin shell is every agent's exec surface; and dispatch is not partitioned either — a non-forge agent may dispatch a `forge-*` worker through the native `subagent` tool under the same session-keyed gates as the forge primary (forge-subagents 'Dispatch gates enforced on the native subagent tool'), and no gate SHALL refuse a call because of who the calling agent is. Forge state files are boundary-protected: a non-forge session's attempt to write into `.opencode/plan/` or `.opencode/goal/` SHALL be refused at the tool layer, while reading them stays unrestricted. Tool partition SHALL NOT write any of these permission or tool fields into an agent record that is not its own; existing configurable primary-picker hiding is independent and retained (forge-agent v2 single-agent surface). The plugin SHALL NOT write any of this tool partition into an agent record that is not its own: a user-defined agent's fields are never touched, and the refusal alone is the guarantee there. Native agents absent from the user's config need no record of the plugin's — the refusal is keyed on the session's agent, not on a config entry.
 
-#### Scenario: The seal composes with the draft posture
+#### Scenario: A non-forge session's harness tool call is refused
 
-- **WHEN** an explicit readonly worker's `forge_shell` call arrives during a plan-draft phase on a governed session
-- **THEN** the existing draft-phase ask/deny semantics apply unchanged — the seal neither weakens nor replaces them
+- **WHEN** the native build agent calls a harness state tool such as goal_write
+- **THEN** the call is refused with the partition guidance before the tool executes, and the goal state is unchanged
 
-### Requirement: Exec posture pass-through on the exec surface
+#### Scenario: The search override and the shell are open to every agent
 
-The forge exec surface (`forge_shell`) SHALL resolve its permission posture
-with NO plugin-injected default and NO plugin-side resolution: the plugin
-SHALL NOT rewrite the posture for unconfigured users (the host's own default
-flows — in practice `"*": allow` — so an unconfigured `forge_shell` executes
-in serve, TUI, and run modes alike, exactly like the native shell tool), and
-SHALL NOT classify commands to resolve any posture. Explicit user values
-(`allow` / `deny` / `ask`) SHALL flow to the host verbatim in every mode: an
-explicit `ask` behaves exactly like the native shell tool's ask in that mode
-(a real dialog in TUI, the host's ask auto-reject semantics in run mode, a
-pending ask on a serve host until answered via the host API — the host's
-business, disclosed, not the plugin's). User-confirmation doors —
-`plan_approve`, `plan_close`, `goal_write (arm)`, `goal_complete`,
-`goal_resume`, `goal_discard`, `crew_close` — exactly the non-exec `gate()`
-permission keys — SHALL NEVER be auto-resolved in any mode; they remain real
-dialogs. The readonly-exec-seal SHALL remain the ONLY plugin-side exec
-refusal (below: the cross-anchor rescue and its deny-gate excepted — the
-rescue restores the documented default, it does not refuse) :
-explicit-readonly workers' write-class commands are refused by the seal
-before execution, posture-independently (a pure-function command classifier
-recognizes write-class commands for the seal; that classifier has no role on
-the posture path). Disclosure: with no explicit permission configured, ANY
-command the model issues through `forge_shell` runs without confirmation in
-every mode — this default-open posture is the documented, accepted product
-decision; the safety belt for readonly workers is the seal, which is
-posture-independent.
+- **WHEN** the native build agent assembles its toolset and the user's own configuration denies none of the three
+- **THEN** `grep` and `glob` carry the plugin's override and the builtin shell is available; the plugin has pushed no deny for any of the three onto that agent
 
-On hosts whose permission assert evaluates at the plugin host's location
-(v2 geometry; every 2.x host observed), an agent that registers only at the
-project location (native-first workers) cannot resolve at the assert anchor
-and the host falls back to a literal deny-all BEFORE any rule, saved
-approval, hook, or ask is consulted. The plugin SHALL therefore maintain a
-cross-anchor rescue for forge-family sessions, EXACTLY bounded: it SHALL
-ensure, through the host's documented session-rule surface, that the
-session's permission rules end with
-`{action: "forge_shell", resource: "*", effect: "allow"}` — session rules
-evaluate after agent rules with last-match-wins, so the rule restores the
-documented default-open posture in exactly the geometry where the host
-defect would silently replace it with deny-all. The rescue SHALL inject on
-the forge primary session (child sessions inherit session rules at creation)
-and, as a belt, on a worker session at its first `forge_shell` call. The
-injection SHALL be read-back-merge (never clobber existing session rules),
-idempotent, and scoped to the `forge_shell` action alone. An explicit user
-`deny` — in EITHER supported config shape (legacy `permission.forge_shell`
-or the v2 `permissions` rule array) — SHALL disable the rescue entirely (no
-injection on any session) and SHALL refuse the call plugin-side before the
-assert, verbatim as today. As belt-in-depth, when the host assert rejects a `forge_shell` call FROM A
-FORGE WORKER SESSION with the bare no-reason deny signature AND the
-resolved posture is not an explicit deny (the rejection can only be the
-cross-anchor fallback), the call SHALL proceed with a bounded
-`[forge:session-rescue]` finding naming the rescue; the belt SHALL never
-fire past an explicit deny, nor outside worker sessions (a primary
-session's agent resolves at the assert anchor — a bare deny there is a
-real deny and propagates). v1 hosts are
-untouched (draft materialization resolves at the host anchor; the v1 domain
-has no session-rule surface and no defect).
+#### Scenario: A non-forge dispatch of a forge worker flows
 
-#### Scenario: Unconfigured posture runs everywhere (default-open)
+- **WHEN** the native build agent calls the native `subagent` tool for a `forge-*` worker of the session's own workspace pool
+- **THEN** the call is admitted exactly as the same call from the forge primary would be, and the host creates the child
 
-- **WHEN** the user's config has NO explicit permission for `forge_shell` and a forge-family worker calls it with any command
-- **THEN** the command executes in serve, TUI, and run modes alike — the plugin injects no ask, classifies nothing, and the host's default applies; in a worker session under the cross-anchor geometry this default is delivered by the session-rule rescue below, not left to the broken fallback
+#### Scenario: A non-forge write into forge state files is refused
 
-#### Scenario: Explicit allow skips the ask; explicit deny refuses
+- **WHEN** the native build agent attempts to write or edit a file under `.opencode/plan/` or `.opencode/goal/`
+- **THEN** the call is refused with an error naming the forge state boundary, and the file is unchanged
 
-- **WHEN** the user's config explicitly allows or denies `forge_shell`
-- **THEN** `allow` runs the command without the ask in every mode, and `deny` refuses in every mode — both verbatim, with no plugin-side reinterpretation
+#### Scenario: A native child of a non-forge session inherits the isolation
 
-#### Scenario: Explicit ask follows host semantics with no plugin resolution
+- **WHEN** a non-forge agent dispatches a child through the native `subagent` tool with the `general` agent
+- **THEN** a harness state tool call from that child is refused the same way
 
-- **WHEN** the user's config explicitly sets `forge_shell: "ask"` and a call arrives in TUI, run, or serve mode
-- **THEN** the ask reaches the host unmodified — dialog in TUI, auto-reject semantics in run mode, pending ask in serve mode exactly like the native shell tool's ask there; the plugin never classifies the command and never emits `[forge:headless-denied]`
+#### Scenario: A user-defined agent's fields are never touched
 
-#### Scenario: No posture command classification anywhere
+- **WHEN** the user defines their own agent in config and the plugin loads
+- **THEN** no field of that entry is changed; a harness tool call from it is refused by the belt, and everything else about the agent stands as the user wrote it
 
-- **WHEN** any `forge_shell` call arrives under any posture in any host mode
-- **THEN** the plugin performs no command classification on the posture path — the exec classifier exists solely inside the readonly-exec-seal for explicit-readonly workers
+### Requirement: Draft safety interop reaches every agent in the session
 
-#### Scenario: User-confirmation doors are never auto-resolved
+While a session has an active plan draft, the draft-phase write ban SHALL remain session-scoped: write-class tool calls — the host's builtin `shell` included — are denied for every agent in that session, including non-forge agents, because the draft protects shared session state. The dispatch shape exemption SHALL follow the same session scope and the plan harness's semantics: a native `subagent` call whose target is a `forge-*` worker of effective readonly shape passes during draft regardless of the speaking agent, while every other call — a write-shape worker, a readonly worker that keeps the shell, a non-forge agent — stays denied, exactly as plan-harness 'Hard write ban during draft' defines. A non-forge turn gains exactly that from the exemption — a reconnaissance dispatch under the session-keyed gates — and no write and no other dispatch. Denials SHALL name the way out (plan_approve, or /plan discard). This remains the one deliberate forge constraint that reaches non-forge turns: passive protection of shared state — forge SHALL never actively drive a non-forge turn.
 
-- **WHEN** a `plan_approve` / `plan_close` / `goal_write (arm)` / `goal_complete` / `goal_resume` / `goal_discard` / `crew_close` confirmation door fires in any host mode
-- **THEN** the ask remains a real pending dialog and is never resolved by any plugin-side mechanism
+#### Scenario: A non-forge agent is write-blocked during an active draft
 
-#### Scenario: Seal refuses readonly workers' writes as the sole plugin refusal
+- **WHEN** the user switches a draft-bound session to the build agent and it attempts a write
+- **THEN** the write is denied with guidance naming plan approval via forge or /plan discard, and the draft is untouched
 
-- **WHEN** an explicit-readonly forge worker calls `forge_shell` with a WRITE-class command, under any permission posture and any host mode
-- **THEN** the readonly-exec-seal refuses the call before execution — the only plugin-side exec refusal, posture-independent
+#### Scenario: A non-forge turn gains one reconnaissance dispatch and nothing else
 
-#### Scenario: Session-rule rescue unblocks native workers
-
-- **WHEN** a native (md-materialized) forge worker session calls `forge_shell` with no explicit deny configured, on a host whose assert evaluates cross-anchor
-- **THEN** the session's permission rules end with the `forge_shell` allow rule (injected read-back-merge, idempotent, scoped to that action) and the command executes exactly as the documented default-open posture prescribes
-
-#### Scenario: Explicit deny disables the rescue everywhere
-
-- **WHEN** the user's config carries an explicit `forge_shell` deny in EITHER shape (legacy `permission.forge_shell` map or v2 `permissions` rule array)
-- **THEN** no session ever receives the injected rule, and the call is refused plugin-side before the assert with the existing verbatim deny refusal
-
-#### Scenario: Primary injection lets children inherit
-
-- **WHEN** a forge primary session prompts (v2 session hook) with no explicit deny configured
-- **THEN** the plugin ensures the allow rule on that session so worker child sessions created afterwards inherit session rules carrying it at creation
-
-#### Scenario: Rescue never clobbers session rules
-
-- **WHEN** a target session already carries session-scoped permission rules (any origin)
-- **THEN** the injection appends (or skips when our exact rule is already present) and writes back the merged array — existing rules survive byte-for-byte
-
-#### Scenario: Fallback belt behind the injection
-
-- **WHEN** the host assert rejects a `forge_shell` call from a forge WORKER session with the bare no-reason deny signature, the resolved posture is not an explicit deny, and the session-rule surface is unavailable or the injection failed
-- **THEN** the call proceeds and a bounded `[forge:session-rescue]` finding is attached naming the rescue — the belt never fires when the posture is an explicit deny, and never outside worker sessions
-
-### Requirement: Non-interactive exec hygiene on the forge_shell surface
-
-Every `forge_shell` execution SHALL be spawned with a non-interactive
-environment merged into the child process env — at minimum `GIT_EDITOR=:`,
-`EDITOR=:`, `GIT_PAGER=cat`, `PAGER=cat`, and `GIT_MERGE_AUTOEDIT=no` — so no
-spawned command can hang on an editor or pager prompt regardless of the
-command, the host mode, or the platform shell. The injection SHALL happen at
-spawn time (process env), never by rewriting the command string. A command
-matching an enumerated known-interactive list (interactive logins, primary
-pagers, installers that demand manual input) SHALL attach a non-blocking
-warning line to the tool result naming the matched pattern; the command
-itself still runs or is refused solely by the permission posture — the
-warning never blocks, never retries, and never mutates the command.
-
-#### Scenario: Spawn env carries the defang set
-
-- **WHEN** any `forge_shell` command spawns (git or not, any host mode)
-- **THEN** the child process env contains the non-interactive set (`GIT_EDITOR=:`, `EDITOR=:`, `GIT_PAGER=cat`, `PAGER=cat`, `GIT_MERGE_AUTOEDIT=no`), and the command string is byte-identical to what the model issued
-
-#### Scenario: Known-interactive command warns without blocking
-
-- **WHEN** a `forge_shell` call issues a command matching the known-interactive list
-- **THEN** the tool result carries a warning line naming the matched pattern and the command's own result follows — the call is not refused by the hygiene layer
-
-#### Scenario: A command that would open an editor completes instead of hanging
-
-- **WHEN** a `forge_shell` command would normally open an interactive editor or pager (e.g. a git command that wants a merge message)
-- **THEN** the command completes using the non-interactive fallback (`:` editor, `cat` pager) without hanging
+- **WHEN** a draft-bound session is driven by a non-forge agent that makes native `subagent` calls for `forge-<ns>-research` (effective readonly, its recipe denying the shell) and for `general`
+- **THEN** the forge-* target passes as a reconnaissance dispatch under the session-keyed gates, and the `general` target is refused by the draft's dispatch ban

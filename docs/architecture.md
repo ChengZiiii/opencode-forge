@@ -1,7 +1,7 @@
 # 架构与机制（改 plugin.ts / 查机制前必读）
 
 > 由仓库根 `AGENTS.md` 路由到本文件。读完就退场，不常驻上下文。
-> 2026-11-26：以已批准的 `retire-plugin-runtime` 为现行目标架构。以下区分工作区源码已实现的部分、待宿主验证的部分与尚未完成的目标；不代表已发布版本或最终验收结果。详细契约、证据及剩余工作以该 change 的 `design.md`、`specs/`、`tasks.md` 为准。
+> 2026-11-27 当前状态：0.35.0 已发布并由官方路径安装，实包/registry/本机四文件同字节，用户明确「全部通过」（主控及既有发布凭据记账）。用户另已授权正式归档与规范清理；详细契约以 `openspec/specs/` 为准，历史证据及未覆盖项见 retire-plugin-runtime 的 `design.md`、`tasks.md` 和既有 dependency audit。下文未覆盖矩阵不是当前源码未实现或仍待本次 owner 验收；不以发布/用户接受限制代替完整实测。
 
 ## 架构总览
 
@@ -10,10 +10,10 @@ Forge 是主代理及 Plan / Crew / Goal 文件契约的治理层，不再承担
 | 边界 | 工作区现状 / 目标 |
 | --- | --- |
 | 执行 | 插件执行工具、作业注册/唤醒、执行封条和进程停滞看门狗的实现已移除（tasks 4.2–4.5）；原生 shell 的真实权限及后台行为待探针 A/B/C。plan/goal 冻结检查的宿主执行器仍保留，不是通用执行面。 |
-| 派发 | 插件 `task` 工具及派发引擎核心模块已删除（5.1、5.3）；原生 `subagent` 是目标唯一入口，完成通知、子会话记录和消息续用由宿主负责。旧入口的兼容拦截及原生派发门迁移还未全部完成（5.2、6.x）。 |
-| 搜索 | 已移除旧搜索别名及相应分区（8.5）。当前保留内建 `grep` / `glob`；仅在原授权与输出契约等价可证时做同名扩展（D9、8.x）。增强尚未完成。 |
-| 停止 | **尚未完成**：当前 `/forge stop` 仅披露自动取消不可用，不能声称已经停止任何子会话或命令（D8、7.x）。 |
-| 加载 | 当前仍有 `server` 和 `v2Setup` 两个入口及旧停用判断；package.json 仍导出 `./server` 且兼容 v1。最终仅支持 v2，使用宿主原生插件启停（D10、9.x）；不能宣称已删除 v1 或完成启停迁移。 |
+| 派发 | 插件旧派发工具及引擎已删除；原生 `subagent` 是唯一入口，完成通知、子会话记录和消息续用由宿主负责。原生调用拦截与轮次记账已有实现，完整适用矩阵及先迁后删过程要求并未因发布全部签收。 |
+| 搜索 | 已删除旧搜索别名，通过 editor.update 同名增强内建 `grep` / `glob`。保留参数/output schema及授权检查；搜索/K 真实完整矩阵仍有正式访问边界阻塞，不能声称增强/环境/卸载等价均已验收。 |
+| 停止 | `/forge stop` 已实现双证归属、后台 shell 停止、孩子 interrupt 及诚实回访回执；最终实包双孩子局部 smoke 已通过。未知/部分枚举不扩围，完整停止矩阵仍未全部验证。 |
+| 加载 | 已删除 v1 `server` 入口、`./server` 导出及旧 forgeDisabled 判断；仅 v2 setup，engine ^2.0.0。采用宿主原生插件启停；K 停用/恢复/多目录完整矩阵仍 blocked，不与代理 disable 混同。 |
 
 ### 文件职责
 
@@ -32,7 +32,7 @@ Forge 是主代理及 Plan / Crew / Goal 文件契约的治理层，不再承担
 | `src/native-child-gate.ts` | 既有原生孩子状态观察、终态与未知区分，供 harness 判断合法等待；不创建孩子或替代宿主完成通知。 |
 | `src/goal-activity.ts` | 轻量活动观测，区分真实工具执行和可比较的检查证据；目标是减少误暂停，不是模型评估器。 |
 | `src/run-check.ts` / `src/proc.ts` / `src/shell-select.ts` | Plan/Goal 共用冻结检查执行、文件契约、cwd、解释器选择及检查超时清理；保留的有限检查链（4.7、6.10）。v2.4.0 公开接口无初始 merged shell 输入，按既有平台链回退且不声称与用户自定义 native shell 等价；真实解释器探针尚待 1.14/9.1。 |
-| `src/search-core.ts` / `src/search-js.ts` | 搜索结果语义及双引擎实现；同名扩展仍待 8.x，不因现有引擎可用就推断原生权限等价。 |
+| `src/search-core.ts` / `src/search-js.ts` | 搜索结果语义及双引擎实现，供原生同名更新调用；8.x完整权限/环境/卸载矩阵仍未验，不因引擎可用就推断等价。 |
 | `tests/*.test.mjs` | node:test 纯函数、合成宿主接线及有限本地执行测试；v1 保留行为断言先迁移再删入口（1.16、9.x）。 |
 | `dist/index.js` | 自包含构建产物，入库；最终产物及安装行为独立验收。 |
 
@@ -41,14 +41,14 @@ Forge 是主代理及 Plan / Crew / Goal 文件契约的治理层，不再承担
 - **sole-pool-ownership / pool-namespace-contract**：会话锚点向上最近的 `.opencode/forge.json` 是该工作区独占池，嵌套子树不扫描。仅无工作区池时整体 fallback 到 global，不合并；坏工作区文件不退 global。host materialization union（global + 已见工作区池）不是单会话 roster。池文件删除即失池，归属按磁盘真值重推。全池命名 `forge-<ns>-<id>` / `forge-global-<id>`；没有 primary 纯 id 特权。路径纯字典序确定性、namespace 撞名后缀及跨族 id 撞名先者胜，均有 finding。合法 `pool` 声明用于 crew 合规检查，单个坏工人条目不构成文件级违规。
 - **物化**：native-first Markdown 代理（`mode: subagent`，description 带池来源、model 钉扎）。生成头标识配方及所有权，显式 sync 或既有 auto opt-in 才写，GC 只处理确认所有权的孤儿；手写同名文件不改不删。过期/升级兼容按内容与编译契约，不以 mtime 相同或 touch/checkout 判成功。当前已有兼容检查接线，workspace/global/override 实际热应用及权限面仍待 3.7、1.15。
 - **工人形状（D2）**：缺省 shape 为 write。现有 namespaced worker 编译已转向原生工具权限：默认关闭 `subagent`、`question` 和 15 个 harness 工具，readonly 另关闭写/编辑/patch 家族及 `execute`，默认保留原生 shell。显式权限覆盖形状默认（`subagent` 禁再派不可解除；`shell`/`bash` 读作同一动作）的完整验证尚欠 3.2/探针 C。允许工人提问可能无法收到后台回答；readonly 不再具有命令级只读封条，不能当沙箱。general/explore 原有独立投影语义不因 namespaced worker 改变。
-- **工具分区（D6 目标）**：15 个状态工具（6 plan、6 goal、2 crew、1 sync）仅主代理使用；工人及非 forge 调用由拦截带拒绝，不改写他人 tools/permissions；Tab picker 隐藏与实际登记可用性独立，显式用户配置优先。原生派发不按调用者族限制，而按会话及目标判门。当前旧兼容分区仍有残余，6.5/9.1 未完成。
+- **工具分区（D6 目标）**：15 个状态工具（6 plan、6 goal、2 crew、1 sync）仅主代理使用；工人及非 forge 调用由拦截带拒绝，不改写他人 tools/permissions；Tab picker 隐藏与实际登记可用性独立，显式用户配置优先。原生派发不按调用者族限制，而按会话及目标判门。旧兼容分区已删除；6.5/9.1 未满足整项的历史条件仍保留未勾，不等于当前仍有旧入口。
 - **钉扎**：`dispatch-depth.ts` 的七词（none/minimal/low/medium/high/xhigh/max）是词典而非白名单；不插值、词通道默认透传并披露 unverified，legacy budget 无对应词或纯 toggle 档词不注入并给 finding。Anthropic 家族传输形状优先于目录声明（adaptive effort 与 legacy budget 分开），其后 catalog / provider fallback。v2 draft 不写 model 的历史宿主差异由 context payload 钉扎承接（2.3.2 曾实证），本 change 最终实际服务模型与 catalog snapshot/cache/null fallback 仍需 1.14、11.2 验证。
 
 ### 拦截带与确认门
 
 宿主 v2 `tool.execute.before` 能拒绝完整工具调用（含目标参数）；`permission.evaluate` 只在宿主工具请求权限时触发，不能替代调用拦截。依据 D4、D7，最终顺序为：可靠会话定位 → 草稿期写禁 → 状态文件边界 → harness 工具分区 → 原生派发池归属 / crew 暂停 / crew 合规门。Goal 暂停授权检查优先于新自主工作接纳与续跑；未知会话归属对一般池门不猜、不借默认目录，放行须披露，不等于未知 goal 授权可放行。
 
-当前 `v2RegisterToolHooks` 已使用原生词表并接入会话定位、状态文件边界、原生目标池归属及工件过期预检；仍有旧 `task` 兼容分支，草稿侦察、crew 暂停/合规及完整顺序尚未迁完（6.1–6.8），不能把 before 放行当真实宿主成功。状态文件边界已在合成 v2 测试中覆盖直接 write/edit（主代理亦须经状态工具），读放行；未知锚不借用其他目录。
+当前 `v2RegisterToolHooks` 使用原生词表，接入会话定位、草稿侦察、状态文件边界、harness 分区、原生目标池归属、crew 暂停/合规与工件预检；旧派发兼容分支已退役。现态实现审查与历史先迁后删过程分开记账（tasks 1.16/5.2/9.3），不能把 before 放行当真实宿主成功。状态文件边界已在合成 v2 测试中覆盖直接 write/edit（主代理亦须经状态工具），读放行；未知锚不借用其他目录。
 
 草稿期目标合同：原生 shell 和写类工具禁用；仅显式 readonly、无写权限抬离、显式禁 shell 且实际宿主权限面和生成工件合格的工人可侦察。续用按本次指定代理判，不能以旧身份绕开；其他目标拒绝并列可派名册及批准/放弃出口。真实拒绝不建孩子、合格侦察完成并回报仍待探针 D 和 11.2。
 
@@ -85,7 +85,7 @@ Forge 是主代理及 Plan / Crew / Goal 文件契约的治理层，不再承担
 
 ## 尚未完成的宿主边界
 
-- **停止（D8）**：目标为命令执行体内、与模型配合无关的有限宿主停止能力，非 forge 会话也是合法入口。范围仅确认属于本会话原生派发的孩子及其后台命令；归属未知、部分枚举、失败不能扩围。请求与确认终态分列，不触碰其他会话、其他作业或用户排队消息，不删子会话。当前只有不可用披露，不能将目标合同当作可用操作；7.x 及 E/G 未完成。
+- **停止（D8）**：目标为命令执行体内、与模型配合无关的有限宿主停止能力，非 forge 会话也是合法入口。范围仅确认属于本会话原生派发的孩子及其后台命令；归属未知、部分枚举、失败不能扩围。请求与确认终态分列，不触碰其他会话、其他作业或用户排队消息，不删子会话。当前实现及最终实包局部停止 smoke 已有真实证据；7.x 与 E/G 的完整失效/归属/终态矩阵未全验，不从局部结果泛化。
 - **搜索（D9）**：目标是在宿主内建定义上保留原参数、输出 schema、授权及环境可用性约束的同名扩展，保留 follow/hidden 结果语义及去重/外部目标披露。实际外部链接目标须读取前获得原宿主授权，双引擎均须等价；无法证明则保持内建、不安装覆盖、不加别名。最终卸载恢复内建，8.x 与 F 未完成。
 - **停用/卸载（D10）**：最终采用宿主原生插件启停、删除旧私有 disable 判断；代理 disable 不等同于插件停用。停用不运行 Forge 注册/门/续跑/搜索扩展，宿主配置继续生效。落盘 workspace/global 工人及 general/explore override 是独立加载的宿主工件，可能仍有效但失去 Forge 门与注入保障；不自动改写、隐藏或删除，没有 marker 或所有权不明的文件须保留。Plan/Goal/Crew 历史及 forge.json 不因停用而删除。具体启停、作用域、多目录及恢复待 K/9.x/11.3 实证。
 

@@ -638,4 +638,18 @@ Candidate3 unknown check 正式局部签收（candidate3-goal-check-unknown.log�
 | 真实包 / 9.2 | 随后独立以内存只读 tarfile 检查 `candidate-tgz-20261126-230159-5041/sorenllm-opencode-forge-0.34.1.tgz`，确为上述四文件。包内 manifest：version=0.34.1，exports 仅 `.`→import `./dist/index.js` 与 `./schema.json`→`./dist/forge.schema.json`，无 ./server；engines.opencode=^2.0.0；description 点名 native worker agents、Plan/Goal/Crew，无作业监管/看门狗。tgz SHA-256=`35dcc7a294ec63d222e00be1aaf5e0324ad0194ee1e71dbcfde00e0894311a64`；包内 index hash 与上述 dist 相同；schema 顶层 jobs/watchdog/dispatch 缺席。凭真实包内容签收 9.2，不是仅凭 dry-run，更非发布或安装终验。 |
 | 残留 / 9.4 | 本次独立 `rg` 扫描 tests 的 `\bserver\s*\(` 与 `import.*\bserver\b` 均零命中；plugin.ts/src 的 `export const server|\.server\b|forgeDisabled|NATIVE_PARTITION_FALLBACKS` 零命中。结合本候选 747/747，仅签收 9.4 的静态残留及全量条件。 |
 
-任务裁定：本轮新增勾选 **9.2、9.4**。**1.16、9.3** 仍欠逐断言保留/迁移/退役映射、混合文件完整性及先迁后删顺序签收，全绿不能替代这些证据。**11.1** 可记冻结 candidate 最低门槛绿，但版本仍为 0.34.1，最终 0.35.0 尚未到位，保持未勾。**11.2–11.4** 以及发布、最终包 E2E、安装与用户验收均不据此勾选；既有 staged 局部宿主证据不升级为完整 GATE。未提交、push 或 archive。
+该历史快照任务裁定：当轮新增勾选 **9.2、9.4**；其余条件未因旧 candidate 全绿关闭。此处版本0.34.1、未提交/push/archive仅为快照时点，不代表当前发布/验收状态。
+
+## 2026-11-27 授权收尾最终汇总（已完成文档/OpenSpec收尾）
+
+用户明确批准正式归档 retire-plugin-runtime、删除两退役空壳、七份 Purpose/旧 task 工具语义清理、AGENTS 三 harness 简介、证据归位及汇总后合 main；不把历史未覆盖任务勾全。合 main/git 写由主控负责，本工人仅 OpenSpec/文档收尾。
+
+- 提交账（主控报告均已推）：`0742759`、`8d86fda`、`d4da0f2`。不为本汇总自身后续提交递归补 hash。
+- 质量及实包：本次发布最低门槛全量767/767、零 fail/cancelled/skipped/todo，typecheck/bundle/pack 通过；0.35.0 最终真实 tgz 的 Goal/双孩子 stop 局部 smoke 实际通过，非完整矩阵。tgz SHA-256=`5e2d45fb26e365dbc1a23793f28e3d4a8c7882d0ec19c7322d42ad029723e7b5`，shasum=`06fcc1f4e6e5aa3b0c2dde3f96606448385b97ce`；index SHA-256=`5798a04452b0cb003efd8cc020f2518aa3d9f936659b8153f85a6687e78dc941`。registry latest/本机均0.35.0，四文件与测试包同字节；核验主体及证据边界见上文发布凭据。用户明确「全部通过」关闭本次 owner 验收，不推断具体重启步骤，不改写历史JSON。
+- 证据归位：本工人独立 Read workspace `archive/2026-11-26-retire-plugin-runtime/evidence-relocation-20261126T193252339Z-f79ab1cf/summary.json`，Status=verified；sandbox333文件/116214328bytes/253目录，四旧tgz共941558bytes，manifest及目录match=true，源sandbox不存在、源tgz无残留。归位工人实施及主控独立核对，无删除按主控报告；本工人未重算全部文件hash。
+- 永久保留的限制：search/K完整矩阵受公开宿主访问边界阻塞，须公开合法隔离机制或用户授权完整discovery环境后针对同一最终产物补跑，不patch/委派绕行；stop/等待/权限/重启/多目录等未覆盖矩阵按 tasks各原条目补跑，双项目late是driver缺陷非权限D6；Token非零/聚合/迟到/重启/调用前硬限未证，不实现预算或虚称硬限。1.16/5.2/9.3先迁后删偏差不可逆，现态review关闭不抹去过程偏差。owner接受限制不等于全矩阵通过，不虚勾历史whole tasks。
+- 归档前复核：reviewer6bc最终PASS/0 blocker按主控转述；本工人独立核ADDED16/MODIFIED39/REMOVED57目标及208live场景标题保留、退役17/6精确全删、六依赖归档/三取消原件位置正确。OpenSpec1.13.0 status/apply root.path均为本仓库。正常archive --yes首次因零requirements硬拒绝，无文件改动；原始日志在workspace `archive/2026-11-26-retire-plugin-runtime/openspec-archive-20261127.log`。后续归档/严格校验结果按实际追加，不将初次拒绝写作成功。
+
+收尾最终结果：正常archive首次硬拒绝后，依CLI原生机制仅合并 .openspec.yaml 的 retire_capabilities:true，保留schema/created，不跳校验；重跑正常archive --yes成功，归档至 openspec/changes/archive/2026-11-27-retire-plugin-runtime/。两退役spec由CLI直接删除，实核目录/文件均不存在；没有人为制造空壳。+16/~39/-57与审查一致；49历史unfinished被CLI以--yes明确接受，未虚勾。第二次原始命令日志 openspec-archive-20261127-retire-capabilities.log 与首次失败日志均保留。七Purpose与AGENTS三harness/验证解释器链已更新，architecture即时状态已纠偏；tasks12.1–12.5完成，历史未验整项仍未勾。
+
+最终扫描分类：live case-insensitive独立task词36行，4场景标题（含 Pending crew refuses task dispatch / Task dispatches count as crew-turn activity，全部原样）、9旧permission键归一/历史迁移/明确禁止、23普通任务/编号/文件内容词；无现行旧task工具派发语义。旧forge_shell/jobs/grep/glob名字只留禁止注册/提示词负向合同，非可用工具。确认门watchdog不是退役进程watchdog。原始扫描 live-task-semantics-20261127.log 已归位。最终 openspec validate --specs --strict、--all --strict 实际各10 passed/0 failed，仅长requirement信息提示；两原始日志已存workspace证据根。本轮不运行测试/构建/宿主、不改生产源码/package/dist、不git写/merge/publish/install。合main留主控。

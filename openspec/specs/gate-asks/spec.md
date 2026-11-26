@@ -1,11 +1,7 @@
 # gate-asks Specification
 
 ## Purpose
-What happens to a plugin confirmation gate (plan_approve, plan_close,
-goal_write arm, goal_complete, goal_resume, goal_discard, crew_close) while
-it waits for the user: every gate is time-boxed by the plugin-side watchdog
-and resolves as a disclosed rejection when no answer arrives, so no session
-is left wedged on a dialog nobody answered.
+Preserve user adjudication for six confirmation doors (`plan_approve`, `goal_write` arm, `goal_complete`, `goal_resume`, `goal_discard`, `crew_close`), including specified goal-governed Crew exemptions. The independent confirmation watchdog rejects unanswered calls fail-closed unless disabled, never auto-approves and leaves late replies harmless. `plan_close` is non-modal and plugin-verified, not a confirmation door; the confirmation watchdog is not the retired process supervisor.
 
 ## Requirements
 
@@ -35,3 +31,18 @@ The six confirmation gates (plan_approve, goal_write arm, goal_complete, goal_re
 - **WHEN** the client replies to the stale dialog after the watchdog already refused the call
 - **THEN** the reply does not approve, mutate state, or affect the refused call
 - **AND** the refusal disclosure already delivered names the retry contract
+
+### Requirement: User-confirmation doors are never auto-resolved
+
+The user-confirmation doors — `plan_approve`, `goal_write (arm)`,
+`goal_complete`, `goal_resume`, `goal_discard`, `crew_close`, exactly the
+plugin's six `gate()` permission keys — SHALL NEVER be auto-resolved
+by the plugin on v2: each actually opened door (excluding both crew_close paths under an active governing goal; explicit deny stays deny) remains a real pending dialog until
+the user answers it, or, only when the watchdog is enabled (nonzero `FORGE_GATE_ASK_WATCHDOG_MS`), until the gate's own time-box (the requirement
+'Confirmation gates resolve fail-closed on watchdog timeout') resolves
+it as a disclosed rejection.
+
+#### Scenario: User-confirmation doors are never auto-resolved
+
+- **WHEN** a `plan_approve` / `goal_write (arm)` / `goal_complete` / `goal_resume` / `goal_discard` / `crew_close` confirmation door fires on v2
+- **THEN** the ask remains a real pending dialog until a user answer or, with watchdog enabled, disclosed fail-closed timeout; zero means no plugin timeout; no automatic allow is issued

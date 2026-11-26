@@ -1,18 +1,23 @@
 # forge-subagents Specification
 
 ## Purpose
-Static, forge.json-defined worker subagents for the forge agent: each definition is either pinned (a model + thoughtLevel atomic pair bound at materialization) or an Auto worker (neither field — the materialized agent carries no model key and inherits the parent session's model at dispatch, provider-default depth); a half-configured pair is rejected per entry. Every definition materializes as a native hidden-from-cycle subagent carrying the worker discipline and a shape-derived permission, and is dispatched through the host's native task tool — TUI-visible, with no plugin-side dispatch engine. The plugin reads user configuration and never writes it.
+Static, forge.json-defined worker subagents for the forge agent: each definition is either pinned (a model + thoughtLevel atomic pair bound at materialization) or an Auto worker (neither field — the materialized agent carries no model key and inherits the parent session's model at dispatch, provider-default depth); a half-configured pair is rejected per entry. Every definition materializes as a native hidden-from-cycle subagent carrying the worker discipline and a shape-derived permission, and is dispatched through the host's native `subagent` tool — TUI-visible, with no plugin-side dispatch engine. The host owns execution, message continuation and completion notifications; Forge retains session/target dispatch gates, native worker permissions and model/depth pinning. The plugin reads user configuration and never writes it.
 
 ## Requirements
 
 ### Requirement: Static agent definitions in a dedicated forge.json
 
-Subagents SHALL be configured in a dedicated `forge.json` (JSONC — comments allowed), resolved by an opencode-aligned two-layer merge: global `~/.config/opencode/forge.json` as the base layer, plus the NEAREST project `.opencode/forge.json` discovered by walking UP from the discovery anchor directory until the filesystem root (the first file found on the walk is the project layer; no deeper file is consulted); on a host initialized in multiple workspaces, every workspace pool the host has seen materializes as a namespaced family per the *Workspace pool ownership and global fallback* requirement. The anchor SHALL be the session-effective worktree where the plugin can observe one (tool-context worktree with the host launch directory as fallback), and the host anchor set for host-level materialization in the config hook. The two layers SHALL be MERGED, not replaced: the agent maps combine, and on agent-id collision the project definition replaces the global one for that id (per-agent precedence; there is never cross-layer field blending — an agent's definition comes wholly from one layer). The file SHALL define `agents` as a map of agent id to `{model?, thoughtLevel?, prompt?, shape?, permission?}` where the id is a plain role word matching `[a-z0-9-]`: the reserved `forge-` prefix SHALL be stripped from an id (all repetitions) with a warn finding naming the normalized id — the plugin materializes every id as `forge-<ns>-<id>` under its family's namespace, so a prefixed id would double up (`forge-coder` → agent `forge-<ns>-forge-coder`) — and an id that is empty after stripping SHALL be rejected as invalid; when two entries collide after normalization the later entry SHALL be skipped with an error finding (first definition wins). `model` and `thoughtLevel` form an atomic configuration pair: both absent defines an **Auto worker** — the materialized agent carries no `model` key and inherits the parent session's model through the host's native spawn behavior, with no depth injected (the provider default applies); both present defines a **pinned worker** — `model` is the exact `provider/model` identity pinned into the materialized agent and `thoughtLevel` is a pinned reasoning word (canonical `none|low|medium|high|max` or a native level name, verbatim); exactly one of the two present — in either direction, including `thoughtLevel` without `model` — makes the entry invalid: it SHALL be skipped with an error finding naming the agent id and the missing half, while its siblings still apply. A forge.json MAY also declare a top-level `pool` string — a short namespace (`[a-z0-9-]`, at most 24 characters) naming this file's family: EVERY family materializes namespaced (`forge-<ns>-<id>`), and when the field is absent the namespace derives from the file's directory name; an invalid value (wrong type, empty after trim, charset mismatch, or over length) SHALL degrade to a warn finding naming the file plus the directory-name fallback, and the family still materializes. The crew orchestration layer additionally requires a valid declared `pool` as a file-level compliance precondition for crew-governed dispatch (see the crew-harness capability's *Crew-governed dispatch pool-compliance gate*). The legacy `depths` array SHALL be ignored with a deprecation finding and SHALL NOT influence behavior. Configuration SHALL hot-apply: the plugin re-reads the files (mtime-cached) and re-runs the upward workspace-pool discovery at every config hook and every depth-injection lookup, so edits — and the appearance or removal of a project or pool file anywhere on an anchor's ancestor chain — take effect without a host restart. The plugin SHALL only ever READ these files — never create, write, or migrate them. When no forge.json exists in any layer or pool the unconfigured state SHALL be inert: no subagents registered, no errors raised, no AI-facing configuration recipe emitted; onboarding lives in the README for the human operator.
+Subagents SHALL be configured in a dedicated `forge.json` (JSONC — comments allowed), resolved by exclusive workspace ownership: walk UP from the session effective worktree to the owning `.opencode/forge.json`; nested files below the owning workspace do not participate. Global `~/.config/opencode/forge.json` supplies workers only if the workspace has no pool file; on a host initialized in multiple workspaces, every workspace pool the host has seen materializes as a namespaced family per the *Workspace pool ownership and global fallback* requirement. The anchor SHALL be the session-effective worktree where the plugin can observe one (tool-context worktree with the host launch directory as fallback), and the host anchor set — every directory the host has initialized — for host-wide pool discovery. The workspace pool SHALL be the entire session roster even when empty, unreadable or invalid; disclose findings, never fall back to global on a malformed existing pool. Only absence permits global fallback. Host materialization is the union of known workspace families and global, not a session roster. The independent global `override` entries are not pool workers. The file SHALL define `agents` as a map of agent id to `{model?, thoughtLevel?, prompt?, shape?, permission?}` where the id is a plain role word matching `[a-z0-9-]`: the reserved `forge-` prefix SHALL be stripped from an id (all repetitions) with a warn finding naming the normalized id — the plugin materializes every id as `forge-<ns>-<id>` under its family's namespace, so a prefixed id would double up (`forge-coder` → agent `forge-<ns>-forge-coder`) — and an id that is empty after stripping SHALL be rejected as invalid; when two entries collide after normalization the later entry SHALL be skipped with an error finding (first definition wins). `model` and `thoughtLevel` form an atomic configuration pair: both absent defines an **Auto worker** — the materialized agent carries no `model` key and inherits the parent session's model through the host's native spawn behavior, with no depth injected (the provider default applies); both present defines a **pinned worker** — `model` is the exact `provider/model` identity pinned into the materialized agent and `thoughtLevel` is a pinned reasoning word (canonical `none|low|medium|high|max` or a native level name, verbatim); exactly one of the two present — in either direction, including `thoughtLevel` without `model` — makes the entry invalid: it SHALL be skipped with an error finding naming the agent id and the missing half, while its siblings still apply. A forge.json MAY also declare a top-level `pool` string — a short namespace (`[a-z0-9-]`, at most 24 characters) naming this file's family: EVERY family materializes namespaced (`forge-<ns>-<id>`), and when the field is absent the workspace namespace derives from the file's directory name; global is fixed `global`; an invalid workspace namespace (wrong type, empty after trim, charset mismatch, or over length) SHALL degrade to a warn finding naming the file plus the directory-name fallback, and the family still materializes; the global namespace remains fixed. The crew orchestration layer additionally requires a valid declared `pool` as a file-level compliance precondition for workspace-pool crew-governed dispatch (see the crew-harness capability's *Crew-governed dispatch pool-compliance gate*). The legacy `depths` array SHALL be ignored with a deprecation finding and SHALL NOT influence behavior. Configuration SHALL hot-apply: the plugin re-reads the files (mtime-cached) and re-runs the upward workspace-pool discovery whenever it next resolves the roster and at every depth-injection lookup, so edits — and the appearance or removal of an owning workspace pool file — take effect without a host restart. The plugin SHALL only ever READ these files — never create, write, or migrate them. When no forge.json exists in any layer or pool the unconfigured state SHALL be inert: no subagents registered, no errors raised, no AI-facing configuration recipe emitted; onboarding lives in the README for the human operator.
 
 #### Scenario: Project file wins over global
 
 - **WHEN** both `~/.config/opencode/forge.json` (defining `research` and `review`) and a project `.opencode/forge.json` (defining `research` with a different definition) are loadable
-- **THEN** the layers MERGE: the effective set contains both `review` (wholly from the global layer) and `research` (wholly from the project layer — the project definition wins for that id, never field-blended)
+- **THEN** the workspace session roster contains only project `research`; global `review` remains in the host union but is not dispatchable from that session
+
+#### Scenario: Malformed or empty workspace pool does not inherit global workers
+
+- **WHEN** a workspace pool exists but is empty, malformed or unreadable while the global recipe contains workers
+- **THEN** the workspace roster remains exclusive, findings are disclosed as applicable, no global worker is substituted, and only actual pool absence enables global fallback
 
 #### Scenario: A forge--prefixed id is self-healed to its plain role word
 
@@ -22,12 +27,12 @@ Subagents SHALL be configured in a dedicated `forge.json` (JSONC — comments al
 #### Scenario: The project layer is discovered by walking up
 
 - **WHEN** the discovery anchor is `C:/work/repo/packages/app` and the only project file is `C:/work/repo/.opencode/forge.json`
-- **THEN** that file is the project layer (nearest on the ancestor chain wins); a `.opencode/forge.json` at any deeper level would take precedence over it, and no file above it on the chain is consulted once one is found
+- **THEN** that file owns the workspace roster; nested files below the owning workspace do not take precedence, and global does not merge
 
 #### Scenario: A session-visible anchor re-runs discovery where the plugin reads per session
 
 - **WHEN** `crew_begin` executes in a session whose effective worktree differs from the host launch directory
-- **THEN** the gate's guidance resolves the project-layer path from the session's anchor (walking up from it), and the load reflects that anchor's chain
+- **THEN** the gate's guidance resolves the project-layer path from the session's anchor (walking up from it), and the load reflects that owning workspace, not a deeper nested file or host launch directory
 
 #### Scenario: A pool field names the family's namespace
 
@@ -37,16 +42,16 @@ Subagents SHALL be configured in a dedicated `forge.json` (JSONC — comments al
 #### Scenario: An invalid pool field degrades to a finding plus the fallback
 
 - **WHEN** a forge.json declares `"pool": "Aa Team!"` (charset mismatch) or `"pool": 7` (wrong type)
-- **THEN** a warn finding names the file and the invalid value, and the family materializes under the directory-name-derived namespace instead — the family is never dropped for a bad `pool`
+- **THEN** a warn finding names the file and the invalid value, and the workspace family materializes under the directory-name-derived namespace instead (global remains fixed `global`) — the family is never dropped for a bad `pool`
 
 #### Scenario: Edits hot-apply without restart
 
-- **WHEN** the user edits a layer's `forge.json` on a running host — or creates/deletes a project file on an anchor's ancestor chain — and the next config hook or depth lookup fires
+- **WHEN** the user edits a layer's `forge.json` on a running host — or creates/deletes a project file on an anchor's ancestor chain — and the plugin next resolves the roster
 - **THEN** the materialized agent set and depth lookups reflect the new effective set; no host restart is required
 
 #### Scenario: The plugin never writes the file
 
-- **WHEN** any plugin lifecycle event occurs (load, config hook, chat.params, error)
+- **WHEN** any plugin lifecycle event occurs (load, setup, a tool call, chat.params, error)
 - **THEN** `forge.json` is only read; the plugin never generates, completes, or migrates it
 
 #### Scenario: Legacy depths field degrades to a finding
@@ -71,17 +76,17 @@ Subagents SHALL be configured in a dedicated `forge.json` (JSONC — comments al
 
 ### Requirement: Materialization as native subagents with a pinned model
 
-The config hook SHALL materialize each configured agent as a `mode: subagent` agent `forge-<ns>-<id>` (every family namespaced — plain-id materialization no longer exists) that is visible to the host's native `task` tool vocabulary (discoverable by the model, excluded from the Tab cycle by its subagent mode), a prompt composed of the worker discipline wrapped around the role prompt, and a deny-style permission: `shape: "readonly"` — which MUST be explicit — denies the full mutating-tool family — `write`, `edit`, `bash`, and the host's patch-family tools (`patch`, `applypatch`, `apply`, `multiedit`); `shape: "write"` allows them, and an ABSENT `shape` field SHALL default to `write` (open permissions — readonly is a restriction the pool author must ask for explicitly, never a surprise default); an explicit `permission` map overrides the shape-derived default — and every agent SHALL deny `task` regardless (recursive spawning stays physically impossible). A pinned entry's materialized agent SHALL carry the definition's pinned `model` (the brain is bound at materialization — there is no per-call model selection); an Auto entry's materialized agent SHALL carry no `model` key at all, deferring to the host's native spawn behavior — the parent session's current model binds at dispatch time (snapshot semantics: later primary model switches do not affect already-dispatched runs). The task-vocabulary description SHALL name the role and, for a pinned entry, the pinned brain; an Auto entry's description SHALL state that it inherits the parent session's model instead of claiming a pinned identity. Every description SHALL additionally name the agent's POOL PROVENANCE: its family namespace and origin forge.json path, and — for every family except the global fallback — that the agent is dispatchable only from sessions whose workspace pool is that file; the global fallback family's description names the global layer as its origin. The provenance line is static host-wide truth (per-family, not per-session): the dispatching model meets where an agent belongs before any dispatch gate fires. The worker discipline embedded in the prompt SHALL mandate workspace-relative paths only (never absolute paths outside the workspace), verbatim reporting of tool refusals instead of improvising workarounds, and conclusions carrying evidence references; readonly agents are additionally told to report rather than work around restrictions. Materialization SHALL be create-only: a user-defined entry of the same id is never touched (identically under the v2 `setup` entry point, which registers the same agents on a create-only basis). When `agent["forge"].disable` is set no subagents SHALL be registered.
+The plugin SHALL materialize each configured namespaced pool worker as a `mode: subagent` agent `forge-<ns>-<id>` (every family namespaced — plain-id materialization no longer exists) that is visible to the host's native `subagent` tool vocabulary (discoverable by the model, excluded from the Tab cycle by its subagent mode), a prompt composed of the worker discipline wrapped around the role prompt, and a deny-style permission: `shape: "readonly"` — which MUST be explicit — denies the mutating file-tool family — `write`, `edit`, and the host's patch-family tools (`patch`, `applypatch`, `apply`, `multiedit`) — while the builtin shell stays available, matching the host's own read-only `explore` agent — and the host's code-mode entry (`execute`) stays denied for the readonly shape, because the builtin shell is reachable through it where the host enables full code mode; `shape: "write"` allows them, and an ABSENT `shape` field SHALL default to `write` (open permissions — readonly is a restriction the pool author must ask for explicitly, never a surprise default); an explicit `permission` map overrides the shape-derived default — and every namespaced worker SHALL deny the host's dispatch action — `subagent` in the host's current vocabulary, onto which the host normalizes an older `task` key — regardless, so recursive spawning stays physically impossible. A pinned entry's materialized agent SHALL carry the definition's pinned `model` (the brain is bound at materialization; a `model` passed on the native call does not unpin it — see 'Runtime model pin on v2 hosts'); an Auto entry's materialized agent SHALL carry no `model` key at all, deferring to the host's native spawn behavior — the parent session's current model binds at dispatch time (snapshot semantics: later primary model switches do not affect already-dispatched runs). The subagent-vocabulary description SHALL name the role and, for a pinned entry, the pinned brain; an Auto entry's description SHALL state that it inherits the parent session's model instead of claiming a pinned identity. Every description SHALL additionally name the agent's POOL PROVENANCE: its family namespace and origin forge.json path, and — for every family except the global fallback — that the agent is dispatchable only from sessions whose workspace pool is that file; the global fallback family’s description names the global layer as its origin and limits dispatchability to sessions without a workspace pool. The provenance line is static host-wide truth (per-family, not per-session): the dispatching model meets where an agent belongs before the dispatch gate is consulted. The worker discipline embedded in the prompt SHALL mandate workspace-relative paths only (never absolute paths outside the workspace), verbatim reporting of tool refusals instead of improvising workarounds, and conclusions carrying evidence references; readonly agents are additionally told to report rather than work around restrictions. Materialization SHALL be create-only: a user-defined entry of the same id is never touched. When the host disables the plugin, Forge SHALL make no runtime agent registrations, materializations or sync writes; existing generated files are independently host-loaded and SHALL remain untouched, as specified in forge-agent 'One-knob return to native' and 'Uninstall self-healing'. Agent-level disablement is not plugin disablement.
 
 #### Scenario: Agent entries carry the pinned model
 
 - **WHEN** the plugin loads with a forge.json defining `research: {model: "prov/x", thoughtLevel: "low"}` and the injected agent set is inspected
-- **THEN** `forge-<ns>-research` is a subagent-mode agent whose `model` is exactly `prov/x`, listed for the native task tool, with a deny-style permission including `task: deny`
+- **THEN** `forge-<ns>-research` is a subagent-mode agent whose `model` is exactly `prov/x`, listed for the native subagent tool, with a deny-style permission including the dispatch denial
 
 #### Scenario: An Auto worker materializes without a model key
 
 - **WHEN** the plugin loads with a forge.json defining `scout: {}` (no `model`, no `thoughtLevel`, no `shape`) and the injected agent set is inspected
-- **THEN** `forge-<ns>-scout` is a subagent-mode agent with no `model` field, listed for the native task tool, with the same deny-style permission including `task: deny`, a description that names inheritance rather than a pinned identity — and, defining no `shape`, OPEN write permissions (the absent-shape default)
+- **THEN** `forge-<ns>-scout` is a subagent-mode agent with no `model` field, listed for the native subagent tool, with the same deny-style permission including the dispatch denial, a description that names inheritance rather than a pinned identity — and, defining no `shape`, OPEN write permissions (the absent-shape default)
 
 #### Scenario: The materialized prompt embeds the discipline
 
@@ -90,33 +95,33 @@ The config hook SHALL materialize each configured agent as a `mode: subagent` ag
 
 #### Scenario: The description carries pool provenance
 
-- **WHEN** the task-vocabulary description of a workspace pool's materialized `forge-<ns>-coder` is inspected (on any host, in any session)
-- **THEN** it names the namespace `<ns>`, the origin forge.json path of its family, and that it is dispatchable only from sessions whose workspace pool is that file; a global fallback family's description instead names the global layer as its origin — the same static text in every session
+- **WHEN** the subagent-vocabulary description of a workspace pool's materialized `forge-<ns>-coder` is inspected (on any host, in any session)
+- **THEN** it names the namespace `<ns>`, the origin forge.json path of its family, and that it is dispatchable only from sessions whose workspace pool is that file; a global fallback family’s description instead names the global layer as its origin and applies only to sessions without a workspace pool — the same static text in every session
 
 #### Scenario: The readonly deny face covers the patch family
 
 - **WHEN** an agent with an EXPLICIT `shape: "readonly"` has its materialized permission enumerated
-- **THEN** `patch`, `applypatch`, `apply`, and `multiedit` are denied alongside `write`, `edit`, and `bash`, and `task` stays denied for every shape; the same family governs the draft-phase shape gate's lifting test (a permission override that lifts any of them out of `deny` disqualifies the readonly exemption)
+- **THEN** `patch`, `applypatch`, `apply`, and `multiedit` are denied alongside `write` and `edit` (the builtin shell is not part of the deny face), the code-mode entry stays denied, and dispatch stays denied for every shape. The draft-phase dispatch gate is stricter than this face (see 'Workers are not dispatched while a plan draft is active'): there a permission override that lifts a file-mutating tool out of `deny` disqualifies the readonly exemption, and so does a shell left available to the worker
 
 #### Scenario: An absent shape defaults to open permissions
 
 - **WHEN** a pool defines `ta-tool: {model: "prov/x"}` with NO `shape` field and the materialized permission is inspected
-- **THEN** the mutating-tool family is not denied (open write permissions), `task` stays denied — and the draft-phase recon exemption does NOT apply to this agent (the exemption keys on an explicitly readonly shape; a shape-less agent is not draft-exempt)
+- **THEN** the mutating-tool family is not denied (open write permissions), dispatch stays denied — and the draft-phase recon exemption does NOT apply to this agent (the exemption keys on an explicitly readonly shape; a shape-less agent is not draft-exempt)
 
 #### Scenario: A permission override keeps the recursion ban
 
-- **WHEN** an agent sets `permission: {"bash": "deny"}` with `shape: "write"`
-- **THEN** the materialized permission honors the override and still carries `task: deny`
+- **WHEN** an agent sets `permission: {"shell": "deny"}` with `shape: "write"`
+- **THEN** the materialized permission honors the override and still denies dispatch
 
 #### Scenario: A user-defined agent entry is never clobbered
 
-- **WHEN** the user has their own `agent["forge-<ns>-research"]` configuration (v1 or v2 loader)
+- **WHEN** the user has their own `agent["forge-<ns>-research"]` configuration
 - **THEN** the plugin skips injection for that id and the user's entry stands
 
 #### Scenario: The disable knob registers nothing
 
-- **WHEN** `agent["forge"].disable: true` is set
-- **THEN** no `forge-*` subagents are registered alongside the other plugin silences
+- **WHEN** the host's native plugin disable mechanism is applied to Forge and the host restarts
+- **THEN** Forge registers no runtime subagents and makes no generated-file writes; any previously generated or hand-written Markdown remains separate host-managed agent data, and the plugin provides no runtime dispatch gates or model injections
 
 ### Requirement: Pinned thoughtLevel injection keyed by agent name
 
@@ -164,7 +169,7 @@ For any session running a `forge-<id>` agent, the plugin SHALL translate that ag
 
 ### Requirement: Field-level fail-soft validation
 
-forge.json parsing SHALL degrade semantically invalid content at the smallest enclosing level rather than discarding more than necessary: a syntactically broken document (invalid JSONC) yields an EMPTY agent set **for its own layer only** plus an error finding carrying the parse location, while the other layer still applies; an agent entry whose `model`/`thoughtLevel` pair is half-configured — exactly one of the two present after field-type normalization, in either direction, or a present `model`/`thoughtLevel` of the wrong type — is skipped with an error finding while its siblings still apply. Findings from every consulted layer SHALL be surfaced through the plugin's diagnostics channel and never silently swallowed; no fallback seed agents exist in any failure path.
+forge.json parsing SHALL degrade semantically invalid content at the smallest enclosing level rather than discarding more than necessary: a syntactically broken document (invalid JSONC) yields an EMPTY agent set **for its own family only** plus an error finding carrying the parse location. Other valid families remain independently materialized in the host-wide union, but a session with an existing broken workspace pool gets an empty dispatch roster and SHALL NOT fall back to the global family; only absence of an owning workspace pool permits that fallback (see 'Workspace pool ownership and global fallback'). An agent entry whose `model`/`thoughtLevel` pair is half-configured — exactly one of the two present after field-type normalization, in either direction, or a present `model`/`thoughtLevel` of the wrong type — is skipped with an error finding while its siblings still apply. Findings from every consulted family SHALL be surfaced through the plugin's diagnostics channel and never silently swallowed; no fallback seed agents exist in any failure path.
 
 #### Scenario: One bad entry does not disable its siblings
 
@@ -173,8 +178,8 @@ forge.json parsing SHALL degrade semantically invalid content at the smallest en
 
 #### Scenario: Broken JSON empties the set with an error finding
 
-- **WHEN** a layer's forge.json fails JSONC parsing
-- **THEN** that layer contributes no agents and an error finding carries the parse location; the other layer still applies (a broken project file over a valid global file leaves the global agents in effect), with no other layer present the effective set is empty — the built-in seed is never resurrected in any case
+- **WHEN** a family's forge.json fails JSONC parsing
+- **THEN** that family contributes no agents and an error finding carries the parse location; other valid families remain materialized independently, but a session owning the broken workspace pool has an empty dispatch roster even when a valid global recipe exists; the built-in seed is never resurrected
 
 #### Scenario: A mistyped optional field costs only itself
 
@@ -183,7 +188,7 @@ forge.json parsing SHALL degrade semantically invalid content at the smallest en
 
 ### Requirement: Workspace pool ownership and global fallback
 
-WORKSPACE pool — the nearest `.opencode/forge.json` discovered by walking up from the session's effective worktree — plus the global layer (`~/.config/opencode/forge.json`) as a FALLBACK ONLY: when the workspace has a pool file, the global layer is NOT consulted for that session's dispatch roster (the workspace pool is the whole roster — fallback, not merge); when the workspace has none, the global layer serves as the whole roster. `forge.json` files nested DEEPER in the workspace's subtree (any directory below the owning one) SHALL be ignored entirely — the same workspace-ownership strictness as the host's native MCP config; a git checkout or subfolder carrying its own forge.json does not split or extend the pool. On a host where multiple workspaces' pools have been materialized, the plugin's task-dispatch guard SHALL scope dispatch SESSION-LOCALLY: a task call targeting an agent whose pool belongs to ANOTHER workspace SHALL be refused with a finding that names the target's origin pool path, states it is not dispatchable from this session, and names the exits (open a session in that workspace, or configure the role into this workspace's pool or the global layer). For that guard the session's workspace anchor SHALL be resolved from the host's AUTHORITATIVE session record (`client.session.get`, `effectiveWorktree(worktree, directory)`) whenever the record can be fetched — the plugin's in-memory session map serves as the anchor source ONLY when that fetch fails or is unavailable (no client, API error, or missing record); this ordering exists because the in-memory map has degenerate writers (resumed-after-restart sessions never re-fire `session.created`; some tool-context shapes degenerate to the host launch directory), and a session bound to a pool-less anchor by such a writer would otherwise lose its OWN pool's dispatch rights. The MIRROR degeneration is resolved symmetrically: when the authoritative record yields a valid but POOL-LESS anchor (a resumed-after-restart session re-bound to a new launch directory) while the in-memory binding — kept fresh by the session's own live activity — is a DIFFERENT non-degenerate worktree that OWNS a pool file, the POOLED in-memory binding SHALL win that resolution, with ONE bounded disclosure per session recording the substitution; in every other shape the authoritative record keeps its precedence. The BOTH-DEGENERATE shape — an in-memory binding that is EMPTY (a restart-resumed session before any live activity in the new host life) plus an authoritative record re-bound to a pool-less anchor — is resolved by a PERSISTED SESSION-ANCHOR LEDGER: the plugin maintains a namespaced, bounded JSONL ledger (`<os-tmp>/opencode-forge/session-anchors.jsonl`) mapping session ids to the pooled worktrees where live activity bound them, written ONLY when a bind lands on a worktree owning a pool file (positive evidence of a real pooled binding), deduplicated per session (the last entry wins) and FIFO-capped (compacted to the latest entry per session on overflow), with every ledger read/write failure FAIL-SOFT — resolution degrades to the chain below and dispatch is never blocked by ledger IO. When the chain above yields an anchor that owns NO pool, the guard SHALL consult the ledger; a hit whose worktree still OWNS a pool file on disk (verified at resolution time — a deleted pool file keeps the disappears-from-materialization semantics) SHALL re-bind the session (seeding the in-memory map under the non-degenerate-refinement rule), ALLOW own-pool dispatch, and disclose the re-bind once per session; a cross-pool target from that session remains refused. In that in-memory map, a degenerate anchor (empty or filesystem-root) SHALL never overwrite an existing non-degenerate binding; non-degenerate refinement (session.created seed corrected by a later tool-context binding) keeps today's overwrite semantics. The crew compliance gate resolves its session anchor through the same authoritative-first chain (pooled preference included). EVERY family materializes namespaced: each workspace pool under its declared `pool` namespace (failing that, the sanitized pool-directory basename), and the global fallback layer under the fixed namespace `global` (`forge-global-<id>`) — NO family receives plain ids, so a materialized id is identical on every host regardless of the order workspaces were initialized in. Pool resolution order SHALL be deterministic — families ordered lexicographically by absolute pool-file path — and a cross-family materialized-id collision SHALL resolve in that order: the earlier pool's agent wins, the colliding later agent is skipped with an error finding naming both files. The host-wide materialization set is the union of the global layer and every workspace pool the host has seen (hot-applied per the existing mtime contract; there is no append-only anchor set — a pool file deleted from disk disappears from materialization). Sessions whose workspace cannot be observed (unknown anchor — no in-memory binding AND no authoritative record) keep the existing fail-open belt posture with a disclosure.
+WORKSPACE pool — the nearest `.opencode/forge.json` discovered by walking up from the session's effective worktree — plus the global layer (`~/.config/opencode/forge.json`) as a FALLBACK ONLY: when the workspace has a pool file (including malformed, unreadable or empty), the global layer is NOT consulted for that session's dispatch roster (the workspace pool is the whole roster — fallback, not merge); when the workspace has none, the global layer serves as the whole roster. `forge.json` files nested DEEPER in the workspace's subtree (any directory below the owning one) SHALL be ignored entirely — the same workspace-ownership strictness as the host's native MCP config; a git checkout or subfolder carrying its own forge.json does not split or extend the pool. On a host where multiple workspaces' pools have been materialized, the plugin's dispatch gate (the tool-execute interception belt) SHALL scope dispatch SESSION-LOCALLY: a native `subagent` call targeting a namespaced worker outside that session’s exclusive roster (including global workers in a pooled workspace) SHALL be refused with a finding that names the target's origin pool path, states it is not dispatchable from this session, and names the exits (open a session in that workspace, or configure the role into this workspace's pool or the global layer). For that guard the session's workspace anchor SHALL be resolved from the host's AUTHORITATIVE session record (`client.session.get`, `effectiveWorktree(worktree, directory)`) whenever the record can be fetched — the plugin's in-memory session map serves as the anchor source ONLY when that fetch fails or is unavailable (no client, API error, or missing record); this ordering exists because the in-memory map has degenerate writers (resumed-after-restart sessions never re-fire `session.created`; some tool-context shapes degenerate to the host launch directory), and a session bound to a pool-less anchor by such a writer would otherwise lose its OWN pool's dispatch rights. The MIRROR degeneration is resolved symmetrically: when the authoritative record yields a valid but POOL-LESS anchor (a resumed-after-restart session re-bound to a new launch directory) while the in-memory binding — kept fresh by the session's own live activity — is a DIFFERENT non-degenerate worktree that OWNS a pool file, the POOLED in-memory binding SHALL win that resolution, with ONE bounded disclosure per session recording the substitution; in every other shape the authoritative record keeps its precedence. The BOTH-DEGENERATE shape — an in-memory binding that is EMPTY (a restart-resumed session before any live activity in the new host life) plus an authoritative record re-bound to a pool-less anchor — is resolved by a PERSISTED SESSION-ANCHOR LEDGER: the plugin maintains a namespaced, bounded JSONL ledger (`<os-tmp>/opencode-forge/session-anchors.jsonl`) mapping session ids to the pooled worktrees where live activity bound them, written ONLY when a bind lands on a worktree owning a pool file (positive evidence of a real pooled binding), deduplicated per session (the last entry wins) and FIFO-capped (compacted to the latest entry per session on overflow), with every ledger read/write failure FAIL-SOFT — resolution degrades to the chain below and dispatch is never blocked by ledger IO. When the chain above yields an anchor that owns NO pool, the guard SHALL consult the ledger; a hit whose worktree still OWNS a pool file on disk (verified at resolution time — a deleted pool file keeps the disappears-from-materialization semantics) SHALL re-bind the session (seeding the in-memory map under the non-degenerate-refinement rule), ALLOW own-pool dispatch, and disclose the re-bind once per session; a cross-pool target from that session remains refused. In that in-memory map, a degenerate anchor (empty or filesystem-root) SHALL never overwrite an existing non-degenerate binding; non-degenerate refinement (session.created seed corrected by a later tool-context binding) keeps today's overwrite semantics. The crew compliance gate resolves its session anchor through the same authoritative-first chain (pooled preference included). EVERY family materializes namespaced: each workspace pool under its declared `pool` namespace (failing that, the sanitized pool-directory basename), and the global fallback layer under the fixed namespace `global` (`forge-global-<id>`) — NO family receives plain ids, so a materialized id is identical on every host regardless of the order workspaces were initialized in. Pool resolution order SHALL be deterministic — families ordered lexicographically by absolute pool-file path — and a cross-family materialized-id collision SHALL resolve in that order: the earlier pool's agent wins, the colliding later agent is skipped with an error finding naming both files. Host materialization is visibility only, never session permission or qualification; the per-session roster remains exclusive. The host-wide materialization set is the union of the global layer and every workspace pool the host has seen (hot-applied per the existing mtime contract; there is no append-only anchor set — a pool file deleted from disk disappears from materialization). Sessions whose workspace cannot be observed (unknown anchor — no in-memory binding AND no authoritative record) keep the existing fail-open belt posture with a disclosure.
 
 #### Scenario: The workspace pool is the whole roster
 
@@ -202,7 +207,7 @@ WORKSPACE pool — the nearest `.opencode/forge.json` discovered by walking up f
 
 #### Scenario: Cross-workspace dispatch is refused with exits
 
-- **WHEN** a session in workspace A dispatches a task targeting `forge-<nsB>-coder`, whose pool origin is workspace B's forge.json
+- **WHEN** a session in workspace A calls the host's native `subagent` tool targeting `forge-<nsB>-coder`, whose pool origin is workspace B's forge.json
 - **THEN** the dispatch is refused; the finding names workspace B's forge.json path, states it is not dispatchable from this session, and lists the exits (open a session in workspace B, or configure the role into this workspace's pool / the global layer)
 
 #### Scenario: Own-pool dispatch survives a degraded in-memory binding
@@ -233,7 +238,7 @@ WORKSPACE pool — the nearest `.opencode/forge.json` discovered by walking up f
 #### Scenario: Same-id agents across workspaces stay collision-free
 
 - **WHEN** two workspaces' pools both define a `coder` agent and both are materialized on one host
-- **THEN** each materializes under its own family's namespace — `forge-<nsA>-coder` and `forge-<nsB>-coder` — no silent overwrite and no plain-id privilege for either; the session-local dispatch guard is the authority on which one a given session may call
+- **THEN** each materializes under its own family's namespace — `forge-<nsA>-coder` and `forge-<nsB>-coder` — no silent overwrite and no plain-id privilege for either; the dispatch gate (see 'The native subagent tool is the only dispatch surface') is the authority on which one a given session may call
 
 #### Scenario: Materialized ids are host-history-independent
 
@@ -247,12 +252,12 @@ WORKSPACE pool — the nearest `.opencode/forge.json` discovered by walking up f
 
 #### Scenario: Pool deletion un-materializes
 
-- **WHEN** a workspace's forge.json is deleted from disk and the next config hook runs
+- **WHEN** a workspace's forge.json is deleted from disk and the plugin next resolves the roster
 - **THEN** its agents disappear from the host's materialization set (no append-only residue) and sessions in that workspace fall back to the global layer if one exists
 
 #### Scenario: Unknown session anchor keeps the fail-open belt
 
-- **WHEN** a task-dispatching session's workspace cannot be observed
+- **WHEN** a session calling the native `subagent` tool has a workspace that cannot be observed
 - **THEN** the existing fail-open belt posture applies, with a disclosure that the session's pool ownership could not be established
 
 ### Requirement: Pool-level shared prompt segment
@@ -288,326 +293,6 @@ A pool's forge.json MAY declare an optional top-level `shared` field — a strin
 
 - **WHEN** no pool file (workspace or global) declares `shared`
 - **THEN** every materialized prompt is byte-identical to the pre-change build, and no finding is recorded
-
-### Requirement: Task shadow surface (native name, forge engine)
-
-The plugin SHALL register its dispatch implementation under the tool name `task`, shadowing the native task tool host-wide, so the TUI drives its native task rendering (the live subagent panel) for forge dispatches. The tool SHALL accept `description`, `prompt`, `subagent_type`, and `run_in_background` and SHALL dispatch ANY materialized target agent via SDK child sessions (child creation with `parentID`, the target agent id, the parent's session directory — resolved from the authoritative session anchor — and the native-parity title): forge-* targets pass the forge dispatch gates (session-domain pool gate with the `not dispatchable from this session` finding, crew pending and pool-compliance belts); non-forge host targets dispatch through the same engine without the forge pool gate — the crew pending belt stays SESSION-keyed (it refuses ANY `task` call per the crew-harness pause semantics, target class notwithstanding) while the pool-compliance belt stays forge-*-keyed. Child-session creation SHALL resolve the ACTUAL client surface on the host with guarded shape probing (the literal `client.session.create` seam is a pre-2.3.2 shape; on hosts where the seam moved or is absent, the tool SHALL adapt to the host's exposed create surface), and when NO create seam is resolvable on the host, the tool SHALL return an honest degradation error naming the native task tool as the available dispatch surface — never a raw TypeError. Child sessions carry tool-part metadata mirroring the native shape (`agent`, `sessionId`, `taskId`, `run_in_background`, `description`, `prompt`). Question policy is mode-keyed: sync dispatches keep questions available (native parity); async (`run_in_background: true`) dispatches create the child with the question tool denied session-wide. Sync dispatches SHALL abort the child when the dispatching turn is aborted; async children survive turn aborts and die at session death. The `forge_dispatch` tool SHALL NOT be registered.
-
-#### Scenario: A forge dispatch renders in the native task panel
-
-- **WHEN** the forge primary dispatches `task {subagent_type: "forge-plugindev-coder", description: "...", prompt: ...}` and the user opens the transcript in the TUI
-- **THEN** the call is rendered by the native task panel (live block keyed on the `task` tool name with the child session linked via metadata), indistinguishable in shape from a native dispatch
-
-#### Scenario: Non-forge targets keep native dispatch parity
-
-- **WHEN** a non-forge agent dispatches `task` to a host agent target (not a forge-* agent)
-- **THEN** the same SDK child-session engine serves the call without the forge pool gate — the child runs the target agent and the result returns to the dispatcher as the native task tool would
-
-#### Scenario: Question policy is mode-keyed
-
-- **WHEN** a sync dispatch runs, its child may ask the user questions (native parity); WHEN an async dispatch runs, its child session is created with the question tool denied session-wide and proceeds without blocking on human input
-
-#### Scenario: Sync abort parity
-
-- **WHEN** the dispatching turn is aborted while a sync dispatch is in flight
-- **THEN** the child session is aborted via the SDK, and the tool call resolves with the abort disclosed
-
-#### Scenario: forge_dispatch is retired
-
-- **WHEN** the plugin's tool registrations are enumerated
-- **THEN** no `forge_dispatch` tool exists; `task` is the single dispatch surface
-
-#### Scenario: A moved child-creation seam adapts by probing
-
-- **WHEN** the host's client exposes child-session creation under a different receiver or method name than the pre-2.3.2 shape
-- **THEN** the guarded probe finds the exposed create surface and dispatch proceeds through it, with the parent's directory resolved from the authoritative session anchor
-
-#### Scenario: An absent create seam degrades honestly
-
-- **WHEN** the host's client surface exposes no resolvable child-session creation seam
-- **THEN** the task tool returns the contract degradation error naming the native task tool as the dispatch surface (exact string, no raw TypeError), and the native task tool remains fully functional for the same dispatch
-
-### Requirement: Dispatch lifecycle (wake, cap, harvest)
-
-The async dispatch lifecycle carries over from async-dispatch unchanged
-and now attaches to the `task` surface: `run_in_background: true` SHALL
-return a task handle immediately (task id, agent identity, child session
-id) and deliver at most ONE completion wake carrying the child's final
-assistant message (bounded 2500-character tail) following the
-job-supervisor completion-wake discipline (idle-only injection,
-at-most-once, delivery window with ledger overflow). Interim
-`[forge:dispatch-progress]` notices are informational, delivered
-idle-only, and never consume that budget. The plugin SHALL
-cap concurrent running async dispatches per session (default 3); beyond
-the cap, an async dispatch SHALL enter a per-session FIFO queue (bounded,
-default 10) instead of failing — the call SHALL return a queued handle
-immediately (metadata marking it queued until it spawns) and the child
-SHALL be spawned when a slot frees — any terminal transition of that
-session's dispatches frees a slot, a kill settle included, so a cancelled
-dispatch releases its slot to the queued head — with a
-`[forge:dispatch-progress]` notice announcing the queued wish's start; the
-checks re-evaluated at spawn time
-are the target roster, the draft gate, and the crew belt (a tightening
-between call and spawn fails the wish as an honest error wake, never
-silently); beyond the queue bound the call SHALL be refused with the
-in-flight and queued task ids and guidance. When a
-dispatching session ends, its live async dispatches SHALL be aborted and
-recorded in the diagnostics ledger, and its queued wishes SHALL be
-flushed without spawning — the flush SHALL terminalize the journal
-records of those queued wishes. A sync dispatch whose child never
-reaches a terminal state within the poll timeout SHALL return an honest
-timeout finding naming the child session id (natively inspectable and
-abortable) — and SHALL arm the standard completion tracking (dispatch
-registry entry + completion poller) for the already-running child before
-returning, so exactly one `[forge:dispatch-complete]` wake carries the
-child's final report when it eventually completes; the arming bypasses
-the async concurrency cap (the cap governs new async dispatch decisions,
-not an already-running child), and the timeout finding SHALL disclose
-the armed wake. The poll timeout SHALL default to 600000 ms and SHALL
-be tunable via the `FORGE_DISPATCH_POLL_TIMEOUT_MS` environment
-variable; it scopes the SYNC WAIT only. The completion tracker SHALL
-NOT terminate on any wall-clock deadline measured from dispatch:
-while the child is running (active in the status map) the poller SHALL
-keep polling indefinitely — the sole clock-based termination of a running
-child is the activity-stale reap specified under "Dispatch resilience" — and past
-the notification interval (default
-600000 ms, tunable via `FORGE_DISPATCH_NOTIFY_INTERVAL_MS`) it SHALL
-emit non-terminal `[forge:dispatch-progress]` notices — informational
-only, delivered idle-only, never consuming the completion wake budget;
-the single `[forge:dispatch-complete]` wake carrying the final report
-SHALL arrive at true terminal regardless of duration or how close
-completion falls to an interval boundary. A child that stays
-continuously not-active (missing from the map) across a full
-notification interval while its latest finished assistant message
-lacks a truthy `finish` or non-empty text SHALL terminate honestly as
-a no-reportable-final-message finding naming the child session id; any
-busy reading resets that streak, so a running child is never
-terminated by it; a registry kill (an owner-session end, the user cancel
-lever, or the explicit kill of a dispatch row through the job lever)
-stops the watch at its next kill check — at a slice top, before a
-consumed signal, after every poll, and once more before the exit settle
-— and the kill verdict outranks any verdict the watch observed: the
-dispatch is journaled and surfaced as aborted, never as `error` or
-`completed`, and never feeds the provider breaker as a failure. A
-plugin-instance dispose is not a registry-kill trigger (specified under
-"Dispatch rows survive plugin-instance disposal"). The sync-armed poller
-shares the tracker and inherits never-die tracking. Terminal
-inference SHALL be sound against unreadable readings: a status
-fetch failure SHALL be treated as active (keep polling — never a
-terminal verdict on a signal that could not be read); a session MISSING
-from a successfully fetched status map is the host's idle signal (the
-map lists only currently-active sessions — a completed session is
-removed) and counts as not-active; a completed
-verdict SHALL require the not-active + finished-latest-assistant
-condition to hold stable across consecutive poll ticks (resetting when
-the session turns busy again — which also self-heals transient flakes
-where a running child blinks out of the map for a tick or two), and the
-finished message SHALL carry a
-truthy `finish` and non-empty text parts, otherwise the poller SHALL
-keep polling; the async wake path shares the poller and inherits the same
-soundness.
-The plan-draft interop is unchanged: during an active draft, a dispatch
-to an effective-readonly forge target passes as a reconnaissance
-dispatch in either mode, and write targets are refused by the same
-write-class deny as before, in either mode. Activity-stale reaping,
-error-classified retry, and restart recovery are specified under
-"Dispatch resilience".
-
-#### Scenario: Async handle and single completion wake
-
-- **WHEN** the model dispatches `task` with `run_in_background: true` and the owning session later idles
-- **THEN** the call returns a handle immediately and exactly one wake message with the child's final message is injected into the session (interim `[forge:dispatch-progress]` notices may precede it; they are informational and never replace it)
-
-#### Scenario: Long child keeps tracking past the notification interval
-
-- **WHEN** an async child runs past the notification interval and reaches a textful terminal state later
-- **THEN** non-terminal `[forge:dispatch-progress]` notices arrive while it runs, and the single `[forge:dispatch-complete]` wake carrying the final report still arrives when it completes — however long it runs or how close completion falls to an interval boundary
-
-#### Scenario: Textless idle child terminates honestly
-
-- **WHEN** a child stays continuously not-active (missing from the status map) across a full notification interval while its latest finished assistant message lacks a truthy `finish` or non-empty text
-- **THEN** the tracker terminates with an honest no-reportable-final-message finding naming the child session id, and a busy reading within the window resets the streak so a running child is never terminated
-
-#### Scenario: Concurrency cap
-
-- **WHEN** a session already has the cap of async dispatches running and dispatches async again within the queue bound
-- **THEN** the call returns a queued handle immediately, the wish spawns automatically when a slot frees with a progress notice announcing its start (roster, draft gate, and crew belt re-checked at spawn), and only a wish beyond the queue bound is refused with the in-flight and queued task ids and guidance
-
-#### Scenario: Owner death harvests children
-
-- **WHEN** a session with live async dispatches is deleted
-- **THEN** each running child session is aborted via the SDK, the orphans are recorded in the diagnostics ledger, the session's queued wishes are flushed without spawning, and the queued wishes' journal records are terminalized
-
-#### Scenario: Sync timeout is honest
-
-- **WHEN** a sync dispatch's child does not reach a terminal state within the poll timeout
-- **THEN** the tool returns a timeout finding naming the child session id rather than hanging, the finding discloses the armed wake, the child is registered for completion tracking bypassing the async cap, and exactly one `[forge:dispatch-complete]` wake carrying the child's final report arrives when the child later completes
-
-#### Scenario: Status fetch failure never terminates
-
-- **WHEN** a status fetch fails (unreadable) while the child has a finished assistant message
-- **THEN** the poller treats the reading as active, keeps polling, and does not declare completion or error on that observation
-
-#### Scenario: Missing-from-map is the idle signal, flakes self-heal
-
-- **WHEN** a session is missing from a successfully fetched status map (the host lists only currently-active sessions, so missing = not-active) — either because it completed or because a running child transiently blinked out during a server flake
-- **THEN** the reading counts toward the stability run; if the child re-appears busy within the window the run resets (a flake can never reach depth on a stale receipt), and a genuinely completed child reaches the depth stably and completes
-
-#### Scenario: Receipt-only messages are not final reports
-
-- **WHEN** the child's latest assistant message is a finished acknowledgement but the session turns busy again (still working) within the stability window
-- **THEN** the stability requirement resets and the poller keeps polling; a completed verdict requires the condition to hold stable across consecutive ticks with a truthy finish and non-empty text parts on the latest assistant message
-
-#### Scenario: Draft interop unchanged
-
-- **WHEN** the dispatching session has an active draft plan
-- **THEN** an effective-readonly forge target passes in either mode and write targets are refused in either mode — identical outcomes to the pre-shadow gates
-
-#### Scenario: A kill outranks the verdict the watch observed
-
-- **WHEN** a dispatch row is killed (owner-session end, the cancel lever, or an explicit kill) and the abort makes the child surface afterwards as a host `session.execution.failed` verdict or as a finished-looking transcript that the watch reads
-- **THEN** the dispatch is journaled and surfaced as aborted with the killer's reason — never as an error that feeds the dispatch breaker, never as a completion — and the slot it held is pumped to the session's queued head like any other terminal transition
-
-### Requirement: Dispatch resilience (stale reap, retry, restart recovery)
-
-A running dispatch child that produces no activity for
-`FORGE_DISPATCH_STALE_MS` (default 2700000 ms = 45 min) past a 60-second
-minimum-runtime floor SHALL be reaped. The activity anchor is the child's
-`session.get` `time.updated` timestamp (part-level updates — a child
-streaming one long generation still refreshes it); when no message has
-ever arrived, the anchor is the dispatch start time. Before acting, the
-reaper SHALL re-read `session.get`: a refreshed timestamp resets the
-timer (a child that is actually producing can never be reaped), and the
-same call doubles as the existence probe (status unresolved → skip this
-sweep, session missing → finalize). The reap SHALL abort the child via
-the SDK and deliver exactly one honest terminal wake (`stale: aborted
-after N min without activity`); if the abort call fails and the session
-still exists, the reaper SHALL skip this sweep and re-arm — finalization
-happens only when existence proves the session gone.
-`FORGE_DISPATCH_STALE_MODE` SHALL support `kill` (default) and `observe`
-(one progress notice per threshold crossing, no kill). A child that
-terminates in a RETRYABLE error — the transient transport/5xx/overload/
-rate-limit error patterns — SHALL be respawned automatically: same agent,
-original prompt plus a resume preamble instructing the new child to
-inspect the current workspace state before acting and continue the work
-rather than redo it; `FORGE_DISPATCH_MAX_ATTEMPTS` SHALL bound total
-attempts (default 2), with a fixed 10 s backoff between attempts; the
-retry inherits the dying child's registry slot (no queue re-entry) and
-re-applies the dispatch-time policies (draft/crew mode-keyed denies);
-each attempt is surfaced as a `[forge:dispatch-progress]` notice and the
-final wake SHALL disclose the number of attempts; exactly one terminal
-wake still. Deterministic terminal error classes — the provider-
-configuration, auth, model-not-supported, and contract error patterns —
-SHALL never be retried; unknown error classes SHALL never be retried;
-stale kills, user aborts, and textless-idle floor findings SHALL never
-be retried. Every dispatch record SHALL be appended to a bounded
-workspace journal (`.opencode/forge/dispatch-log.jsonl`, bounded at
-`FORGE_DISPATCH_JOURNAL_MAX` records, default 200) on every state
-transition (dispatched, queued, started, retry-pending, terminal); a
-corrupt journal line SHALL be tolerated (skipped) without aborting
-recovery; rotation SHALL compact terminal records only and SHALL never
-remove a non-terminal record; the original prompt SHALL be retained
-while a record is non-terminal (the journal is the only prompt source
-after a restart) and SHALL be redacted when the record terminates. On plugin
-init, non-terminal records SHALL be recovered per state, scoped to the
-launch-anchor workspace at init and lazily per workspace on its first
-session: a `running` record's child still alive → registry row and
-poller re-armed; finished while the host was down → final message
-fetched and the completion wake delivered; child gone → honest terminal.
-A `queued` record → re-entered into the queue when the owner session
-still resolves, otherwise terminated honestly and ledgered. A
-`retry-pending` record → the retry decision resumed (respawn when
-attempts remain, otherwise honest terminal). A host restart SHALL NOT
-orphan a running child, silently discard a queued wish, or lose a
-finished child's report. This journal is the dispatch-session analogue
-of job-supervisor's persisted survival registry (which recovers
-surviving job processes); they are separate ledgers and are not
-cross-read.
-
-#### Scenario: Stale reap after prolonged inactivity
-
-- **WHEN** a running child's `session.get` `time.updated` has not advanced for the stale threshold past the runtime floor, the pre-kill re-read confirms no refresh, and stale mode is `kill`
-- **THEN** the child is aborted via the SDK and exactly one terminal wake delivers the honest stale finding naming the child session id
-
-#### Scenario: Stale observe mode only notifies
-
-- **WHEN** stale mode is `observe` and the stale threshold is crossed
-- **THEN** one progress notice reports the inactivity (one per crossing, not per tick) and the child is NOT aborted
-
-#### Scenario: Active children are never reaped
-
-- **WHEN** the stale threshold is crossed but the pre-kill re-read finds a refreshed `time.updated`
-- **THEN** the timer resets and the child keeps running
-
-#### Scenario: Runtime floor blocks early reap
-
-- **WHEN** a child is younger than the 60-second minimum runtime, however silent
-- **THEN** no reap is considered for it
-
-#### Scenario: Existence probe decides the ambiguous reading
-
-- **WHEN** the status map is unhelpful at reap consideration
-- **THEN** the `session.get` probe decides: unresolved status skips the sweep, a missing session finalizes the record
-
-#### Scenario: Failed abort skips the sweep
-
-- **WHEN** the reaper's abort call fails and the session still exists
-- **THEN** the sweep is skipped and re-armed — the record is only finalized when existence proves the session gone
-
-#### Scenario: No-message children anchor at start
-
-- **WHEN** a child has produced no message at all and stays silent past the stale threshold measured from dispatch start
-- **THEN** the reap machinery applies identically (floor, re-read, abort, honest wake)
-
-#### Scenario: Retryable error respawns with a resume preamble
-
-- **WHEN** a child terminates in a transient transport/5xx/overload/rate-limit-class error and attempts remain
-- **THEN** a fresh child of the same agent spawns after the 10 s backoff with the original prompt plus the inspect-then-continue preamble, a progress notice discloses the retry, the retry keeps the dying child's registry slot, and the final wake arrives once, when the last attempt settles, disclosing the attempt count
-
-#### Scenario: Deterministic terminal classes are never retried
-
-- **WHEN** a child terminates in a provider-configuration, auth, model-not-supported, or contract error pattern
-- **THEN** no respawn happens and the honest terminal wake is delivered as-is
-
-#### Scenario: Stale kills, aborts, and floor findings are never retried
-
-- **WHEN** a child terminates via a stale reap, a user abort, or a textless-idle floor finding
-- **THEN** no respawn happens and the honest terminal wake is delivered as-is
-
-#### Scenario: Rotation never loses a non-terminal record
-
-- **WHEN** the journal reaches its rotation bound while a dispatch is still running
-- **THEN** only terminal records are compacted and the running dispatch's record survives
-
-#### Scenario: Every state transition is journaled
-
-- **WHEN** a dispatch moves between dispatched / queued / started / retry-pending / terminal states
-- **THEN** a journal record is appended for the transition
-
-#### Scenario: Restart re-arms a live child
-
-- **WHEN** the plugin initializes and the journal holds a running dispatch whose child session is still alive
-- **THEN** the registry row and poller are re-armed and the completion wake still arrives when the child finishes
-
-#### Scenario: Restart delivers a missed report
-
-- **WHEN** the plugin initializes and the journal holds a running dispatch whose child finished while the host was down
-- **THEN** the final message is fetched and the completion wake is delivered to the owner session
-
-#### Scenario: Restart terminalizes a gone child
-
-- **WHEN** the plugin initializes and the journal holds a running dispatch whose child session no longer exists
-- **THEN** the record terminates with an honest finding instead of resurrecting a phantom
-
-#### Scenario: Restart re-queues a queued wish
-
-- **WHEN** the plugin initializes and the journal holds a queued record whose owner session still resolves
-- **THEN** the wish re-enters the queue and spawns when a slot frees; when the owner no longer resolves, the record terminates honestly and is ledgered
-
-#### Scenario: Restart resumes a retry-pending attempt
-
-- **WHEN** the plugin initializes and the journal holds a retry-pending record
-- **THEN** the retry decision resumes — the child respawns when attempts remain, otherwise the record terminates honestly
 
 ### Requirement: Runtime model pin on v2 hosts
 
@@ -660,235 +345,24 @@ encoder rejects it).
 - THEN the variant is set to `"high"`; with no depth word pinned, the
   stale variant is dropped instead
 
+#### Scenario: A native call cannot unpin a pinned worker
+
+- **WHEN** a session calls the native `subagent` tool for a pinned `forge-*`
+  worker and passes a `model` of its own
+- **THEN** the child runs that worker agent and every request it builds is
+  rewritten to the pinned model, exactly as for a call that passed no model
+
 ### Requirement: Sandbox full-chain proof
 
-The change `SHALL` be verified on the live 2.3.2 sandbox: a pool agent
-with a model pin, dispatched as a subagent, completes a turn served by
-the pinned model (asserted on the served message record).
+The change `SHALL` be verified on the live 2.4.0 sandbox: a pool agent
+with a model pin, dispatched through the host's native `subagent` tool,
+completes a turn served by the pinned model (asserted on the served
+message record).
 
 #### Scenario: Dispatched pinned subagent serves on the pin
 
-- WHEN a primary dispatches a task to a pinned pool agent on the sandbox
+- WHEN a primary dispatches a native `subagent` call to a pinned pool agent on the sandbox
 - THEN the subagent's assistant record names the pinned model
-
-### Requirement: Dispatch outcome honesty on result-stream loss
-
-The dispatch layer `SHALL` classify every dispatch outcome as exactly one of
-`completed`, `failed`, or `stream-lost/unknown`. A result stream that breaks
-before a final report arrives `SHALL` classify as `stream-lost/unknown` and
-`SHALL NOT` produce a terminal verdict: no exit-1 death certificate, no "no
-reportable final message" obituary. The surfaced message `SHALL` state that
-the result stream was lost and that the child state is unknown (possibly
-still running). On hosts where host-signal completion detection is active,
-the `stream-lost/unknown` verdict `SHALL` be declared only after the
-reconcile pass also fails to observe the child: execution events that keep
-flowing for an in-flight child `SHALL NOT` be overruled by an unread
-synchronous view, and a child that host signals show to be alive `SHALL NOT`
-be declared lost.
-
-#### Scenario: Result stream breaks mid-dispatch
-
-- WHEN the child session's result stream breaks (e.g. network
-  `Connection reset`) before a final report arrives
-- THEN the dispatch outcome is `stream-lost/unknown`
-- AND the surfaced message states "result stream lost" and that the
-  child state is UNKNOWN (possibly still running)
-- AND no exit-1 / death / terminal obituary wording is produced
-
-#### Scenario: healthy child is never declared lost
-
-- WHEN the synchronous status/messages view is unreadable while the child's
-  execution events continue to arrive
-- THEN the dispatch stays in flight (no verdict is declared)
-- AND the outcome settles from the host signals or the reconcile pass as
-  usual
-
-#### Scenario: verdict only after signals and reconcile both fail
-
-- WHEN neither the host signals nor the reconcile pass can observe an
-  in-flight child for the sustained streak
-- THEN the outcome is `stream-lost/unknown` with the last-observed activity
-  timestamp
-- AND the report-file delivery contract remains the ground-truth recovery
-  channel
-
-### Requirement: Ledger completeness across outcome classes
-
-The dispatch layer `SHALL` write a ledger entry for every dispatch
-outcome class, including `stream-lost/unknown`, carrying the
-last-observed activity timestamp.
-
-#### Scenario: Ledger entry on stream loss
-
-- WHEN a dispatch's result stream breaks before a final report
-- THEN the job ledger records a `stream-lost/unknown` entry carrying
-  the last-observed activity timestamp
-- AND `forge_jobs list` surfaces the dispatch as
-  `stream-lost/unknown`
-
-### Requirement: Report-file delivery contract
-
-The dispatch prompt template `SHALL` include a standing report-file
-delivery instruction naming the caller-provided report path
-(`reports/<task>-report.md` convention), so a worker's final report
-survives the primary's view loss.
-
-#### Scenario: Worker report survives view loss
-
-- WHEN a dispatched worker completes its work after the primary's
-  result stream was lost
-- THEN the worker's final report is available at the agreed report
-  path in the workspace
-- AND the primary can resolve the dispatch outcome by reading that
-  file without re-dispatching
-
-### Requirement: Sync wait-budget expiry presented as a notice
-
-The sync dispatch layer `SHALL` present a wait-budget expiry handoff as
-a normal notification — informational styling with wording naming the
-outcome ("sync wait budget ended — the dispatch continues in the
-background; collect with `forge_jobs`") — and `SHALL NOT` render it
-through the error channel.
-
-#### Scenario: Wait budget expires while child is healthy
-
-- WHEN a synchronous dispatch's wait budget expires while the child
-  session is still running
-- THEN the handoff surfaces as an informational notice naming the
-  outcome and the collection path (`forge_jobs`)
-- AND no error-channel rendering / alarm styling is used
-
-### Requirement: Genuine dispatch failures keep error presentation
-
-Genuine sync dispatch failures `SHALL` keep error-class presentation:
-dispatch refusal (gates, pool caps) and evidence-backed worker errors
-render through the error channel as before.
-
-#### Scenario: Refusal and evidence-backed failure stay errors
-
-- WHEN a dispatch is refused by a gate/pool cap, or the worker fails
-  with recorded evidence
-- THEN the message renders through the error channel unchanged
-
-### Requirement: Budget-expiry notice carries retrieval pointers
-
-The budget-expiry notice `SHALL` carry the retrieval pointers previously
-carried by the error message — job id, task handle, and report path
-when present — so the caller can collect the result without
-re-dispatching.
-
-#### Scenario: Notice is actionable
-
-- WHEN the budget-expiry notice surfaces
-- THEN it includes the job id (and task handle / report path when
-  present)
-
-### Requirement: Active-textful completion override
-
-When a dispatch child's status view keeps reporting the session active but
-the child's final assistant text has already arrived and remained stable,
-the poller `SHALL` verdict the dispatch COMPLETE from the message-stream
-evidence alone — it `SHALL NOT` wait for the status view to flip, `SHALL
-NOT` run the dispatch to a timeout, and the terminal wake `SHALL` disclose
-that completion was established from the message stream while the status
-view lagged. The override `SHALL` use the same stability window (three
-consecutive poll ticks with finish conditions holding and non-empty final
-text) as the ordinary not-active completion path, `SHALL` cover sync and
-async dispatches alike, and `SHALL NOT` fire when the final text has not
-arrived (a stuck-active child with no text keeps its existing honest
-uncertainty handling — the override never invents completion).
-
-#### Scenario: Stuck-active status with the final report already out
-
-- **WHEN** a child's status map reports active on every poll tick while
-  the child's final assistant text is readable and has held the finish
-  conditions for the stability window
-- **THEN** the poller verdicts COMPLETE, the terminal wake names the
-  message-stream override as the establishment path, and no timeout path
-  runs
-
-#### Scenario: Stuck-active with no text stays honest
-
-- **WHEN** a child's status map reports active and no final assistant text
-  has arrived
-- **THEN** the override does not fire and the existing textless-idle and
-  stale handling governs — no completion is invented
-
-### Requirement: Nested-dispatch tool guard on non-forge child sessions
-
-Child-session creation `SHALL` accept a task-deny option that carries the
-task-tool deny permission in the create body (the channel QUESTION_DENY
-already uses, proven effective by a sandbox probe before the guard ships).
-The dispatch path `SHALL` set this option when — and only when — the
-target is a non-forge host agent whose resolved provider family is
-anthropic: such children `SHALL NOT` receive a dispatchable task tool,
-preventing the nested-delegation 400 that family returns. Forge-*
-targets `SHALL` remain governed solely by their structural `task: deny`
-(this guard adds nothing to them), and non-forge targets on other
-provider families `SHALL` be untouched by this guard. The guard lives at
-the single child-creation funnel so every spawn site inherits it.
-
-#### Scenario: Non-forge anthropic target denies the task tool in the child
-
-- **WHEN** a dispatch targets a non-forge host agent whose provider family
-  resolves to anthropic
-- **THEN** the child session is created with the task-tool deny riding the
-  create body, and the child cannot dispatch further subagents
-
-#### Scenario: Forge family and other families are untouched
-
-- **WHEN** a dispatch targets a forge-* agent, or a non-forge agent on a
-  non-anthropic family
-- **THEN** the create body carries no task deny from this guard (forge's
-  structural deny still applies to forge-* targets through the materialized
-  permissions)
-
-### Requirement: Provider-dimension dispatch gate and circuit breaker
-
-The dispatch path `SHALL` maintain in-process counters of live children
-keyed by provider and by provider/model, fed at the terminal-recording
-seam, and `SHALL` enforce optional per-provider and per-model concurrency
-limits. A circuit breaker `SHALL` track consecutive failed terminals per
-provider: at the configured threshold the breaker opens and refuses NEW
-dispatches on that provider; after the configured cooldown it half-opens
-(one dispatch allowed; success closes, failure re-opens). Both mechanisms
-`SHALL` be configured through an optional `dispatch` node in forge.json
-(`providerConcurrency` map, `modelConcurrency` map, `circuitBreaker`
-`{consecutiveFailures, cooldownMs}`), cascade-merged across config layers
-with field-level fail-soft (a bad value drops with a warn finding and
-never throws); an absent node `SHALL` mean no limits (today's behavior).
-Queued dispatches `SHALL` re-check the gate at dequeue time. Every
-refusal `SHALL` be an honest message naming the mechanism, the counted
-dimension and its current value, and the recovery condition (a live child
-  finishing for the concurrency gate; the cooldown elapsing for the
-breaker); breaker refusals `SHALL` be classified as the plugin's own
-throttle, not as provider errors, and `SHALL NOT` trigger the provider
-  retry path.
-
-#### Scenario: Provider concurrency gate refuses and admits
-
-- **WHEN** the live count for a provider is at its configured limit and a
-  new dispatch on that provider arrives
-- **THEN** the dispatch is refused with the gate named, the counted
-  dimension shown, and the recovery condition stated; when a live child on
-  that provider terminates, the next dispatch is admitted
-
-#### Scenario: Breaker opens, half-opens, and closes
-
-- **WHEN** a provider accumulates the configured number of consecutive
-  failed terminals
-- **THEN** new dispatches on that provider are refused naming the breaker
-  and cooldown; after the cooldown the next dispatch is admitted
-  (half-open) and on its success the breaker closes (a failure re-opens it
-  with the cooldown re-armed)
-
-#### Scenario: Absent or malformed dispatch node is fail-soft
-
-- **WHEN** forge.json carries no `dispatch` node, or one with malformed
-  values
-- **THEN** dispatches are unlimited (or the malformed fields are ignored
-  with a warn finding) and no dispatch is ever refused due to a parse
-  failure
 
 ### Requirement: JSON Schema publication for forge.json
 
@@ -944,21 +418,22 @@ sole semantic
 authority: pools, session-domain dispatch gating, crew roster
 disclosure, and compliance checks `SHALL` continue reading the recipe
 through the existing pool resolver, with native files serving only as
-the materialized projection. Each compiled file `SHALL` carry the
+the materialized projection. Each namespaced worker compiled file `SHALL` carry the
 provenance-bearing description, an always-stamped `mode: subagent`
 (without which the host silently falls back to a general dispatch), the
 pinned model identity including its variant channel where the recipe's
 depth word maps to one, the tools face in the host's current tool
-vocabulary per the entry's shape, and the dispatch mandates baked into
-the prompt body — all emitted under a GENERATED header that directs
-edits to the recipe. The sync `SHALL` write atomically and `SHALL`
+vocabulary per the entry's shape as 'Materialization as native subagents
+with a pinned model' defines it — the builtin shell open to every worker
+unless an explicit permission override denies it — and the
+worker mandates baked into the prompt body as 'Worker prompts and
+descriptions name the native dispatch path' defines them — all emitted
+under a GENERATED header that directs edits to the recipe. The sync `SHALL` write atomically and `SHALL`
 garbage-collect namespaced files whose entries left the recipe.
-Compilation `SHALL` emit only probe-proven frontmatter keys (unknown
+The compiler SHALL separate namespaced worker policies from `general`/`explore` override compilation even where `toolsFaceFor` is shared. Only namespaced workers receive this change’s worker-specific question, harness and recursion restrictions and discipline; built-in overrides retain their independent existing shape/model/prompt/permission semantics. Compilation `SHALL` emit only probe-proven frontmatter keys (unknown
 keys are dropped by the host once `permissions` is present). Before
-crew registration on a native-mode host the plugin `SHALL` check
-recipe-versus-artifact staleness — mtime-triggered with content
-adjudication (a byte-identical touch is not staleness) — and refuse
-with a one-step recovery instruction when stale; the sync
+crew registration or dispatch relying on a generated definition (including draft scouts) on a native-mode host the plugin `SHALL` check
+recipe-versus-artifact staleness — content and compiler-contract compatibility adjudication independent of mtime (a byte-identical current artifact touch is not staleness; an old compiler projection is stale even at equal timestamps) — and refuse use of incompatible artifacts with a one-step recovery instruction when stale; the sync
 operation `SHALL` be agent-invocable so recovery happens in-band and
 transcript-visible, and the host's hot-apply `SHALL` be relied on (no
 restart demanded). A `sync: "auto"` opt-in `SHALL` regenerate on
@@ -992,6 +467,11 @@ cross-machine story.
   hot-applies the files, and the retry passes — all visible in the
   session transcript
 
+#### Scenario: Upgrade rejects old projection even at identical timestamps
+
+- **WHEN** an unchanged workspace recipe or global fallback recipe has an old generated permission face or prompt with matching timestamps
+- **THEN** the incompatible projection is detected before use; explicit authorized sync or the owning recipe's existing auto opt-in regenerates it, otherwise no write occurs and recovery is disclosed. Workspace and global fallback are checked separately without merging the session roster.
+
 #### Scenario: Depth rides variant where expressible, params elsewhere
 
 - **WHEN** an entry's depth word maps to a variant value versus a word
@@ -1014,231 +494,34 @@ cross-machine story.
 - **WHEN** a workspace with committed recipe and committed generated
   artifacts is pulled onto a fresh machine
 - **THEN** no initialization or migration step is required — the
-  artifacts arrive with the recipe via the same pull, and staleness
-  checks pass because both files travelled together
+  current compatible artifacts arrive with the recipe via the same pull and content/compatibility checks pass; travelling together is not itself proof of compatibility
 
 #### Scenario: Runtime materialization remains available as an escape hatch
 
-- **WHEN** the materialize knob selects the runtime path (v1 hosts are
-  pinned to it by generation; v2 hosts may opt in as the escape hatch)
-- **THEN** behavior is byte-equal to today's draft-based
-  materialization (the staleness gate is a native-mode facility)
-
-### Requirement: Agent-bound child creation with pre-spawn validation
-
-On v2 hosts the dispatch layer `SHALL` pass the target agent id (and the
-pinned model when the roster defines one) in the child session-create call,
-mirroring the host's own subagent creation contract. The create-time model
-record `SHALL` carry the bare model id in its `id` field (`{providerID,
-modelID, id: <modelID>}`): the host stores `id` verbatim in the session
-model record and composes the runner select key as `providerID + "/" + id`,
-so a provider-qualified `id` produces a tripled key and fails the child at
-drain with `ModelUnavailableError`. Before spawning, the layer `SHALL`
-validate that the target agent resolves in the live roster (pool resolution
-or materialized native roster); a non-resolving agent `SHALL` be refused
-with a disclosure naming the agent and the roster source, and `SHALL NOT`
-degrade to a default-agent child. After creation, the layer `SHALL` read
-back the created session and assert the bound agent matches the request; a
-mismatch or unknown-agent result `SHALL` fail the dispatch loud (error
-class + journal entry) rather than leave a silently-unbound child running.
-
-#### Scenario: agent binding honored at create
-
-- **WHEN** a dispatch targets a roster agent that resolves in the live
-  roster on a v2 host
-- **THEN** the child session is created with that agent bound (and the
-  pinned model when defined), and the read-back assertion passes
-
-#### Scenario: non-resolving agent is refused, not degraded
-
-- **WHEN** a dispatch targets an agent that does not resolve in the live
-  roster
-- **THEN** the dispatch is refused with a disclosure naming the agent and
-  the roster source
-- **AND** no child session is created as a default agent
-
-#### Scenario: read-back mismatch fails loud
-
-- **WHEN** the created child's bound agent does not match the requested
-  agent
-- **THEN** the dispatch fails with a loud binding-lost error and a journal
-  entry, and no prompt is sent to the mismatched child
-
-#### Scenario: pinned model record carries the bare model id
-
-- **WHEN** a dispatch resolves a roster pin to a model identity
-  (providerID, modelID) and builds the child session-create body
-- **THEN** the body's model record is `{providerID, modelID, id: <modelID>}`
-  with `id` equal to the bare model id, never the provider-qualified key
-
-#### Scenario: runner composes a clean key from the stored record
-
-- **WHEN** a child session is created from the pinned model record and the
-  host runner resolves its select key
-- **THEN** the composed key is `providerID + "/" + modelID` (two segments),
-  not a tripled key, regardless of the provider being known to the host
-  catalog
-
-### Requirement: Host-signal completion detection
-
-On v2 hosts the dispatch layer `SHALL` detect child completion primarily via
-host-owned signals: durable `session.execution.{succeeded, failed,
-interrupted}` events matched on the child session id, and/or a one-shot wait
-on the child session. The layer `SHALL` run a reconcile pass over in-flight
-children at a cadence of at least 10 seconds that reads each child's actual
-state as the backstop for missed or lost events, and `SHALL` re-subscribe
-when its event stream is lost. The synchronous status/messages REST view
-`SHALL NOT` be the sole terminal signal for a dispatch.
-
-#### Scenario: durable event settles a dispatch
-
-- **WHEN** a child session's execution emits a terminal durable event
-- **THEN** the dispatch settles from that signal without any status polling
-
-#### Scenario: reconcile pass catches a missed event
-
-- **WHEN** a terminal event for an in-flight child is missed (e.g. the
-  event stream dropped between publish and subscribe)
-- **THEN** the reconcile pass observes the child's settled state and the
-  dispatch settles from that observation
-
-#### Scenario: event stream loss triggers re-subscription
-
-- **WHEN** the plugin's event subscription is lost (e.g. plugin reload,
-  connection drop)
-- **THEN** the layer re-subscribes and the reconcile pass covers children
-  whose terminal events fired during the gap
-
-### Requirement: Persisted dispatch registry with post-reload adoption
-
-The dispatch layer `SHALL` persist in-flight dispatch rows (task id, child
-session id, target agent, prompt anchor, timestamps) outside plugin-instance
-memory, and after a plugin reload or host restart `SHALL` adopt persisted
-in-flight rows: re-arm completion watching for each child and resume the
-normal outcome path. Restart recovery `SHALL` fall back to walking the
-parent session relationship when a stored row is unreadable. An adopted
-dispatch `SHALL NOT` be re-dispatched while its child is still observable.
-
-#### Scenario: reload mid-dispatch adopts the child
-
-- **WHEN** the plugin is hot-reloaded while a dispatch is in flight
-- **THEN** the reloaded generation adopts the persisted row and continues
-  watching the same child session
-- **AND** the final outcome is delivered exactly once, without a second
-  child being spawned for the same task
-
-#### Scenario: restart recovery falls back to parent walk
-
-- **WHEN** a persisted row is unreadable after a restart but the child
-  session records the parent relationship
-- **THEN** the layer recovers the dispatch from the parent walk instead of
-  losing it
+- **WHEN** the materialize knob selects the runtime path (an escape hatch a
+  host may opt into)
+- **THEN** the host runtime projection uses the new worker face and prompts from the recipe (the generated-file staleness gate is a native-mode facility)
 
 ### Requirement: Parent-interrupt disclosure
 
-WHEN the parent session's turn is interrupted while async dispatches are in flight, the plugin `SHALL` surface the in-flight dispatch list with cancellation guidance in the interruption path — naming the session-scoped stop route and the per-id cancel escape hatch. The default posture is disclose-only: an interrupt `SHALL NOT` silently cancel running children.
+WHEN the parent session's turn is interrupted while native subagent children of this session are in flight, the plugin `SHALL` surface the in-flight child list with cancellation guidance in the interruption path — naming the session-scoped stop route (`/forge stop`). There is no per-id cancel verb for native children. The default posture is disclose-only: an interrupt `SHALL NOT` silently cancel running children.
 
 #### Scenario: ESC with children in flight
 
-- **WHEN** the user interrupts the parent session's turn while dispatches are in flight
-- **THEN** the in-flight dispatch list with cancellation guidance is surfaced to the session
+- **WHEN** the user interrupts the parent session's turn while native subagent children are in flight
+- **THEN** the in-flight child list with cancellation guidance (naming `/forge stop`) is surfaced to the session
 - **AND** the children remain running unless explicitly cancelled
-
-### Requirement: Orphan-child disclosure
-
-WHEN a child session produced by the dispatch layer is observed streaming
-while its registry row is dead or missing (e.g. an adoption gap), the plugin
-`SHALL` surface the orphan with adopt/cancel guidance instead of letting it
-run invisibly.
-
-#### Scenario: orphaned streaming child is surfaced
-
-- **WHEN** a streaming child session has no live registry row
-- **THEN** the orphan is disclosed with its task id and child session id
-- **AND** the disclosure offers the adopt and cancel paths
-
-### Requirement: Dispatch rows survive plugin-instance disposal
-
-Plugin `dispose` SHALL NOT be a registry-kill trigger for dispatch rows. On any host — single- or multi-context — a plugin dispose that is not the host-process exit SHALL leave every in-flight dispatch row untouched: no kill, no child abort, no journal terminalization; the settle loop keeps watching and the completion wake arrives at true terminal. This supersedes any earlier implication that dispose is a dispatch registry-kill trigger; the remaining legitimate registry-kill triggers are owner-session end and the user cancel lever. A real host-process exit needs no dispatch kill either: dispatch children are server-side sessions unaffected by the plugin process, and their cross-restart continuity is the dispatch journal with restart recovery (probe → re-arm, completed-wake, or honest error per record state).
-
-#### Scenario: Dispose in another context leaves the dispatch running
-
-- **WHEN** a dispatch is in flight and a plugin context (not the whole host process) is disposed
-- **THEN** the dispatch row remains running, its journal record stays non-terminal, and the final wake is delivered on completion
-
-#### Scenario: Host-process exit relies on the journal, not on kills
-
-- **WHEN** the host process exits while dispatches are in flight
-- **THEN** no dispatch journal record is terminalized by the exit itself, and on next host boot restart recovery resolves each live child (re-arm the running, deliver the finished, honestly terminalize the gone)
-
-### Requirement: Honest aborted outcome surfacing
-
-When a dispatch row is legitimately killed (owner-session end or the user cancel lever), the surfaced wake and the journal terminal record SHALL name the outcome as aborted with its reason — never as a completed "finished" report. A killed dispatch's wake SHALL NOT present an empty tail as a final report (no "(no output)" fabrication); the wake SHALL state that the dispatch was aborted, carry the journal reason, and — when the child could not be confirmed idle after the abort attempt — disclose that the child session may still be running (the orphan-disclosure path). The reason SHALL be ONE sentence on both sides — the sentence the kill stamped on the row at kill time — and each lever SHALL have its own sentence: an owner-session end, the user cancel lever (the per-id cancel and the session-scoped stop), and the explicit kill of a dispatch row through the job lever; the owner-death sentence SHALL NOT name any other trigger (a plugin dispose is not one). A host execution error carried as a nested object SHALL be rendered readable (its message, name, error, reason, or data — else a clipped JSON rendering) wherever a journal reason or a wake cites it — never the string `[object Object]`; an error object that cannot be rendered (circular, BigInt-bearing, or throwing when read) SHALL yield to the caller's own honest fallback and SHALL NOT throw into the signal path. A kill that lands while a retry respawns the child SHALL be honored — the fresh child SHALL NOT be left running unwatched: when the kill landed during its creation it is never prompted (aborted as cleanup; the row keeps naming the attempt's real child), and when the kill landed during the prompt send the row is rebound to it and it is aborted. An abort that has not returned within a bounded moment counts as unconfirmed too — a hung host call is not a clean abort — and a wake rendered while the abort is still in flight SHALL wait for that same bounded moment, so the wake discloses exactly what the journal discloses whichever of the two is written first.
-
-#### Scenario: Killed dispatch wakes as aborted, not finished
-
-- **WHEN** an in-flight dispatch row is killed by owner-session end or the cancel lever
-- **THEN** the wake names the dispatch as aborted with its reason, no final-report text is fabricated from the empty tail, and the journal terminal record carries the same reason
-
-#### Scenario: Each lever names itself on both sides
-
-- **WHEN** a dispatch row is killed by the explicit job-lever kill, by the cancel lever, or by an owner-session end
-- **THEN** the journal terminal reason and the wake carry that lever's sentence verbatim and no other lever's — an explicit kill is never reported as an owner death or as a plugin dispose
-
-#### Scenario: Nested error objects render readable
-
-- **WHEN** a host terminal event carries its error as a nested object with no string `message` and the dispatch journals it
-- **THEN** the journal reason names the error's own text (or a clipped JSON rendering of the object) and never contains `[object Object]`
-
-#### Scenario: Unrenderable error objects never throw
-
-- **WHEN** the error object cannot be serialized (circular, BigInt-bearing) or throws when read (a throwing getter, a hostile Proxy)
-- **THEN** the renderer returns no detail, the citing journal reason and wake fall back to their own honest wording, and nothing is thrown into the signal path
-
-#### Scenario: Kill lands in the respawn window
-
-- **WHEN** a dispatch row is killed while its retry child is being created, or while the retry prompt is being sent to it
-- **THEN** the dispatch settles aborted with the killer's sentence, the fresh child is aborted (never prompted when the kill preceded the prompt), and no unwatched child keeps running
-
-#### Scenario: Unconfirmed abort is disclosed
-
-- **WHEN** a kill path's abort attempt fails or cannot be verified (e.g. an abort-less session client)
-- **THEN** the journal and the wake disclose that the abort could not be confirmed and the child may still be running
-
-#### Scenario: An abort that never returns is unconfirmed
-
-- **WHEN** a kill path issues its abort and the host call has not returned within the bounded wait
-- **THEN** the journal terminal reason and the wake both disclose that the abort call had not returned and the child may still be running — never a bare aborted outcome
-
-#### Scenario: An already-idle owner hears what the journal says
-
-- **WHEN** the owning session is already idle when its dispatch row is killed, so the wake is delivered at kill time, and the abort then fails
-- **THEN** the wake waits for the abort verdict and discloses the failed abort with the same wording the journal terminal reason carries
-
-### Requirement: Abort effectiveness on the v2 session client
-
-The session client used for dispatch SHALL provide a real abort on every host generation, or the absence SHALL be disclosed rather than swallowed. On v2 hosts the child-session abort SHALL be wired through an actually available surface (the SDK session abort or the host's HTTP session-abort endpoint) instead of silently no-opping on a missing method; kill paths SHALL NOT discard the abort result silently — a failed or unverifiable abort SHALL be journaled and surfaced per the honest-aborted-outcome requirement.
-
-#### Scenario: v2 kill path aborts the child for real
-
-- **WHEN** a dispatch row is killed on a v2 host and the wired abort surface is available
-- **THEN** the abort is issued through that surface and the child session stops running
-
-#### Scenario: Abort-less client is disclosed, not swallowed
-
-- **WHEN** the session client cannot abort at all (no abort surface on this host generation)
-- **THEN** the kill path records the unverifiable abort in the journal and the wake instead of silently treating the row as cleanly killed
 
 ### Requirement: Session directory resolved per session on multi-location hosts
 
-On a host that loads several locations in one process, the plugin SHALL resolve every session's working directory from that session's OWN record — never from which location happened to initialize last. A child session created by a dispatch SHALL be bound to its owner's resolved directory at creation, before its first tool call. A session without an in-memory binding (a fresh child, a session resumed after a host restart) SHALL be resolved through the host's session record — the session's own directory, else its parent's — before any fallback. A fallback to a plugin-level default directory SHALL be disclosed in the tool result. Everything keyed on the session's directory (shell cwd, relative `workdir` joins, plan / goal / crew records, the dispatch journal, the pool gate) SHALL land in the resolved directory.
+On a host that loads several locations in one process, the plugin SHALL resolve every session's working directory from that session's OWN record — never from which location happened to initialize last. The plugin creates no child session of its own: the host places a native subagent child in its parent's directory, and the plugin SHALL resolve any plugin state it writes for such a child from the host's session record. A session without an in-memory binding (a fresh child, a session resumed after a host restart) SHALL be resolved through the host's session record — the session's own directory, else its parent's — before any fallback. A fallback to a plugin-level default directory SHALL be disclosed in the tool result. Everything keyed on the session's directory (plan / goal / crew records, the pool gate) SHALL land in the resolved directory. A command's working directory is not the plugin's to set: the host runs a native subagent child's builtin shell in the parent's directory, and any other session's in the session's own directory.
 
-The same resolution SHALL hold wherever the plugin applies a rule that depends on a session's directory — inside tool bodies and in the checks that run before a tool call (the draft write ban, the dispatch gates, the state-file boundary) alike. No check SHALL bind a session to the directory that was initialized last. A check SHALL apply such a rule to a session that has no in-memory binding only on the strength of the host's session record — the session's own directory, else its parent's — resolved the way a tool body resolves it; a check that cannot read the record SHALL apply the rule to no directory at all and leave the decision to a check that can. Before a write-class tool of such a session executes, the draft write ban SHALL have been decided against the workspace the host's session record names, so that a draft in another location never refuses the call and a draft in the session's own workspace still does. When the record yields no directory, or cannot be read, the session SHALL stay unbound and every such check SHALL let the call through without consulting any record that depends on a directory: the plugin SHALL NOT guess a directory, and SHALL NOT put its default directory in place of the session's for a check. A binding written on behalf of a check SHALL be the directory the host's session record yielded. This holds whatever makes the session known first — a write-class call, a dispatch the plugin checks, or a call that ends refused — and for a child the host created on its own (no plugin binding at creation) as much as for a child the plugin created.
+The same resolution SHALL hold wherever the plugin applies a rule that depends on a session's directory — inside tool bodies and in the checks that run before a tool call (the draft write ban, the dispatch gates, the state-file boundary) alike. No check SHALL bind a session to the directory that was initialized last. A check SHALL apply such a rule to a session that has no in-memory binding only on the strength of the host's session record — the session's own directory, else its parent's — resolved the way a tool body resolves it; a check that cannot read the record SHALL apply the rule to no directory at all and leave the decision to a check that can. Before a write-class tool of such a session executes, the draft write ban SHALL have been decided against the workspace the host's session record names, so that a draft in another location never refuses the call and a draft in the session's own workspace still does. When the record yields no directory, or cannot be read, the session SHALL stay unbound and every such check SHALL let the call through without consulting any record that depends on a directory: the plugin SHALL NOT guess a directory, and SHALL NOT put its default directory in place of the session's for a check. A binding written on behalf of a check SHALL be the directory the host's session record yielded. This holds whatever makes the session known first — a write-class call, a native `subagent` call the dispatch gates check, or a call that ends refused — and for a native subagent child the host created (no plugin binding at creation) like any other session.
 
 #### Scenario: A fresh worker's first shell command runs in the owner's workspace
 
-- **WHEN** a worker child created by a session anchored to workspace A issues its first `forge_shell` call on a host whose last-initialized location is workspace B
-- **THEN** the command's cwd is resolved under workspace A, and the result's `cwd:` line names a directory under workspace A
+- **WHEN** a native subagent child of a session anchored to workspace A issues its first builtin shell call on a host whose last-initialized location is workspace B
+- **THEN** the command runs under workspace A — the host creates the child in its parent's directory and runs the builtin shell there; no plugin `cwd:` line is involved, and a plugin state write for that child resolves under A
 
 #### Scenario: A goal created from a session lands in that session's workspace
 
@@ -1263,21 +546,21 @@ The same resolution SHALL hold wherever the plugin applies a rule that depends o
 #### Scenario: A session's first call after a host restart is a write-class call
 
 - **WHEN** a session that existed before a host restart makes its first tool call after the restart, that call is a write-class one, the host's session record carries workspace A for the session, and the host initialized location B after A
-- **THEN** the session is bound to workspace A — never to B — and a following `forge_shell` call without `workdir` runs under A without any default-directory notice
+- **THEN** the session is bound to workspace A — never to B — and a following plugin call that depends on the session's directory (for example a goal write) resolves under A without any default-directory notice
 
 #### Scenario: A fresh session's first call is a write-class call
 
 - **WHEN** a session that acquired no binding when the host created it makes a write-class call as its first tool call, the host's session record carries workspace A for the session, and the host's last-initialized location is workspace B
-- **THEN** the session is bound to workspace A, never to B, and a following `forge_shell` call without `workdir` runs under A
+- **THEN** the session is bound to workspace A, never to B, and a following plugin call that depends on the session's directory (for example a goal write) resolves under A
 
 #### Scenario: A child the host created on its own is bound from its record on its first write-class call
 
 - **WHEN** a child session created by the host's own subagent tool — no plugin binding at creation — makes a write-class call as its first tool call, the host's session record carries workspace A for the child, and the host's last-initialized location is workspace B
-- **THEN** the child is bound to workspace A, never to B, and a following `forge_shell` call without `workdir` runs under A
+- **THEN** the child is bound to workspace A, never to B, and a following plugin call that depends on the session's directory (for example a goal write) resolves under A
 
 #### Scenario: A refused dispatch leaves the caller bound to its own directory only
 
-- **WHEN** a session with no in-memory binding dispatches through the plugin's `task` tool, the host's session record carries workspace A for the session, the host's last-initialized location is workspace B, and the dispatch is refused before any child is created
+- **WHEN** a session with no in-memory binding calls the native `subagent` tool for a `forge-*` worker of another pool, the host's session record carries workspace A for the session, the host's last-initialized location is workspace B, and the call is refused before any child is created
 - **THEN** the refusal stands, and every binding written for the session during that call names workspace A — never B
 
 #### Scenario: A draft in another location does not refuse the session's write
@@ -1287,7 +570,7 @@ The same resolution SHALL hold wherever the plugin applies a rule that depends o
 
 #### Scenario: A draft in the session's own workspace is still honored
 
-- **WHEN** workspace A holds an active draft, and a session with no in-memory binding whose host record carries workspace A calls a write-class tool on a host whose last-initialized location is workspace B
+- **WHEN** workspace A holds an active draft, and a session with no in-memory binding whose host record carries workspace A calls a write-class tool (the host's builtin `shell`, for example — the plugin counts it write-class) on a host whose last-initialized location is workspace B
 - **THEN** the call is denied exactly as it is for a session that was bound to workspace A all along, with the message naming `plan_approve` or discard
 
 #### Scenario: No record and several locations: the session stays unbound and the call passes
@@ -1304,114 +587,6 @@ The same resolution SHALL hold wherever the plugin applies a rule that depends o
 
 - **WHEN** a non-forge agent's session with no in-memory binding calls `write` or `edit` with a relative path on a host that initialized more than one location, and the host's session record yields no directory for the session
 - **THEN** the path is not resolved against any other directory: one that would land inside a state directory only when read from some particular working directory is not refused by this check, while one that names a state directory by its own spelling — it lands there from every working directory — is still refused, since that verdict needs no base directory
-
-### Requirement: User-facing dispatch cancellation (in-flight and queued)
-
-The plugin `SHALL` expose a session-scoped stop lever for in-flight async dispatches: the stop route `SHALL` cancel every in-flight dispatch owned by the invoking session — and only those; dispatches owned by other sessions `SHALL` never be touched by another session's stop. Invoked for a listing, the lever `SHALL` list every in-flight dispatch on the host with its task id, target agent, child session id, owner session, and age (host-wide visibility, no session scoping on the listing). Invoked with an explicit task id, the lever `SHALL` cancel that dispatch — the explicit-id escape hatch, which MAY target another session's dispatch by explicit intent. No host-wide cancel verb `SHALL` exist: no single lever call cancels every dispatch on the host. Cancellation `SHALL` abort the child session through the existing abort engine, settle the registry row as `aborted`, record the cancellation in the ledger, and deliver a wake disclosing it. A cancelled dispatch `SHALL NOT` be retried by any resilience path. Each cancellation receipt (the per-id cancel, and every row of a stop) `SHALL` report the post-abort idle confirmation honestly as one of three outcomes: the child is confirmed idle through the host's active-session view; the child did not reach idle within the assertion window (it may have resisted); or the view could not be read, so idle is unconfirmed — a receipt `SHALL` never claim a confirmed idle without a readable view, and no view read `SHALL` hold a receipt past the assertion window. The stop route `SHALL` also cancel every queued wish of the invoking session — and only those: the session's queued wishes `SHALL` be removed from its queue BEFORE any in-flight dispatch is cancelled, so no slot a cancelled dispatch frees is pumped and no cancelled wish ever spawns. A cancelled queued wish `SHALL` terminalize its journal record as `aborted` with a sentence naming the stop lever and stating that nothing was spawned; it has no child and no registry row, so it `SHALL` deliver no wake and `SHALL NOT` be re-entered by restart recovery. The stop receipt `SHALL` name the cancelled queued wishes separately from the cancelled in-flight dispatches; a stop in a session with queued wishes and nothing in flight `SHALL` cancel the queued wishes and say that nothing was in flight; only a session with neither `SHALL` report nothing to stop. A queued wish the queue pump is already spawning when the stop fires `SHALL` be cancelled as well and `SHALL` never be left running: while its child session is still being created the wish `SHALL` not be prompted — its journal record is terminal `aborted` with a sentence naming the stop lever and stating that the wish was never prompted, and the receipt counts it with the cancelled queued wishes; once its prompt was sent the wish `SHALL` be cancelled like any in-flight dispatch of that stop. If the stop fires before the pump has created a child session for the wish, `SHALL` none be created. The lever `SHALL` wait a bounded time for such a wish to land; a wish still being started when that wait ends `SHALL` be cancelled the moment it lands, and the receipt `SHALL` say that it was still starting. Cancels of one session's dispatches `SHALL` run one at a time, whether the stop lever or the queue pump issues them.
-
-#### Scenario: list in-flight dispatches
-
-- **WHEN** the cancel lever is invoked for a listing while dispatches are in flight
-- **THEN** each in-flight dispatch is listed with task id, agent, child session id, owner session, and age
-- **AND** no dispatch is cancelled by a bare listing
-
-#### Scenario: cancel one dispatch
-
-- **WHEN** the cancel lever is invoked with an in-flight task id
-- **THEN** the child session is aborted and the receipt reports the idle-confirmation outcome (confirmed idle, resisted, or unreadable view)
-- **AND** the registry row settles as `aborted` and the ledger records the cancellation
-- **AND** the owner session receives a wake disclosing the cancellation
-
-#### Scenario: cancelled dispatch never retries
-
-- **WHEN** a dispatch is cancelled by the user lever
-- **THEN** no resilience path (retry, stale reap, adoption) respawns or resumes it
-
-#### Scenario: stop scopes to the invoking session
-
-- **WHEN** session A owns two in-flight dispatches, session B owns one, and the stop lever fires in session A
-- **THEN** both of A's dispatches are cancelled with honest aborted wakes and B's dispatch is untouched — it keeps running and delivers its completion wake at true terminal
-
-#### Scenario: No host-wide cancel verb
-
-- **WHEN** the lever is asked to cancel `all` dispatches in one call
-- **THEN** the request is refused as an unknown route with guidance to the session-scoped stop and the per-id escape hatch
-
-#### Scenario: An unreadable idle view is disclosed, never claimed
-
-- **WHEN** the active-session view cannot be read (or a read hangs) while a cancellation's idle confirmation is running
-- **THEN** the receipt returns within the assertion window, reports that idle could not be confirmed, and makes no confirmed-idle or resisted claim
-
-#### Scenario: stop cancels the queued wishes and nothing spawns into the freed slots
-
-- **WHEN** a session has queued wishes beyond the concurrency cap and the stop lever fires in that session
-- **THEN** the session's queued wishes are removed from its queue first, the in-flight dispatches are cancelled, and no wish spawns into the slots the cancelled dispatches freed
-- **AND** each cancelled queued wish's journal record is terminal `aborted` with the stop-lever sentence stating nothing was spawned, and no wake is delivered for it
-- **AND** the receipt names the cancelled in-flight dispatches and the cancelled queued wishes separately
-
-#### Scenario: stop with queued wishes only
-
-- **WHEN** nothing is in flight for a session but it owns queued wishes, and the stop lever fires in that session
-- **THEN** the queued wishes are cancelled and the receipt says that nothing was in flight and names the cancelled wishes
-
-#### Scenario: a cancelled queued wish stays cancelled
-
-- **WHEN** the host restarts after a stop cancelled queued wishes
-- **THEN** none of those wishes re-enters the queue or spawns
-
-#### Scenario: a wish the queue pump is already spawning when stop lands
-
-- **WHEN** the queue pump has dequeued one of a session's queued wishes and is creating its child session, and the stop lever fires in that session
-- **THEN** that child session is never prompted: the wish's journal record is terminal `aborted` with the never-prompted sentence, the empty child session is aborted as cleanup, the receipt counts the wish with the cancelled queued wishes, and no wake is delivered for it
-
-#### Scenario: stop lands before the spawning wish has a child session
-
-- **WHEN** the queue pump has dequeued one of a session's queued wishes, the stop lever fires in that session before the pump has created a child session for it, and the pump reaches its spawn step afterwards
-- **THEN** no child session is created for that wish, its journal record is terminal `aborted` with the never-prompted sentence, and the receipt counts it with the cancelled queued wishes
-
-#### Scenario: a wish whose prompt was already sent when stop lands
-
-- **WHEN** the queue pump has dequeued one of a session's queued wishes and its prompt is being sent while the stop lever fires in that session
-- **THEN** the lever waits for the wish to land and cancels it like any in-flight dispatch of that stop: the child is aborted once, the journal record is terminal `aborted` with the lever sentence, and the receipt lists it among the stopped in-flight dispatches
-
-#### Scenario: the lever stops waiting while a wish is still being started
-
-- **WHEN** a wish is still being started when the lever's bounded wait ends
-- **THEN** the receipt says that a wish was still starting, the lever's own cancels and the late wish's cancellation never run at the same time, and the late wish is cancelled the moment it lands with the lever sentence and an aborted wake
-
-### Requirement: Progress-notice freshness
-
-A `[forge:dispatch-progress]` or `[forge:dispatch-notice]` notice that is parked for a busy owner SHALL be delivered at the owner's next idle edge only while what it reports is still true at delivery time. A notice scoped to one dispatch SHALL be delivered only while that dispatch is live — in flight, retry-pending, or still queued; when the dispatch has reached terminal by delivery time the notice SHALL be dropped without delivery. The parent-interrupt disclosure SHALL likewise be dropped when no dispatch of that session is in flight at delivery time. A dropped notice SHALL NOT be requeued, rewritten, or replaced — the completion wake remains the single carrier of a dispatch's terminal state and SHALL never be affected by this rule. A notice that is not scoped to one dispatch (the orphan-child disclosure) SHALL be delivered as before. A notice dropped here SHALL remain in the dispatch job's own output tail — only its delivery is skipped. Independently of delivery, the completion wake of a finished dispatch SHALL NOT present a notice the plugin appended to the dispatch's output as report content: its final-report block SHALL carry only the output after the last appended notice, while the dispatch job's output tail itself SHALL keep those notices, and the stream-lost wake's last observation SHALL keep the whole output.
-
-#### Scenario: the completion wake does not repeat an appended notice
-
-- **WHEN** the plugin appended a progress notice to a dispatch's output (whether or not that notice was delivered to the owner) and the dispatch then finishes
-- **THEN** the completion wake's final-report block does not contain that notice, and the dispatch job's output tail still does
-
-#### Scenario: the child finishes while the owner is busy
-
-- **WHEN** a progress notice is parked for a busy owner and the dispatch reaches terminal before the owner's next idle edge
-- **THEN** the notice is not delivered and the owner receives only the completion wake
-
-#### Scenario: the dispatch is still live at the idle edge
-
-- **WHEN** the owner's next idle edge arrives while the dispatch is still live
-- **THEN** the parked notice is delivered as before, ahead of any completion wake
-
-#### Scenario: a retry in progress is still live
-
-- **WHEN** a retry attempt notice is parked and the dispatch is between attempts at delivery time
-- **THEN** the notice is delivered — the dispatch has not reached terminal
-
-#### Scenario: the interrupted session has nothing in flight any more
-
-- **WHEN** a parent-interrupt disclosure is parked and every dispatch it named has reached terminal before delivery
-- **THEN** the disclosure is dropped
-
-#### Scenario: a cancelled queued wish is not announced
-
-- **WHEN** a queued wish is cancelled by the stop lever while a notice about that wish is still parked
-- **THEN** the notice is dropped and nothing announces a wish that will never spawn
 
 ### Requirement: Built-in subagent override via the global recipe
 
@@ -1436,6 +611,8 @@ than the `forge-` prefix. The gating probe ran 2026-11-21
 (`reports/probe-builtin-override.md`): user same-name files DO shadow
 the built-ins (description/system/model replaced, permissions
 base-∪-appended, hot-apply) on the lowercase id only — POSITIVE.
+
+The namespaced worker-only policy changes SHALL NOT alter the existing override face, prompts or model semantics through shared compilation helpers. Existing generated lowercase `general.md` / `explore.md` SHALL be checked against the independent override projection; stale generated files may be corrected only by the existing authorized explicit sync or applicable global auto opt-in. Hand-written same-name files remain byte-identical, never treated as generated, overwritten or garbage-collected. If authorization is absent, disclose stale generated files without writing; preserve original override behavior and marker-keyed deletion.
 
 #### Scenario: The scaffold arrives only on ask, inert by default
 
@@ -1464,66 +641,193 @@ base-∪-appended, hot-apply) on the lowercase id only — POSITIVE.
 - **THEN** sync refuses with a disclosure naming the collision, and
   the hand-written file is left byte-identical
 
+#### Scenario: Worker compiler migration preserves independent built-in overrides
+
+- **WHEN** namespaced workers and activated global overrides are compiled, including existing generated files at equal timestamps and a hand-written same-name file
+- **THEN** worker-specific policy applies only to namespaced workers, existing override semantics remain intact; authorized sync reconciles stale generated files only, absent authorization writes nothing, and hand-written collisions are disclosed without modification
+
 ### Requirement: User-facing /forge command family
 
-The plugin `SHALL` provide the `sync`, `init`, and `init global` routes
-of the single `/forge` command via typed arguments (see command-surface
-'Single forge command surface'). These three routes `SHALL` be
-agent-instructing templates (the commands themselves `SHALL NOT` write
-files; every write goes through the in-band tools with transcript
-visibility). The shared `/forge` template `SHALL` instruct the agent to
-stop and redirect the user to forge before routing if `forge_sync` is
-not available. The guard here is the existing template-level tool
-visibility check, not a separate host identity check; the behavior of
-the existing `stop` route is governed by command-surface.
-`/forge sync` `SHALL` instruct the forge agent to invoke the
-`forge_sync` tool immediately and report the diff — a manual
-force/debug/fallback lever that leaves the default staleness-gate
-posture and the `sync:"auto"` opt-in unchanged. `/forge init` `SHALL`
-draft the workspace forge.json in-band with the user (pool namespace,
-roles, shapes) and `SHALL` refuse when the file already exists,
-offering review instead of overwrite. `/forge init global` `SHALL`
-draft the global forge.json the same way, shipping built-in override
-entries in comment form (inert until uncommented — see
-builtin-override). The unconfigured-crew refusal `SHALL` name these
-levers alongside the in-band drafting affordance.
+The plugin SHALL provide the `sync`, `init`, and `init global` routes of the single `/forge` command via typed arguments (see command-surface 'Single forge command surface'). The three routes SHALL be agent-instructing templates; the commands themselves SHALL NOT write files, and every write SHALL go through the in-band tools with transcript visibility. Before any of these routes starts its work, the plugin SHALL check the actual invoking agent identity, independently of the available tools. Only a verified forge primary may start these routes. Unknown identity, workers and other agents SHALL be redirected without starting route work or reading recipe files. The `stop` route SHALL be exempt from that guard; its command-execution and session-scoped stop semantics are defined in command-surface 'Session-scoped stop for native subagents'.
+
+`sync` SHALL instruct the forge agent to invoke `forge_sync` immediately and report the diff; the staleness gate, in-band default and `sync:"auto"` opt-in remain unchanged. `init` SHALL draft the workspace forge.json in-band with the user (pool namespace, roles, shapes), refuse to overwrite an existing file and offer review instead. `init global` SHALL do likewise for the global forge.json, with commented General/Explore override entries inert until uncommented (see 'Built-in subagent override via the global recipe'). Both init routes SHALL require explicit user consent before any normal write. Unconfigured-crew refusal SHALL name these levers alongside the in-band drafting affordance.
 
 #### Scenario: /forge sync forces an immediate sync
 
-- **WHEN** the user runs `/forge sync` in a forge session
-- **THEN** the forge agent invokes forge_sync now and reports the
-  created/updated/GC'd diff — and the default posture (staleness gate
-  + in-band sync; `sync:"auto"` opt-in) is unchanged
+- **WHEN** the user runs `/forge sync` in a verified forge-primary session
+- **THEN** the forge agent invokes forge_sync now and reports the created/updated/GC'd diff, and the default posture (staleness gate + in-band sync; `sync:"auto"` opt-in) is unchanged; unavailable or denied tools remain subject to normal permissions
 
 #### Scenario: /forge init scaffolds the project recipe
 
-- **WHEN** the user runs `/forge init` in a workspace with no
-  forge.json
-- **THEN** the forge agent drafts the recipe in-band with the user
-  (pool namespace, roles, shapes); the file hot-applies and a crew
-  retry passes
+- **WHEN** the user runs `/forge init` in a verified forge-primary workspace session with no forge.json
+- **THEN** the forge agent drafts the recipe in-band with the user (pool namespace, roles, shapes), writes only on explicit consent and through the normal write path, and the file hot-applies and a crew retry passes for a valid authorized recipe
 - **WHEN** a forge.json already exists
-- **THEN** the command refuses to overwrite and offers a review of the
-  existing recipe instead
+- **THEN** the command refuses to overwrite and offers a review of the existing recipe instead
 
 #### Scenario: /forge init global scaffolds the global layer inert
 
-- **WHEN** the user runs `/forge init global` with no global
-  forge.json
-- **THEN** the scaffold is drafted in-band with the General/Explore
-  override entries in comment form; built-in behavior is unchanged
-  until an entry is uncommented and filled
+- **WHEN** the user runs `/forge init global` in a verified forge-primary session with no global forge.json
+- **THEN** the scaffold is drafted in-band with the General/Explore override entries in comment form, written only on explicit consent, and built-in behavior is unchanged until an entry is uncommented and filled
 
 #### Scenario: The net still teaches the levers
 
-- **WHEN** a session with no recipe hits the unconfigured-crew
-  refusal
-- **THEN** the refusal names both paths: the in-band ask (the agent
-  drafts it on explicit go-ahead) and the `/forge init` levers
+- **WHEN** a session with no recipe hits the unconfigured-crew refusal
+- **THEN** the refusal names both paths: the in-band ask (the agent drafts it on explicit go-ahead) and the `/forge init` levers
 
 #### Scenario: Family guard holds
 
-- **WHEN** a session without `forge_sync` in its available tools invokes `/forge`
-- **THEN** the shared template instructs the agent to stop before routing
-  and tell the user the command belongs to the forge agent (switch agents
-  and rerun)
+- **WHEN** a worker, non-forge session or session of unknown identity invokes `sync`, `init` or `init global`, even if `forge_sync` is visible
+- **THEN** the command redirects to the forge primary before any route work or recipe read, and the same guard admits a verified forge primary independently of tool visibility (without overriding normal permissions)
+
+#### Scenario: Stop is exempt from the command family guard
+
+- **WHEN** a non-forge session runs `/forge stop`
+- **THEN** the command performs the scope-checked stop and returns its receipt as specified in command-surface, without a family-guard redirect
+
+### Requirement: The native subagent tool is the only dispatch surface
+
+The plugin SHALL register no dispatch tool of its own — no `task`, `forge_dispatch`, or any other tool that creates a child session. The host's native `subagent` tool is the only way any session dispatches a worker: the forge primary and every non-forge agent alike call it, and it lists every `forge-*` worker the calling agent may use. A native call returns a child session id at once; the child runs as a host background job in its parent's directory, and the host delivers a `<background-result kind="subagent">` message to the parent each time the child goes idle — carrying its final report, its error, or its cancellation — and again after each later round of work. The plugin SHALL NOT deliver, duplicate, or supplement that message, SHALL NOT poll or re-subscribe to children as a dispatch engine, and SHALL NOT resume children itself. Crew-local scheduling observation and bounded rechecks remain permitted under crew-harness; they neither deliver nor imitate host completion messages. There is no synchronous dispatch, no concurrency cap, no queue, no wait budget, and no automatic retry: the plugin SHALL impose none of them, and no forge.json node, plugin option, or environment variable SHALL bring any of them back. A `forge-*` worker is an ordinary host agent preset: the plugin contributes its worker definitions (model pin, tool face, question denial, prompt) and nothing in the execution path.
+
+#### Scenario: No plugin dispatch tool is registered
+
+- **WHEN** the plugin loads under any configuration
+- **THEN** the host's tool registry holds no plugin-registered tool that creates a child session, and the native `subagent` tool is the only one that does
+
+#### Scenario: A forge worker is dispatched natively
+
+- **WHEN** the forge primary calls the native `subagent` tool with `agent: "forge-<ns>-coder"` and a task prompt
+- **THEN** the call returns a child session id immediately, the child runs the `forge-<ns>-coder` agent in the parent's directory (a pinned worker on its pinned model, an Auto worker on the parent's model), and the host delivers the child's final message to the parent
+
+#### Scenario: The plugin neither polls nor re-wakes
+
+- **WHEN** a native child completes, fails, or is cancelled
+- **THEN** the host owns actual subagent completion notification; any harness continuation is a separate scheduling observation — the plugin injects no completion wake, no progress notice, and no retry
+
+#### Scenario: A failed child is not respawned
+
+- **WHEN** a native child ends in an error
+- **THEN** no automatic retry spawns a second child; the parent receives the host's message carrying the error and decides whether to dispatch again
+
+#### Scenario: Nothing brings the engine back
+
+- **WHEN** forge.json carries a top-level `dispatch` node, an old `FORGE_DISPATCH_*` environment variable is set, or a stale workspace dispatch journal exists
+- **THEN** none of them is honored; the node and each variable are ignored with a bounded finding; and no cap, queue, circuit breaker, retry, reaping, or restart recovery runs
+
+### Requirement: Dispatch gates enforced on the native subagent tool
+
+Every dispatch gate the plugin enforced on its own `task` tool SHALL be enforced by the plugin's tool-execute interception belt on calls of the host's native `subagent` tool — the host's `execute.before` tool hook, whose rejection refuses the call before the tool runs — so that retiring the engine removes no gate. The belt SHALL judge each call by the directory the calling session resolves to ('Session directory resolved per session on multi-location hosts') and by the agent the call names as its target; no gate SHALL key on the calling session's own agent:
+
+- a `forge-*` target outside the calling session’s exclusive workspace roster or, only without a workspace pool, its global fallback roster SHALL be refused with the cross-workspace refusal and its exits ('Workspace pool ownership and global fallback');
+- a `forge-*` target called from a session with an active plan draft SHALL meet the draft's dispatch gate ('Workers are not dispatched while a plan draft is active');
+- a `forge-*` target called from a crew-governed session SHALL meet the crew pending and pool-compliance belts (see crew-harness).
+
+A call whose target is not a `forge-*` agent SHALL carry no pool gate and no crew-compliance gate (the crew pending belt is keyed on the session and applies to every call). Every refusal SHALL be decided before any child session is created and SHALL reach the model as the call's error carrying the belt's own message — the gate named, with its way out. A session the belt cannot place SHALL keep the fail-open posture with a disclosure. The gates SHALL key on the host's `subagent` tool name, kept in the plugin's single native-tool vocabulary with its drift-mirror test — never on a plugin tool name (a `task` key in a worker's permission map is the host's to normalize onto `subagent`; it is not a tool name the belt matches).
+
+#### Scenario: Cross-pool dispatch is refused on the native tool
+
+- **WHEN** a session in workspace A calls the native `subagent` tool for `forge-<nsB>-coder`, whose pool origin is workspace B's forge.json
+- **THEN** the call is refused by the belt before any child session is created, with the same finding and exits as the cross-workspace refusal always carried
+
+#### Scenario: Own-pool dispatch flows
+
+- **WHEN** a session whose workspace pool is workspace A's forge.json calls the native `subagent` tool for `forge-<nsA>-coder`
+- **THEN** the call is admitted, the host creates the child, and the plugin adds no refusal, notice, or wake of its own
+
+#### Scenario: A non-forge target is not pool-gated
+
+- **WHEN** a forge-family session calls the native `subagent` tool for a host agent such as `general`
+- **THEN** no pool gate fires and the host serves the call on its own terms
+
+#### Scenario: A non-forge session may dispatch a forge worker under the same gates
+
+- **WHEN** a session driven by a non-forge agent calls the native `subagent` tool for a `forge-*` worker of that session's own workspace pool
+- **THEN** the call is admitted exactly as the same call from the forge primary would be — no gate keys on the calling agent — and the host creates the child
+
+#### Scenario: A refused call creates no child
+
+- **WHEN** the belt refuses a native `subagent` call
+- **THEN** the host creates no child session and the refusal reaches the model as the tool call's error
+
+#### Scenario: The refusal reaches the model in the belt's words
+
+- **WHEN** the belt refuses a native `subagent` call
+- **THEN** the error text the model reads is the belt's own refusal — naming the gate and the way out — never a bare denial
+
+#### Scenario: The gate keys on the host's action name
+
+- **WHEN** a worker's permission map names the dispatch action as `task`
+- **THEN** the host evaluates it as `subagent`, the belt judges the call as a `subagent` call, and the name `subagent` is locked by the same drift-mirror test that locks the rest of the native tool vocabulary
+
+### Requirement: Workers cannot ask the user a question
+
+Every `forge-*` worker definition the plugin compiles — a native agent file or a runtime draft — SHALL deny the worker the host's `question` action — the same choice the host ships for its own background subagents `general` and `explore` — so that a worker running as a background child has no question tool and never parks on a question nobody answers. The denial SHALL sit in the compiled definition's own permission face, beside the recursion ban on the host's `subagent` action. The recursion ban SHALL stand for every shape and SHALL NOT be liftable by a recipe. An explicit `permission` entry in the worker's recipe SHALL win for every other tool — `question` included: the pool author's explicit statement wins, and the README SHALL say that a worker allowed to ask will wait for an answer a background child never gets. The plugin SHALL NOT use a hook to deny questions to agents that are not `forge-*` workers — those are the user's own configuration.
+
+#### Scenario: A worker has no question tool
+
+- **WHEN** a `forge-*` worker dispatched as a native subagent tries to ask the user something
+- **THEN** it has no question tool and proceeds without blocking — it never parks on an unanswered question
+
+#### Scenario: The denial is in the compiled worker definition
+
+- **WHEN** the plugin compiles a `forge-*` worker (a native agent file or a runtime draft)
+- **THEN** its permission face denies `question` and the host's `subagent` action, alongside the shape-derived entries
+
+#### Scenario: A recipe cannot lift the recursion ban
+
+- **WHEN** a recipe entry's `permission` map sets `task` to anything other than deny
+- **THEN** the compiled worker is still denied the host's `subagent` action
+
+#### Scenario: A recipe cannot lift the recursion ban by the native name
+
+- **WHEN** a recipe entry's `permission` map sets `subagent` to `allow`
+- **THEN** the compiled worker is still denied the host's `subagent` action, and the tool list the host offers a session running that worker carries no dispatch tool
+
+#### Scenario: A recipe may re-enable the question tool explicitly
+
+- **WHEN** a recipe entry's `permission` map sets `question` to `allow`
+- **THEN** the compiled worker keeps its question tool — the explicit statement wins — while the recursion ban stands
+
+### Requirement: Workers are not dispatched while a plan draft is active
+
+While the session has an active plan draft, the plugin's tool-execute interception belt SHALL enforce the draft's dispatch gate on native `subagent` calls, exactly as it enforced it on its own `task` calls. The gate SHALL be decided by the TARGET, read from the recipe, in the terms plan-harness 'Hard write ban during draft' defines, and SHALL be no looser than before the builtin shell was opened to readonly workers: a call whose target is a `forge-*` worker of effective readonly shape SHALL flow as a reconnaissance dispatch, and every other `subagent` call — a write-shape worker, a readonly worker that keeps the shell, a non-forge agent target, an absent or unresolvable target — SHALL be refused with the draft refusal naming the dispatchable effective-readonly roster and the exits (`plan_approve` / discard). A follow-up call to an existing child SHALL be judged by the agent it names, like a new dispatch. The gate SHALL be decided before any child session is created and SHALL lift when the plan is approved or discarded.
+
+A qualified scout SHALL have a current compatible materialized definition matching the recipe and the host's effective permission face. Ordinary host permissions still govern the call and child; `execute.before` admission alone is not proof of a successful dispatch. Where the permission chain or materialized definition does not establish the required face, disclose and refuse qualification until corrected through authorized sync, not treating an old generated artifact as evidence.
+
+#### Scenario: Draft blocks a write worker
+
+- **WHEN** the session has an active plan draft and calls the native `subagent` tool for a write-shape `forge-*` worker
+- **THEN** the call is refused with the draft refusal before any child session is created
+
+#### Scenario: Draft lets a shell-less effective-readonly worker through
+
+- **WHEN** the session has an active plan draft and calls the native `subagent` tool for a `forge-*` worker of effective readonly shape
+- **THEN** the host admits the call through normal permissions, creates the qualified child with the effective readonly face and delivers its reconnaissance report; before-hook admission alone is insufficient
+
+#### Scenario: Draft blocks a readonly worker that keeps the shell
+
+- **WHEN** the session has an active plan draft and calls the native `subagent` tool for a `forge-*` worker of readonly shape whose recipe leaves the shell available
+- **THEN** the call is refused — during a draft no worker that can run a command or write a file is dispatched
+
+#### Scenario: Draft blocks a non-forge target
+
+- **WHEN** the session has an active plan draft and calls the native `subagent` tool for a non-forge agent
+- **THEN** the call is refused like any write-class tool during a draft
+
+#### Scenario: A follow-up is judged by the agent it names
+
+- **WHEN** the session has an active plan draft and calls the native `subagent` tool with an existing child's session id and the agent `general`
+- **THEN** the call is refused like a new dispatch to that agent would be
+
+### Requirement: Worker prompts and descriptions name the native dispatch path
+
+The namespaced worker description and prompt body the plugin compiles — for a native agent file or a runtime draft — SHALL describe work in the native path's terms. They SHALL NOT mention a `task` tool, `subagent_type`, `run_in_background`, `forge_shell`, `forge_jobs`, task handles, completion wakes, or report files, and SHALL NOT prefer `forge_grep` / `forge_glob` over the builtin search tools. The description SHALL tell the dispatching model to call the host's `subagent` tool with the worker's agent id. The prompt SHALL tell a worker that it is a background subagent whose final message is its report, that it cannot ask the user, that it searches with the builtin `grep` / `glob` tools and runs commands with the builtin shell, that a long-running command goes through the shell's `background` parameter and the host re-wakes it when the command exits (never poll or sleep), and that a commit uses `-m` / `--no-edit`, since the builtin shell's editor and pager behavior is the host's.
+
+#### Scenario: No compiled text names the retired surface
+
+- **WHEN** the plugin's compiled worker descriptions and prompt bodies are inspected
+- **THEN** none of them mentions `task`, `subagent_type`, `run_in_background`, `forge_shell`, `forge_jobs`, a task handle, a completion wake, or a report file, and none prefers `forge_grep` / `forge_glob`
+
+#### Scenario: The compiled text teaches the native path
+
+- **WHEN** the plugin's compiled worker descriptions and prompt bodies are inspected
+- **THEN** the description names the `subagent` tool and the worker's agent id, and the prompt states that the worker is a background subagent, that its final message is its report, that it cannot ask the user, how to run a long command, and how to commit

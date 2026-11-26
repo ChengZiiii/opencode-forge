@@ -2,15 +2,19 @@
 
 ## 项目简介
 
-单一通用 agent **forge** + 双正交 harness 的 opencode 插件。**plan
-harness**（决策优先）：plan 落盘 `.opencode/plan/`、结构由工具校验、
-draft 期写操作权限层硬禁、`plan_approve` 钉死 ask（用户
-确认框即批准门）、`plan_close` 插件验证式完成门（冻结 checks 宿主
-重跑，fail-closed，无模态）、`plan_tick` 打勾带时间戳审计。**goal harness**
-（执行优先）：目标契约落盘 `.opencode/goal/`、idle 续跑引擎在
-turn/分钟预算内自主推进、完成门由插件**在宿主机上重跑全部验证项**
-（fail-closed）、无进展/传输失败/预算耗尽/草稿冲突自动暂停。三工作流
-（OpenSpec / plan / goal）语义零耦合，仅安全互操作（draft 禁写优先）。
+单一通用 agent **forge** + **Plan / Goal / Crew 三 harness** 的 opencode v2 插件。
+执行走宿主原生 `shell`，派发走原生 `subagent`，消息续用与完成通知由宿主管理；
+插件保留会话/权限治理，不再提供通用执行、作业监管或自建派发运行时。
+**Plan**（决策优先）：计划落盘 `.opencode/plan/`，结构校验、draft 写禁、
+`plan_approve` 用户确认、`plan_tick` 时间戳审计；`plan_close` 重跑冻结 checks，
+fail-closed，无新增确认框。**Goal**（执行优先）：契约落盘 `.opencode/goal/`，
+五态、turn/分钟预算、idle 续跑、具体 blocker 暂停与完成检查/确认门。
+**Crew**（编排与证据）：声明及报告落盘 `.opencode/crew/`，治理原生派发波次、
+等待、授权与 close 对账；不替宿主创建孩子或补发完成通知。
+Plan/Goal 共用 `src/run-check.ts`、`src/proc.ts`、`src/shell-select.ts` 的有限验证
+执行器与解释器链，**不随通用执行面退役**，不声称与用户自定义 native shell 等价。
+OpenSpec 与三个 harness 各守文件契约，仅安全互操作（draft 禁写优先）；
+规范要求与实测覆盖分开，以主规格及归档任务中的证据/D6/过程偏差为准。
 
 - 行为规范：`openspec/specs/`（改行为前必读）
 - 用户文档：`README.md`（安装/卸载/文件账本/goal 章节）
