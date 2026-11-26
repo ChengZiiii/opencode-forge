@@ -22,14 +22,34 @@
 // `node --test tests/<file>` run is isolated too) gets the same thing; the
 // guard makes the double import a no-op.
 //
-// Deliberately NOT set here: FORGE_TEST_FORGE_HOME — the HOME alias for
-// config discovery (a different axis; it also carries the session-anchor
-// ledger, as it always has). Whether a test sees the real `~/.config` is that
-// test's own decision; this module only decides where the `<os-tmp>`
-// artifacts are written.
+// The suite also owns a fixture root. Ordinary real-disk recipe discovery
+// may only see files below this root; injected filesystem fixtures are
+// unaffected. Redirect OS temp so existing mkdtemp-based fixtures stay valid.
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+
+if (process.env.FORGE_TEST_FIXTURE_OWNER !== String(process.pid)) {
+  const root = mkdtempSync(join(tmpdir(), "forge-test-fixtures-"))
+  process.env.FORGE_TEST_FIXTURE_ROOT = root
+  process.env.FORGE_TEST_FIXTURE_OWNER = String(process.pid)
+  // An inherited host config override is not a test fixture. Tests that need
+  // one set it explicitly in their body, after the preload.
+  delete process.env.OPENCODE_CONFIG_DIR
+  delete process.env.FORGE_TEST_FORGE_HOME
+  process.on("exit", () => {
+    try { rmSync(root, { recursive: true, force: true }) } catch {}
+  })
+}
+const root = process.env.FORGE_TEST_FIXTURE_ROOT
+for (const key of ["TMPDIR", "TMP", "TEMP"]) process.env[key] = root
+if (!process.env.FORGE_TEST_FORGE_HOME) {
+  const home = mkdtempSync(join(root, "home-"))
+  process.env.FORGE_TEST_FORGE_HOME = home
+  process.on("exit", () => {
+    try { rmSync(home, { recursive: true, force: true }) } catch {}
+  })
+}
 
 if (!process.env.FORGE_TEST_RUNTIME_DIR) {
   const dir = mkdtempSync(join(tmpdir(), "forge-test-ns-"))

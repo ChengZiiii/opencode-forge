@@ -131,11 +131,11 @@ test("A3: the host gives nothing → the plugin default, and the tool result NAM
   const latest = await init(dirB)
 
   // A text result from a session with no record at all.
-  const res = await latest.state.tools.get("forge_jobs").execute({ action: "list" }, realCtx("ses-a3-note"))
+  const res = await latest.state.tools.get("plan_write").execute({ goal: "anchor report", context: "c", approach: "a", tasks: ["t"], risks: "r", acceptance: ["a"] }, realCtx("ses-a3-note"))
   const note = `[forge] The host gave no workspace for this session (no directory in the session record), so this call ran in the plugin's default directory: ${dirB}`
   assert.ok(String(res.content).endsWith("\n\n" + note), `the result ends with the one naming sentence; got: ${res.content}`)
   assert.equal(String(res.content).split("[forge] The host gave no workspace").length, 2, "named exactly once")
-  assert.match(String(res.title), /^jobs \(\d+\)$/, "the result itself is unchanged")
+  assert.ok(String(res.content).length > note.length, "the tool result is preserved before the note")
 
   await bindVia(latest.state, "ses-a3-bind")
   assert.equal(surface.worktreeOf("ses-a3-bind"), dirB, "the default is still the last resort")
@@ -152,33 +152,6 @@ test("A3: the host gives nothing → the plugin default, and the tool result NAM
   const blind = await surface.resolveToolContext(realCtx("ses-a3-blind"), undefined)
   assert.equal(blind.context.worktree, dirB)
   assert.equal(blind.defaultDirectory, dirB)
-})
-
-test("A4: a dispatch child is bound to the owner's resolved directory the moment it exists", async (t) => {
-  const dirA = mk("forge-anchor-a4-owner-")
-  const dirB = mk("forge-anchor-a4-latest-")
-  await init(dirA)
-  const latest = await init(dirB)
-  const sid = "ses-a4-owner"
-  latest.state.sessionRecords.set(sid, { sessionID: sid, location: { directory: dirA } })
-  t.after(async () => {
-    try {
-      await latest.state.tools.get("forge_jobs").execute({ action: "stop" }, { sessionID: sid, worktree: dirA, directory: dirA, metadata: () => {}, message: async () => {} })
-    } catch {}
-  })
-
-  const res = await latest.state.tools.get("task").execute({ subagent_type: "general", prompt: "anchor probe", description: "anchor probe", run_in_background: true }, realCtx(sid))
-
-  assert.ok(/task id|dispatched/i.test(String(res.content ?? res)), "an async handle returns")
-  assert.equal(latest.state.creates.length, 1, "one child was created")
-  const flat = latest.state.creates[0]
-  assert.equal(flat.parentID, sid)
-  assert.equal(flat.directory, dirA, "the child is created in the owner's resolved directory (not the default dirB)")
-  // The mock's create seam answers with the bare record `ses_mockchild_<n>`.
-  const childId = "ses_mockchild_1"
-  assert.equal(surface.worktreeOf(childId), dirA, "bound to it at creation — no window before the child's first tool call")
-  // The owner itself was resolved from its record.
-  assert.equal(surface.worktreeOf(sid), dirA)
 })
 
 test("A5: single-directory initialization — resolution and results as before", async () => {
@@ -201,9 +174,9 @@ test("A5: single-directory initialization — resolution and results as before",
   assert.equal(bare.context.worktree, dirA, "the directory resolution does not depend on it")
   assert.equal(typeof r.context.metadata, "function")
 
-  const res = await only.state.tools.get("forge_jobs").execute({ action: "list" }, realCtx(sid))
-  assert.doesNotMatch(String(res.content), /default directory/, "a byte-identical result: no naming sentence")
-  assert.match(String(res.title), /^jobs \(\d+\)$/)
+  const res = await only.state.tools.get("plan_write").execute({ goal: "anchor report", context: "c", approach: "a", tasks: ["t"], risks: "r", acceptance: ["a"] }, realCtx(sid))
+  assert.doesNotMatch(String(res.content), /default directory/, "no naming sentence when the host supplies a directory")
+  assert.ok(String(res.content).length > 0)
 
   // Level 2 keeps precedence over the record: a session already bound in
   // memory is not re-resolved (the pre-existing contract, untouched).

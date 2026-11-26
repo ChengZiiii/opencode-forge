@@ -21,17 +21,8 @@ process.on("exit", () => {
   } catch {}
 })
 
-import { server, v2Setup, FORGE_COMMAND_TEMPLATE, GLOBAL_RECIPE_SCAFFOLD_JSONC } from "../plugin.ts"
+import { v2Setup, v2WiringSeam, FORGE_COMMAND_TEMPLATE, GLOBAL_RECIPE_SCAFFOLD_JSONC } from "../plugin.ts"
 import { createV2MockContext } from "./lib/v2-mock-context.mjs"
-
-const input = (dir) => ({
-  client: { session: {} },
-  project: { id: "p" },
-  directory: dir,
-  worktree: dir,
-  serverUrl: new URL("http://127.0.0.1:1"),
-  $: () => {},
-})
 
 const allowCtx = (sessionID) => ({
   sessionID,
@@ -39,13 +30,6 @@ const allowCtx = (sessionID) => ({
   metadata: () => {},
   message: async () => {},
 })
-
-let lastHost = null
-async function startServer(inputArg, opts) {
-  if (lastHost) lastHost.__forgeSubagentsTest.resetAnchors()
-  lastHost = await server(inputArg, opts)
-  return lastHost
-}
 
 // ---------------------------------------------------------------------------
 // Template content (design D1/D2/D3)
@@ -63,10 +47,11 @@ test("/forge template: one command, $ARGUMENTS routing — all four forms plus t
   assert.match(t, /\/forge sync \(force a roster sync NOW/)
   assert.match(t, /\/forge init \(draft this workspace's forge\.json/)
   assert.match(t, /\/forge init global \(draft the global forge\.json/)
-  // fix-stop-cancels-queued-wishes (0.34.0): the help line names the queued
-  // half too, and so does the stop route's own instruction.
-  assert.match(t, /\/forge stop \(cancel THIS session's in-flight and queued async dispatches\)/)
-  assert.match(t, /every QUEUED wish of this session \(removed from the queue before it can spawn/)
+  // The queue is retired; the approved stop contract still requires stopping
+  // confirmed child sessions and their background commands, scoped to this session.
+  assert.match(t, /\/forge stop \(/)
+  assert.match(t, /(?:request|stop|cancel)[^.\n]*(?:child sessions|subagents)/i, "stop must request cancellation of this session's children")
+  assert.match(t, /relay the command receipt/, "stop relays the command execution receipt")
 })
 
 test("/forge template: FAMILY GUARD step-0 names the forge agent and the forge_sync tool", () => {
@@ -124,29 +109,6 @@ test("/forge template: the commands never write — every write rides a tool, tr
 // Registration — v1 config hook domain
 // ---------------------------------------------------------------------------
 
-test("v1 config hook registers command.forge (template constant, no-clobber on a user-defined entry)", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-cmds-v1-"))
-  t.after(() => {
-    try {
-      rmSync(dir, { recursive: true, force: true })
-    } catch {}
-  })
-  const h = await startServer(input(dir), {})
-  t.after(() => h.dispose?.())
-  const cfg = { agent: {}, command: {}, permission: {} }
-  await h.config(cfg)
-  const cmd = cfg.command["forge"]
-  assert.ok(cmd, "command.forge registered")
-  assert.equal(cmd.template, FORGE_COMMAND_TEMPLATE, "byte-identical template constant")
-  assert.match(cmd.description, /roster levers/)
-  assert.match(cmd.description, /init global/)
-
-  // no-clobber: a user-defined /forge of their own is never overwritten
-  const cfg2 = { agent: {}, command: { forge: { template: "MINE", description: "user owned" } }, permission: {} }
-  await h.config(cfg2)
-  assert.equal(cfg2.command.forge.template, "MINE")
-})
-
 // ---------------------------------------------------------------------------
 // Registration — v2 command domain
 // ---------------------------------------------------------------------------
@@ -158,9 +120,11 @@ test("v2 command domain registers the forge command (execute-type, sends the sam
   const cmd = state.commands.get("forge")
   assert.ok(cmd, "the v2 command editor carries 'forge'")
   assert.match(cmd.description, /roster levers/)
+  assert.match(cmd.description, /init global/)
   assert.equal(typeof cmd.execute, "function")
+  state.sessionRecords.set("ses_v2_forge", { agent: "forge" })
   await cmd.execute({ sessionID: "ses_v2_forge" })
-  const sent = state.prompts.find((p) => p?.text === FORGE_COMMAND_TEMPLATE)
+  const sent = state.prompts.find((p) => p?.text === FORGE_COMMAND_TEMPLATE.split("\n").filter(line => !line.startsWith("FAMILY GUARD")).join("\n"))
   assert.ok(sent, "the executable sends the SAME constant template into the invoking session")
   assert.equal(sent.sessionID, "ses_v2_forge")
 })
@@ -176,11 +140,13 @@ test("crew_begin unconfigured refusal names the /forge init levers alongside the
       rmSync(dir, { recursive: true, force: true })
     } catch {}
   })
-  const h = await startServer(input(dir), {})
-  t.after(() => h.dispose?.())
-  await h.config({ agent: {}, command: {}, permission: {} })
+  const { ctx, state } = createV2MockContext()
+  v2WiringSeam.resetHostAnchors()
+  state.sessionRecords.set("ses_gate_levers", { id: "ses_gate_levers", directory: dir, worktree: dir })
+  const cleanup = await v2Setup(ctx, { anchors: [dir], materialize: "runtime" })
+  t.after(() => cleanup?.())
   await assert.rejects(
-    () => h.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, allowCtx("ses_gate_levers")),
+    () => state.tools.get("crew_begin").execute({ objective: "o", subtasks: [{ title: "x" }] }, { ...allowCtx("ses_gate_levers"), agent: "forge" }),
     (err) => {
       const m = String(err)
       assert.match(m, /CREW IS NOT INITIALIZED/)

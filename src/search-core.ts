@@ -1,5 +1,5 @@
 // forge-search-tools (change forge-search-tools, design D1-D5): the PURE
-// function core for `forge_grep` / `forge_glob`. No @opencode-ai imports, no
+// function core for local grep / glob. No @opencode-ai imports, no
 // spawn, no fs access at module scope — every environment touch (realpath
 // resolution, existence checks, PATH) is an injectable seam. Wired in
 // plugin.ts by a later task through src/proc.ts `shellSpawn` with shell:false.

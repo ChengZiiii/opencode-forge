@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://unpkg.com/@sorenllm/opencode-forge@latest/dist/forge.schema.json",
   "title": "opencode-forge forge.json",
-  "description": "Static worker subagent definitions for the opencode-forge plugin. The file is JSONC (comments and trailing commas allowed). Validation in the plugin is field-level fail-soft: a bad entry is skipped with a finding while its siblings still apply; this schema is an editor-side convenience mirror of that surface, not the enforcement. The plugin only ever READS this file.",
+  "description": "Static worker subagent definitions for the opencode-forge plugin. The file is JSONC (comments and trailing commas allowed). Validation in the plugin is field-level fail-soft: a bad entry is skipped with a finding while its siblings still apply; this schema is an editor-side convenience mirror of that surface, not the enforcement. The plugin only ever READS this file. Retired jobs, watchdog and dispatch runtime keys are ignored with one warning per present key; they are not recipe fields.",
   "type": "object",
   "properties": {
     "$schema": {

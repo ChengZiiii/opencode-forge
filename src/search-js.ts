@@ -41,7 +41,7 @@ function escapeReChar(c: string): string {
  * Regex specials are escaped everywhere else. Unclosed `[` / `{` degrade to
  * literal characters — exotic constructs under-match, never throw.
  */
-function translateGlob(pat: string): string {
+function translateGlob(pat: string, strict = false): string {
   let out = ""
   let i = 0
   while (i < pat.length) {
@@ -99,6 +99,7 @@ function translateGlob(pat: string): string {
         k++
       }
       if (close === -1 || close === j) {
+        if (strict) throw new Error("Invalid glob: unclosed or empty character class")
         // Unclosed or empty class → literal `[` (exotic under-match).
         out += "\\["
         i++
@@ -127,12 +128,13 @@ function translateGlob(pat: string): string {
     } else if (c === "{") {
       const close = pat.indexOf("}", i + 1)
       if (close === -1) {
+        if (strict) throw new Error("Invalid glob: unclosed alternative")
         out += "\\{"
         i++
         continue
       }
       const alts = pat.slice(i + 1, close).split(",")
-      out += "(?:" + alts.map((a) => translateGlob(a)).join("|") + ")"
+      out += "(?:" + alts.map((a) => translateGlob(a, strict)).join("|") + ")"
       i = close + 1
     } else {
       out += escapeReChar(c)
@@ -166,6 +168,11 @@ export function globToRegExp(pattern: string): RegExp {
   }
   globRegexCache.set(pattern, re)
   return re
+}
+
+/** Strict query validation for the native-name search override. */
+export function strictGlobToRegExp(pattern: string, anchored = pattern.includes("/")): RegExp {
+  return new RegExp((anchored ? "^" : "(?:^|/)") + translateGlob(pattern, true) + "$")
 }
 
 /** Match a glob pattern against a walk-relative forward-slash path. */

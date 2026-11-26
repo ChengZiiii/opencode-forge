@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync, utimesSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -9,7 +9,7 @@ import { join } from "node:path"
 //      real SessionPrompt carries NO agent field, so family capture rides
 //      the context hook's SessionContext.agent) + "context"
 //      (thoughtLevel injection onto event.options + family-gated system
-//      injections incl. the forge_shell channel mandate + plan/goal
+//      injections incl. plan/goal
 //      notices) + "compaction" (goal-brief reinjection onto event.context)
 //      + "experimental.idle" (the W6a idle edge — see v2-continuation).
 //      Fail-open posture: garbage events never throw, unknown sessions
@@ -26,7 +26,7 @@ import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 process.env.FORGE_TEST_NO_FENCE = "1"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 
-import { v2Setup, v2WiringSeam, PLAN_COMMAND_TEMPLATE, GOAL_COMMAND_TEMPLATE, FORGE_COMMAND_TEMPLATE } from "../plugin.ts"
+import { resetServiceHttpDiscoveryForTests, v2Setup, v2WiringSeam, PLAN_COMMAND_TEMPLATE, GOAL_COMMAND_TEMPLATE, FORGE_COMMAND_TEMPLATE } from "../plugin.ts"
 
 const HOME = join(tmpdir(), "forge-v2-sess-home")
 process.env.FORGE_TEST_FORGE_HOME = HOME
@@ -71,10 +71,10 @@ test("v2 session: drift — missing/not-function register nothing; garbage event
 
 // ---------------------------------------------------------------------------
 // prompt (busy marking) + context (family capture / system injections /
-// channel mandate)
+// plan/goal notices)
 // ---------------------------------------------------------------------------
 
-test("v2 session: prompt marks the session busy (SessionPrompt shape, no agent); context captures the family and injects job guidance into forge-family sessions only", async () => {
+test("v2 session: prompt marks the session busy (SessionPrompt shape, no agent); context preserves ordinary system text without retired job guidance", async () => {
   const dir = mkdtempSync(join(tmpdir(), "forge-v2-sc-cap-"))
   const { prompt, context } = await setup(dir)
   try {
@@ -82,13 +82,12 @@ test("v2 session: prompt marks the session busy (SessionPrompt shape, no agent);
     // delivery} — NO agent field; the prompt hook only marks busy.
     await prompt({ sessionID: "ses_f", messageID: "msg_1", prompt: { text: "go" }, delivery: "steer" })
     // Family capture rides the CONTEXT hook (SessionContext.agent).
-    const out = { system: [], options: {} }
+    const out = { system: ["host system prompt"], options: {} }
     await context({ sessionID: "ses_f", agent: "forge", ...out })
-    assert.equal(out.system.length, 1, "guidance landed on the event's own system array")
-    assert.match(out.system[0], /^\[forge:job-guidance\]/)
-    // Channel mandate (default partition): the HARD wording.
-    assert.match(out.system[0], /Every shell command — quick ones included/)
-    assert.match(out.system[0], /refused on this agent/)
+    assert.deepEqual(out.system, ["host system prompt"])
+    const worker = { system: [] }
+    await context({ sessionID: "ses_worker", agent: "forge-global-research", ...worker })
+    assert.doesNotMatch(worker.system.join(" "), /forge_shell|forge_jobs|job-guidance|run_in_background/)
     // Unknown session: fail-silent — no forge-authored text at all.
     const out2 = { system: [] }
     await context({ sessionID: "ses_anon", agent: "build", ...out2 })
@@ -148,10 +147,49 @@ test("v2 session: context injects the pinned thoughtLevel onto event.options; fr
     const out2 = { options: {} }
     await context({ sessionID: "ses_dep1", agent: "forge-depth-research", model: { providerID: "anthropic", id: "claude-x" }, ...out2 })
     assert.equal(out2.options.reasoningEffort, "low", "frozen translation re-applies verbatim")
+    out1.options.reasoningEffort = "TAMPERED"
+    await context({ sessionID: "ses_dep1", agent: "forge-depth-research", model: { providerID: "openai", id: "gpt" }, ...out1 })
+    assert.equal(out1.options.reasoningEffort, "low", "the frozen pin overwrites tampered options")
+    const fresh = { options: {} }
+    await context({ sessionID: "ses_dep_fresh", agent: "forge-depth-research", model: { providerID: "openai", id: "gpt" }, ...fresh })
+    assert.equal(fresh.options.reasoningEffort, "low", "a fresh session resolves the same pin")
     // Non-forge agent: no depth keys.
     const out3 = { options: {} }
     await context({ sessionID: "ses_dep2", agent: "build", model: { providerID: "openai", id: "gpt" }, ...out3 })
     assert.deepEqual(out3.options, {})
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("v2 session: depth channel fallback matrix", async (t) => {
+  v2WiringSeam.resetHostAnchors()
+  const dir = poolDir("matrix", {
+    unknown: { model: "weird/m", thoughtLevel: "XHigh" },
+    unknownlow: { model: "weird/m", thoughtLevel: "low" },
+    mixed: { model: "openai/gpt", thoughtLevel: "XHigh" },
+    old: { model: "anthropic/claude-4-6", thoughtLevel: "high" },
+    adaptive: { model: "anthropic/claude-opus-4-7", thoughtLevel: "xhigh" },
+    dead: { model: "anthropic/claude-opus-4-6", thoughtLevel: "ultra" },
+  })
+  try {
+    const warn = t.mock.method(console, "warn", () => {})
+    const { context } = await setup(dir)
+    const call = async (sid, agent, providerID, id, key = "id") => {
+      const options = {}
+      await context({ sessionID: sid, agent: `forge-matrix-${agent}`, model: { providerID, [key]: id }, options })
+      return options
+    }
+    assert.deepEqual(await call("matrix-u", "unknown", "weird", "m"), { reasoningEffort: "xhigh" })
+    assert.deepEqual(await call("matrix-ulow", "unknownlow", "weird", "m"), { reasoningEffort: "low" })
+    assert.deepEqual(await call("matrix-mixed", "mixed", "openai", "gpt"), { reasoningEffort: "xhigh" })
+    assert.deepEqual(await call("matrix-old", "old", "anthropic", "claude-4-6"), { thinking: { type: "enabled", budget_tokens: 24576 } })
+    assert.deepEqual(await call("matrix-new", "adaptive", "anthropic", "claude-opus-4-7"), { effort: "xhigh" })
+    assert.deepEqual(await call("matrix-old-modelid", "old", "anthropic", "claude-4-6", "modelID"), { thinking: { type: "enabled", budget_tokens: 24576 } })
+    assert.deepEqual(await call("matrix-new-modelid", "adaptive", "anthropic", "claude-opus-4-7", "modelID"), { effort: "xhigh" })
+    assert.deepEqual(warn.mock.calls.filter(c => c.arguments.join(" ").includes("[forge:depth]")), [], "valid channels do not emit a finding")
+    assert.deepEqual(await call("matrix-dead", "dead", "anthropic", "claude-opus-4-6"), {})
+    assert.deepEqual(await call("matrix-dead", "dead", "openai", "gpt"), {})
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -214,7 +252,7 @@ test("v2 model pin: identity-equal rewrite preserves the host variant; a model s
 
 test("v2 session: compaction reinjects the goal brief for a live-goal forge session; silent otherwise", async () => {
   const dir = mkdtempSync(join(tmpdir(), "forge-v2-sc-goal-"))
-  const { state, compaction } = await setup(dir)
+  const { state, compaction, context } = await setup(dir)
   try {
     await state.tools.get("goal_write").execute(
       { goal: "make the suite green", criteria: ["all tests pass"], checks: [{ shell: "node --test" }], constraints: "none", arm: true },
@@ -227,6 +265,16 @@ test("v2 session: compaction reinjects the goal brief for a live-goal forge sess
     assert.match(ev.context[0], /\[forge:goal-brief\]/)
     assert.match(ev.context[0], /make the suite green/)
     assert.match(ev.context[0], /1\. all tests pass/)
+    // The same goal owner under a non-forge speaker must not receive the brief.
+    await context({ sessionID: "ses_goal", agent: "build", system: [] })
+    const switched = { context: [] }
+    await compaction({ sessionID: "ses_goal", agent: "build", ...switched })
+    assert.deepEqual(switched.context, [])
+    await context({ sessionID: "ses_goal", agent: "forge", system: [] })
+    const resumed = { context: [] }
+    await compaction({ sessionID: "ses_goal", agent: "forge", ...resumed })
+    assert.equal(resumed.context.length, 1)
+    assert.match(resumed.context[0], /\[forge:goal-brief\]/)
     // Non-forge / unknown sessions: nothing.
     const ev2 = { context: [] }
     await compaction({ sessionID: "ses_goal_other", agent: "build", ...ev2 })
@@ -253,6 +301,14 @@ test("v2 session: goal-notice rides the context system injections for the live-g
     const notice = out.system.find((s) => s.startsWith("[forge:goal-notice]"))
     assert.ok(notice, "goal notice injected")
     assert.match(notice, /status: active/)
+    assert.match(notice, /wait for verified settlement of any outstanding crew rounds before advancing/)
+    assert.match(notice, /without polling or sleeping/)
+    assert.match(notice, /if globally blocked call goal_pause with the concrete blocker/)
+    assert.match(notice, /if independent authorized work remains after a local issue continue that work/)
+    assert.match(notice, /already accepted host work may finish/)
+    assert.match(notice, /minute budget still runs;.*stop at either budget limit/)
+    assert.match(notice, /asks the user/)
+    assert.doesNotMatch(notice, /forge_shell|forge_jobs|subagent_type|run_in_background/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -283,13 +339,33 @@ test("v2 commands: /forge stop route delivery — typed \"stop\" composes into t
     await state.commands.get("forge").execute({ sessionID: "ses_cmdstop", prompt: { text: "stop" } })
     const sent = state.prompts.find((p) => p.sessionID === "ses_cmdstop")
     assert.ok(sent, "the /forge execute delivered a prompt into the invoking session")
-    assert.ok(sent.text.includes('(forge roster levers. Argument: "stop")'), "the typed stop form composed into $ARGUMENTS")
-    assert.ok(sent.text.includes('- Argument "stop":'), "the stop route line rides the delivered template")
-    assert.match(sent.text, /forge_jobs with action "stop"/, "the stop route instructs the session-scoped forge_jobs stop action")
-    assert.equal(sent.text, FORGE_COMMAND_TEMPLATE.replaceAll("$ARGUMENTS", () => "stop"), "byte-identical composition of the router constant")
+    assert.match(sent.text, /forge stop receipt/)
+    assert.match(sent.text, /remaining count unknown/)
+    assert.doesNotMatch(sent.text, /forge_jobs|forge_shell/)
+    assert.doesNotMatch(sent.text, /forge_sync|Scaffold shape|FAMILY GUARD/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
+})
+
+test("v2 commands: /plan template carries native reconnaissance and planning discipline", () => {
+  const text = PLAN_COMMAND_TEMPLATE
+  assert.match(text, /using read\/glob when needed for routing/)
+  assert.match(text, /if draft, remain read-only and follow user review and approval below/)
+  assert.match(text, /Reconnaissance and alignment \(read-only\): explore with read\/grep\/glob/)
+  assert.match(text, /native subagent tool for breadth evidence from effective-readonly forge scouts both BEFORE and DURING the draft/)
+  assert.match(text, /current, compatible definition and effective host permissions/)
+  assert.match(text, /explicitly readonly recipe, deny all file-mutating tools \(write\/edit\/patch family\), and explicitly deny shell/)
+  assert.match(text, /Respect ordinary host permissions/)
+  assert.match(text, /all write tools and the builtin shell are DENIED while a draft exists/)
+  assert.match(text, /Write-shaped workers, readonly workers with shell, and non-forge agents must wait for approval/)
+  assert.match(text, /1-3 focused questions/)
+  assert.match(text, /never implement before approval succeeds/)
+  assert.match(text, /after approval succeeds, execute directly or dispatch via the native subagent tool, subject to ordinary host permissions/)
+  assert.match(text, /call plan_tick with the numbered step immediately after EACH step's work is actually done — never batch ticks/)
+  assert.match(text, /multiple sessions or days of multi-file change, or needing multi-round requirement review, is spec work \(e\.g\. OpenSpec\), not plan work/)
+  assert.doesNotMatch(text, /\b(?:task|forge_shell|skill)\b/i)
+  assert.doesNotMatch(text, /!`/)
 })
 
 test("v2 commands: invoking execute sends the byte-identical template into the invoking session", async () => {
@@ -300,18 +376,44 @@ test("v2 commands: invoking execute sends the byte-identical template into the i
     assert.ok(GOAL_COMMAND_TEMPLATE.startsWith("(forge goal harness routing."))
     // Invoke the executable: it sends the SAME constant text via the flat
     // {sessionID, text} prompt (W6a shape matrix).
+    for (const sessionID of ["ses_cmd1", "ses_cmd2", "ses_cmd3"]) state.sessionRecords.set(sessionID, { agent: "forge" })
     await state.commands.get("plan").execute({ sessionID: "ses_cmd1" })
     await state.commands.get("goal").execute({ sessionID: "ses_cmd2" })
     const texts = Object.fromEntries(state.prompts.map((p) => [p.sessionID, p.text]))
-    assert.equal(texts.ses_cmd1, PLAN_COMMAND_TEMPLATE, "plan template byte-identical")
-    assert.equal(texts.ses_cmd2, GOAL_COMMAND_TEMPLATE, "goal template byte-identical")
+    assert.equal(texts.ses_cmd1, PLAN_COMMAND_TEMPLATE.split("\n").filter(line => !line.startsWith("FAMILY GUARD")).join("\n"), "plan template byte-identical")
+    assert.equal(texts.ses_cmd2, GOAL_COMMAND_TEMPLATE.split("\n").filter(line => !line.startsWith("FAMILY GUARD")).join("\n"), "goal template byte-identical")
     // Crew composes through the SAME crewOrchestrationTemplate the v1
     // config hook uses; the roster leg names the materialized worker.
     await state.commands.get("crew").execute({ sessionID: "ses_cmd3" })
     const crew = state.prompts.find((p) => p.sessionID === "ses_cmd3")?.text ?? ""
     assert.ok(crew.startsWith("(forge crew"), "roster leg of the crew template")
+    assert.match(crew, /CREW ORCHESTRATION discipline/)
     assert.ok(crew.includes("forge-cmdt-research"), "the session-domain roster names the materialized worker")
-    assert.match(state.commands.get("crew").description, /register a declared subtask plan/)
+    assert.match(state.commands.get("crew").description, /register a declared subtask plan.*native subagent calls/)
+    assert.match(crew, /execution has NOT started.*END YOUR TURN/)
+    assert.match(crew, /native `subagent` calls made together/)
+    assert.match(crew, /Children work in the background; use host completion messages and available session evidence/)
+    assert.match(crew, /every work round of the previous wave is verified settled/)
+    assert.match(crew, /Reuse of a sessionID starts another work round/)
+    assert.match(crew, /A diagnostic is not permission to launch another wave/)
+    assert.match(crew, /unknown or incomplete evidence cannot establish PASS/)
+    assert.match(crew, /existing approval rules/)
+    assert.match(crew, /without polling or sleeping/)
+    assert.match(crew, /idle or missing sessions, and unresolved outcomes do not establish settlement/)
+    assert.match(crew, /A host terminal outcome alone does not establish PASS/)
+    assert.match(crew, /Native fallback: when the pool offers no forge worker fitting a subtask/)
+    assert.match(crew, /close evidence says it ran native/)
+    assert.match(crew, /no configured forge-\* agent matches/)
+    assert.doesNotMatch(crew, /non-primary|primary pool|forge_dispatch|\[forge:dispatch-complete\]/)
+    for (const phrase of [
+      "THE PAUSE", "may come from an approved plan, a spec change, or inline text",
+      "mutually exclusive within a wave", "`computer` tool", "abandon: true",
+      "optional `lineage` argument", "CONTRACT RELAY", "explicitly carry",
+      "never your paraphrase", "NEVER dropped for being too long",
+      "close-report evidence statement MUST name the contract",
+    ]) assert.ok(crew.includes(phrase), phrase)
+    assert.doesNotMatch(crew, /Proceed with the discipline: waves/)
+    assert.doesNotMatch(crew, /forge_shell|forge_jobs|subagent_type|run_in_background|native `task`/)
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -335,20 +437,40 @@ test("v2 commands: empty-pool host crew shows the NOT INITIALIZED guidance; re-r
     await v2Setup(m.ctx, { anchors: [empty] })
     s2 = m.state
     assert.match(s2.commands.get("crew").description, /NOT INITIALIZED/)
+    s2.sessionRecords.set("ses_empty", { agent: "forge" })
     await s2.commands.get("crew").execute({ sessionID: "ses_empty" })
     const text = s2.prompts.find((p) => p.sessionID === "ses_empty")?.text ?? ""
     assert.ok(text.includes(".opencode"), "init guidance points at the pool file")
+    // Ordinary setup guidance retained from forge-subagents-wiring: no
+    // host-config mutation is performed by invoking this command.
+    assert.match(text, /CREW IS NOT INITIALIZED/)
+    assert.match(text, /ONLY if the user explicitly asks/)
+    assert.match(text, /NO host restart is needed/)
+    assert.match(text, /thoughtLevel/)
+    assert.match(text, /"prompt"/)
+    assert.match(text, /SHORT prompt/)
+    assert.match(text, /"shape"/)
+    assert.match(text, /ABSENT shape defaults to WRITE/)
+    assert.match(text, /EXPLICIT `shape`/)
+    assert.match(text, /REQUIRED for crew-governed dispatch/)
+    assert.match(text, /WITHOUT the `forge-` prefix/)
+    assert.match(text, /only the ids `research` and `review` carry built-ins/)
+    assert.match(text, /every pool materializes as `forge-<ns>-<id>`/)
+    assert.match(text, /the global fallback materializes as `forge-global-<id>`/)
+    assert.doesNotMatch(text, /non-primary|primary pool/)
   } finally {
     process.chdir(prevCwd)
     rmSync(empty, { recursive: true, force: true })
   }
 })
 
-test("v2 commands: no get on the editor — v1 create-only is NOT implementable (documented drift); forge adds last", async () => {
+test("v2 commands: add-only editor uses last add; post config replay wins host collisions", async () => {
   const dir = mkdtempSync(join(tmpdir(), "forge-v2-sc-cmduser-"))
   const { ctx, state } = createV2MockContext()
-  // The v2 editor contract: add() only. A user command registered earlier is
-  // overwritten by forge's add (host-side last-wins; documented in design.md).
+  const userSync = { name: "forge-sync", template: "USER LEVER", description: "user sync command" }
+  state.commands.set(userSync.name, userSync)
+  // The mock's add-only editor replaces an earlier same-name add. This is
+  // editor-level ordering, not the final host config precedence.
   await ctx.command.transform(async (editor) => {
     editor.add({ name: "plan", description: "the user's own /plan", execute: async () => {} })
   })
@@ -356,6 +478,25 @@ test("v2 commands: no get on the editor — v1 create-only is NOT implementable 
   try {
     assert.equal(state.commands.get("plan").description.includes("forge plan harness"), true, "forge re-adds over the user def (drift vs v1 create-only)")
     assert.equal(state.commands.get("goal").description.includes("forge goal harness"), true, "siblings still register")
+
+    // Inert model of v2.4.0's post-plugin ConfigCommandPlugin replay: the
+    // host registry uses Map.set, so config metadata replaces the collision.
+    const pluginForge = state.commands.get("forge")
+    assert.ok(pluginForge, "plugin /forge must register")
+    assert.strictEqual(state.commands.get("forge-sync"), userSync, "retired user command remains untouched")
+    assert.deepEqual(state.commands.get("forge-sync"), { name: "forge-sync", template: "USER LEVER", description: "user sync command" })
+    const registry = new Map(state.commands)
+    for (const name of ["plan", "goal", "crew"]) {
+      assert.ok(state.commands.has(name), `${name} must be registered before host config replay`)
+      const configured = { name, description: `configured /${name}`, template: "configured template", agent: "configured-agent" }
+      registry.set(configured.name, configured)
+      assert.deepEqual(registry.get(name), configured)
+    }
+    assert.equal(registry.get("forge"), pluginForge, "plugin command remains registered before host collision")
+    const userForge = { name: "forge", template: "MINE", description: "user forge command" }
+    registry.set(userForge.name, userForge)
+    assert.deepEqual(registry.get("forge"), userForge, "host config replay wins /forge collision")
+    assert.strictEqual(registry.get("forge-sync"), userSync, "host user /forge-sync survives replay")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -366,5 +507,187 @@ test("v2 commands: drifted command domain — every mode is a silent no-op", asy
     const d = createV2MockContext({ drift: { command: mode } })
     await assert.doesNotReject(v2Setup(d.ctx, { anchors: [join(tmpdir(), "forge-v2-sc-none")] }), `command/${mode}`)
     assert.equal(d.state.commands.size, 0, `${mode}: nothing registered`)
+  }
+})
+
+
+test("v2 depth catalog: actual setup snapshot drives word/toggle channels, Anthropic family wins, findings are bounded", async (t) => {
+  v2WiringSeam.resetHostAnchors()
+  const dir = poolDir("catalog-depth", {
+    ladder: { model: "zai/ladder", thoughtLevel: "XHigh" },
+    matched: { model: "openai/gpt", thoughtLevel: "XHigh" },
+    unmatched: { model: "openai/unmatched", thoughtLevel: "xhigh" },
+    toggle: { model: "openai/toggle", thoughtLevel: "high" },
+    silent: { model: "zai/silent", thoughtLevel: "high" },
+    glm: { model: "zai/glm-5.3", thoughtLevel: "xhigh" },
+    adaptive: { model: "anthropic/claude-opus-4-7", thoughtLevel: "xhigh" },
+    adaptivehigh: { model: "anthropic/claude-opus-4-7", thoughtLevel: "high" },
+    adaptivenew: { model: "anthropic/claude-opus-4-8", thoughtLevel: "xhigh" },
+    glmcat: { model: "zai-coding-plan/glm-5.3", thoughtLevel: "high" },
+    legacy: { model: "anthropic/claude-opus-4-6", thoughtLevel: "high" },
+    legacyxhigh: { model: "anthropic/claude-opus-4-6", thoughtLevel: "xhigh" },
+    legacyminimal: { model: "anthropic/claude-opus-4", thoughtLevel: "minimal" },
+    auto: {},
+  })
+  const previous = process.env.FORGE_TEST_NO_DISPATCH_FETCH
+  process.env.FORGE_TEST_NO_DISPATCH_FETCH = "0"
+  t.after(() => {
+    if (previous === undefined) delete process.env.FORGE_TEST_NO_DISPATCH_FETCH
+    else process.env.FORGE_TEST_NO_DISPATCH_FETCH = previous
+    rmSync(dir, { recursive: true, force: true })
+  })
+  const effort = { reasoning_options: [{ type: "effort", values: ["low", "high", "max"] }] }
+  const anthropicEffort = { reasoning_options: [{ type: "effort", values: ["low", "medium", "high"] }] }
+  const fetch = t.mock.method(globalThis, "fetch", async () => ({ ok: true, text: async () => JSON.stringify({
+    zai: { models: { ladder: effort } },
+    openai: { models: { gpt: { reasoning_options: [{ type: "effort", values: ["low", "xhigh"] }] }, unmatched: effort, toggle: { reasoning_options: [{ type: "toggle" }] } } },
+    anthropic: { models: { "claude-opus-4-7": anthropicEffort, "claude-opus-4-8": anthropicEffort, "claude-opus-4-6": anthropicEffort, "claude-opus-4": anthropicEffort } },
+    "zai-coding-plan": { models: { "glm-5.3": effort } },
+  }) }))
+  const warn = t.mock.method(console, "warn", () => {})
+  const { context } = await setup(dir)
+  assert.equal(fetch.mock.callCount(), 1)
+  const adaptiveCatalog = v2WiringSeam.modelsDevCatalog()?.providers.anthropic?.models["claude-opus-4-7"]
+  assert.equal(adaptiveCatalog?.reasoningShape, "effort")
+  assert.deepEqual(adaptiveCatalog?.reasoningOptions, ["low", "medium", "high"])
+  const call = async (agent, suffix = "first") => {
+    const options = {}
+    await context({ sessionID: `catalog-${agent}-${suffix}`, agent: `forge-catalog-depth-${agent}`, model: { providerID: "fixture", id: "fixture" }, options })
+    return options
+  }
+  assert.deepEqual(await call("ladder"), { reasoningEffort: "xhigh" })
+  assert.deepEqual(await call("matched"), { reasoningEffort: "xhigh" })
+  assert.deepEqual(await call("unmatched"), { reasoningEffort: "xhigh" })
+  assert.deepEqual(await call("toggle"), {})
+  assert.deepEqual(await call("toggle", "second"), {})
+  assert.deepEqual(await call("silent"), {})
+  assert.deepEqual(await call("glm"), {})
+  assert.deepEqual(await call("adaptive"), { effort: "xhigh" })
+  assert.deepEqual(await call("adaptivehigh"), { effort: "high" })
+  assert.deepEqual(await call("adaptivenew"), { effort: "xhigh" })
+  assert.deepEqual(await call("glmcat"), { reasoningEffort: "high" })
+  assert.deepEqual(await call("legacy"), { thinking: { type: "enabled", budget_tokens: 24576 } })
+  assert.deepEqual(await call("legacyxhigh"), { thinking: { type: "enabled", budget_tokens: 28672 } })
+  assert.deepEqual(await call("legacyminimal"), { thinking: { type: "enabled", budget_tokens: 1024 } })
+  assert.deepEqual(await call("auto"), {})
+  const findings = warn.mock.calls.map(c => c.arguments.join(" ")).filter(s => s.includes("[forge:depth]"))
+  assert.equal(findings.length, 3)
+  for (const agent of ["toggle", "silent"]) assert.ok(findings.some(s => s.includes(`forge-catalog-depth-${agent}`) && /high/.test(s) && /toggle/.test(s)))
+  assert.ok(findings.some(s => s.includes("forge-catalog-depth-glm") && /xhigh/.test(s) && /toggle/.test(s)))
+})
+
+test("v2 depth freeze: hot word fix and model swap reach fresh sessions only", async (t) => {
+  v2WiringSeam.resetHostAnchors()
+  const legacy = "anthropic/claude-opus-4-6"
+  const dir = poolDir("fresh-depth", { fix: { model: legacy, thoughtLevel: "ultra" }, swap: { model: legacy, thoughtLevel: "ultra" } })
+  t.after(() => rmSync(dir, { recursive: true, force: true }))
+  const warn = t.mock.method(console, "warn", () => {})
+  const { context } = await setup(dir)
+  const call = async (agent, suffix) => {
+    const sessionID = `fresh-${agent}-${suffix}`, options = {}
+    await context({ sessionID, agent: `forge-fresh-depth-${agent}`, model: { providerID: "anthropic", id: "claude-opus-4-6" }, options })
+    return options
+  }
+  for (const agent of ["fix", "swap"]) {
+    assert.deepEqual(await call(agent, "old"), {})
+    assert.equal(v2WiringSeam.sessionDepths.get(`fresh-${agent}-old`).translation, null)
+  }
+  const file = join(dir, ".opencode", "forge.json")
+  writeFileSync(file, JSON.stringify({ pool: "fresh-depth", agents: { fix: { model: legacy, thoughtLevel: "high" }, swap: { model: "openai/gpt", thoughtLevel: "ultra" } } }))
+  utimesSync(file, 1700000000, 1700000000)
+  for (const agent of ["fix", "swap"]) {
+    assert.deepEqual(await call(agent, "old"), {})
+    assert.equal(v2WiringSeam.sessionDepths.get(`fresh-${agent}-old`).translation, null)
+  }
+  assert.deepEqual(await call("fix", "new"), { thinking: { type: "enabled", budget_tokens: 24576 } })
+  assert.deepEqual(await call("swap", "new"), { reasoningEffort: "ultra" })
+  const findings = warn.mock.calls.map(c => c.arguments.join(" ")).filter(s => s.includes("[forge:depth]"))
+  assert.equal(findings.length, 2)
+  for (const agent of ["fix", "swap"]) assert.ok(findings.some(s => s.includes(`forge-fresh-depth-${agent}`) && /ultra/.test(s) && /budget/.test(s)))
+})
+
+test("v2 commands: fresh identity, not tools or cached speaker, gates every route", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "forge-command-identity-"))
+  const { state, ctx } = await setup(dir)
+  try {
+    const sid = "ses_identity"
+    const visibleTools = ["plan_write", "goal_write", "crew_begin", "forge_sync"]
+    for (const [name, text] of [["plan", "resume"], ["goal", "resume"], ["crew", "objective"], ["forge", "sync"], ["forge", "init"], ["forge", "init global"]]) {
+      for (const record of [{ agent: "build" }, { agent: "forge-worker" }, { agent: "forge", parentID: "parent" }, {}]) {
+        state.sessionRecords.set(sid, record)
+        v2WiringSeam.sessionAgents.set(sid, "forge")
+        const count = state.prompts.length
+        await assert.rejects(state.commands.get(name).execute({ sessionID: sid, prompt: { text }, visibleTools }), /primary forge agent/)
+        assert.equal(state.prompts.length, count)
+      }
+      state.sessionRecords.set(sid, { agent: "forge" })
+      for (const tools of [visibleTools, []]) {
+        await state.commands.get(name).execute({ sessionID: sid, prompt: { text }, visibleTools: tools })
+        assert.doesNotMatch(state.prompts.at(-1).text, /FAMILY GUARD/)
+      }
+    }
+    ctx.session.get = async () => { throw new Error("unavailable") }
+    await assert.rejects(state.commands.get("plan").execute({ sessionID: sid }), /primary forge agent/)
+    await state.commands.get("forge").execute({ sessionID: sid, prompt: { text: "stop" } })
+    assert.match(state.prompts.at(-1).text, /forge stop receipt/)
+    assert.equal(state.asserts.length, 0)
+  } finally { rmSync(dir, { recursive: true, force: true }) }
+})
+
+// Synthetic HTTP fixture: exercise the real command and local service adapter, not a host E2E.
+test("v2 stop: scoped shell DELETE precedes child interrupt and receipt; native list survives unavailable HTTP", async () => {
+  const dir = poolDir("stophttp", {})
+  const { ctx, state } = await setup(dir)
+  const old = process.env.FORGE_SERVICE_FILE, originalFetch = globalThis.fetch
+  const file = join(dir, "service.json"), base = "http://127.0.0.1:54321"
+  const calls = [], root = "stop-root", child = "stop-child"
+  let removed = false, interrupted = false
+  const entries = [{ id: child, parentID: root }, { id: "unknown", parentID: root }]
+  const list = parent => ({ data: parent === root ? entries : [], cursor: parent === root ? { next: "opaque-page" } : {} })
+  ctx.session.get = async () => ({ agent: "build", location: { directory: dir } })
+  ctx.session.context = async () => [{ type: "assistant", content: [{ type: "tool", name: "subagent", state: { status: "completed", metadata: { sessionID: child, status: "running" } } }] }]
+  ctx.session.interrupt = async ({ sessionID }) => { calls.push(["interrupt", sessionID]); interrupted = true; return { interrupted: true } }
+  ctx.session.prompt = async input => { calls.push(["prompt", input.sessionID]); state.prompts.push(input) }
+  globalThis.fetch = async (url, opts) => {
+    const u = new URL(url)
+    assert.equal(u.origin, base)
+    assert.equal(opts.headers.authorization, `Basic ${Buffer.from("opencode:test-password").toString("base64")}`)
+    if (u.pathname === "/api/session") return Response.json(list(u.searchParams.get("parentID")))
+    if (u.pathname === "/api/session/active") return Response.json(interrupted ? {} : { [child]: { type: "running" } })
+    assert.equal(u.searchParams.get("location[directory]"), dir)
+    if (u.pathname === "/api/shell" && opts.method === "GET") return Response.json(removed ? [] : [{ id: "owned", metadata: { sessionID: child } }, { id: "foreign", metadata: { sessionID: "unknown" } }])
+    assert.equal(u.pathname, "/api/shell/owned")
+    assert.equal(opts.method, "DELETE")
+    calls.push(["delete", "owned"]); removed = true
+    return new Response(null, { status: 204 })
+  }
+  try {
+    writeFileSync(file, JSON.stringify({ url: base, password: "test-password" }))
+    process.env.FORGE_SERVICE_FILE = file; resetServiceHttpDiscoveryForTests()
+    await state.commands.get("forge").execute({ sessionID: root, prompt: { text: "stop" } })
+    assert.deepEqual(calls, [["delete", "owned"], ["interrupt", child], ["prompt", root]])
+    assert.match(state.prompts.at(-1).text, /remaining count unknown/)
+    assert.match(state.prompts.at(-1).text, /confirmed no longer running/)
+    calls.length = 0
+    process.env.FORGE_SERVICE_FILE = join(dir, "missing.json"); resetServiceHttpDiscoveryForTests()
+    ctx.session.list = async ({ parentID }) => list(parentID)
+    // A pending lookup must not prevent native stop when no shell channel exists.
+    ctx.session.get = async () => new Promise(() => {})
+    await state.commands.get("forge").execute({ sessionID: root, prompt: { text: "stop" } })
+    assert.ok(calls.some(([op, id]) => op === "interrupt" && id === child))
+    assert.ok(calls.every(([op, id]) => op !== "delete" && id !== "unknown"))
+    assert.deepEqual(calls.at(-1), ["prompt", root])
+    assert.match(state.prompts.at(-1).text, /Shell enumeration unavailable; remaining count unknown/)
+    calls.length = 0
+    // With HTTP reachable, a hanging directory lookup consumes only the bounded shell phase.
+    process.env.FORGE_SERVICE_FILE = file; resetServiceHttpDiscoveryForTests()
+    await state.commands.get("forge").execute({ sessionID: root, prompt: { text: "stop" } })
+    assert.ok(calls.some(([op, id]) => op === "interrupt" && id === child))
+    assert.deepEqual(calls.at(-1), ["prompt", root])
+    assert.match(state.prompts.at(-1).text, /Shell enumeration unavailable; remaining count unknown/)
+  } finally {
+    globalThis.fetch = originalFetch
+    if (old === undefined) delete process.env.FORGE_SERVICE_FILE; else process.env.FORGE_SERVICE_FILE = old
+    resetServiceHttpDiscoveryForTests(); rmSync(dir, { recursive: true, force: true })
   }
 })

@@ -9,7 +9,9 @@ import { join } from "node:path"
 // field-level fail-soft degradations, cascade with a single winner, hot-apply
 // cache, NO seed, NO recipe, inert unconfigured state.
 
-import { createForgeConfigLoader, parseForgeJsonc, validateAgentSet, forgeConfigPaths, validateDispatchNode, mergeDispatchNodes } from "../src/forge-config.ts"
+import { createForgeConfigLoader, createPoolResolver, parseForgeJsonc, validateAgentSet, forgeConfigPaths, legacyDispatchEnvFindings, legacyRuntimeOptionFindings } from "../src/forge-config.ts"
+
+import { planRosterSync } from "../src/roster-compile.ts"
 
 function loaderWith(files, opts = {}) {
   return createForgeConfigLoader({
@@ -19,6 +21,25 @@ function loaderWith(files, opts = {}) {
     readFile: (p) => files[p],
   })
 }
+
+test("retired runtime recipe keys warn once per key without changing workers", () => {
+  const path = "C:/proj/.opencode/forge.json"
+  const files = { [path]: JSON.stringify({ pool: "proj", agents: { good: {} }, jobs: { mode: "native", keepBuiltinShell: true }, watchdog: null, dispatch: { providerConcurrency: { p: 2 } } }) }
+  const loaded = loaderWith(files).load()
+  assert.deepEqual(Object.keys(loaded.agents), ["good"])
+  assert.equal(Object.hasOwn(loaded, "dispatch"), false)
+  const resolver = createPoolResolver({ homeDir: "C:/home", stat: (p) => files[p] === undefined ? null : { mtimeMs: 1, size: files[p].length }, readFile: (p) => files[p] })
+  const resolution = resolver.resolve(["C:/proj", "C:/proj/nested"])
+  assert.equal(planRosterSync(resolution, { globalPoolFile: "C:/home/.config/opencode/forge.json" })[0].files[0].fileName, "forge-proj-good.md")
+  for (const result of [loaded, resolution]) {
+    const warnings = result.findings.filter((f) => f.code === "legacy-runtime-option-in-recipe")
+    assert.equal(warnings.length, 3)
+    assert.ok(warnings.every((f) => f.level === "warn" && f.message.startsWith(path)))
+    assert.match(warnings[0].message, /"jobs"/)
+    assert.match(warnings[1].message, /"watchdog"/)
+    assert.match(warnings[2].message, /"dispatch"/)
+  }
+})
 
 test("parse: valid JSONC with comments and trailing commas", () => {
   const r = parseForgeJsonc(`{\n  // comment\n  "agents": { "a": { "model": "p/m", "thoughtLevel": "low", } },\n}`)
@@ -265,82 +286,24 @@ test("loader against a real temp dir end to end", () => {
   }
 })
 
-// ---------------------------------------------------------------------------
-// dispatch node (harden-dispatch-resilience D3): field-level fail-soft
-// parsing + cascade merge. Absent node = no limits (today's behavior); a
-// bad value drops with a warn finding and never throws.
-// ---------------------------------------------------------------------------
-
-test("dispatch node: absent/undefined means null (no limits), zero findings", () => {
-  for (const raw of [undefined, null]) {
-    const r = validateDispatchNode(raw, "f: dispatch")
-    assert.equal(r.config, null)
-    assert.deepEqual(r.findings, [])
+test("dispatch recipe: malformed or null, one warning and valid worker survives", () => {
+  for (const dispatch of [null, false, { providerConcurrency: { bad: "bad" } }]) {
+    const result = loaderWith({ "C:/proj/.opencode/forge.json": JSON.stringify({ agents: { good: {} }, dispatch }) }).load()
+    assert.deepEqual(Object.keys(result.agents), ["good"])
+    assert.equal(result.findings.length, 1)
+    assert.match(result.findings[0].message, /"dispatch".*ignored/)
   }
 })
 
-test("dispatch node: a non-object node drops wholly with one warn finding (never a throw)", () => {
-  const r = validateDispatchNode("nope", "f: dispatch")
-  assert.equal(r.config, null)
-  assert.equal(r.findings.length, 1)
-  assert.equal(r.findings[0].level, "warn")
-  assert.equal(r.findings[0].code, "dispatch-node-invalid")
-})
-
-test("dispatch node: valid maps and breaker fields parse through", () => {
-  const r = validateDispatchNode(
-    { providerConcurrency: { zai: 2, anthropic: 5 }, modelConcurrency: { "zai/glm": 1 }, circuitBreaker: { consecutiveFailures: 3, cooldownMs: 60000 } },
-    "f: dispatch",
-  )
-  assert.equal(r.findings.length, 0)
-  assert.deepEqual(r.config.providerConcurrency, { zai: 2, anthropic: 5 })
-  assert.deepEqual(r.config.modelConcurrency, { "zai/glm": 1 })
-  assert.deepEqual(r.config.circuitBreaker, { consecutiveFailures: 3, cooldownMs: 60000 })
-})
-
-test("dispatch node: bad map values drop per entry with a warn finding; siblings survive", () => {
-  const r = validateDispatchNode({ providerConcurrency: { zai: "oops", anthropic: 0, openai: 1.5, ok: 2 } }, "f: dispatch")
-  assert.deepEqual(r.config.providerConcurrency, { ok: 2 })
-  const codes = r.findings.map((f) => f.code)
-  assert.deepEqual(codes, ["dispatch-map-value-invalid", "dispatch-map-value-invalid", "dispatch-map-value-invalid"])
-  for (const f of r.findings) assert.equal(f.level, "warn")
-})
-
-test("dispatch node: a non-object map drops wholly with a warn; breaker bad fields drop per field", () => {
-  const r = validateDispatchNode(
-    { providerConcurrency: [1, 2], circuitBreaker: { consecutiveFailures: "x", cooldownMs: -5, extra: true } },
-    "f: dispatch",
-  )
-  assert.deepEqual(r.config.providerConcurrency, {})
-  assert.deepEqual(r.config.circuitBreaker, {})
-  const codes = r.findings.map((f) => f.code).sort()
-  assert.deepEqual(codes, ["dispatch-breaker-cooldown-invalid", "dispatch-breaker-failures-invalid", "dispatch-map-invalid"])
-})
-
-test("dispatch node: mergeDispatchNodes cascades per map key and per breaker field; null+null = null", () => {
-  assert.equal(mergeDispatchNodes(null, null), null)
-  const merged = mergeDispatchNodes(
-    { providerConcurrency: { zai: 1, anthropic: 2 }, modelConcurrency: { "zai/glm": 1 }, circuitBreaker: { consecutiveFailures: 3, cooldownMs: 60000 } },
-    { providerConcurrency: { zai: 4 }, modelConcurrency: {}, circuitBreaker: { cooldownMs: 1000 } },
-  )
-  assert.deepEqual(merged.providerConcurrency, { zai: 4, anthropic: 2 })
-  assert.deepEqual(merged.modelConcurrency, { "zai/glm": 1 })
-  assert.deepEqual(merged.circuitBreaker, { consecutiveFailures: 3, cooldownMs: 1000 })
-})
-
-test("dispatch node: the loader cascade-merges global base + project override", () => {
-  const files = {
-    "C:/proj/.opencode/forge.json": JSON.stringify({ dispatch: { providerConcurrency: { zai: 4 }, circuitBreaker: { cooldownMs: 1000 } } }),
-    "C:/home/.config/opencode/forge.json": JSON.stringify({ dispatch: { providerConcurrency: { zai: 1, anthropic: 2 }, circuitBreaker: { consecutiveFailures: 3, cooldownMs: 60000 } } }),
-  }
-  const r = loaderWith(files).load()
-  assert.deepEqual(r.dispatch.providerConcurrency, { zai: 4, anthropic: 2 })
-  assert.deepEqual(r.dispatch.circuitBreaker, { consecutiveFailures: 3, cooldownMs: 1000 })
-})
-
-test("dispatch node: fail-soft in the loader — malformed values warn and limit nothing", () => {
-  const files = { "C:/proj/.opencode/forge.json": JSON.stringify({ dispatch: { providerConcurrency: { zai: "boom" } } }) }
-  const r = loaderWith(files).load()
-  assert.deepEqual(r.dispatch.providerConcurrency, {})
-  assert.ok(r.findings.some((f) => f.code === "dispatch-map-value-invalid" && f.level === "warn"))
+test("legacy env findings are bounded, value-free and leave other variables alone", () => {
+  const suffixes = "DEBUG JOURNAL_MAX MAX_ATTEMPTS NOTIFY_INTERVAL_MS POLL_INTERVAL_MS POLL_SLICE_MS POLL_TIMEOUT_MS QUEUE_MAX RECONCILE_FLOOR_MS RETRY_BACKOFF_MS STALE_FLOOR_MS STALE_MODE STALE_MS".split(" ")
+  const env = Object.fromEntries(suffixes.map(s => [`FORGE_DISPATCH_${s}`, "secret-value"]))
+  env.FORGE_DISPATCH_UNKNOWN = "secret-value"
+  env.FORGE_GATE_ASK_WATCHDOG_MS = "secret-value"
+  const findings = legacyDispatchEnvFindings(env)
+  assert.equal(findings.length, 13)
+  assert.ok(findings.every(f => f.level === "warn" && !f.message.includes("secret-value")))
+  assert.deepEqual(legacyDispatchEnvFindings({}), [])
+  assert.equal(legacyDispatchEnvFindings({ FORGE_DISPATCH_DEBUG: "" }).length, 1)
+  assert.equal(legacyRuntimeOptionFindings({ jobs: null, watchdog: {}, search: {}, dispatch: {} }, "plugin options", false).length, 2)
 })

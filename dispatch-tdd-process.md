@@ -1,5 +1,7 @@
 # add-dispatch-suite · TDD 循环迭代开发流程（ZCode goal 模式 · 单闸门制）
 
+> **历史归档说明（2026-11-26）**：本文仅记录 `add-dispatch-suite` 当时的 v1 实现流程，不是当前开发或验收指令。旧派发引擎由 `retire-plugin-runtime` 退役；现行验收以该 change 的 tasks 和工作区工作流为准，不再执行本文的旧目标文本及旧验收命令。
+
 > 2026-09-27 定稿（v3：范围扩为三合一 change `add-dispatch-suite` = 派发核心 + waves 后台唤醒 + /crew 编排）。
 > 驱动器：**ZCode 的 goal 模式**。你贴一段主目标文本开 goal 后不再介入；代理自主跑完 A→G 七个阶段与全部自检，你回家只做**终局验收**。
 

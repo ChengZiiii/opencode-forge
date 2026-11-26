@@ -12,6 +12,7 @@ import { join } from "node:path"
 // untouched by the change (runtime-pinned, byte-equal) — its net is the
 // pre-existing 788-test baseline.
 
+import "./lib/test-runtime-namespace.mjs"
 import { v2Setup, v2WiringSeam } from "../plugin.ts"
 import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 import { parseTopLevelKnobs } from "../src/forge-config.ts"
@@ -47,7 +48,7 @@ async function boot(dir, deps = {}) {
   return mock
 }
 
-const ctxExec = (dir, sessionID) => ({ sessionID, worktree: dir, directory: dir, metadata: () => {} })
+const ctxExec = (dir, sessionID) => ({ sessionID, agent: "forge", worktree: dir, directory: dir, metadata: () => {} })
 
 // ---------------------------------------------------------------------------
 // Knob matrix (D5)
@@ -155,11 +156,12 @@ test("gate: GC — an entry removed from the recipe has its file collected on th
 test("dispatch hint: an unknown forge target on a stale native roster surfaces the sync guidance", async () => {
   const dir = ws("hint", RECIPE("hint"))
   const { state } = await boot(dir)
+  state.sessionRecords.set("ses_hint", { location: { directory: dir }, agent: "forge" })
+  const before = state.toolHooks.find((h) => h.name === "execute.before").cb
   await assert.rejects(
-    state.tools.get("task").execute({ subagent_type: "forge-hint-ghost", prompt: "x" }, ctxExec(dir, "ses_hint")),
+    before({ tool: "subagent", sessionID: "ses_hint", agent: "forge", input: { agent: "forge-hint-ghost", prompt: "x", description: "test roster hint" } }),
     (err) => {
-      assert.match(String(err), /not a materialized forge subagent/)
-      assert.match(String(err), /Native-roster hint:/)
+      assert.match(String(err), /Roster stale refused/)
       assert.match(String(err), /forge_sync/)
       return true
     },

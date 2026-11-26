@@ -36,7 +36,7 @@ process.env.FORGE_DISPATCH_POLL_INTERVAL_MS = "5"
 process.env.FORGE_DISPATCH_POLL_SLICE_MS = "10"
 process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS = "0"
 
-import { __sessionAnchorTestSurface, recoverOneDispatchRecord, v2Setup } from "../plugin.ts"
+import { __sessionAnchorTestSurface, v2Setup } from "../plugin.ts"
 
 const surface = __sessionAnchorTestSurface
 const dirs = []
@@ -82,7 +82,7 @@ const PLAN_WRITE_ARGS = (slug) => ({ goal: `draft ${slug}`, context: "c", approa
 // An active DRAFT plan in `dir`, written through the plugin's own tool.
 async function draftIn(initd, dir, slug) {
   const owner = `ses-owner-${slug}`
-  await initd.state.tools.get("plan_write").execute(PLAN_WRITE_ARGS(slug), { sessionID: owner, worktree: dir })
+  await initd.state.tools.get("plan_write").execute(PLAN_WRITE_ARGS(slug), { sessionID: owner, agent: "forge", worktree: dir })
   return owner
 }
 // <ws>\.opencode\plan-drafts — from here "../plan/y.md" lands INSIDE the
@@ -277,29 +277,19 @@ test("1.5 state-file boundary: a relative path is resolved against the HOST RECO
   await assert.doesNotReject(beforeOf(c.state)(writeEvent("ses-15-abs-ok", join(dirB, "notes.md"), "build")))
 })
 
-test("1.6 task tool body: a dispatch refused by a gate leaves the caller bound to the HOST RECORD's directory — with the belt in front, and without it", async () => {
+test("1.6 native dispatch preflight binds the caller to its own directory before a draft refusal", async () => {
   const { a, latest } = await multiDirectoryHost("forge-seed-16")
-  const task = latest.state.tools.get("task")
-  const ARGS = { subagent_type: "forge-seed-nope", prompt: "anchor probe" }
-  const NOT_MATERIALIZED = /is not a materialized forge subagent/
+  await draftIn(a, a.dir, "16")
+  const before = beforeOf(latest.state)
+  const dispatch = (sessionID) => before({ tool: "subagent", sessionID, agent: "forge", input: { agent: "forge-seed-nope", prompt: "anchor probe" } })
+  const sid = "ses-16-belt"
+  hostRecord(latest, sid, a.dir)
+  await assert.rejects(dispatch(sid), /draft/)
+  assert.equal(surface.worktreeOf(sid), a.dir, "a refused dispatch binds only the caller's own directory")
 
-  // The belt runs first (the host fires execute.before), then the body refuses.
-  const sidBelt = "ses-16-belt"
-  hostRecord(latest, sidBelt, a.dir)
-  await assert.doesNotReject(beforeOf(latest.state)({ tool: "task", sessionID: sidBelt, agent: "forge", messageID: "msg_1", id: "call_1", input: ARGS }))
-  assert.equal(surface.worktreeOf(sidBelt), a.dir, "bound by the belt's resolution")
-  await assert.rejects(task.execute(ARGS, realCtx(sidBelt)), NOT_MATERIALIZED)
-  assert.equal(surface.worktreeOf(sidBelt), a.dir)
-
-  // The body alone (design D4): resolved BEFORE the refusing gate.
-  const sidBody = "ses-16-body"
-  hostRecord(latest, sidBody, a.dir)
-  await assert.rejects(task.execute(ARGS, realCtx(sidBody)), NOT_MATERIALIZED)
-  assert.equal(surface.worktreeOf(sidBody), a.dir, "a refused dispatch bound the caller to its own directory only")
-
-  // A caller the host cannot resolve is refused all the same and stays unbound.
+  // No host record: the preflight must not bind to the last setup's directory.
   const sidNone = "ses-16-unresolved"
-  await assert.rejects(task.execute(ARGS, realCtx(sidNone)), NOT_MATERIALIZED)
+  await assert.doesNotReject(dispatch(sidNone))
   assert.equal(surface.worktreeOf(sidNone), null)
 })
 
@@ -343,39 +333,4 @@ test("P1 the synchronous permission belt never seeds on a multi-directory proces
   await evaluate(again)
   assert.equal(again.effect, "deny")
   assert.match(String(again.message), /plan_approve/)
-})
-
-test("1.8 recovery of a retry-pending record: an owner the map does not know is judged by the HOST RECORD's directory — its own draft refuses the respawn, and the owner ends bound to that directory", async () => {
-  const { a } = await multiDirectoryHost("forge-seed-18")
-  await draftIn(a, a.dir, "18")
-  const owner = "ses-18-own-a"
-  hostRecord(a, owner, a.dir)
-  // A forge target that resolves nowhere: with no draft verdict the chain
-  // would stop at "does not resolve in the live roster" and never respawn.
-  const rec = { id: "j-seed-18", agent: "forge-seed-nope", ownerSession: owner, workspace: a.dir, state: "retry-pending", attempts: 1, createdAt: 1, updatedAt: 1, prompt: "resume me", questionDeny: true }
-  seedJournal(a.dir, rec)
-  await recoverOneDispatchRecord(a.ctx, a.dir, rec)
-  const last = journalRecords(a.dir).at(-1)
-  assert.equal(last.id, rec.id)
-  assert.equal(last.state, "terminal")
-  assert.equal(last.outcome, "error")
-  assert.match(String(last.reason), /retry refused at recovery: \[forge\] A plan is in draft/)
-  assert.equal(surface.worktreeOf(owner), a.dir, "resolved through the recovery's own client — to the record's directory")
-})
-
-test("1.9 the queue pump: a queued wish whose owner the map does not know is refused by its OWN directory's draft (host record), read through whichever initialization runs the recovery", async () => {
-  const { a, b } = await multiDirectoryHost("forge-seed-19")
-  await draftIn(a, a.dir, "19") // the draft lives in A; B (last initialized) has none
-  const owner = "ses-19-own-a"
-  hostRecord(b, owner, a.dir) // the host record is host-global: B's initialization reads it too
-  const rec = { id: "j-seed-19", agent: "general", ownerSession: owner, workspace: a.dir, state: "queued", attempts: 1, createdAt: 1, updatedAt: 1, prompt: "run me", questionDeny: true }
-  seedJournal(a.dir, rec)
-  // A queued record re-enters the queue for a live owner and is pumped at once.
-  await recoverOneDispatchRecord(b.ctx, a.dir, rec)
-  const last = journalRecords(a.dir).at(-1)
-  assert.equal(last.id, rec.id)
-  assert.equal(last.state, "terminal")
-  assert.equal(last.outcome, "error")
-  assert.match(String(last.reason), /spawn refused at queue pump: \[forge\] A plan is in draft/)
-  assert.equal(surface.worktreeOf(owner), a.dir)
 })

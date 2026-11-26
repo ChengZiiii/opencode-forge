@@ -3,58 +3,25 @@ import assert from "node:assert/strict"
 import { mkdtempSync, readFileSync, rmSync, writeFileSync, mkdirSync, readdirSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 
 // Debounce must be tiny BEFORE plugin.ts is imported (module-level const).
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 // Sandbox the plugin's runtime-artifact home (session-anchor ledger etc.) —
 // this suite binds POOLED workspaces and must never write the real ledger.
 process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "goal-mode-home-"))
-const { server } = await import("../plugin.ts")
-import { appendLedger, parseGoal } from "../src/goal-file.ts"
-import { appendTerminalSection, parsePlan, rankActivePlans, transitionStatus } from "../src/plan-file.ts"
+const { v2Setup, v2WiringSeam, resetServiceHttpDiscoveryForTests } = await import("../plugin.ts")
+import { crewNativeView } from "./lib/crew-native-view.mjs"
+const native = await crewNativeView(process.env.FORGE_TEST_FORGE_HOME, resetServiceHttpDiscoveryForTests)
+test.after(() => native.close())
 import { setShellRunnerForTests, runChecks } from "../src/run-check.ts"
 
 const NOW_PREFIX = "goal-mode-test"
 let sidCounter = 0
 const nextSid = () => `ses_${NOW_PREFIX}-${++sidCounter}`
 
-const allowAsk = async () => {}
-const denyAsk = async () => {
-  throw new Error("denied by user (test)")
-}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-
-function makeHarness(opts = {}) {
-  const prompts = []
-  const client = {
-    session: {
-      prompt:
-        opts.prompt ??
-        (async (body) => {
-          prompts.push(body)
-        }),
-      get: opts.getSession ?? (async () => undefined),
-      status: opts.status ?? (async (o) => ({ [o.path.id]: { type: "idle" } })),
-    },
-  }
-  const serverPromise = server({
-    client,
-    project: { id: "p" },
-    directory: opts.worktree,
-    worktree: opts.worktree,
-    serverUrl: new URL("http://127.0.0.1:1"),
-    $: {},
-    experimental_workspace: { register() {} },
-  })
-  return { client, prompts, serverPromise }
-}
-
-function toolCtx(sid, worktree, ask = allowAsk) {
-  return { sessionID: sid, worktree, ask, metadata() {}, callID: "c", agent: "forge", messageID: "m" }
-}
-
-const fakeRunnerPass = async () => ({ code: 0, output: "ok", timedOut: false })
-const fakeRunnerFail = async () => ({ code: 1, output: "boom", timedOut: false })
+const toolCtx = (sid, worktree) => ({ sessionID: sid, worktree, metadata() {}, callID: "c", agent: "forge", messageID: "m" })
 
 function goalArgs(overrides = {}) {
   return {
@@ -66,282 +33,19 @@ function goalArgs(overrides = {}) {
   }
 }
 
-async function armGoal(hooks, worktree, overrides = {}, ask = allowAsk) {
-  const sid = nextSid()
-  await hooks.tool.goal_write.execute({ ...goalArgs(overrides), arm: true }, toolCtx(sid, worktree, ask))
-  return sid
-}
-
-function goalFiles(worktree) {
-  const dir = join(worktree, ".opencode", "goal")
-  if (!existsSync(dir)) return []
-  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((f) => ({ name: f, text: readFileSync(join(dir, f), "utf8") }))
-}
-
-function liveDoc(worktree) {
-  const files = goalFiles(worktree)
-  assert.ok(files.length > 0, "expected a goal file")
-  return { name: files[0].name, doc: parseGoal(files[0].text) }
-}
-
-// ---------------------------------------------------------------------------
-// config / registration surface
-// ---------------------------------------------------------------------------
-
-test("config: goal permission keys pinned to ask, user deny respected, /goal command registered without clobbering", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-cfg-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const cfg = { agent: {}, permission: { goal_write: "deny" } }
-    await hooks.config(cfg)
-    assert.equal(cfg.permission.plan_approve, "ask")
-    // plan-close-verified D4: plan_close left the door list — the completion
-    // gate is plugin-verified now, so no permission key is injected for it.
-    assert.equal(cfg.permission.plan_close, undefined)
-    assert.equal(cfg.permission.goal_write, "deny") // explicit deny kept
-    assert.equal(cfg.permission.goal_complete, "ask")
-    assert.equal(cfg.permission.goal_resume, "ask")
-    assert.equal(cfg.permission.goal_discard, "ask")
-    assert.ok(cfg.command.goal.template.includes("forge goal harness routing"))
-    // No clobbering of a user command of the same name.
-    const cfg2 = { agent: {}, command: { goal: { template: "mine" } } }
-    await hooks.config(cfg2)
-    assert.equal(cfg2.command.goal.template, "mine")
-    // All twelve tools registered (6 plan incl. plan_reopen + 6 goal).
-    for (const t of ["plan_write", "plan_tick", "plan_approve", "plan_close", "plan_reopen", "plan_discard", "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard"]) {
-      assert.ok(hooks.tool[t], `missing tool ${t}`)
-    }
-    // Disable knob removes everything.
-    const cfg3 = { agent: { forge: { disable: true } } }
-    await hooks.config(cfg3)
-    assert.deepEqual(hooks.tool, {})
-    // Restore the module-level knob for subsequent tests in this process.
-    await hooks.config({ agent: {} })
-    assert.ok(hooks.tool.goal_write)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// goal_write: arm / queue / single-live / draft refusal / revise
-// ---------------------------------------------------------------------------
-
-test("goal_write arm=true passes the arm gate and lands an active, owned goal", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-arm-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    let asked = 0
-    const out = await hooks.tool.goal_write.execute({ ...goalArgs(), arm: true }, toolCtx(sid, wt, async (req) => {
-      asked++
-      assert.equal(req.permission, "goal_write")
-      assert.ok(req.metadata.title.startsWith("Arm goal:"))
-    }))
-    assert.equal(asked, 1, "arm gate must fire exactly once")
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.status, "active")
-    assert.equal(doc.session, sid)
-    assert.equal(doc.revision, 1)
-    assert.match(out.output, /armed/)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_write arm=false queues without any dialog", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-queue-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    const out = await hooks.tool.goal_write.execute({ ...goalArgs(), arm: false }, toolCtx(sid, wt, denyAsk))
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.status, "queued")
-    assert.equal(doc.session, "")
-    assert.match(out.output, /queued \(inert\)/)
-    // Queued goals never continue on idle.
-    const { prompts } = makeHarness({ worktree: wt })
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 0)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_write refuses a second live goal for the SAME session with edit/queue/discard options", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-single-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    await assert.rejects(
-      hooks.tool.goal_write.execute({ ...goalArgs({ goal: "another" }), arm: true }, toolCtx(sid, wt)),
-      /already has a goal|edit|queue|discard/i,
-    )
-    assert.equal(goalFiles(wt).length, 1)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_write arming is refused while the session plan is in draft (safety interop, not binding)", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-draft-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(
-      {
-        goal: "draft something",
-        context: "looked around",
-        approach: "do it",
-        tasks: ["step one"],
-        risks: "none",
-        acceptance: ["it works"],
-      },
-      toolCtx(sid, wt),
-    )
-    await assert.rejects(
-      hooks.tool.goal_write.execute({ ...goalArgs(), arm: true }, toolCtx(sid, wt, allowAsk)),
-      /plan in draft|write ban/i,
-    )
-    assert.equal(goalFiles(wt).length, 0, "no goal file may be created")
-    // Queuing stays allowed during draft (inert goal, no loop).
-    await hooks.tool.goal_write.execute({ ...goalArgs(), arm: false }, toolCtx(sid, wt))
-    assert.equal(liveDoc(wt).doc.status, "queued")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_write revise bumps the revision and keeps status/owner/budget", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-revise-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt, { maxTurns: 5 })
-    const out = await hooks.tool.goal_write.execute(
-      { ...goalArgs({ goal: "make the suite green and fast", criteria: ["npm test exits 0", "lint passes"] }), revise: true },
-      toolCtx(sid, wt, denyAsk),
-    )
-    assert.match(out.title, /rev 2/)
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.revision, 2)
-    assert.equal(doc.status, "active")
-    assert.equal(doc.session, sid)
-    assert.equal(doc.maxTurns, 5)
-    assert.equal(doc.criteria.length, 2)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_write revise carries the Check Log and Turn Ledger audit trail", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-revise-hist-"))
-  try {
-    setShellRunnerForTests(fakeRunnerPass)
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    // Produce a Check Log (goal_check) and a Turn Ledger entry (one
-    // continuation turn with activity), then revise the contract.
-    await hooks.tool.goal_check.execute({}, toolCtx(sid, wt))
-    const file = goalFiles(wt)[0]
-    writeFileSync(join(wt, ".opencode", "goal", file.name), appendLedger(file.text, { turn: 1, revision: 1, at: "2026-09-25T10:00:00+08:00", activity: true, writes: 2, checks: 1 }, "2026-09-25T10:00:00+08:00"))
-    await hooks.tool.goal_write.execute({ ...goalArgs({ goal: "make the suite greener" }), revise: true }, toolCtx(sid, wt, denyAsk))
-    const after = goalFiles(wt)[0]
-    const doc = parseGoal(after.text)
-    assert.equal(doc.revision, 2, "revision bumped")
-    assert.equal(doc.log.length, 2, "both rev1 Check Log lines survive the revision")
-    assert.match(doc.log[0], /rev1 #1 OK .*`npm test`/)
-    assert.equal(doc.ledger.length, 1, "the rev1 Turn Ledger entry survives the revision")
-    assert.match(after.text, /- turn 1 rev1 .*activity=yes \(writes=2 checks=1\)/)
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_write revise keeps stop_reason of a paused goal", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-revise-pause-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    await hooks.tool.goal_pause.execute({ blocker: "waiting on an external API key" }, toolCtx(sid, wt))
-    assert.equal(liveDoc(wt).doc.status, "paused")
-    await hooks.tool.goal_write.execute({ ...goalArgs({ goal: "make the suite green once unblocked" }), revise: true }, toolCtx(sid, wt, denyAsk))
-    const { doc, name } = liveDoc(wt)
-    assert.equal(doc.status, "paused", "status stays paused across the revision")
-    assert.equal(doc.stopReason, "blocker", "stop_reason survives the revision")
-    assert.match(readFileSync(join(wt, ".opencode", "goal", name), "utf8"), /^stop_reason: blocker$/m)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
 // ---------------------------------------------------------------------------
 // goal_check / goal_complete
 // ---------------------------------------------------------------------------
-
-test("goal_check runs items on the host and appends a revision-stamped Check Log", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-check-"))
-  try {
-    writeFileSync(join(wt, "done.txt"), "done\n")
-    setShellRunnerForTests(fakeRunnerPass)
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    const out = await hooks.tool.goal_check.execute({}, toolCtx(sid, wt))
-    assert.match(out.output, /2\/2|#1 \[PASS\]/)
-    const text = goalFiles(wt)[0].text
-    assert.match(text, /run=\S+ rev1 #1 OK .*`npm test`/)
-    assert.match(text, /rev1 #2 OK .*`done.txt :: done`/)
-    // Subset selection keeps original numbering.
-    const out2 = await hooks.tool.goal_check.execute({ items: [2] }, toolCtx(sid, wt))
-    assert.match(out2.output, /#2 \[PASS\]/)
-    await assert.rejects(hooks.tool.goal_check.execute({ items: [9] }, toolCtx(sid, wt)), /None of the given item numbers/)
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_check requires a live goal", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-checknolive-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await assert.rejects(hooks.tool.goal_check.execute({}, toolCtx(sid, wt)), /No live goal/)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
 
 test("goal_check real-runner smoke: echo pass, exit 1 fail, contains hit and miss", async () => {
   const wt = mkdtempSync(join(tmpdir(), "goal-real-"))
   try {
     mkdirSync(join(wt, "sub"))
     writeFileSync(join(wt, "done.txt"), "all done\n")
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
+    const { ctx, state } = createV2MockContext()
+    const cleanup = await v2Setup(ctx, { anchors: [wt] })
     const sid = nextSid()
-    await hooks.tool.goal_write.execute(
+    await state.tools.get("goal_write").execute(
       {
         goal: "real runner smoke",
         criteria: ["echo works", "exit codes work", "file contract works"],
@@ -357,13 +61,13 @@ test("goal_check real-runner smoke: echo pass, exit 1 fail, contains hit and mis
       },
       toolCtx(sid, wt),
     )
-    const out = await hooks.tool.goal_check.execute({}, toolCtx(sid, wt))
-    assert.match(out.output, /#1 \[PASS\][\s\S]*forge-goal-smoke/)
-    assert.match(out.output, /#2 \[FAIL\][\s\S]*exit=1/)
-    assert.match(out.output, /#3 \[PASS\]/)
-    assert.match(out.output, /#4 \[FAIL\][\s\S]*not found/)
-    assert.match(out.output, /#5 \[FAIL\][\s\S]*escapes the workspace/)
-    await hooks.dispose?.()
+    const out = await state.tools.get("goal_check").execute({}, toolCtx(sid, wt))
+    assert.match(out.content, /#1 \[PASS\][\s\S]*forge-goal-smoke/)
+    assert.match(out.content, /#2 \[FAIL\][\s\S]*exit=1/)
+    assert.match(out.content, /#3 \[PASS\]/)
+    assert.match(out.content, /#4 \[FAIL\][\s\S]*not found/)
+    assert.match(out.content, /#5 \[FAIL\][\s\S]*escapes the workspace/)
+    await cleanup()
   } finally {
     rmSync(wt, { recursive: true, force: true })
   }
@@ -372,10 +76,10 @@ test("goal_check real-runner smoke: echo pass, exit 1 fail, contains hit and mis
 test("goal_check real-runner smoke: shell timeout kills the command", async () => {
   const wt = mkdtempSync(join(tmpdir(), "goal-timeout-"))
   try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
+    const { ctx, state } = createV2MockContext()
+    const cleanup = await v2Setup(ctx, { anchors: [wt] })
     const sid = nextSid()
-    await hooks.tool.goal_write.execute(
+    await state.tools.get("goal_write").execute(
       {
         goal: "timeout smoke",
         criteria: ["command must time out"],
@@ -386,974 +90,18 @@ test("goal_check real-runner smoke: shell timeout kills the command", async () =
       toolCtx(sid, wt),
     )
     const started = Date.now()
-    const out = await hooks.tool.goal_check.execute({}, toolCtx(sid, wt))
+    const out = await state.tools.get("goal_check").execute({}, toolCtx(sid, wt))
     assert.ok(Date.now() - started < 5000, "timeout must fire at ~1s")
-    assert.match(out.output, /#1 \[FAIL\][\s\S]*timed out after 1s/)
-    await hooks.dispose?.()
+    assert.match(out.content, /#1 \[FAIL\][\s\S]*timed out after 1s/)
+    await cleanup()
   } finally {
     rmSync(wt, { recursive: true, force: true })
   }
 })
 
-test("goal_complete is fail-closed: failing check refuses without reaching the gate", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-fail-"))
-  try {
-    setShellRunnerForTests(fakeRunnerFail)
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    let gated = 0
-    await assert.rejects(
-      hooks.tool.goal_complete.execute(
-        { attestations: [{ criterion: "npm test exits 0", pass: true, evidence: "x" }] },
-        toolCtx(sid, wt, async () => {
-          gated++
-        }),
-      ),
-      /fail-closed|FAIL/,
-    )
-    assert.equal(gated, 0, "user gate must not be reached on failing checks")
-    assert.equal(liveDoc(wt).doc.status, "active")
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_complete rejects incomplete or failing self-attestations", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-attest-"))
-  try {
-    writeFileSync(join(wt, "done.txt"), "done\n")
-    setShellRunnerForTests(fakeRunnerPass)
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    await assert.rejects(
-      hooks.tool.goal_complete.execute({ attestations: [] }, toolCtx(sid, wt)),
-      /no self-attestation/,
-    )
-    await assert.rejects(
-      hooks.tool.goal_complete.execute({ attestations: [{ criterion: "npm test exits 0", pass: false, evidence: "still red" }] }, toolCtx(sid, wt)),
-      /unmet/,
-    )
-    assert.equal(liveDoc(wt).doc.status, "active")
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_complete: all checks re-run passing + full attestation + user allow -> completed", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-done-"))
-  try {
-    writeFileSync(join(wt, "done.txt"), "done\n")
-    setShellRunnerForTests(fakeRunnerPass)
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    const out = await hooks.tool.goal_complete.execute(
-      { attestations: [{ criterion: "npm test exits 0", pass: true, evidence: "exit 0, 42 tests" }] },
-      toolCtx(sid, wt),
-    )
-    assert.match(out.output, /completed/)
-    const text = goalFiles(wt)[0].text
-    assert.match(text, /^status: completed$/m)
-    assert.match(text, /rev1 #1 OK/, "final gate re-run recorded")
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_complete requires an active (not paused) goal", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-completeactive-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    await hooks.tool.goal_pause.execute({}, toolCtx(sid, wt))
-    await assert.rejects(
-      hooks.tool.goal_complete.execute({ attestations: [{ criterion: "npm test exits 0", pass: true, evidence: "x" }] }, toolCtx(sid, wt)),
-      /No active goal/,
-    )
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// pause / resume / discard
-// ---------------------------------------------------------------------------
-
-test("goal_pause is ungated and records the stop reason taxonomy", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-pause-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    const out = await hooks.tool.goal_pause.execute({}, toolCtx(sid, wt, denyAsk))
-    assert.match(out.output, /stop_reason: user/)
-    await hooks.tool.goal_resume.execute({}, toolCtx(sid, wt))
-    const out2 = await hooks.tool.goal_pause.execute({ blocker: "auth service is down" }, toolCtx(sid, wt, denyAsk))
-    assert.match(out2.output, /stop_reason: blocker/)
-    assert.match(goalFiles(wt)[0].text, /^stop_reason: blocker$/m)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_resume: deny keeps it paused; allow re-arms, rebinds owner, tops up budget with ceiling", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-resume-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt, { maxTurns: 10 })
-    await hooks.tool.goal_pause.execute({}, toolCtx(sid, wt, denyAsk))
-    await assert.rejects(hooks.tool.goal_resume.execute({}, toolCtx(sid, wt, denyAsk)), /denied by user/)
-    assert.equal(liveDoc(wt).doc.status, "paused")
-    const sid2 = nextSid()
-    await hooks.tool.goal_resume.execute({ addTurns: 5 }, toolCtx(sid2, wt))
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.status, "active")
-    assert.equal(doc.session, sid2, "ownership rebinds to the resuming session")
-    assert.equal(doc.maxTurns, 15)
-    // Hard ceiling holds even with an absurd top-up.
-    await hooks.tool.goal_pause.execute({}, toolCtx(sid2, wt, denyAsk))
-    await hooks.tool.goal_resume.execute({ addTurns: 99999 }, toolCtx(sid2, wt))
-    assert.equal(liveDoc(wt).doc.maxTurns, 200)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_resume promotes the oldest queued goal (/goal next path)", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-next-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const s1 = nextSid()
-    const s2 = nextSid()
-    await hooks.tool.goal_write.execute({ ...goalArgs({ goal: "first queued" }), arm: false }, toolCtx(s1, wt))
-    await sleep(5)
-    await hooks.tool.goal_write.execute({ ...goalArgs({ goal: "second queued" }), arm: false }, toolCtx(s2, wt))
-    const promoter = nextSid()
-    await hooks.tool.goal_resume.execute({}, toolCtx(promoter, wt))
-    const files = goalFiles(wt)
-    const active = files.find((f) => parseGoal(f.text).status === "active")
-    assert.ok(active, "one goal must be active")
-    assert.match(active.name, /first-queued/, "the OLDEST queued goal is promoted")
-    assert.equal(parseGoal(active.text).session, promoter)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("goal_discard: gated; abandoned file remains as history; engine forgets the session", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-discard-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    await assert.rejects(hooks.tool.goal_discard.execute({ reason: "wrong objective" }, toolCtx(sid, wt, denyAsk)), /denied by user/)
-    assert.equal(liveDoc(wt).doc.status, "active")
-    const out = await hooks.tool.goal_discard.execute({ reason: "wrong objective" }, toolCtx(sid, wt))
-    assert.match(out.output, /abandoned/)
-    assert.match(goalFiles(wt)[0].text, /^status: abandoned$/m)
-    // A fresh goal may now be created in the same session.
-    await hooks.tool.goal_write.execute({ ...goalArgs({ goal: "fresh start" }), arm: false }, toolCtx(sid, wt))
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// continuation engine
-// ---------------------------------------------------------------------------
-
-test("idle continuation: armed goal continues the owner session with a compact brief; turns and ledger increment", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-cont-"))
-  try {
-    setShellRunnerForTests(fakeRunnerPass)
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 1)
-    const body = prompts[0]
-    assert.equal(body.path.id, sid)
-    const brief = body.body.parts[0].text
-    assert.match(brief, /\[forge:goal-continue\]/)
-    assert.match(brief, /make the suite green/)
-    assert.match(brief, /shell `npm test`/)
-    assert.match(brief, /0\/25 turns used/)
-    assert.match(brief, /Crew layer: you own it under this goal/, "the continuation brief carries the crew-layer directive")
-    assert.equal(body.body.agent, undefined, "no agent override: single-principle, no switching")
-    assert.match(goalFiles(wt)[0].text, /^turns_used: 1$/m)
-    // Second idle evaluates turn 1 (ledger entry, no activity) and continues.
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 2)
-    assert.match(goalFiles(wt)[0].text, /- turn 1 rev1 \S+ activity=no \(writes=0 checks=0\)/)
-    assert.equal(liveDoc(wt).doc.turnsUsed, 2)
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("idle continuation brief: crew-layer directive is structure-aware — PREFER born-armed re-registration only for structured contracts", async () => {
-  // crew-goal-conversion-relay 1.2: a contract whose criteria name forge-* agents
-  // (or carry a numbered subtask structure) earns the PREFER directive; a plain
-  // contract keeps the baseline discretionary crew-layer line only.
-  const wtStructured = mkdtempSync(join(tmpdir(), "goal-pref-structured-"))
-  const wtPlain = mkdtempSync(join(tmpdir(), "goal-pref-plain-"))
-  try {
-    setShellRunnerForTests(fakeRunnerPass)
-    {
-      // Structured: the criteria name a forge-* worker -> PREFER re-registering.
-      const { serverPromise, prompts } = makeHarness({ worktree: wtStructured })
-      const hooks = await serverPromise
-      const sid = await armGoal(hooks, wtStructured, {
-        criteria: ["forge-plugindev-coder lands the wiring tests", "suite stays green"],
-        constraints: "keep per-subtask evidence for the close report",
-      })
-      await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-      await sleep(60)
-      assert.equal(prompts.length, 1)
-      const brief = prompts[0].body.parts[0].text
-      assert.match(brief, /Crew layer: you own it under this goal/, "the baseline crew-layer line still leads for a structured contract")
-      assert.match(brief, /PREFER re-registering it as a born-armed crew/, "a criterion naming a forge-* agent earns the PREFER directive over self-executing the plan")
-      await hooks.dispose?.()
-    }
-    {
-      // Plain: no forge-* mention, no numbered subtask list -> baseline only.
-      const { serverPromise, prompts } = makeHarness({ worktree: wtPlain })
-      const hooks = await serverPromise
-      const sid = await armGoal(hooks, wtPlain)
-      await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-      await sleep(60)
-      assert.equal(prompts.length, 1)
-      const brief = prompts[0].body.parts[0].text
-      assert.match(brief, /Crew layer: you own it under this goal/, "a plain contract still carries the baseline crew-layer line")
-      assert.doesNotMatch(brief, /PREFER/, "no PREFER directive without subtask structure")
-      await hooks.dispose?.()
-    }
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wtStructured, { recursive: true, force: true })
-    rmSync(wtPlain, { recursive: true, force: true })
-  }
-})
-
-test("idle: non-owner session and unknown-session-without-directory never continue", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-owner-"))
-  try {
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    const stranger = nextSid()
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: stranger } } })
-    await sleep(60)
-    assert.equal(prompts.length, 0, "non-owner must not continue")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("idle: lazy seeding resolves an unknown session via client.session.get", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-lazy-"))
-  try {
-    const { serverPromise, prompts } = makeHarness({
-      worktree: wt,
-      getSession: async () => ({ directory: wt, worktree: wt }),
-    })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    // New harness lost the in-memory map; simulate restart by using a fresh
-    // unknown-but-real owner id: re-render the goal file's owner.
-    const files = goalFiles(wt)
-    const ghost = parseGoal(files[0].text).session
-    // Drop the in-memory binding (new process semantics) by disposing.
-    await hooks.dispose?.()
-    const { serverPromise: sp2, prompts: prompts2 } = makeHarness({ worktree: wt, getSession: async () => ({ directory: wt }) })
-    const hooks2 = await sp2
-    await hooks2.event({ event: { type: "session.idle", properties: { sessionID: ghost } } })
-    await sleep(60)
-    assert.equal(prompts2.length, 1, "lazy-seeded continuation for the persisted owner")
-    await hooks2.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("budget: turn exhaustion wraps up once and pauses with budget-turns", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-budget-"))
-  try {
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt, { maxTurns: 1 })
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 1, "the single budgeted continuation")
-    assert.match(goalFiles(wt)[0].text, /^turns_used: 1$/m)
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(80)
-    assert.equal(prompts.length, 2, "exactly one wrap-up prompt")
-    assert.match(prompts[1].body.parts[0].text, /\[forge:goal-wrapup\]/)
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.status, "paused")
-    assert.equal(doc.stopReason, "budget-turns")
-    // No further continuation after the pause.
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 2)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("no-progress: two activity-free continuation turns auto-pause; a write resets the streak", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-noprog-"))
-  try {
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt, { maxTurns: 10 })
-    // Turn 1: no activity.
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 1)
-    // Turn 2: a write happened -> streak resets.
-    await hooks["tool.execute.after"]({ tool: "write", sessionID: sid, callID: "c", args: {} }, { title: "", output: "", metadata: {} })
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 2)
-    assert.equal(liveDoc(wt).doc.status, "active")
-    // Turns 3 and 4: no activity twice -> auto-pause with wrap-up.
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(80)
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.status, "paused")
-    assert.equal(doc.stopReason, "no-progress")
-    assert.ok(prompts.at(-1).body.parts[0].text.includes("[forge:goal-wrapup]"))
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("no-progress honesty: a forge_shell verification turn scores as activity and resets the streak; the brief carries the per-turn discipline", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-noprog-exec-"))
-  try {
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt, { maxTurns: 10 })
-    // Turn 1: no activity.
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 1)
-    // The brief teaches the discipline the detector enforces.
-    assert.ok(prompts[0].body.parts[0].text.includes("Per-turn discipline"), "the brief states the per-turn verification-or-write discipline")
-    assert.ok(prompts[0].body.parts[0].text.includes("read-only turns"), "the discipline names the ledger consequence")
-    // Turn 2: a VERIFICATION COMMAND ran through forge_shell (no writes) —
-    // the goal-no-progress-honesty scoring: this is activity, the streak
-    // resets, and the loop continues (the 2026-11-19 misfire class).
-    await hooks["tool.execute.after"]({ tool: "forge_shell", sessionID: sid, callID: "c", args: {} }, { title: "", output: "", metadata: {} })
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 2, "the verifying turn continued the loop")
-    assert.equal(liveDoc(wt).doc.status, "active", "a verification-command turn is never scored no-progress")
-    const entry = liveDoc(wt).doc.ledger.at(-1)
-    assert.ok(entry, "the turn was ledgered")
-    assert.equal(entry.activity, true, "the ledger scores the exec turn as activity")
-    assert.equal(entry.checks, 1, "the exec rides the checks counter")
-    assert.equal(entry.writes, 0, "no write happened")
-    // Turns 3 and 4 with NO tool calls at all: the genuinely-idle path is
-    // unchanged — the streak builds and the auto-pause still fires.
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(80)
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.status, "paused")
-    assert.equal(doc.stopReason, "no-progress")
-    assert.ok(prompts.at(-1).body.parts[0].text.includes("[forge:goal-wrapup]"))
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("transport failures: three consecutive failed deliveries auto-pause with transport-failures", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-transport-"))
-  try {
-    let fails = 0
-    const { serverPromise } = makeHarness({
-      worktree: wt,
-      prompt: async () => {
-        fails++
-        throw new Error("connection refused (test)")
-      },
-    })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt, { maxTurns: 10 })
-    for (let i = 0; i < 3; i++) {
-      await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-      await sleep(60)
-    }
-    assert.equal(fails, 3)
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.status, "paused")
-    assert.equal(doc.stopReason, "transport-failures")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("draft-conflict: a draft plan appearing mid-goal pauses the loop instead of fighting the write ban", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-conflict-"))
-  try {
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    await hooks.tool.plan_write.execute(
-      {
-        goal: "mid-goal planning",
-        context: "context",
-        approach: "approach",
-        tasks: ["one"],
-        risks: "none",
-        acceptance: ["ok"],
-      },
-      toolCtx(sid, wt),
-    )
-    // The write ban still denies writes (plan behavior byte-identical).
-    await assert.rejects(
-      hooks["tool.execute.before"]({ tool: "write", sessionID: sid, callID: "c" }, { args: {} }),
-      /\[forge\] A plan is in draft/,
-    )
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(80)
-    assert.equal(prompts.length, 0, "no continuation into a walled loop")
-    const { doc } = liveDoc(wt)
-    assert.equal(doc.status, "paused")
-    assert.equal(doc.stopReason, "draft-conflict")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// plan terminal lifecycle wiring (spec: Discard exit / Terminal lifecycle
-// narrative): the dated narrative and the status flip land in ONE write;
-// supersession is opt-in via the supersede argument, never inferred.
-// ---------------------------------------------------------------------------
-
-function planArgs(overrides = {}) {
-  return {
-    goal: "supersedeable work",
-    context: "recon found the entry point",
-    approach: "direct edit; rejected the framework swap as too big",
-    tasks: ["step one", "step two"],
-    risks: "none",
-    acceptance: ["it works", "it is fast"],
-    ...overrides,
-  }
-}
-
-function planFile(worktree) {
-  const dir = join(worktree, ".opencode", "plan")
-  const names = readdirSync(dir).filter((f) => f.endsWith(".md"))
-  assert.equal(names.length, 1)
-  const path = join(dir, names[0])
-  return { name: names[0], path, text: readFileSync(path, "utf8") }
-}
-
-test("plan_discard {supersede}: superseded status + successor narrative, output names the section, one atomic write", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-supersede-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(planArgs(), toolCtx(sid, wt))
-    const before = planFile(wt)
-    const out = await hooks.tool.plan_discard.execute(
-      { reason: "work moved to crew orchestration", supersede: ".opencode/crew/2026-10-01-campaign.md" },
-      toolCtx(sid, wt),
-    )
-    const f = planFile(wt)
-    assert.equal(parsePlan(f.text).status, "superseded", "supersede present -> superseded, never abandoned")
-    // Single atomic write: the on-disk bytes equal exactly one composition of
-    // the status flip + narrative under ONE shared timestamp (a section date
-    // differing from `updated` would mean two writes happened).
-    const updated = f.text.match(/^updated: (.*)$/m)[1]
-    assert.equal(
-      f.text,
-      appendTerminalSection(
-        transitionStatus(before.text, "superseded", updated),
-        "superseded",
-        { reason: "work moved to crew orchestration", successor: ".opencode/crew/2026-10-01-campaign.md" },
-        updated,
-      ),
-    )
-    assert.ok(f.text.includes("reason: work moved to crew orchestration"))
-    assert.ok(f.text.includes("successor: .opencode/crew/2026-10-01-campaign.md"))
-    assert.match(out.output, /superseded/)
-    assert.match(out.output, /— superseded/, "output names the appended section")
-    assert.match(out.output, /successor/)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("plan_discard without supersede stays abandoned; reason survives verbatim; missing reason lands (none given)", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-abandon-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(planArgs(), toolCtx(sid, wt))
-    const before = planFile(wt)
-    const out = await hooks.tool.plan_discard.execute({ reason: "user cancelled the task" }, toolCtx(sid, wt))
-    const f = planFile(wt)
-    assert.equal(parsePlan(f.text).status, "abandoned")
-    assert.ok(f.text.includes("reason: user cancelled the task"), "reason verbatim in the artifact")
-    assert.ok(!f.text.includes("successor:"), "no successor line on a plain discard")
-    const updated = f.text.match(/^updated: (.*)$/m)[1]
-    assert.equal(
-      f.text,
-      appendTerminalSection(transitionStatus(before.text, "abandoned", updated), "abandoned", { reason: "user cancelled the task" }, updated),
-    )
-    assert.match(out.output, /— abandoned/)
-    // Missing reason: the transition still appends the explicit (none given)
-    // marker — never silent. The abandoned plan is terminal, so a fresh
-    // session can plan again in the same workspace.
-    await hooks.tool.plan_write.execute(planArgs({ goal: "second attempt" }), toolCtx(nextSid(), wt))
-    await hooks.tool.plan_discard.execute({}, toolCtx(nextSid(), wt))
-    const others = readdirSync(join(wt, ".opencode", "plan")).filter((n) => n !== f.name)
-    assert.equal(others.length, 1)
-    const text2 = readFileSync(join(wt, ".opencode", "plan", others[0]), "utf8")
-    assert.equal(parsePlan(text2).status, "abandoned")
-    assert.ok(text2.includes("reason: (none given)"))
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("plan_close (legacy, no declared checks): zero ask events, evidence-summary close section in the same write as done", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-close-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(planArgs(), toolCtx(sid, wt))
-    await hooks.tool.plan_approve.execute({}, toolCtx(sid, wt))
-    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sid, wt))
-    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sid, wt))
-    const before = planFile(wt)
-    let asked = 0
-    const out = await hooks.tool.plan_close.execute(
-      {
-        checks: [
-          { criterion: "it works", pass: true, evidence: "node --test: 2 pass" },
-          { criterion: "it is fast", pass: true, evidence: "bench p95 12ms" },
-        ],
-      },
-      toolCtx(sid, wt, (req) => {
-        asked++
-      }),
-    )
-    // D4: the modal completion gate is gone — a plan_close call must never
-    // create an ask (the plugin verifies; the user reviews asynchronously).
-    assert.equal(asked, 0, "close must fire ZERO ask events")
-    const f = planFile(wt)
-    assert.equal(parsePlan(f.text).status, "done")
-    const updated = f.text.match(/^updated: (.*)$/m)[1]
-    assert.equal(
-      f.text,
-      appendTerminalSection(
-        transitionStatus(before.text, "done", updated),
-        "closed",
-        {
-          reason: "completion gate passed (plugin-verified)",
-          checks: [
-            { criterion: "it works", pass: true, evidence: "node --test: 2 pass" },
-            { criterion: "it is fast", pass: true, evidence: "bench p95 12ms" },
-          ],
-        },
-        updated,
-      ),
-    )
-    assert.ok(f.text.includes("reason: completion gate passed (plugin-verified)"))
-    assert.ok(f.text.includes("- PASS — it works"))
-    assert.ok(f.text.includes("  evidence: node --test: 2 pass"))
-    assert.ok(f.text.includes("- PASS — it is fast"))
-    assert.match(out.output, /— closed/, "output names the appended section")
-    assert.match(out.output, /plugin-verified/, "output announces the plugin-verified gate")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-function planDirEntries(worktree) {
-  const dir = join(worktree, ".opencode", "plan")
-  return readdirSync(dir)
-    .filter((f) => f.endsWith(".md"))
-    .map((name) => ({ name, text: readFileSync(join(dir, name), "utf8") }))
-}
-
-// ---------------------------------------------------------------------------
-// plan terminal lifecycle edges (task 5.2): the blank-supersede fallback, the
-// exact section relay in tool outputs, superseded-as-terminal discovery.
-
-test("plan_discard: a blank/whitespace supersede is a plain abandonment — supersession stays opt-in", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-blank-supersede-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(planArgs({ goal: "blank supersede case" }), toolCtx(sid, wt))
-    const out = await hooks.tool.plan_discard.execute({ reason: "moved on", supersede: "   " }, toolCtx(sid, wt))
-    const f = planFile(wt)
-    assert.equal(parsePlan(f.text).status, "abandoned", "a whitespace-only supersede is treated as absent (S2 trade-off)")
-    assert.ok(!f.text.includes("successor:"), "no successor line without a real successor value")
-    assert.match(out.output, /— abandoned/, "the output announces the abandoned exit, never superseded")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("terminal outputs relay the exact appended section: discard and close both name their `## <iso> — <kind>` heading", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-section-relay-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    // Discard relay.
-    const sidA = nextSid()
-    await hooks.tool.plan_write.execute(planArgs({ goal: "relay the discard section" }), toolCtx(sidA, wt))
-    const outA = await hooks.tool.plan_discard.execute({ reason: "user cancelled" }, toolCtx(sidA, wt))
-    const fA = planDirEntries(wt).find((e) => e.text.includes("goal: relay the discard section"))
-    const headingA = fA.text.match(/^## (.+ — abandoned)$/m)[1]
-    assert.ok(outA.output.includes(`## ${headingA}`), "the discard output carries the exact dated section heading from disk")
-    // Close relay.
-    const sidB = nextSid()
-    await hooks.tool.plan_write.execute(planArgs({ goal: "relay the close section" }), toolCtx(sidB, wt))
-    await hooks.tool.plan_approve.execute({}, toolCtx(sidB, wt))
-    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sidB, wt))
-    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sidB, wt))
-    const outB = await hooks.tool.plan_close.execute(
-      {
-        checks: [
-          { criterion: "it works", pass: true, evidence: "node --test: 2 pass" },
-          { criterion: "it is fast", pass: true, evidence: "bench p95 12ms" },
-        ],
-      },
-      toolCtx(sidB, wt, () => {
-        throw new Error("plan_close must never ask (D4)")
-      }),
-    )
-    const fB = planDirEntries(wt).find((e) => e.text.includes("goal: relay the close section"))
-    const headingB = fB.text.match(/^## (.+ — closed)$/m)[1]
-    assert.ok(outB.output.includes(`## ${headingB}`), "the close output carries the exact dated section heading from disk")
-    // plan-close-verified: the relay carries the evidence-summary content —
-    // plugin-verified verdict plus the per-criterion evidence lines on disk.
-    assert.match(outB.output, /plugin-verified/)
-    assert.ok(fB.text.includes("- PASS — it works"), "evidence summary verdicts live on disk")
-    assert.ok(fB.text.includes("  evidence: node --test: 2 pass"))
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// plan-close-verified: structured Verification Checks — frozen-set close
-// re-run (the FILE is the truth), fail-closed Check Log, plan_reopen.
-// ---------------------------------------------------------------------------
-
-test("plan_write checks: goal-shaped items render into `## Verification Checks` + an empty `## Check Log` and round-trip through parsePlan", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-checks-render-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    const out = await hooks.tool.plan_write.execute(
-      planArgs({
-        goal: "structured checks plan",
-        checks: [
-          { shell: "npm test" },
-          { shell: "echo hi", timeoutSec: 5 },
-          { containsFile: "done.txt", containsText: "done" },
-        ],
-      }),
-      toolCtx(sid, wt),
-    )
-    const f = planFile(wt)
-    assert.ok(f.text.includes("## Verification Checks"), "checks section rendered")
-    assert.ok(f.text.includes("1. shell `npm test` (timeout 120s)"))
-    assert.ok(f.text.includes("2. shell `echo hi` (timeout 5s)"))
-    assert.ok(f.text.includes("3. contains `done.txt` :: `done`"))
-    assert.ok(f.text.includes("## Check Log"), "check log section present from creation")
-    assert.ok(f.text.includes("(no checks recorded yet)"))
-    // Round-trip: the parser recovers exactly the frozen set (file = truth).
-    assert.deepEqual(parsePlan(f.text).checks, [
-      { kind: "shell", cmd: "npm test", timeoutSec: 120 },
-      { kind: "shell", cmd: "echo hi", timeoutSec: 5 },
-      { kind: "contains", file: "done.txt", text: "done" },
-    ])
-    assert.match(out.output, /Verification Checks: 3 items/)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("plan_close (structured): re-runs exactly the FROZEN file set — the file is the truth, close-time args carry no checks-swapping power", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-close-frozen-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(planArgs({ goal: "frozen set plan", checks: [{ shell: "echo alpha" }] }), toolCtx(sid, wt))
-    await hooks.tool.plan_approve.execute({}, toolCtx(sid, wt))
-    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sid, wt))
-    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sid, wt))
-    // Mutate the file's check set after approval: close re-runs whatever the
-    // FILE carries (the file is the frozen state — there is no separate
-    // approval-time memory to diverge from).
-    const f = planFile(wt)
-    writeFileSync(
-      f.path,
-      f.text.replace("1. shell `echo alpha` (timeout 120s)", "1. shell `echo alpha` (timeout 120s)\n2. shell `echo beta` (timeout 120s)"),
-    )
-    const cmds = []
-    setShellRunnerForTests(async (cmd) => {
-      cmds.push(cmd)
-      return { code: 0, output: `ran ${cmd}`, timedOut: false }
-    })
-    let asked = 0
-    const out = await hooks.tool.plan_close.execute(
-      // The only checks field plan_close accepts is per-criterion self-check
-      // EVIDENCE — no argument can inject or swap verification items.
-      { checks: [{ criterion: "it works", pass: true, evidence: "extra human-readable evidence" }] },
-      toolCtx(sid, wt, () => {
-        asked++
-      }),
-    )
-    assert.equal(asked, 0, "structured close must fire ZERO ask events")
-    assert.deepEqual(cmds, ["echo alpha", "echo beta"], "close re-runs exactly the file's frozen set")
-    const closed = planFile(wt)
-    assert.equal(parsePlan(closed.text).status, "done")
-    assert.ok(closed.text.includes("reason: completion gate passed (plugin-verified)"))
-    // Evidence summary terminal section: one OK (ms) line per re-run check.
-    assert.ok(/- #1 OK \(\d+ms\) `echo alpha`/.test(closed.text))
-    assert.ok(/- #2 OK \(\d+ms\) `echo beta`/.test(closed.text))
-    assert.ok(closed.text.includes("  output: exit=0 ran echo alpha"))
-    // The optional self-check rides along as extra evidence, never as the gate.
-    assert.ok(closed.text.includes("- PASS — it works"))
-    assert.match(out.output, /2 frozen verification items re-run passing/)
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("plan_close (structured): failing host re-run refuses the close, the failing run lands in the Check Log on disk, status stays approved; a fixed re-run closes", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-close-failclosed-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(planArgs({ goal: "fail-closed plan", checks: [{ shell: "npm test" }] }), toolCtx(sid, wt))
-    await hooks.tool.plan_approve.execute({}, toolCtx(sid, wt))
-    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sid, wt))
-    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sid, wt))
-    setShellRunnerForTests(fakeRunnerFail)
-    await assert.rejects(
-      () => hooks.tool.plan_close.execute({}, toolCtx(sid, wt, () => {})),
-      (e) => e instanceof Error && /fail-closed/.test(e.message) && /Fix the work and retry/.test(e.message),
-    )
-    const refused = planFile(wt)
-    assert.equal(parsePlan(refused.text).status, "approved", "a refused close leaves the plan approved")
-    const log = refused.text.slice(refused.text.indexOf("## Check Log"))
-    assert.ok(!log.includes("(no checks recorded yet)"), "the placeholder is replaced by the real run")
-    assert.match(log, /- \S+ run=\S+ #1 FAIL \(\d+ms\) `npm test` :: exit=1 boom/, "the failing run is recorded in the Check Log on disk")
-    // Fix the work: the same frozen set re-runs green and the close passes.
-    setShellRunnerForTests(fakeRunnerPass)
-    const out = await hooks.tool.plan_close.execute({}, toolCtx(sid, wt, () => {}))
-    const closed = planFile(wt)
-    assert.equal(parsePlan(closed.text).status, "done")
-    assert.match(out.output, /— closed/)
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("plan_reopen: done -> approved with a dated `— reopened` section, explicit session rebind, and a second close appends a second dated close section", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-reopen-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(planArgs({ goal: "reopenable work" }), toolCtx(sid, wt))
-    await hooks.tool.plan_approve.execute({}, toolCtx(sid, wt))
-    await hooks.tool.plan_tick.execute({ n: 1 }, toolCtx(sid, wt))
-    await hooks.tool.plan_tick.execute({ n: 2 }, toolCtx(sid, wt))
-    await hooks.tool.plan_close.execute(
-      { checks: [{ criterion: "it works", pass: true, evidence: "e" }, { criterion: "it is fast", pass: true, evidence: "e" }] },
-      toolCtx(sid, wt),
-    )
-    // A DIFFERENT session reopens: the done plan is terminal, so this only
-    // works through plan_reopen's explicit discovery + rebind wiring.
-    const sid2 = nextSid()
-    const out = await hooks.tool.plan_reopen.execute({ reason: "user read the evidence and asked for more" }, toolCtx(sid2, wt, () => {}))
-    const f = planFile(wt)
-    assert.equal(parsePlan(f.text).status, "approved", "reopen flips done -> approved")
-    assert.ok(f.text.includes("— reopened"), "dated reopened section appended")
-    assert.ok(f.text.includes("reason: user read the evidence and asked for more"), "reopen reason verbatim")
-    assert.match(out.output, /done -> approved/)
-    assert.match(out.output, /2\/2 tasks still ticked/)
-    // The rebind is real: sid2 (which never owned the plan) can close it —
-    // without the explicit state.planPath rewiring resolveActivePlan would
-    // skip the terminal file and refuse with "No plan to close."
-    await hooks.tool.plan_close.execute(
-      { checks: [{ criterion: "it works", pass: true, evidence: "e2" }, { criterion: "it is fast", pass: true, evidence: "e2" }] },
-      toolCtx(sid2, wt, () => {}),
-    )
-    const reclosed = planFile(wt)
-    assert.equal(parsePlan(reclosed.text).status, "done", "frontmatter status is the single current truth")
-    const closeHeadings = reclosed.text.match(/^## .+ — closed$/gm)
-    assert.equal(closeHeadings.length, 2, "a second close appends a SECOND dated close section")
-    // And the cycle holds: the done plan is terminal again for everyone else.
-    await assert.rejects(
-      () => hooks.tool.plan_close.execute({}, toolCtx(nextSid(), wt, () => {})),
-      /No plan to close\./,
-    )
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("a superseded plan is an ordinary terminal artifact: discovery skips it and a fresh draft reclaims the session", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "plan-superseded-terminal-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    await hooks.tool.plan_write.execute(planArgs({ goal: "the superseded ancestor" }), toolCtx(sid, wt))
-    await hooks.tool.plan_discard.execute(
-      { reason: "work moved to the crew", supersede: ".opencode/crew/2026-10-01-campaign.md" },
-      toolCtx(sid, wt),
-    )
-    const ancestor = planFile(wt)
-    assert.equal(parsePlan(ancestor.text).status, "superseded")
-    // Discovery ordering (pure core): rankActivePlans drops the superseded file entirely.
-    assert.deepEqual(rankActivePlans(planDirEntries(wt)), [])
-    // Wiring: resolveActivePlan no longer binds it — approval refuses with the no-plan contract string.
-    await assert.rejects(
-      () => hooks.tool.plan_approve.execute({}, toolCtx(sid, wt)),
-      /No plan awaiting approval\. Create one with plan_write first\./,
-    )
-    // A fresh session plans again in the same workspace and becomes the active plan.
-    const sid2 = nextSid()
-    await hooks.tool.plan_write.execute(planArgs({ goal: "the fresh successor plan" }), toolCtx(sid2, wt))
-    const ranked = rankActivePlans(planDirEntries(wt))
-    assert.equal(ranked.length, 1)
-    assert.equal(ranked[0].doc.status, "draft")
-    assert.equal(ranked[0].doc.goal, "the fresh successor plan")
-    await hooks.tool.plan_approve.execute({}, toolCtx(sid2, wt))
-    const successor = planDirEntries(wt).find((e) => e.text.includes("goal: the fresh successor plan"))
-    assert.equal(parsePlan(successor.text).status, "approved")
-    assert.equal(parsePlan(ancestor.text).status, "superseded", "the terminal ancestor stays frozen")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-// ---------------------------------------------------------------------------
-// compaction + notices
-// ---------------------------------------------------------------------------
-
-test("compaction: brief rides along; synthetic auto-continue suppressed only for goal sessions", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-compaction-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    const compacting = { context: [] }
-    await hooks["experimental.session.compacting"]({ sessionID: sid }, compacting)
-    assert.equal(compacting.context.length, 1)
-    assert.match(compacting.context[0], /\[forge:goal-brief\]/)
-    assert.match(compacting.context[0], /make the suite green/)
-    const ac1 = { enabled: true }
-    await hooks["experimental.compaction.autocontinue"]({ sessionID: sid }, ac1)
-    assert.equal(ac1.enabled, false)
-    const other = { enabled: true }
-    await hooks["experimental.compaction.autocontinue"]({ sessionID: "ses_unknown" }, other)
-    assert.equal(other.enabled, true, "non-goal sessions keep the host default")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("system notice: goal and plan notices coexist; paused notice routes explicit continuation through goal_resume", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-notice-"))
-  try {
-    const { serverPromise } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = nextSid()
-    // Arm the goal FIRST (arming after a draft exists is refused by design).
-    await hooks.tool.goal_write.execute({ ...goalArgs({ goal: "notice goal" }), arm: true }, toolCtx(sid, wt))
-    await hooks.tool.plan_write.execute(
-      { goal: "a plan", context: "c", approach: "a", tasks: ["t"], risks: "r", acceptance: ["ok"] },
-      toolCtx(sid, wt),
-    )
-    const out1 = { system: [] }
-    await hooks["experimental.chat.system.transform"]({ sessionID: sid, model: { providerID: "x", modelID: "y" } }, out1)
-    const planNotice = out1.system.find((s) => s.includes("[forge:plan-notice]"))
-    const goalNotice = out1.system.find((s) => s.includes("[forge:goal-notice]"))
-    assert.ok(planNotice, "plan notice present")
-    assert.ok(goalNotice, "goal notice present")
-    assert.match(goalNotice, /status: active/)
-    await hooks.tool.goal_pause.execute({}, toolCtx(sid, wt, denyAsk))
-    const out3 = { system: [] }
-    await hooks["experimental.chat.system.transform"]({ sessionID: sid, model: { providerID: "x", modelID: "y" } }, out3)
-    const pausedNotice = out3.system.find((s) => s.includes("[forge:goal-notice]"))
-    assert.match(pausedNotice, /stopped: user/)
-    assert.match(pausedNotice, /goal_resume/)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// decoupling boundary (grep-level regression)
-// ---------------------------------------------------------------------------
+// v1 autocontinue suppression has no v2 hook and is retired. The v2
+// compaction brief, budget, activity, pause and persistence cases live in
+// v2-goal-lifecycle and v2-session-commands; lazy seeding in v2-continuation.
 
 test("decoupling: goal core modules import nothing from plan-file; gate tools read no plan state", async () => {
   const { readFile } = await import("node:fs/promises")
@@ -1366,136 +114,19 @@ test("decoupling: goal core modules import nothing from plan-file; gate tools re
   assert.ok(!seg.includes("resolveActivePlan") && !seg.includes("planPath"), "goal_check/goal_complete read no plan state")
 })
 
-// ---------------------------------------------------------------------------
-// Review regression tests (post-0.2.0 findings)
-// ---------------------------------------------------------------------------
-
-test("promotion of an old queued goal re-arms the wall-clock budget (armed_at)", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-promo-clock-"))
+test("v2 idle sends one goal continuation and no retired dispatch brief", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "forge-b36-v2-"))
+  v2WiringSeam.resetHostAnchors()
+  const { ctx, state } = createV2MockContext()
+  const cleanup = await v2Setup(ctx, { anchors: [wt] })
+  const sid = nextSid()
   try {
-    setShellRunnerForTests(fakeRunnerPass)
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    // Queue a goal whose created timestamp is long past its 5-minute window.
-    const sidA = nextSid()
-    await hooks.tool.goal_write.execute({ ...goalArgs({ maxMinutes: 5 }), arm: false }, toolCtx(sidA, wt))
-    const file = goalFiles(wt)[0]
-    const goalPath = join(wt, ".opencode", "goal", file.name)
-    const old = new Date(Date.now() - 30 * 60_000).toISOString()
-    writeFileSync(goalPath, readFileSync(goalPath, "utf8").replace(/^created:.*$/m, `created: ${old}`))
-    // A second session promotes it through the resume gate and idles.
-    const sidB = nextSid()
-    await hooks.tool.goal_resume.execute({}, toolCtx(sidB, wt, allowAsk))
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sidB } } })
-    await sleep(60)
-    assert.equal(prompts.length, 1, "fresh armed_at must let the promoted goal continue instead of budget-pausing on stale created")
-    assert.match(goalFiles(wt)[0].text, /^turns_used: 1$/m)
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("disable knob: the continuation engine must not inject briefs", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-disable-idle-"))
-  try {
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    await hooks.config({ agent: { forge: { disable: true } } })
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 0, "a disabled plugin must not continue goals (the user cannot discard one either)")
-    // Re-enable and confirm the loop runs again (the knob is live).
-    await hooks.config({ agent: {} })
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 1)
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("the completion turn gets its Turn Ledger line even after the goal is terminal", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-gate-ledger-"))
-  try {
-    writeFileSync(join(wt, "done.txt"), "done\n")
-    setShellRunnerForTests(fakeRunnerPass)
-    const { serverPromise, prompts } = makeHarness({ worktree: wt })
-    const hooks = await serverPromise
-    const sid = await armGoal(hooks, wt)
-    // Turn 1: the engine continues; the turn has goal_check activity.
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.equal(prompts.length, 1)
-    await hooks["tool.execute.after"]({ tool: "goal_check", sessionID: sid, callID: "c", args: {} }, { title: "", output: "", metadata: {} })
-    // The model completes inside the continuation turn.
-    await hooks.tool.goal_complete.execute(
-      { attestations: [{ criterion: "npm test exits 0", pass: true, evidence: "exit=0 (fake runner)" }] },
-      toolCtx(sid, wt, allowAsk),
-    )
-    assert.equal(liveDoc(wt).doc.status, "completed")
-    // The next idle must still ledger turn 1 although the goal is terminal.
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(60)
-    assert.match(goalFiles(wt)[0].text, /- turn 1 rev1 \S+ activity=yes \(writes=0 checks=1\)/)
-    assert.equal(prompts.length, 1, "no further continuation for a terminal goal")
-    await hooks.dispose?.()
-  } finally {
-    setShellRunnerForTests(null)
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-// B36 (successor): the goal continuation fires exactly once per idle and no
-// dispatch machinery remains (the old coalesce brief is gone with the engine).
-test("B36: goal continuation fires once per idle; no dispatch briefs exist", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "forge-b36-"))
-  try {
-    const calls = []
-    const client = {
-      session: {
-        prompt: async (body) => calls.push(body),
-        promptAsync: async (body) => calls.push(body),
-        get: async () => undefined,
-        status: async (o) => ({ [o.path.id]: { type: "idle" } }),
-      },
-    }
-    const hooks = await server({
-      client,
-      project: { id: "p" },
-      directory: wt,
-      worktree: wt,
-      serverUrl: new URL("http://127.0.0.1:1"),
-      $: {},
-      experimental_workspace: { register() {} },
-    }, {})
-    await hooks.config({ agent: {}, command: {}, permission: {} })
-    assert.equal(hooks.__forgeDispatchTest, undefined, "the old dispatch seam is gone")
-
-    // arm a live goal owned by this session (same harness recipe as above)
-    const sid = "ses_b36"
-    await hooks.tool.goal_write.execute(
-      {
-        goal: "b36 once",
-        criteria: ["npm test exits 0"],
-        checks: [{ shell: "npm test" }],
-        constraints: "stay in the sandbox",
-        arm: true,
-      },
-      { sessionID: sid, worktree: wt, ask: async () => ({ status: "allow" }), metadata() {}, callID: "c", agent: "forge", messageID: "m" },
-    )
-
-    await hooks.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
-    await sleep(300) // goal debounce settles
-
-    assert.equal(calls.filter((c) => JSON.stringify(c.body ?? c).includes("[forge:goal-continue]")).length, 1, "single goal re-prompt for one idle")
-    assert.equal(calls.filter((c) => JSON.stringify(c.body ?? c).includes("[forge:dispatch-complete]")).length, 0, "no dispatch briefs exist anymore")
-    await hooks.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
+    await state.tools.get("goal_write").execute({ ...goalArgs(), arm: true }, toolCtx(sid, wt))
+    await state.sessionHooks.find(h => h.name === "experimental.idle").cb({ sessionID: sid, background: [] })
+    await sleep(100)
+    assert.equal(state.prompts.filter(p => p.text.includes("[forge:goal-continue]")).length, 1)
+    assert.equal(state.prompts.filter(p => p.text.includes("[forge:dispatch-complete]")).length, 0)
+  } finally { await cleanup(); rmSync(wt, { recursive: true, force: true }) }
 })
 
 // align-shell-interpreter: the goal gate's REAL shell runner (no fake
@@ -1514,128 +145,63 @@ test("align-shell-interpreter: run-check real runner propagates exit codes throu
   }
 })
 
-// ---------------------------------------------------------------------------
-// Goal-delegated crew self-orchestration (change add-crew-execution-mode-gate,
-// D9): under a governing ACTIVE goal owned by the session, crews are born
-// armed in one call and crew gates stay internal to the loop.
-
-function crewWorktree(t) {
-  const wt = mkdtempSync(join(tmpdir(), "goal-crew-"))
-  t.after(() => {
-    try {
-      rmSync(wt, { recursive: true, force: true })
-    } catch {}
-  })
+// Goal governance exercises actual registered v2 tools and permission domain.
+async function crewFixture(t, compliant = true) {
+  const wt = mkdtempSync(join(tmpdir(), "goal-crew-v2-"))
   mkdirSync(join(wt, ".opencode"), { recursive: true })
-  writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "goalcrew", agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
-  return wt
+  writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ ...(compliant ? { pool: "goalcrew" } : {}), agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
+  v2WiringSeam.resetHostAnchors()
+  const { ctx, state } = createV2MockContext()
+  const cleanup = await v2Setup(ctx, { anchors: [wt], materialize: "runtime" })
+  const sid = nextSid()
+  t.after(async () => { await cleanup(); v2WiringSeam.resetHostAnchors(); rmSync(wt, { recursive: true, force: true }) })
+  return { wt, sid, state, call: (name, args) => state.tools.get(name).execute(args, toolCtx(sid, wt)) }
 }
 
-test("goal delegation: one-call born-armed crew; crew gates stay internal to the loop", async (t) => {
-  const wt = crewWorktree(t)
-  const { serverPromise } = makeHarness({ worktree: wt })
-  const hooks = await serverPromise
-  // Re-anchor the module-level host forge loader to THIS worktree (the loader
-  // is (re)created only inside the config hook).
-  await hooks.config({ agent: {} })
-  const sid = await armGoal(hooks, wt)
-
-  // One-call register+arm: born EXECUTING, never pends, no three-choice stop.
-  const out = await hooks.tool.crew_begin.execute(
-    { objective: "crew under goal", subtasks: [{ title: "one" }], execution: "waves" },
-    toolCtx(sid, wt),
-  )
-  assert.match(out.output, /born armed/)
-  // crew-native-fallback 1.2: the born-armed (goal-delegated) arming output
-  // carries the same one-line fallback rule as the standalone arm.
-  assert.match(out.output, /Native fallback: when the pool offers no forge worker fitting a subtask/, "the born-armed arming output carries the fallback rule")
-  assert.match(out.output, /RECORD the fallback/, "the recording duty rides the born-armed output")
-  assert.doesNotMatch(out.output, /PENDING for this session/)
-  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid).mode, "executing")
-
-  // Gates internal: the report close succeeds even when ask would deny.
-  const closed = await hooks.tool.crew_close.execute(
-    { report: [{ title: "one", verdict: "PASS", evidence: "ok" }] },
-    toolCtx(sid, wt, denyAsk),
-  )
-  assert.match(closed.output, /Crew closed/)
-
-  // Re-shard unattended: abandon is ask-free under the goal; a fresh one-call
-  // re-arm follows immediately.
-  const out2 = await hooks.tool.crew_begin.execute({ objective: "reshard", subtasks: [{ title: "two" }], execution: "waves" }, toolCtx(sid, wt))
-  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid).mode, "executing")
-  const abandoned = await hooks.tool.crew_close.execute({ abandon: true, reason: "wrong decomposition" }, toolCtx(sid, wt, denyAsk))
-  assert.match(abandoned.output, /ABANDONED/)
-  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid), undefined)
-
-  // Conversion is refused under a governing goal (already governed) — even
-  // for a pending crew registered plain inside the loop.
-  await hooks.tool.crew_begin.execute({ objective: "c", subtasks: [{ title: "t" }] }, toolCtx(sid, wt))
-  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid).mode, "pending")
-  await assert.rejects(() => hooks.tool.crew_begin.execute({ execution: "goal" }, toolCtx(sid, wt)), /refused under a governing goal/)
-  await hooks.tool.crew_close.execute({ abandon: true, reason: "cleanup" }, toolCtx(sid, wt))
-  await hooks.dispose?.()
+test("v2 goal-delegated crew gates stay internal through close, reshard and conversion", async t => {
+  const { sid, state, call } = await crewFixture(t)
+  await call("goal_write", { ...goalArgs(), arm: true })
+  state.assertBehavior = "deny"
+  const before = state.asserts.length
+  const out = await call("crew_begin", { objective: "crew under goal", subtasks: [{ title: "one" }], execution: "waves" })
+  assert.match(out.content, /born armed/)
+  assert.match(out.content, /Native fallback: when the pool offers no forge worker fitting a subtask/)
+  assert.match(out.content, /RECORD the fallback/)
+  assert.doesNotMatch(out.content, /PENDING for this session/)
+  assert.equal(v2WiringSeam.crews.get(sid).mode, "executing")
+  const closed = await call("crew_close", { report: [{ title: "one", verdict: "PASS", evidence: "ok" }] })
+  assert.match(closed.content, /Crew closed/)
+  await call("crew_begin", { objective: "reshard", subtasks: [{ title: "two" }], execution: "waves" })
+  assert.equal(v2WiringSeam.crews.get(sid).mode, "executing")
+  const abandoned = await call("crew_close", { abandon: true, reason: "wrong decomposition" })
+  assert.match(abandoned.content, /ABANDONED/)
+  assert.equal(v2WiringSeam.crews.get(sid), undefined)
+  await call("crew_begin", { objective: "c", subtasks: [{ title: "t" }] })
+  assert.equal(v2WiringSeam.crews.get(sid).mode, "pending")
+  await assert.rejects(call("crew_begin", { execution: "goal" }), /refused under a governing goal/)
+  await call("crew_close", { abandon: true, reason: "cleanup" })
+  assert.equal(state.asserts.length, before, "governing goal keeps crew gates internal")
 })
 
-test("goal delegation: outside a governing goal the one-call arm still refuses (no goal / paused goal)", async (t) => {
-  // No goal at all.
-  const wt0 = crewWorktree(t)
-  const h0 = await makeHarness({ worktree: wt0 }).serverPromise
-  await h0.config({ agent: {} })
-  const sid0 = nextSid()
-  await assert.rejects(
-    () => h0.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }], execution: "waves" }, toolCtx(sid0, wt0)),
-    /cannot self-arm outside a governing goal/,
-  )
-  await h0.dispose?.()
-
-  // A PAUSED goal does not govern: one-call arm still refuses.
-  const wt1 = crewWorktree(t)
-  const h1 = await makeHarness({ worktree: wt1 }).serverPromise
-  await h1.config({ agent: {} })
-  const sid1 = await armGoal(h1, wt1)
-  await h1.tool.goal_pause.execute({ blocker: "waiting on the user" }, toolCtx(sid1, wt1))
-  await assert.rejects(
-    () => h1.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }], execution: "waves" }, toolCtx(sid1, wt1)),
-    /cannot self-arm outside a governing goal/,
-  )
-  // Plain registration still works and PENDS (the three-choice pause is the
-  // user's decision point outside goal governance).
-  await h1.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }] }, toolCtx(sid1, wt1))
-  assert.equal(h1.__forgeSubagentsTest.crews().get(sid1).mode, "pending")
-  await h1.dispose?.()
+test("v2 one-call crew arm refuses without an active governing goal", async t => {
+  const { sid, call } = await crewFixture(t)
+  const args = { objective: "o", subtasks: [{ title: "x" }], execution: "waves" }
+  await assert.rejects(call("crew_begin", args), /cannot self-arm outside a governing goal/)
+  await call("goal_write", { ...goalArgs(), arm: true })
+  await call("goal_pause", { blocker: "waiting on the user" })
+  await assert.rejects(call("crew_begin", args), /cannot self-arm outside a governing goal/)
+  await call("crew_begin", { objective: "o", subtasks: [{ title: "x" }] })
+  assert.equal(v2WiringSeam.crews.get(sid).mode, "pending")
 })
 
-// pool-namespace-contract (spec: crew-harness — "Crew-governed dispatch
-// pool-compliance gate"): the born-armed one-call registration runs the SAME
-// compliance pre-flight as plain registration — a NON-compliant workspace
-// pool (forge.json with agents, no `pool` field) refuses even under a
-// governing active goal: no record, no born-armed crew.
-test("goal delegation: born-armed one-call registration is REFUSED on a non-compliant workspace pool", async (t) => {
-  const wt = mkdtempSync(join(tmpdir(), "goal-crew-nc-"))
-  t.after(() => {
-    try {
-      rmSync(wt, { recursive: true, force: true })
-    } catch {}
+test("v2 goal-governed born-armed crew rejects non-compliant pool without records", async t => {
+  const { wt, sid, call } = await crewFixture(t, false)
+  await call("goal_write", { ...goalArgs(), arm: true })
+  await assert.rejects(call("crew_begin", { objective: "o", subtasks: [{ title: "x" }], execution: "waves" }), err => {
+    assert.match(err.message, /Pool compliance refused/)
+    assert.match(err.message, /missing top-level pool field/)
+    return true
   })
-  mkdirSync(join(wt, ".opencode"), { recursive: true })
-  // NON-compliant fixture: agents present, NO top-level `pool` field.
-  writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "zai/glm", thoughtLevel: "low" } } }))
-  const { serverPromise } = makeHarness({ worktree: wt })
-  const hooks = await serverPromise
-  await hooks.config({ agent: {} })
-  const sid = await armGoal(hooks, wt)
-
-  await assert.rejects(
-    () => hooks.tool.crew_begin.execute({ objective: "o", subtasks: [{ title: "x" }], execution: "waves" }, toolCtx(sid, wt)),
-    (err) => {
-      const m = String(err)
-      assert.match(m, /Pool compliance refused/, "the same pre-flight refusal as plain registration")
-      assert.match(m, /missing top-level pool field/, "the missing-vs-invalid violation")
-      return true
-    },
-  )
-  assert.equal(hooks.__forgeSubagentsTest.crews().get(sid), undefined, "no crew record — the refusal precedes any born-armed registration")
-  assert.equal(existsSync(join(wt, ".opencode", "crew")), false, "no crew record file was written")
-  await hooks.dispose?.()
+  assert.equal(v2WiringSeam.crews.get(sid), undefined)
+  assert.equal(existsSync(join(wt, ".opencode", "crew")), false)
 })

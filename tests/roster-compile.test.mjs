@@ -80,8 +80,14 @@ test("vocab mirror: NATIVE_TOOL_VOCAB is locked to the probe evidence (host 2.3.
   // frontmatter key `task` is host-mapped onto it (task:false → subagent deny).
   assert.equal(NATIVE_TOOL_VOCAB.dispatchTool, "subagent")
   assert.equal(NATIVE_TOOL_VOCAB.taskKey, "task")
-  // Probe §5: the shell channel is the Code Mode runtime `execute`; the
-  // legacy bash:false → shell-deny mapping does not cover it.
+  // retire-plugin-runtime design D6 records the v2.4.0 native names.
+  // This is a source-evidence mirror, not a live host registry check.
+  assert.equal(NATIVE_TOOL_VOCAB.shell, "shell")
+  assert.equal(NATIVE_TOOL_VOCAB.question, "question")
+  assert.equal(NATIVE_TOOL_VOCAB.grep, "grep")
+  assert.equal(NATIVE_TOOL_VOCAB.glob, "glob")
+  // Probe §5: Code Mode runtime `execute` is separate from native shell.
+  // The legacy bash:false → shell-deny mapping does not cover it.
   assert.equal(NATIVE_TOOL_VOCAB.shellChannel, "execute")
   assert.deepEqual([...NATIVE_TOOL_VOCAB.legacyShellKeys], ["shell", "bash"])
   // The readonly face feeds from the SAME mutating family as the v1
@@ -128,20 +134,39 @@ test("compile: variant words ride the model string; non-variant words leave it b
   assert.equal(modelStringFor({}), undefined, "Auto worker — no model key")
 })
 
-test("compile: tools face per shape in probe vocabulary", () => {
-  const ro = toolsFaceFor("readonly")
-  assert.equal(ro.task, false, "task:false (host maps to its real dispatch tool `subagent`)")
-  for (const t of MUTATING_TOOLS) assert.equal(ro[t], false, `readonly seals ${t}`)
-  assert.equal(ro.execute, false, "readonly seals the Code-Mode shell channel `execute`")
-  for (const k of ["shell", "bash"]) assert.equal(ro[k], false, `legacy ${k} hidden`)
-  const wr = toolsFaceFor("write")
-  assert.equal(wr.task, false)
-  for (const k of ["shell", "bash"]) assert.equal(wr[k], false, "write workers hide the builtin shell — forge_shell owns execution")
-  assert.equal(wr.execute, undefined, "write workers keep the execute channel (forge_shell partition keys on the forge- prefix)")
-  for (const t of MUTATING_TOOLS) {
-    if (NATIVE_TOOL_VOCAB.legacyShellKeys.includes(t)) continue // bash is hidden for every worker
-    assert.equal(wr[t], undefined, `write shape leaves ${t} open (shape-default-open)`)
+test("compile: native worker face denies recursion, question and all harness tools", () => {
+  for (const shape of ["readonly", "write"]) {
+    const face = toolsFaceFor(shape)
+    assert.equal(face.subagent, "deny")
+    assert.equal(face.question, "deny")
+    assert.equal(NATIVE_TOOL_VOCAB.primaryOnly.length, 15)
+    for (const tool of NATIVE_TOOL_VOCAB.primaryOnly) assert.equal(face[tool], "deny")
+    for (const tool of MUTATING_TOOLS) assert.equal(face[tool], shape === "readonly" ? "deny" : undefined)
+    assert.equal(face.execute, shape === "readonly" ? "deny" : undefined)
+    assert.equal(face.shell, undefined)
+    assert.equal(face.bash, undefined)
   }
+})
+
+test("compile: explicit effects survive except forced recursion and harness denies; either shell alias denies", () => {
+  const permission = { question: "ask", task: "allow", subagent: "allow", plan_write: "allow", shell: "allow", bash: "deny", read: "ask" }
+  const face = toolsFaceFor("readonly", permission)
+  assert.equal(face.question, "ask")
+  assert.equal(face.read, "ask")
+  assert.equal(face.shell, "deny")
+  assert.equal(face.subagent, "deny")
+  assert.equal(face.plan_write, "deny")
+  assert.equal(face.execute, "deny")
+  assert.equal(toolsFaceFor("write", { shell: "deny", bash: "allow" }).shell, "deny")
+  assert.equal(toolsFaceFor("write", { bash: "ask" }).shell, "ask")
+  assert.equal(toolsFaceFor("write", { question: "allow" }).question, "allow")
+  const compiled = compileRosterEntry({ matId: "alpha-worker", def: { permission }, provenance: { global: true } })
+  assert.ok(compiled.content.includes(`action: "shell"
+    resource: "*"
+    effect: "deny"`))
+  assert.ok(compiled.content.includes(`action: "question"
+    resource: "*"
+    effect: "ask"`))
 })
 
 test("compile: mandates + shape frame + role prompt + shared segment are baked into the body", () => {
@@ -183,7 +208,7 @@ test("compile: description carries the pool provenance (workspace + global fallb
   assert.equal(g.files[0].fileName, "forge-global-helper.md")
 })
 
-test("compile: frontmatter emits ONLY probe-proven keys (no permissions, no depth keys)", () => {
+test("compile: frontmatter emits ONLY probe-proven keys (native permissions, no depth keys)", () => {
   const compiled = compileRosterEntry({
     matId: "alpha-research",
     def: { model: "zai/glm", thoughtLevel: "low", shape: "readonly" },
@@ -191,7 +216,7 @@ test("compile: frontmatter emits ONLY probe-proven keys (no permissions, no dept
   })
   const fm = compiled.content.split("---")[1]
   const keys = fm.split("\n").filter((l) => l && !l.startsWith(" ")).map((l) => l.split(":")[0])
-  assert.deepEqual(keys.sort(), ["description", "mode", "model", "tools"])
+  assert.deepEqual(keys.sort(), ["description", "mode", "model", "permissions"])
 })
 
 // ---------------------------------------------------------------------------
@@ -245,22 +270,28 @@ test("execute: a failing write leaves NO half file at the destination (atomicity
   assert.equal(fs.paths().some((p) => p.endsWith(".new")), false, "no temp residue")
 })
 
-test("execute: rename refuses an existing destination → unlink+rename fallback lands the new content", () => {
+test("execute: rename failure preserves old destination and still writes siblings", () => {
   const fs = fakeFs()
-  seedPool(fs, "C:/WsG/.opencode/forge.json", { pool: "eta", agents: { research: {} } })
+  const recipe = "C:/WsG/.opencode/forge.json"
+  const dest = "C:/WsG/.opencode/agent/forge-eta-research.md"
+  seedPool(fs, recipe, { pool: "eta", agents: { research: {} } })
   const plan = () => planRosterSync(resolveOver(fs, ["C:/WsG"]), { globalPoolFile: GLOBAL })
-  executeRosterSync(plan(), fs) // creates the artifact
-  fs.writeFile("C:/WsG/.opencode/forge.json", JSON.stringify({ pool: "eta", agents: { research: { prompt: "NEW ROLE" } } }))
+  executeRosterSync(plan(), fs)
+  const old = fs.text(dest)
+  fs.writeFile(recipe, JSON.stringify({ pool: "eta", agents: { research: { prompt: "NEW ROLE" }, sibling: {} } }))
   const refusing = {
     ...fs,
     rename: (from, to) => {
-      if (fs.stat(to) !== null) throw new Error("EPERM: destination exists")
+      if (to === dest) throw new Error("EPERM: rename failed")
       return fs.rename(from, to)
     },
   }
   const outcome = executeRosterSync(plan(), refusing)
-  assert.equal(outcome.updated.length, 1)
-  assert.ok(fs.text("C:/WsG/.opencode/agent/forge-eta-research.md").includes("NEW ROLE"))
+  assert.equal(fs.text(dest), old)
+  assert.equal(outcome.updated.length, 0)
+  assert.equal(outcome.created.length, 1)
+  assert.match(outcome.errors[0], /EPERM: rename failed/)
+  assert.equal(fs.paths().some(p => p.endsWith(".new")), false)
 })
 
 // ---------------------------------------------------------------------------
@@ -306,6 +337,29 @@ test("staleness: content-based verdict — an mtime-newer recipe with identical 
   const verdict = staleCheckForPool("C:/WsI/.opencode/forge.json", ["iota-research"], fs, contentOf)
   assert.equal(verdict.stale, true)
   assert.match(verdict.reason, /differs from what it compiles to/)
+})
+
+test("staleness: differing compiled content is stale even at equal or newer artifact mtimes", () => {
+  const fs = fakeFs()
+  const pool = "C:/WsJ/.opencode/forge.json"
+  const artifact = "C:/WsJ/.opencode/agent/forge-kappa-research.md"
+  const ids = ["kappa-research"]
+  seedPool(fs, pool, { pool: "kappa", agents: { research: {} } })
+  const plans = planRosterSync(resolveOver(fs, ["C:/WsJ"]), { globalPoolFile: GLOBAL })
+  const contentOf = (matId) => plans[0].files.find((f) => f.matId === matId).content
+  const recipeMtime = fs.stat(pool).mtimeMs
+  // Same recipe, older projection content, but no timestamp signal.
+  fs.writeFile(artifact, "old generated content")
+  for (const mtime of [recipeMtime, recipeMtime + 1]) {
+    fs.setMtime(artifact, mtime)
+    const verdict = staleCheckForPool(pool, ids, fs, contentOf)
+    assert.equal(verdict.stale, true, `different content at artifact mtime ${mtime}: ${verdict.reason}`)
+    assert.match(verdict.reason, /differs from what it compiles to/)
+    assert.equal(staleCheckForPool(pool, ids, fs).stale, false)
+  }
+  fs.writeFile(artifact, contentOf(ids[0]))
+  fs.setMtime(artifact, recipeMtime)
+  assert.equal(staleCheckForPool(pool, ids, fs, contentOf).stale, false)
 })
 
 test("agentDirFor: workspace pools and the global layer both target their sibling agent directory", () => {

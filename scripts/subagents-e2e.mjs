@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): mixed retained config and retired task assertions; not current acceptance.
 // Official-install E2E for simplify-dispatch-to-static-agents (task 7.2).
 //
 // Phases (all against a SANDBOX config dir; the official `opencode plugin

@@ -1,6 +1,6 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs"
+import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -20,7 +20,7 @@ import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 process.env.FORGE_TEST_NO_FENCE = "1"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 
-import { v2Setup, v2WiringSeam } from "../plugin.ts"
+import { v2Setup, v2WiringSeam, __sessionAnchorTestSurface } from "../plugin.ts"
 
 const HOME = join(tmpdir(), "forge-v2-toolhooks-home")
 process.env.FORGE_TEST_FORGE_HOME = HOME
@@ -74,7 +74,7 @@ test("v2 tool hooks: draft write-freeze  - write refused, read passes, readonly 
   try {
     await state.tools.get("plan_write").execute(
       { goal: "belt draft", context: "c", approach: "a", tasks: ["t"], risks: "r", acceptance: ["a1"] },
-      { sessionID: "ses_d", worktree: dir },
+      { sessionID: "ses_d", agent: "forge", worktree: dir },
     )
     await assert.rejects(before({ tool: "write", sessionID: "ses_d", messageID: "msg_1", id: "call_1", input: { filePath: "x.ts" } }), /plan is in draft; write operations are denied \(write\)/)
     await assert.doesNotReject(before({ tool: "read", sessionID: "ses_d", messageID: "msg_1", id: "call_1", input: { filePath: "x.ts" } }))
@@ -84,10 +84,10 @@ test("v2 tool hooks: draft write-freeze  - write refused, read passes, readonly 
       const { state: s2, before: b2 } = await setup(pool)
       await s2.tools.get("plan_write").execute(
         { goal: "recon draft", context: "c", approach: "a", tasks: ["t"], risks: "r", acceptance: ["a1"] },
-        { sessionID: "ses_rec", worktree: pool },
+        { sessionID: "ses_rec", agent: "forge", worktree: pool },
       )
       // Session bound to the POOL worktree, dispatching its own readonly worker.
-      v2WiringSeam.sessions.set("ses_rec", { sessionID: "ses_rec", worktree: pool })
+      v2WiringSeam.sessions.set("ses_rec", { sessionID: "ses_rec", agent: "forge", worktree: pool })
       await assert.doesNotReject(b2({ tool: "task", sessionID: "ses_rec", args: { subagent_type: "forge-recon-scout" } }), "readonly recon passes during draft")
       await assert.rejects(b2({ tool: "task", sessionID: "ses_rec", args: { subagent_type: "general" } }), /dispatch is denied for this target/)
     } finally {
@@ -98,16 +98,25 @@ test("v2 tool hooks: draft write-freeze  - write refused, read passes, readonly 
   }
 })
 
-test("v2 tool hooks: dispatch guards  - non-forge speaker cannot dispatch forge-*; unknown session fails open", async () => {
+test("v2 tool hooks: dispatch guards  - legacy task family restriction, native build own-pool admission; unknown session fails open", async () => {
   const dir = poolDir("guards", { research: { ...RO } })
-  const { before } = await setup(dir)
+  const { before, state } = await setup(dir)
   try {
     // Family capture via the prompt seam (Decision 3 topology).
     await assert.rejects(
       before({ tool: "task", sessionID: "ses_out", agent: "build", messageID: "msg_1", id: "call_1", input: { subagent_type: "forge-guards-research" } }),
       /Dispatch refused: "forge-guards-research" is a forge-family worker and the current agent \("build"\) is outside the forge family/,
     )
-    // Unknown session, forge target: fail open (no speaker statement).
+    // Native dispatch is target/session-scoped, not restricted by speaker family.
+    v2WiringSeam.sessions.set("ses_out", { sessionID: "ses_out", agent: "build", worktree: dir })
+    await assert.doesNotReject(
+      before({ tool: "subagent", sessionID: "ses_out", agent: "build", messageID: "msg_1", id: "native_1", input: { agent: "forge-guards-research" } }),
+    )
+    await assert.doesNotReject(
+      before({ tool: "subagent", sessionID: "ses_out", id: "native_2", input: { agent: "forge-guards-research" } }),
+    )
+    assert.equal(state.creates.length, 0, "native admission must not create any session through the plugin")
+    // Unknown session with an ordinary target: no partition refusal.
     await assert.doesNotReject(before({ tool: "task", sessionID: "ses_unknown_g", messageID: "msg_1", id: "call_1", input: { subagent_type: "general" } }))
   } finally {
     rmSync(dir, { recursive: true, force: true })
@@ -126,6 +135,12 @@ test("v2 tool hooks: session-domain pool gate  - another workspace's pool is not
     v2WiringSeam.sessions.set("ses_a", { sessionID: "ses_a", worktree: wsA })
     // Own pool: passes the pool gate (no refusal).
     await assert.doesNotReject(before({ tool: "task", sessionID: "ses_a", agent: "forge", messageID: "msg_1", id: "call_1", input: { subagent_type: "forge-alpha-research" } }))
+    // Native preflight must reject the same cross-pool target before execution.
+    await assert.rejects(
+      before({ tool: "subagent", sessionID: "ses_a", agent: "build", id: "native_cross_pool", input: { agent: "forge-global-shader" } }),
+      /not dispatchable from this session/,
+    )
+    assert.equal(state.creates.length, 0)
     // Global-fallback target from a pooled workspace: refused with the
     // three-exits copy.
     await assert.rejects(
@@ -150,11 +165,15 @@ test("v2 tool hooks: crew pending belt + pool-compliance belt (hot-apply unblock
     // Register a PENDING crew through the same shared core (crew_begin).
     await state.tools.get("crew_begin").execute(
       { objective: "v2 belt crew", subtasks: [{ title: "scout" }] },
-      { sessionID: "ses_crew", worktree: dir, metadata: () => {} },
+      { sessionID: "ses_crew", agent: "forge", worktree: dir, metadata: () => {} },
     )
     await assert.rejects(before({ tool: "task", sessionID: "ses_crew", agent: "forge", messageID: "msg_1", id: "call_1", input: { subagent_type: "general" } }), /is PENDING \(registered, not armed\)/)
+    for (const agent of ["general", "forge-crewb-research"]) {
+      await assert.rejects(before({ tool: "subagent", sessionID: "ses_crew", agent: "build", messageID: "msg_1", id: "native_pending", input: { agent } }), /is PENDING \(registered, not armed\)/)
+    }
+    assert.equal(state.creates.length, 0, "refusal must not create any session through the plugin")
     // Arm the crew (waves)  - the pending belt lifts...
-    await state.tools.get("crew_begin").execute({ execution: "waves" }, { sessionID: "ses_crew", worktree: dir, metadata: () => {} })
+    await state.tools.get("crew_begin").execute({ execution: "waves" }, { sessionID: "ses_crew", agent: "forge", worktree: dir, metadata: () => {} })
     await assert.doesNotReject(before({ tool: "task", sessionID: "ses_crew", agent: "forge", messageID: "msg_1", id: "call_1", input: { subagent_type: "forge-crewb-research" } }))
     // ...then degrade the pool file mid-crew (drop the `pool` namespace):
     // the compliance belt refuses further forge-* dispatches...
@@ -172,38 +191,42 @@ test("v2 tool hooks: crew pending belt + pool-compliance belt (hot-apply unblock
   }
 })
 
-test("v2 tool hooks: readonly-exec seal  - WRITE-class denied, READ-class flows, primary/unknown unsealed", async () => {
-  const dir = poolDir("seal", { reviewer: { ...RO } })
-  const { before } = await setup(dir)
-  try {
-    // The event's own agent field is the strongest speaker statement.
-    await assert.rejects(before({ tool: "forge_shell", sessionID: "ses_ro", agent: "forge-seal-reviewer", messageID: "msg_1", id: "call_1", input: { command: "node build.js > out.txt" } }), /forge:seal] Exec refused: this session runs the readonly worker "forge-seal-reviewer"/)
-    await assert.doesNotReject(before({ tool: "forge_shell", sessionID: "ses_ro", agent: "forge-seal-reviewer", messageID: "msg_1", id: "call_1", input: { command: 'node -e "console.log(1)"' } }))
-    // The primary forge session is never sealed; unknown sessions fail open.
-    await assert.doesNotReject(before({ tool: "forge_shell", sessionID: "ses_primary", agent: "forge", messageID: "msg_1", id: "call_1", input: { command: "node build.js > out.txt" } }))
-    await assert.doesNotReject(before({ tool: "forge_shell", sessionID: "ses_unknown_seal", messageID: "msg_1", id: "call_1", input: { command: "node build.js > out.txt" } }))
-  } finally {
-    rmSync(dir, { recursive: true, force: true })
-  }
-})
-
 test("v2 tool hooks: state-file boundary + worker→STATE refusal + partition fallbacks", async () => {
   const dir = mkdtempSync(join(tmpdir(), "forge-v2-th-part-"))
-  const { before } = await setup(dir)
+  const { before, state } = await setup(dir)
   try {
     // Non-forge speaker writing into .opencode/plan: refused.
     await assert.rejects(
       before({ tool: "write", sessionID: "ses_np", agent: "build", messageID: "msg_1", id: "call_1", input: { filePath: ".opencode/plan/x.md", content: "y" } }),
       /inside the forge state directories/,
     )
+    for (const agent of ["forge", "build", "forge-worker", undefined]) {
+      for (const path of [".opencode/plan/x.md", ".opencode/goal/x.md", join(dir, ".opencode", "plan", "x.md"), join(dir, ".opencode", "goal", "x.md")]) {
+        for (const tool of ["write", "edit"]) {
+          await assert.rejects(before({ tool, agent, sessionID: "ses_boundary", input: { filePath: path } }), /inside the forge state directories/)
+        }
+        await assert.doesNotReject(before({ tool: "read", agent, sessionID: "ses_boundary", input: { filePath: path } }))
+      }
+    }
     // Same speaker, ordinary path: no boundary refusal.
     await assert.doesNotReject(before({ tool: "write", sessionID: "ses_np", agent: "build", messageID: "msg_1", id: "call_1", input: { filePath: "src/x.ts", content: "y" } }))
-    // Non-forge speaker calling a forge tool: fallback belt refusal.
-    await assert.rejects(before({ tool: "forge_jobs", sessionID: "ses_np", agent: "build", messageID: "msg_1", id: "call_1", input: { action: "list" } }), /belongs to the forge agent family/)
-    // forge-family worker calling a STATE tool: primary-only refusal.
-    await assert.rejects(before({ tool: "plan_tick", sessionID: "ses_worker", agent: "forge-x-research", messageID: "msg_1", id: "call_1", input: { n: 1 } }), /reserved for the primary forge agent/)
-    // forge-family calling the builtin shell: channel mandate refusal.
-    await assert.rejects(before({ tool: "bash", sessionID: "ses_worker2", agent: "forge", messageID: "msg_1", id: "call_1", input: { command: "ls" } }), /Builtin shell refused: the forge family executes through forge_shell/)
+    // Retained STATE tools, not retired runtime tools, are primary-only.
+    const goalDir = join(dir, ".opencode", "goal")
+    mkdirSync(goalDir, { recursive: true })
+    const sentinel = join(goalDir, "sentinel.md")
+    writeFileSync(sentinel, "unchanged fixture")
+    for (const tool of ["plan_write", "plan_tick", "plan_approve", "plan_close", "plan_reopen", "plan_discard", "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard", "crew_begin", "crew_close", "forge_sync"]) {
+      await assert.rejects(before({ tool, sessionID: "ses_np", agent: "build", input: {} }), /belongs to the forge agent family/)
+      await assert.rejects(before({ tool, sessionID: "ses_worker", agent: "forge-x-research", input: {} }), /reserved for the primary forge agent/)
+      await assert.rejects(before({ tool, sessionID: "ses_unknown", input: {} }), /primary identity is not established/)
+      await assert.doesNotReject(before({ tool, sessionID: "ses_primary", agent: "forge", input: {} }))
+      const execute = state.tools.get(tool).execute
+      for (const agent of ["build", "general", "forge-x-research", undefined]) {
+        await assert.rejects(execute({}, { sessionID: "ses_direct", worktree: dir, agent, ask() { assert.fail("unauthorized tool reached permission gate") } }), /\[forge:partition\] Tool refused/)
+      }
+    }
+    assert.deepEqual(readdirSync(goalDir), ["sentinel.md"])
+    assert.equal(readFileSync(sentinel, "utf8"), "unchanged fixture")
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }
@@ -214,20 +237,63 @@ test("v2 tool hooks: activity marking  - the after ledger counts writes/ticks/ch
   const { after } = await setup(dir)
   try {
     v2WiringSeam.turnActivity.set("ses_act", { writes: 0, checks: 0 })
-    await after({ tool: "write", sessionID: "ses_act", id: "call_1", input: {} })
-    await after({ tool: "plan_tick", sessionID: "ses_act", id: "call_1", input: {} })
-    await after({ tool: "goal_check", sessionID: "ses_act", id: "call_1", input: {} })
-    await after({ tool: "read", sessionID: "ses_act", id: "call_1", input: {} })
-    assert.deepEqual(v2WiringSeam.turnActivity.get("ses_act"), { writes: 2, checks: 1 })
+    await after({ tool: "write", sessionID: "ses_act", id: "call_write", input: {} })
+    await after({ tool: "plan_tick", sessionID: "ses_act", id: "call_plan_tick", input: {} })
+    await after({ tool: "goal_check", sessionID: "ses_act", id: "call_goal_check", input: {} })
+    await after({ tool: "read", sessionID: "ses_act", id: "call_read", input: {} })
+    assert.equal(v2WiringSeam.turnActivity.get("ses_act").writes, 2)
+    assert.equal(v2WiringSeam.turnActivity.get("ses_act").checks, 1)
     v2WiringSeam.crewTurnActivity.set("ses_cact", { dispatches: 0, writes: 0 })
-    await after({ tool: "task", sessionID: "ses_cact", id: "call_1", input: {} })
-    await after({ tool: "edit", sessionID: "ses_cact", id: "call_1", input: {} })
-    await after({ tool: "grep", sessionID: "ses_cact", id: "call_1", input: {} })
-    // "task" is itself a write tool (isWriteTool covers it): dispatch + write.
-    assert.deepEqual(v2WiringSeam.crewTurnActivity.get("ses_cact"), { dispatches: 1, writes: 2 })
+    await after({ tool: "task", sessionID: "ses_cact", id: "call_task", input: {} })
+    await after({ tool: "edit", sessionID: "ses_cact", id: "call_edit", input: {} })
+    await after({ tool: "grep", sessionID: "ses_cact", id: "call_grep", input: {} })
+    // A repeated observation of the same call is not a new execution.
+    await after({ tool: "edit", sessionID: "ses_cact", id: "call_edit", input: {} })
+    const crewActivity = v2WiringSeam.crewTurnActivity.get("ses_cact")
+    assert.equal(crewActivity.dispatches, 1)
+    assert.equal(crewActivity.writes, 2)
+    assert.deepEqual(crewActivity.seen, new Set(["call_task", "call_edit", "call_grep"]))
     // Inactive sessions: no-op, never a throw.
     await assert.doesNotReject(after({ tool: "write", sessionID: "ses_nobody", id: "call_1", input: {} }))
   } finally {
     rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+
+test("v2 native pool gate: host-visible ghost is denied for known healthy and broken pools, unknown session remains fail-open", async () => {
+  const dir = poolDir("ghostgate", { real: { ...RO } })
+  const sibling = poolDir("ghostsibling", { real: { ...RO } })
+  v2WiringSeam.resetHostAnchors()
+  __sessionAnchorTestSurface.resetInitializedDirectories()
+  const { ctx, state } = createV2MockContext()
+  const siblingHost = createV2MockContext()
+  let cleanup, siblingCleanup
+  try {
+    cleanup = await v2Setup(ctx, { anchors: [dir], materialize: "runtime" })
+    siblingCleanup = await v2Setup(siblingHost.ctx, { anchors: [sibling], materialize: "runtime" })
+    assert.equal(__sessionAnchorTestSurface.initializedDirectories().length, 2)
+    state.agents.set("forge-ghostgate-ghost", { id: "forge-ghostgate-ghost", mode: "subagent" })
+    v2WiringSeam.sessions.set("ses_ghost_known", { sessionID: "ses_ghost_known", worktree: dir })
+    const before = state.toolHooks.find(h => h.name === "execute.before").cb
+    const dispatch = (sessionID, agent) => before({ tool: "subagent", sessionID, agent: "build", input: { agent } })
+    await assert.doesNotReject(dispatch("ses_ghost_known", "forge-ghostgate-real"))
+    await assert.rejects(dispatch("ses_ghost_known", "forge-ghostgate-ghost"), /not dispatchable from this session/)
+    await assert.rejects(dispatch("ses_ghost_known", "forge-ghostsibling-real"), /not dispatchable from this session/)
+    assert.equal(state.sessionRecords.has("ses_ghost_unknown"), false)
+    assert.equal(v2WiringSeam.sessions.has("ses_ghost_unknown"), false)
+    await assert.doesNotReject(dispatch("ses_ghost_unknown", "forge-ghostgate-ghost"))
+    assert.equal(v2WiringSeam.sessions.has("ses_ghost_unknown"), false, "unknown must remain unbound")
+    writeFileSync(join(dir, ".opencode", "forge.json"), "{ broken config")
+    await assert.rejects(dispatch("ses_ghost_known", "forge-ghostgate-real"), /not dispatchable from this session/)
+    await assert.rejects(dispatch("ses_ghost_known", "forge-ghostgate-ghost"), /not dispatchable from this session/)
+    await assert.rejects(dispatch("ses_ghost_known", "forge-ghostsibling-real"), /not dispatchable from this session/)
+  } finally {
+    await siblingCleanup?.()
+    await cleanup?.()
+    v2WiringSeam.resetHostAnchors()
+    __sessionAnchorTestSurface.resetInitializedDirectories()
+    rmSync(dir, { recursive: true, force: true })
+    rmSync(sibling, { recursive: true, force: true })
   }
 })

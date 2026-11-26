@@ -1,11 +1,12 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, rmSync, existsSync, readdirSync } from "node:fs"
+import fs, { mkdtempSync, rmSync, existsSync, readdirSync, mkdirSync, readFileSync, writeFileSync } from "node:fs"
+import { syncBuiltinESMExports } from "node:module"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 
-// Task 2.1 — the v2 tool surface: ALL tools (forge_shell, forge_jobs,
-// 5 plan_*, 6 goal_*, 2 crew_*, task, forge_grep, forge_glob) register via
+// V2 tool surface after shell/jobs/task retirement (tasks 4.2, 5.1): retained tools (
+// 6 plan_*, 6 goal_*, 2 crew_*, forge_sync) register via
 // ctx.tool.transform against the mock harness, each with a JSON Schema
 // input contract translated from the tool.schema.* chains by the shared
 // builder, reusing the exact v1 execute cores (one code path). Results
@@ -14,7 +15,7 @@ import { join } from "node:path"
 
 import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 
-// Execute-core hygiene (same as every wiring suite): the forge_jobs core
+// Execute-core hygiene (same as every wiring suite): the dispatch core
 // lazily starts the job lifecycle — without the no-fence knob its stdin
 // watcher holds the test process's event loop open. Must precede the
 // plugin import (goal debounce knob same discipline).
@@ -22,12 +23,24 @@ process.env.FORGE_TEST_NO_FENCE = "1"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 
 import { v2Setup } from "../plugin.ts"
+import { NATIVE_TOOL_VOCAB } from "../src/roster-compile.ts"
+import { renderPlan, tickTask, transitionStatus } from "../src/plan-file.ts"
 
-// The full W2 registration surface (20 tools — forge_sync joined with
+// Source mirror: retire-plugin-runtime design D6 records these host v2.4.0
+// names. setupTools observes plugin registrations only, not the host registry.
+test("native tool vocabulary mirrors recorded v2.4.0 names (registry probe pending)", () => {
+  assert.deepEqual([
+    NATIVE_TOOL_VOCAB.shell,
+    NATIVE_TOOL_VOCAB.dispatchTool,
+    NATIVE_TOOL_VOCAB.question,
+    NATIVE_TOOL_VOCAB.grep,
+    NATIVE_TOOL_VOCAB.glob,
+  ], ["shell", "subagent", "question", "grep", "glob"])
+})
+
+// The full W2 registration surface (15 tools — forge_sync joined with
 // native-first-roster; plan_reopen joined with plan-close-verified D5).
 const EXPECTED_TOOLS = [
-  "forge_shell",
-  "forge_jobs",
   "plan_write",
   "plan_tick",
   "plan_approve",
@@ -43,9 +56,6 @@ const EXPECTED_TOOLS = [
   "crew_begin",
   "crew_close",
   "forge_sync",
-  "task",
-  "forge_grep",
-  "forge_glob",
 ]
 
 async function setupTools() {
@@ -61,9 +71,13 @@ async function setupTools() {
   return state
 }
 
-test("v2 tools: ALL 20 tools register with descriptions and object input schemas", async () => {
+test("v2 tools: ALL 15 tools register with descriptions and object input schemas", async () => {
   const state = await setupTools()
   assert.deepEqual([...state.tools.keys()].sort(), [...EXPECTED_TOOLS].sort())
+  assert.equal(state.tools.has("forge_shell"), false, "retired shell tool is absent")
+  assert.equal(state.tools.has("forge_jobs"), false, "retired jobs tool is absent")
+  assert.equal(state.tools.has("forge_grep"), false, "retired search alias is absent")
+  assert.equal(state.tools.has("forge_glob"), false, "retired search alias is absent")
   for (const name of EXPECTED_TOOLS) {
     const def = state.tools.get(name)
     assert.equal(typeof def.description, "string", `${name} carries a description`)
@@ -74,7 +88,7 @@ test("v2 tools: ALL 20 tools register with descriptions and object input schemas
   }
 })
 
-test("v2 tools: schema translation — required vs optional, ints, arrays, describes (plan_write / forge_shell / plan_tick)", async () => {
+test("v2 tools: schema translation — required vs optional, ints, arrays, describes (plan_write / plan_tick)", async () => {
   const state = await setupTools()
   const pw = state.tools.get("plan_write").input
   // plan_write: goal/context/approach/tasks/risks/acceptance required; nonGoals optional
@@ -84,19 +98,10 @@ test("v2 tools: schema translation — required vs optional, ints, arrays, descr
   assert.equal(pw.properties.tasks.type, "array")
   assert.equal(pw.properties.tasks.items.type, "string")
   assert.ok(pw.properties.goal.description?.length > 0, ".describe() text rides the schema")
-  const fs2 = state.tools.get("forge_shell").input
-  assert.ok(fs2.required.includes("command"))
-  for (const opt of ["workdir", "run_in_background", "idle_ms", "max_wait_ms", "success_pattern", "keep_alive", "notify", "survive"]) {
-    assert.equal(fs2.required.includes(opt), false, `forge_shell.${opt} optional`)
-  }
-  assert.equal(fs2.properties.run_in_background.type, "boolean")
-  assert.equal(fs2.properties.idle_ms.type, "integer", ".int() translates to integer")
   const pt = state.tools.get("plan_tick").input
   assert.equal(pt.properties.n.type, "integer", "int().positive() -> integer with exclusiveMinimum")
   assert.ok(pt.properties.n.exclusiveMinimum !== undefined)
   assert.deepEqual(pt.required, ["n"])
-  const gj = state.tools.get("forge_jobs").input
-  assert.deepEqual(gj.required, ["action"])
 })
 
 test("v2 tools: crew_begin schema — subtasks is OPTIONAL (the arm-only {execution} call passes parameter validation)", async () => {
@@ -119,10 +124,6 @@ test("v2 tools: crew_begin schema — subtasks is OPTIONAL (the arm-only {execut
 
 test("v2 tools: execute reuses the shared cores — results wrap in { content } (SANDBOX-PENDING shape)", async () => {
   const state = await setupTools()
-  // forge_jobs list: harmless, registry empty on a fresh process.
-  const jobs = await state.tools.get("forge_jobs").execute({ action: "list" }, {})
-  assert.ok(typeof jobs.content === "string", "result wrapped as { content }")
-  assert.match(jobs.content, /\(no jobs\)/)
   // plan_write through the adapter: a real plan file lands in the worktree.
   const dir = mkdtempSync(join(tmpdir(), "forge-v2-tool-plan-"))
   try {
@@ -135,7 +136,7 @@ test("v2 tools: execute reuses the shared cores — results wrap in { content } 
         risks: "shape drift",
         acceptance: ["tools register"],
       },
-      { sessionID: "s-v2", worktree: dir },
+      { sessionID: "s-v2", agent: "forge", worktree: dir },
     )
     assert.ok(typeof res.content === "string")
     assert.match(res.content, /Plan created/)
@@ -147,9 +148,96 @@ test("v2 tools: execute reuses the shared cores — results wrap in { content } 
   // plan_tick without an approved plan: the core's error propagates.
   const tickDir = mkdtempSync(join(tmpdir(), "forge-v2-tool-x-"))
   try {
-    await assert.rejects(state.tools.get("plan_tick").execute({ n: 1 }, { sessionID: "s-v2-tick", worktree: tickDir }))
+    await assert.rejects(state.tools.get("plan_tick").execute({ n: 1 }, { sessionID: "s-v2-tick", agent: "forge", worktree: tickDir }))
   } finally {
     rmSync(tickDir, { recursive: true, force: true })
+  }
+})
+
+test("v2 tools: plan_tick preserves approved plan bytes on rename failure", async (t) => {
+  const state = await setupTools()
+  const dir = mkdtempSync(join(tmpdir(), "forge-v2-tick-atomic-"))
+  try {
+    const planDir = join(dir, ".opencode", "plan")
+    const file = join(planDir, "2026-11-26-tick.md")
+    mkdirSync(planDir, { recursive: true })
+    const now = "2026-11-26T12:00:00Z"
+    const draft = renderPlan({
+      goal: "Atomic tick fixture", context: "Existing plan", approach: "Fixture only",
+      tasks: ["first", "second"], risks: "rename failure", acceptance: ["bytes preserved"],
+    }, now)
+    const original = Buffer.from(tickTask(transitionStatus(draft, "approved", now), 1, now))
+    writeFileSync(file, original)
+    const metadata = t.mock.fn()
+    const context = { sessionID: "s-v2-tick-atomic", agent: "forge", worktree: dir, metadata }
+    const execute = state.tools.get("plan_tick").execute
+    const failure = new Error("forced plan tick rename failure")
+    const realRename = fs.renameSync
+    const rename = t.mock.method(fs, "renameSync", (temp, target) => {
+      if (resolve(target) !== resolve(file)) return realRename(temp, target)
+      assert.notEqual(resolve(temp), resolve(file))
+      assert.match(readFileSync(temp, "utf8"), /- \[x\] 2\. second/)
+      throw failure
+    })
+    syncBuiltinESMExports()
+    try {
+      await assert.rejects(execute({ n: 2 }, context), (err) => err === failure)
+      assert.equal(rename.mock.callCount(), 1)
+      assert.deepEqual(readFileSync(file), original)
+      assert.deepEqual(readdirSync(planDir), ["2026-11-26-tick.md"])
+      assert.equal(metadata.mock.callCount(), 0)
+      await assert.rejects(execute({ n: 7 }, context), /Task number 7 does not exist/)
+      assert.deepEqual(readFileSync(file), original)
+      await assert.rejects(execute({ n: 1 }, context), /already ticked/)
+      assert.deepEqual(readFileSync(file), original)
+      assert.equal(rename.mock.callCount(), 1)
+      assert.equal(metadata.mock.callCount(), 0)
+    } finally {
+      rename.mock.restore()
+      syncBuiltinESMExports()
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("v2 tools: plan revision, approval and discard preserve the draft on rename failure", async (t) => {
+  const state = await setupTools()
+  const dir = mkdtempSync(join(tmpdir(), "forge-v2-plan-atomic-"))
+  try {
+    const args = { goal: "Atomic plan fixture", context: "test", approach: "test", tasks: ["first"], risks: "none", acceptance: ["preserved"] }
+    const metadata = t.mock.fn()
+    const context = { sessionID: "s-v2-plan-atomic", agent: "forge", worktree: dir, metadata }
+    const call = (name, input) => state.tools.get(name).execute(input, context)
+    await call("plan_write", args)
+    const planDir = join(dir, ".opencode", "plan")
+    const [name] = readdirSync(planDir)
+    const file = join(planDir, name)
+    const original = readFileSync(file)
+    metadata.mock.resetCalls()
+    const failure = new Error("forced plan rename failure")
+    const realRename = fs.renameSync
+    const rename = t.mock.method(fs, "renameSync", (temp, target) => {
+      if (resolve(target) !== resolve(file)) return realRename(temp, target)
+      assert.notEqual(resolve(temp), resolve(file))
+      throw failure
+    })
+    syncBuiltinESMExports()
+    try {
+      for (const [tool, input] of [["plan_write", { ...args, tasks: ["revised"] }], ["plan_approve", {}], ["plan_discard", { reason: "cancel" }], ["plan_discard", { supersede: "successor.md" }]]) {
+        await assert.rejects(call(tool, input), (err) => err === failure, tool)
+        assert.deepEqual(readFileSync(file), original, tool)
+        assert.deepEqual(readdirSync(planDir), [name], tool)
+        assert.equal(metadata.mock.callCount(), 0, tool)
+      }
+      assert.equal(rename.mock.callCount(), 4)
+      assert.equal(state.asserts.length, 1, "approval still requests confirmation")
+    } finally {
+      rename.mock.restore()
+      syncBuiltinESMExports()
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
   }
 })
 
@@ -178,41 +266,10 @@ test("v2 tools: agent materialization and tool registration are independent slic
   assert.ok(t2.state.agents.has("forge"), "the agent registers regardless of the tool domain")
 })
 
-test("v2 task dispatch (fix-v2-crew-surface-drift D2): the 2.3.2 promise-layer create seam adapts — FLAT create input, bare record resolved, anchored parent directory", async (t) => {
-  process.env.FORGE_DISPATCH_POLL_INTERVAL_MS = "5"
-  process.env.FORGE_DISPATCH_POLL_SLICE_MS = "10"
-  // Hermetic tracker teardown (service-discovery-hermetic): on a v2 client the
-  // background tracker is an infinite slice loop — no status reader, and the
-  // HTTP messages reader reports capability-pending when no service is
-  // discovered. It used to end only because the user's REAL host answered 404
-  // to the leaked reads (view-loss). It now ends through the public lever
-  // (`forge_jobs stop` from the owner session); the reconcile floor is dropped
-  // so the tracker observes the kill at its next (10 ms) slice, not 10 s later.
-  process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS = "0"
+test("v2 tools: no plugin-provided child-session creation tool registers", async () => {
   const state = await setupTools()
-  const dir = mkdtempSync(join(tmpdir(), "forge-v2-task-seam-"))
-  t.after(async () => {
-    await state.tools.get("forge_jobs").execute({ action: "stop" }, { sessionID: "s-v2-task", worktree: dir, directory: dir, metadata: () => {}, message: async () => {} })
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_DISPATCH_POLL_INTERVAL_MS
-    delete process.env.FORGE_DISPATCH_POLL_SLICE_MS
-    delete process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS
-  })
-  // The authoritative record for the calling session anchors the child
-  // (design D2 2.3): a record pointing at the tool-context workspace makes
-  // the flat create's directory resolve from the authoritative chain.
-  state.sessionRecords.set("s-v2-task", { sessionID: "s-v2-task", directory: dir, worktree: dir })
-  const res = await state.tools.get("task").execute(
-    { subagent_type: "general", prompt: "probe dispatch", description: "seam probe", run_in_background: true },
-    { sessionID: "s-v2-task", worktree: dir, directory: dir, metadata: () => {}, message: async () => {} },
-  )  // The moved-seam adaptation (D2): the dispatch engine's v1 {body,query}
-  // call is translated to the FLAT single-object param the 2.3.2
-  // promise-layer create accepts, and the BARE record response resolves.
-  assert.ok(state.creates.length >= 1, "the flat create seam was called")
-  const flat = state.creates[0]
-  assert.equal(flat.parentID, "s-v2-task", "flat param: parentID rides the root object")
-  assert.ok(typeof flat.title === "string" && flat.title.includes("(@general subagent)"), "flat param: the native child title format")
-  assert.ok(!("body" in flat) && !("query" in flat), "the v1 {body,query} envelope is NOT handed to the 2.3.2 create seam")
-  assert.equal(flat.directory, dir, "the parent directory anchors the child (authoritative-first chain, tool-context fallback here)")
-  assert.ok(/task id|dispatched/i.test(String(res.content ?? res)), "an async handle returns")
+  for (const name of ["task", "subagent", "forge_dispatch", "forge_dispatch_config", "forge_dispatch_list", "forge_dispatch_kill"]) {
+    assert.equal(state.tools.has(name), false, name + " is not a plugin registration")
+  }
+  assert.equal(state.creates.length, 0, "setup does not create children in an empty workspace")
 })

@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): historical goal sandbox bootstrap; not current acceptance.
 // Sandbox E2E bootstrap: fixed config dir + file:// plugin entry.
 // Usage: node scripts/sandbox-e2e-setup.mjs
 import { mkdirSync, rmSync, writeFileSync, existsSync } from "node:fs"

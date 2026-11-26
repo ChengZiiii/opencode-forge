@@ -3,6 +3,7 @@ import assert from "node:assert/strict"
 import { mkdtempSync, rmSync, writeFileSync, mkdirSync, readFileSync, readdirSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { createServer } from "node:http"
 
 // Debounce must be tiny BEFORE plugin.ts is imported (module-level const).
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
@@ -10,523 +11,103 @@ process.env.FORGE_TEST_NO_FENCE = "1"
 // Sandbox the plugin's runtime-artifact home (session-anchor ledger etc.) —
 // this suite binds POOLED workspaces and must never write the real ledger.
 process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "part-wiring-home-"))
-const { server } = await import("../plugin.ts")
-
-// Host-lifetime simulation (hierarchical-pool-materialization): reset the
-// anchor set before each server() call so every test runs on a fresh host
-// (the primary anchor — plain-id pool — must be the test's own dir).
-let lastHost = null
-async function startServer(inputArg, opts) {
-  if (lastHost) lastHost.__forgeSubagentsTest.resetAnchors()
-  lastHost = await server(inputArg, opts)
-  return lastHost
-}
+const { v2Setup, v2WiringSeam, __sessionAnchorTestSurface, resetServiceHttpDiscoveryForTests } = await import("../plugin.ts")
+const { createV2MockContext } = await import("./lib/v2-mock-context.mjs")
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-const allowAsk = async () => {}
+const ctx = (sid, wt) => ({ sessionID: sid, worktree: wt, metadata() {}, callID: "c", agent: "forge", messageID: "m" })
 
-function inputFor(wt) {
-  return {
-    client: { session: {} },
-    project: { id: "p" },
-    directory: wt,
-    worktree: wt,
-    serverUrl: new URL("http://127.0.0.1:1"),
-    $: () => {},
-    experimental_workspace: { register() {} },
-  }
-}
-
-const ctx = (sid, wt) => ({ sessionID: sid, worktree: wt, ask: allowAsk, metadata() {}, callID: "c", agent: "forge", messageID: "m" })
-
-const seed = (h, sid, agent) => h["chat.message"]({ sessionID: sid, agent }, { message: {}, parts: [] })
-
-const ALL_FORGE_TOOLS = [
-  "plan_write", "plan_tick", "plan_approve", "plan_close", "plan_discard",
+const STATE_TOOLS = [
+  "plan_write", "plan_tick", "plan_approve", "plan_close", "plan_reopen", "plan_discard",
   "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard",
-  "crew_begin", "crew_close", "forge_shell", "forge_jobs", "forge_grep", "forge_glob",
+  "crew_begin", "crew_close", "forge_sync",
 ]
-const STATE_TOOLS = ALL_FORGE_TOOLS.filter((t) => !["forge_shell", "forge_jobs", "forge_grep", "forge_glob"].includes(t))
 
 // ---------------------------------------------------------------------------
 // config-side partition injections (task 3.1 / 2.4)
 // ---------------------------------------------------------------------------
 
-test("partition config: non-forge agents hide every plugin tool; explicit true is respected; nobody is disabled", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-cfg-"))
-  try {
-    const h = await startServer(inputFor(wt), {})
-    const cfg = { agent: { mine: { tools: { forge_shell: true } }, plain: {} } }
-    await h.config(cfg)
-    for (const t of ALL_FORGE_TOOLS) {
-      assert.equal(cfg.agent.plain.tools[t], false, `plain agent hides ${t}`)
-      assert.equal(cfg.agent.mine.tools[t], t === "forge_shell" ? true : false, `mine respects explicit true for ${t}`)
-    }
-    // Native fallbacks materialized as minimal partition entries.
-    for (const native of ["build", "plan", "general", "explore"]) {
-      assert.ok(cfg.agent[native], `${native} materialized`)
-      assert.equal(cfg.agent[native].disable, undefined, `${native} is NOT disabled`)
-      for (const t of ALL_FORGE_TOOLS) assert.equal(cfg.agent[native].tools[t], false, `${native} hides ${t}`)
-      assert.equal(Object.keys(cfg.agent[native]).length === 1 && cfg.agent[native].tools !== undefined, true, `${native} entry is minimal`)
-    }
-    // The forge family is never touched by the non-forge pass.
-    assert.equal(cfg.agent.forge.tools.write, undefined)
-    // Default subject (D13): coexistence must not flip the default to build.
-    assert.equal(cfg.default_agent, "forge")
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
 
-test("partition config: an explicit user default_agent is respected", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-def-"))
-  try {
-    const h = await startServer(inputFor(wt), {})
-    const cfg = { agent: {}, default_agent: "build" }
-    await h.config(cfg)
-    assert.equal(cfg.default_agent, "build", "the user's explicit choice stands")
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("partition config: forge-* workers lose harness state tools but keep the exec pair", async () => {
+test("v2 partition config: worker definition preserves its shape and recursion rule", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-worker-"))
+  let cleanup
   try {
     mkdirSync(join(wt, ".opencode"), { recursive: true })
     writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "part", agents: { builder: { model: "x/y", thoughtLevel: "low", shape: "write" } } }))
-    const h = await startServer(inputFor(wt), {})
-    const cfg = { agent: {} }
-    await h.config(cfg)
-    const worker = cfg.agent["forge-part-builder"]
+    const mock = createV2MockContext()
+    v2WiringSeam.resetHostAnchors()
+    cleanup = await v2Setup(mock.ctx, { anchors: [wt], materialize: "runtime" })
+    const worker = mock.state.agents.get("forge-part-builder")
     assert.ok(worker, "worker materialized")
-    assert.equal(worker.tools.shell, false, "builtin shell hidden at materialization")
-    assert.equal(worker.tools.bash, false)
-    assert.equal(worker.permission.task, "deny")
-    for (const t of STATE_TOOLS) assert.equal(worker.tools[t], false, `worker hides state tool ${t}`)
-    assert.equal(worker.tools.forge_shell, undefined, "worker keeps forge_shell")
-    assert.equal(worker.tools.forge_jobs, undefined, "worker keeps forge_jobs")
-    // Search pair (forge-search-tools D6): workers keep both search tools too.
-    assert.equal(worker.tools.forge_grep, undefined, "worker keeps forge_grep")
-    assert.equal(worker.tools.forge_glob, undefined, "worker keeps forge_glob")
-    // The primary is not reduced.
-    assert.equal(cfg.agent.forge.tools.plan_write, undefined)
-    await h.dispose?.()
+    assert.equal(worker.mode, "subagent")
+    assert.ok(Array.isArray(worker.permissions))
+    assert.ok(worker.permissions.some((p) => p.action === "task" && p.resource === "*" && p.effect === "deny"))
+    assert.equal(mock.state.agents.get("forge").tools?.plan_write, undefined)
+    assert.equal(mock.state.tools.has("forge_shell"), false)
+    assert.equal(mock.state.tools.has("forge_jobs"), false)
   } finally {
+    cleanup?.()
     rmSync(wt, { recursive: true, force: true })
   }
 })
 
-// ---------------------------------------------------------------------------
-// runtime belts (tasks 4.4 / 4.7 / 4.9)
-// ---------------------------------------------------------------------------
-
-test("partition belt: task dispatch of forge-* is refused for non-forge speakers, open for forge/unknown", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-dispatch-"))
+// D7: task identity and both-fields seams retire with the v1 task surface.
+test("v2 draft recon admits only a current shell-denied readonly scout", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-native-recon-"))
+  mkdirSync(join(wt, ".opencode"), { recursive: true })
+  const base = { model: "x/y", thoughtLevel: "low" }
+  writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "recon", agents: {
+    scout: { ...base, shape: "readonly", permission: { shell: "deny" } },
+    shellask: { ...base, shape: "readonly", permission: { shell: "ask" } },
+    shellopen: { ...base, shape: "readonly" },
+    lifted: { ...base, shape: "readonly", permission: { shell: "deny", write: "allow" } },
+    patchlift: { ...base, shape: "readonly", permission: { shell: "deny", patch: "allow" } },
+    coder: { ...base, shape: "write" },
+  } }))
+  v2WiringSeam.resetHostAnchors()
+  const { ctx: host, state } = createV2MockContext()
+  const cleanup = await v2Setup(host, { anchors: [wt] })
+  const sid = "ses_native_recon"
   try {
-    const h = await startServer(inputFor(wt), {})
-    await seed(h, "ses_b", "build")
-    await seed(h, "ses_f", "forge")
-    await seed(h, "ses_w", "forge-research")
-    const out = () => ({ args: { subagent_type: "forge-research", prompt: "x" } })
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: "ses_b", callID: "c1" }, out()),
-      /\[forge:partition\] Dispatch refused.*forge-research.*outside the forge family/,
-    )
-    await h["tool.execute.before"]({ tool: "task", sessionID: "ses_f", callID: "c2" }, out())
-    await h["tool.execute.before"]({ tool: "task", sessionID: "ses_w", callID: "c3" }, out())
-    // Unknown speakers fail open (map is the best signal available).
-    await h["tool.execute.before"]({ tool: "task", sessionID: "ses_u", callID: "c4" }, out())
-    // Non-forge target is never touched.
-    await h["tool.execute.before"]({ tool: "task", sessionID: "ses_b", callID: "c5" }, { args: { subagent_type: "general", prompt: "x" } })
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("partition belt: non-forge writes into forge state directories are refused; others pass", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-state-"))
-  try {
-    const h = await startServer(inputFor(wt), {})
-    await seed(h, "ses_b", "build")
-    await seed(h, "ses_f", "forge")
-    const planFile = join(wt, ".opencode", "plan", "x.md")
-    const goalFile = join(wt, ".opencode", "goal", "g.md")
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "write", sessionID: "ses_b", callID: "c1" }, { args: { filePath: planFile } }),
-      /\[forge:partition\] Write refused.*forge state directories/,
-    )
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "edit", sessionID: "ses_b", callID: "c2" }, { args: { filePath: goalFile } }),
-      /\[forge:partition\] Write refused/,
-    )
-    // Relative paths resolve against the session worktree.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "write", sessionID: "ses_b", callID: "c3" }, { args: { filePath: ".opencode/plan/rel.md" } }),
-      /\[forge:partition\] Write refused/,
-    )
-    // Reads, other paths, forge speakers, and unknown speakers pass.
-    await h["tool.execute.before"]({ tool: "read", sessionID: "ses_b", callID: "c4" }, { args: { filePath: planFile } })
-    await h["tool.execute.before"]({ tool: "write", sessionID: "ses_b", callID: "c5" }, { args: { filePath: "src/ok.ts" } })
-    await h["tool.execute.before"]({ tool: "write", sessionID: "ses_f", callID: "c6" }, { args: { filePath: planFile } })
-    await h["tool.execute.before"]({ tool: "write", sessionID: "ses_u", callID: "c7" }, { args: { filePath: planFile } })
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("partition fallback belts: forge bash refused, non-forge forge tools refused, hatches open, unknown open", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-belt-"))
-  try {
-    const h = await startServer(inputFor(wt), {})
-    await seed(h, "ses_f", "forge")
-    await seed(h, "ses_b", "build")
-    // Forge speaker: builtin shell hard-refused with forge_shell guidance.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "bash", sessionID: "ses_f", callID: "c1" }, { args: { command: "echo x" } }),
-      /\[forge:partition\] Builtin shell refused.*forge_shell/,
-    )
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "shell", sessionID: "ses_f", callID: "c2" }, { args: { command: "echo x" } }),
-      /\[forge:partition\] Builtin shell refused/,
-    )
-    // Non-forge speaker: any forge tool refused with partition guidance.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_b", callID: "c3" }, { args: { command: "echo x" } }),
-      /\[forge:partition\] Tool refused: "forge_shell".*outside it/,
-    )
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "plan_write", sessionID: "ses_b", callID: "c4" }, { args: {} }),
-      /\[forge:partition\] Tool refused/,
-    )
-    // Escape hatch: keepBuiltinShell opens the builtin shell for the family.
-    const h2 = await startServer(inputFor(mkdtempSync(join(tmpdir(), "part-belt2-"))), { jobs: { keepBuiltinShell: true } })
-    await seed(h2, "ses_f2", "forge")
-    await h2["tool.execute.before"]({ tool: "bash", sessionID: "ses_f2", callID: "c5" }, { args: { command: "echo x" } })
-    // Unknown speakers fail open on both belts.
-    await h["tool.execute.before"]({ tool: "bash", sessionID: "ses_u", callID: "c6" }, { args: { command: "echo x" } })
-    await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_u", callID: "c7" }, { args: { command: "echo x" } })
-    // Non-forge speaker using non-forge tools passes.
-    await h["tool.execute.before"]({ tool: "write", sessionID: "ses_b", callID: "c8" }, { args: { filePath: "src/x.ts" } })
-    await h.dispose?.()
-    await h2.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("partition fallback belts: forge-* worker state-tool calls are refused with primary-only guidance; primary, worker exec pair, and unknown sessions pass", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-worker-state-"))
-  try {
-    const h = await startServer(inputFor(wt), {})
-    await seed(h, "ses_w", "forge-verifier")
-    await seed(h, "ses_f", "forge")
-    // Worker quadrant (forge-* non-primary): one representative per state
-    // family (plan_* / goal_* / crew_*) is hard-refused before any execution
-    // or gate ask, with guidance naming the tool, the worker, and the way out.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "goal_complete", sessionID: "ses_w", callID: "c1" }, { args: {} }),
-      /\[forge:partition\] Tool refused: "goal_complete" is a harness state tool reserved for the primary forge agent; "forge-verifier" is a forge worker\. Report your findings back to the orchestrating session/,
-    )
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "plan_close", sessionID: "ses_w", callID: "c2" }, { args: {} }),
-      /"plan_close" is a harness state tool reserved for the primary forge agent; "forge-verifier" is a forge worker.*Report your findings back to the orchestrating session/,
-    )
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "crew_begin", sessionID: "ses_w", callID: "c3" }, { args: {} }),
-      /"crew_begin" is a harness state tool reserved for the primary forge agent; "forge-verifier" is a forge worker.*Report your findings back to the orchestrating session/,
-    )
-    // Primary is not hit: the belt never fires for the forge agent itself —
-    // the call proceeds to its own validation and gate.
-    await h["tool.execute.before"]({ tool: "goal_complete", sessionID: "ses_f", callID: "c4" }, { args: {} })
-    // Worker exec pair is not hit: forge_shell rides with forge-* workers.
-    await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_w", callID: "c5" }, { args: { command: "echo x" } })
-    // Unknown sessions fail open (same posture as every belt).
-    await h["tool.execute.before"]({ tool: "goal_complete", sessionID: "ses_u", callID: "c6" }, { args: {} })
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("partition fallback belts: non-forge refusal keeps its wording precedence over the worker state-tool refusal (zero regression)", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-belt-prece-"))
-  try {
-    const h = await startServer(inputFor(wt), {})
-    await seed(h, "ses_b", "build")
-    // A non-forge speaker calling a STATE tool hits the pre-existing
-    // non-forge branch first: refused with the family wording, never the new
-    // primary-only STATE wording.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "goal_complete", sessionID: "ses_b", callID: "c1" }, { args: {} }),
-      (err) => {
-        assert.match(
-          err.message,
-          /\[forge:partition\] Tool refused: "goal_complete" belongs to the forge agent family and the current agent \("build"\) is outside it/,
-        )
-        assert.doesNotMatch(err.message, /harness state tool reserved for the primary forge agent/)
-        return true
-      },
-    )
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("partition: the draft write-ban message is agent-agnostic (D12, session-scoped)", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-draft-"))
-  try {
-    const h = await startServer(inputFor(wt), {})
-    const sid = "ses_draft"
-    await h.tool.plan_write.execute(
-      { goal: "draft ban wording", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
-      ctx(sid, wt),
-    )
-    // Speaker switches to build; the session-scoped ban still bites.
-    await seed(h, sid, "build")
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "write", sessionID: sid, callID: "c1" }, { args: { filePath: "src/x.ts" } }),
-      /A plan is in draft.*Switch back to the forge agent.*plan_approve.*\/plan discard/,
-    )
-    // Draft-phase task dispatch from the non-forge speaker is also banned.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "c2" }, { args: { subagent_type: "general", prompt: "x" } }),
-      /A plan is in draft/,
-    )
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// draft recon shape gate (allow-readonly-recon-during-plan-draft)
-// ---------------------------------------------------------------------------
-
-const RECON_ROSTER = {
-  scout: { model: "x/y", thoughtLevel: "low", shape: "readonly" }, // EXPLICIT readonly — the exemption keys on this
-  bare: { model: "x/y", thoughtLevel: "low" }, // absent shape — defaults to write, NOT draft-exempt
-  coder: { model: "x/y", thoughtLevel: "low", shape: "write" },
-  lifted: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { write: "allow" } }, // override lifts write off deny
-  asking: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { bash: "ask" } }, // ask counts as lifted too
-}
-
-test("recon gate: explicit-readonly dispatch passes during draft; every other target is denied with the roster", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-recon-"))
-  try {
-    mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "part", agents: RECON_ROSTER }))
-    const h = await startServer(inputFor(wt), {})
-    const cfg = { agent: {} }
-    await h.config(cfg)
-    const sid = "ses_recon"
-    await h.tool.plan_write.execute(
-      { goal: "recon gate", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
-      ctx(sid, wt),
-    )
-
-    // 1. explicit-readonly target passes the write-class ban (no throw).
-    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1" }, { args: { subagent_type: "forge-part-scout", prompt: "x" } })
-
-    // 1b. shape-default-open: an absent shape defaults to write — the scout
-    //     is NOT draft-exempt (same refusal, roster unchanged).
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r1b" }, { args: { subagent_type: "forge-part-bare", prompt: "x" } }),
-      (err) => {
-        assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
-        assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-part-scout\./, "roster carries exactly the explicit-readonly worker")
-        assert.match(err.message, /plan_approve/)
-        assert.match(err.message, /\/plan discard/)
-        return true
-      },
-    )
-
-    // 2. write shape: denied, roster lists ONLY the effective-readonly worker.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r2" }, { args: { subagent_type: "forge-part-coder", prompt: "x" } }),
-      (err) => {
-        assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
-        assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-part-scout\./, "roster carries exactly the effective-readonly worker")
-        assert.ok(!err.message.includes("forge-part-coder") || !/dispatchable during draft: [^.]*coder/.test(err.message))
-        assert.match(err.message, /plan_approve/)
-        assert.match(err.message, /\/plan discard/)
-        return true
-      },
-    )
-
-    // 3. permission override lifting write (or bash to ask) breaks effectiveness.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r3" }, { args: { subagent_type: "forge-part-lifted", prompt: "x" } }),
-      /dispatch is denied for this target/,
-    )
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r4" }, { args: { subagent_type: "forge-part-asking", prompt: "x" } }),
-      /dispatch is denied for this target/,
-    )
-
-    // 4. native / absent / resume-style targets fail closed.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r5" }, { args: { subagent_type: "general", prompt: "x" } }),
-      /dispatch is denied for this target/,
-    )
-    await assert.rejects(h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r6" }, { args: {} }), /dispatch is denied for this target/)
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "r7" }, { args: { task_id: "ses_prev", prompt: "x" } }),
-      /dispatch is denied for this target/,
-    )
-
-    // 5. non-task write tools keep the original agent-agnostic wording.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "write", sessionID: sid, callID: "r8" }, { args: { filePath: "x" } }),
-      /write operations are denied \(write\)/,
-    )
-
-    // 6. the permission.ask belt stays deny for task during draft (fail-closed
-    //    side belt: user-configured ask hosts degrade to today's behavior).
-    const askOut = { status: "allow" }
-    await h["permission.ask"]({ sessionID: sid, id: "task", metadata: { tool: "task" } }, askOut)
-    assert.equal(askOut.status, "deny")
-
-    // 7. with no draft in the worktree, every dispatch passes.
-    const wt2 = mkdtempSync(join(tmpdir(), "part-recon2-"))
-    try {
-      mkdirSync(join(wt2, ".opencode"), { recursive: true })
-      writeFileSync(join(wt2, ".opencode", "forge.json"), JSON.stringify({ pool: "part", agents: RECON_ROSTER }))
-      const h2 = await startServer(inputFor(wt2), {})
-      await h2.config({ agent: {} })
-      await h2["tool.execute.before"]({ tool: "task", sessionID: "ses_free", callID: "f1" }, { args: { subagent_type: "forge-part-coder", prompt: "x" } })
-      await h2.dispose?.()
-    } finally {
-      rmSync(wt2, { recursive: true, force: true })
+    await state.tools.get("forge_sync").execute({}, ctx(sid, wt))
+    const artifact = join(wt, ".opencode", "agent", "forge-recon-scout.md")
+    assert.match(readFileSync(artifact, "utf8"), /GENERATED BY forge_sync/)
+    await state.tools.get("plan_write").execute({ goal: "recon gate", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] }, ctx(sid, wt))
+    const before = state.toolHooks.find(h => h.name === "execute.before").cb
+    const dispatch = agent => before({ tool: "subagent", sessionID: sid, agent: "forge", input: { agent } })
+    for (const target of ["general", "forge-recon-shellask", "forge-recon-shellopen", "forge-recon-lifted", "forge-recon-patchlift", "forge-recon-coder"]) {
+      await assert.rejects(dispatch(target), /A plan is in draft/, target)
     }
-
-    // 8. /plan template states the carve-out accurately.
-    assert.match(cfg.command.plan.template, /readonly-shape forge scouts/)
-    assert.match(cfg.command.plan.template, /so is dispatching write-shaped workers or native agents/)
-    assert.match(cfg.command.plan.template, /write tools and bash are DENIED while a draft exists/)
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-test("recon gate: an empty roster refuses with configuration guidance, not a bare wall", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-recon0-"))
-  try {
-    const h = await startServer(inputFor(wt), {})
-    const sid = "ses_recon0"
-    await h.tool.plan_write.execute(
-      { goal: "empty roster", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
-      ctx(sid, wt),
-    )
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "e1" }, { args: { subagent_type: "forge-scout", prompt: "x" } }),
-      (err) => {
-        assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
-        assert.match(err.message, /No readonly worker is configured — define one in forge\.json/)
-        assert.match(err.message, /"shape": "readonly"/, "the empty-roster guidance teaches the explicit readonly shape")
-        assert.match(err.message, /plan_approve/)
-        return true
-      },
-    )
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// patch-family shape gate (postrelease-hardening task 5.2): the draft gate's
-// lifting test keys on MUTATING_TOOLS — a permission override that lifts ANY
-// patch-family member (allow or ask) disqualifies the readonly exemption,
-// exactly like a write/edit/bash lift.
-
-const PATCH_LIFT_ROSTER = {
-  scout: { model: "x/y", thoughtLevel: "low", shape: "readonly" }, // effective readonly — the only exempt target
-  patched: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { patch: "allow" } },
-  applied: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { apply: "ask" } },
-  applypatched: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { applypatch: "allow" } },
-  multiedited: { model: "x/y", thoughtLevel: "low", shape: "readonly", permission: { multiedit: "ask" } },
-}
-
-test("recon gate: a patch-family permission lift kills the readonly exemption with the same refusal", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-patchlift-"))
-  try {
-    mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ pool: "part", agents: PATCH_LIFT_ROSTER }))
-    const h = await startServer(inputFor(wt), {})
-    await h.config({ agent: {} })
-    const sid = "ses_patchlift"
-    await h.tool.plan_write.execute(
-      { goal: "patch lift gate", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
-      ctx(sid, wt),
-    )
-    // Every lifted member is refused like any write-class target, and the
-    // roster still names exactly the effective-readonly worker.
-    for (const [callID, target] of [["p1", "forge-part-patched"], ["p2", "forge-part-applied"], ["p3", "forge-part-applypatched"], ["p4", "forge-part-multiedited"]]) {
-      await assert.rejects(
-        h["tool.execute.before"]({ tool: "task", sessionID: sid, callID }, { args: { subagent_type: target, prompt: "x" } }),
-        (err) => {
-          assert.match(err.message, /A plan is in draft; dispatch is denied for this target/)
-          assert.match(err.message, /Readonly recon scouts ARE dispatchable during draft: forge-part-scout\./, "the roster carries exactly the untouched readonly worker")
-          assert.match(err.message, /plan_approve/)
-          return true
-        },
-      )
+    await assert.rejects(dispatch(undefined), /A plan is in draft/)
+    await assert.rejects(dispatch("forge-recon-ghost"), /A plan is in draft/)
+    const evaluate = state.permissionHooks.find(h => h.name === "evaluate").cb
+    for (const effect of ["allow", "ask", "deny"]) {
+      await assert.doesNotReject(dispatch("forge-recon-scout"), "D7 qualified scout must pass")
+      const event = { sessionID: sid, agent: "forge", action: "subagent", resources: ["forge-recon-scout"], effect }
+      await evaluate(event)
+      assert.equal(event.effect, effect, "qualified scout must preserve the host permission decision")
     }
-    // ...while the untouched readonly scout keeps the exemption.
-    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "p5" }, { args: { subagent_type: "forge-part-scout", prompt: "x" } })
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// both-fields roster seam (postrelease-hardening task 5.4): the gate extracts
-// the target as `subagent_type ?? agent` — a both-fields call resolves
-// through subagent_type FIRST, and the agent field never overrides it. (The
-// host schema refuses agent-only calls; the seam itself is what this pins.)
-
-test("recon gate: a both-fields task call resolves through the subagent_type-first seam", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-bothfields-"))
-  try {
-    mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(
-      join(wt, ".opencode", "forge.json"),
-      JSON.stringify({
-        pool: "part",
-        agents: {
-          scout: { model: "x/y", thoughtLevel: "low", shape: "readonly" },
-          coder: { model: "x/y", thoughtLevel: "low", shape: "write" },
-        },
-      }),
-    )
-    const h = await startServer(inputFor(wt), {})
-    await h.config({ agent: {} })
-    const sid = "ses_bothfields"
-    await h.tool.plan_write.execute(
-      { goal: "both fields seam", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
-      ctx(sid, wt),
-    )
-    // Both fields agree on the readonly scout: the draft exemption holds.
-    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b1" }, { args: { subagent_type: "forge-part-scout", agent: "forge-part-scout", prompt: "x" } })
-    // subagent_type (readonly) wins over a write-shaped agent field: exempt.
-    await h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b2" }, { args: { subagent_type: "forge-part-scout", agent: "forge-part-coder", prompt: "x" } })
-    // Mirror: subagent_type (write) wins over a readonly agent field — refused.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "task", sessionID: sid, callID: "b3" }, { args: { subagent_type: "forge-part-coder", agent: "forge-part-scout", prompt: "x" } }),
-      /A plan is in draft; dispatch is denied for this target/,
-    )
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
+    for (const resources of [[], undefined, "forge-recon-scout", [null], ["general"], ["forge-recon-shellask"], ["forge-recon-shellopen"], ["forge-recon-lifted"], ["forge-recon-patchlift"], ["forge-recon-coder"], ["forge-recon-ghost"], ["forge-recon-scout", "general"]]) {
+      const event = { sessionID: sid, agent: "forge", action: "subagent", resources, effect: "allow" }
+      await evaluate(event)
+      assert.equal(event.effect, "deny", JSON.stringify(resources))
+    }
+    // Recipe changes are judged again at permission time, rather than caching admission.
+    const recipe = join(wt, ".opencode", "forge.json")
+    const original = readFileSync(recipe, "utf8")
+    const changed = JSON.parse(original)
+    changed.agents.scout.permission.shell = "allow"
+    writeFileSync(recipe, JSON.stringify(changed))
+    const changedEvent = { sessionID: sid, action: "subagent", resources: ["forge-recon-scout"], effect: "allow" }
+    await evaluate(changedEvent)
+    assert.equal(changedEvent.effect, "deny")
+    writeFileSync(recipe, original)
+    await state.tools.get("plan_approve").execute({}, ctx(sid, wt))
+    await assert.doesNotReject(dispatch("forge-recon-coder"))
+    const approvedEvent = { sessionID: sid, action: "subagent", resources: ["forge-recon-coder"], effect: "allow" }
+    await evaluate(approvedEvent)
+    assert.equal(approvedEvent.effect, "allow")
+  } finally { await cleanup(); v2WiringSeam.resetHostAnchors(); rmSync(wt, { recursive: true, force: true }) }
 })
 
 // Belt 3.1 (task 3.1): a task-spawned CHILD session is an independent
@@ -534,180 +115,148 @@ test("recon gate: a both-fields task call resolves through the subagent_type-fir
 // fallback re-binds it to the same draft — the session-level write ban is
 // ambient for the child. The scout's forge_shell passes through untouched
 // (posture pass-through): no plugin-side rewrite, whatever the host resolved.
-test("recon gate ambient belt: a child session inherits the draft write ban; forge_shell passes through untouched", async () => {
+test("v2 draft belt: child resolves parent anchor and rejects native shell writes", async () => {
   const wt = mkdtempSync(join(tmpdir(), "part-ambient-"))
+  const other = mkdtempSync(join(tmpdir(), "part-ambient-other-"))
+  v2WiringSeam.resetHostAnchors()
+  __sessionAnchorTestSurface.resetInitializedDirectories()
+  v2WiringSeam.sessions.clear()
+  const parentHost = createV2MockContext()
+  const otherHost = createV2MockContext()
+  let cleanupParent, cleanupOther
   try {
-    mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { scout: { model: "x/y" } } }))
-    const h = await startServer(inputFor(wt), {})
-    await h.config({ agent: {} })
-    await h.tool.plan_write.execute(
+    cleanupParent = await v2Setup(parentHost.ctx, { anchors: [wt], materialize: "runtime" })
+    cleanupOther = await v2Setup(otherHost.ctx, { anchors: [other], materialize: "runtime" })
+    parentHost.state.sessionRecords.set("ses_child_ambient", { parentID: "ses_parent_ambient" })
+    parentHost.state.sessionRecords.set("ses_parent_ambient", { directory: wt })
+    await parentHost.state.tools.get("plan_write").execute(
       { goal: "ambient belt", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] },
-      ctx("ses_parent", wt),
+      ctx("ses_parent_ambient", wt),
     )
-    // The child sessionID was NEVER seen by the host (no chat.message, no
-    // tool context) — stateForBan seeds it from the launch worktree and the
-    // directory fallback resolves the draft: writes are refused in the child.
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "write", sessionID: "ses_child", callID: "a1" }, { args: { filePath: "x" } }),
-      /A plan is in draft; write operations are denied \(write\)/,
-    )
-    await assert.rejects(
-      h["tool.execute.before"]({ tool: "bash", sessionID: "ses_child", callID: "a2" }, { args: { command: "ls" } }),
-      /A plan is in draft; write operations are denied \(bash\)/,
-    )
-    // forge_shell is not in the write class: it passes tool.execute.before
-    // (no throw) and the permission.ask belt leaves it EXACTLY as the host
-    // resolved it — pass-through, no plugin-side rewrite in any direction.
-    await h["tool.execute.before"]({ tool: "forge_shell", sessionID: "ses_child", callID: "a3" }, { args: { command: "ls" } })
-    const askOut = { status: "allow" }
-    await h["permission.ask"]({ sessionID: "ses_child", id: "forge_shell", metadata: { tool: "forge_shell" } }, askOut)
-    assert.equal(askOut.status, "allow", "forge_shell passes through — the plugin never rewrites the host's resolution")
-    const askOut2 = { status: "ask" }
-    await h["permission.ask"]({ sessionID: "ses_child", id: "forge_shell", metadata: { tool: "forge_shell" } }, askOut2)
-    assert.equal(askOut2.status, "ask", "an explicit-ask resolution also passes through untouched")
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
-// command templates (task 4.6)
-// ---------------------------------------------------------------------------
-
-test("partition: /plan, /goal, /crew templates lead with the family guard", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-cmd-"))
-  try {
-    mkdirSync(join(wt, ".opencode"), { recursive: true })
-    writeFileSync(join(wt, ".opencode", "forge.json"), JSON.stringify({ agents: { research: { model: "x/y" } } }))
-    const h = await startServer(inputFor(wt), {})
-    const cfg = { agent: {} }
-    await h.config(cfg)
-    for (const [cmd, entryTool] of [["plan", "plan_write"], ["goal", "goal_write"]]) {
-      const t = cfg.command[cmd].template
-      assert.match(t, /FAMILY GUARD \(step 0/, `${cmd} carries the guard`)
-      assert.ok(t.indexOf("FAMILY GUARD") < t.indexOf(entryTool), `${cmd} guard precedes the discipline (${entryTool})`)
-      assert.match(t, new RegExp(entryTool), `${cmd} guard names the entry tool`)
+    const before = parentHost.state.toolHooks.find((h) => h.name === "execute.before").cb
+    assert.equal(v2WiringSeam.sessions.has("ses_child_ambient"), false)
+    for (const tool of ["write", "shell"]) {
+      await assert.rejects(before({ tool, sessionID: "ses_child_ambient", id: `call_${tool}`, input: { filePath: "x", command: "ls" } }), {
+        message: `[forge] A plan is in draft; write operations are denied (${tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`,
+      })
     }
-    const crew = cfg.command.crew.template
-    assert.match(crew, /FAMILY GUARD \(step 0/)
-    assert.ok(crew.indexOf("FAMILY GUARD") < crew.indexOf("crew_begin"), "crew guard precedes the discipline")
-    // Unconfigured /crew (init-gate form) carries the same guard.
-    const h2 = await startServer(inputFor(mkdtempSync(join(tmpdir(), "part-cmd2-"))), {})
-    const cfg2 = { agent: {} }
-    await h2.config(cfg2)
-    assert.match(cfg2.command.crew.template, /FAMILY GUARD \(step 0/)
-    await h.dispose?.()
-    await h2.dispose?.()
+    assert.equal(v2WiringSeam.sessions.get("ses_child_ambient").worktree, wt, "child inherits the parent anchor, not the latest host")
   } finally {
+    cleanupOther?.(); cleanupParent?.()
+    __sessionAnchorTestSurface.resetInitializedDirectories()
+    v2WiringSeam.resetHostAnchors()
     rmSync(wt, { recursive: true, force: true })
+    rmSync(other, { recursive: true, force: true })
   }
 })
 
-// ---------------------------------------------------------------------------
-// engine + injection gates (tasks 4.1 / 4.2 / 4.8)
-// ---------------------------------------------------------------------------
-
-test("partition: the goal loop parks under a non-forge speaker and resumes on forge", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-goal-"))
+// v1 experimental.compaction.autocontinue has no v2 equivalent and retires.
+// The family-switched compaction brief is covered by v2-session-commands.
+test("v2 goal loop parks for build and resumes for forge", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "part-goal-v2-"))
+  const host = createServer((req, res) => {
+    res.setHeader("content-type", "application/json")
+    res.end(JSON.stringify(req.url.startsWith("/api/session/active") ? {} : []))
+  })
+  await new Promise(resolve => host.listen(0, "127.0.0.1", resolve))
+  const priorService = process.env.FORGE_SERVICE_FILE
+  const serviceFile = join(wt, "service.json")
+  writeFileSync(serviceFile, JSON.stringify({ url: `http://127.0.0.1:${host.address().port}`, password: "test" }))
+  process.env.FORGE_SERVICE_FILE = serviceFile
+  resetServiceHttpDiscoveryForTests()
+  const { state, cleanup } = await v2Host(wt)
+  const sid = "ses_family_goal"
   try {
-    const prompts = []
-    const client = {
-      session: {
-        prompt: async (body) => prompts.push(body),
-        get: async () => ({ directory: wt, worktree: wt }),
-        status: async (o) => ({ [o.path.id]: { type: "idle" } }),
-      },
-    }
-    const h = await startServer({ ...inputFor(wt), client }, {})
-    const sid = "ses_goal"
-    await h.tool.goal_write.execute(
-      {
-        goal: "family-gated loop",
-        criteria: ["done"],
-        checks: [{ containsFile: "done.txt", containsText: "done" }],
-        constraints: "c",
-        arm: true,
-      },
-      ctx(sid, wt),
-    )
-    // Speaker switches to build; idle must not continue and must not burn budget.
-    await seed(h, sid, "build")
-    await h.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    await state.tools.get("goal_write").execute({ goal: "family-gated loop", criteria: ["done"], checks: [{ containsFile: "done.txt", containsText: "done" }], constraints: "c", arm: true }, ctx(sid, wt))
+    const context = state.sessionHooks.find(h => h.name === "context").cb
+    const idle = state.sessionHooks.find(h => h.name === "experimental.idle").cb
+    await context({ sessionID: sid, agent: "build", system: [] })
+    await idle({ sessionID: sid, background: [] })
     await sleep(80)
-    assert.equal(prompts.length, 0, "no continuation under a non-forge speaker")
-    const docOf = () => Number(/^turns_used: (\d+)$/m.exec(readGoal(wt))?.[1])
-    assert.equal(docOf(), 0, "budget untouched while parked")
-    // Switch back to forge: the loop resumes.
-    await seed(h, sid, "forge")
-    await h.event({ event: { type: "session.idle", properties: { sessionID: sid } } })
+    assert.equal(state.prompts.length, 0)
+    const dir = join(wt, ".opencode", "goal")
+    const goal = () => readFileSync(join(dir, readdirSync(dir).find(x => x.endsWith(".md"))), "utf8")
+    assert.match(goal(), /^turns_used: 0$/m)
+    await context({ sessionID: sid, agent: "forge", system: [] })
+    await idle({ sessionID: sid, background: [] })
     await sleep(80)
-    assert.equal(prompts.length, 1, "continuation resumes for the forge speaker")
-    assert.match(prompts[0].body.parts[0].text, /\[forge:goal-continue\]/)
-    await h.dispose?.()
+    assert.equal(state.prompts.length, 1)
+    assert.match(state.prompts[0].text, /\[forge:goal-continue\]/)
   } finally {
+    await cleanup()
+    host.closeAllConnections?.()
+    await new Promise(resolve => host.close(resolve))
+    if (priorService === undefined) delete process.env.FORGE_SERVICE_FILE
+    else process.env.FORGE_SERVICE_FILE = priorService
+    resetServiceHttpDiscoveryForTests()
     rmSync(wt, { recursive: true, force: true })
   }
 })
 
-function readGoal(wt) {
-  const dir = join(wt, ".opencode", "goal")
-  const f = join(dir, readdirSync(dir).find((x) => x.endsWith(".md")))
-  return readFileSync(f, "utf8")
+async function v2Host(dir) {
+  v2WiringSeam.resetHostAnchors()
+  v2WiringSeam.sessionAgents.clear()
+  v2WiringSeam.sessions.clear()
+  const mock = createV2MockContext()
+  const cleanup = await v2Setup(mock.ctx, { anchors: [dir], materialize: "runtime" })
+  return { ...mock, cleanup, before: mock.state.toolHooks.find((h) => h.name === "execute.before").cb }
 }
 
-test("partition: compaction brief and auto-continue suppression follow the agent family", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-compact-"))
+test("v2 partition: preserves unrelated user agent fields", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "part-v2-config-"))
+  const mock = createV2MockContext()
+  const entries = { mine: { tools: { goal_write: true }, permission: { shell: "deny" }, prompt: "custom" }, plain: {}, build: { permission: { shell: "ask" } }, general: { tools: { read: true } }, "forge-custom": { tools: { plan_write: true } } }
+  for (const [id, value] of Object.entries(structuredClone(entries))) mock.state.agents.set(id, value)
+  v2WiringSeam.resetHostAnchors()
+  const cleanup = await v2Setup(mock.ctx, { anchors: [dir], materialize: "runtime" })
   try {
-    const h = await startServer(inputFor(wt), {})
-    const sid = "ses_comp"
-    await h.tool.goal_write.execute(
-      {
-        goal: "family-gated compaction",
-        criteria: ["done"],
-        checks: [{ containsFile: "done.txt", containsText: "done" }],
-        constraints: "c",
-        arm: true,
-      },
-      ctx(sid, wt),
-    )
-    // Forge speaker: brief rides, suppression applies.
-    const compacting = { context: [] }
-    await h["experimental.session.compacting"]({ sessionID: sid }, compacting)
-    assert.equal(compacting.context.length, 1)
-    assert.match(compacting.context[0], /\[forge:goal-brief\]/)
-    const ac1 = { enabled: true }
-    await h["experimental.compaction.autocontinue"]({ sessionID: sid }, ac1)
-    assert.equal(ac1.enabled, false)
-    // Non-forge speaker: no forge text, native auto-continue restored.
-    await seed(h, sid, "build")
-    const compacting2 = { context: [] }
-    await h["experimental.session.compacting"]({ sessionID: sid }, compacting2)
-    assert.equal(compacting2.context.length, 0, "non-forge sessions carry no forge brief")
-    const ac2 = { enabled: true }
-    await h["experimental.compaction.autocontinue"]({ sessionID: sid }, ac2)
-    assert.equal(ac2.enabled, true, "suppression is family-gated")
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
+    for (const [id, value] of Object.entries(entries)) for (const [field, expected] of Object.entries(value)) assert.deepEqual(mock.state.agents.get(id)[field], expected, `${id}.${field}`)
+    assert.deepEqual(mock.state.agents.get("plain"), {})
+    for (const native of ["plan", "explore"]) assert.equal(mock.state.agents.has(native), false)
+    assert.equal(mock.state.agents.get("forge").tools?.write, undefined)
   }
+  finally { cleanup(); rmSync(dir, { recursive: true, force: true }) }
 })
 
-test("partition: session.deleted evicts the family map", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "part-evict-"))
+test("v2 partition: state tool admission distinguishes primary, worker, non-forge and unknown", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "part-v2-belt-"))
+  const { before, cleanup } = await v2Host(dir)
   try {
-    const h = await startServer(inputFor(wt), {})
-    await seed(h, "ses_x", "forge")
-    const out1 = { system: [] }
-    await h["experimental.chat.system.transform"]({ sessionID: "ses_x" }, out1)
-    assert.ok(out1.system.some((s) => s.startsWith("[forge:job-guidance]")))
-    await h.event({ event: { type: "session.deleted", properties: { info: { id: "ses_x" } } } })
-    const out2 = { system: [] }
-    await h["experimental.chat.system.transform"]({ sessionID: "ses_x" }, out2)
-    assert.ok(!out2.system.some((s) => s.startsWith("[forge:")), "the evicted session is unknown again")
-    await h.dispose?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
+    for (const tool of STATE_TOOLS) {
+      const call = (agent) => before({ tool, sessionID: `ses_${tool}_${agent}`, agent, input: {} })
+      await assert.rejects(call("build"), { message: `[forge:partition] Tool refused: "${tool}" belongs to the forge agent family and the current agent ("build") is outside it. Switch to forge (Tab) to use forge tooling.` })
+      await assert.rejects(call("forge-x-research"), { message: `[forge:partition] Tool refused: "${tool}" is a harness state tool reserved for the primary forge agent; "forge-x-research" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${tool} at the gate.` })
+      await assert.rejects(call(undefined), { message: `[forge:partition] Tool refused: "${tool}" is reserved for the primary forge agent; primary identity is not established. Switch to forge (Tab) to use forge tooling.` })
+      await assert.doesNotReject(call("forge"))
+    }
+    await assert.doesNotReject(before({ tool: "shell", sessionID: "ses_primary_shell", agent: "forge", input: { command: "echo x" } }))
+    await assert.doesNotReject(before({ tool: "read", sessionID: "ses_worker_read", agent: "forge-x-research", input: { filePath: "src/x.ts" } }))
+    await assert.doesNotReject(before({ tool: "write", sessionID: "ses_build_write", agent: "build", input: { filePath: "src/x.ts" } }))
+  } finally { cleanup(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("v2 partition: draft write ban survives a speaker switch", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "part-v2-draft-"))
+  const { state, before, cleanup } = await v2Host(dir)
+  try {
+    await state.tools.get("plan_write").execute({ goal: "draft", context: "c", approach: "a", tasks: ["one"], risks: "none", acceptance: ["ok"] }, { sessionID: "ses_draft_v2", agent: "forge", worktree: dir })
+    for (const tool of ["write", "shell"]) {
+      await assert.rejects(before({ tool, sessionID: "ses_draft_v2", agent: "build", input: { filePath: "src/x.ts", agent: "general" } }), { message: `[forge] A plan is in draft; write operations are denied (${tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.` })
+    }
+    await assert.rejects(before({ tool: "subagent", sessionID: "ses_draft_v2", agent: "build", input: { agent: "general" } }), {
+      message: "[forge] A plan is in draft; dispatch is denied for this target. No current qualified shell-denied readonly scout. Define a readonly worker in forge.json with explicit shape readonly and shell permission deny. Wait for plan_approve or /plan discard.",
+    })
+    await assert.doesNotReject(before({ tool: "read", sessionID: "ses_draft_v2", agent: "build", input: { filePath: "src/x.ts" } }))
+  } finally { cleanup(); rmSync(dir, { recursive: true, force: true }) }
+})
+
+test("v2 partition: session.deleted evicts family identity", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "part-v2-delete-"))
+  const { state, cleanup } = await v2Host(dir)
+  try {
+    v2WiringSeam.sessionAgents.set("ses_x", "forge")
+    assert.equal(v2WiringSeam.sessionAgents.get("ses_x"), "forge")
+    await state.emit("session.deleted", { sessionID: "ses_x" })
+    assert.equal(v2WiringSeam.sessionAgents.get("ses_x"), undefined)
+  } finally { cleanup(); rmSync(dir, { recursive: true, force: true }) }
 })

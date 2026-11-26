@@ -25,7 +25,36 @@ import { materializeAgentPrompt } from "./dispatch-prompt.ts"
 // Exported since native-first-roster: src/roster-compile.ts feeds the
 // native compiler's readonly tools face from the SAME constant (one
 // source, zero drift between the v1 permission face and the native one).
-export const MUTATING_TOOLS = ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"] as const
+export const MUTATING_TOOLS = ["write", "edit", "patch", "applypatch", "apply", "multiedit"] as const
+
+export const PRIMARY_ONLY_WORKER_TOOLS = [
+  "plan_write", "plan_tick", "plan_approve", "plan_close", "plan_reopen", "plan_discard",
+  "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard",
+  "crew_begin", "crew_close", "forge_sync",
+] as const
+
+// Shared worker policy; absence leaves ordinary host authorization alone.
+export function workerPermissionFor(def: ForgeAgentDef): Record<string, string> {
+  const explicit = def.permission ?? {}
+  const permission: Record<string, string> = {}
+  if (Object.hasOwn(explicit, "*")) permission["*"] = explicit["*"]
+  permission.question = "deny"
+  if (def.shape === "readonly") {
+    for (const tool of MUTATING_TOOLS) permission[tool] = "deny"
+    permission.execute = "deny"
+  }
+  for (const [tool, effect] of Object.entries(explicit)) {
+    if (tool !== "*" && tool !== "shell" && tool !== "bash" && tool !== "task" && tool !== "subagent" && !(PRIMARY_ONLY_WORKER_TOOLS as readonly string[]).includes(tool)) {
+      Object.defineProperty(permission, tool, { value: effect, enumerable: true, writable: true, configurable: true })
+    }
+  }
+  const shell = explicit.shell === "deny" || explicit.bash === "deny" ? "deny" : explicit.shell ?? explicit.bash
+  if (shell !== undefined) permission.shell = shell
+  permission.task = "deny"
+  permission.subagent = "deny"
+  for (const tool of PRIMARY_ONLY_WORKER_TOOLS) permission[tool] = "deny"
+  return permission
+}
 
 // Built-in role defaults: an explicit def.prompt overrides everything;
 // research/review carry curated defaults; a custom agent without a prompt
@@ -48,7 +77,7 @@ export function rolePromptFor(agentId: string, def?: { prompt?: string }, shared
   const chain =
     def?.prompt && def.prompt.trim().length > 0
       ? def.prompt
-      : ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`
+      : ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned work exactly as scoped.`
   return shared === undefined ? chain : `${shared}\n\n${chain}`
 }
 
@@ -75,14 +104,14 @@ export function poolProvenanceLine(provenance: PoolProvenance): string {
   return `Pool '${provenance.ns}' — origin ${provenance.file}; dispatchable only from sessions whose workspace pool is this file.`
 }
 
-// Short task-tool description: this is what the dispatching model sees in
-// the task tool vocabulary, so it names the role and the brain — the pinned
+// Short native subagent description: this is what the dispatching model sees
+// when choosing an agent, so it names the role and the brain — the pinned
 // identity for pinned workers, the inheritance semantics for Auto workers —
 // plus, when provenance is supplied, the one-sentence pool provenance line.
 export function agentDescriptionFor(agentId: string, def: ForgeAgentDef, provenance?: PoolProvenance): string {
   const shape = def.shape === "readonly" ? "readonly" : "write"
   const brain = def.model !== undefined ? `pinned ${def.model}` : "auto — inherits the parent session's model at dispatch"
-  const base = `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`
+  const base = `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the subagent tool with agent "forge-${agentId}".`
   return provenance === undefined ? base : `${base} ${poolProvenanceLine(provenance)}`
 }
 
@@ -91,27 +120,16 @@ export function agentDescriptionFor(agentId: string, def: ForgeAgentDef, provena
 // carry a model" rule: the brain is pinned by the definition, resolved by
 // the host at spawn time); an Auto definition carries NO model key at all —
 // the host's native spawn behavior binds the parent session's current model
-// at dispatch (snapshot semantics). `tools` carries the exec-partition
-// surface (tool-partition spec): every worker — regardless of shape — runs
-// commands only through forge_shell, so the builtin shell/bash pair is
-// hidden at materialization.
+// at dispatch (snapshot semantics). The permission map shares the worker
+// compiler policy; it adds no blanket shell authorization.
 export function forgeAgentDef(
   agentId: string,
   def: ForgeAgentDef,
   provenance?: PoolProvenance,
   sharedSeg?: string,
 ): Record<string, unknown> {
-  const permission: Record<string, string> = { task: "deny" }
-  // shape-default-open: an ABSENT shape defaults to WRITE (open permissions
-  // — readonly is a restriction the pool author must ask for explicitly,
-  // never a surprise default). Only an explicit "readonly" seals the
-  // mutating-tool family.
   const shape = def.shape ?? "write"
-  if (shape === "readonly") {
-    for (const t of MUTATING_TOOLS) permission[t] = "deny"
-  }
-  Object.assign(permission, def.permission ?? {})
-  permission.task = "deny" // an override never lifts the recursion ban
+  const permission = workerPermissionFor(def)
   const entry: Record<string, unknown> = {
     description: agentDescriptionFor(agentId, def, provenance),
     mode: "subagent",
@@ -124,7 +142,6 @@ export function forgeAgentDef(
       role: rolePromptFor(agentId, def, sharedSeg),
     }),
     permission,
-    tools: { shell: false, bash: false },
   }
   if (def.model !== undefined) entry.model = def.model
   return entry
@@ -143,7 +160,7 @@ export function forgeAgentDef(
 export function effectiveReadonlyShape(def: ForgeAgentDef): boolean {
   if (def.shape !== "readonly") return false
   const perm = def.permission ?? {}
-  for (const t of MUTATING_TOOLS) {
+  for (const t of [...MUTATING_TOOLS, "bash", "shell", "execute"]) {
     const v = perm[t]
     if (v !== undefined && v !== "deny") return false
   }

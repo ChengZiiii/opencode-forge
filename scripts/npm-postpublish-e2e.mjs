@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): mixed retained effort and retired dispatch assertions; not current acceptance.
 // Postpublish behavioral E2E (catalog-driven-depth-shapes + allow-readonly-recon
 // verification): drive a sandbox host whose plugin comes from the npm REGISTRY
 // (npm:@sorenllm/opencode-forge — the freshly published version) and verify:

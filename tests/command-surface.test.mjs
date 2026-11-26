@@ -24,7 +24,6 @@ process.on("exit", () => {
 })
 
 import {
-  server,
   v2Setup,
   FORGE_COMMAND_TEMPLATE,
   FORGE_HELP_ROUTE_LINE,
@@ -38,22 +37,6 @@ import {
   composeCommandPrompt,
 } from "../plugin.ts"
 import { createV2MockContext } from "./lib/v2-mock-context.mjs"
-
-const input = (dir) => ({
-  client: { session: {} },
-  project: { id: "p" },
-  directory: dir,
-  worktree: dir,
-  serverUrl: new URL("http://127.0.0.1:1"),
-  $: () => {},
-})
-
-let lastHost = null
-async function startServer(inputArg, opts) {
-  if (lastHost) lastHost.__forgeSubagentsTest?.resetAnchors?.()
-  lastHost = await server(inputArg, opts)
-  return lastHost
-}
 
 // ---------------------------------------------------------------------------
 // Task 2.1 — single-source lever bodies, byte-identical routing template
@@ -70,7 +53,7 @@ test("routing template embeds the single-source lever bodies verbatim (extractio
   assert.ok(FORGE_COMMAND_TEMPLATE.includes("$ARGUMENTS"), "the router still routes on $ARGUMENTS")
 })
 
-test("retired hyphen family: all four names are absent from BOTH host generations (v1 config hook + v2 command domain)", async (t) => {
+test("retired hyphen family: all four names are absent from the v2 command domain", async (t) => {
   const RETIRED = ["forge-sync", "forge-init", "forge-init-global", "forge-cancel"]
   // v2: the command domain registers none of the retired names.
   const { ctx, state } = createV2MockContext()
@@ -78,20 +61,7 @@ test("retired hyphen family: all four names are absent from BOTH host generation
   for (const name of RETIRED) {
     assert.equal(state.commands.has(name), false, `v2: ${name} not registered`)
   }
-  // v1: the config hook registers none of the retired names either.
-  const dir = mkdtempSync(join(tmpdir(), "forge-cmdsurf-v1-"))
-  t.after(() => {
-    try {
-      rmSync(dir, { recursive: true, force: true })
-    } catch {}
-  })
-  const h = await startServer(input(dir), {})
-  t.after(() => h.dispose?.())
-  const cfg = { agent: {}, command: {}, permission: {} }
-  await h.config(cfg)
-  for (const name of RETIRED) {
-    assert.equal(name in cfg.command, false, `v1: ${name} not registered`)
-  }
+
 })
 
 // ---------------------------------------------------------------------------
@@ -136,6 +106,7 @@ test("v2 command domain registers exactly the forge surface: crew / forge / goal
 test("v2 execute composes typed arguments: /forge sync delivers the routing template with the argument and the delivery hint", async () => {
   const { ctx, state } = createV2MockContext()
   await v2Setup(ctx, { anchors: [mkdtempSync(join(tmpdir(), "forge-cmdsurf-v2b-"))] })
+  state.sessionRecords.set("ses_x", { agent: "forge" })
   await state.commands.get("forge").execute({ sessionID: "ses_x", prompt: { text: "sync" }, delivery: "steer" })
   const sent = state.prompts.at(-1)
   assert.ok(sent?.text?.startsWith('(forge roster levers. Argument: "sync")'), "the placeholder got the typed text")
@@ -147,44 +118,13 @@ test("v2 execute composes typed arguments: /forge sync delivers the routing temp
 test("v2 execute: whitespace or missing typed text sends the /forge router template unchanged", async () => {
   const { ctx, state } = createV2MockContext()
   await v2Setup(ctx, { anchors: [mkdtempSync(join(tmpdir(), "forge-cmdsurf-v2c-"))] })
+  state.sessionRecords.set("ses_y", { agent: "forge" })
   await state.commands.get("forge").execute({ sessionID: "ses_y", prompt: { text: "   \n\t" } })
-  assert.equal(state.prompts.at(-1).text, FORGE_COMMAND_TEMPLATE, "whitespace typed text leaves the template unchanged")
+  assert.equal(state.prompts.at(-1).text, FORGE_COMMAND_TEMPLATE.split("\n").filter(line => !line.startsWith("FAMILY GUARD")).join("\n"), "whitespace typed text leaves the template unchanged")
+  state.sessionRecords.set("ses_w", { agent: "forge" })
   await state.commands.get("forge").execute({ sessionID: "ses_w" })
-  assert.equal(state.prompts.at(-1).text, FORGE_COMMAND_TEMPLATE, "missing prompt.text sends the template unchanged")
+  assert.equal(state.prompts.at(-1).text, FORGE_COMMAND_TEMPLATE.split("\n").filter(line => !line.startsWith("FAMILY GUARD")).join("\n"), "missing prompt.text sends the template unchanged")
   assert.ok(!("delivery" in state.prompts.at(-1)), "no delivery key is fabricated when the invocation has none")
-})
-
-// ---------------------------------------------------------------------------
-// Task 3.2 + 5.2 — v1 wiring: the hyphenated family in the config hook
-// ---------------------------------------------------------------------------
-
-test("v1 config hook registers command.forge only (byte-identical router template, no-clobber — a user entry of their own is never overwritten)", async (t) => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-cmdsurf-v1b-"))
-  t.after(() => {
-    try {
-      rmSync(dir, { recursive: true, force: true })
-    } catch {}
-  })
-  const h = await startServer(input(dir), {})
-  t.after(() => h.dispose?.())
-  const cfg = { agent: {}, command: {}, permission: {} }
-  await h.config(cfg)
-  assert.equal(cfg.command["forge"]?.template, FORGE_COMMAND_TEMPLATE, "/forge template byte-identical")
-  assert.match(cfg.command["forge"].description, /roster levers/)
-  // no-clobber survival: retirement means "never registered again", never
-  // deleting a user's own entry — user-owned /forge AND a user-owned retired
-  // name both survive verbatim.
-  const cfg2 = {
-    agent: {},
-    command: {
-      forge: { template: "MINE", description: "user owned" },
-      "forge-sync": { template: "USER LEVER", description: "user owned" },
-    },
-    permission: {},
-  }
-  await h.config(cfg2)
-  assert.equal(cfg2.command.forge.template, "MINE", "user-owned /forge untouched")
-  assert.equal(cfg2.command["forge-sync"].template, "USER LEVER", "user-owned retired-name entry untouched")
 })
 
 // ---------------------------------------------------------------------------

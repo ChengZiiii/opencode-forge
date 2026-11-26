@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): historical command-domain probe; not current command acceptance.
 // v2-command-surface task 1.1 gate probe: does a 2.3.x host accept a
 // hyphenated command name on the v2 command domain, and what does the
 // invocation actually deliver to execute?

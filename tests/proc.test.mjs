@@ -41,16 +41,17 @@ test("killTree: windows path runs taskkill through the injected spawn", () => {
 })
 
 test("killTree: a missing pid degrades to a direct child kill", () => {
-  const child = fakeChild(undefined)
+  const child = { ...fakeChild(), pid: undefined }
   killTree(child, { platform: "win32", spawnFn: () => { throw new Error("must not spawn") } })
   assert.deepEqual(child.killCalls, ["SIGTERM"])
 })
 
-test("killTree: posix group kill failure falls back to a direct SIGKILL", () => {
+test("killTree: posix group kill failure falls back to a direct SIGKILL", (t) => {
   const child = fakeChild(1234)
-  // No process group 1234 exists in the test process, so the group signal
-  // throws and the fallback fires.
+  const kill = t.mock.method(process, "kill", () => { throw new Error("simulated group kill failure") })
   killTree(child, { platform: "linux" })
+  assert.equal(kill.mock.callCount(), 1)
+  assert.deepEqual(kill.mock.calls[0].arguments, [-1234, "SIGKILL"])
   assert.deepEqual(child.killCalls, ["SIGKILL"])
 })
 

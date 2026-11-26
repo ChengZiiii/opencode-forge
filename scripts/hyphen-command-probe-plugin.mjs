@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): companion to historical command probe; not current command acceptance.
 // v2-command-surface task 1.1 probe plugin: registers a hyphenated command
 // ("forge-sync") on the v2 command domain and logs (a) the invocation input
 // shape the host actually delivers, (b) whether the promise-layer prompt

@@ -5,14 +5,14 @@
 //
 // PURE: no @opencode-ai imports, no host state — the client is an injectable
 // seam (any object with optional session.list / session.status), the clock
-// lives in the plugin.ts wiring. FAIL-OPEN polarity (design D2): an
-// unreadable list/status view is "no children in flight" — a false in-flight
-// STRANDS the crew, a false idle costs one redundant brief (today's noise).
+// lives in the plugin.ts wiring. An unreadable list/status view is unknown;
+// Goal/Crew callers must not treat it as proof of settlement.
 
 export type NativeChildOutcome = "succeeded" | "failed" | "interrupted"
 
-/** Minimal client seam: both methods optional — absence fails OPEN. */
+/** Minimal client seam: absent required read surfaces yield unknown. */
 export type NativeChildClient = {
+  deadlineMs?: number
   session?: {
     list?: (args?: unknown) => Promise<unknown>
     status?: (opts?: unknown) => Promise<unknown>
@@ -31,8 +31,7 @@ export type NativeChildSettled = {
  * walk is the single authority for BOTH the gate and the outcome digest).
  *
  * `readable: false` ⇒ nothing is known: the view failed to read and the
- * caller must treat it exactly like the fail-OPEN "no children in flight"
- * (send) — AND must not conclude anything about children it is waiting on.
+ * caller must not conclude that children are settled or that work can advance.
  */
 export type NativeChildWalkView = {
   readable: boolean
@@ -70,7 +69,7 @@ export function nativeChildOutcome(value: unknown): NativeChildOutcome | null {
  * the session ⇒ settled, carrying its row outcome.
  *
  * Any throw / unreadable shape ⇒ `readable: false` with nothing in flight
- * (fail-OPEN, never fail-silent — design D2).
+ * or settled; the view is unknown.
  *
  * The hint matters on the live host (2.3.2 OpenAPI, session.list): an
  * unscoped GET /api/session returns "the newest 50 sessions" GLOBALLY, and
@@ -82,28 +81,68 @@ export function nativeChildOutcome(value: unknown): NativeChildOutcome | null {
 export async function walkNativeChildren(client: NativeChildClient, sessionID: string): Promise<NativeChildWalkView> {
   if (!sessionID) return unreadable()
   try {
-    const raw = await client?.session?.list?.({ parentID: sessionID })
-    const body = (raw as { data?: unknown } | undefined)?.data ?? raw
-    const list = Array.isArray(body)
-      ? (body as Array<Record<string, unknown>>)
-      : Array.isArray((body as { sessions?: unknown[] } | undefined)?.sessions)
-        ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
-        : null
-    if (list === null) return unreadable() // no readable list at all
+    const deadline = Date.now() + (client.deadlineMs ?? 8000)
+    const bounded = async <T>(call: () => Promise<T>): Promise<T> => {
+      const remaining = deadline - Date.now()
+      if (remaining <= 0) throw new Error("native child walk deadline")
+      let timer: ReturnType<typeof setTimeout> | undefined
+      try {
+        return await Promise.race([Promise.resolve().then(call), new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error("native child walk timeout")), remaining) })])
+      } finally { if (timer !== undefined) clearTimeout(timer) }
+    }
+    if (typeof client?.session?.list !== "function") return unreadable()
     const rows: NativeChildSettled[] = []
-    for (const s of list) {
-      if (!s || typeof s.id !== "string" || !s.id) continue
-      if (s.parentID !== sessionID) continue
-      rows.push({ childID: s.id, outcome: nativeChildOutcome(s.outcome) })
+    const cursors = new Set<string>()
+    const ids = new Set<string>()
+    let cursor: string | undefined
+    let count = 0
+    for (let page = 0; ; page++) {
+      if (page >= 500) return unreadable()
+      const raw = await bounded(() => client.session!.list!({ parentID: sessionID, ...(cursor ? { cursor } : {}) }))
+      type ListEnvelope = { data?: unknown; cursor?: unknown; truncated?: unknown; partial?: unknown; error?: unknown }
+      const envelope = raw as ListEnvelope | undefined
+      const body = envelope?.data ?? raw
+      const list = Array.isArray(body)
+        ? (body as Array<Record<string, unknown>>)
+        : Array.isArray((body as { sessions?: unknown[] } | undefined)?.sessions)
+          ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
+          : null
+      // Both accepted envelope levels may carry completeness metadata. Never
+      // discard an inner warning or guess which of two conflicting cursors wins.
+      let next: string | null | undefined
+      for (const layer of (body === raw ? [envelope] : [envelope, body as ListEnvelope])) {
+        if (layer?.truncated || layer?.partial || layer?.error) return unreadable()
+        if (layer?.cursor === undefined) continue
+        const metadata = layer.cursor
+        if (!metadata || typeof metadata !== "object" || Array.isArray(metadata)) return unreadable()
+        const token = (metadata as { next?: unknown }).next ?? null
+        if (token !== null && (typeof token !== "string" || !token)) return unreadable()
+        if (next !== undefined && next !== token) return unreadable()
+        next = token
+      }
+      if (list === null || (count += list.length) >= 500 || list.some(row => !row || typeof row.id !== "string" || !row.id)) return unreadable()
+      for (const s of list) {
+        const id = s.id as string
+        if (ids.has(id)) return unreadable()
+        ids.add(id)
+        if (s.parentID !== sessionID) continue
+        rows.push({ childID: id, outcome: nativeChildOutcome(s.outcome) })
+      }
+      // The host emits a next anchor even on short final nonempty pages.
+      // Follow it through to the tail; an empty page with another anchor is unknown.
+      if (next == null) break
+      if (!list.length || cursors.has(next)) return unreadable()
+      cursors.add(next)
+      cursor = next
     }
     if (rows.length === 0) return { readable: true, inFlight: [], settled: [] }
     // Status cross-read exactly like detectOrphanDispatchChildren: unwrap
     // .data, keys = busy session ids ("Sessions absent from the result are
     // inactive" — host contract).
     if (typeof client?.session?.status !== "function") return unreadable()
-    const st = await client.session.status()
+    const st = await bounded(() => client.session!.status!())
     const map = (st as { data?: Record<string, unknown> } | undefined)?.data
-    if (!map || typeof map !== "object") return unreadable()
+    if (!map || typeof map !== "object" || Array.isArray(map)) return unreadable()
     const inFlight: string[] = []
     const settled: NativeChildSettled[] = []
     for (const row of rows) {
@@ -112,11 +151,11 @@ export async function walkNativeChildren(client: NativeChildClient, sessionID: s
     }
     return { readable: true, inFlight, settled }
   } catch {
-    return unreadable() // fail-OPEN, never fail-silent (design D2)
+    return unreadable() // unknown, never settlement evidence
   }
 }
 
-/** Gate verdict of the walk: ANY non-idle/non-terminal native child ⇒ true. */
+/** Legacy boolean projection: true for any observed in-flight child; false does not establish completeness. */
 export async function nativeChildrenInFlight(client: NativeChildClient, sessionID: string): Promise<boolean> {
   return (await walkNativeChildren(client, sessionID)).inFlight.length > 0
 }
@@ -134,7 +173,7 @@ export async function nativeSessionBusy(client: NativeChildClient, sessionID: st
     if (typeof client?.session?.status !== "function") return null
     const st = await client.session.status()
     const map = (st as { data?: Record<string, unknown> } | undefined)?.data
-    if (!map || typeof map !== "object") return null
+    if (!map || typeof map !== "object" || Array.isArray(map)) return null
     return entryInFlight(map[sessionID])
   } catch {
     return null

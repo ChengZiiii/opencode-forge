@@ -8,9 +8,6 @@ import { resolveShell, type ResolvedShell } from "./shell-select.ts"
 export type SpawnFn = typeof spawn
 export type SpawnSyncFn = typeof spawnSync
 
-/** Structural type of the job-fence watcher handle (src/job-fence.ts). */
-export type JobFenceLike = { assign(pid: number): void; dispose(): void }
-
 export type ShellSpawnOptions = {
   cwd?: string
   /** Merged over the parent environment — marker variables (FORGE_JOB_ID, ...) ride along here. */
@@ -24,10 +21,8 @@ export type ShellSpawnOptions = {
   shell?: ResolvedShell
 }
 
-// Non-interactive exec hygiene (shell-defang-default-open, spec
-// tool-partition — "Non-interactive exec hygiene on the forge_shell
-// surface"): every spawn merges this set into the child env so no command
-// can hang on an editor or pager prompt — git or not. Precedence: parent
+// Non-interactive defaults for the shared Plan/Goal checker: every spawn
+// merges this set into the child env to avoid default editor or pager prompts. Precedence: parent
 // env < this set < the caller's opts.env (a caller-passed value always
 // wins; the set always beats the inherited environment). Injected at SPAWN
 // time — the command string is never rewritten.

@@ -20,10 +20,14 @@ import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 process.env.FORGE_TEST_NO_FENCE = "1"
 process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 
-import { __permissionDoorsTestSurface, __sessionAnchorTestSurface, v2Setup } from "../plugin.ts"
+import { __permissionDoorsTestSurface, __sessionAnchorTestSurface, v2Setup, resetServiceHttpDiscoveryForTests } from "../plugin.ts"
+import { crewNativeView } from "./lib/crew-native-view.mjs"
 
 const HOME = join(tmpdir(), "forge-v2-perm-home")
 process.env.FORGE_TEST_FORGE_HOME = HOME
+mkdirSync(HOME, { recursive: true })
+const native = await crewNativeView(HOME, resetServiceHttpDiscoveryForTests)
+test.after(() => native.close())
 
 // One belt setup bound to its own worktree (hostWorktree = anchor ⇒
 // stateForBan binds unknown sessions to this dir, like a v1 host launch).
@@ -127,6 +131,9 @@ test("v2 permission: a tool that is not a door is never rewritten, in any direct
     "goal_check",
     "goal_pause",
     "forge_sync",
+    "grep",
+    "glob",
+    "external_directory",
     "some_unrelated_tool",
   ]
   for (const name of nonDoors) {
@@ -141,12 +148,12 @@ test("v2 permission: a tool that is not a door is never rewritten, in any direct
   }
 })
 
-test("v2 permission: the door set is DERIVED — exactly the gate() keys minus forge_shell, and nothing else", () => {
+test("v2 permission: the door set is DERIVED — exactly the six gate() keys", () => {
   const { gateKeys, v2Doors } = __permissionDoorsTestSurface
   const sorted = (xs) => [...xs].sort()
   assert.deepEqual(sorted(v2Doors), sorted(SIX_DOORS), "the belt's doors are the six doors")
-  assert.deepEqual(sorted(gateKeys.filter((k) => k !== "forge_shell")), sorted(v2Doors), "every non-exec gate() key is a door — no hand-copied second list")
-  assert.ok(gateKeys.includes("forge_shell"), "forge_shell is a gate() key (captured by the config hook) but not a door")
+  assert.deepEqual(sorted(gateKeys), sorted(v2Doors), "every gate() key is a door — no hand-copied second list")
+  assert.ok(!gateKeys.includes("forge_shell"), "the retired execution tool is not a gate")
   assert.equal(v2Doors.has("forge_shell"), false)
   assert.equal(v2Doors.has("plan_close"), false)
 })
@@ -250,9 +257,9 @@ test("v2 permission: draft write-freeze — write tools deny during draft, other
   try {
     await state.tools.get("plan_write").execute(
       { goal: "v2 belt draft", context: "c", approach: "a", tasks: ["t"], risks: "r", acceptance: ["a1"] },
-      { sessionID: "ses_draft", worktree: dir },
+      { sessionID: "ses_draft", worktree: dir, agent: "forge" },
     )
-    for (const tool of ["edit", "write", "bash", "task"]) {
+    for (const tool of ["edit", "write", "shell", "subagent", "task"]) {
       const e = ev({ sessionID: "ses_draft", action: tool })
       await cb(e)
       assert.equal(e.effect, "deny", `${tool} denied during draft`)
@@ -280,12 +287,12 @@ test("v2 permission: approval lifts the freeze (phase-aware, not global)", async
   try {
     await state.tools.get("plan_write").execute(
       { goal: "v2 belt approve", context: "c", approach: "a", tasks: ["t"], risks: "r", acceptance: ["a1"] },
-      { sessionID: "ses_ap", worktree: dir, ask: async () => ({ status: "allow" }), metadata: () => {} },
+      { sessionID: "ses_ap", worktree: dir, agent: "forge", metadata: () => {} },
     )
     await state.tools.get("plan_approve").execute({}, {
       sessionID: "ses_ap",
       worktree: dir,
-      ask: async () => ({ status: "allow" }),
+      agent: "forge",
       metadata: () => {},
     })
     const e = ev({ sessionID: "ses_ap", action: "edit" })

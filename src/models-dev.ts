@@ -9,7 +9,7 @@
 // falls back to verbatim pass-through (the provider is the final judge).
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs"
-import { join } from "node:path"
+import { join, resolve } from "node:path"
 import { tmpdir } from "node:os"
 
 export const DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json"
@@ -107,10 +107,12 @@ export function reduceModelsDev(raw: unknown): CatalogSnapshot {
   const providers = (raw as Record<string, Record<string, unknown>> | null)?.constructor === Object ? (raw as Record<string, Record<string, unknown>>) : null
   if (!providers) return catalog
   for (const [providerID, provider] of Object.entries(providers)) {
+    if (!provider || typeof provider !== "object" || Array.isArray(provider)) continue
     const models = (provider as { models?: Record<string, unknown> }).models
-    if (!models || typeof models !== "object") continue
+    if (!models || typeof models !== "object" || Array.isArray(models)) continue
     const out: CatalogSnapshot["providers"][string] = { models: {} }
     for (const [modelID, model] of Object.entries(models as Record<string, unknown>)) {
+      if (!model || typeof model !== "object" || Array.isArray(model)) continue
       const m = model as { reasoning_options?: unknown; cost?: Record<string, unknown> }
       const rows = Array.isArray(m.reasoning_options) ? (m.reasoning_options as unknown[]) : undefined
       const shape = rows !== undefined ? shapeOf(rows) : undefined
@@ -142,8 +144,26 @@ export async function loadModelsDevSnapshot(
     } catch {}
     return { catalog: { providers: {} }, degraded: true, source: "fetch-failed" }
   }
+  // Directory setups share only pending loads for the same source and cache.
+  // The injected transport above remains independent and never writes disk.
+  const timeoutMs = opts.timeoutMs ?? 8_000
+  const key = JSON.stringify([resolve(cacheDir), url, timeoutMs])
+  const pending = pendingLoads.get(key)
+  if (pending) return pending
+  const load = loadCachedSnapshot(url, cacheDir, cacheFile, timeoutMs)
+  pendingLoads.set(key, load)
   try {
-    const res = await fetch(url, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8_000) })
+    return await load
+  } finally {
+    pendingLoads.delete(key)
+  }
+}
+
+const pendingLoads = new Map<string, Promise<ModelsDevResult>>()
+
+async function loadCachedSnapshot(url: string, cacheDir: string, cacheFile: string, timeoutMs: number): Promise<ModelsDevResult> {
+  try {
+    const res = await fetch(url, { signal: AbortSignal.timeout(timeoutMs) })
     if (res.ok) {
       const catalog = reduceModelsDev(JSON.parse(await res.text()))
       try {

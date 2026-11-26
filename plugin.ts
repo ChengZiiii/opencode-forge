@@ -1,8 +1,12 @@
-import type { Plugin, ToolDefinition } from "@opencode-ai/plugin"
+import { stopNative, STOP_LIST_LIMIT } from "./src/stop-native.ts"
+import { authorizedSearch, ambiguousSearchPath, jsGrep, type SearchInput, type SearchInvocation, type SearchMatch } from "./src/search-authorized.ts"
+import { strictGlobToRegExp, matchGlob, MAX_FILE_BYTES } from "./src/search-js.ts"
+import { resolveRgBinary } from "./src/search-core.ts"
+import { spawnSync } from "node:child_process"
+import { classifyGoalActivity, hasIdleBackgroundShell, idleBackgroundKnown, settledGoalRounds, observeGoalActivity, rememberGoalCheck, type GoalActivity } from "./src/goal-activity.ts"
+import type { ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
-import { execFileSync, spawn } from "node:child_process"
-import { open as fsOpen, readdir as fsReaddir, stat as fsStat } from "node:fs/promises"
-import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
+import { closeSync, fstatSync, openSync, readSync, appendFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs"
 import { basename, dirname, isAbsolute, join, relative } from "node:path"
 import { tmpdir, homedir } from "node:os"
 import {
@@ -54,46 +58,14 @@ import {
   type StopReason,
 } from "./src/goal-file.ts"
 import { OUTPUT_LIMIT, formatOutcomes, outcomesAllOk, runChecks } from "./src/run-check.ts"
-import { killTree, pidAlive } from "./src/proc.ts"
-import { setHostShell } from "./src/shell-select.ts"
-import { createJobManager, newJobId, type Job } from "./src/job-manager.ts"
-import { HARD_MAX_WAIT_MS, POLL_WAIT_MAX_MS, adoptSurvivor, jobsLogDir, pollJob, readJobLog, startJob } from "./src/job-runner.ts"
-import { createJobFence, type JobFence } from "./src/job-fence.ts"
-import { createJobRegistry, registryPathFor, structuralRelocate, structuralRelocateAsync, type JobRegistry } from "./src/job-registry.ts"
-import { createExitCleanup, type ExitCleanup } from "./src/host-exit.ts"
-import {
-  WATCHDOG_ENV_MARK,
-  clampStallMs,
-  createFileLedger,
-  createWatchdog,
-  parseMode,
-  watchdogLogDir,
-  type LedgerEntry,
-  type Watchdog,
-} from "./src/watchdog.ts"
-import { createLocator, commandNeedle, markerValue, parseWindowsProcs } from "./src/proc-locate.ts"
-import { nativeLadder, loadModelsDevSnapshot, modelDepthShape, parseIdentity, modelsDevCacheDir, type CatalogSnapshot } from "./src/models-dev.ts"
-import { validateCrewReport, type CrewSubtask, type CrewSubtaskReport, type CrewSession } from "./src/crew-gate.ts"
+import { loadModelsDevSnapshot, modelDepthShape, parseIdentity, modelsDevCacheDir, type CatalogSnapshot } from "./src/models-dev.ts"
+import { validateCrewReport, crewAcceptedRound, crossCheckCrewEvidence, type CrewRound, type CrewCloseEvidence, type CrewSubtask, type CrewSubtaskReport } from "./src/crew-gate.ts"
 import { createNativeChildTracker, nativeChildDigestLine, nativeChildEventOutcome, nativeSessionBusy, walkNativeChildren, type NativeChildClient, type NativeChildOutcome, type NativeChildWalkView } from "./src/native-child-gate.ts"
 import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
-import { classifyExecCommand, WRITE_CLASS, interactiveBanner } from "./src/exec-classify.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
-import { createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, parseTopLevelKnobs, poolFileCompliance, sanitizeNamespace, type DispatchNodeConfig, type ForgeAgentDef, type ForgeMaterializeKnob, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
-import { compileRosterEntry, executeRosterSync, globalAgentDirFor, planOverrideSync, planRosterSync, staleCheckForPool, VARIANT_DEPTH_WORDS, type RosterFsDeps, type SyncPlan } from "./src/roster-compile.ts"
-import type { PoolProvenance } from "./src/dispatch-tiers.ts"
-import { buildRgArgv, buildRgFilesArgv, dedupeFollowMatches, formatSearchOutput, parseRgFilesList, parseRgJsonStream, resolveRgBinary, type RgMatchRecord, type SearchToolKind } from "./src/search-core.ts"
-import { jsSearch, type JsSearchSeams } from "./src/search-js.ts"
-import { DEFAULT_POLL_INTERVAL_MS, TASK_CREATE_SEAM_ABSENT, abortChild, createChildSession, decideStaleSweep, fetchFinalMessage, applyStaleProbe, pollChild, resolveNotifyIntervalMs, resolvePollTimeoutMs, resolveStaleFloorMs, resolveStaleMode, resolveStaleMs, sendPrompt, sessionGet, staleSilentMinutes, staleThresholdCrossed, ACTIVE_TEXTFUL_OVERRIDE_NOTE, type DispatchClient, type SessionMessageLike, type StaleMode, type StaleSweepState, type TerminalStabilityState, type CreateChildInput, type CreateChildResult } from "./src/dispatch-async.ts"
-import { buildRetryPrompt, classifyDispatchError, resolveMaxAttempts, resolveRetryBackoffMs } from "./src/dispatch-retry.ts"
-import { createDispatchGate, type DispatchGate, type ModelIdentity } from "./src/dispatch-gate.ts"
-import { withReportDelivery } from "./src/dispatch-prompt.ts"
-import {
-  createDispatchJournal,
-  resolveJournalMax,
-  type DispatchJournal,
-  type DispatchJournalRecord,
-  type JournalFs,
-} from "./src/dispatch-journal.ts"
+import { legacyDispatchEnvFindings, createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, parseTopLevelKnobs, poolFileCompliance, recipeFileStat, sanitizeNamespace, type ForgeAgentDef, type ForgeMaterializeKnob, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
+import { agentDirFor, rosterAgentDirFor, compileResolvedRosterEntry, executeRosterSync, globalAgentDirFor, planOverrideSync, overrideSyncFindings, planRosterSync, staleCheckForPool, NATIVE_TOOL_VOCAB, VARIANT_DEPTH_WORDS, type RosterFsDeps, type SyncPlan } from "./src/roster-compile.ts"
+
 
 const FORGE_AGENT = "forge"
 
@@ -124,42 +96,14 @@ const FORGE_STATE_TOOLS = [
   // (dispatch-tiers), plus the primary-only refusal in the task tool's own
   // execute (belt parity).
 ] as const
-const FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"] as const
-// Search pair (change forge-search-tools, design D6): joins the same
-// partition constants — hidden from non-forge agents, available to the
-// primary AND every forge-* worker regardless of shape (NOT in
-// MUTATING_TOOLS, NOT ask-gated — readonly by construction).
-const FORGE_SEARCH_TOOLS = ["forge_grep", "forge_glob"] as const
-const FORGE_ALL_TOOLS: readonly string[] = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS, ...FORGE_SEARCH_TOOLS]
-const FORGE_TOOL_SET = new Set<string>(FORGE_ALL_TOOLS)
+const FORGE_TOOL_SET = new Set<string>(FORGE_STATE_TOOLS)
 const FORGE_STATE_TOOL_SET = new Set<string>(FORGE_STATE_TOOLS)
-// Native agents the partition must cover even when absent from the user's
-// config (materialized as minimal tools-only entries; hidden utility agents
-// summary/title/compaction have no tool surface and are not touched).
-const NATIVE_PARTITION_FALLBACKS = ["build", "plan", "general", "explore"] as const
 
 const FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
 Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.
 
-Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch a host agent through the task tool instead.`
-
-// Channel mandate (forge-shell-mandate): the exec-surface paragraph is
-// composed per config because its refusal claim is only TRUE while the exec
-// partition holds. Hard wording when the forge-family builtin shell is
-// hidden — on hosts that ignore injected tools maps (paseo) the tool stays
-// VISIBLE but every call is belt-refused, so the prompt must say so up
-// front instead of teaching it one wasted round-trip at a time. Preference
-// wording under the keepBuiltinShell escape hatch (the builtin tool is
-// legitimately present there). No paragraph at all under supervisor
-// retirement, and the bare FORGE_PROMPT under v2 (no tool domain — the
-// claim would be false there).
-function forgePromptText(opts: { hardRefusal: boolean }): string {
-  const mandate = opts.hardRefusal
-    ? "Exec surface: every shell command — quick ones included — runs through the forge_shell tool. The builtin shell/bash tools are refused on this agent; never try them first, not even for trivial commands."
-    : "Exec surface: prefer the forge_shell tool for every shell command — quick ones included; it is this agent's exec surface, and the builtin shell exists only as an explicit escape hatch."
-  return `${FORGE_PROMPT}\n\n${mandate} Long-running or non-exiting commands: forge_shell with run_in_background, then collect results via forge_jobs.`
-}
+Subagent dispatch (native \`subagent\` tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch a host agent through the native \`subagent\` tool instead, subject to existing permissions and approvals. Native calls run in the background; use available host completion messages and session records as evidence, not repeated polling. Never assume unknown outcomes are settled. For ordinary commands, use the host shell when permitted; long commands can use \`background\` and host completion notifications rather than polling or sleeping. Git commits should use \`-m\` or \`--no-edit\`. Never create or edit files under .opencode/plan/ or .opencode/goal/ directly; use their state tools within the user-authorized mode.`
 
 // The single /plan command routes on its argument: empty = list, resume =
 // continue latest non-terminal plan, discard = abandon, anything else = start
@@ -173,26 +117,25 @@ export const PLAN_COMMAND_TEMPLATE = [
   "",
   "FAMILY GUARD (step 0, before anything else): if you do not have the plan_write tool in your available tools, you are not in a forge session — STOP now: execute nothing below (including the directory listing), and tell the user that /plan belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
   "",
-  "Current .opencode/plan/ directory:",
-  "!`ls -1 .opencode/plan 2>/dev/null || echo '(empty)'`",
+  "Inspect the current .opencode/plan/ directory using read/glob when needed for routing; treat an absent directory as empty.",
   "",
   "Route on the argument above (decide silently; do not recite this routing text to the user):",
-  '- Argument empty: for every non-terminal plan (status draft or approved) in the directory above, read its frontmatter and task checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.',
-  '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked tasks to the user in one short list, then continue executing it — tick each task the moment it is done (plan_tick). If none exists, say so.',
+  '- Argument empty: for every non-terminal plan (status draft or approved) in that directory, read its frontmatter and numbered checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.',
+  '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked steps to the user in one short list, then continue according to its status: if draft, remain read-only and follow user review and approval below; if approved, execute the remaining steps — tick each step the moment it is done (plan_tick). If none exists, say so.',
   '- Argument "discard": call the plan_discard tool with a short reason, then tell the user the plan was abandoned and writes are restored. If the work is NOT ending but moving to another harness — crew orchestration (/crew) or a goal contract (/goal) — pass supersede with the successor artifact path (e.g. ".opencode/crew/2026-10-01-....md") so the plan is marked superseded instead, with the successor recorded in the plan file.',
-  "- Any other argument: treat it as the task goal — you are now in planning mode for this goal. Follow the plan discipline below end to end.",
+  "- Any other argument: treat it as the plan goal — you are now in planning mode for this goal. Follow the plan discipline below end to end.",
   "",
   "## Plan discipline",
   "",
-  "Plans are short-horizon, single-task-goal documents (.opencode/plan/<date>-<slug>.md). The harness enforces the hard parts (draft write-ban, approval/close dialogs); you supply the engineering judgment. Never edit or create plan files by hand — every change goes through the plan_* tools.",
+  "Plans are short-horizon, single-goal documents (.opencode/plan/<date>-<slug>.md). The harness enforces the hard parts (draft write-ban, approval gate, verification at close); you supply the engineering judgment. Never edit or create plan files by hand — every change goes through the plan_* tools.",
   "",
-  "1. Reconnaissance and alignment (read-only): explore with read/grep/glob, and dispatch readonly-shape forge scouts (task tool) for breadth evidence — reconnaissance dispatch to effective-readonly workers keeps this session's context lean and is allowed both BEFORE and DURING the draft. All write tools and bash are DENIED while a draft exists, and so is dispatching write-shaped workers or native agents; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous or leaves meaningful choices open (scope, approach, acceptance), settle them with the user FIRST — 1-3 focused questions — and only write the draft once the shape is agreed; never plan against assumptions the user could settle in one line.",
+  "1. Reconnaissance and alignment (read-only): explore with read/grep/glob, and use the native subagent tool for breadth evidence from effective-readonly forge scouts both BEFORE and DURING the draft. Only dispatch workers with a current, compatible definition and effective host permissions that match an explicitly readonly recipe, deny all file-mutating tools (write/edit/patch family), and explicitly deny shell. Respect ordinary host permissions; if eligibility is unknown or denied, stay with permitted read tools and disclose the limitation. The host delivers the background scout's findings in its completion message. Remain read-only: all write tools and the builtin shell are DENIED while a draft exists (plan_* tools manage the plan). Write-shaped workers, readonly workers with shell, and non-forge agents must wait for approval; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous or leaves meaningful choices open (scope, approach, acceptance), settle them with the user FIRST — 1-3 focused questions — and only write the draft once the shape is agreed; never plan against assumptions the user could settle in one line.",
   "2. Draft (plan_write): call plan_write with structured fields; the tool renders and validates the fixed sections, so a malformed plan cannot exist. Quality bar: goal = one line, the outcome not the activity; context = verified findings with file:line evidence, including what you ruled out and why; approach = the chosen approach AND at least one rejected alternative with the reason (a plan with no considered alternative is a guess); tasks = 3-8 concrete, independently verifiable steps, each doable in one sitting ('improve the code' is invalid; 'extract the timeout constant into config.ts and default it to 3000' is valid); risks = what could break, blast radius, rollback path; acceptance = criteria verifiable by a command, a file, or an observable behavior (vague criteria will fail the close); nonGoals = explicit out-of-scope items. To revise after feedback, call plan_write again — while in draft it overwrites the same file.",
-  "3. User review, then approval (plan_approve): after plan_write, present the plan in chat — goal, chosen approach with one line why, the numbered task list, the acceptance criteria — then STOP: end your turn and wait. The user owns the review, at their own pace: feedback → revise with plan_write, re-present, and wait again; rejection → /plan discard (or re-plan together); explicit go-ahead (e.g. \"execute\", \"批准\", \"looks good\") → call plan_approve — its confirmation dialog is the final hard gate, and the user's Allow starts execution. Never call plan_approve in the same turn that presents a draft, and never implement before approval succeeds.",
-  "4. Execution (tick as you go): work tasks in order; call plan_tick with the task number immediately after EACH task's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected task or ask about revising (/plan with the same goal re-enters planning).",
+  "3. User review, then approval (plan_approve): after plan_write, present the plan in chat — goal, chosen approach with one line why, the numbered steps, the acceptance criteria — then STOP: end your turn and wait. The user owns the review, at their own pace: feedback → revise with plan_write, re-present, and wait again; rejection → /plan discard (or re-plan together); explicit go-ahead (e.g. \"execute\", \"批准\", \"looks good\") → call plan_approve — its confirmation dialog is the final hard gate, and the user's Allow starts execution. Never call plan_approve in the same turn that presents a draft, and never implement before approval succeeds.",
+  "4. Execution (tick as you go): after approval succeeds, execute directly or dispatch via the native subagent tool, subject to ordinary host permissions. Work tasks in order; call plan_tick with the numbered step immediately after EACH step's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected step or ask about revising (/plan with the same goal re-enters planning).",
   "5. Completion (plan_close): when all tasks are ticked, self-check EVERY acceptance criterion with concrete evidence (file:line, command output, test result), then call plan_close — NO confirmation dialog appears. If the plan declares Verification Checks, the plugin itself re-runs the frozen check set on the host (fail-closed: a failing check refuses the close, records the run in the plan's Check Log, and the plan stays approved — that is the design working, not an inconvenience); otherwise your per-criterion self-checks gate the close. Either way an evidence summary is written into the plan file for the user to review asynchronously.",
   "",
-  "Boundaries: /plan discard abandons the plan (terminal, file kept as history, writes restored) — pass supersede (the successor artifact path) when the work moves to crew/goal rather than ends, marking it superseded; /plan resume continues an unfinished plan from its remaining tasks. Work expected to span multiple sessions or days of multi-file change is spec work (e.g. OpenSpec), not plan work — say so once and let the user choose.",
+  "Boundaries: /plan discard abandons the plan (terminal, file kept as history, writes restored) — pass supersede (the successor artifact path) when the work moves to crew/goal rather than ends, marking it superseded; /plan resume continues an unfinished plan from its remaining tasks. Work expected to span multiple sessions or days of multi-file change, or needing multi-round requirement review, is spec work (e.g. OpenSpec), not plan work — say so once and let the user choose.",
   "",
 ].join("\n")
 
@@ -210,7 +153,7 @@ export const GOAL_COMMAND_TEMPLATE = [
   "",
   "Route on the argument above (decide silently; do not recite this routing text to the user):",
   "- Argument empty: for every non-terminal goal in the directory above, read its frontmatter and report to the user: path, status (queued/active/paused + stop_reason), revision, turns_used/max_turns budget. Mention queued goals and the /goal next promotion option. Ask whether to resume/promote one or arm something new.",
-  '- Argument "pause": call the goal_pause tool (with the blocker text as `blocker` when there is one), then tell the user the loop is stopped and how to resume.',
+  '- Argument "pause": call the goal_pause tool (with the blocker text as `blocker` when there is one), then tell the user the goal is paused, that already accepted work may finish, and how to resume.',
   '- Argument "resume": call the goal_resume tool for the session\'s paused goal (optionally with addTurns if the user asked for more budget). If no live goal exists but queued goals do, promote the oldest via goal_resume instead. The user confirms in a dialog.',
   '- Argument "next": promote the oldest queued goal via the goal_resume tool (no live goal must remain). The user confirms in a dialog.',
   '- Argument "discard" (also "stop"/"cancel"/"off"): call the goal_discard tool. The user confirms in a dialog.',
@@ -288,17 +231,13 @@ export const INIT_GLOBAL_BODY =
   `same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. ${INIT_GLOBAL_SCAFFOLD_NOTE}`
 
 export const FORGE_HELP_ROUTE_LINE =
-  "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (cancel THIS session's in-flight and queued async dispatches) — and stop."
+  "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (request stop of confirmed native child sessions) — and stop."
 
-// Dispatch stop route body (command-surface-v2-cleanup D1): session-scoped
-// cancellation. Host children are independent sessions — ESC interrupts the
-// parent turn only, so without this lever a runaway worker is unkillable
-// (upstream #64073). The scoping lives in the TOOL layer (forge_jobs stop
-// filters by context.sessionID) — template-layer instructions are routing
-// only, never trust boundaries (design D2).
+// Session-scoped cancellation. A parent interrupt does not guarantee the
+// native children stop; /forge stop explicitly requests their cancellation.
 export const STOP_LEVER_BODY = [
-  '- Argument "stop": call forge_jobs with action "stop" (no other parameters) and relay the tool result verbatim — it cancels every in-flight ASYNC DISPATCH owned by THIS session (each child session is aborted and CONFIRMED idle; each dispatch settles as aborted and is never retried) and every QUEUED wish of this session (removed from the queue before it can spawn — nothing was running for it; it is never dispatched). A dispatch owned by another session is NOT touched: name its task id only if the user asks, and cancel it with the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"}. Then STOP: no re-dispatch, no replacement work.',
-  "Boundaries: cancellation is USER intent only — never stop dispatches on your own initiative; a stopped dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entries and the owner wakes are delivered by the plugin's terminal path, not by you.",
+  '- Argument "stop": relay the command receipt for confirmed native child sessions; do not issue additional cancellation requests. Do not claim anything was stopped without confirmation. Do not launch further work.',
+  "Boundaries: cancellation is USER intent only; do not touch unrelated sessions or commands. Interrupting the parent does not guarantee children stop; use /forge stop for explicit child cancellation. Report unknown outcomes honestly.",
 ].join("\n")
 
 export const FORGE_COMMAND_TEMPLATE = [
@@ -402,19 +341,23 @@ function movedEventFields(fields: Record<string, unknown>): { sessionID: unknown
 // belts, no injection for push paths).
 const sessionAgents = new Map<string, string>()
 
-// Exec-seal findings (readonly-exec-seal, tool-partition): bounded per
-// session per WRITE-CLASS indicator — a denial throws on EVERY write-class
-// call, but the console finding is recorded once per session per indicator
-// class so the transcript never floods. Evicted on session.deleted like the
-// maps above. `sealUnknownNotes` bounds the one-time fail-open disclosure
-// for sessions whose agent cannot be resolved.
-const sealFindings = new Map<string, Set<string>>()
-const sealUnknownNotes = new Set<string>()
 
 function isForgeFamilyAgent(name: unknown): boolean {
   if (typeof name !== "string") return false
   const n = name.toLowerCase()
   return n === FORGE_AGENT || n.startsWith("forge-")
+}
+
+// Authorization is independent of tool visibility and host permission decisions.
+function assertHarnessAgent(tool: string | undefined, speaker: string | undefined): void {
+  if (!tool || !FORGE_STATE_TOOL_SET.has(tool) || speaker === FORGE_AGENT) return
+  if (speaker && !isForgeFamilyAgent(speaker)) {
+    throw new Error(`[forge:partition] Tool refused: "${tool}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`)
+  }
+  if (speaker?.toLowerCase().startsWith("forge-")) {
+    throw new Error(`[forge:partition] Tool refused: "${tool}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${tool} at the gate.`)
+  }
+  throw new Error(`[forge:partition] Tool refused: "${tool}" is reserved for the primary forge agent; primary identity is not established. Switch to forge (Tab) to use forge tooling.`)
 }
 
 function sessionIsForgeFamily(sessionID: string | undefined): boolean {
@@ -430,11 +373,6 @@ function noteToolAgent(context: { sessionID?: string; agent?: unknown } | undefi
     sessionAgents.set(context.sessionID, context.agent)
   }
 }
-
-// Captured in the config hook; flips the tool getter and skips every config
-// injection when the user sets agent["forge"].disable = true (one-knob
-// return-to-native, forge-agent spec).
-let forgeDisabled = false
 
 // ---------------------------------------------------------------------------
 // Forge subagents + depth injection (spec: forge-subagents; change
@@ -457,6 +395,9 @@ let forgeDisabled = false
 // target's pool must be this session's workspace pool, or the global layer
 // when the workspace has none (fallback, not merge).
 const hostAnchors: string[] = []
+// Historical recipe paths are for missing-artifact disclosure only. They
+// never participate in resolution or authorize a sync plan.
+const observedRecipeFiles = new Set<string>()
 let poolResolver: ReturnType<typeof createPoolResolver> | null = null
 // Last config-hook resolution snapshot (roster surfaces + test seam); chat
 // params and the crew gate resolve FRESH per call (hot-apply parity).
@@ -497,35 +438,68 @@ function nativeRosterActive(): boolean {
 // Real-fs adapter for the compiler's injectable deps (plugin-side only —
 // the pure core in src/roster-compile.ts stays fs-free).
 function realRosterFs(): RosterFsDeps {
+  const fixtureRoot = process.env.FORGE_TEST_FIXTURE_ROOT
+  // Test-only boundary: resolve existing path components before any real
+  // filesystem access. Missing directories are checked via their nearest
+  // existing ancestor; an unresolvable existing entry fails closed.
+  const checkPath = (path: string): void => {
+    if (!fixtureRoot) return
+    const within = (root: string, candidate: string) => {
+      const rel = relative(root, candidate)
+      return !isAbsolute(rel) && rel !== ".." && !rel.startsWith("../") && !rel.startsWith("..\\")
+    }
+    const refused = () => new Error(`test fixture root refused roster path: ${path}`)
+    if (!within(fixtureRoot, path)) throw refused()
+    const root = realpathSync(fixtureRoot)
+    let cursor = path
+    while (true) {
+      try {
+        lstatSync(cursor)
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err
+        const parent = dirname(cursor)
+        if (parent === cursor || !within(fixtureRoot, parent)) throw refused()
+        cursor = parent
+        continue
+      }
+      if (!within(root, realpathSync(cursor))) throw refused()
+      return
+    }
+  }
   return {
     stat: (path) => {
       try {
+        checkPath(path)
         const s = statSync(path)
         return { mtimeMs: s.mtimeMs, size: s.size }
       } catch {
         return null
       }
     },
-    readFile: (path) => readFileSync(path, "utf8"),
-    writeFile: (path, data) => writeFileSync(path, data),
-    rename: (from, to) => renameSync(from, to),
-    unlink: (path) => unlinkSync(path),
+    readFile: (path) => { checkPath(path); return readFileSync(path, "utf8") },
+    writeFile: (path, data) => { checkPath(dirname(path)); checkPath(path); writeFileSync(path, data) },
+    rename: (from, to) => {
+      checkPath(dirname(from)); checkPath(from)
+      checkPath(dirname(to)); checkPath(to)
+      renameSync(from, to)
+    },
+    unlink: (path) => { checkPath(dirname(path)); checkPath(path); unlinkSync(path) },
     readdir: (path) => {
       try {
+        checkPath(path)
         return readdirSync(path)
       } catch {
         return null
       }
     },
-    mkdir: (path) => mkdirSync(path, { recursive: true }),
+    mkdir: (path) => { checkPath(path); mkdirSync(path, { recursive: true }) },
   }
 }
 
 // The global layer's host knobs (materialize/sync), read fail-soft: an
 // absent/unreadable/broken global file keeps the defaults.
-function readGlobalKnobs(deps?: { readFile?: (path: string) => string }): { materialize: ForgeMaterializeKnob | undefined; syncAuto: boolean } {
+function readGlobalKnobs(path: string, deps?: { readFile?: (path: string) => string }): { materialize: ForgeMaterializeKnob | undefined; syncAuto: boolean } {
   try {
-    const path = globalPoolPathOf()
     const text = deps?.readFile ? deps.readFile(path) : readFileSync(path, "utf8")
     const parsed = parseForgeJsonc(text)
     if (!parsed.ok) return { materialize: undefined, syncAuto: false }
@@ -546,16 +520,33 @@ function readGlobalKnobs(deps?: { readFile?: (path: string) => string }): { mate
 function runRosterSync(): { lines: string[]; errorCount: number } {
   const resolution = resolvePools()
   const overrideDir = globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR })
+  const rosterDirs = { globalPoolFile: globalPoolPathOf(), globalAgentDir: overrideDir }
   const overridePlan = resolution
     ? planOverrideSync(resolution.overrides ?? {}, {
         dir: overrideDir,
         recipeFile: globalPoolPathOf(),
       })
     : null
-  if (!resolution || (resolution.families.length === 0 && overridePlan === null)) {
+  if (!resolution) {
     return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection)."], errorCount: 0 }
   }
-  const plans: SyncPlan[] = [...planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() })]
+  const missingRecipeNotes: string[] = []
+  const candidateFiles = new Set([globalPoolPathOf(), ...observedRecipeFiles, ...hostAnchors.map((anchor) => forgeConfigPaths({ projectDir: anchor }).project)])
+  for (const file of candidateFiles) {
+    const fixtureRoot = process.env.FORGE_TEST_FIXTURE_ROOT
+    if (fixtureRoot) {
+      const rel = relative(fixtureRoot, file)
+      if (isAbsolute(rel) || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\")) continue
+    }
+    if (recipeFileStat(file) !== null) continue
+    const verdict = staleCheckForPool(file, [], realRosterFs(), rosterContentOf(resolution), rosterAgentDirFor(file, rosterDirs))
+    if (verdict.stale) missingRecipeNotes.push(`  finding [warn]: ${verdict.reason}; restore the recipe or explicitly manage its generated files (sync leaves them untouched).`)
+  }
+  if (resolution.families.length === 0 && overridePlan === null) {
+    return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection).", ...missingRecipeNotes], errorCount: 0 }
+  }
+  const recipeUsable = (file: string) => recipeFileStat(file) !== null && !resolution.findings.some((f) => (f.code === "config-parse-error" || f.code === "config-not-object") && f.message.startsWith(`${file}:`))
+  const plans: SyncPlan[] = planRosterSync(resolution, rosterDirs).filter((p) => recipeUsable(p.family.file))
   // builtin-override (E2E scenario-6 fix): the override channel ALWAYS rides
   // the sync — planOverrideSync returning null (no ACTIVE entries) becomes an
   // empty plan, which is exactly the DEACTIVATION pass: the executor's
@@ -563,9 +554,10 @@ function runRosterSync(): { lines: string[]; errorCount: number } {
   // wants. Hand-written files never carry the marker and are never touched;
   // when nothing is configured and nothing stale exists the pass is a no-op
   // (one readdir + marker check, zero writes).
-  plans.push(overridePlan ?? { kind: "override", dir: overrideDir, files: [] })
+  if (recipeUsable(globalPoolPathOf())) plans.push(overridePlan ?? { kind: "override", dir: overrideDir, files: [] })
   const outcome = executeRosterSync(plans, realRosterFs())
-  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.filter((p) => p.files.length > 0).length} pool(s):`]
+  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.filter((p) => p.files.length > 0).length} pool(s):`, ...missingRecipeNotes]
+  if (foldPath(agentDirFor(rosterDirs.globalPoolFile)) !== foldPath(overrideDir)) lines.push(`  global artifacts use ${overrideDir}; former recipe-sibling path ${agentDirFor(rosterDirs.globalPoolFile)} is not scanned or cleaned by this global sync.`)
   if (outcome.created.length) lines.push(`  created: ${outcome.created.join(", ")}`)
   if (outcome.updated.length) lines.push(`  updated: ${outcome.updated.join(", ")}`)
   if (outcome.unchanged.length) lines.push(`  unchanged: ${outcome.unchanged.length} file(s) already current`)
@@ -585,16 +577,10 @@ function runRosterSync(): { lines: string[]; errorCount: number } {
   return { lines, errorCount: outcome.errors.length + resolution.findings.filter((f) => f.level === "error").length }
 }
 
-// Content oracle for the staleness gate: compile one entry's expected
-// content on demand (the mtime trigger is cheap; the final verdict is
-// content-based, so a touched-but-identical recipe never dead-ends).
+// Content oracle for the staleness gate: use exactly the sync compiler.
 function rosterContentOf(resolution: PoolResolution): (matId: string) => string {
-  const globalPath = globalPoolPathOf()
-  return (matId) => {
-    const agent = resolution.agents[matId]
-    const provenance: PoolProvenance = foldPath(agent.file) === foldPath(globalPath) ? { global: true } : { ns: agent.ns, file: agent.file }
-    return compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined }).content
-  }
+  const globalPoolFile = globalPoolPathOf()
+  return (matId) => compileResolvedRosterEntry(resolution, matId, { globalPoolFile }).content
 }
 
 // Staleness refusal for the crew gate (design D4): native mode refuses
@@ -604,7 +590,8 @@ function rosterStaleRefusal(anchor: string | null): string | null {
   const resolution = resolvePools()
   const poolFile = anchor ? sessionPoolFileOf(anchor) : null
   const fam = resolution?.families.find((f) => foldPath(f.file) === foldPath(poolFile ?? globalPoolPathOf()))
-  const verdict = staleCheckForPool(fam ? fam.file : poolFile, fam ? fam.materializedIds : [], realRosterFs(), resolution ? rosterContentOf(resolution) : undefined)
+  const file = fam ? fam.file : poolFile
+  const verdict = staleCheckForPool(file, fam ? fam.materializedIds : [], realRosterFs(), resolution ? rosterContentOf(resolution) : undefined, file === null ? undefined : rosterAgentDirFor(file, { globalPoolFile: globalPoolPathOf(), globalAgentDir: globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR }) }))
   if (!verdict.stale) return null
   return (
     `[forge:crew] Roster stale refused: this session's native roster artifacts are out of date with the recipe — ${verdict.reason}. ` +
@@ -613,41 +600,25 @@ function rosterStaleRefusal(anchor: string | null): string | null {
   )
 }
 
-// Sync hint for the plain dispatch path (design D4): on a native-mode
-// host, a forge-* dispatch that finds no roster must not dead-end at
-// "worker not found" — a fresh workspace after upgrade surfaces the same
-// one-step sync guidance.
-function nativeRosterSyncHint(): string | null {
-  if (!nativeRosterActive()) return null
-  const resolution = resolvePools()
-  if (!resolution) return null
-  const deps = realRosterFs()
-  const contentOf = rosterContentOf(resolution)
-  for (const fam of resolution.families) {
-    const verdict = staleCheckForPool(fam.file, fam.materializedIds, deps, contentOf)
-    if (verdict.stale) {
-      return (
-        ` Native-roster hint: this host materializes workers from compiled .opencode/agent/forge-*.md files and they are stale or missing (${verdict.reason}). ` +
-        `Call the forge_sync tool to regenerate them, then retry.`
-      )
-    }
-  }
-  return null
-}
-
-
 // Anchor normalization: resolved real path, backslashes + case-folding on
 // win32 — "C:/Temp1" and "c:\temp1\" cannot double-add.
-function normalizeAnchorDir(dir: string): string {
-  let p = (dir ?? "").trim()
+function anchorPath(dir: string): string {
+  const p = (dir ?? "").trim()
   if (!p) return ""
   try {
-    p = realpathSync(p)
+    return realpathSync(p)
   } catch {
     // Missing/unresolvable (e.g. tests with fake fs): keep the trimmed input.
+    return p
   }
-  if (process.platform === "win32") return p.replace(/\//g, "\\").toLowerCase()
-  return p
+}
+
+function anchorKey(path: string): string {
+  return process.platform === "win32" ? path.replace(/\//g, "\\").toLowerCase() : path
+}
+
+function normalizeAnchorDir(dir: string): string {
+  return anchorKey(anchorPath(dir))
 }
 
 function rememberHostAnchor(dir: string): void {
@@ -659,9 +630,12 @@ function rememberHostAnchor(dir: string): void {
       )
     } catch {}
   }
-  const normalized = normalizeAnchorDir(dir)
+  const path = anchorPath(dir)
+  const normalized = anchorKey(path)
   if (!normalized) return
-  if (!hostAnchors.includes(normalized)) hostAnchors.push(normalized)
+  // The folded identity is only a dedup key; retain the real path for
+  // discovery, provenance and filesystem operations.
+  if (!hostAnchors.some((anchor) => anchorKey(anchor) === normalized)) hostAnchors.push(path)
   if (!poolResolver) {
     poolResolver = createPoolResolver({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
   }
@@ -680,7 +654,9 @@ function resolvePools(): PoolResolution | null {
     } catch {}
   }
   if (!poolResolver || hostAnchors.length === 0) return null
-  return poolResolver.resolve(hostAnchors)
+  const resolution = poolResolver.resolve(hostAnchors)
+  for (const family of resolution.families) observedRecipeFiles.add(family.file)
+  return resolution
 }
 // Session-anchored project-only discovery (sole-pool-ownership residual
 // mismatch + the session's workspace pool): NO global layer here — the
@@ -771,10 +747,13 @@ function crewPoolComplianceRefusal(anchor: string): string | null {
 // native task channel was never refused for forge-family sessions and still
 // is not; the recording duty rides existing surfaces (wave notes + the close
 // evidence saying it ran native — no schema field, D2).
+const CREW_WAVE_RULE =
+  "A wave is the set of native `subagent` calls made together by the orchestrating session (agent = the selected worker). Reuse of a sessionID starts another work round; duplicate observations of one round count once. Children work in the background; use host completion messages and available session evidence to verify settlement. Launch the next wave ONLY after every work round of the previous wave is verified settled. Partial, truncated or unknown views, idle or missing sessions, and unresolved outcomes do not establish settlement; end your turn and wait for the rest, without polling or sleeping. A diagnostic is not permission to launch another wave."
 const CREW_NATIVE_FALLBACK_RULE =
-  "Native fallback: when the pool offers no forge worker fitting a subtask (or forge-* dispatch is blocked by a degraded pool), dispatch the native general subagent with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native)."
+  "Native fallback: when the pool offers no forge worker fitting a subtask or the pool is degraded, disclose the gap and suggest configuring the missing role; use the native `subagent` tool for a non-forge agent (e.g. general) only when permitted, with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native). Respect all approvals and host permissions."
+// Legacy task-belt refusal: keep its live-runtime wording until 6.4 migrates the belt.
 const CREW_COMPLIANCE_NATIVE_EXIT =
-  " Native exit: while the pool is being repaired, the affected subtask may dispatch through the NATIVE task channel with the same relay contract — this compliance belt gates forge-* dispatch only, never the crew's existence."
+  " Repair the pool before retrying the refused operation; respect existing approvals and permissions."
 // Crew orchestration state (spec: crew-harness, change
 // add-crew-execution-mode-gate): in-memory and session-bound — a host restart
 // kills it honestly and a new /crew starts fresh. A registered crew starts
@@ -785,7 +764,7 @@ const CREW_COMPLIANCE_NATIVE_EXIT =
 // (their record file is the history). The declared subtask plan (registered at
 // crew_begin) is the crew_close gate's source of truth.
 type CrewMode = "pending" | "executing"
-type CrewEntry = { objective: string; startedAt: string; subtasks: CrewSubtask[]; mode: CrewMode; recordPath: string | null }
+type CrewEntry = { objective: string; startedAt: string; subtasks: CrewSubtask[]; mode: CrewMode; recordPath: string | null; goalGoverned?: boolean; rounds?: CrewRound[] }
 const crews = new Map<string, CrewEntry>()
 
 // Crew record file (change add-crew-execution-mode-gate, D7): an
@@ -849,9 +828,9 @@ function governingGoalFor(sessionID: string | undefined): boolean {
 
 function crewPendingChoiceLines(): string[] {
   return [
-    "[forge:crew] The crew is PENDING — execution has NOT started. Present the execution-mode choice to the user and END YOUR TURN (every task dispatch is refused while the crew pends):",
+    "[forge:crew] The crew is PENDING — execution has NOT started. Present the execution-mode choice to the user and END YOUR TURN (do not start any subagent work while the crew pends):",
     `RELAY FIRST: tell the user the crew record path (it leads this output) alongside this choice — the record is on disk from the registration moment, and the user must hear it.`,
-    `  1. supervised waves NOW — when the user says go, call crew_begin {execution: "waves"} and run the wave discipline; waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard);`,
+    `  1. supervised waves NOW — when the user says go, call crew_begin {execution: "waves"} and run the wave discipline; waves auto-advance on session idle until crew_close only after verified settlement of the previous wave (the engine stops after a stall — nudge or re-shard);`,
     `  2. convert to a goal contract — call crew_begin {execution: "goal"} (the crew ends as a conversion record; no extra dialog here), then draft goal_write with arm=true folding the declared subtasks into criteria/checks — the arm dialog is the user's gate;`,
     `  3. standby — no call; the crew waits until armed or abandoned.`,
   ]
@@ -863,9 +842,6 @@ let modelsDevCatalog: CatalogSnapshot | null = null
 // Bounded once-per-agent diagnostics for untranslatable depth words
 // (spec: inject nothing + record a finding; never break the session).
 const depthFindingNotes = new Map<string, string>()
-// Last config-hook result snapshots (test seam only — no behavior reads them).
-let crewCommandSnapshot: { template: string; description: string } | null = null
-let materializedSnapshot: Record<string, Record<string, unknown>> = {}
 
 // sessionID -> frozen resolution: the chat.params injection table. The FIRST
 // request of a forge-agent session freezes the resolution (D3 stability:
@@ -939,203 +915,6 @@ function resolveDepthChannel(providerID: string, modelID: string): DepthChannel 
 }
 
 
-// ---------------------------------------------------------------------------
-// Job supervisor (forge_shell / forge_jobs): non-blocking shell execution
-// with a four-condition completion race, session-owned jobs, and a
-// completion wake. See openspec job-supervisor spec + design.
-// ---------------------------------------------------------------------------
-
-// Plugin options (second server argument), captured at load.
-let jobsMode: "auto" | "forge" | "native" = "auto"
-let jobsKeepBuiltinShell = false
-// jobs.survive: "never" (default — param may still opt a job in), "always"
-// (param may still opt a job out), "deny" (survive is off and cannot be
-// enabled per-call — the explicit user deny wins over everything).
-let jobsSurviveMode: "never" | "always" | "deny" = "never"
-
-// Resolve config + per-call flag. Throws on the one forbidden combination.
-export function effectiveSurvive(config: "never" | "always" | "deny", param: boolean | undefined): boolean {
-  if (config === "deny") {
-    if (param === true) throw new Error("[forge] jobs.survive is explicitly denied in config; a per-call survive=true cannot override it.")
-    return false
-  }
-  if (param !== undefined) return param
-  return config === "always"
-}
-
-// Lazy lifecycle wiring (started with the first job of this host process):
-// persistent survivor registry, the Windows job-object fence, the exit-matrix
-// cleanup, and adoption of survivors from PREVIOUS host runs. Lazy so merely
-// importing the plugin (tests, disabled installs) spawns nothing.
-let jobFence: JobFence | null = null
-let jobRegistry: JobRegistry | null = null
-let exitCleanup: ExitCleanup | null = null
-let jobsLifecycleStarted = false
-
-function ensureJobLifecycle(): { registry: JobRegistry | null; fence: JobFence | null } {
-  if (jobsLifecycleStarted) return { registry: jobRegistry, fence: jobFence }
-  jobsLifecycleStarted = true
-  const registry = createJobRegistry(registryPathFor(jobLogDir()))
-  jobRegistry = registry
-  // Previous-run survivors: adopt the alive, ledger the dead (POSIX orphan
-  // detection rides the same scan — there is no kernel fence there).
-  const { adopted, dead } = registry.rescan(pidAlive, structuralRelocate)
-  for (const entry of adopted) {
-    adoptSurvivor(jobManager, entry, { registry, logDir: jobLogDir(), relocate: structuralRelocate })
-  }
-  for (const entry of dead) {
-    jobLedgerSink({ at: new Date().toISOString(), kind: "orphan-job", jobId: entry.id, session: entry.ownerSession, detail: `previous-run survivor pid ${entry.pid} is dead (cmd: ${entry.cmd.slice(0, 120)})` })
-  }
-  jobFence = process.env.FORGE_TEST_NO_FENCE === "1"
-    ? null // wiring tests run without a real watcher (its stdin pipe would
-      // hold the test process's event loop open; fence behavior is covered
-      // by job-fence.test.mjs fakes + the live 4.1b check)
-    : createJobFence({
-        onDegrade: (reason) => {
-          jobLedgerSink({ at: new Date().toISOString(), kind: "fence-degraded", jobId: "-", session: "-", detail: reason })
-        },
-      })
-  exitCleanup = createExitCleanup(jobManager, {
-    graceMs: 3_000,
-    // fix-dispatch-dispose-kill D1: dispatch rows are exempt from the ENTIRE
-    // exit matrix (dispose + SIGINT/SIGTERM/exit/uncaught) — no kill, no
-    // abort, no journal terminal state; continuity rides the dispatch
-    // journal + restart recovery.
-    skip: isDispatchRow,
-    // Diagnostics only (the sandbox probe log): the exit matrix leaves a
-    // trace of what each trigger saw and killed.
-    trace: (line) => goalProbe(`exit-cleanup ${line}`),
-    after: () => {
-      jobFence?.dispose()
-    },
-  })
-  return { registry, fence: jobFence }
-}
-
-// Stage matrix (partition era, tool-partition spec): the forge-side exec
-// partition holds regardless of any host background capability, so `auto` and
-// `forge` are equivalent. Only the manual `native` mode retires the
-// supervisor — tools unregistered and the builtin-shell hide withdrawn in the
-// same stroke, so the forge agent is never left without an exec surface.
-function jobStage(): 0 | 2 {
-  if (jobsMode === "native") return 2
-  return 0
-}
-
-// Resolved per call (fix-test-runtime-namespace-isolation): the job home is
-// `<os-tmp>/opencode-forge/jobs` with the `<os-tmp>` level from
-// forgeRuntimeTmp() — never a module-load constant, so a test's redirect is
-// honored wherever in the test body it is set.
-function jobLogDir(): string {
-  return jobsLogDir(forgeRuntimeRoot())
-}
-
-// Diagnostics ledger sink: bounded in memory by the manager; on disk a
-// JSONL file that resets once it passes 1MB.
-function jobLedgerSink(entry: Record<string, unknown>): void {
-  try {
-    mkdirSync(jobLogDir(), { recursive: true })
-    const jobLedgerPath = join(jobLogDir(), "ledger.jsonl")
-    if (existsSync(jobLedgerPath) && statSync(jobLedgerPath).size > 1_000_000) writeFileSync(jobLedgerPath, "")
-    appendFileSync(jobLedgerPath, `${JSON.stringify(entry)}\n`)
-  } catch {
-    // A broken ledger write must never take the supervisor down.
-  }
-}
-
-const jobManager = createJobManager({
-  sink: jobLedgerSink,
-  // Wake push at queue time (job-read-consumption D6): a completion that
-  // arrives while the owning session is ALREADY idle has no future idle
-  // edge to ride — the old idle-transition-only sweep would let it sit
-  // until the delivery window abandoned it. When the session is known-idle,
-  // deliver now; busy sessions stay on the idle-edge path.
-  onWakeQueued: (job) => {
-    if (idleJobSessions.has(job.ownerSession)) {
-      // Progress flushes BEFORE terminal wakes (design D6 FINAL/PROGRESS
-      // separation): older information lands first on the same idle edge.
-      void deliverDispatchProgress(job.ownerSession).then(() => deliverJobWakes(job.ownerSession))
-    }
-  },
-})
-
-// Pending [forge:dispatch-progress] notices (sync-timeout-notify fold #2,
-// design D6): parked per owner session at the notify-interval cadence and
-// flushed through the SAME idle-edge mechanism as job wakes. Delivery is
-// LOSSY by design — a failed send drops the notice (no requeue, no budget
-// interaction): progress is informational; the terminal
-// [forge:dispatch-complete] wake is the guarantee and never shares this
-// queue or the wake budget.
-// fix-stale-progress-notice: an entry may carry an `isLive` predicate. The
-// notice is delivered ONLY while it still holds AT DELIVERY TIME — a notice
-// parked for a busy owner whose dispatch finished meanwhile is dropped (the
-// terminal wake is the single carrier of the terminal state; the notice
-// itself stays in the job's output tail). Entries without a predicate (a
-// notice that is not about one dispatch) are delivered as before.
-type DispatchProgressNotice = { text: string; isLive?: () => boolean }
-const dispatchProgressQueue = new Map<string, DispatchProgressNotice[]>()
-// Dropped-as-stale notices per owner session (bounded; the wiring tests'
-// read-only view of the drop side).
-const dispatchProgressDropped = new Map<string, string[]>()
-
-/** True while task `jobId` is in flight, between retry attempts, still waiting in a queue, or being spawned from a queue. */
-function dispatchStillLive(jobId: string): boolean {
-  const row = jobManager.get(jobId)
-  if (row) return row.state === "running"
-  // No registry row yet: a wish is live while it is still queued, or while
-  // the queue pump is spawning it (the transit window — see PumpRun).
-  for (const queue of dispatchQueues.values()) {
-    if (queue.some((wish) => wish.jobId === jobId)) return true
-  }
-  for (const pumps of pumpInFlight.values()) {
-    for (const run of pumps) if (run.wishId === jobId) return true
-  }
-  return false
-}
-
-function queueDispatchProgress(sessionID: string, text: string, isLive?: () => boolean): void {
-  const notice: DispatchProgressNotice = isLive ? { text, isLive } : { text }
-  const queued = dispatchProgressQueue.get(sessionID)
-  if (queued) queued.push(notice)
-  else dispatchProgressQueue.set(sessionID, [notice])
-}
-
-async function deliverDispatchProgress(sessionID: string): Promise<void> {
-  if (forgeDisabled) return
-  const pending = dispatchProgressQueue.get(sessionID)
-  if (!pending || pending.length === 0) return
-  dispatchProgressQueue.delete(sessionID)
-  if (!jobClient || typeof jobClient.session.promptAsync !== "function") return
-  for (const notice of pending) {
-    if (notice.isLive) {
-      // A predicate that throws decides nothing: the notice is delivered as
-      // it always was (never a throw into the idle-edge path).
-      let live = true
-      try {
-        live = notice.isLive()
-      } catch {}
-      if (!live) {
-        dispatchProgressDropped.set(sessionID, [...(dispatchProgressDropped.get(sessionID) ?? []), notice.text].slice(-20))
-        continue
-      }
-    }
-    try {
-      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: notice.text }] } })
-    } catch {
-      // Lossy: the notice is dropped — never requeued, never retried.
-    }
-  }
-}
-
-// Message-send client for completion wakes (promptAsync: fire-and-forget,
-// does not block the plugin fiber) and session lookups for handoff roots.
-type JobClient = {
-  session: {
-    promptAsync?: (opts: unknown) => Promise<unknown>
-    get?: (opts: unknown) => Promise<unknown>
-  }
-}
-let jobClient: JobClient | null = null
 
 // fix-v2-crew-surface-drift task 1.1 (design D1): the authoritative
 // anchor-client seam, hoisted into SHARED module state so the dispatch
@@ -1152,219 +931,6 @@ function sharedAnchorClient(): AnchorClient | null {
   return anchorClientShared
 }
 
-// Sessions believed idle (job-read-consumption D6): chat.message marks a
-// turn in flight (busy), session.idle marks it over. Unknown sessions are
-// treated as busy — they keep the conservative idle-edge delivery path.
-const idleJobSessions = new Set<string>()
-
-// Dispatch marker riding async-dispatch registry entries (kind=dispatch,
-// async-dispatch design D3): the entry is a job-manager registry row, not a
-// process — the wake text carries the child's final assistant message inline.
-// fix-dispatch-dispose-kill: `outcome` is stamped "aborted" by the kill hook
-// (dispatchKillTreeHook) BEFORE markTerminal queues the wake, so the wake
-// renders the honest aborted branch; `abortReason` carries the kill reason.
-type DispatchJobMeta = { agentID: string; childSessionID: string; description: string; outcome?: string; abortReason?: string }
-
-// fix-dispatch-dispose-kill D1: the single dispatch-row predicate — the
-// dispatch meta is the row's ONLY identity marker. Rows it matches are
-// exempt from the exit matrix (host-exit skip) and disposeAll: no pid (no
-// local process tree — terminateTreeSync is already a no-op for them), the
-// child is a server-side session, and continuity is carried by the dispatch
-// journal + restart recovery. An exit-time kill's only effects are
-// destructive (journal aborted → recovery skips a live child; lost wake).
-function isDispatchRow(job: Job): boolean {
-  return (job as Job & { dispatch?: DispatchJobMeta }).dispatch != null
-}
-
-// fix-dispatch-dispose-kill D2 (abort-unconfirmed disclosure): jobId → the
-// honest error from a failed/unavailable abortChild on a kill path. Read at
-// journal settle (the poller's kill exit appends it to the terminal reason)
-// and at wake delivery (jobWakeText discloses it) — never silently dropped.
-const abortUnconfirmedNotes = new Map<string, string>()
-// jobId → the abortChild promise a kill hook left in flight. The watcher's
-// kill settle waits (bounded) on it before writing the journal terminal, so
-// an abort that FAILED is disclosed in the journal too — not only in the
-// wake, which is rendered later.
-const abortInFlight = new Map<string, Promise<void>>()
-// How long a kill settle (and a wake rendered at kill time) waits for an
-// in-flight abort before treating it as unconfirmed.
-const KILL_ABORT_VERDICT_WAIT_MS = 2_000
-const KILL_ABORT_PENDING_NOTE = `the abort call had not returned within ${KILL_ABORT_VERDICT_WAIT_MS / 1000} s`
-
-/**
- * Wait (bounded) for a kill's in-flight abort and make its verdict honest.
- * A FAILED or unavailable abort is recorded by the kill hook itself; an
- * abort that has NOT RETURNED within the bound is recorded HERE as
- * unconfirmed too (spec review 2026-11-23, finding ④): a hung host call is
- * not a clean abort — the child may still be running — and the journal used
- * to write a bare "aborted" once its 2 s wait ran out. BOTH readers call
- * this — the journal settle and the wake delivery — so an already-idle owner
- * (woken at kill time, before the abort verdict lands) is told exactly what
- * the journal says, whichever of the two renders first.
- */
-async function awaitAbortVerdict(jobId: string): Promise<void> {
-  const pending = abortInFlight.get(jobId)
-  if (!pending) return
-  await new Promise<void>((resolve) => {
-    const timer = setTimeout(() => resolve(), KILL_ABORT_VERDICT_WAIT_MS)
-    const done = () => {
-      clearTimeout(timer)
-      resolve()
-    }
-    pending.then(done, done)
-  })
-  if (abortInFlight.get(jobId) === pending) abortUnconfirmedNotes.set(jobId, KILL_ABORT_PENDING_NOTE)
-}
-
-/**
- * fix-dispatch-dispose-kill D2/D3: the ONE killTree hook factory for
- * dispatch registry rows — every call site routes here, no `void`-discarded
- * abortChild results. The aborted outcome is stamped SYNCHRONOUSLY (before
- * the abort promise settles) because markTerminal fires onWakeQueued
- * synchronously inside kill() — the queued wake must already render the
- * honest aborted branch, never "finished / Final report: (no output)". A
- * failed or unavailable abort lands in abortUnconfirmedNotes for the
- * journal+wake disclosure; it never blocks the kill itself.
- */
-function dispatchKillTreeHook(client: DispatchClient, jobId: string, childSessionID: () => string): () => void {
-  return () => {
-    const job = jobManager.get(jobId)
-    const meta = job ? (job as Job & { dispatch?: DispatchJobMeta }).dispatch : undefined
-    if (meta && meta.outcome !== "stream-lost/unknown") {
-      meta.outcome = "aborted"
-      meta.abortReason = meta.abortReason ?? REGISTRY_KILL_ABORT_REASON
-    }
-    const sid = childSessionID()
-    if (!sid) return
-    const pending = abortChild(client, sid).then((res) => {
-      if (!res.ok) abortUnconfirmedNotes.set(jobId, res.error)
-    })
-    abortInFlight.set(jobId, pending)
-    const drop = () => {
-      if (abortInFlight.get(jobId) === pending) abortInFlight.delete(jobId)
-    }
-    void pending.then(drop, drop)
-  }
-}
-
-// fix-stale-progress-notice: the plugin's own progress notices ride the
-// dispatch job's output tail (the registry row's in-memory tail — `forge_jobs`
-// poll stays readable; a dispatch job writes no log file), but they are
-// timely markers, not report content — the completion wake's "Final report"
-// block never shows a "still running" line above the report. Every notice
-// goes through appendDispatchNotice, so the wake cuts them out by the exact
-// appended text (never by matching a prefix the report itself could
-// legitimately contain). The memo lives on the JOB, not on the dispatch
-// meta: a retry rebinds the meta and must not forget earlier notices.
-const DISPATCH_NOTICE_MEMORY = 30
-
-function appendDispatchNotice(job: Job, notice: string): void {
-  jobManager.appendOutput(job, notice)
-  const memo = job as Job & { progressNotices?: string[] }
-  if (!memo.progressNotices) memo.progressNotices = []
-  memo.progressNotices.push(notice)
-  if (memo.progressNotices.length > DISPATCH_NOTICE_MEMORY) memo.progressNotices.splice(0, memo.progressNotices.length - DISPATCH_NOTICE_MEMORY)
-}
-
-/**
- * The dispatch job's output AFTER the last plugin notice it still holds.
- * The poller appends notices first and the final text last, so what follows
- * the last notice IS the final text. A notice the tail cap truncated away
- * simply is not found (the cut then sits after a later one, or nowhere — in
- * which case the tail is returned whole, exactly as before this rule).
- */
-function dispatchReportTail(job: Job): string {
-  const memo = (job as Job & { progressNotices?: string[] }).progressNotices
-  if (!memo || memo.length === 0) return job.tail
-  let cut = -1
-  for (const notice of memo) {
-    const at = job.tail.lastIndexOf(notice)
-    if (at !== -1) cut = Math.max(cut, at + notice.length)
-  }
-  return cut === -1 ? job.tail : job.tail.slice(cut)
-}
-
-function jobWakeText(job: Job): string {
-  const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
-  if (dispatch) {
-    // dispatch-stream-loss-honesty: the stream-lost/unknown wake states the
-    // view loss and the UNKNOWN child state — never a terminal verdict.
-    if (dispatch.outcome === "stream-lost/unknown") {
-      return [
-        `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — RESULT STREAM LOST (task ${job.id}, child session ${dispatch.childSessionID}): the dispatch view broke before a final report arrived; child state UNKNOWN (possibly still running).`,
-        `Last observation:\n${job.tail.slice(-2500) || "(no output)"}`,
-        `Ground-truth recovery: read reports/${job.id}-report.md in the workspace BEFORE considering a re-dispatch; the child session stays inspectable and natively abortable in the host TUI.`,
-      ].join("\n")
-    }
-    // fix-dispatch-dispose-kill D2 (killed wake honesty): a killed/aborted
-    // dispatch is presented AS an abort with its reason — NEVER "finished …
-    // Final report:" with an empty tail faking a report.
-    if (job.state === "killed" || dispatch.outcome === "aborted") {
-      const reason = dispatch.abortReason ?? REGISTRY_KILL_ABORT_REASON
-      const unconfirmed = abortUnconfirmedNotes.get(job.id)
-      return [
-        `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — ABORTED (task ${job.id}, child session ${dispatch.childSessionID}): ${reason}.`,
-        unconfirmed
-          ? `abort unconfirmed — child may still be running (${unconfirmed}); inspect or abort it natively in the host TUI.`
-          : `The child session was aborted; this dispatch did NOT finish and produced no final report.`,
-        `Ground truth if needed: reports/${job.id}-report.md in the workspace, or the child transcript in the host TUI.`,
-      ].join("\n")
-    }
-    return [
-      `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
-      `Final report:\n${dispatchReportTail(job).slice(-2500) || "(no output)"}`,
-      "The dispatch is complete — read the report above; no polling, no re-dispatch needed.",
-    ].join("\n")
-  }
-  return [
-    `[forge:job-complete] Background job ${job.id} finished (${job.state}${job.exitCode !== null ? `, exit ${job.exitCode}` : ""}).`,
-    `Command: ${job.cmd}`,
-    `Recent output:\n${job.tail.slice(-1500) || "(none)"}`,
-    "Details via forge_jobs (poll/log); the job stays in the registry until cleared.",
-  ].join("\n")
-}
-
-// Deliver queued completion wakes to a session that just went idle. A send
-// failure re-queues the wake (bounded by the manager's delivery window,
-// which abandons it to the ledger instead of looping forever). No jobStage
-// guard: async-dispatch registry entries (kind=dispatch) ride this same
-// path and their wakes must deliver even under supervisor retirement.
-async function deliverJobWakes(sessionID: string): Promise<void> {
-  if (forgeDisabled) return
-  if (!jobClient || typeof jobClient.session.promptAsync !== "function") return
-  for (const job of jobManager.deliverWakesFor(sessionID)) {
-    // A killed dispatch's abort may still be in flight when an ALREADY-IDLE
-    // owner is woken at kill time — before the abort verdict lands. Give it
-    // the same bounded moment the journal settle gets (and the same
-    // unconfirmed note for a hung call), so the wake never says a clean
-    // "aborted" where the journal says "unconfirmed". Rows with no abort in
-    // flight take NO await here: a plain job's wake is delivered
-    // synchronously on the idle edge, as it always was.
-    if (abortInFlight.has(job.id)) await awaitAbortVerdict(job.id)
-    try {
-      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: jobWakeText(job) }] } })
-    } catch {
-      job.wakeState = "queued"
-    }
-  }
-}
-
-// Root ancestor of a session for handoff rebinding, best-effort through the
-// host API; undefined when unresolvable (handoff then stays plugin-global).
-async function handoffTarget(sessionID: string): Promise<string | undefined> {
-  if (!jobClient || typeof jobClient.session.get !== "function") return undefined
-  let current = sessionID
-  for (let depth = 0; depth < 10; depth++) {
-    try {
-      const info = (await jobClient.session.get({ path: { id: current } })) as { parentID?: string } | undefined
-      if (!info?.parentID) return current === sessionID ? undefined : current
-      current = info.parentID
-    } catch {
-      return undefined
-    }
-  }
-  return current === sessionID ? undefined : current
-}
 
 // ---------------------------------------------------------------------------
 // Session-anchor ledger (change pool-rebind-on-resume): persisted, bounded
@@ -1390,25 +956,18 @@ type SessionAnchorLedgerFs = { read: () => string; write: (text: string) => void
 // ---------------------------------------------------------------------------
 // Runtime-artifact namespace (fix-test-runtime-namespace-isolation).
 // Every per-host runtime artifact lives under `<os-tmp>/opencode-forge/`:
-// job logs + the survivor registry + the jobs ledger, the models-dev cache,
-// the watchdog ledger, the session-anchor ledger. Production's two levels are
+// the models-dev cache and session-anchor ledger. Diagnostic probes use
+// the same temp redirect. Production's two levels are
 // mirrored by two helpers, both resolved AT USE TIME:
 //   forgeRuntimeTmp()  = the `<os-tmp>` level
-//   forgeRuntimeRoot() = `<os-tmp>/opencode-forge` (jobs/, models-dev/,
-//                        watchdog/, session-anchors.jsonl live under it)
+//   forgeRuntimeRoot() = `<os-tmp>/opencode-forge` (models-dev/, session-anchors.jsonl)
 // and the `<os-tmp>` level is:
 //   production             → undefined → each helper's own default (as ever)
 //   FORGE_TEST_RUNTIME_DIR → a test swaps the `<os-tmp>` level (the suite
 //                            preloads a private temp dir via --import)
 // FORGE_TEST_FORGE_HOME is NOT this axis: it stays exactly what it always was
 // — the HOME alias for config discovery, plus this ledger's historical knob.
-// Why (2026-11-24): the job directory used to be fixed at plugin module load,
-// so every unit test that spawned a real job wrote its logs into the REAL
-// directory shared with the running host plugin, overwrote the host's
-// `registry.json`, and `ensureJobLifecycle` adopted the host's live survivors
-// into the test process; every `config` hook rewrote the host's models-dev
-// snapshot. Production never sets FORGE_TEST_RUNTIME_DIR, so every path is
-// byte-identical.
+// Production never sets FORGE_TEST_RUNTIME_DIR; the retained paths are unchanged.
 // ---------------------------------------------------------------------------
 function forgeRuntimeTmp(): string | undefined {
   return process.env.FORGE_TEST_RUNTIME_DIR || undefined
@@ -1434,8 +993,18 @@ function modelsDevCacheRoot(): string {
   return forgeRuntimeRoot()
 }
 
-function watchdogLogHome(): string {
-  return watchdogLogDir(forgeRuntimeTmp())
+// Both entry points use the same snapshot/cache and fail-soft policy.
+async function refreshModelsDevCatalog(skipFetch = process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1", timeoutMs?: number): Promise<void> {
+  if (skipFetch) {
+    modelsDevCatalog = null
+    return
+  }
+  try {
+    const snapshot = await loadModelsDevSnapshot({ cacheDir: modelsDevCacheRoot(), timeoutMs })
+    modelsDevCatalog = snapshot.catalog
+  } catch {
+    modelsDevCatalog = null
+  }
 }
 
 // The env-gated diagnostic probes (FORGE_*_PROBE — off in production) write
@@ -1451,11 +1020,8 @@ function probeTmp(): string {
 export const __runtimeNamespaceTestSurface = {
   tmp: forgeRuntimeTmp,
   root: forgeRuntimeRoot,
-  jobLogDir: (): string => jobLogDir(),
-  jobLedgerPath: (): string => join(jobLogDir(), "ledger.jsonl"),
   modelsDevCacheRoot,
   modelsDevCacheDir: (): string => modelsDevCacheDir(modelsDevCacheRoot()),
-  watchdogLogDir: watchdogLogHome,
   probeTmp,
   sessionAnchorLedgerPath,
 }
@@ -1686,12 +1252,16 @@ function resolveAnchorViaLedger(sessionID: string, resolved: string): string {
 // forge-* worker whose pool belongs to ANOTHER workspace is refused — the
 // target's origin pool path is named, with the three exits. Unknown session
 // anchors keep the fail-open belt posture with a bounded disclosure.
-async function poolGateRefusal(anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null | undefined, sessionID: string, target: string): Promise<string | null> {
+async function poolGateRefusal(anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null | undefined, sessionID: string, target: string, requireEntry = false, deferMissing?: (refusal: string) => void): Promise<string | null> {
+  const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID)
+  return poolGateRefusalAtAnchor(anchor, sessionID, target, requireEntry, deferMissing)
+}
+
+function poolGateRefusalAtAnchor(anchor: string, sessionID: string, target: string, requireEntry = false, deferMissing?: (refusal: string) => void): string | null {
   const resolution = resolvePools()
   const agentId = target.slice("forge-".length)
   const entry = resolution?.agents[agentId]
-  if (!(resolution && entry)) return null
-  const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID)
+  if (!entry && !requireEntry) return null
   if (!anchor) {
     if (!poolGateUnknownNotes.has(sessionID)) {
       poolGateUnknownNotes.add(sessionID)
@@ -1703,6 +1273,22 @@ async function poolGateRefusal(anchorClient: { session?: { get?: (opts: unknown)
   }
   const sessionPool = sessionPoolFileOf(anchor)
   const allowed = sessionPool ?? globalPoolPathOf()
+  if (!entry) {
+    // Preserve stale-roster recovery guidance before reporting a missing role.
+    const stale = nativeRosterActive() ? rosterStaleRefusal(anchor) : null
+    const refusal = stale ?? (
+      `[forge:pool] Dispatch refused: "${target}" is not a materialized forge subagent and is not dispatchable from this session. ` +
+      `This session's dispatchable roster is ${sessionPool ? `its workspace pool (${sessionPool})` : `the global fallback (${globalPoolPathOf()})`}. ` +
+      `Exits: open a session in the role's workspace, or configure the role into this workspace's pool (its .opencode/forge.json), or into the global layer (${globalPoolPathOf()}).`
+    )
+    // An absent entry proves no foreign origin. Keep the refusal while the
+    // crew belts provide the more specific pending/compliance recovery.
+    if (deferMissing) {
+      deferMissing(refusal)
+      return null
+    }
+    return refusal
+  }
   if (allowed === null || foldPath(entry.file) !== foldPath(allowed)) {
     return (
       `[forge:pool] Dispatch refused: "${target}" belongs to the pool ${entry.file} — not dispatchable from this session. ` +
@@ -1735,7 +1321,13 @@ async function crewComplianceRefusalFor(anchorClient: { session?: { get?: (opts:
   const crew = crews.get(sessionID)
   if (!(crew && (crew.mode === "pending" || crew.mode === "executing"))) return null
   const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID)
-  if (!anchor) return null
+  return crewComplianceRefusalAtAnchor(anchor, sessionID, target)
+}
+
+function crewComplianceRefusalAtAnchor(anchor: string, sessionID: string, target: string): string | null {
+  if (!anchor || !target.toLowerCase().startsWith("forge-")) return null
+  const crew = crews.get(sessionID)
+  if (!(crew && (crew.mode === "pending" || crew.mode === "executing"))) return null
   const complianceRefusal = crewPoolComplianceRefusal(anchor)
   // crew-native-fallback: the MID-CREW refusal gains the native exit
   // sentence; the refusal CONDITION is untouched.
@@ -1777,11 +1369,27 @@ function draftDispatchRefusalForState(state: SessionState | null, target: string
   )
 }
 
-function draftDispatchRefusal(sessionID: string | undefined, target: string | undefined): string | null {
-  return draftDispatchRefusalForState(stateForBan(sessionID), target)
+function nativeDraftDispatchRefusal(state: SessionState, target: string | undefined): string | null {
+  const pool = sessionPoolFileOf(state.worktree) ?? globalPoolPathOf()
+  const resolution = resolvePools()
+  const scouts = Object.entries(resolution?.agents ?? {}).filter(([, entry]) =>
+    pool !== null && foldPath(entry.file) === foldPath(pool) && effectiveReadonlyShape(entry.def) &&
+    (entry.def.permission?.shell === "deny" || entry.def.permission?.bash === "deny"))
+  const roster = rosterStaleRefusal(state.worktree) ? [] : scouts.map(([id]) => "forge-" + id).sort()
+  if (target && roster.includes(target)) return null
+  return "[forge] A plan is in draft; dispatch is denied for this target. " +
+    (roster.length ? "Qualified readonly recon scouts: " + roster.join(", ") + ". " : "No current qualified shell-denied readonly scout. Define a readonly worker in forge.json with explicit shape readonly and shell permission deny. ") +
+    "Wait for plan_approve or /plan discard."
 }
 
-const WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"])
+// Keep legacy task/bash classified until the old execution surfaces retire.
+// Native dispatch is conservatively write-class until its draft recon gate lands.
+const WRITE_TOOLS = new Set<string>([
+  ...NATIVE_TOOL_VOCAB.mutatingFamily,
+  ...NATIVE_TOOL_VOCAB.legacyShellKeys,
+  NATIVE_TOOL_VOCAB.dispatchTool,
+  NATIVE_TOOL_VOCAB.taskKey,
+])
 
 function isWriteTool(name: string): boolean {
   const n = name.toLowerCase()
@@ -1928,7 +1536,7 @@ const planWriteTool = tool({
     }
     const { checks: rawChecks, ...fields } = args
     const text = renderPlan({ ...fields, ...(checks && checks.length > 0 ? { checks } : {}) }, now, created)
-    writeFileSync(path, text)
+    atomicWrite(path, text)
     state.planPath = path
     const doc = parsePlan(text)
     context.metadata({ title: `${mode === "created" ? "Create" : "Revise"} plan: ${doc.goal}` })
@@ -1960,7 +1568,7 @@ const planTickTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`)
     }
     const next = tickTask(readFileSync(active.path, "utf8"), args.n, nowIso())
-    writeFileSync(active.path, next)
+    atomicWrite(active.path, next)
     const doc = parsePlan(next)
     const p = progressOf(doc)
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` })
@@ -1980,14 +1588,8 @@ const planTickTool = tool({
 // while context.ask() creates a real user confirmation (TUI dialog; run mode
 // auto-rejects; --auto approves). The user's answer IS the gate.
 //
-// INVARIANT: the gate() helper itself NEVER auto-resolves. forge_shell is
-// NOT a user-confirmation door — its gate ask is resolved by the HOST
-// against the permission rules (posture pass-through: no plugin-injected
-// rule, no plugin-side classification). The 6 doors — plan_approve,
-// goal_write (arm), goal_complete, goal_resume, goal_discard, crew_close;
-// exactly the non-exec gate() permission keys — are never auto-resolved in
-// any mode; they remain real dialogs. plan_close is NOT a door
-// (plan-close-verified): its completion gate is plugin-verified — the
+// gate() never auto-resolves. plan_close is not a door:
+// its completion gate is plugin-verified — the
 // frozen check set re-runs on the host, fail-closed, no modal.
 type AskFn = (input: {
   permission: string
@@ -2072,191 +1674,19 @@ export function resolveGateAskWatchdogMs(env: NodeJS.ProcessEnv = process.env): 
   return Math.min(raw, 3_600_000)
 }
 
-// ---------------------------------------------------------------------------
-// Exec posture pass-through (shell-defang-default-open, spec tool-partition —
-// "Exec posture pass-through on the exec surface"). Supersedes dispatch-
-// resilience fold A's headless ask liveness: the plugin performs NO command
-// classification on the posture path and injects NO default permission rule.
-// ---------------------------------------------------------------------------
-
-// The gate permission keys — the exact set the config hook posture-rewrites
-// for the DOORS (single constant so the snapshot capture and the rewrite can
-// never drift). forge_shell is snapshot-captured but never rewritten: its
-// posture passes through untouched.
+// The exact user-confirmation doors, shared by gate() and both permission adapters.
 const GATE_PERMISSION_KEYS = [
   "plan_approve",
   "goal_write",
   "goal_complete",
   "goal_resume",
   "goal_discard",
-  "forge_shell",
   "crew_close",
 ] as const
 
 // Every permission a gate() call may name (fix-crew-close-ask-door D2).
 type GatePermissionKey = (typeof GATE_PERMISSION_KEYS)[number]
 
-// The USER'S OWN explicit permission values for the gate keys, captured in
-// the config hook. The config hook mutates a MERGED config object that the
-// host may RE-PRESENT on later passes — the anti-recapture rule is: only
-// "allow"/"deny" are ever captured ("ask" never is). Only forge_shell's
-// entry is CONSUMED (belt-in-depth enforcement of the user's own explicit
-// rule — the rule itself now stands verbatim in the config; the snapshot is
-// defense if a host ever fails to resolve plugin-tool asks); the doors
-// never read it.
-const gatePermissionSnapshot = new Map<string, "allow" | "deny">()
-
-// The forge_shell posture resolution — PASS-THROUGH, no plugin-side
-// resolution of any kind: (1) an explicit user "deny" refuses (the user's
-// own rule, enforced belt-in-depth before any ask); (2) an explicit user
-// "allow" skips the ask (again the user's own rule — the ask would resolve
-// allow anyway, skipping it just avoids the round-trip); (3) otherwise the
-// ask reaches the host UNMODIFIED and the host resolves it against the
-// permission rules — unconfigured inherits the host default (in practice
-// allow everywhere), an explicit user "ask" behaves exactly like the native
-// shell tool's ask in the current mode (TUI dialog / run-mode auto-reject /
-// serve pending ask). No headless branch, no classifier: the plugin is not
-// smarter than the host (omo parity, product decision 2026-11-16).
-async function forgeShellGate(ask: AskFn, command: string, sessionID?: string): Promise<void> {
-  const explicit = explicitForgeShellPosture()
-  if (explicit === "deny") {
-    throw new Error(
-      `[forge] forge_shell is explicitly denied by user configuration (permission forge_shell: "deny"). Nothing was executed. Remove or change the deny rule to re-enable the exec surface.`,
-    )
-  }
-  if (explicit === "allow") {
-    return // the user's own rule — skip the ask round-trip, run
-  }
-  try {
-    await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`)
-  } catch (err) {
-    // worker-shell-session-allow D5 — the fallback belt (v2 worker sessions
-    // ONLY): the bare no-reason deny `Permission denied: forge_shell` is the
-    // host's cross-anchor deny-all fallback (the assert resolves the agent
-    // at the PLUGIN HOST's location; a native worker md registers only at
-    // the project location — never resolvable there). A real user deny was
-    // already refused above (posture gate); a saved-rule deny carries its
-    // rules and an unanswered ask reads differently ("nobody is present"),
-    // so inside this scoping the bare message can ONLY be the fallback.
-    // Proceed + disclose; never fires on primary sessions (their agent
-    // resolves — a bare deny there is a real deny) nor on v1 hosts.
-    if (
-      v2HostSeen &&
-      isForgeWorkerSession(sessionID) &&
-      (err as { message?: unknown } | null)?.message === "Permission denied: forge_shell"
-    ) {
-      markSessionRescueDisclosed(sessionID!)
-      return
-    }
-    throw err
-  }
-}
-
-// ---------------------------------------------------------------------------
-// worker-shell-session-allow D3 — explicit forge_shell posture from the
-// host's own config DOCUMENTS (not forge.json). v2 hosts never run the v1
-// config hook, so the snapshot above stays empty there; the belt resolves
-// the posture by reading the host config files directly: global layer first,
-// workspace layers last (highest precedence — the host's own load order);
-// within one document the v2 `permissions` rule array (the V2-native field)
-// wins over the legacy `permission` map; the array resolves LAST-match-wins,
-// mirroring the host's findLast evaluation. allow/deny mirror into the
-// snapshot so diagnostics keep one truth. Fail-soft on every layer.
-// ---------------------------------------------------------------------------
-
-// Pure core (exported for the test matrix). `documents` ordered
-// lowest→highest precedence; null = absent/unreadable layer.
-export function resolveForgeShellPosture(documents: Array<string | null>): "allow" | "deny" | "ask" | undefined {
-  let resolved: "allow" | "deny" | "ask" | undefined
-  for (const text of documents) {
-    if (typeof text !== "string" || !text.trim()) continue
-    const parsed = parseForgeJsonc(text)
-    if (!parsed.ok) continue // a broken layer never blocks the belt
-    const cfg = parsed.config as Record<string, unknown>
-    // v2 rule array — the V2-native field, wins within this document.
-    if (Array.isArray(cfg.permissions)) {
-      let hit: "allow" | "deny" | "ask" | undefined
-      for (const rule of cfg.permissions) {
-        if (rule === null || typeof rule !== "object") continue
-        const r = rule as { action?: unknown; resource?: unknown; effect?: unknown }
-        if (r.effect !== "allow" && r.effect !== "deny" && r.effect !== "ask") continue
-        if (!ruleMatchesForgeShellAssert(r.action, r.resource)) continue
-        hit = r.effect // last match wins
-      }
-      if (hit !== undefined) {
-        resolved = hit
-        continue // the array decided this document
-      }
-    }
-    // legacy v1 map.
-    const legacy = cfg.permission as unknown
-    const v = legacy !== null && typeof legacy === "object" ? (legacy as Record<string, unknown>).forge_shell : undefined
-    if (v === "allow" || v === "deny" || v === "ask") resolved = v
-  }
-  return resolved
-}
-
-// The belt's assert shape is exactly (action "forge_shell", resource "*") —
-// a rule matches when its action pattern matches "forge_shell" AND its
-// resource pattern matches "*" (host wildcard semantics: `*` and `?`).
-function ruleMatchesForgeShellAssert(action: unknown, resource: unknown): boolean {
-  return wildcardMatchValue("forge_shell", action) && wildcardMatchValue("*", resource)
-}
-
-function wildcardMatchValue(value: string, pattern: unknown): boolean {
-  if (typeof pattern !== "string" || pattern === "") return false
-  const re = new RegExp(
-    "^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$",
-    "i",
-  )
-  return re.test(value)
-}
-
-// The host config documents for the posture belt, lowest→highest: the
-// global layer (OPENCODE_CONFIG_DIR override honored, mirroring
-// globalAgentDirFor's host resolution) then the workspace layers. Per
-// directory the first existing name wins (opencode.json over .jsonc).
-function hostConfigDocumentsFor(homeDir: string, workspace: string | null | undefined): Array<string | null> {
-  const docs: Array<string | null> = []
-  const pushDir = (dir: string | null | undefined) => {
-    if (!dir) return
-    let pushed = false
-    for (const name of ["opencode.json", "opencode.jsonc"]) {
-      try {
-        docs.push(readFileSync(join(dir, name), "utf8"))
-        pushed = true
-        break
-      } catch {
-        // absent — try the next name
-      }
-    }
-    if (!pushed) docs.push(null)
-  }
-  const cfgEnv = (process.env.OPENCODE_CONFIG_DIR ?? "").trim()
-  const sep = homeDir.includes("\\") && !homeDir.includes("/") ? "\\" : "/"
-  pushDir(cfgEnv || join(homeDir, ".config", "opencode"))
-  if (workspace) {
-    pushDir(workspace)
-    pushDir(join(workspace, ".opencode"))
-  }
-  return docs
-}
-
-// Single posture entry: v1 hosts keep the snapshot truth (byte-equal
-// behavior — the belt never reads disk there); v2 hosts resolve from the
-// config documents on demand.
-let v2PostureHomeDir: string | null = null
-// Test seam (worker-shell-session-allow): non-null = resolve verbatim,
-// keeping unit tests off the real config disk. Never set in production.
-let v2PostureTestOverride: { value: "allow" | "deny" | "ask" | undefined } | null = null
-function explicitForgeShellPosture(): "allow" | "deny" | "ask" | undefined {
-  if (v2PostureTestOverride !== null) return v2PostureTestOverride.value
-  if (!v2HostSeen) return gatePermissionSnapshot.get("forge_shell")
-  const home = v2PostureHomeDir ?? homedir()
-  const resolved = resolveForgeShellPosture(hostConfigDocumentsFor(home, hostWorktree))
-  if (resolved === "allow" || resolved === "deny") gatePermissionSnapshot.set("forge_shell", resolved)
-  return resolved
-}
 
 const planApproveTool = tool({
   description:
@@ -2274,7 +1704,7 @@ const planApproveTool = tool({
     // The approval gate: user confirms in the dialog this creates. A rejected
     // or auto-rejected ask throws and the plan stays in draft.
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`)
-    writeFileSync(active.path, transitionStatus(readFileSync(active.path, "utf8"), "approved", nowIso()))
+    atomicWrite(active.path, transitionStatus(readFileSync(active.path, "utf8"), "approved", nowIso()))
     context.metadata({ title: `Plan approved: ${active.doc.goal}` })
     return {
       title: "plan approved",
@@ -2439,7 +1869,7 @@ const planDiscardTool = tool({
       { reason: args.reason, ...(superseding ? { successor } : {}) },
       exitedAt,
     )
-    writeFileSync(active.path, next)
+    atomicWrite(active.path, next)
     state.planPath = undefined
     const section = `## ${exitedAt} — ${target}`
     context.metadata({ title: superseding ? `Plan superseded: ${active.doc.goal}` : `Plan abandoned: ${active.doc.goal}` })
@@ -2586,13 +2016,20 @@ const goalWriteTool = tool({
             // A paused goal keeps its stop_reason across a revision: the
             // pause reason is why the loop stopped, not part of the contract
             // being edited.
-            ...(existing.doc.status === "paused" && existing.doc.stopReason ? { stopReason: existing.doc.stopReason } : {}),
+            ...(existing.doc.status === "paused" && existing.doc.stopReason ? { stopReason: existing.doc.stopReason, blocker: existing.doc.blocker } : {}),
           },
         ),
         existing.doc,
       )
       atomicWrite(existing.path, text)
       const doc = parseGoal(text)
+      const retry = goalNativeRecheck.get(doc.session)
+      const flight = continuationInFlight.get(doc.session) ?? goalDeadlineTimers.get(doc.session)
+      if (doc.status === "active" && (retry || flight)) {
+        goalStopNativeRecheck(doc.session)
+        goalArmNativeRecheck(doc.session, (retry || flight)!.client, { path: existing.path, doc }, retry ? retry.deadlineOnly : false)
+        goalArmDeadline(doc.session, (retry || flight)!.client, { path: existing.path, doc })
+      }
       context.metadata({ title: `Revise goal (rev ${doc.revision}): ${doc.goal}` })
       return {
         title: `goal revised (rev ${doc.revision})`,
@@ -2630,7 +2067,7 @@ const goalWriteTool = tool({
       output: arm
         ? [
             `Goal armed: ${relFrom(state.worktree, path)} (revision 1, ${doc.criteria.length} criteria, ${doc.checks.length} verification items, budget ${doc.maxTurns} turns / ${doc.maxMinutes} min).`,
-            "The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker.",
+            "The loop is intended to continue this session on eligible idle turns until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If globally blocked with no independent authorized work remaining, call goal_pause with the concrete blocker. If a local issue leaves independent authorized work, continue that work. End your turn during genuine host waiting rather than polling.",
           ].join("\n")
         : `Goal queued (inert): ${relFrom(state.worktree, path)}. It never runs until promoted via /goal next or goal_resume (user dialog).`,
     }
@@ -2652,6 +2089,7 @@ const goalCheckTool = tool({
     const wanted = args.items ? new Set(args.items) : null
     const selected = goal.doc.checks.map((c, i) => ({ c, n: i + 1 })).filter((x) => !wanted || wanted.has(x.n))
     if (selected.length === 0) throw new GoalError("None of the given item numbers exist in this goal's Verification Checks.")
+    const activity = turnActivity.get(context.sessionID)
     const outcomes = await runChecks(
       selected.map((x) => x.c),
       state.worktree,
@@ -2664,14 +2102,13 @@ const goalCheckTool = tool({
     atomicWrite(goal.path, next)
     const ok = outcomesAllOk(outcomes)
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` })
-    return {
-      title: `goal_check ${ok ? "all pass" : "failing"}`,
-      output: [
-        `Host verification run (revision ${goal.doc.revision}), recorded in the Check Log:`,
-        formatOutcomes(outcomes),
-        ok ? "All selected items pass. Proceed to goal_complete (it re-runs everything itself at the gate)." : "Failing items remain — fix the work, then re-run goal_check.",
-      ].join("\n"),
-    }
+    const output = [
+      `Host verification run (revision ${goal.doc.revision}), recorded in the Check Log:`,
+      formatOutcomes(outcomes),
+      ok ? "All selected items pass. Proceed to goal_complete (it re-runs everything itself at the gate)." : "Failing items remain — fix the work, then re-run goal_check.",
+    ].join("\n")
+    if (activity && turnActivity.get(context.sessionID) === activity) rememberGoalCheck(activity, selected, outcomes, output)
+    return { title: `goal_check ${ok ? "all pass" : "failing"}`, output }
   },
 })
 
@@ -2723,7 +2160,7 @@ const goalCompleteTool = tool({
 
 const goalPauseTool = tool({
   description:
-    "Pause the session's live goal (active -> paused); the continuation loop stops immediately. Always safe, no confirmation needed. Pass the blocker text when pausing because you are stuck (stop_reason blocker); omit it for a user-requested pause.",
+    "Pause the session's live goal (active -> paused); do not start further autonomous work. Already accepted host work may finish; cancellation is not promised. Always safe, no confirmation needed. Pass the blocker text when pausing because you are stuck (stop_reason blocker); omit it for a user-requested pause.",
   args: {
     blocker: tool.schema.string().optional().describe("Specific blocker that prevents progress (recorded as stop_reason blocker)"),
   },
@@ -2733,13 +2170,14 @@ const goalPauseTool = tool({
     if (!goal || goal.doc.status !== "active") {
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`)
     }
-    const stopReason: StopReason = args.blocker ? "blocker" : "user"
-    atomicWrite(goal.path, transitionGoal(readFileSync(goal.path, "utf8"), "paused", nowIso(), { stopReason }))
+    const stopReason: StopReason = args.blocker?.trim() ? "blocker" : "user"
+    atomicWrite(goal.path, transitionGoal(readFileSync(goal.path, "utf8"), "paused", nowIso(), { stopReason, blocker: args.blocker?.trim() }))
     engineForgetSession(context.sessionID)
+    if (goal.doc.session && goal.doc.session !== context.sessionID) engineForgetSession(goal.doc.session)
     context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` })
     return {
       title: `goal paused (${stopReason})`,
-      output: `Goal paused: ${relFrom(state.worktree, goal.path)} (stop_reason: ${stopReason}${args.blocker ? ` — ${args.blocker}` : ""}). Continuation is stopped; /goal resume or an explicit "continue" from the user re-arms it through a confirmation dialog.`,
+      output: `Goal paused: ${relFrom(state.worktree, goal.path)} (stop_reason: ${stopReason}${args.blocker ? ` — ${args.blocker}` : ""}). Do not start further autonomous work; already accepted host work may finish. /goal resume or an explicit "continue" from the user re-arms it through a confirmation dialog.`,
     }
   },
 })
@@ -2769,6 +2207,10 @@ const goalResumeTool = tool({
     const promoting = goal.doc.status === "queued"
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`)
     let text = readFileSync(goal.path, "utf8")
+    const confirmed = parseGoalLoose(text)
+    if (!confirmed || confirmed.status !== goal.doc.status || confirmed.revision !== goal.doc.revision || confirmed.armedAt !== goal.doc.armedAt || confirmed.session !== goal.doc.session || confirmed.created !== goal.doc.created) {
+      throw new GoalError("Goal authorization changed while awaiting confirmation; retry goal_resume.")
+    }
     if (args.addTurns) text = bumpBudget(text, args.addTurns, nowIso())
     text = transitionGoal(text, "active", nowIso(), { session: context.sessionID })
     atomicWrite(goal.path, text)
@@ -2806,3544 +2248,15 @@ const goalDiscardTool = tool({
 })
 
 // ---------------------------------------------------------------------------
-// Job supervisor tools
-// ---------------------------------------------------------------------------
 
-const FORGE_SHELL_DESCRIPTION = [
-  "Run a shell command without ever blocking the session indefinitely. The call completes on the FIRST of: process exit (bound to the exit event — a detached grandchild holding the stdio pipes cannot suspend the call); success_pattern matching new output (opt-in regex); idle_ms with no new output (default 60000); max_wait_ms hard cap (default 120000, max 600000 — returns still-running, never kills).",
-  "Idle/max-wait return `still-running` with a jobId — the process stays alive; keep watching with forge_jobs poll / log, stop it with forge_jobs kill. run_in_background returns {jobId, logPath} immediately.",
-  "success_pattern semantics: a match completes the call as success; the process is kept alive by default (server semantics — the thing you just verified keeps running); pass keep_alive=false to kill its tree on match. Common patterns: dev servers `listening on|ready in|Local:`, builds `Compiled successfully|Done in`, test suites `passed|all tests`.",
-  "This tool is the forge agent's exec surface for every shell command — quick ones included. Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) should start with run_in_background and collect results via forge_jobs.",
-  "Interpreter: commands run under the host-preferred shell — the PowerShell family on Windows (git-bash only on machines without PowerShell), the login shell with bash preferred on POSIX — the same interpreter the host's builtin shell tool uses.",
-].join("\n")
-
-const forgeShellExecute = async (args: {
-  command: string
-  workdir?: string
-  run_in_background?: boolean
-  idle_ms?: number
-  max_wait_ms?: number
-  success_pattern?: string
-  keep_alive?: boolean
-  notify?: boolean
-  survive?: boolean
-}, context: { sessionID: string; worktree: string; ask: AskFn; metadata: (input: { title?: string; metadata?: Record<string, unknown> }) => void }) => {
-  if (jobStage() >= 2) {
-    throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.")
-  }
-  const state = ensureSession(context.sessionID, worktreeFor(context))
-  // Permission posture (shell-defang-default-open): pass-through — the ask
-  // reaches the host unmodified and the host resolves it against the
-  // permission rules (no plugin-injected rule, no plugin-side
-  // classification; unconfigured inherits the host default). An explicit
-  // user deny always wins (snapshot-enforced). The readonly-exec-seal in
-  // tool.execute.before fires structurally BEFORE this execute, so a seal
-  // refusal always lands first.
-  //
-  // worker-shell-session-allow D4 (coverage channel): belt-inject the
-  // session-rule rescue directly on a WORKER session (covers children
-  // created before the primary seeding landed — and wins the first-turn
-  // race against it). Fail-soft; v1 hosts have no session-rule API and
-  // skip this entirely (their drafts resolve at the host anchor).
-  if (isForgeWorkerSession(context.sessionID)) await ensureSessionRescueRule(context.sessionID)
-  await forgeShellGate(context.ask, args.command, context.sessionID)
-  const rescueNote = takeSessionRescueDisclosure(context.sessionID)
-  if (rescueNote) context.metadata({ title: rescueNote })
-    const survive = effectiveSurvive(jobsSurviveMode, args.survive)
-    let successPattern: RegExp | null = null
-    if (args.success_pattern) {
-      try {
-        successPattern = new RegExp(args.success_pattern)
-      } catch (err) {
-        throw new Error(`Invalid success_pattern: ${(err as Error).message}`)
-      }
-    }
-    const { registry, fence } = ensureJobLifecycle()
-    const cwd = args.workdir ? (isAbsolute(args.workdir) ? args.workdir : join(state.worktree, args.workdir)) : state.worktree
-    const started = startJob(jobManager, {
-      cmd: args.command,
-      cwd,
-      ownerSession: context.sessionID,
-      worktree: state.worktree,
-      logDir: jobLogDir(),
-      runInBackground: args.run_in_background === true,
-      ...(args.idle_ms !== undefined ? { idleMs: args.idle_ms } : {}),
-      ...(args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {}),
-      successPattern,
-      ...(args.keep_alive !== undefined ? { keepAlive: args.keep_alive } : {}),
-      ...(args.notify !== undefined ? { notify: args.notify } : {}),
-      ...(survive ? { survive: true, registry: registry ?? undefined } : { fence, relocate: structuralRelocate, relocateAsync: structuralRelocateAsync }),
-    })
-    if (survive) {
-      return {
-        title: `job started (survives host exit): ${started.job.id}`,
-        output: [
-          `[forge:job] Started in background — SURVIVES host exit (no fence, no exit kill).`,
-          `jobId: ${started.job.id}`,
-          `logPath: ${started.job.logPath}`,
-          "Recorded in the persistent registry: the next opencode run can poll/log/kill it via forge_jobs. Stop it explicitly when done.",
-        ].join("\n"),
-      }
-    }
-    context.metadata({ title: `forge_shell: ${args.command.slice(0, 60)}` })
-    if (args.run_in_background === true) {
-      return {
-        title: `job started: ${started.job.id}`,
-        output: [`[forge:job] Started in background.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `logPath: ${started.job.logPath}`, "Track with forge_jobs poll; a [forge:job-complete] message arrives on exit."].join("\n"),
-      }
-    }
-    const r = await started.settle
-    if (r.status === "exited") {
-      // fix-shell-spawn-error-outcome D1: a command that never started is its
-      // own return form (job-supervisor: the spawn-failure form). It used to
-      // share the exited text — "Command finished", "Output was delivered in
-      // full above", "output:" — with the real reason on the fifth line
-      // (2026-11-23 real machine: three worker calls read as finished).
-      if (r.spawnError) {
-        return {
-          title: `not started`,
-          output: [`[forge:job] NOT STARTED — spawn failed; nothing was executed.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `spawn error: ${r.spawnError}`].join("\n"),
-        }
-      }
-      return {
-        title: `exit ${r.exitCode ?? "?"}`,
-        output: [
-          `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
-          `cwd: ${cwd}`,
-          `jobId: ${started.job.id}`,
-          `Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed).`,
-          ...(r.spawnError ? [`spawn error: ${r.spawnError}`] : []),
-          `output:\n${r.outputTail || "(none)"}`,
-        ].join("\n"),
-      }
-    }
-    if (r.status === "succeeded") {
-      return {
-        title: `success: ${r.matched}`,
-        output: [
-          `[forge:job] Success pattern matched: "${r.matched}".`,
-          `cwd: ${cwd}`,
-          r.keptAlive
-            ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).`
-            : `The process tree was terminated (keep_alive=false) — terminal evidence: job ${started.job.id} self-cleared from the registry (no wake, no clear needed).`,
-          `output:\n${r.outputTail}`,
-        ].join("\n"),
-      }
-    }
-    return {
-      title: `still running (${Math.round(r.idleForMs / 1000)}s idle)`,
-      output: [
-        `[forge:job] Still running — ${Math.round(r.idleForMs / 1000)}s without new output (or the wait budget ran out). The process is alive as job ${started.job.id}.`,
-        `cwd: ${cwd}`,
-        `logPath: ${started.job.logPath}`,
-        `recent output:\n${r.outputTail || "(none yet)"}`,
-        "Next: forge_jobs poll to keep waiting, forge_jobs log for history, forge_jobs kill to stop.",
-      ].join("\n"),
-    }
-}
-
-// The registered tool: a thin wrapper over forgeShellExecute that prepends
-// the non-blocking known-interactive warning (exec hygiene,
-// shell-defang-default-open) to whatever result the run produced. The
-// warning NEVER blocks, retries, or mutates the command — the permission
-// posture and the seal are the only refusers.
-const forgeShellTool = tool({
-  description: FORGE_SHELL_DESCRIPTION,
-  args: {
-    command: tool.schema.string().describe("The shell command to run"),
-    workdir: tool.schema.string().optional().describe("Working directory (workspace-relative, or absolute)"),
-    run_in_background: tool.schema.boolean().optional().describe("Return {jobId, logPath} immediately, without waiting for any output or exit"),
-    idle_ms: tool.schema.number().int().nonnegative().optional().describe("No-new-output early-return threshold in ms (default 60000)"),
-    max_wait_ms: tool.schema.number().int().nonnegative().optional().describe("Hard cap on this call's wait in ms (default 120000, clamped to 600000); returns still-running, never kills"),
-    success_pattern: tool.schema.string().optional().describe("Regex; a match against new output completes the call as success immediately"),
-    keep_alive: tool.schema.boolean().optional().describe("After a success match: keep the process alive (default) or kill its tree (false)"),
-    notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)"),
-    survive: tool.schema.boolean().optional().describe("Opt this job OUT of dying with the host: it keeps running after opencode exits, recorded in the persistent registry so the next run can poll/kill it (config jobs.survive sets the default; an explicit config deny cannot be overridden)"),
-  },
-  execute: async (args, context) => {
-    const res = await forgeShellExecute(args, context)
-    const banner = interactiveBanner(args.command)
-    return banner ? { ...res, output: `${banner}\n${res.output}` } : res
-  },
-})
-
-const FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "stop", "clear", "handoff"]
-
-const forgeJobsTool = tool({
-  description:
-    "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel ONE in-flight ASYNC DISPATCH by explicit task id, including one owned by ANOTHER session (the deliberate cross-session escape hatch behind no ownership check; its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried); stop — cancel EVERY in-flight async dispatch AND every queued wish owned by THIS session only (the /forge stop lever; session-scoped by construction, other sessions' dispatches are untouched; the queued wishes leave the queue first, so none spawns into a slot a cancelled dispatch frees; nothing in flight and nothing queued = honest no-op report); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
-  args: {
-    action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
-    jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list and stop)"),
-    waitMs: tool.schema.number().int().nonnegative().optional().describe("poll: bounded in-call wait (clamped to 30000)"),
-    offset: tool.schema.number().int().nonnegative().optional().describe("log: first line index; omitted = tail window"),
-    limit: tool.schema.number().int().positive().optional().describe("log: max lines (default 200)"),
-  },
-  execute: async (args, context) => {
-    if (jobStage() >= 2) throw new Error("[forge] The job supervisor is retired on this host.")
-    noteToolAgent(context)
-    const action = String(args.action ?? "")
-    if (!FORGE_JOBS_ACTIONS.includes(action)) {
-      throw new Error(`Unknown action "${action}" — use one of: ${FORGE_JOBS_ACTIONS.join(", ")}.`)
-    }
-    if (action === "list") {
-      ensureJobLifecycle()
-      const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.previousRun ? "previous-run" : j.survive ? "survive" : j.scope}  ${j.cmd.slice(0, 60)}`)
-      return { title: `jobs (${rows.length})`, output: rows.length > 0 ? rows.join("\n") : "(no jobs)" }
-    }
-    if (action === "stop") {
-      // Session-scoped stop (command-surface-v2-cleanup D2): the scoping
-      // decision lives HERE in the tool execute layer — context.sessionID is
-      // host-truth, never model-relayed. Cancel each of THIS session's
-      // in-flight dispatches SERIALLY (concurrent aborts would race the idle
-      // assertion); nothing in flight and nothing queued = honest no-op
-      // report. No jobId: the scope IS the calling session.
-      // fix-stop-cancels-queued-wishes D1: the session's queued wishes leave
-      // the queue FIRST. A slot freed by a cancelled dispatch is pumped the
-      // moment that row settles, so a queue still in place would spawn its
-      // head before the last cancel returns — the user would watch new
-      // children start right after asking for everything to stop.
-      const client = dispatchClient()
-      if (!client) throw new Error("[forge] stop: no dispatch client on this host.")
-      const sid = context.sessionID
-      // D5: a wish the queue pump is spawning RIGHT NOW is in neither the
-      // queue nor the registry. Mark the stop (a pump reads the epoch when it
-      // dequeues), empty the queue, then let the pumps that are running land:
-      // a wish whose child is still being created is cancelled unprompted
-      // (the pump journals it and hands it to this receipt); one whose prompt
-      // already went out is a registered in-flight dispatch the loop below
-      // cancels like any other.
-      const epoch = stopEpoch(sid) + 1
-      stopEpochs.set(sid, epoch)
-      stopWaiting.add(sid)
-      let landed: "settled" | "timeout"
-      let stillLanding = 0
-      let flight: string[]
-      let queuedCancelled: string[]
-      try {
-        queuedCancelled = cancelQueuedWishes(sid)
-        landed = await settlePumps(sid)
-        stillLanding = inTransitWishes(sid).length
-        flight = inFlightAsyncDispatches(sid)
-      } finally {
-        // Same sync edge as the registry read above: a wish registered after
-        // this point is cancelled by its own pump.
-        stopWaiting.delete(sid)
-      }
-      // Wishes this session's pumps cancelled unprompted while the lever was
-      // waiting. The first lever to resume takes them (a second stop waiting
-      // on the same pumps never reports them twice).
-      queuedCancelled.push(...(stopDequeued.get(sid) ?? []))
-      stopDequeued.delete(sid)
-      if (flight.length === 0 && queuedCancelled.length === 0 && stillLanding === 0) {
-        return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${sid}) — nothing to stop.` }
-      }
-      const results: string[] = []
-      for (const taskId of flight) {
-        const res = await stopSerialCancel(sid, () => cancelDispatch(client, taskId))
-        results.push(`- ${res.text}`)
-      }
-      return stopReceipt(sid, flight.length, results, queuedCancelled, landed === "timeout" ? stillLanding : 0, stopSettleMs())
-    }
-    if (!args.jobId) throw new Error(`Action "${action}" requires jobId.`)
-    // "all" refusal hoisted BEFORE the registry lookup (command-surface
-    // cleanup nit, flagged by the test wave): cancel "all" must always
-    // reach the retirement redirect — never a "No job all in the registry"
-    // miss on a registry that has no such row.
-    if (action === "cancel" && String(args.jobId).trim().toLowerCase() === "all") {
-      throw new Error('[forge] cancel "all" is retired — use action "stop" (cancels THIS session\'s in-flight and queued dispatches) or cancel an explicit task id.')
-    }
-    const job = jobManager.get(args.jobId)
-    if (!job) {
-      throw new Error(
-        jobManager.consumed(args.jobId)
-          ? `Job ${args.jobId} was already consumed: a terminal-evidence foreground return delivered its complete output inline, so it self-cleared from the registry — no wake fires and no clear is needed.`
-          : `No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`,
-      )
-    }
-    if (action === "poll") {
-      const p = await pollJob(jobManager, args.jobId, args.waitMs ?? 0)
-      if (!p) throw new Error(`No job ${args.jobId}.`)
-      // fix-shell-spawn-error-outcome D2: a terminal job whose process never
-      // started says so in its first sentence (it used to read as a plain
-      // "killed" row — indistinguishable from a command that ran and was
-      // stopped).
-      if (job.spawnError) {
-        return {
-          title: `${job.id}: not started`,
-          output: [
-            `[forge:job] ${job.id}: NOT STARTED — spawn failed; nothing was executed (terminal state: ${p.state}).`,
-            `spawn error: ${job.spawnError}`,
-            `new output:\n${p.newOutput || "(none in this window)"}`,
-            `logPath: ${p.logPath}`,
-          ].join("\n"),
-        }
-      }
-      return {
-        title: `${job.id}: ${p.state}`,
-        output: [
-          `[forge:job] ${job.id}: ${p.state}${p.exitCode !== null ? ` exit=${p.exitCode}` : ""}${p.succeeded ? " (success pattern matched)" : ""}`,
-          `new output:\n${p.newOutput || "(none in this window)"}`,
-          `logPath: ${p.logPath}`,
-        ].join("\n"),
-      }
-    }
-    if (action === "log") {
-      const page = readJobLog(job.logPath, {
-        ...(args.offset !== undefined ? { offset: args.offset } : {}),
-        ...(args.limit !== undefined ? { limit: args.limit } : {}),
-      })
-      return {
-        title: `${job.id} log ${page.offset}-${page.offset + page.lines.length}/${page.total}`,
-        output: [
-          ...(page.windowed ? [`(log exceeds ${8}MB — showing the most recent window; read the file directly for full history: ${job.logPath})`] : []),
-          page.lines.length > 0 ? page.lines.join("\n") : "(empty)",
-        ].join("\n"),
-      }
-    }
-    if (action === "kill") {
-      // A dispatch row killed through the generic action: stamp its reason
-      // BEFORE the kill (the hook keeps an already-stamped reason) so the
-      // journal and the wake name THIS lever — not an owner death.
-      {
-        const meta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
-        if (meta && meta.outcome !== "stream-lost/unknown") meta.abortReason = EXPLICIT_KILL_ABORT_REASON
-      }
-      jobManager.kill(job)
-      return { title: `${job.id} killed`, output: `[forge:job] ${job.id}: tree kill issued (state: killed).` }
-    }
-    if (action === "cancel") {
-      // Dispatch cancellation engine (dispatch-cancel-lifecycle): abort +
-      // CONFIRMED-idle assertion + aborted settle + never-retried. Per-id
-      // ONLY (command-surface-v2-cleanup D2): the explicit task id is the
-      // deliberate cross-session escape hatch — cancelDispatch performs no
-      // ownership check BY DESIGN (spec-pinned). The session-scoped bulk
-      // form is the `stop` action; "all" is retired. A non-dispatch job
-      // refuses with the in-flight list (kill stays the generic lever).
-      const client = dispatchClient()
-      if (!client) throw new Error("[forge] cancel: no dispatch client on this host.")
-      const res = await cancelDispatch(client, args.jobId)
-      if (!res.ok) return { title: `${args.jobId} not cancellable`, output: `[forge:job] ${res.text}` }
-      return { title: `${args.jobId} cancelled (${res.idle})`, output: `[forge:job] ${res.text}` }
-    }
-    if (action === "clear") {
-      const ok = jobManager.clear(args.jobId)
-      return ok
-        ? { title: `${job.id} cleared`, output: `[forge:job] ${job.id} removed from the registry (log file untouched).` }
-        : { title: `${job.id} not cleared`, output: `[forge:job] ${job.id} is still running — kill it first.` }
-    }
-    // handoff
-    const target = await handoffTarget(context.sessionID)
-    jobManager.handoff(args.jobId, target)
-    return {
-      title: `${job.id} handed off`,
-      output: `[forge:job] ${job.id}: promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`,
-    }
-  },
-})
-
-// ---------------------------------------------------------------------------
-// task (change task-shadow, spec: forge-subagents — "Task shadow surface" +
-// "Dispatch lifecycle"): the 0.22.0 SDK dispatch engine registered under the
-// NATIVE tool name `task` (OMO-proven shadow — the TUI keys its live
-// subagent panel on the tool NAME), host-wide. Dispatches ANY materialized
-// target as a REAL child session on the same host (SDK session.create with
-// parentID): forge-* targets pass the full forge gate chain (pool gate,
-// crew belts, cap, draft interop); non-forge host targets ride the same
-// engine without the forge pool gate (native parity). run_in_background
-// selects the mode: sync blocks (question tool available — native parity,
-// abort parity: turn abort kills the child), async returns a handle (child
-// created with the question tool denied session-wide; single completion
-// wake through the job-wake path). forge_dispatch is RETIRED. The
-// child-session lifecycle core is src/dispatch-async.ts (structural client
-// seam, no @opencode-ai imports).
-// ---------------------------------------------------------------------------
-
-// Host agent vocabulary (task-shadow full-parity non-forge path): refreshed
-// from the merged agent section on every config pass; the native fallbacks
-// are always members. A non-forge target outside this set is an honest
-// "Agent not found" refusal.
-const knownHostAgents = new Set<string>(["general", ...NATIVE_PARTITION_FALLBACKS])
-
-// Per-session concurrent async cap (spec: Dispatch lifecycle).
-export const ASYNC_DISPATCH_CAP = 3
-
-// ---------------------------------------------------------------------------
-// Provider-dimension dispatch gate + circuit breaker
-// (harden-dispatch-resilience design D3). One host-process gate singleton:
-// live counters (provider + provider/model) and per-provider breaker state
-// survive config hot-applies (updateConfig only swaps the limits). Fed at
-// the terminal-recording seam (journalTerminalRecord), enforced at the
-// dispatch call before child creation and re-checked at queue dequeue.
-// ---------------------------------------------------------------------------
-
-// sessionID → the session's resolved model (captured at chat.params /
-// session.context request-build time — the same resolution chain chat.params
-// sees; child sessions report here too, so a finished child's model is the
-// terminal feed's session-model fallback).
-const sessionModels = new Map<string, ModelIdentity>()
-
-// The host-process gate singleton (null until the first dispatch resolves
-// it — an unconfigured host never builds one).
-let dispatchGate: DispatchGate | null = null
-
-// jobId → identity for every ADMITTED dispatch whose terminal has not yet
-// fed the gate (the release bookkeeping; spawn failures release eagerly).
-const admittedGate = new Map<string, ModelIdentity>()
-
-// Every provider ever admitted on this host (test seam: the breaker table
-// survives releases, so the observation set is tracked alongside).
-const gateProvidersSeen = new Set<string>()
-
-// Anchor-keyed cascade loaders for the dispatch node (global base + the
-// session workspace's nearest forge.json override — the same cascade
-// semantics as the agent set, with mtime hot-apply).
-const dispatchConfigLoaders = new Map<string, ReturnType<typeof createForgeConfigLoader>>()
-function dispatchConfigFor(anchor: string): DispatchNodeConfig | null {
-  const key = anchor || "-"
-  let l = dispatchConfigLoaders.get(key)
-  if (!l) {
-    l = createForgeConfigLoader({ projectDir: anchor, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() })
-    dispatchConfigLoaders.set(key, l)
-    while (dispatchConfigLoaders.size > 8) {
-      const oldest = dispatchConfigLoaders.keys().next().value
-      if (oldest === undefined) break
-      dispatchConfigLoaders.delete(oldest)
-    }
-  }
-  return l.load().dispatch ?? null
-}
-
-/** The gate with the anchor's dispatch config hot-applied (state survives). */
-function gateFor(anchor: string): DispatchGate {
-  if (!dispatchGate) dispatchGate = createDispatchGate()
-  const node = dispatchConfigFor(anchor)
-  dispatchGate.updateConfig(
-    node
-      ? {
-          providerConcurrency: node.providerConcurrency,
-          modelConcurrency: node.modelConcurrency,
-          circuitBreaker: { consecutiveFailures: node.circuitBreaker.consecutiveFailures ?? 0, cooldownMs: node.circuitBreaker.cooldownMs ?? 0 },
-        }
-      : null,
-  )
-  return dispatchGate
-}
-
-/**
- * Agent → model identity (the chat.params resolution chain): a forge-*
- * target's PINNED model from the pool lookup (fresh resolve, hot-apply);
- * anything unpinned falls back to the session's captured model — the CHILD
- * session's when known, else the dispatching owner's (the child inherits
- * the parent's model until its own first request-build reports). Null when
- * nothing resolves: the dispatch is honestly uncounted (no gate applies —
- * an uncounted dimension is never limited).
- */
-function dispatchModelIdentity(agentID: string, ownerSession: string, childSessionID?: string): ModelIdentity | null {
-  if (agentID.toLowerCase().startsWith("forge-")) {
-    const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def
-    if (def?.model) {
-      const identity = parseIdentity(def.model)
-      if (identity) return { provider: identity.provider, model: identity.model }
-    }
-  }
-  if (childSessionID && sessionModels.has(childSessionID)) return sessionModels.get(childSessionID) ?? null
-  return sessionModels.get(ownerSession) ?? null
-}
-
-/**
- * Roster pin → create-time model binding (dispatch-v2-hostsignals task 2.1):
- * a forge-* target's PINNED model from the FRESH pool resolution — the
- * create body's `model` key binds it at spawn (host precedence: an explicit
- * create model wins). Null for Auto workers and non-forge targets: no model
- * key, the host default applies (agent's configured model, else inherited).
- * Variant leg (fix-runtime-model-pin-variant D2): when the recipe's
- * thoughtLevel is a variant word (low/medium/high), the pin carries it as
- * `variant` — the same value the compiled `.md` model string would carry as
- * `#<depth>` — so the session's model record (what the UI reads) shows the
- * real depth even when the host did not pre-resolve the agent file.
- */
-function rosterModelPin(agentID: string): { providerID: string; modelID: string; variant?: string } | null {
-  if (!agentID.toLowerCase().startsWith("forge-")) return null
-  const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def
-  if (!def?.model) return null
-  const identity = parseIdentity(def.model)
-  if (!identity) return null
-  const depth = typeof def.thoughtLevel === "string" ? def.thoughtLevel : ""
-  return VARIANT_DEPTH_WORDS.includes(depth)
-    ? { providerID: identity.provider, modelID: identity.model, variant: depth }
-    : { providerID: identity.provider, modelID: identity.model }
-}
-
-/**
- * Pre-spawn roster validation (dispatch-v2-hostsignals task 2.2): a forge-*
- * target MUST resolve in the live pool resolution — refuse-not-degrade,
- * naming the agent and the roster source (the task 1.1 probe proved the
- * host's create accepts ANY agent id verbatim, bogus included: without this
- * check a drifted roster spawns a naked default-agent child). Host-built-in
- * targets (general/explore) resolve in the host's own registry and pass.
- * Null = dispatchable.
- */
-function forgeTargetUnresolved(agentID: string): string | null {
-  if (!agentID.toLowerCase().startsWith("forge-")) return null
-  const resolution = resolvePools()
-  if (resolution?.agents[agentID.slice("forge-".length)]) return null
-  return (
-    `"${agentID}" does not resolve in the live roster (pool source: ` +
-    `${resolution ? "the workspace pool resolution" : "none — no forge.json in scope for this host"}); ` +
-    `refusing to spawn a default-agent child — re-sync the roster (/forge sync) or correct the target`
-  )
-}
-
-/**
- * Nested-dispatch guard rule (harden-dispatch-resilience D2): a NON-forge
- * host-agent target served by the anthropic family gets the task-tool deny
- * on its create body. forge family targets are untouched here — their depth
- * is structurally capped at ≤1 by the materialized `task: deny`
- * (dispatch-tiers), so this guard never stacks on it. The childSessionID
- * seam (design "known leftovers" — the dead parameter, consumed here):
- * respawn sites pass the PREVIOUS child's id so an unpinned (Auto) worker
- * resolves the child's own captured model, not just the owner's.
- */
-function nestedTaskDenyFor(agentID: string, ownerSession: string, childSessionID?: string): boolean {
-  const id = agentID.toLowerCase()
-  if (id === "forge" || id.startsWith("forge-")) return false
-  const identity = dispatchModelIdentity(agentID, ownerSession, childSessionID)
-  return identity !== null && dispatchProviderFamily(identity.provider) === "anthropic"
-}
-
-/** Release an admission eagerly (spawn failed before any child existed). */
-function releaseGateAdmission(jobId: string): void {
-  const identity = admittedGate.get(jobId)
-  if (!identity) return
-  admittedGate.delete(jobId)
-  try {
-    dispatchGate?.release(identity)
-  } catch {
-    // Fail-soft by contract.
-  }
-}
-
-type DispatchHandle = { jobId: string; childSessionID: string; agentID: string; ownerSession: string; description: string }
-// jobId -> handle. Entries are pruned when the poller settles or the owner
-// session ends; the cap counts entries whose registry job is still running.
-const dispatchTasks = new Map<string, DispatchHandle>()
-
-// fix-multi-location-session-anchor (design D1 方案甲 item 1): the moment a
-// dispatch child EXISTS it is bound to the owner's resolved directory — the
-// very directory the child was created in — so its first tool call never
-// reaches the plugin-level default. On a multi-directory host that default
-// is the LAST-initialized directory: the 2026-11-23 real-machine incident had
-// a review worker (host record: this workspace) bound to the Unity project,
-// and its three forge_shell calls failed to spawn (cwd did not exist).
-// One binding, three entry shapes:
-//   - created here and now  → createChildSessionBound (parentDirectory)
-//   - adopted / re-armed    → registerDispatchTask (the dispatch's directory)
-// Both are idempotent (ensureSession never lets a degenerate value clobber).
 function bindChildToDirectory(childSessionID: string | undefined, directory: string | undefined): void {
   if (!childSessionID || !directory || isRootish(directory)) return
   ensureSession(childSessionID, directory)
 }
 
-async function createChildSessionBound(client: DispatchClient, input: CreateChildInput): Promise<CreateChildResult> {
-  const created = await createChildSession(client, input)
-  if (created.ok) bindChildToDirectory(created.sessionID, input.parentDirectory)
-  return created
-}
-
-function registerDispatchTask(handle: DispatchHandle, directory: string | undefined): void {
-  dispatchTasks.set(handle.jobId, handle)
-  bindChildToDirectory(handle.childSessionID, directory)
-}
-
-function inFlightAsyncDispatches(sessionID: string): string[] {
-  const ids: string[] = []
-  for (const [id, handle] of dispatchTasks) {
-    if (handle.ownerSession !== sessionID) continue
-    const job = jobManager.get(id)
-    if (job) {
-      if (job.state === "running") ids.push(id)
-    } else {
-      dispatchTasks.delete(id)
-    }
-  }
-  return ids
-}
-
-// ---------------------------------------------------------------------------
-// dispatch-resilience fold D — per-session FIFO queue: the 4th+ async wish
-// from one session QUEUES (bounded FORGE_DISPATCH_QUEUE_MAX, default 10)
-// instead of being refused; a pump spawns the queue head on every slot
-// release (any terminal transition of that session's dispatches). Belts
-// evaluate at CALL time (unchanged); the pump re-checks the target roster,
-// the draft gate, and the crew belt at SPAWN time — a tightening between
-// call and spawn fails the wish as an honest error wake, never silently.
-// Owner death flushes queued wishes WITHOUT spawning and terminalizes their
-// journal records (fold E).
-// ---------------------------------------------------------------------------
-
-/** Default queue bound per session (FORGE_DISPATCH_QUEUE_MAX). */
-export const DEFAULT_DISPATCH_QUEUE_MAX = 10
-
-/** Resolve FORGE_DISPATCH_QUEUE_MAX (default 10; invalid → default). */
-export function resolveDispatchQueueMax(env: { [key: string]: string | undefined } = process.env): number {
-  const raw = env.FORGE_DISPATCH_QUEUE_MAX
-  if (raw === undefined || raw === "") return DEFAULT_DISPATCH_QUEUE_MAX
-  const parsed = Number(raw)
-  if (!Number.isFinite(parsed) || parsed < 1) return DEFAULT_DISPATCH_QUEUE_MAX
-  return Math.round(parsed)
-}
-
-type QueuedDispatchWish = {
-  jobId: string
-  agentID: string
-  ownerSession: string
-  description: string
-  prompt: string
-  directory: string
-  questionDeny: boolean
-  enqueuedAt: number
-}
-
-// ownerSession → FIFO wishes (queue order = enqueue order).
-const dispatchQueues = new Map<string, QueuedDispatchWish[]>()
-
-// fix-stop-cancels-queued-wishes D5: the queue pump's TRANSIT window. Between
-// `queue.shift()` and `registerDispatchTask` a wish sits in several awaits
-// (the crew-belt read, child creation, prompt send) — in neither the queue
-// nor the registry. A stop that lands inside that window must not miss it, or
-// the wish would start right after the user asked for everything to stop.
-//   stopEpochs   session → bumped by every stop. A pump iteration that
-//                dequeued under an older epoch knows a stop landed while it
-//                was in transit.
-//   stopWaiting  sessions whose stop lever is waiting for their pumps to
-//                land (or is about to read the registry). A wish registered
-//                while its owner is in here is seen by that lever.
-//   PumpRun      one running pump: the wish it holds (null = none) and its
-//                completion. `pumpInFlight` lets the lever wait for a wish in
-//                transit to land on one side or the other, and lets a notice
-//                about such a wish count as live.
-//   stopDequeued wishes a pump cancelled itself because a stop landed while
-//                they were in transit unprompted; a lever that is waiting
-//                folds them into its receipt (a note is left only when one
-//                is, and consumed by the first lever to resume — a second
-//                stop waiting on the same pump never reports it twice).
-const stopEpochs = new Map<string, number>()
-const stopWaiting = new Set<string>()
-type PumpRun = { wishId: string | null; done: Promise<void> }
-const pumpInFlight = new Map<string, Set<PumpRun>>()
-const stopDequeued = new Map<string, string[]>()
-
-const stopEpoch = (sessionID: string): number => stopEpochs.get(sessionID) ?? 0
-const stoppedSince = (sessionID: string, epoch: number): boolean => stopEpoch(sessionID) !== epoch
-
-/** Wishes a pump of `sessionID` holds right now (dequeued, not registered yet). */
-function inTransitWishes(sessionID: string): string[] {
-  const ids: string[] = []
-  for (const run of pumpInFlight.get(sessionID) ?? []) if (run.wishId) ids.push(run.wishId)
-  return ids
-}
-
-/**
- * How long the stop lever lets a wish in transit land (FORGE_STOP_SETTLE_MS
- * overrides it for tests). A parked host call is not waited for past this.
- */
-function stopSettleMs(): number {
-  const raw = Number(process.env.FORGE_STOP_SETTLE_MS)
-  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 60_000) : 15_000
-}
-
-/** Wait (bounded) for the pumps of `sessionID` that are running right now. */
-async function settlePumps(sessionID: string): Promise<"settled" | "timeout"> {
-  const pumps = [...(pumpInFlight.get(sessionID) ?? [])]
-  if (pumps.length === 0) return "settled"
-  let timer: ReturnType<typeof setTimeout> | undefined
-  try {
-    return await Promise.race([
-      Promise.allSettled(pumps.map((run) => run.done)).then(() => "settled" as const),
-      new Promise<"timeout">((resolve) => {
-        timer = setTimeout(() => resolve("timeout"), stopSettleMs())
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
-
-// Cancels of one session's dispatches run ONE AT A TIME (concurrent aborts
-// would race the idle assertion). The stop lever's cancels and a pump's
-// self-cancel (a wish that landed after its lever stopped waiting) share
-// this per-session chain, so they can never overlap.
-const stopCancelTails = new Map<string, Promise<void>>()
-function stopSerialCancel<T>(sessionID: string, cancel: () => Promise<T>): Promise<T> {
-  const next = (stopCancelTails.get(sessionID) ?? Promise.resolve()).then(cancel)
-  const settled: Promise<void> = next.then(
-    () => undefined,
-    () => undefined,
-  )
-  stopCancelTails.set(sessionID, settled)
-  void settled.then(() => {
-    if (stopCancelTails.get(sessionID) === settled) stopCancelTails.delete(sessionID)
-  })
-  return next
-}
-
-function queuedAsyncDispatchIds(sessionID: string): string[] {
-  return (dispatchQueues.get(sessionID) ?? []).map((w) => w.jobId)
-}
-
-/** The queued-start progress notice (spec: "a progress notice announcing the queued wish's start"). */
-function announceQueuedStart(ownerSession: string, notice: string, jobId: string): void {
-  // Delivered only while the wish is still queued or in flight — never
-  // after it was cancelled or settled (fix-stale-progress-notice).
-  queueDispatchProgress(ownerSession, notice, () => dispatchStillLive(jobId))
-  if (idleJobSessions.has(ownerSession)) void deliverDispatchProgress(ownerSession)
-}
-
-/**
- * Fail a queued wish as an honest ERROR WAKE at spawn time (roster vanished,
- * draft tightened, crew belt) — the wish never spawns, and the single
- * terminal wake carries the reason (never silent).
- */
-function failQueuedWishHonestly(wish: QueuedDispatchWish, reason: string): void {
-  const job = jobManager.create({
-    id: wish.jobId,
-    cmd: `dispatch ${wish.agentID}: ${wish.description} (queued, refused at spawn)`,
-    worktree: wish.directory,
-    ownerSession: wish.ownerSession,
-    logPath: join(jobLogDir(), "dispatch", `${wish.jobId}.txt`),
-    notify: true,
-    killTree: () => {},
-  })
-  ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = {
-    agentID: wish.agentID,
-    childSessionID: "",
-    description: wish.description,
-  }
-  const text = `(spawn refused at queue pump: ${reason} — the queued wish never spawned)`
-  jobManager.appendOutput(job, text)
-  jobManager.markTerminal(job, "exited", 1)
-  journalTerminalRecord(
-    { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory },
-    "error",
-    text,
-  )
-}
-
-/**
- * The queue pump (fold D): spawn queued wishes FIFO while the session has
- * free async slots. Spawn-time re-checks (design D4): the target roster,
- * the draft gate, and the crew belt — a tightening fails the wish as an
- * honest error wake instead of spawning. Retry interplay: a retrying
- * dispatch keeps its registry slot (its job row stays "running"), so the
- * pump sees no free slot until the retry chain settles — queued wishes
- * never jump a retry.
- */
-function pumpDispatchQueue(client: DispatchClient, sessionID: string): Promise<void> {
-  const run: PumpRun = { wishId: null, done: Promise.resolve() }
-  let pumps = pumpInFlight.get(sessionID)
-  if (!pumps) pumpInFlight.set(sessionID, (pumps = new Set()))
-  pumps.add(run)
-  run.done = pumpDequeuedWishes(client, sessionID, run).finally(() => {
-    // Also on a rejected body: a wish is never left "in transit" for good
-    // (it would hold a cap slot and read as live forever).
-    run.wishId = null
-    const left = pumpInFlight.get(sessionID)
-    if (!left) return
-    left.delete(run)
-    if (left.size === 0) pumpInFlight.delete(sessionID)
-  })
-  return run.done
-}
-
-/**
- * fix-stop-cancels-queued-wishes D5: a wish the pump had dequeued is
- * cancelled because a stop landed while it was in transit, BEFORE its prompt
- * went out. `child` = a child session the pump managed to create (never
- * prompted): aborted as cleanup only, exactly like the retry respawn
- * window's "empty husk". No registry row ever existed, so nothing settles
- * and no wake follows — the stop receipt is the report. When a lever is
- * waiting for this pump, the wish is handed to its receipt.
- */
-function cancelDequeuedByStop(client: DispatchClient, wish: QueuedDispatchWish, child: string | undefined): void {
-  releaseGateAdmission(wish.jobId)
-  // The empty child's abort is cleanup, not a cancel: nothing is awaited and
-  // an empty session cannot be running anything (same rule as the retry
-  // respawn window's "empty husk").
-  if (child) dispatchKillTreeHook(client, wish.jobId, () => child)()
-  journalTerminalRecord(
-    { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, description: wish.description, questionDeny: wish.questionDeny },
-    "aborted",
-    STOP_DEQUEUED_REASON,
-  )
-  const sessionID = wish.ownerSession
-  if (!stopWaiting.has(sessionID)) return
-  const notes = stopDequeued.get(sessionID) ?? []
-  notes.push(wish.jobId)
-  stopDequeued.set(sessionID, notes.slice(-50))
-}
-
-async function pumpDequeuedWishes(client: DispatchClient, sessionID: string, run: PumpRun): Promise<void> {
-  for (;;) {
-    // Sync edge: the previous iteration's wish has landed (registered, or
-    // terminal) before the next one is dequeued, so it is no longer in transit.
-    run.wishId = null
-    const queue = dispatchQueues.get(sessionID)
-    if (!queue || queue.length === 0) return
-    // A wish another pump is spawning holds its slot already.
-    if (inFlightAsyncDispatches(sessionID).length + inTransitWishes(sessionID).length >= ASYNC_DISPATCH_CAP) return
-    const wish = queue.shift()
-    if (queue.length === 0) dispatchQueues.delete(sessionID)
-    if (!wish) return
-    // fix-stop-cancels-queued-wishes D5: from here until the row is
-    // registered this wish is in transit. A stop that lands meanwhile is
-    // recognised through the session's stop epoch (read at dequeue).
-    run.wishId = wish.jobId
-    const stopEpochAtDequeue = stopEpoch(sessionID)
-    // --- spawn-time re-checks (belts evaluated at CALL time; these are the
-    // tightening guards). A refusal = honest error wake, never a spawn.
-    if (wish.agentID.toLowerCase().startsWith("forge-")) {
-      const agentId = wish.agentID.slice("forge-".length)
-      const resolution = resolvePools()
-      if (!resolution || !resolution.agents[agentId]) {
-        failQueuedWishHonestly(
-          wish,
-          `"${wish.agentID}" is no longer a materialized forge subagent on this host (the roster changed while the wish was queued)`,
-        )
-        continue
-      }
-    }
-    const crewRefusal = crewPendingRefusal(sessionID) ?? (await crewComplianceRefusalFor(jobClient, sessionID, wish.agentID))
-    if (crewRefusal) {
-      failQueuedWishHonestly(wish, crewRefusal)
-      continue
-    }
-    // D5: the belt read above is an await too — a stop that landed during it
-    // cancels the wish before any child session is created.
-    if (stoppedSince(sessionID, stopEpochAtDequeue)) {
-      cancelDequeuedByStop(client, wish, undefined)
-      continue
-    }
-    // fix-unknown-session-anchor-seed D2: resolve the owner (host record on a
-    // multi-directory process) BEFORE the draft verdict — the queued wish's
-    // owner may be a session this process has never bound. Read through the
-    // dispatch's OWN client (the function parameter), never a module-level
-    // "latest init" seam.
-    const draftRefusal = draftDispatchRefusalForState(await stateForCheck(sessionID, anchorReaderOf(client)), wish.agentID)
-    if (draftRefusal) {
-      failQueuedWishHonestly(wish, draftRefusal)
-      continue
-    }
-    // Provider gate re-check (harden-dispatch-resilience D3): the gate is
-    // re-evaluated at DEQUEUE time — a breaker that opened (or a limit that
-    // tightened via hot-apply) while the wish was queued fails it as an
-    // honest error wake, never a silent skip. Breaker refusals are the
-    // plugin's own throttle — they never enter the provider-retry path
-    // (nothing has spawned; the classifier is never consulted).
-    const gate = gateFor(wish.directory)
-    const wishIdentity = dispatchModelIdentity(wish.agentID, wish.ownerSession)
-    if (wishIdentity) {
-      const admission = gate.admit(wishIdentity)
-      if (!admission.ok) {
-        failQueuedWishHonestly(wish, admission.refusal)
-        continue
-      }
-      gateProvidersSeen.add(wishIdentity.provider)
-      admittedGate.set(wish.jobId, wishIdentity)
-    }
-    // --- spawn: same engine as the direct async path.
-    const created = await createChildSessionBound(client, {
-      parentSessionID: wish.ownerSession,
-      parentDirectory: wish.directory,
-      agentID: wish.agentID,
-      description: wish.description,
-      questionDeny: wish.questionDeny,
-      // Agent-bound creation (dispatch-v2-hostsignals 2.1): the roster pin
-      // rides the create body; the binding is asserted on the record read
-      // back (v2 proven by the task 1.1 probe — v1 records not probed, the
-      // assert stays off there).
-      modelPin: rosterModelPin(wish.agentID),
-      assertBinding: v2HostSeen,
-      // Nested-dispatch guard (D2): re-resolved at SPAWN time like every
-      // other pump re-check — the model identity may have shifted while the
-      // wish sat queued.
-      taskDeny: nestedTaskDenyFor(wish.agentID, wish.ownerSession),
-    })
-    if (!created.ok) {
-      releaseGateAdmission(wish.jobId)
-      failQueuedWishHonestly(wish, `child session creation failed: ${created.error}`)
-      continue
-    }
-    if (stoppedSince(sessionID, stopEpochAtDequeue)) {
-      // D5: a stop landed WHILE this child session was being created. The
-      // wish is cancelled like one that was still queued — it is never
-      // prompted. The created-but-empty child is aborted as cleanup only
-      // (the retry respawn window's "empty husk" rule); the stop receipt
-      // folds the wish into its queued group.
-      cancelDequeuedByStop(client, wish, created.sessionID)
-      continue
-    }
-    const sent = await sendPrompt(client, {
-      sessionID: created.sessionID,
-      agentID: wish.agentID,
-      prompt: wish.prompt,
-      directory: wish.directory,
-    })
-    if (!sent.ok) {
-      releaseGateAdmission(wish.jobId)
-      failQueuedWishHonestly(wish, `prompt send to child session ${created.sessionID} failed: ${sent.error}`)
-      continue
-    }
-    const job = jobManager.create({
-      id: wish.jobId,
-      cmd: `dispatch ${wish.agentID}: ${wish.description}`,
-      worktree: wish.directory,
-      ownerSession: wish.ownerSession,
-      logPath: join(jobLogDir(), "dispatch", `${wish.jobId}.txt`),
-      notify: true,
-      killTree: dispatchKillTreeHook(client, wish.jobId, () => created.sessionID),
-    })
-    ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description }
-    registerDispatchTask({ jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description }, wish.directory)
-    journalTransition(
-      wish.directory,
-      journalRecord(
-        { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, questionDeny: wish.questionDeny, description: wish.description, prompt: wish.prompt },
-        "started",
-        { childSessionId: created.sessionID },
-      ),
-    )
-    announceQueuedStart(
-      wish.ownerSession,
-      `[forge:dispatch-progress] wish ${wish.jobId} spawned from the queue (agent ${wish.agentID}, child session ${created.sessionID}) — tracking as a normal async dispatch; the single [forge:dispatch-complete] wake reports when it finishes.`,
-      wish.jobId,
-    )
-    void runAsyncDispatchPoller(client, job, created.sessionID, {
-      prompt: wish.prompt,
-      directory: wish.directory,
-      questionDeny: wish.questionDeny,
-    })
-    if (stoppedSince(sessionID, stopEpochAtDequeue) && !stopWaiting.has(sessionID)) {
-      // D5: the prompt was already on its way when a stop landed, and no
-      // lever is waiting to cancel what it started (it gave up waiting, or
-      // already read the registry). The row is a normal in-flight dispatch
-      // now — cancel it through the lever's own path, serially with any
-      // lever cancels still running for this session.
-      void stopSerialCancel(sessionID, () => cancelDispatch(client, wish.jobId)).catch((err: unknown) => {
-        console.warn(`[forge:dispatch] stop: the late-landing task ${wish.jobId} could not be cancelled by its own pump: ${String(err)}`)
-      })
-    }
-  }
-}
-
-/**
- * Owner death (fold D 4.3): queued wishes flush WITHOUT spawning — nothing
- * to abort (no child exists) — and their journal records terminalize.
- */
-function flushDispatchQueue(sessionID: string): void {
-  const queue = dispatchQueues.get(sessionID)
-  if (!queue) return
-  dispatchQueues.delete(sessionID)
-  for (const wish of queue) {
-    journalTerminalRecord(
-      { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory },
-      "aborted",
-      `owner session ${sessionID} ended before the queued wish spawned — flushed without spawning`,
-    )
-  }
-}
-
-// fix-stop-cancels-queued-wishes D2/D3: the stop lever's queue half. The
-// session's queued wishes leave the queue WITHOUT spawning and their journal
-// records terminalize — there is no child to abort and no registry row to
-// settle, so no wake follows: the stop receipt is the report and the terminal
-// journal record is what restart recovery reads (never re-entered). The
-// sentence keeps the lever prefix the in-flight rows carry, and says what is
-// true here: nothing was spawned.
-export const STOP_QUEUED_REASON =
-  "cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried"
-
-// D5: the same lever, for a wish the queue pump had dequeued and was creating
-// a child session for when stop landed — that child was never prompted.
-export const STOP_DEQUEUED_REASON =
-  "cancelled by the user lever (/forge stop) — the wish was leaving the queue when stop arrived: it was never prompted and the dispatch is never retried"
-
-function cancelQueuedWishes(sessionID: string): string[] {
-  const queue = dispatchQueues.get(sessionID)
-  if (!queue || queue.length === 0) return []
-  dispatchQueues.delete(sessionID)
-  const ids: string[] = []
-  for (const wish of queue) {
-    ids.push(wish.jobId)
-    // Same base the queued record carried (description + question flag), so
-    // the terminal line reads like every other dispatch's.
-    journalTerminalRecord(
-      { id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, description: wish.description, questionDeny: wish.questionDeny },
-      "aborted",
-      STOP_QUEUED_REASON,
-    )
-  }
-  return ids
-}
-
-/**
- * The stop lever's receipt (pure): the in-flight rows first, then the
- * cancelled queued wishes as their own line, then — only when the lever
- * stopped waiting while a wish was still being spawned (D5) — a line saying
- * so. A session with queued wishes and nothing in flight is not reachable
- * while the queue pump is healthy (a wish queues only behind a full cap) —
- * the receipt still says exactly that.
- */
-export function stopReceipt(
-  sessionID: string,
-  flightCount: number,
-  rows: string[],
-  queuedCancelled: string[],
-  stillLanding = 0,
-  settleMs = 0,
-): { title: string; output: string } {
-  const queuedNote =
-    queuedCancelled.length > 0
-      ? `\n[forge:job] Cancelled ${queuedCancelled.length} queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): ${queuedCancelled.join(", ")}`
-      : ""
-  const landingNote =
-    stillLanding > 0
-      ? `\n[forge:job] ${stillLanding} queued wish(es) of this session were still being started when the lever stopped waiting (${Math.max(1, Math.round(settleMs / 1000))} s) — each is cancelled the moment it lands; nothing of them is left running.`
-      : ""
-  if (flightCount === 0) {
-    return {
-      title: queuedCancelled.length > 0 ? `${queuedCancelled.length} queued wish(es) cancelled` : "stop",
-      output: `[forge:job] No async dispatches in flight for this session (${sessionID}).${queuedNote}${landingNote}`,
-    }
-  }
-  return {
-    title: `${flightCount} dispatch(es) stopped`,
-    output: `[forge:job] Stopped ${flightCount} in-flight dispatch(es) of this session:\n${rows.join("\n")}${queuedNote}${landingNote}`,
-  }
-}
-
-// ---------------------------------------------------------------------------
-// dispatch-resilience fold E — persisted journal + restart recovery. The
-// journal is the memory; init is the resurrection. One journal instance per
-// workspace (lazy), fs injectable for tests, every operation fail-soft.
-// ---------------------------------------------------------------------------
-
-const dispatchJournals = new Map<string, DispatchJournal>()
-let dispatchJournalFsFactory: ((filePath: string) => JournalFs) | null = null
-
-function journalFor(worktree: string): DispatchJournal {
-  let j = dispatchJournals.get(worktree)
-  if (!j) {
-    const filePath = join(worktree, ".opencode", "forge", "dispatch-log.jsonl")
-    const fs = dispatchJournalFsFactory ? dispatchJournalFsFactory(filePath) : undefined
-    j = createDispatchJournal(filePath, { fs, maxRecords: resolveJournalMax() })
-    dispatchJournals.set(worktree, j)
-  }
-  return j
-}
-
-/** Journal base fields shared by every transition of one dispatch. */
-type JournalBase = {
-  id: string
-  agent: string
-  ownerSession: string
-  workspace: string
-  prompt?: string
-  description?: string
-  questionDeny?: boolean
-}
-
-function journalRecord(base: JournalBase, state: DispatchJournalRecord["state"], extra: Partial<DispatchJournalRecord> = {}): DispatchJournalRecord {
-  const now = Date.now()
-  return {
-    id: base.id,
-    agent: base.agent,
-    ownerSession: base.ownerSession,
-    workspace: base.workspace,
-    state,
-    attempts: 1,
-    createdAt: now,
-    updatedAt: now,
-    ...(base.description !== undefined ? { description: base.description } : {}),
-    ...(base.questionDeny !== undefined ? { questionDeny: base.questionDeny } : {}),
-    // The prompt rides every NON-TERMINAL transition (the journal is the
-    // only prompt source after a restart); journalTerminalRecord redacts it
-    // by overriding to undefined after this spread.
-    ...(base.prompt !== undefined ? { prompt: base.prompt } : {}),
-    ...extra,
-  }
-}
-
-/** Append one transition (fail-soft: a journal failure never breaks a dispatch). */
-function journalTransition(worktree: string, record: DispatchJournalRecord): void {
-  try {
-    journalFor(worktree).append(record)
-  } catch {
-    // Fail-soft by contract.
-  }
-}
-
-/** Terminal transition: the prompt is REDACTED (dropped) on terminal records. */
-function journalTerminalRecord(base: JournalBase, outcome: string, reason: string): void {
-  // Provider-gate feed (harden-dispatch-resilience D3): every terminal of an
-  // ADMITTED dispatch releases its concurrency slot and advances the breaker
-  // ("completed" closes/resets, "error"/"stream-lost/unknown" count as
-  // failed terminals, user aborts / stale kills are neutral). Records that
-  // were never admitted (queued refusals, owner-death flushes) feed nothing.
-  const admitted = admittedGate.get(base.id)
-  if (admitted) {
-    admittedGate.delete(base.id)
-    try {
-      dispatchGate?.recordTerminal(
-        admitted,
-        outcome === "completed" ? "completed" : outcome === "error" || outcome === "stream-lost/unknown" ? "failed" : "neutral",
-      )
-    } catch {
-      // Fail-soft by contract (the journal append below still runs).
-    }
-  }
-  journalTransition(base.workspace, { ...journalRecord(base, "terminal"), prompt: undefined, outcome, reason })
-  // Persisted registry (dispatch-v2-hostsignals 4.1): terminal is the
-  // removal choke point — every terminal path (completed / error /
-  // aborted / stream-lost / stale) clears its row exactly once here (a
-  // no-op on v1 hosts, where no rows are written).
-  void removeDispatchStorageRow(base.id)
-}
-
-// Workspaces whose journals have been recovered this process (idempotence:
-// recovery runs at most once per workspace — launch anchor at init, every
-// other workspace lazily on its FIRST session).
-const recoveredDispatchWorkspaces = new Set<string>()
-
-/**
- * Restart recovery (fold E 5.3), scoped per workspace. Per non-terminal
- * record: running (alive → re-arm the poller; finished-while-down → fetch
- * the final message and deliver the wake; gone → honest terminal, no wake
- * fabrication), queued/dispatched (owner resolves → re-enter the queue;
- * else honest terminal), retry-pending (attempts remain → respawn with the
- * resume preamble; else honest terminal). Bounded: at most one wake per
- * recovered record, delivered via the standard wake queue.
- */
-async function recoverWorkspaceDispatches(client: DispatchClient | null, workspace: string): Promise<void> {
-  if (!client || !workspace) return
-  if (recoveredDispatchWorkspaces.has(workspace)) return
-  recoveredDispatchWorkspaces.add(workspace)
-  let records: DispatchJournalRecord[]
-  try {
-    records = journalFor(workspace).nonTerminal()
-  } catch {
-    return
-  }
-  for (const rec of records) {
-    try {
-      await recoverOneDispatchRecord(client, workspace, rec)
-    } catch {
-      // Fail-soft per record: siblings still recover.
-    }
-  }
-}
-
-/** Exported for tests (dispatch-cancel-lifecycle 4.1): the recovery respawn path. */
-export async function recoverOneDispatchRecord(client: DispatchClient, workspace: string, rec: DispatchJournalRecord): Promise<void> {
-  // Idempotence: an id already tracked in this process is never re-armed.
-  if (dispatchTasks.has(rec.id) || jobManager.get(rec.id)) return
-  // Retry guard (dispatch-cancel-lifecycle 1.4): a cancelled dispatch is
-  // never resurrected by recovery — its non-terminal journal record (a
-  // retry-pending scheduled before the cancel landed) terminalizes here.
-  if (isDispatchCancelled(rec.id)) {
-    journalTerminalRecord(
-      { id: rec.id, agent: rec.agent, ownerSession: rec.ownerSession, workspace, description: rec.description ?? "" },
-      "aborted",
-      "cancelled by the user lever (/forge stop) — recovery refuses to respawn a cancelled dispatch",
-    )
-    return
-  }
-  const base: JournalBase = {
-    id: rec.id,
-    agent: rec.agent,
-    ownerSession: rec.ownerSession,
-    workspace,
-    prompt: rec.prompt,
-    description: rec.description,
-    questionDeny: rec.questionDeny ?? true,
-  }
-  const prompt = typeof rec.prompt === "string" ? rec.prompt : ""
-  const attempts = typeof rec.attempts === "number" && rec.attempts >= 1 ? rec.attempts : 1
-
-  if (rec.state === "started" && typeof rec.childSessionId === "string" && rec.childSessionId !== "") {
-    const childId = rec.childSessionId
-    const probe = await sessionGet(client, childId)
-    if (probe.exists === false) {
-      // Child gone: honest terminal + ledger note, no wake fabrication.
-      journalTerminalRecord(base, "error", `child session ${childId} no longer exists at recovery — dispatch finalized honestly (no report fabricated)`)
-      console.warn(`[forge:dispatch] recovery: task ${rec.id} (child session ${childId}) is gone — journal terminalized honestly.`)
-      return
-    }
-    // Alive (or probe-unresolved — never a verdict): decide running vs
-    // finished via the status map; a not-active child with a fetchable
-    // final message finished while the host was down → deliver the wake.
-    let active = true
-    try {
-      if (typeof client.session.status !== "function") throw new Error("no status capability")
-      const st = await client.session.status()
-      if (st.error === undefined && st.data && typeof st.data === "object") {
-        const entry = (st.data as { [sid: string]: { type?: string } | undefined })[childId]
-        active = entry !== undefined && ["busy", "retry", "running"].includes(entry?.type ?? "")
-      }
-    } catch {
-      active = true // unreadable status = active (soundness posture)
-    }
-    if (!active) {
-      const fin = await fetchFinalMessage(client, childId)
-      if (fin.ok) {
-        const job = jobManager.create({
-          id: rec.id,
-          cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered)`,
-          worktree: workspace,
-          ownerSession: rec.ownerSession,
-          logPath: join(jobLogDir(), "dispatch", `${rec.id}.txt`),
-          notify: true,
-          killTree: dispatchKillTreeHook(client, rec.id, () => childId),
-        })
-        ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" }
-        jobManager.appendOutput(job, fin.text)
-        jobManager.markTerminal(job, "exited", 0) // exactly one wake, via the standard queue
-        journalTerminalRecord(base, "completed", `final report recovered after host restart (child session ${childId})`)
-        // D6 parity (fold E recovery): a fresh host has no idle-edge memory
-        // for this owner — its next idle edge may never come. Deliver now
-        // when the owner exists and is not mid-turn (lossy single attempt:
-        // a failed send re-queues to the standard idle-edge/window path).
-        try {
-          if (typeof client.session.status !== "function") throw new Error("no status capability")
-          const st2 = await client.session.status()
-          const ownerEntry = (st2.data as { [sid: string]: { type?: string } | undefined } | undefined)?.[rec.ownerSession]
-          if (!ownerEntry || !["busy", "retry", "running"].includes(ownerEntry?.type ?? "")) {
-            await deliverJobWakes(rec.ownerSession)
-          }
-        } catch {
-          // Soundness: undeliverable now → the standard window/idle path resumes.
-        }
-        return
-      }
-      // Not reportably done → re-arm; the poller's floor resolves honestly.
-    }
-    // Re-arm the standard completion poller (registry row + tracker).
-    const job = jobManager.create({
-      id: rec.id,
-      cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered, re-armed)`,
-      worktree: workspace,
-      ownerSession: rec.ownerSession,
-      logPath: join(jobLogDir(), "dispatch", `${rec.id}.txt`),
-      notify: true,
-      killTree: dispatchKillTreeHook(client, rec.id, () => childId),
-    })
-    ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" }
-    registerDispatchTask({ jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace)
-    journalTransition(workspace, journalRecord(base, "started", { childSessionId: childId, attempts, prompt }))
-    void runAsyncDispatchPoller(client, job, childId, {
-      prompt,
-      directory: workspace,
-      questionDeny: base.questionDeny ?? true,
-      attemptOffset: attempts - 1,
-    })
-    return
-  }
-
-  if (rec.state === "queued" || rec.state === "dispatched") {
-    // Queued semantics (a dispatched-but-never-started crash window rides
-    // the same branch): owner resolves → re-enter the queue; else honest
-    // terminal + ledger note — never spawn for a dead owner.
-    const owner = await sessionGet(client, rec.ownerSession)
-    if (owner.exists === true) {
-      const queue = dispatchQueues.get(rec.ownerSession) ?? []
-      queue.push({
-        jobId: rec.id,
-        agentID: rec.agent,
-        ownerSession: rec.ownerSession,
-        description: rec.description ?? "",
-        prompt,
-        directory: workspace,
-        questionDeny: true,
-        enqueuedAt: Date.now(),
-      })
-      dispatchQueues.set(rec.ownerSession, queue)
-      announceQueuedStart(
-        rec.ownerSession,
-        `[forge:dispatch-progress] queued wish ${rec.id} (agent ${rec.agent}) re-entered the queue after host restart — it spawns when a slot frees.`,
-        rec.id,
-      )
-      await pumpDispatchQueue(client, rec.ownerSession)
-    } else {
-      journalTerminalRecord(base, "aborted", `owner session ${rec.ownerSession} no longer resolves at recovery — queued wish terminalized without spawning`)
-      console.warn(`[forge:dispatch] recovery: queued wish ${rec.id} owner ${rec.ownerSession} unresolvable — journal terminalized honestly.`)
-    }
-    return
-  }
-
-  if (rec.state === "retry-pending") {
-    const maxAttempts = resolveMaxAttempts()
-    // The record's `attempts` is the attempt number that was SCHEDULED but
-    // never confirmed started (the started transition overwrites it once the
-    // respawn child takes the prompt) — recovery resumes THAT attempt.
-    if (attempts <= maxAttempts && prompt !== "") {
-      // Attempts remain: respawn the child (same agent, prompt from the
-      // journal — its ONLY source after a restart — plus the preamble).
-      const refusal =
-        crewPendingRefusal(rec.ownerSession) ??
-        draftDispatchRefusalForState(await stateForCheck(rec.ownerSession, anchorReaderOf(client)), rec.agent) ??
-        forgeTargetUnresolved(rec.agent)
-      if (refusal) {
-        journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`)
-        return
-      }
-      const respawn = await createChildSessionBound(client, {
-        parentSessionID: rec.ownerSession,
-        parentDirectory: workspace,
-        agentID: rec.agent,
-        description: rec.description ?? "",
-        questionDeny: base.questionDeny ?? true,
-        modelPin: rosterModelPin(rec.agent),
-        assertBinding: v2HostSeen,
-        taskDeny: nestedTaskDenyFor(rec.agent, rec.ownerSession, typeof rec.childSessionId === "string" ? rec.childSessionId : undefined),
-      })
-      if (!respawn.ok) {
-        journalTerminalRecord(base, "error", `retry spawn failed at recovery: ${respawn.error}`)
-        return
-      }
-      const sent = await sendPrompt(client, {
-        sessionID: respawn.sessionID,
-        agentID: rec.agent,
-        prompt: buildRetryPrompt(prompt),
-        directory: workspace,
-      })
-      if (!sent.ok) {
-        journalTerminalRecord(base, "error", `retry prompt send failed at recovery: ${sent.error}`)
-        return
-      }
-      const job = jobManager.create({
-        id: rec.id,
-        cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered retry)`,
-        worktree: workspace,
-        ownerSession: rec.ownerSession,
-        logPath: join(jobLogDir(), "dispatch", `${rec.id}.txt`),
-        notify: true,
-        killTree: dispatchKillTreeHook(client, rec.id, () => respawn.sessionID),
-      })
-      ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: rec.agent, childSessionID: respawn.sessionID, description: rec.description ?? "" }
-      registerDispatchTask({ jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace)
-      const nextAttempt = attempts
-      journalTransition(workspace, journalRecord(base, "started", { childSessionId: respawn.sessionID, attempts: nextAttempt, prompt }))
-      announceQueuedStart(
-        rec.ownerSession,
-        `[forge:dispatch-progress] task ${rec.id} retry attempt ${nextAttempt}/${maxAttempts} resumed after host restart — child session ${respawn.sessionID}.`,
-        rec.id,
-      )
-      void runAsyncDispatchPoller(client, job, respawn.sessionID, {
-        prompt,
-        directory: workspace,
-        questionDeny: base.questionDeny ?? true,
-        attemptOffset: attempts - 1,
-      })
-    } else {
-      journalTerminalRecord(base, "error", `attempts exhausted at recovery (${attempts}/${maxAttempts}) — no respawn`)
-    }
-    return
-  }
-  // "terminal" records never reach here (nonTerminal() filters them).
-}
-
-function dispatchClient(): DispatchClient | null {
-  return jobClient as unknown as DispatchClient | null
-}
-
-// Async poller (design D3 + sync-timeout-notify fold #2 never-die tracking):
-// an in-plugin loop watching the child session — NOT a job-runner child
-// process. The watch runs in slices so a registry kill (owner death,
-// dispose) stops the loop at the next slice boundary. There is NO
-// wall-clock deadline: the loop ends only at a textful completion, an
-// explicit child error, a registry kill, or the textless-idle floor. Past
-// each notification interval it emits a non-terminal [forge:dispatch-progress]
-// notice (job tail + pending queue — never markTerminal/wakeState, so the
-// at-most-once completion budget stays intact). On terminal it fetches the
-// final message, parks it on the registry row's tail (the wake text reads
-// it inline), and marks the job terminal — the manager's wake queue does
-// the rest (idle-only injection, at-most-once, delivery window, ledger
-// overflow).
-//
-// dispatch-resilience folds B+C:
-//  • Activity-stale reap (fold B): the SOLE clock-based termination of a
-//    RUNNING child. Each slice (while the child is believed active — the
-//    textless-idle floor below owns the not-active axis) probes
-//    session.get: a refreshed time.updated resets the anchor (a producing
-//    child can never be reaped); when the anchor has been silent for
-//    FORGE_DISPATCH_STALE_MS past the 60 s runtime floor, kill mode aborts
-//    the child via the SDK and delivers the ONE honest terminal wake
-//    (`stale: aborted after N min without activity`); a failed abort with
-//    the session still existing skips the sweep and re-arms (finalization
-//    only when existence proves the session gone). Observe mode notifies
-//    once per crossing and never kills.
-//  • Error-classified retry (fold C): a child terminating in a RETRYABLE
-//    error class with attempts remaining respawns after a fixed backoff —
-//    same agent, original prompt + the inspect-then-continue resume
-//    preamble — inheriting the dying child's registry slot (same job row,
-//    new child session id; no queue re-entry, no cap interaction). Stale
-//    kills, user aborts (registry kills), floor findings, and
-//    deterministic/unknown classes NEVER retry. The final wake discloses
-//    the attempt count; exactly one terminal wake still.
-type DispatchRetryContext = {
-  /** The ORIGINAL dispatch prompt (the retry prepends the resume preamble). */
-  prompt: string
-  /** The parent directory the child is anchored to. */
-  directory: string
-  /** Mode-keyed question policy (task-shadow) — re-applied on the fresh child. */
-  questionDeny: boolean
-  /**
-   * Fold E recovery offset: the journal's attempt count at re-arm — the
-   * poller's attempt counter starts at 1 + offset so a recovered chain keeps
-   * its true attempt accounting (and the attempt cap).
-   */
-  attemptOffset?: number
-}
-
-// ---------------------------------------------------------------------------
-// User-facing cancellation lever (dispatch-cancel-lifecycle, forge-subagents
-// spec "User-facing dispatch cancellation"): the cancel core behind the
-// `/forge stop` route (session-scoped bulk) and the explicit per-id
-// forge_jobs cancel action. Cancel = the EXISTING registry kill (the
-// manager's kill fires the row's killTree → abortChild) + the honest
-// settle: the journal records `aborted` with the USER-LEVER reason, the
-// persisted row is removed by the terminal choke point, and the owner gets
-// a wake through the normal aborted-wake path. Post-abort idle assertion:
-// the child must be observed idle (absent from the host status map — the
-// proven field reality) within the assertion window or the disclosure says
-// it resisted. Retry guard: cancelled ids are excluded from every
-// resilience path (fold-C respawn checks the set; terminal rows are skipped
-// by recovery/adoption by construction).
-// ---------------------------------------------------------------------------
-
-const cancelledDispatchIds = new Set<string>()
-
-// One source for the user-lever abort reason: stamped on the row's dispatch
-// meta at cancel time (the wake renders it) AND written as the journal
-// terminal reason by the watcher's kill settle — journal and wake carry the
-// same sentence verbatim. (Live 2.4.0 finding 2026-11-23: a /forge stop wake
-// said "registry kill (owner session ended / user cancel)" — a disjunction
-// that names neither what happened nor that the owner is alive and cancelling.)
-const USER_LEVER_ABORT_REASON =
-  "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried"
-// The sentence for a registry kill that is NOT a lever. Since
-// fix-dispatch-dispose-kill its only trigger is the owner session ENDING
-// (a plugin dispose no longer kills dispatch rows) and the user lever has
-// its own sentence above — so the former "(owner session ended / user
-// cancel)" named things that were either no longer true or somebody else's
-// reason. The kill hook stamps ONE sentence on the row and BOTH readers —
-// the journal terminal (settleKilled) and the wake (jobWakeText) — render
-// that stamped sentence (a spec review on 2026-11-23 found the two sides
-// carrying different sentences on the owner-death path: the journal its own
-// literal, the wake this constant).
-const REGISTRY_KILL_ABORT_REASON = "registry kill (owner session ended) — the child was aborted and the dispatch is never retried"
-// The generic forge_jobs kill action applied to a dispatch row: an explicit
-// lever, not an owner death — its reason is stamped before the kill.
-const EXPLICIT_KILL_ABORT_REASON = "killed by the explicit forge_jobs kill action — the child was aborted and the dispatch is never retried"
-
-// Read at CALL time (the poll envs' lazy posture): ESM evaluates imported
-// modules BEFORE the importing test file's env preamble, so a module-level
-// read would freeze the 10 s default into every suite run.
-function cancelIdleAssertionMs(): number {
-  const raw = Number(process.env.FORGE_CANCEL_IDLE_ASSERTION_MS)
-  return Number.isFinite(raw) && raw > 0 ? raw : 10_000
-}
-
-function inFlightDispatchList(): Array<{ taskId: string; agent: string; childSessionID: string; ownerSession: string; description: string; ageMs: number | null }> {
-  const rows: Array<{ taskId: string; agent: string; childSessionID: string; ownerSession: string; description: string; ageMs: number | null }> = []
-  for (const row of dispatchTasks.values()) {
-    const job = jobManager.get(row.jobId)
-    // Listing semantics match inFlightAsyncDispatches: only RUNNING jobs
-    // are in flight; a dead handle is pruned on sight.
-    if (!job || job.state !== "running") {
-      dispatchTasks.delete(row.jobId)
-      continue
-    }
-    rows.push({
-      taskId: row.jobId,
-      agent: row.agentID,
-      childSessionID: row.childSessionID,
-      ownerSession: row.ownerSession,
-      description: row.description ?? "",
-      ageMs: job?.startedAt ? Date.now() - job.startedAt : null,
-    })
-  }
-  return rows
-}
-
-function formatInFlightDispatchList(): string {
-  const rows = inFlightDispatchList()
-  if (rows.length === 0) return "(no async dispatches in flight)"
-  return rows
-    .map((r) => {
-      const age = r.ageMs !== null ? ` — running ${Math.max(1, Math.round(r.ageMs / 1000))}s` : ""
-      const desc = r.description ? ` — ${r.description.slice(0, 80)}` : ""
-      return `- ${r.taskId}  agent ${r.agent}  child session ${r.childSessionID}${age}${desc}`
-    })
-    .join("\n")
-}
-
-// Parent-interrupt disclosure (dispatch-cancel-lifecycle 2.1, spec
-// "Parent-interrupt disclosure"): ESC interrupts the parent turn ONLY —
-// in-flight host children keep running (upstream #64073). Disclose-only:
-// the interrupt NEVER cancels a child; the disclosure names the flight and
-// the exact cancel lever. Deduplicated per flight COMPOSITION (same flight
-// re-discloses nothing; a newly spawned dispatch re-arms the disclosure).
-const interruptDisclosureSeen = new Set<string>()
-
-export function disclosedInterruptFlights(): number {
-  return interruptDisclosureSeen.size
-}
-
-export function discloseInterruptedParent(sessionID: string): boolean {
-  const flight = inFlightAsyncDispatches(sessionID)
-  if (flight.length === 0) return false
-  const key = `${sessionID}:${flight.slice().sort().join(",")}`
-  if (interruptDisclosureSeen.has(key)) return false
-  interruptDisclosureSeen.add(key)
-  // Delivered only while dispatches of this session are still in flight
-  // (fix-stale-progress-notice): "REMAIN IN FLIGHT" must be true when read.
-  queueDispatchProgress(
-    sessionID,
-    `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):\n${formatInFlightDispatchList()}\nCancel with /forge stop (cancels every in-flight and queued dispatch of THIS session) or the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"} (the cross-session escape hatch). Nothing was cancelled automatically.`,
-    () => inFlightAsyncDispatches(sessionID).length > 0,
-  )
-  return true
-}
-
-/** The active-session view for the post-abort idle assertion.
- * A v1-style client exposes session.status; the v2 promise-layer adapter
- * does not — on a live 2.4.0 host every cancel therefore disclosed "state
- * could not be read to confirm idle" (finding 2026-11-23) while the host's
- * own HTTP surface (GET /api/session/active — the native-child walker's
- * channel) had the answer. The walker stays a DEDICATED object (nothing is
- * added to the shared adapter). Returns null when this host offers no view
- * (no service.json → "unresolved" at once, exactly as before). */
-function activeSessionView(client: DispatchClient): (() => Promise<Record<string, unknown> | undefined>) | null {
-  const own = client.session?.status
-  if (typeof own === "function") {
-    const read = own as (this: unknown) => Promise<unknown>
-    return async () => {
-      const st = await read.call(client.session)
-      const map = (st as { data?: unknown } | undefined)?.data
-      return map && typeof map === "object" ? (map as Record<string, unknown>) : undefined
-    }
-  }
-  if (!discoverServiceHttp()) return null
-  const walker = v2NativeChildWalker()
-  const status = walker.session?.status
-  if (typeof status !== "function") return null
-  return async () => {
-    const st = await status.call(walker.session)
-    const map = (st as { data?: unknown } | undefined)?.data
-    return map && typeof map === "object" ? (map as Record<string, unknown>) : undefined
-  }
-}
-
-/** Post-abort idle assertion: the child must reach idle within the window. */
-async function assertChildIdleAfterAbort(client: DispatchClient, childSessionID: string): Promise<"idle" | "resisted" | "unresolved"> {
-  const view = activeSessionView(client)
-  if (!view) return "unresolved"
-  const assertionMs = cancelIdleAssertionMs()
-  const deadline = Date.now() + assertionMs
-  // Every view read is bounded by what is left of the assertion window: a
-  // hung HTTP read (the v2 view rides service.json HTTP) must not stretch a
-  // cancel — or a serial /forge stop over several rows — past the window
-  // the disclosure names. A read that overruns counts as unreadable.
-  const readWithin = async (ms: number): Promise<Record<string, unknown> | undefined | "timeout"> => {
-    let timer: ReturnType<typeof setTimeout> | undefined
-    const cap = new Promise<"timeout">((resolve) => {
-      timer = setTimeout(() => resolve("timeout"), Math.max(1, ms))
-    })
-    try {
-      return await Promise.race([view(), cap])
-    } finally {
-      if (timer) clearTimeout(timer)
-    }
-  }
-  while (Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 400))
-    try {
-      const map = await readWithin(Math.max(1, deadline - Date.now()))
-      // Field reality (soundness, pollChild): the host's status map holds
-      // ONLY active sessions — an absent child IS idle.
-      if (map !== "timeout" && map && typeof map === "object" && map[childSessionID] === undefined) return "idle"
-    } catch {
-      // View unreadable: keep trying until the window closes.
-    }
-  }
-  try {
-    const map = await readWithin(2_000)
-    if (!map || map === "timeout") return "unresolved"
-    return map[childSessionID] === undefined ? "idle" : "resisted"
-  } catch {
-    return "unresolved"
-  }
-}
-
-export async function cancelDispatch(
-  client: DispatchClient,
-  taskId: string,
-): Promise<{ ok: boolean; childSessionID?: string; idle: "idle" | "resisted" | "unresolved" | "not-asserted"; text: string }> {
-  const row = dispatchTasks.get(taskId)
-  const job = jobManager.get(taskId)
-  if (!row || !job) {
-    return {
-      ok: false,
-      idle: "not-asserted",
-      text: `"${taskId}" is not an in-flight async dispatch — nothing to cancel.\nIn flight now:\n${formatInFlightDispatchList()}`,
-    }
-  }
-  cancelledDispatchIds.add(taskId)
-  // The wake names the lever: stamped BEFORE the registry kill (the kill hook
-  // keeps an abortReason that is already set, jobWakeText renders it).
-  {
-    const meta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
-    if (meta && meta.outcome !== "stream-lost/unknown") meta.abortReason = USER_LEVER_ABORT_REASON
-  }
-  // The registry kill fires the row's killTree (abortChild via the SDK) —
-  // the SAME engine the owner-death path uses; the watcher settles the row
-  // as aborted as soon as it sees the kill (before any poll/signal verdict),
-  // the journal choke point removes the persisted row, and the owner gets
-  // the normal aborted wake.
-  jobManager.kill(job)
-  const idle = await assertChildIdleAfterAbort(client, row.childSessionID)
-  const assertionMs = cancelIdleAssertionMs()
-  const idleNote =
-    idle === "idle"
-      ? `the child session ${row.childSessionID} is confirmed idle (the cancellation is REAL, not bookkeeping)`
-      : idle === "resisted"
-        ? `the child session ${row.childSessionID} did NOT reach idle within ${Math.round(assertionMs / 1000)}s — it may have resisted cancellation; inspect or abort it natively in the host TUI`
-        : `the child session ${row.childSessionID}'s state could not be read to confirm idle — verify it natively in the host TUI`
-  return {
-    ok: true,
-    childSessionID: row.childSessionID,
-    idle,
-    text: `Cancelled ${taskId} (agent ${row.agentID}, child session ${row.childSessionID}) — cancelled by the user lever; never retried. ${idleNote}.`,
-  }
-}
-
-/** Retry guard (task 1.4): a cancelled dispatch is never respawned. */
-export function isDispatchCancelled(taskId: string): boolean {
-  return cancelledDispatchIds.has(taskId)
-}
-
-// ---------------------------------------------------------------------------
-// Host-signal completion core (dispatch-v2-hostsignals D4): child-session-id
-// keyed terminal-signal inbox + activity ledger. The v2 event subscription
-// (and the v1 event hook, where its bus delivers) route durable
-// session.execution.{succeeded,failed,interrupted} events here; the watch
-// loops consume an inbox signal BEFORE their REST poll — task 3.5: the poll
-// is demoted to reconcile plumbing, never the sole terminal signal. The
-// activity ledger (execution.started / step edges) feeds the
-// reconcile-confirmation rule: a child whose execution events keep flowing
-// is NEVER declared stream-lost by an unread synchronous view.
-// Exported for tests (same seam posture as TASK_SEAM_DEGRADED_ERROR).
-// ---------------------------------------------------------------------------
-
-export type DispatchTerminalSignal = {
-  kind: "succeeded" | "failed" | "interrupted"
-  /** execution.failed error head / interrupted reason / wait-latch marker. */
-  detail?: string
-  at: number
-}
-
-const dispatchTerminalInbox = new Map<string, DispatchTerminalSignal>()
-const dispatchChildActivityAt = new Map<string, number>()
-
-/** Readable detail of a host execution error carried by a terminal event.
- * 2.4.0 publishes `error` as a nested object with no string `message` —
- * `String(obj)` rendered "[object Object]" into the dispatch journal (live
- * finding 2026-11-23). Digs the first informative string (message / name /
- * error / reason / data, bounded depth), else a clipped JSON rendering. */
-export function executionErrorDetail(error: unknown): string | undefined {
-  try {
-    return executionErrorDetailInner(error)
-  } catch {
-    // A hostile object (a throwing getter, a null-prototype object, a
-    // Proxy): the caller's own honest fallback — this function is total, it
-    // never throws into the signal path.
-    return undefined
-  }
-}
-
-function executionErrorDetailInner(error: unknown): string | undefined {
-  if (error === undefined || error === null) return undefined
-  if (typeof error === "string") return error || undefined
-  if (typeof error === "number" || typeof error === "boolean") return String(error)
-  if (typeof error !== "object") return undefined
-  const dig = (v: unknown, depth: number): string | undefined => {
-    if (v === undefined || v === null) return undefined
-    if (typeof v === "string") return v || undefined
-    if (typeof v === "number" || typeof v === "boolean") return String(v)
-    if (typeof v !== "object" || depth <= 0) return undefined
-    const o = v as Record<string, unknown>
-    for (const key of ["message", "error", "reason", "data", "name"]) {
-      const got = dig(o[key], depth - 1)
-      if (got) return got
-    }
-    return undefined
-  }
-  const o = error as Record<string, unknown>
-  const name = typeof o.name === "string" && o.name ? o.name : undefined
-  // An Error-like object reads like Error.toString(): "Name: message".
-  const message = dig(o.message, 4) ?? dig(o.data, 4) ?? dig(o.error, 4) ?? dig(o.reason, 4)
-  if (name && message && message !== name) return `${name}: ${message}`
-  if (message) return message
-  if (name) return name
-  const found = dig(error, 4)
-  if (found) return found
-  try {
-    const s = JSON.stringify(error)
-    if (s && s !== "{}") return s.length > 300 ? `${s.slice(0, 300)}…` : s
-    // An empty object says nothing: undefined lets the caller use its own
-    // honest fallback instead of "[object Object]".
-    if (s === "{}") return undefined
-  } catch {
-    // A circular or BigInt-bearing object cannot be serialized: fall to the
-    // same "says nothing" answer — String(obj) would render exactly the
-    // "[object Object]" this function exists to prevent (and throws for a
-    // null-prototype object).
-  }
-  return undefined
-}
-
-/** Route a durable terminal event for a child (first terminal wins). */
-export function noteDispatchTerminalSignal(sessionID: string, kind: DispatchTerminalSignal["kind"], detail?: string): void {
-  dispatchChildActivityAt.set(sessionID, Date.now())
-  if (dispatchTerminalInbox.has(sessionID)) return
-  dispatchTerminalInbox.set(sessionID, { kind, detail, at: Date.now() })
-}
-
-/** Non-terminal execution activity ping (execution.started / step edges). */
-export function noteDispatchChildActivity(sessionID: string): void {
-  dispatchChildActivityAt.set(sessionID, Date.now())
-}
-
-/** Consume the inbox signal (if any) — the watch loops own this. */
-export function takeDispatchTerminalSignal(sessionID: string): DispatchTerminalSignal | null {
-  const signal = dispatchTerminalInbox.get(sessionID)
-  if (signal) dispatchTerminalInbox.delete(sessionID)
-  return signal ?? null
-}
-
-/** Reconcile confirmation: execution activity for this child within `withinMs`? */
-export function recentDispatchChildActivity(sessionID: string, withinMs: number): boolean {
-  const at = dispatchChildActivityAt.get(sessionID)
-  return at !== undefined && Date.now() - at <= withinMs
-}
-
-/** Watch ended for this child: drop its signal state (bounded ledgers). */
-export function forgetDispatchSignals(sessionID: string): void {
-  dispatchTerminalInbox.delete(sessionID)
-  dispatchChildActivityAt.delete(sessionID)
-}
-
-// D4 one-shot wait seam (task 3.2, v2-only): armed per in-flight child —
-// resolves when the host's agent loop goes idle (POST
-// /api/experimental/session/:id/wait, NoContent). Routed into the SAME
-// inbox as the durable events (first-terminal-wins); failures are silent —
-// the events + the reconcile pass remain the primaries.
-let v2SessionWaitSeam: ((sessionID: string) => Promise<unknown>) | null = null
-
-/** Test seam: inject/clear the v2 wait latch (null restores v1 posture). */
-export function setDispatchWaitSeamForTests(seam: ((sessionID: string) => Promise<unknown>) | null): void {
-  v2SessionWaitSeam = seam
-}
-
-function armDispatchWaitWatcher(sessionID: string): void {
-  const wait = v2SessionWaitSeam
-  if (!wait) return
-  void wait(sessionID)
-    .then(() => {
-      // Idle latch: settle as succeeded UNLESS a durable terminal event
-      // already claimed the inbox (first-terminal-wins ordering).
-      if (!dispatchTerminalInbox.has(sessionID)) noteDispatchTerminalSignal(sessionID, "succeeded", "wait-latch")
-    })
-    .catch(() => {
-      // Session gone / service unavailable: silent — the stale reap and the
-      // reconcile pass own gone children.
-    })
-}
-
-// ---------------------------------------------------------------------------
-// Persisted dispatch registry (dispatch-v2-hostsignals D5, tasks 4.1-4.3):
-// in-flight rows mirrored into ctx.storage (host-native plugin KV) at
-// watch start, removed at terminal — the journalTerminalRecord choke point
-// owns removal, so every terminal path (completed / error / aborted /
-// stream-lost / stale) clears its row exactly once. Setup scans the rows,
-// dedupes against the journal recovery's re-arms, adopts running rows back
-// into the active watcher set (watch-only — an adopted dispatch NEVER
-// re-spawns: the re-dispatch guard is the adoption itself), and falls back
-// to a parentID walk when a row is unreadable. v1 hosts keep the
-// journal-only posture (design risk table: ctx.storage unavailable →
-// fail-soft to today's behavior).
-// ---------------------------------------------------------------------------
-
-const DISPATCH_STORAGE_PREFIX = "forge-dispatch/"
-
-type DispatchStorageRow = {
-  taskId: string
-  childSessionID: string
-  agent: string
-  ownerSession: string
-  workspace: string
-  description: string
-  /** The prompt anchor (the retry context rides it when the child errors). */
-  prompt: string
-  questionDeny: boolean
-  attempts: number
-  startedAt: number
-  updatedAt: number
-}
-
-// Test seam: the v2 storage domain (null on v1 — every call is a no-op).
-let v2DispatchStorage: {
-  get: (key: string) => Promise<unknown>
-  set: (key: string, value: unknown) => Promise<void>
-  remove: (key: string) => Promise<void>
-  scan: (options: { prefix: string }) => Promise<{ entries?: ReadonlyArray<{ key: string; value: unknown }> } | undefined> | undefined
-} | null = null
-
-export function setDispatchStorageForTests(storage: typeof v2DispatchStorage): void {
-  v2DispatchStorage = storage
-}
-
-async function writeDispatchStorageRow(row: DispatchStorageRow): Promise<void> {
-  const storage = v2DispatchStorage
-  if (!storage) return
-  try {
-    await storage.set(DISPATCH_STORAGE_PREFIX + row.taskId, row)
-  } catch {
-    // Storage drift: fail-soft — the journal remains the durable truth.
-  }
-}
-
-async function removeDispatchStorageRow(taskId: string): Promise<void> {
-  const storage = v2DispatchStorage
-  if (!storage) return
-  try {
-    await storage.remove(DISPATCH_STORAGE_PREFIX + taskId)
-  } catch {
-    // Fail-soft: a stale row is adoption-deduped by the child-observable check.
-  }
-}
-
-/** parentID walk fallback (task 4.2): find the child by its parent link. */
-async function findChildByParentWalk(client: DispatchClient, ownerSession: string, agent: string): Promise<string | null> {
-  try {
-    const raw = await (client as unknown as { session?: { list?: (args?: unknown) => Promise<unknown> } }).session?.list?.({})
-    const body = (raw as { data?: unknown } | undefined)?.data ?? raw
-    const list = Array.isArray(body)
-      ? (body as Array<Record<string, unknown>>)
-      : Array.isArray((body as { sessions?: unknown[] } | undefined)?.sessions)
-        ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
-        : []
-    const hits: { id: string; created: number }[] = []
-    for (const s of list) {
-      if (!s || typeof s.id !== "string") continue
-      if (s.parentID !== ownerSession) continue
-      if (agent && s.agent !== agent) continue
-      const t = Number((s.time as { created?: unknown } | undefined)?.created ?? 0)
-      hits.push({ id: s.id, created: Number.isFinite(t) ? t : 0 })
-    }
-    hits.sort((a, b) => b.created - a.created)
-    return hits[0]?.id ?? null
-  } catch {
-    return null
-  }
-}
-
-/** Re-arm the standard completion watcher for an adopted child (watch-only). */
-function rearmDispatchWatch(
-  client: DispatchClient,
-  input: { id: string; agent: string; ownerSession: string; workspace: string; childId: string; description: string; prompt: string; questionDeny: boolean; attempts: number },
-): void {
-  const job = jobManager.create({
-    id: input.id,
-    cmd: `dispatch ${input.agent}: ${input.description || "(adopted)"} (adopted, re-armed)`,
-    worktree: input.workspace,
-    ownerSession: input.ownerSession,
-    logPath: join(jobLogDir(), "dispatch", `${input.id}.txt`),
-    notify: true,
-    killTree: dispatchKillTreeHook(client, input.id, () => input.childId),
-  })
-  ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: input.agent, childSessionID: input.childId, description: input.description }
-  registerDispatchTask({ jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description }, input.workspace)
-  // Fold E continuity: the adopted watch journals a started transition (a
-  // missing journal record gets one; an existing one re-affirms).
-  journalTransition(input.workspace, {
-    id: input.id,
-    agent: input.agent,
-    ownerSession: input.ownerSession,
-    workspace: input.workspace,
-    state: "started",
-    childSessionId: input.childId,
-    attempts: input.attempts,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    prompt: input.prompt,
-    questionDeny: input.questionDeny,
-    description: input.description,
-  })
-  void runAsyncDispatchPoller(client, job, input.childId, {
-    prompt: input.prompt,
-    directory: input.workspace,
-    questionDeny: input.questionDeny,
-    attemptOffset: Math.max(0, input.attempts - 1),
-  })
-}
-
-/** Setup-time adoption (task 4.2): scan persisted rows, adopt what's live. */
-export async function adoptPersistedDispatchRows(client: DispatchClient | null, workspace: string): Promise<number> {
-  if (!client || !workspace || isRootish(workspace)) return 0
-  const storage = v2DispatchStorage
-  let adopted = 0
-  if (storage) {
-    try {
-      const scanned = await storage.scan({ prefix: DISPATCH_STORAGE_PREFIX })
-      for (const entry of scanned?.entries ?? []) {
-        const row = entry?.value as Partial<DispatchStorageRow> | undefined
-        if (!row || typeof row !== "object") continue
-        if (normalizeAnchorDir(String(row.workspace ?? "")) !== normalizeAnchorDir(workspace)) continue
-        const taskId = String(row.taskId ?? "")
-        if (!taskId || dispatchTasks.has(taskId)) continue // journal recovery re-armed it first (dedupe)
-        if (isDispatchCancelled(taskId)) {
-          // Retry guard (1.4): adoption never resurrects a cancelled dispatch.
-          journalTerminalRecord(
-            { id: taskId, agent: String(row.agent ?? ""), ownerSession: String(row.ownerSession ?? ""), workspace, description: String(row.description ?? "") },
-            "aborted",
-            "cancelled by the user lever (/forge stop) — adoption refuses to re-arm a cancelled dispatch",
-          )
-          continue
-        }
-        const owner = String(row.ownerSession ?? "")
-        const agent = String(row.agent ?? "")
-        let childId = String(row.childSessionID ?? "")
-        if (!childId) {
-          // Unreadable/incomplete row → parentID walk fallback (spec 4.2).
-          childId = (await findChildByParentWalk(client, owner, agent)) ?? ""
-        }
-        if (!childId) continue // child unobservable: the journal owns the verdict
-        // Child observable? Adopt watch-only. An adopted dispatch never
-        // re-spawns (the re-dispatch guard IS the adoption — task 4.3).
-        const probe = await sessionGet(client, childId)
-        if (probe.exists === false) {
-          // Gone child: terminalize the row honestly via the journal choke
-          // point (which also removes the storage row).
-          journalTerminalRecord(
-            { id: taskId, agent, ownerSession: owner, workspace, description: String(row.description ?? "") },
-            "error",
-            `adopted row's child session ${childId} no longer exists — finalized honestly at adoption`,
-          )
-          continue
-        }
-        rearmDispatchWatch(client, {
-          id: taskId,
-          agent,
-          ownerSession: owner,
-          workspace,
-          childId,
-          description: String(row.description ?? ""),
-          prompt: String(row.prompt ?? ""),
-          questionDeny: row.questionDeny !== false,
-          attempts: Number.isFinite(Number(row.attempts)) && Number(row.attempts) > 0 ? Number(row.attempts) : 1,
-        })
-        adopted++
-      }
-    } catch {
-      // Storage drift / unreadable scan: fail-soft — the journal recovery
-      // remains the durable path.
-    }
-  }
-  // Orphan-child disclosure (dispatch-cancel-lifecycle 2.2) rides the same
-  // adoption pass — but does NOT serialize behind it: fire-and-forget, so
-  // the adoption return contract (and the re-armed watcher's head start)
-  // stays byte-identical to the proven pass. A streaming forge-* child with
-  // no live row is surfaced with the adopt/cancel guidance.
-  void detectOrphanDispatchChildren(client, workspace).catch(() => {})
-  return adopted
-}
-
-// ---------------------------------------------------------------------------
-// Orphan-child disclosure (dispatch-cancel-lifecycle 2.2, spec "Orphan-child
-// disclosure"): a forge-* child session observed STREAMING with no live
-// dispatch row (an adoption gap) is running invisibly — surfaced with its
-// task id (when the journal knows it) and the adopt/cancel guidance.
-// Deduplicated per child id per process; the active-map read is the ONLY
-// streaming classifier — when the host status view is unreadable the sweep
-// stays silent (never cry wolf).
-// ---------------------------------------------------------------------------
-
-const orphanDisclosuresSeen = new Set<string>()
-
-export function observedOrphanDispatches(): number {
-  return orphanDisclosuresSeen.size
-}
-
-export async function detectOrphanDispatchChildren(client: DispatchClient, workspace: string): Promise<number> {
-  const trackedChildren = new Set<string>()
-  for (const h of dispatchTasks.values()) trackedChildren.add(h.childSessionID)
-  // Same list-shape tolerance as findChildByParentWalk (the walk proven on
-  // 2.3.2): array | {sessions} | {data:...} envelopes.
-  let listed: Array<Record<string, unknown>> = []
-  try {
-    const raw = await (client as unknown as { session?: { list?: (args?: unknown) => Promise<unknown> } }).session?.list?.({})
-    const body = (raw as { data?: unknown } | undefined)?.data ?? raw
-    listed = Array.isArray(body)
-      ? (body as Array<Record<string, unknown>>)
-      : Array.isArray((body as { sessions?: unknown[] } | undefined)?.sessions)
-        ? ((body as { sessions: unknown[] }).sessions as Array<Record<string, unknown>>)
-        : []
-  } catch {
-    return 0
-  }
-  if (listed.length === 0) return 0
-  let active: Set<string>
-  try {
-    if (typeof client.session.status !== "function") return 0
-    const st = await client.session.status()
-    const map = (st as { data?: Record<string, unknown> } | undefined)?.data
-    if (!map || typeof map !== "object") return 0
-    active = new Set(Object.keys(map))
-  } catch {
-    return 0 // streaming unclassifiable: silent (never a false orphan)
-  }
-  let found = 0
-  for (const s of listed) {
-    const id = typeof s?.id === "string" ? s.id : ""
-    if (!id || trackedChildren.has(id) || orphanDisclosuresSeen.has(id)) continue
-    const agent = typeof s.agent === "string" ? s.agent : ""
-    const parent = typeof s.parentID === "string" ? s.parentID : ""
-    if (!parent || !agent.startsWith("forge-")) continue
-    if (!active.has(id)) continue // not streaming: not an orphan NOW
-    orphanDisclosuresSeen.add(id)
-    found++
-    // The journal may still name the task id even though the row is gone.
-    let taskId = "(unknown)"
-    try {
-      const rec = journalFor(workspace).nonTerminal().find((r) => r.childSessionId === id)
-      if (rec) taskId = rec.id
-    } catch {}
-    console.warn(
-      `[forge:orphan-dispatch] warn: forge child ${id} (agent ${agent}, parent ${parent}) is STREAMING with no live dispatch row (task id ${taskId}) — adoption gap. Adopt: restart the host or touch the workspace to re-run recovery; Cancel: /forge stop (this session's dispatches) or forge_jobs action=cancel with the task id.`,
-    )
-    queueDispatchProgress(
-      parent,
-      `[forge:dispatch-notice] Orphaned dispatch child detected: forge child ${id} (agent ${agent}, task id ${taskId}) is running with no live dispatch row. It will NOT deliver an outcome on its own — recover it (restart/touch to re-run adoption) or cancel it (forge_jobs action=cancel jobId=${taskId === "(unknown)" ? "<task-id>" : taskId}; or /forge stop when it belongs to this session).`,
-    )
-  }
-  return found
-}
-
-async function runAsyncDispatchPoller(
-  client: DispatchClient,
-  job: Job,
-  initialChildSessionID: string,
-  retryCtx: DispatchRetryContext,
-): Promise<void> {
-  const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
-  // sliceMs is the SLICE boundary, not a deadline — a slice timeout just
-  // returns control here for the kill/floor/notify checks below.
-  const sliceMs = Math.max(
-    intervalMs,
-    Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000),
-    // Reconcile cadence floor (dispatch-v2-hostsignals 3.3): on v2 hosts —
-    // where durable events are the PRIMARY completion channel — the REST
-    // reconcile pass runs at ≥10s (spec SHALL: "at a cadence of at least 10
-    // seconds"; FORGE_DISPATCH_RECONCILE_FLOOR_MS overrides, 0 disables).
-    // v1 hosts keep the proven 5s cadence (v1 is a design non-goal).
-    v2HostSeen ? Number(process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS ?? 10_000) : 0,
-  )
-  // The blind-view streak scales with the cadence so the last-resort
-  // verdict stays inside ~2 minutes even at the 10s floor (30×10s would be
-  // 5 minutes): 12×10s ≈ the proven 30×5s window. At the 5s cadence the
-  // proven default stands.
-  const viewLossTicks = sliceMs >= 10_000 ? 12 : undefined
-  // Notify cadence (design D6): FORGE_DISPATCH_NOTIFY_INTERVAL_MS is
-  // independent of FORGE_DISPATCH_POLL_TIMEOUT_MS — that knob scopes the
-  // SYNC WAIT only and must never kill this tracker.
-  const notifyIntervalMs = resolveNotifyIntervalMs()
-  // Fold B knobs (read at dispatch time, same as the interval knobs).
-  const staleMs = resolveStaleMs()
-  const staleMode: StaleMode = resolveStaleMode()
-  const staleFloorMs = resolveStaleFloorMs()
-  // Fold C knobs.
-  const maxAttempts = resolveMaxAttempts()
-  const retryBackoffMs = resolveRetryBackoffMs()
-  const dispatch = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
-  const agentID = dispatch?.agentID ?? "unknown"
-  let childSessionID = initialChildSessionID
-  let attempt = 1 + (retryCtx.attemptOffset ?? 0)
-  let startedAt = Date.now()
-  let lastNotifiedMultiple = 0
-  let text = ""
-  let exitCode: number | null = 0
-  // dispatch-stream-loss-honesty: the stream-lost/unknown outcome class —
-  // the dispatch VIEW broke (sustained unreadable poll view, or the result
-  // stream ended without a final report); the child's true state is
-  // UNKNOWN (possibly still running). Never an exit-1 death certificate:
-  // the registry row settles exit-null and the ledger records
-  // stream-lost/unknown with the last-observed activity timestamp.
-  let streamLost = false
-  // Active-textful override disclosure (harden-dispatch-resilience D1):
-  // set when the terminal completion was established from the message
-  // stream while the status view lagged — the wake text and the journal
-  // reason both name the establishment path.
-  let activeOverride = false
-  // Terminal-inference soundness is owned by pollChild; the stability
-  // counter (and the textless-idle floor streak) live HERE so they survive
-  // poll-slice boundaries (the async path inherits the same soundness — a
-  // slice timeout must not reset the consecutive-tick run).
-  const stability: TerminalStabilityState = { stableTicks: 0 }
-  // Stale-reap state (fold B): lastActivity = last OBSERVED time.updated;
-  // null until the first probe adopts the host's timestamp (no-message
-  // children anchor at the dispatch start time).
-  const stale: StaleSweepState = { lastActivity: null, staleNotified: false }
-  // Host-signal completion (dispatch-v2-hostsignals): the one-shot wait
-  // latch arms for the FIRST child here (respawns re-arm below) and the
-  // persisted registry row mirrors this watch (removed at terminal by the
-  // journalTerminalRecord choke point).
-  armDispatchWaitWatcher(childSessionID)
-  void writeDispatchStorageRow({
-    taskId: job.id,
-    childSessionID,
-    agent: agentID,
-    ownerSession: job.ownerSession,
-    workspace: retryCtx.directory,
-    description: dispatch?.description ?? "",
-    prompt: retryCtx.prompt,
-    questionDeny: retryCtx.questionDeny,
-    attempts: attempt,
-    startedAt,
-    updatedAt: Date.now(),
-  })
-  const flushProgress = (notice: string) => {
-    // Delivered only while this dispatch is still live (fix-stale-progress-notice).
-    appendDispatchNotice(job, notice)
-    queueDispatchProgress(job.ownerSession, notice, () => dispatchStillLive(job.id))
-    // D6 parity (enqueue-while-idle): a notice parked while the owner is
-    // already idle has no future idle edge to ride — deliver now (lossy).
-    if (idleJobSessions.has(job.ownerSession)) void deliverDispatchProgress(job.ownerSession)
-  }
-  // Reconcile-hold disclosure state (task 3.5): when the synchronous view
-  // is unreadable but host execution signals keep flowing, the verdict is
-  // HELD (disclosed once per hold, not per slice).
-  let reconcileHoldNotified = false
-  // fix-dispatch-dispose-kill D2 (live 2.4.0 finding 2026-11-23): the
-  // registry's kill verdict OUTRANKS whatever this watch observes. An abort
-  // issued by a kill makes the child surface as a host `execution.failed`
-  // event on 2.4.0 (not as an interrupted/user signal), so a signal or poll
-  // verdict observed AFTER the kill used to settle the dispatch as `error`:
-  // a user cancel was journaled as a failure and fed the dispatch breaker as
-  // one. The kill is therefore checked BEFORE any verdict is acted upon —
-  // at the slice top, before a consumed signal, after every poll, and once
-  // more before the exit settle — not only on the quiet (still-running) path.
-  const settleKilled = async (): Promise<boolean> => {
-    if (job.state === "running") return false
-    dispatchTasks.delete(job.id)
-    // A kill seen between slices may still have its abort in flight: give it
-    // a bounded moment so a FAILED — or never-RETURNING — abort reaches the
-    // journal disclosure too.
-    await awaitAbortVerdict(job.id)
-    forgetDispatchSignals(childSessionID)
-    // fix-dispatch-dispose-kill D2: a kill path whose abort result was not
-    // ok (incl. unavailable) appends the unconfirmed disclosure to the
-    // terminal reason — the wake text discloses the same fact.
-    const unconfirmed = abortUnconfirmedNotes.get(job.id)
-    const suffix = unconfirmed ? ` — abort unconfirmed — child may still be running (${unconfirmed})` : ""
-    // ONE sentence for both sides (C1 "Honest aborted outcome surfacing": the
-    // wake carries the journal reason): the sentence the kill hook stamped on
-    // the row — the lever sentence for cancelDispatch / stop, the
-    // explicit-kill sentence for forge_jobs kill, the registry sentence for
-    // an owner-session end. Read from the ROW (not the `dispatch` captured
-    // at watch start: a retry respawn replaces the meta object). The lever
-    // fallback covers a row the hook left unstamped (stream-lost/unknown).
-    const stamped = (job as Job & { dispatch?: DispatchJobMeta }).dispatch?.abortReason
-    journalTerminalRecord(
-      { id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" },
-      "aborted",
-      (stamped ?? (isDispatchCancelled(job.id) ? USER_LEVER_ABORT_REASON : REGISTRY_KILL_ABORT_REASON)) + suffix,
-    )
-    // This terminal transition released the session's async slot: pump the
-    // queue head like every other terminal path (fold D — "any terminal
-    // transition of that session's dispatches"). The early returns of this
-    // settle used to skip it (spec review 2026-11-23): after a cancel or a
-    // /forge stop the owner's queued wishes stayed parked until some OTHER
-    // dispatch of that session completed. An owner-death kill pumps nothing
-    // to speak of — harvestSessionEnd flushed that queue without spawning.
-    void pumpDispatchQueue(client, job.ownerSession)
-    return true
-  }
-  for (;;) {
-    if (await settleKilled()) return
-    // D4 (task 3.1): host-signal first — a durable terminal event settles
-    // the dispatch with ZERO REST polls (the spec: "settles from that
-    // signal without any status polling"). The final-message read below is
-    // the report carrier, not a poll.
-    const signal = takeDispatchTerminalSignal(childSessionID)
-    if (signal) {
-      // The terminal event may BE the abort a kill just issued.
-      if (await settleKilled()) return
-      forgetDispatchSignals(childSessionID)
-      if (signal.kind === "failed") {
-        text = `(child session ended in error: ${signal.detail ?? "session.execution.failed"})`
-        exitCode = 1
-        break
-      }
-      if (signal.kind === "interrupted" && signal.detail === "user") {
-        text = `(child session ${childSessionID} was interrupted by the user — dispatch finalized honestly; the transcript stays inspectable and natively abortable in the host TUI)`
-        exitCode = 1
-        break
-      }
-      if (signal.kind === "succeeded") {
-        const fin = await fetchFinalMessage(client, childSessionID)
-        text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`
-        break
-      }
-      // Non-user interruption: the host's own goal consumer ignores these
-      // (the run may be internally restarted) — treat as activity, keep
-      // reconciling.
-      noteDispatchChildActivity(childSessionID)
-    }
-    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability, viewLossTicks })
-    // A verdict the poll observed may be the abort a kill just issued (or
-    // the kill landed during the slice): the registry verdict wins.
-    if (await settleKilled()) return
-    if (poll.status === "completed") {
-      activeOverride = poll.via === "active-textful"
-      const fin = await fetchFinalMessage(client, childSessionID)
-      text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`
-      if (activeOverride) text += `\n(${ACTIVE_TEXTFUL_OVERRIDE_NOTE})`
-      break
-    }
-    if (poll.status === "error") {
-      // Fold C respawn: retry ONLY transient classes, only while attempts
-      // remain, only while the registry row is still alive (a registry kill
-      // — the owner session ended — is a user abort: never retried).
-      if (attempt < maxAttempts && job.state === "running" && classifyDispatchError(poll.error) === "retryable") {
-        const errorHead = poll.error.split("\n")[0].slice(0, 160)
-        attempt++
-        // Fold E: the retry scheduling is a journaled transition
-        // (retry-pending) — after a restart this record is what resumes
-        // the chain (prompt retained: the journal is its only source).
-        journalTransition(retryCtx.directory, {
-          id: job.id,
-          agent: agentID,
-          ownerSession: job.ownerSession,
-          workspace: retryCtx.directory,
-          state: "retry-pending",
-          childSessionId: undefined,
-          attempts: attempt,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          prompt: retryCtx.prompt,
-          questionDeny: retryCtx.questionDeny,
-          description: dispatch?.description ?? "",
-        })
-        flushProgress(
-          `[forge:dispatch-progress] attempt ${attempt}/${maxAttempts} starting after ${errorHead}… — ` +
-            `respawning ${agentID} (task ${job.id}, previous child session ${childSessionID}) with the resume preamble; ` +
-            `the single [forge:dispatch-complete] wake reports when the last attempt settles.`,
-        )
-        await new Promise((resolve) => setTimeout(resolve, retryBackoffMs))
-        if (job.state !== "running") {
-          // The same kill settle as the main loop (a USER cancel during the
-          // backoff names the lever; an owner death stays a registry kill).
-          if (await settleKilled()) return
-        }
-        // Dispatch-time policies are re-applied on the fresh child the same
-        // way the original spawn applied them (crew belt + draft gate; the
-        // mode-keyed question deny rides the create body below).
-        const refusal =
-          crewPendingRefusal(job.ownerSession) ??
-          draftDispatchRefusalForState(await stateForCheck(job.ownerSession, anchorReaderOf(client)), agentID) ??
-          forgeTargetUnresolved(agentID)
-        if (refusal) {
-          text = `(retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
-          exitCode = 1
-          break
-        }
-        const respawn = await createChildSessionBound(client, {
-          parentSessionID: job.ownerSession,
-          parentDirectory: retryCtx.directory,
-          agentID,
-          description: dispatch?.description ?? "",
-          questionDeny: retryCtx.questionDeny,
-          modelPin: rosterModelPin(agentID),
-          assertBinding: v2HostSeen,
-          taskDeny: nestedTaskDenyFor(agentID, job.ownerSession, childSessionID),
-        })
-        if (!respawn.ok) {
-          text = `(retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
-          exitCode = 1
-          break
-        }
-        // Respawn-window kill (spec review 2026-11-23, finding ③): a kill
-        // that lands WHILE the fresh child is being created or prompted (after
-        // the backoff check above) must not leave that child running
-        // unwatched, and the rebind below must not re-arm the watch on a row
-        // the registry already killed. The registry kill fired the row's hook
-        // on the DYING attempt's child and stamped its sentence on the row's
-        // meta; the fresh child is aborted through the same hook (it keeps
-        // the stamped sentence), then the row settles.
-        //   bindFresh=false — the kill landed during the CREATE: the fresh
-        //   child was never prompted. It is an empty husk, aborted as
-        //   cleanup only; the row keeps naming the attempt's real child (the
-        //   transcript that exists), so the wake points there.
-        //   bindFresh=true — the kill landed during the PROMPT SEND: the
-        //   retry DID start in the fresh child; the row is rebound to it
-        //   first (same job row, new child session id), then aborted.
-        const settleRespawnKill = async (bindFresh: boolean): Promise<void> => {
-          const fresh = respawn.sessionID
-          if (bindFresh) {
-            const previousMeta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
-            ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = {
-              ...(previousMeta ?? { agentID, description: dispatch?.description ?? "" }),
-              childSessionID: fresh,
-            }
-            job.killTree = dispatchKillTreeHook(client, job.id, () => fresh)
-            job.killTree()
-          } else {
-            dispatchKillTreeHook(client, job.id, () => fresh)()
-          }
-          // The row is not running, so the settle journals the abort (it
-          // waits a bounded moment for the fresh abort's verdict, so a FAILED
-          // abort is disclosed too) and ends the watch.
-          forgetDispatchSignals(fresh)
-          await settleKilled()
-        }
-        if (job.state !== "running") {
-          await settleRespawnKill(false)
-          return
-        }
-        const sent = await sendPrompt(client, {
-          sessionID: respawn.sessionID,
-          agentID,
-          prompt: buildRetryPrompt(retryCtx.prompt),
-          directory: retryCtx.directory,
-        })
-        if (!sent.ok) {
-          text = `(retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`
-          exitCode = 1
-          break
-        }
-        if (job.state !== "running") {
-          await settleRespawnKill(true)
-          return
-        }
-        // Inherit the dying child's registry SLOT: same job row, new child
-        // session id — no queue re-entry, no cap interaction (the cap
-        // counts running rows, and the row never left the registry).
-        const previousChild = childSessionID
-        childSessionID = respawn.sessionID
-        // Host-signal rebind: the dead child's signal state is dropped, the
-        // wait latch re-arms for the fresh child, and the persisted row
-        // mirrors the new binding (terminal removal stays the choke point).
-        forgetDispatchSignals(previousChild)
-        armDispatchWaitWatcher(childSessionID)
-        void writeDispatchStorageRow({
-          taskId: job.id,
-          childSessionID,
-          agent: agentID,
-          ownerSession: job.ownerSession,
-          workspace: retryCtx.directory,
-          description: dispatch?.description ?? "",
-          prompt: retryCtx.prompt,
-          questionDeny: retryCtx.questionDeny,
-          attempts: attempt,
-          startedAt,
-          updatedAt: Date.now(),
-        })
-        ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" }
-        registerDispatchTask({ jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" }, retryCtx.directory)
-        // Fold E: the respawn is a journaled started transition (prompt
-        // retained — a crash now recovers as a live running record).
-        journalTransition(retryCtx.directory, {
-          id: job.id,
-          agent: agentID,
-          ownerSession: job.ownerSession,
-          workspace: retryCtx.directory,
-          state: "started",
-          childSessionId: childSessionID,
-          attempts: attempt,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          prompt: retryCtx.prompt,
-          questionDeny: retryCtx.questionDeny,
-          description: dispatch?.description ?? "",
-        })
-        // Owner-death harvest must abort the LIVE child — rebind the kill hook.
-        job.killTree = dispatchKillTreeHook(client, job.id, () => childSessionID)
-        // Fresh tracking state for the fresh child (stability, floor,
-        // progress cadence, and the stale anchor all restart).
-        stability.stableTicks = 0
-        stability.activeTextfulTicks = 0
-        stability.textlessIdleSince = undefined
-        startedAt = Date.now()
-        lastNotifiedMultiple = 0
-        stale.lastActivity = null
-        stale.staleNotified = false
-        continue
-      }
-      text = `(child session ended in error: ${poll.error})`
-      exitCode = 1
-      break
-    }
-    // Sustained view loss (dispatch-stream-loss-honesty): the ENTIRE poll
-    // view (status + messages) was unreadable for the sustained streak —
-    // the layer's view broke, the child's state is UNKNOWN. Honest
-    // classification, no terminal verdict, the child stays alive and
-    // natively abortable; the report file is the recovery channel.
-    if (poll.status === "stream-lost") {
-      // MODIFIED requirement (dispatch-v2-hostsignals): the verdict requires
-      // reconcile confirmation — execution events that keep flowing for the
-      // child overrule the unread synchronous view ("a child that host
-      // signals show to be alive SHALL NOT be declared lost"). Only when
-      // BOTH channels have gone silent for the notification window does the
-      // last-resort verdict stand.
-      if (recentDispatchChildActivity(childSessionID, notifyIntervalMs)) {
-        if (!reconcileHoldNotified) {
-          reconcileHoldNotified = true
-          flushProgress(
-            `[forge:dispatch-progress] the dispatch view (status + messages) is unreadable for child session ${childSessionID}, but host execution signals keep arriving — the child stays in flight (stream-lost verdict withheld; reconcile confirmation active).`,
-          )
-        }
-        await new Promise((resolve) => setTimeout(resolve, sliceMs))
-        continue
-      }
-      reconcileHoldNotified = false
-      streamLost = true
-      const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString()
-      text =
-        `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` +
-        `the dispatch view (status + messages) was unreadable for the sustained poll streak; last observed activity ${lastObserved}. ` +
-        `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` +
-        `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`
-      break
-    }
-    // (A registry kill that landed during the slice is already settled by
-    // the settleKilled() check right after the poll — no wake fires for a
-    // killed row beyond the one markTerminal queued; first-wins.)
-    // Textless-idle floor (design D6, reclassified by
-    // dispatch-stream-loss-honesty): a child continuously not-active for a
-    // full notification interval whose latest finished assistant message
-    // still lacks a truthy finish or non-empty text is a RESULT STREAM that
-    // ended without a final report — classified stream-lost/unknown: the
-    // child's state is UNKNOWN (possibly still running — the field incident
-    // proved this exit fires on live children), never a death certificate.
-    // Any busy reading resets the streak inside pollChild, so a RUNNING
-    // child with a readable view can never reach this.
-    if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
-      // Reconcile confirmation (task 3.5): execution signals flowing within
-      // the notification window overrule the textless-idle reading — the
-      // settled signal (if any) is consumed at the next loop top.
-      if (recentDispatchChildActivity(childSessionID, notifyIntervalMs)) {
-        await new Promise((resolve) => setTimeout(resolve, sliceMs))
-        continue
-      }
-      streamLost = true
-      const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString()
-      text =
-        `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` +
-        `the result stream ended before a final report arrived (last observed activity ${lastObserved}); ` +
-        `the dispatch view cannot confirm completion. ` +
-        `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` +
-        `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`
-      break
-    }
-    // Activity-stale reap (fold B) — only on the RUNNING axis (a textless
-    // idle streak is the floor's axis; the two never overlap). The probe
-    // doubles as the pre-kill re-read (it is fresh by construction) and the
-    // refresh rail: a producing child resets its anchor every slice.
-    if (stability.textlessIdleSince === undefined) {
-      const probe = await sessionGet(client, childSessionID)
-      applyStaleProbe(stale, probe)
-      if (staleThresholdCrossed(stale, Date.now(), startedAt, staleMs, staleFloorMs)) {
-        const decision = decideStaleSweep(probe, stale, staleMode)
-        if (decision.action === "gone") {
-          text = `(stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(stale, Date.now(), startedAt)} min without activity — dispatch finalized honestly)`
-          exitCode = 1
-          break
-        }
-        if (decision.action === "notify") {
-          stale.staleNotified = true
-          flushProgress(
-            `[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) shows no activity for ` +
-              `${staleSilentMinutes(stale, Date.now(), startedAt)} min (stale threshold crossed; FORGE_DISPATCH_STALE_MODE=observe — not killing).`,
-          )
-        } else if (decision.action === "kill") {
-          const minutes = staleSilentMinutes(stale, Date.now(), startedAt)
-          const ab = await abortChild(client, childSessionID)
-          if (!ab.ok) {
-            // Failed abort: finalize only when existence proves the session
-            // gone; otherwise skip this sweep and re-arm (next sweep retries).
-            const reprobe = await sessionGet(client, childSessionID)
-            if (reprobe.exists === false) {
-              text = `(stale: child session ${childSessionID} no longer exists after ${minutes} min without activity — dispatch finalized honestly)`
-              exitCode = 1
-              break
-            }
-          } else {
-            text = `(stale: aborted after ${minutes} min without activity — child session ${childSessionID} was killed by the stale reap (FORGE_DISPATCH_STALE_MS=${staleMs}); inspect its transcript in the host TUI)`
-            exitCode = 1
-            break
-          }
-        }
-        // "skip" (probe unresolved) and "quiet" (observe already notified):
-        // do nothing this sweep — the next slice re-probes.
-      }
-    }
-    // Progress cadence: one informational notice per notification interval
-    // WHILE THE CHILD RUNS (a textless-idle streak is not "running"). Never
-    // touches markTerminal/wakeState — the completion budget stays intact.
-    const multiple = Math.floor((Date.now() - startedAt) / notifyIntervalMs)
-    if (stability.textlessIdleSince === undefined && multiple > lastNotifiedMultiple) {
-      lastNotifiedMultiple = multiple
-      const minutes = Math.max(1, Math.round((Date.now() - startedAt) / 60000))
-      const notice =
-        `[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` +
-        `tracking continues; the final [forge:dispatch-complete] wake with the report arrives when it finishes. ` +
-        `Inspect/abort in the host TUI if this looks stuck.`
-      appendDispatchNotice(job, notice)
-      queueDispatchProgress(job.ownerSession, notice, () => dispatchStillLive(job.id))
-      // D6 parity (enqueue-while-idle): a notice parked while the owner is
-      // already idle has no future idle edge to ride — deliver now (lossy).
-      if (idleJobSessions.has(job.ownerSession)) void deliverDispatchProgress(job.ownerSession)
-    }
-  }
-  if (attempt > 1) text += `\n(after ${attempt} attempt(s))`
-  // Host-signal watch over: drop this child's signal state (bounded
-  // ledgers; the terminal removal of the persisted row rides the
-  // journalTerminalRecord choke point below).
-  forgetDispatchSignals(childSessionID)
-  jobManager.appendOutput(job, text)
-  // stream-lost/unknown: exit-null settle (never an exit-1 death
-  // certificate) + the outcome marker rides the dispatch meta so the
-  // completion wake words itself honestly (jobWakeText).
-  if (streamLost) {
-    exitCode = null
-    const meta = (job as Job & { dispatch?: DispatchJobMeta }).dispatch
-    if (meta) meta.outcome = "stream-lost/unknown"
-  }
-  // A kill that landed during the final-message read or the stale reap: the
-  // registry verdict wins (the queued wake already says ABORTED).
-  if (await settleKilled()) return
-  jobManager.markTerminal(job, "exited", exitCode)
-  dispatchTasks.delete(job.id)
-  // Fold D: the terminal transition releases the session's async slot —
-  // pump the queue head (if any). Fold E: terminalize the journal record
-  // (prompt REDACTED on terminal).
-  journalTerminalRecord(
-    {
-      id: job.id,
-      agent: agentID,
-      ownerSession: job.ownerSession,
-      workspace: retryCtx.directory,
-      description: dispatch?.description ?? "",
-    },
-    streamLost ? "stream-lost/unknown" : exitCode === 0 ? "completed" : "error",
-    streamLost
-      ? `${text.split("\n")[0].slice(0, 200)} — last observed activity ${new Date(stale.lastActivity ?? startedAt).toISOString()}`
-      : activeOverride
-        ? `${text.split("\n")[0].slice(0, 200)} (${ACTIVE_TEXTFUL_OVERRIDE_NOTE})`
-        : text.split("\n")[0].slice(0, 200),
-  )
-  void pumpDispatchQueue(client, job.ownerSession)
-}
-
-// fix-v2-crew-surface-drift task 2.2 (design D2): the honest-degradation
-// CONTRACT STRING for a host client with no child-session creation seam —
-// names the native task tool as the dispatch surface. Contract-tested
-// verbatim (tests assert this exact string); never a raw TypeError.
-export const TASK_SEAM_DEGRADED_ERROR =
-  "[forge:dispatch] child-session creation is unavailable on this host (the client exposes no session.create seam) — use the NATIVE task tool as the dispatch surface for subagent dispatches."
-
-const TASK_DESCRIPTION = [
-  "Dispatch a subagent as a REAL child session on this host (SDK session.create with parentID): the call renders in the host session tree with native subagent affordances — the live task panel, progress, expandable transcript, user abort — and runs the target agent with its own permission map. This is the single dispatch surface: ANY materialized target dispatches through here — configured `forge-*` subagents AND every other host agent.",
-  'run_in_background is YOUR dispatch-time decision: omit it (sync) when your very next step depends on the result — the call blocks until the child finishes and returns its final report (native parity: the child MAY ask the user questions; the user is present at the panel). Set run_in_background: true (async) when the result does NOT block your next steps — the call returns a task handle immediately and the child is created with the question tool denied session-wide (unattended: it never blocks on human input; an unanswered permission ask degrades to the honest poll-timeout finding naming the child session id, which stays inspectable and natively abortable in the TUI).',
-  'async discipline: after an async dispatch, END YOUR TURN. Interim [forge:dispatch-progress] notices may arrive while the child runs (informational only); the single [forge:dispatch-complete] message carrying the worker\'s final report is injected when it finishes — however long it takes (idle-only, at-most-once, delivery window). NEVER poll, re-dispatch, or "check on" an async dispatch before that wake arrives — pre-wake polling is a BLOCKING anti-pattern.',
-  "Sync dispatches carry abort parity: aborting the dispatching turn aborts the child session via the SDK. Async children intentionally SURVIVE turn aborts (session-scoped; they die at owner-session death, orphan-recorded).",
-   "Forge roster guidance: prefer a configured `forge-*` subagent whose description matches the job (each materialized description carries its pool provenance; .opencode/forge.json is the source). Gates on forge-* targets: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance belts, the plan-draft readonly-recon exemption (readonly scouts pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch — recursion is banned at their permission map). Non-forge host targets dispatch with native parity (no forge pool gate; the session-keyed crew pending belt and the plan-draft write-class deny still apply, exactly as for the native task tool). Cap: 3 concurrent async dispatches per session; a wish arriving beyond the cap QUEUES FIFO instead of refusing (per-session bound FORGE_DISPATCH_QUEUE_MAX, default 10) and spawns automatically when a slot frees — its handle reads QUEUED (queue position N) until spawn, and only a full queue refuses the call (listing every in-flight and queued task id).",
-].join("\n")
-
-const taskDispatchTool = tool({
-  description: TASK_DESCRIPTION,
-  args: {
-    subagent_type: tool.schema.string().describe('Target agent id — a materialized forge-* subagent (e.g. "forge-plugindev-spec-reviewer") or any other configured host agent id'),
-    prompt: tool.schema.string().describe("The complete task prompt for the worker (self-contained: it carries the artifact paths/slices and the evidence demands)"),
-    description: tool.schema.string().optional().describe("Short task description used as the child session's title in the host UI (defaults to the prompt's first words)"),
-    run_in_background: tool.schema.boolean().optional().describe('Dispatch-time decision: omit for sync (block this call until the child finishes and return its final report — the child may ask questions, native parity) or true for async (return a task handle immediately; interim [forge:dispatch-progress] notices may arrive while the child runs, and a single [forge:dispatch-complete] wake with the final report is guaranteed when it finishes, however long it takes — the child is sealed against human input)'),
-  },
-  execute: async (args, context) => {
-    noteToolAgent(context)
-    const target = String(args.subagent_type ?? "").trim()
-    const promptRaw = String(args.prompt ?? "")
-    // The dispatch's stable id, allocated up front so the report-file
-    // delivery contract (dispatch-stream-loss-honesty) can name its
-    // concrete path in the child's prompt — the SAME id serves the queued,
-    // async, and sync branches (one newJobId() per dispatch).
-    const dispatchId = newJobId()
-    const prompt = promptRaw ? withReportDelivery(promptRaw, dispatchId) : ""
-    const runInBackground = args.run_in_background === true
-    if (!target || !prompt) throw new Error("[forge:dispatch] subagent_type and prompt are both required.")
-    // fix-unknown-session-anchor-seed (design D4): the caller's directory is
-    // resolved from the host's session record BEFORE any gate below can
-    // refuse. On a multi-directory process a dispatch refused by any gate
-    // can then only leave the caller bound to its OWN directory — the host
-    // record's — never to the last-initialized one. Single-directory
-    // processes seed exactly as before. The read goes through the rebind
-    // client the accepted path below already uses; with no client, or when
-    // the host gives nothing, the caller stays unbound (fail-open).
-    await stateForCheck(context.sessionID, sharedAnchorClient())
-    const forgeTarget = target.toLowerCase().startsWith("forge-")
-    // Tool-partition family gates, enforced in-execute (belt parity with
-    // tool.execute.before): forge-* workers hit the primary-only refusal
-    // (recursion ban depth — their permission map already denies task);
-    // non-forge speakers never reach forge-* targets through us.
-    const speaker = sessionAgents.get(context.sessionID)
-    if (speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT) {
-      throw new Error(
-        `[forge:partition] Tool refused: "task" dispatch is reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent dispatches at the gate.`,
-      )
-    }
-    if (speaker !== undefined && !isForgeFamilyAgent(speaker) && forgeTarget) {
-      throw new Error(
-        `[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use non-forge host subagents, or switch to the forge agent to dispatch forge-* workers.`,
-      )
-    }
-    // Crew pending belt: a registered-but-unarmed crew refuses EVERY task
-    // dispatch (both target classes — same copy as the belt).
-    const pendingRefusal = crewPendingRefusal(context.sessionID)
-    if (pendingRefusal) throw new Error(pendingRefusal)
-    if (forgeTarget) {
-      // Target must be a materialized pool agent (hot-apply resolve).
-      const agentId = target.slice("forge-".length)
-      const resolution = resolvePools()
-      if (!resolution || !resolution.agents[agentId]) {
-        const hint = nativeRosterSyncHint()
-        throw new Error(
-          `[forge:dispatch] "${target}" is not a materialized forge subagent on this host. Check the roster in the agent descriptions (or .opencode/forge.json), or dispatch a host agent instead.${hint ?? ""}`,
-        )
-      }
-      // Gate parity with the task belt: the SAME predicates, same copy.
-      // The anchor resolution uses this host's client (jobClient — the client
-      // of the server() initialization that registered this tool's host).
-      const poolRefusal = await poolGateRefusal(jobClient, context.sessionID, target)
-      if (poolRefusal) throw new Error(poolRefusal)
-      const complianceRefusal = await crewComplianceRefusalFor(jobClient, context.sessionID, target)
-      if (complianceRefusal) throw new Error(complianceRefusal)
-    } else {
-      // Non-forge host target (native parity path): same engine, no forge
-      // pool gate. The target must exist as a host agent — honest refusal
-      // otherwise (OMO "Agent not found" style).
-      if (!knownHostAgents.has(target)) {
-        throw new Error(
-          `Agent not found: "${target}" is neither a materialized forge-* subagent nor a configured host agent. Check the agent id against the TUI agent list (or the forge roster in the agent descriptions) and retry.`,
-        )
-      }
-    }
-    const draftRefusal = draftDispatchRefusalForState(await stateForCheck(context.sessionID, sharedAnchorClient()), target)
-    if (draftRefusal) throw new Error(draftRefusal)
-    // Fold D (cap queueing): at the cap of 3 RUNNING dispatches the wish no
-    // longer refuses — it QUEUES (per-session FIFO, bounded
-    // FORGE_DISPATCH_QUEUE_MAX default 10). Only a wish beyond the queue
-    // bound is refused, with the in-flight AND queued task ids.
-    let queueAfterCap = false
-    if (runInBackground) {
-      const inFlight = inFlightAsyncDispatches(context.sessionID)
-      if (inFlight.length >= ASYNC_DISPATCH_CAP) {
-        const queuedIds = queuedAsyncDispatchIds(context.sessionID)
-        const queueMax = resolveDispatchQueueMax()
-        if (queuedIds.length >= queueMax) {
-          throw new Error(
-            `[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")} — and the dispatch queue is full (bound ${queueMax}): ${queuedIds.join(", ")}. ` +
-              `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one without run_in_background.`,
-          )
-        }
-        queueAfterCap = true
-      }
-    }
-    const client = dispatchClient()
-    if (!client) throw new Error("[forge:dispatch] no host client available — dispatch cannot create a child session.")
-    // fix-v2-crew-surface-drift task 2.2 (design D2): guarded shape probe on
-    // the child-session creation seam. When the host client resolves NO
-    // create seam, the tool degrades with the honest contract string naming
-    // the native task tool as the dispatch surface — never a raw TypeError
-    // (the 2.3.2 live failure: "client.session.create is not a function").
-    if (typeof client.session?.create !== "function") throw new Error(TASK_SEAM_DEGRADED_ERROR)
-    // fix-v2-crew-surface-drift task 2.3 (design D2): the child's parent
-    // directory resolves from the AUTHORITATIVE anchor (the same
-    // authoritative-first chain as the belts) — a re-anchored parent
-    // produces a correctly-anchored child. Without an anchor client the
-    // resolution is exactly today's (tool-context anchor).
-    const anchorSeam = sharedAnchorClient()
-    const anchorDir =
-      anchorSeam && typeof anchorSeam.session?.get === "function"
-        ? (await resolveSessionAnchorForPools(anchorSeam, context.sessionID)) || sessionAnchor(context) || context.worktree
-        : sessionAnchor(context) || context.worktree
-    const state = ensureSession(context.sessionID, anchorDir)
-    const description =
-      typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60)
-    // Provider gate (harden-dispatch-resilience D3): admission is checked
-    // BEFORE any child exists — breaker first, then provider/model
-    // concurrency. A refusal throws the gate's honest string (mechanism,
-    // counted dimension + current value, recovery condition); breaker
-    // refusals are the plugin's own throttle and NEVER enter the
-    // provider-retry path (no child was created, the error classifier is
-    // never consulted). A QUEUED wish checks now but releases immediately —
-    // the pump re-checks (and re-admits) at dequeue time.
-    const gate = gateFor(state.worktree)
-    const gateIdentity = dispatchModelIdentity(target, context.sessionID)
-    if (gateIdentity) {
-      const admission = gate.admit(gateIdentity)
-      if (!admission.ok) throw new Error(admission.refusal)
-      gateProvidersSeen.add(gateIdentity.provider)
-      if (queueAfterCap) dispatchGate?.release(gateIdentity)
-      else admittedGate.set(dispatchId, gateIdentity)
-    }
-    if (queueAfterCap) {
-      // Fold D: the queued handle returns immediately (like an async
-      // handle) with queued: true panel metadata and a queue position note;
-      // the pump spawns it when a slot frees.
-      const jobId = dispatchId
-      const queue = dispatchQueues.get(context.sessionID) ?? []
-      const position = queue.length + 1
-      queue.push({ jobId, agentID: target, ownerSession: context.sessionID, description, prompt, directory: state.worktree, questionDeny: true, enqueuedAt: Date.now() })
-      dispatchQueues.set(context.sessionID, queue)
-      journalTransition(state.worktree, {
-        id: jobId,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        state: "queued",
-        attempts: 1,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        prompt,
-        questionDeny: true,
-        description,
-      })
-      const queuedMeta = {
-        agent: target,
-        sessionId: "",
-        taskId: jobId,
-        run_in_background: true,
-        description,
-        prompt,
-        queued: true,
-      }
-      context.metadata({ title: `${target}: dispatch queued (${jobId})`, metadata: { ...queuedMeta } })
-      return {
-        title: `${target}: dispatch queued (${jobId})`,
-        metadata: { ...queuedMeta },
-        output: [
-          `[forge:dispatch] Dispatched ${target} in async mode — the session is at the async dispatch cap (${ASYNC_DISPATCH_CAP} running), so this wish is QUEUED (queue position ${position}).`,
-          `task id: ${jobId}`,
-          `agent: ${target}`,
-          `queued: position ${position} — the wish spawns automatically when a slot frees (a [forge:dispatch-progress] notice announces its start; the roster, draft gate, and crew belt are re-checked at spawn time).`,
-          `Next: END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when the spawned child finishes — however long it takes. Never poll or re-dispatch to check on it.`,
-        ].join("\n"),
-      }
-    }
-    // Fold E: journal the dispatch-time transition BEFORE the child exists —
-    // a crash between create and spawn leaves this non-terminal record, which
-    // recovery treats with queued semantics.
-    const asyncJobId = runInBackground ? dispatchId : ""
-    if (asyncJobId) {
-      journalTransition(state.worktree, {
-        id: asyncJobId,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        state: "dispatched",
-        attempts: 1,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        prompt,
-        questionDeny: true,
-        description,
-      })
-    }
-    // Pre-spawn roster validation (dispatch-v2-hostsignals 2.2): a drifted
-    // roster refuses HERE — the task 1.1 probe proved the host's create
-    // accepts ANY agent id verbatim (bogus included), so without this check
-    // a stale target spawns a naked default-agent child. Gate admission is
-    // released on the same failure shape as a create failure.
-    const rosterRefusal = forgeTargetUnresolved(target)
-    if (rosterRefusal) {
-      releaseGateAdmission(dispatchId)
-      throw new Error(`[forge:dispatch] target refused: ${rosterRefusal}`)
-    }
-    const created = await createChildSessionBound(client, {
-      parentSessionID: context.sessionID,
-      parentDirectory: state.worktree,
-      agentID: target,
-      description,
-      // Question policy is mode-keyed (task-shadow): sync keeps questions
-      // available (native parity); async seals the child unattended.
-      questionDeny: runInBackground,
-      // Agent-bound creation (dispatch-v2-hostsignals 2.1): the roster pin
-      // rides the create body; the binding is asserted on the record read
-      // back (v2 proven by the task 1.1 probe — v1 records not probed, the
-      // assert stays off there).
-      modelPin: rosterModelPin(target),
-      assertBinding: v2HostSeen,
-      // Nested-dispatch guard (D2): non-forge ∧ anthropic family — the
-      // deny rides the create body on BOTH modes (a sync child can nest as
-      // much as an async one).
-      taskDeny: nestedTaskDenyFor(target, context.sessionID),
-    })
-    if (!created.ok) {
-      releaseGateAdmission(dispatchId)
-      throw new Error(`[forge:dispatch] child session creation failed: ${created.error}`)
-    }
-    const sent = await sendPrompt(client, { sessionID: created.sessionID, agentID: target, prompt, directory: state.worktree })
-    if (!sent.ok) {
-      releaseGateAdmission(dispatchId)
-      throw new Error(`[forge:dispatch] prompt send to child session ${created.sessionID} failed: ${sent.error} — the child exists and is natively abortable in the TUI.`)
-    }
-    // Tool-part metadata mirroring the native/OMO task shape (design D3) —
-    // the TUI task renderer drives off these keys.
-    const taskMetadata = {
-      agent: target,
-      sessionId: created.sessionID,
-      taskId: "",
-      run_in_background: runInBackground,
-      description,
-      prompt,
-    }
-    if (!runInBackground) {
-      // dispatch-resilience folds B+C on the SYNC path: the wait is SLICED
-      // (5 s boundaries) so the same activity-stale reap and error-classified
-      // retry govern sync dispatches — the resilience SHALLs do not carve out
-      // the sync window. A real timeout still arms the standard tracker.
-      const syncIntervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS)
-      const syncSliceMs = Math.max(syncIntervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5_000))
-      const syncTimeoutMs = resolvePollTimeoutMs()
-      const staleMsSync = resolveStaleMs()
-      const staleModeSync: StaleMode = resolveStaleMode()
-      const staleFloorSync = resolveStaleFloorMs()
-      const maxAttemptsSync = resolveMaxAttempts()
-      const retryBackoffSync = resolveRetryBackoffMs()
-      const syncStability: TerminalStabilityState = { stableTicks: 0 }
-      const syncStale: StaleSweepState = { lastActivity: null, staleNotified: false }
-      taskMetadata.taskId = dispatchId
-      const syncJobId = dispatchId
-      // Fold E: the sync path journals the same transitions (dispatched →
-      // started here; terminal at each return below; retry-pending/started
-      // in the retry branch; the armed tracker terminalizes at its settle).
-      const syncJournalBase = { id: syncJobId, agent: target, ownerSession: context.sessionID, workspace: state.worktree, prompt, description, questionDeny: false }
-      journalTransition(state.worktree, {
-        id: syncJobId,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        state: "dispatched",
-        attempts: 1,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        prompt,
-        questionDeny: false,
-        description,
-      })
-      journalTransition(state.worktree, {
-        id: syncJobId,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        state: "started",
-        childSessionId: created.sessionID,
-        attempts: 1,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        prompt,
-        questionDeny: false,
-        description,
-      })
-      let childSessionID = created.sessionID
-      let attemptSync = 1
-      let syncStartedAt = Date.now()
-      const waitStartedAt = Date.now()
-      let syncCompleted = false
-      let syncStreamLost = false
-      let syncOverride = false
-      let syncError: string | null = null
-      const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1"
-      let syncSliceCount = 0
-      // Host-signal completion (dispatch-v2-hostsignals): the wait latch
-      // arms for the FIRST sync child (respawns re-arm below) and the
-      // persisted registry row mirrors this watch while the sync call
-      // blocks (removed at terminal by the journal choke point).
-      armDispatchWaitWatcher(childSessionID)
-      void writeDispatchStorageRow({
-        taskId: syncJobId,
-        childSessionID,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        description,
-        prompt,
-        questionDeny: false,
-        attempts: attemptSync,
-        startedAt: syncStartedAt,
-        updatedAt: Date.now(),
-      })
-      syncWait: for (;;) {
-        // D4 (task 3.1): host-signal first — a durable terminal event
-        // settles the sync wait with zero REST polls. The final-message
-        // read below is the report carrier, not a poll.
-        const signal = takeDispatchTerminalSignal(childSessionID)
-        if (signal) {
-          forgetDispatchSignals(childSessionID)
-          if (signal.kind === "failed") {
-            syncError = signal.detail ?? "session.execution.failed"
-            break syncWait
-          }
-          if (signal.kind === "interrupted" && signal.detail === "user") {
-            const ab = await abortChild(client, childSessionID)
-            journalTerminalRecord(syncJournalBase, "aborted", `child session ${childSessionID} was interrupted by the user (execution.interrupted)`)
-            context.metadata({ title: `${target}: dispatch interrupted`, metadata: { ...taskMetadata } })
-            return {
-              title: `${target}: dispatch interrupted`,
-              metadata: { ...taskMetadata },
-              output: [
-                `[forge:dispatch] Child session ${childSessionID} was interrupted by the user${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`} — dispatch finalized honestly.`,
-                `task id: ${syncJobId}`,
-              ].join("\n"),
-            }
-          }
-          if (signal.kind === "succeeded") {
-            syncCompleted = true
-            break syncWait
-          }
-          // Non-user interruption: treat as activity, keep waiting.
-          noteDispatchChildActivity(childSessionID)
-        }
-        const poll = await pollChild(client, {
-          sessionID: childSessionID,
-          intervalMs: syncIntervalMs,
-          timeoutMs: syncSliceMs,
-          stability: syncStability,
-          signal: context.abort,
-        })
-        if (poll.status === "aborted") {
-          // Sync abort parity (design D4): abort the child via the SDK and
-          // resolve with the abort disclosed.
-          const ab = await abortChild(client, childSessionID)
-          journalTerminalRecord(syncJournalBase, "aborted", `dispatching turn aborted — child session ${childSessionID} aborted via the SDK`)
-          context.metadata({ title: `${target}: dispatch aborted`, metadata: { ...taskMetadata } })
-          return {
-            title: `${target}: dispatch aborted`,
-            metadata: { ...taskMetadata },
-            output: [
-              `[forge:dispatch] The dispatching turn was aborted — child session ${childSessionID} was aborted via the SDK${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`}.`,
-              `task id: ${syncJobId}`,
-            ].join("\n"),
-          }
-        }
-        if (poll.status === "error") {
-          // Fold C on the sync path: retry ONLY transient classes while
-          // attempts remain (stale kills never reach this — they are
-          // orchestrator-side findings below; a registry kill cannot happen
-          // mid-sync-call).
-          if (attemptSync < maxAttemptsSync && classifyDispatchError(poll.error) === "retryable") {
-            const errorHead = poll.error.split("\n")[0].slice(0, 160)
-            attemptSync++
-            journalTransition(state.worktree, {
-              id: syncJobId,
-              agent: target,
-              ownerSession: context.sessionID,
-              workspace: state.worktree,
-              state: "retry-pending",
-              attempts: attemptSync,
-              createdAt: Date.now(),
-              updatedAt: Date.now(),
-              prompt,
-              questionDeny: false,
-              description,
-            })
-            queueDispatchProgress(
-              context.sessionID,
-              `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`,
-              // Delivered only if this call timed out and armed the tracker
-              // (a registry row is then live); a dispatch that completed
-              // inside the sync wait has no row — its result was returned.
-              () => dispatchStillLive(syncJobId),
-            )
-            await new Promise((resolve) => setTimeout(resolve, retryBackoffSync))
-            const refusal =
-              crewPendingRefusal(context.sessionID) ??
-              // fix-unknown-session-anchor-seed D2: the sync-wait retry's
-              // respawn re-judges the draft through the same resolver as the
-              // async poller's (the caller is normally bound since the
-              // pre-gate resolution above; this covers an owner the host
-              // could only resolve later).
-              draftDispatchRefusalForState(await stateForCheck(context.sessionID, sharedAnchorClient()), target) ??
-              forgeTargetUnresolved(target)
-            if (refusal) {
-              journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`)
-              throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
-            }
-            const respawn = await createChildSessionBound(client, {
-              parentSessionID: context.sessionID,
-              parentDirectory: state.worktree,
-              agentID: target,
-              description,
-              questionDeny: false,
-              modelPin: rosterModelPin(target),
-              assertBinding: v2HostSeen,
-              taskDeny: nestedTaskDenyFor(target, context.sessionID, childSessionID),
-            })
-            if (!respawn.ok) {
-              journalTerminalRecord(syncJournalBase, "error", `retry spawn failed: ${respawn.error}`)
-              throw new Error(`[forge:dispatch] retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
-            }
-            const sent = await sendPrompt(client, {
-              sessionID: respawn.sessionID,
-              agentID: target,
-              prompt: buildRetryPrompt(prompt),
-              directory: state.worktree,
-            })
-            if (!sent.ok) {
-              journalTerminalRecord(syncJournalBase, "error", `retry prompt send failed: ${sent.error}`)
-              throw new Error(`[forge:dispatch] retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`)
-            }
-            // Slot inheritance: fresh child, same sync call. Stale, stability,
-            // and the clock restart for the fresh child. Host-signal rebind:
-            // drop the dead child's signals, re-arm the latch + registry row.
-            forgetDispatchSignals(childSessionID)
-            childSessionID = respawn.sessionID
-            armDispatchWaitWatcher(childSessionID)
-            void writeDispatchStorageRow({
-              taskId: syncJobId,
-              childSessionID,
-              agent: target,
-              ownerSession: context.sessionID,
-              workspace: state.worktree,
-              description,
-              prompt,
-              questionDeny: false,
-              attempts: attemptSync,
-              startedAt: syncStartedAt,
-              updatedAt: Date.now(),
-            })
-            taskMetadata.sessionId = childSessionID
-            journalTransition(state.worktree, {
-              id: syncJobId,
-              agent: target,
-              ownerSession: context.sessionID,
-              workspace: state.worktree,
-              state: "started",
-              childSessionId: childSessionID,
-              attempts: attemptSync,
-              createdAt: Date.now(),
-              updatedAt: Date.now(),
-              prompt,
-              questionDeny: false,
-              description,
-            })
-            syncStartedAt = Date.now()
-            syncStale.lastActivity = null
-            syncStale.staleNotified = false
-            syncStability.stableTicks = 0
-            syncStability.activeTextfulTicks = 0
-            syncStability.textlessIdleSince = undefined
-            continue syncWait
-          }
-          syncError = attemptSync > 1 ? `${poll.error} — after ${attemptSync} attempt(s)` : poll.error
-          break syncWait
-        }
-        if (poll.status === "timeout") {
-          if (Date.now() - waitStartedAt >= syncTimeoutMs) break syncWait // real timeout → arm below
-          // Activity-stale reap (fold B) on the running axis — same helpers
-          // as the async poller; the probe doubles as the pre-kill re-read
-          // and the refresh rail.
-          if (syncDbg) {
-            syncSliceCount++
-            if (syncSliceCount === 1) {
-              const names: string[] = []
-              let cur = (client as unknown as { session?: object }).session
-              while (cur && cur !== Object.prototype) {
-                names.push(...Object.getOwnPropertyNames(cur))
-                cur = Object.getPrototypeOf(cur)
-              }
-              console.error(`[forge-dbg] client.session methods: ${[...new Set(names)].filter((n) => n !== "constructor").join(",")}`)
-            }
-            console.error(`[forge-dbg] slice ${syncSliceCount}: status=timeout idle=${syncStability.textlessIdleSince === undefined ? "undef" : "set"} staleMs=${staleMsSync} floor=${staleFloorSync} mode=${staleModeSync} elapsed=${Math.round((Date.now() - syncStartedAt) / 1000)}s`)
-          }
-          if (syncStability.textlessIdleSince === undefined) {
-            const probe = await sessionGet(client, childSessionID)
-            applyStaleProbe(syncStale, probe)
-            if (syncDbg) console.error(`[forge-dbg] probe: exists=${probe.exists} timeUpdated=${probe.timeUpdated} anchor=${syncStale.lastActivity}`)
-            if (staleThresholdCrossed(syncStale, Date.now(), syncStartedAt, staleMsSync, staleFloorSync)) {
-              const decision = decideStaleSweep(probe, syncStale, staleModeSync)
-              if (decision.action === "gone") {
-                journalTerminalRecord(syncJournalBase, "stale", `child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly`)
-                context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } })
-                return {
-                  title: `${target}: dispatch stale-finalized`,
-                  metadata: { ...taskMetadata },
-                  output: [
-                    `[forge:dispatch] (stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly).`,
-                    `task id: ${syncJobId}`,
-                  ].join("\n"),
-                }
-              }
-              if (decision.action === "kill") {
-                const ab = await abortChild(client, childSessionID)
-                if (ab.ok) {
-                  journalTerminalRecord(syncJournalBase, "stale", `aborted after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — child session ${childSessionID} killed by the stale reap`)
-                  context.metadata({ title: `${target}: dispatch stale-reaped`, metadata: { ...taskMetadata } })
-                  return {
-                    title: `${target}: dispatch stale-reaped`,
-                    metadata: { ...taskMetadata },
-                    output: [
-                      `[forge:dispatch] (stale: aborted after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — child session ${childSessionID} was killed by the stale reap (FORGE_DISPATCH_STALE_MS=${staleMsSync}); inspect its transcript in the host TUI).`,
-                      `task id: ${syncJobId}`,
-                    ].join("\n"),
-                  }
-                }
-                // Failed abort: finalize only when existence proves gone;
-                // otherwise skip this sweep and re-arm (next slice retries).
-                const reprobe = await sessionGet(client, childSessionID)
-                if (reprobe.exists === false) {
-                  journalTerminalRecord(syncJournalBase, "stale", `child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly`)
-                  context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } })
-                  return {
-                    title: `${target}: dispatch stale-finalized`,
-                    metadata: { ...taskMetadata },
-                    output: [
-                      `[forge:dispatch] (stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly).`,
-                      `task id: ${syncJobId}`,
-                    ].join("\n"),
-                  }
-                }
-              }
-              // observe mode / skipped sweeps: keep waiting (observe notices
-              // ride the armed tracker if the wait later times out)
-            }
-          }
-          continue syncWait
-        }
-        // Sustained view loss (dispatch-stream-loss-honesty) on the sync
-        // path: the poll view broke — never misread as completion; break
-        // out to the honest arm-and-throw settle below.
-        if (poll.status === "stream-lost") {
-          syncStreamLost = true
-          break syncWait
-        }
-        syncCompleted = true
-        syncOverride = poll.via === "active-textful"
-        break syncWait
-      }
-      // Sync watch over: drop this child's signal state (the persisted row
-      // removal rides the journalTerminalRecord choke points above).
-      forgetDispatchSignals(childSessionID)
-      if (syncCompleted) {
-        const fin = await fetchFinalMessage(client, childSessionID)
-        if (!fin.ok) {
-          journalTerminalRecord(syncJournalBase, "error", fin.error)
-          throw new Error(`[forge:dispatch] ${fin.error}`)
-        }
-        journalTerminalRecord(
-          syncJournalBase,
-          "completed",
-          `${target} finished (child session ${childSessionID})${syncOverride ? ` (${ACTIVE_TEXTFUL_OVERRIDE_NOTE})` : ""}`,
-        )
-        context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } })
-        const recoveredNote = attemptSync > 1 ? ` — recovered on attempt ${attemptSync}/${maxAttemptsSync} (previous child session(s) died with transient errors and were respawned; the [forge:dispatch-progress] notice lands in this transcript when the session idles)` : ""
-        const overrideNote = syncOverride ? ` — ${ACTIVE_TEXTFUL_OVERRIDE_NOTE}` : ""
-        return {
-          title: `${target}: dispatch complete`,
-          metadata: { ...taskMetadata },
-          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID})${recoveredNote}${overrideNote}.`, `Final report:\n${fin.text}`].join("\n"),
-        }
-      }
-      if (syncError !== null) {
-        journalTerminalRecord(syncJournalBase, "error", `child session ${childSessionID} ended in error: ${syncError}`.slice(0, 200))
-        throw new Error(`[forge:dispatch] child session ${childSessionID} ended in error: ${syncError}`)
-      }
-      // sync-timeout-notify: arm, don't abandon (design D1). The child is
-      // already running; before the honest throw we register it in the
-      // dispatch registry and start the standard completion poller so
-      // exactly one [forge:dispatch-complete] wake carries the final
-      // report when it eventually finishes. Arming is UNCONDITIONAL
-      // (design D3): the async cap governs new async dispatch DECISIONS,
-      // not the reality of an already-running child — refusing to track
-      // it would change nothing except guaranteeing the result is lost.
-      // Shared by BOTH honest wait-ends: the wait-budget timeout AND the
-      // sustained view loss (dispatch-stream-loss-honesty) — a lost view
-      // arms the same tracker (a recovered view + finish still delivers
-      // the wake; a sustained loss settles as a stream-lost wake).
-      const armSyncTracker = (): void => {
-        const job = jobManager.create({
-          id: syncJobId,
-          cmd: `dispatch ${target}: ${description} (sync wait ended, armed)`,
-          worktree: state.worktree,
-          ownerSession: context.sessionID,
-          logPath: join(jobLogDir(), "dispatch", `${syncJobId}.txt`),
-          notify: true,
-          // Owner-death harvest parity: the manager's kill() on session end
-          // aborts the child via the SDK and ledgers the orphan.
-          killTree: dispatchKillTreeHook(client, syncJobId, () => childSessionID),
-        })
-        ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID, description }
-        registerDispatchTask({ jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description }, state.worktree)
-        void runAsyncDispatchPoller(client, job, childSessionID, { prompt, directory: state.worktree, questionDeny: false })
-        context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
-      }
-      if (syncStreamLost) {
-        // dispatch-sync-handoff-notice: a view loss is NOT an error — the
-        // tracker is armed and the handoff surfaces as an informational
-        // notice (no error-channel rendering).
-        armSyncTracker()
-        const attemptNoteLost = attemptSync > 1 ? `${attemptSync} attempt(s) so far; tracking continues in the armed tracker.` : ""
-        return {
-          title: `${target}: dispatch continues (result stream lost)`,
-          metadata: { ...taskMetadata },
-          output: [
-            `[forge:dispatch] Result stream lost before a final report — child session ${childSessionID} state UNKNOWN (possibly still running). The dispatch continues in the background; collect with forge_jobs.`,
-            `task id: ${syncJobId}${attemptNoteLost ? ` — ${attemptNoteLost}` : ""}`,
-            `Ground-truth recovery: read reports/${syncJobId}-report.md in the workspace BEFORE considering a re-dispatch.`,
-            `If the view recovers and the child finishes, exactly one [forge:dispatch-complete] wake carries the outcome; the child session stays inspectable and natively abortable in the host TUI.`,
-          ].join("\n"),
-        }
-      }
-      // dispatch-sync-handoff-notice: the wait-budget expiry handoff is a
-      // normal notification, NOT an error — neutral wording naming the
-      // outcome, with every retrieval pointer preserved (job id, task
-      // handle, child session, report path).
-      armSyncTracker()
-      const attemptNote = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; retries continue in the armed tracker.` : ""
-      return {
-        title: `${target}: dispatch continues in background`,
-        metadata: { ...taskMetadata },
-        output: [
-          `[forge:dispatch] Sync wait budget ended (${syncTimeoutMs}ms) — the dispatch continues in the background; collect with forge_jobs.`,
-          `task id: ${syncJobId}${attemptNote}`,
-          `child session: ${childSessionID} — it remains a real session: inspect or abort it natively in the host TUI.`,
-          `Report path (ground truth): reports/${syncJobId}-report.md.`,
-          `The completion contract: exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes (interim [forge:dispatch-progress] notices may arrive meanwhile), however long it takes; do not poll or re-dispatch in the meantime.`,
-        ].join("\n"),
-      }
-    }
-    // async: registry entry (kind=dispatch) + poller; the handle returns now.
-    const jobId = asyncJobId || newJobId()
-    taskMetadata.taskId = jobId
-    const job = jobManager.create({
-      id: jobId,
-      cmd: `dispatch ${target}: ${description}`,
-      worktree: state.worktree,
-      ownerSession: context.sessionID,
-      logPath: join(jobLogDir(), "dispatch", `${jobId}.txt`),
-      notify: true,
-      // Owner-death harvest: the manager's kill() on session end calls this —
-      // the child session is aborted via the SDK and the orphan is ledgered.
-      killTree: dispatchKillTreeHook(client, jobId, () => created.sessionID),
-    })
-    ;(job as Job & { dispatch?: DispatchJobMeta }).dispatch = { agentID: target, childSessionID: created.sessionID, description }
-    registerDispatchTask({ jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description }, state.worktree)
-    // Fold E: the started transition (prompt retained — the journal is the
-    // only prompt source after a restart).
-    journalTransition(state.worktree, {
-      id: jobId,
-      agent: target,
-      ownerSession: context.sessionID,
-      workspace: state.worktree,
-      state: "started",
-      childSessionId: created.sessionID,
-      attempts: 1,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      prompt,
-      questionDeny: true,
-      description,
-    })
-    void runAsyncDispatchPoller(client, job, created.sessionID, { prompt, directory: state.worktree, questionDeny: true })
-    context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } })
-    return {
-      title: `${target}: dispatch async (${jobId})`,
-      metadata: { ...taskMetadata },
-      output: [
-        `[forge:dispatch] Dispatched ${target} in async mode — the child session runs in the background.`,
-        `task id: ${jobId}`,
-        `agent: ${target}`,
-        `child session: ${created.sessionID} (visible in the host session tree; natively abortable)`,
-        `Next: END YOUR TURN. Interim [forge:dispatch-progress] notices may arrive while the child runs (informational only); exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when it finishes — however long it takes. Never poll or re-dispatch to check on it. Cap: ${ASYNC_DISPATCH_CAP} concurrent async dispatches per session.`,
-      ].join("\n"),
-    }
-  },
-})
-
-
-
-
-// ---------------------------------------------------------------------------
-// Search tools (change forge-search-tools D1-D7; engine chain per change
-// search-js-fallback D1/D5/D6)
-// ---------------------------------------------------------------------------
-
-// Config override read at call time through the plugin-options surface (the
-// same surface jobs/watchdog ride). rg resolution itself re-runs PER CALL
-// (config override → PATH → bundled JS engine), so installing rg needs no
-// restart — and a machine with no rg at all still gets every call served.
-let searchRgPathOverride: string | undefined
-
-const FORGE_SEARCH_PREFERENCE_LINE =
-  "Prefer forge_grep/forge_glob over the builtin grep/glob — follow and hidden are on by default (symlinks/junctions and dot-directories are in scope; the builtin pair is blind to both)."
-
-const FORGE_GREP_DESCRIPTION = [
-  "Fast content search (ripgrep when it resolves, the plugin's bundled JS engine otherwise — a trailing engine line discloses which) that sees through symlinks/junctions and dot-directories where the builtin pair is blind. Readonly by construction: the pattern and path reach the serving engine as single literal values — no shell exists, so shell metacharacters can neither redirect output nor alter execution.",
-  "Output matches the builtin grep's format: `Found N matches` header + `path: Line n: content` blocks, truncated at 100 results with a notice. With follow on (default), a file reachable through multiple paths reports once and the output ends with a `+N duplicate paths merged` line; links whose targets lie outside the workspace are followed and the resolved outside target is disclosed.",
-  FORGE_SEARCH_PREFERENCE_LINE,
-].join("\n")
-
-const FORGE_GLOB_DESCRIPTION = [
-  "Fast file-pattern search (ripgrep when it resolves, the plugin's bundled JS engine otherwise — a trailing engine line discloses which) that lists matching paths — including EMPTY files — and paths behind symlinks/junctions and inside dot-directories where the builtin glob is blind. Readonly by construction — no shell ever exists.",
-  "Output matches the builtin glob's format: a plain unique path list (`No files found` when empty), truncated at 100 results with a notice. With follow on (default), duplicate link-path hits merge and the output ends with a `+N duplicate paths merged` line.",
-  FORGE_SEARCH_PREFERENCE_LINE,
-].join("\n")
-
-// Realpath seam for the dedupe post-pass: rg reports paths relative to its
-// cwd (the session worktree), so resolve against the worktree first, then
-// realpath. A resolution failure degrades to the reported path (fail-soft:
-// dedupe simply cannot merge what it cannot resolve).
-function reportedPathResolver(worktree: string): (p: string) => string {
-  return (p) => {
-    try {
-      return realpathSync.native(isAbsolute(p) ? p : join(worktree, p)).toString()
-    } catch {
-      return p
-    }
-  }
-}
-
-// Real fs seams for the bundled JS engine (change search-js-fallback D6):
-// readdir(withFileTypes) mapped to the engine's JsDirent shape; stat follows
-// links (symlink/junction classification); readFilePrefix reads maxBytes + 1
-// so the engine can detect oversized files; realpath via realpathSync.native
-// with a fail-soft fallback to the path as-is (a broken resolution must not
-// kill the walk — the engine's cycle guard degrades, siblings still apply).
-const realJsSeams: JsSearchSeams = {
-  readdir: async (dir) => {
-    const entries = await fsReaddir(dir, { withFileTypes: true })
-    return entries.map((e) => ({
-      name: e.name,
-      isFile: e.isFile(),
-      isDirectory: e.isDirectory(),
-      isSymbolicLink: e.isSymbolicLink(),
-    }))
-  },
-  stat: (p) =>
-    fsStat(p).then((s) => ({ isFile: s.isFile(), isDirectory: s.isDirectory() })),
-  readFilePrefix: async (p, maxBytes) => {
-    const fh = await fsOpen(p, "r")
-    try {
-      const buf = Buffer.alloc(maxBytes + 1)
-      const { bytesRead } = await fh.read(buf, 0, maxBytes + 1, 0)
-      return buf.subarray(0, bytesRead)
-    } finally {
-      await fh.close()
-    }
-  },
-  realpath: (p) => {
-    try {
-      return realpathSync.native(p).toString()
-    } catch {
-      return p
-    }
-  },
-}
-
-// Engine-disclosure footnotes (design D5) — appended LAST, after the dedupe
-// footnotes, whenever the bundled JS engine served the call.
-const ENGINE_FOOTNOTE_MISS =
-  "(engine: builtin-js — ripgrep not found; install ripgrep or set search.rgPath for the faster engine)"
-const engineFootnoteFailure = (reason: string) =>
-  `(engine: builtin-js — rg failed to serve the call (${reason}); install ripgrep or set search.rgPath)`
-
-async function runSearch(
-  kind: SearchToolKind,
-  args: { pattern: string; path?: string; include?: string; follow?: boolean; hidden?: boolean },
-  context: { sessionID: string; worktree: string; directory?: string; agent?: unknown; metadata?: (input: { title?: string }) => void },
-): Promise<{ title: string; output: string }> {
-  // Engine chain (search-js-fallback D1/D6): config override → PATH rg →
-  // bundled JS engine. Resolution re-runs per call, so an install picked up
-  // mid-session works with no restart — and a miss now SERVES the call
-  // through the JS engine instead of failing soft.
-  const resolution = resolveRgBinary(searchRgPathOverride !== undefined ? { rgPath: searchRgPathOverride } : undefined)
-  const state = ensureSession(context.sessionID, worktreeFor(context))
-  const follow = args.follow !== false
-  const hidden = args.hidden !== false
-  const targetPath = typeof args.path === "string" && args.path.length > 0 ? (isAbsolute(args.path) ? args.path : join(state.worktree, args.path)) : undefined
-  // search-glob-anchor D1: an explicit path resolving to a DIRECTORY changes
-  // the serving shape on BOTH legs — the pattern anchors and the output reads
-  // RELATIVE TO THAT DIRECTORY. Root cause on the rg leg: with --hidden or
-  // --follow present (our defaults) and an ABSOLUTE root argument, rg lifts
-  // glob anchoring to the whole path, so anchored patterns (`*/x`) can never
-  // span the `C:\…` prefix (rg 15.2.0, bisect-verified). The fix: spawn rg
-  // with cwd = target dir and the path argument "." — the exact shape the
-  // default-root path always used. FILE targets and the default root keep
-  // their pre-change shapes.
-  let targetIsDir = false
-  if (targetPath !== undefined) {
-    try {
-      targetIsDir = (await fsStat(targetPath)).isDirectory()
-    } catch {
-      // Unstattable target: keep the legacy absolute-argument shape; the JS
-      // leg's root-access error surfaces honestly if rg also cannot serve.
-    }
-  }
-  context.metadata?.({ title: `forge_${kind}: ${args.pattern.slice(0, 60)}` })
-  let records: RgMatchRecord[] = []
-  let jsNotices: string[] = []
-  let engineFootnote: string | undefined
-  if (resolution.ok) {
-    // A path arg is ALWAYS given: with no path and a piped stdin, rg reads
-    // STDIN and never exits (probe-verified). "." keeps output paths relative
-    // (builtin parity). search-glob-anchor D1: an explicit DIRECTORY target
-    // ALSO serves through "." — rg runs with cwd = the target dir so anchored
-    // globs bind target-relative and output paths arrive `.\`-prefixed (the
-    // shared strip below turns them target-relative). A FILE target keeps the
-    // absolute-argument shape (single-file scan, no traversal anchoring).
-    const rgCwd = targetIsDir && targetPath !== undefined ? targetPath : state.worktree
-    const searchPath = targetIsDir ? "." : (targetPath ?? ".")
-    // One fixed argv vector per kind (D1). grep: literal pattern after `--`.
-    // glob: the files-listing vector (D1b, rg --files semantics) — the file
-    // pattern rides `--glob=` and EMPTY files are listed too (zero lines → no
-    // match events → invisible to the content vector; builtin-glob parity).
-    const argv =
-      kind === "glob"
-        ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden })
-        : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden })
-    // Direct spawn, shell:false, fixed argv — no shell string ever exists
-    // (readonly by construction; the exec seal governs forge_shell only).
-    // stdin is ignored: rg must never mistake our pipe for search input.
-    const child = spawn(resolution.binary, argv, { cwd: rgCwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] })
-    let stdout = ""
-    let stderr = ""
-    let spawnError: Error | undefined
-    child.on("error", (err) => {
-      spawnError = err
-    })
-    child.stdout?.on("data", (d: Buffer) => {
-      stdout += d.toString("utf8")
-    })
-    child.stderr?.on("data", (d: Buffer) => {
-      stderr += d.toString("utf8")
-    })
-    const code = await new Promise<number | null>((resolve) => {
-      child.on("close", (c) => resolve(c))
-    })
-    // rg exit codes: 0 = matches, 1 = no matches (both parse), 2+ = error.
-    // Spawn-stage failure (unspawnable binary) or exit > 1 falls THROUGH to
-    // the bundled JS engine (D1) — the old error objects die with the
-    // fail-soft contract; the footnote names the failure instead.
-    if (spawnError !== undefined) {
-      engineFootnote = engineFootnoteFailure(spawnError.message)
-    } else if (code !== null && code > 1) {
-      engineFootnote = engineFootnoteFailure(`exit ${code}`)
-    } else {
-      // rg --files (glob) emits a plain path list; grep emits the --json
-      // stream. The default "." path arg makes rg prefix every path with .\ or
-      // ./ — strip it for builtin-pair output parity (they print bare relative
-      // paths). stderr intentionally unused on clean exits (rg -h noise).
-      void stderr
-      const stripDotPrefix = (p: string): string => p.replace(/^\.(?:\\|\/)/, "")
-      const rawRecords = kind === "glob" ? parseRgFilesList(stdout) : parseRgJsonStream(stdout).records
-      records = rawRecords.map((r) => ({ ...r, path: stripDotPrefix(r.path) }))
-    }
-  } else {
-    // Resolution miss: the bundled JS engine serves the call directly (D6).
-    engineFootnote = ENGINE_FOOTNOTE_MISS
-  }
-  if (engineFootnote !== undefined) {
-    // JS engine serves a call rg could not. The walk root is the resolved
-    // absolute target (or the session worktree). search-glob-anchor D2: a
-    // DIRECTORY target's records stay walk-relative VERBATIM — byte-identical
-    // to the rg leg's stripped `.`-form output for the same query (cross-
-    // engine consistency); only a FILE target carries the root join (its
-    // verbatim-abs records pass through). Errors (compile failure /
-    // inaccessible root) return verbatim — no partial results.
-    const root = targetPath ?? state.worktree
-    const js = await jsSearch(
-      { kind, root, pattern: args.pattern, include: args.include, follow, hidden, pathSeparator: process.platform === "win32" ? "\\" : "/" },
-      realJsSeams,
-    )
-    if (js.error !== undefined) {
-      return { title: "search engine error", output: js.error }
-    }
-    records =
-      targetPath === undefined || targetIsDir
-        ? js.records
-        : js.records.map((r) => (isAbsolute(r.path) ? r : { ...r, path: join(root, r.path) }))
-    jsNotices = js.notices
-  }
-  // Shared post-pass, UNCHANGED for both engines (D2): records →
-  // dedupeFollowMatches (same reportedPathResolver seam) → formatSearchOutput,
-  // with the JS engine's bound notices and — LAST — the engine footnote
-  // appended on new lines. rg-served calls carry no footnote.
-  // search-glob-anchor D3: the realpath resolver keys to the call's
-  // EFFECTIVE root — an explicit directory target resolves its records
-  // against THAT directory (they are target-relative now), not the worktree;
-  // the outside-workspace disclosure keeps comparing against the worktree
-  // (disclosure semantics: what escapes the WORKSPACE).
-  const effectiveRoot = targetIsDir && targetPath !== undefined ? targetPath : state.worktree
-  const deduped = dedupeFollowMatches(records, {
-    worktreeRoot: state.worktree,
-    resolvePath: reportedPathResolver(effectiveRoot),
-    follow,
-  })
-  const body = formatSearchOutput(deduped.records, {
-    kind,
-    mergedDuplicates: deduped.mergedDuplicates,
-    outsideTargets: deduped.outsideTargets,
-  })
-  const output = [body, ...jsNotices, ...(engineFootnote !== undefined ? [engineFootnote] : [])].join("\n")
-  return {
-    title: `${deduped.records.length} result${deduped.records.length === 1 ? "" : "s"}`,
-    output,
-  }
-}
-
-const forgeGrepTool = tool({
-  description: FORGE_GREP_DESCRIPTION,
-  args: {
-    pattern: tool.schema.string().describe("The regular expression to search for (passed to ripgrep verbatim as a single literal argument)"),
-    path: tool.schema.string().optional().describe("Optional target file or directory (workspace-relative, or absolute). Defaults to the session worktree"),
-    include: tool.schema.string().optional().describe("File filter glob (e.g. \"*.ts\") — only matching files are searched"),
-    follow: tool.schema.boolean().optional().describe("Follow symlinks/junctions during traversal (default TRUE — diverges from the builtin pair by design)"),
-    hidden: tool.schema.boolean().optional().describe("Search dot-directories (default TRUE — diverges from the builtin pair by design)"),
-  },
-  execute: async (args, context) => {
-    noteToolAgent(context)
-    return runSearch("grep", { pattern: args.pattern, path: args.path, include: args.include, follow: args.follow, hidden: args.hidden }, context)
-  },
-})
-
-const forgeGlobTool = tool({
-  description: FORGE_GLOB_DESCRIPTION,
-  args: {
-    pattern: tool.schema.string().describe("The file-pattern glob to list (e.g. \"**/*.ts\") — rides ripgrep's --glob filter verbatim"),
-    path: tool.schema.string().optional().describe("Optional target directory (workspace-relative, or absolute). Defaults to the session worktree"),
-    follow: tool.schema.boolean().optional().describe("Follow symlinks/junctions during traversal (default TRUE — diverges from the builtin pair by design)"),
-    hidden: tool.schema.boolean().optional().describe("List dot-directories' files (default TRUE — diverges from the builtin pair by design)"),
-  },
-  execute: async (args, context) => {
-    noteToolAgent(context)
-    return runSearch("glob", { pattern: args.pattern, path: args.path, follow: args.follow, hidden: args.hidden }, context)
-  },
-})
-
 // /crew discipline (spec: crew-harness, change simplify-dispatch-to-static-agents):
-// a template rulebook + an in-memory registry. Waves are batches of parallel
-// native `task` calls (results return in-turn); the declared subtask plan
+// a template rulebook + an in-memory registry. The native workflow describes
+// waves of `subagent` calls and separately delivered results; the declared subtask plan
 // registered at crew_begin is the crew_close gate's source of truth. The
 // template is COMPOSED PER CONFIG at the config hook: with configured agents
 // it carries the orchestration rulebook plus the live agent roster; with an
@@ -6386,7 +2299,7 @@ export function crewOrchestrationTemplate(resolution: PoolResolution | null): st
     "",
     "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
     "",
-    "Configured forge subagents (task-tool vocabulary). ROSTER OWNERSHIP (sole ownership): THIS session's dispatchable roster is its WORKSPACE pool — the nearest .opencode/forge.json walking up from this session's worktree — or, when the workspace has none, the GLOBAL fallback layer (a fallback, not a merge; forge.json files nested deeper in the workspace subtree are ignored, same as opencode's native MCP config). Check this workspace's pool:",
+    "Configured forge subagents (native subagent tool). ROSTER OWNERSHIP (sole ownership): THIS session's dispatchable roster is its WORKSPACE pool — the nearest .opencode/forge.json walking up from this session's worktree — or, when the workspace has none, the GLOBAL fallback layer (a fallback, not a merge; forge.json files nested deeper in the workspace subtree are ignored, same as opencode's native MCP config). Check this workspace's pool:",
     '  - this workspace pool (when the path prints, its agents ARE the roster): !`ls .opencode/forge.json 2>/dev/null || echo "(no workspace pool — the global fallback applies)"`',
     `  - global fallback layer: ${globalPath} — dispatchable ONLY when the workspace has no pool of its own`,
     ...(otherLines.length > 0
@@ -6395,14 +2308,14 @@ export function crewOrchestrationTemplate(resolution: PoolResolution | null): st
     "",
     "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). The macro contract above the crew may come from an approved plan, a spec change, or inline text — the discipline is identical in all three cases and never requires a plan. Follow it exactly:",
     "",
-    "1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). When the macro contract descends from a plan artifact, pass its path as the optional `lineage` argument (e.g. lineage: \".opencode/plan/2026-10-01-my-plan.md\") — the descent is recorded as a first-class line in the crew record header; lineage is never inferred. Reconnaissance BEFORE registration is free (task calls included). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. A wrong plan is fixed by abandoning and re-crewing (crew_close {abandon: true, reason}), never by improvising outside the declared plan.",
-    '2. THE PAUSE: registration enters a PENDING crew — execution has NOT started. STOP and present the user the three execution-mode choices (supervised waves now / convert to a goal contract / standby), then END YOUR TURN. Arm per the user\'s choice: waves → crew_begin {execution: "waves"} (waves then auto-advance on session idle until crew_close — the engine stops after a stall, nudge or re-shard); conversion → crew_begin {execution: "goal"} followed by goal_write (arm=true — its dialog is the user\'s gate) folding the declared subtasks into criteria/checks; standby → no call. EXCEPTION: while a live active goal governs this session, register with execution: "waves" in the SAME call — the crew is born armed (the goal contract already authorized orchestration) and crew_close / abandon stay ask-free under that goal.',
-    "3. WAVES, NEVER FLOODS (armed crews only): execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in. GUI / computer-use subtasks are mutually exclusive within a wave (the desktop is a singleton resource — at most ONE in flight; non-GUI subtasks still parallelize freely), and GUI walkthroughs use the `computer` tool rather than DIY shell screenshot pipelines. Native fallback: when the pool offers no forge worker fitting a subtask (or forge-* dispatch is blocked by a degraded pool), dispatch the native general subagent with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native).",
+    "1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). When the macro contract descends from a plan artifact, pass its path as the optional `lineage` argument (e.g. lineage: \".opencode/plan/2026-10-01-my-plan.md\") — the descent is recorded as a first-class line in the crew record header; lineage is never inferred. Reconnaissance BEFORE registration is subject to ordinary host permissions and existing approvals. If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. A wrong plan is fixed by abandoning and re-crewing (crew_close {abandon: true, reason}), never by improvising outside the declared plan.",
+    '2. THE PAUSE: registration enters a PENDING crew — execution has NOT started. STOP and present the user the three execution-mode choices (supervised waves now / convert to a goal contract / standby), then END YOUR TURN. Arm per the user\'s choice: waves → crew_begin {execution: "waves"} (waves then continue on session idle only after verified settlement and while authorization remains — if stalled, seek the user’s decision or re-shard within existing approvals); conversion → crew_begin {execution: "goal"} followed by goal_write (arm=true — its dialog is the user\'s gate) folding the declared subtasks into criteria/checks; standby → no call. EXCEPTION: while a live active goal governs this session, register with execution: "waves" in the SAME call — the crew is born armed (the goal contract already authorized orchestration) and crew_close / abandon stay ask-free under that goal.',
+    `3. WAVES, NEVER FLOODS (armed crews only): ${CREW_WAVE_RULE} GUI / computer-use subtasks are mutually exclusive within a wave (the desktop is a singleton resource — at most ONE in flight; non-GUI subtasks still parallelize freely), and GUI walkthroughs use the \`computer\` tool rather than DIY shell screenshot pipelines. ${CREW_NATIVE_FALLBACK_RULE}`,
     "4. CONTRACT RELAY (lineage-descended crews): when the macro contract descends from an on-disk artifact (the lineage names a plan artifact, a spec change directory, or a goal contract), every subtask's dispatch prompt MUST explicitly carry that artifact's path — or the exact slice the subtask works from (a delta file path, a quoted criteria section) — so the dispatched worker reads the contract itself, never your paraphrase of it. A large artifact is relayed by its exact slice; it is NEVER dropped for being too long to inline. Every close-report evidence statement MUST name the contract (or slice) the subtask worked against.",
-    "5. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, run that subtask through a native task call anyway AND tell the user about the gap — suggest configuring the missing role in forge.json.",
-    "6. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the task result text. A result that does not meet the statement is a failure even if the worker sounded confident.",
-    "7. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or agent. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
-    "8. CLOSE: when every declared subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks the report against the declared plan — a declared subtask missing from the report refuses the close, and so does an undeclared one. The user confirms the closing dialog (ask-free while a goal governs the session).",
+    "5. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, tell the user about the gap — suggest configuring the missing role in forge.json. Use only an authorized native subagent for that work.",
+    "6. VERIFY: judge each subtask strictly against its acceptance-evidence statement using the child's report and verified evidence. Associate the declared title with the work rounds (including a reused session), attempts and any recorded fallback. A host terminal outcome alone does not establish PASS; unknown or incomplete evidence cannot establish PASS.",
+    "7. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or agent, subject to existing approvals. Keep both attempts visible; only verified successful evidence supports PASS after a failure. If the retry also fails, record FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
+    "8. CLOSE: when all work rounds are verified settled and every declared subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks the report against the declared plan — a declared subtask missing from the report refuses the close, and so does an undeclared one. The user confirms the closing dialog under existing approval rules.",
   ].join("\n")
 }
 
@@ -6527,16 +2440,17 @@ const crewBeginTool = tool({
           ].join("\n"),
         }
       }
+      crew.goalGoverned = governingGoalFor(context.sessionID)
       crew.mode = "executing"
       appendCrewRecord(crew.recordPath, "armed (waves)", ["The user chose supervised waves; the dispatch belt is lifted."])
       return {
         title: `crew armed: ${crew.objective.slice(0, 60)}`,
         output: [
           `[forge:crew] Crew ARMED for supervised waves: ${crew.objective}`,
-          `Waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard).`,
+          `Waves auto-advance on session idle until crew_close only after verified settlement of the previous wave (the engine stops after a stall — nudge or re-shard).`,
           `Declared plan (${crew.subtasks.length}):`,
           ...crew.subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
-          "Proceed with the wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+          `Proceed with the wave discipline: ${CREW_WAVE_RULE} Record per-subtask evidence verdicts, at most one retry, then crew_close with the full report covering every declared subtask under existing user approval rules.`,
           CREW_NATIVE_FALLBACK_RULE,
         ].join("\n"),
       }
@@ -6614,7 +2528,7 @@ const crewBeginTool = tool({
     // (crew-autonomous-waves D3): a stalled PRIOR crew never silences a new
     // one's idle continuation.
     crewEngineForgetSession(context.sessionID)
-    crews.set(context.sessionID, { objective: objectiveText, startedAt: nowIso(), subtasks, mode: governed ? "executing" : "pending", recordPath })
+    crews.set(context.sessionID, { objective: objectiveText, startedAt: nowIso(), subtasks, mode: governed ? "executing" : "pending", recordPath, goalGoverned: governed })
     appendCrewRecord(recordPath, governed ? "registered (born armed under a governing goal)" : "registered (pending)", subtasks.map((s, i) => `${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`))
     // Residual workspace-mismatch disclosure (sole-pool-ownership): the
     // session's own discovery found a forge.json this host has NOT
@@ -6674,8 +2588,8 @@ const crewBeginTool = tool({
     if (governed) {
       lines.push(
         "Goal-delegated orchestration: the governing goal contract already authorized this crew — run the wave discipline NOW (crew gates stay internal to the loop; crew_close and abandon are ask-free under this goal), and re-shard via crew_close {abandon: true, reason} + a fresh one-call crew_begin when the decomposition proves wrong.",
-        "This crew is driven by the goal engine's own continuations (no separate crew briefs); standalone waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard).",
-        "Wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+        "This crew is driven by the goal engine's own continuations (no separate crew briefs); standalone waves auto-advance on session idle until crew_close only after verified settlement of the previous wave (the engine stops after a stall — nudge or re-shard).",
+        `Wave discipline: ${CREW_WAVE_RULE} Record per-subtask evidence verdicts, at most one retry, then crew_close with the full report covering every declared subtask under existing approval rules.`,
         CREW_NATIVE_FALLBACK_RULE,
       )
     } else {
@@ -6696,7 +2610,8 @@ const crewCloseTool = tool({
       title: tool.schema.string().describe("Subtask title — must match a title declared at crew_begin"),
       verdict: tool.schema.string().describe("PASS or FAIL"),
       evidence: tool.schema.string().describe("Acceptance evidence: what the result contained that satisfies the acceptance statement"),
-      attempts: tool.schema.array(tool.schema.string()).optional().describe("For FAIL: both failure reports (attempt and retry)"),
+      attempts: tool.schema.array(tool.schema.string()).optional().describe("Both attempts when retried, including both failure reports for FAIL"),
+      rounds: tool.schema.array(tool.schema.string()).optional().describe("Optional native dispatch call IDs when the dispatch description does not identify this declared title"),
     })).optional().describe("The full crew report — one entry per declared subtask (not needed when abandoning)"),
     abandon: tool.schema.boolean().optional().describe("true = abandon the crew (re-shard / standby-cancel): ends it with an abandonment record, no verdicts required"),
     reason: tool.schema.string().optional().describe("Why the crew is abandoned (recorded in the crew record)"),
@@ -6725,6 +2640,12 @@ const crewCloseTool = tool({
     }
     const report = (args.report ?? []) as CrewSubtaskReport[]
     const check = validateCrewReport(report, crew.subtasks)
+    if (check.ok) {
+      const read = (context as unknown as { crewCloseEvidence?: () => Promise<CrewCloseEvidence> }).crewCloseEvidence
+      const evidence = read ? await read() : { rounds: crew.rounds ?? [], readable: false, inFlight: [], settled: [], context: null }
+      check.gaps.push(...crossCheckCrewEvidence(report, crew.subtasks, evidence))
+      check.ok = check.gaps.length === 0
+    }
     if (!check.ok) {
       throw new Error(`[forge:crew] crew_close refused — the report does not match the declared plan:\n${check.gaps.map((g) => `- ${g}`).join("\n")}\nThe crew stays active; complete or correct the report and call crew_close again.`)
     }
@@ -6784,26 +2705,21 @@ function forgeTools(): Record<string, ToolDefinition> {
     goal_resume: goalResumeTool,
     goal_discard: goalDiscardTool,
   }
-  if (jobStage() < 2) {
-    tools.forge_shell = forgeShellTool
-    tools.forge_jobs = forgeJobsTool
-  }
-  // Search pair (forge-search-tools D6): registered unconditionally — it is
-  // not part of the job supervisor (no retirement) and carries no ask-gate.
-  tools.forge_grep = forgeGrepTool
-  tools.forge_glob = forgeGlobTool
-  if (!forgeDisabled) {
-    tools.crew_begin = crewBeginTool
-    tools.crew_close = crewCloseTool
-    // native-first-roster: the in-band roster sync tool (both host
-    // generations register it through this one factory).
-    tools.forge_sync = forgeSyncTool
-    // task (change task-shadow): the SDK dispatch engine shadows the native
-    // task tool under its own NAME — the TUI keys its live subagent panel on
-    // `task` (OMO-proven on this stack). Removed with the whole family under
-    // the disable knob (the native task tool returns). forge_dispatch is
-    // RETIRED: this is the single dispatch surface.
-    tools.task = taskDispatchTool
+  tools.crew_begin = crewBeginTool
+  tools.crew_close = crewCloseTool
+  // The host owns the v2 registry lifecycle; the retained v1 getter
+  // independently decides whether to expose this factory at all.
+  tools.forge_sync = forgeSyncTool
+  for (const [name, def] of Object.entries(tools)) {
+    if (!FORGE_STATE_TOOL_SET.has(name)) continue
+    tools[name] = {
+      ...def,
+      async execute(args, context) {
+        const speaker = v2AgentNameOf(context) ?? sessionAgents.get(context.sessionID)
+        assertHarnessAgent(name, speaker)
+        return def.execute(args, context)
+      },
+    }
   }
   return tools
 }
@@ -6891,14 +2807,141 @@ function anchorReaderOf(client: unknown): V2AnchorReader {
 // Debounce between a session.idle event and the continuation send.
 const IDLE_DEBOUNCE_MS = Number(process.env.FORGE_GOAL_DEBOUNCE_MS ?? 2000)
 
-const idleTimers = new Map<string, ReturnType<typeof setTimeout>>()
-const continuationInFlight = new Set<string>()
+const idleTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; client: GoalClient }>()
+const continuationInFlight = new Map<string, { client: GoalClient }>()
+const disposedGoalClients = new WeakSet<GoalClient>()
+
+// Each v2 setup creates its own adapter. Revoke only work captured by it;
+// session-wide forgetting can write a ledger and would affect other setups.
+function disposeGoalClient(client: GoalClient): void {
+  disposedGoalClients.add(client)
+  for (const [id, pending] of idleTimers) {
+    if (pending.client !== client) continue
+    clearTimeout(pending.timer)
+    idleTimers.delete(id)
+  }
+  for (const [id, flight] of continuationInFlight) {
+    if (flight.client !== client) continue
+    continuationInFlight.delete(id)
+    const pending = pendingContinuationTurn.get(id)
+    if (pending?.client === client && pending.turn === undefined) {
+      pendingContinuationTurn.delete(id)
+      turnActivity.delete(id)
+    }
+  }
+  for (const [id, pending] of goalDeadlineTimers) {
+    if (pending.client === client) goalStopDeadline(id)
+  }
+  for (const [id, pending] of goalNativeRecheck) {
+    if (pending.client === client) { goalStopNativeRecheck(id); goalNativeWatch.delete(id) }
+  }
+  for (const [id, pending] of crewNativeRecheck) {
+    if (pending.client === client) crewStopNativeRecheck(id)
+  }
+}
+// Goal waits reuse the native host walk, but never accept an old child event
+// as proof of a reused session's current round. Keep the observed busy IDs
+// until their own durable terminal rows are visible.
+const goalNativeWatch = new Map<string, Set<string>>()
+const goalAcceptedCalls = new Map<string, Map<string, string>>()
+const goalBackgroundHeld = new Set<string>()
+const goalDeadlineTimers = new Map<string, { timer: ReturnType<typeof setTimeout>; client: GoalClient }>()
+function goalStopDeadline(sessionID: string): void {
+  const pending = goalDeadlineTimers.get(sessionID)
+  if (pending) clearTimeout(pending.timer)
+  goalDeadlineTimers.delete(sessionID)
+}
+function goalArmDeadline(sessionID: string, client: GoalClient, goal: ActiveGoal): void {
+  goalStopDeadline(sessionID)
+  const deadline = Date.parse(goal.doc.armedAt || goal.doc.created) + goal.doc.maxMinutes * 60_000
+  const timer = setTimeout(() => {
+    if (goalDeadlineTimers.get(sessionID)?.timer !== timer) return
+    goalDeadlineTimers.delete(sessionID)
+    if (disposedGoalClients.has(client)) return
+    const state = sessions.get(sessionID)
+    const fresh = state && resolveLiveGoal(state)
+    if (!state || !fresh || fresh.path !== goal.path || fresh.doc.status !== "active" || fresh.doc.session !== sessionID || fresh.doc.revision !== goal.doc.revision || fresh.doc.armedAt !== goal.doc.armedAt) return
+    if (budgetState(fresh.doc) === "budget-time") void autoPauseGoal(client, state, fresh, "budget-time", false)
+    else if (Date.now() <= deadline) goalArmDeadline(sessionID, client, fresh)
+  }, Math.max(1, deadline - Date.now() + 1))
+  timer.unref?.()
+  goalDeadlineTimers.set(sessionID, { timer, client })
+}
+const goalNativeRecheck = new Map<string, { timer: ReturnType<typeof setTimeout>; client: GoalClient; deadlineOnly: boolean }>()
+function goalStopNativeRecheck(sessionID: string): void {
+  const pending = goalNativeRecheck.get(sessionID)
+  if (pending) clearTimeout(pending.timer)
+  goalNativeRecheck.delete(sessionID)
+}
+function goalNativeViewHeld(sessionID: string, view: NativeChildWalkView): boolean {
+  if (!view.readable) return true
+  const watched = goalNativeWatch.get(sessionID) ?? new Set<string>()
+  for (const child of view.inFlight) watched.add(child)
+  for (const row of view.settled) {
+    if (row.outcome) watched.delete(row.childID)
+    else watched.add(row.childID)
+  }
+  if (watched.size) goalNativeWatch.set(sessionID, watched)
+  else goalNativeWatch.delete(sessionID)
+  return watched.size > 0 || view.settled.some(row => !row.outcome)
+}
+function goalArmNativeRecheck(sessionID: string, client: GoalClient, goal: ActiveGoal, deadlineOnly = false): void {
+  if (goalNativeRecheck.has(sessionID) || disposedGoalClients.has(client)) return
+  const deadline = Date.parse(goal.doc.armedAt || goal.doc.created) + goal.doc.maxMinutes * 60_000
+  const remaining = Math.max(1, deadline - Date.now() + 1)
+  // After the observation ceiling, stop polling; one final deadline check
+  // preserves the wall-clock budget even without another host edge.
+  const ceiling = crewNativeCeiling.get(sessionID)?.disclosed
+  const interval = CREW_NATIVE_CHILD_RECHECK_MS > 0 ? CREW_NATIVE_CHILD_RECHECK_MS : remaining
+  const delay = ceiling || deadlineOnly ? remaining : Math.min(interval, remaining)
+  const timer = setTimeout(() => {
+    if (goalNativeRecheck.get(sessionID)?.timer !== timer) return
+    goalNativeRecheck.delete(sessionID)
+    const state = sessions.get(sessionID)
+    const fresh = state && resolveLiveGoal(state)
+    if (!fresh || fresh.path !== goal.path || fresh.doc.status !== "active" || fresh.doc.session !== sessionID ||
+        fresh.doc.revision !== goal.doc.revision || fresh.doc.armedAt !== goal.doc.armedAt) return
+    if (!idleTimers.has(sessionID)) void continueIfEligible(client, sessionID, deadlineOnly)
+  }, delay)
+  timer.unref?.()
+  goalNativeRecheck.set(sessionID, { timer, client, deadlineOnly })
+}
+
 const transportFails = new Map<string, number>()
 const noProgressStreak = new Map<string, number>()
 // Per-continuation-turn activity counters, read by tool.execute.after and
 // evaluated at the next idle for the no-progress detector.
-const turnActivity = new Map<string, { writes: number; checks: number }>()
-const pendingContinuationTurn = new Set<string>()
+const turnActivity = new Map<string, GoalActivity>()
+const previousGoalEvidence = new Map<string, string>()
+type PendingGoalTurn = { client: GoalClient; goal: ActiveGoal; activity: GoalActivity; turn?: number; previous?: string; waited?: boolean }
+const pendingContinuationTurn = new Map<string, PendingGoalTurn>()
+
+// Address the admitted contract directly, never a newly ranked live goal.
+function matchingGoalTurn(text: string, pending: PendingGoalTurn): GoalDoc | null {
+  const fresh = parseGoalLoose(text)
+  const admitted = pending.goal.doc
+  return fresh && fresh.created === admitted.created && fresh.revision === admitted.revision &&
+    fresh.session === admitted.session && fresh.armedAt === admitted.armedAt ? fresh : null
+}
+
+function ledgerGoalTurn(pending: PendingGoalTurn) {
+  const act = pending.activity
+  const classification = classifyGoalActivity(act, pending.previous)
+  if (pending.turn !== undefined) {
+    try {
+      const text = readFileSync(pending.goal.path, "utf8")
+      if (matchingGoalTurn(text, pending)) {
+        atomicWrite(pending.goal.path, appendLedger(text, {
+          turn: pending.turn, revision: pending.goal.doc.revision, at: nowIso(),
+          activity: classification.activity, writes: act.writes, checks: act.checks,
+        }, nowIso()))
+      }
+    } catch (err) {
+      goalProbe(`ledger append failed session=${pending.goal.doc.session} err=${String(err)}`)
+    }
+  }
+  return classification
+}
 
 function goalProbe(line: string): void {
   if (process.env.FORGE_GOAL_PROBE) {
@@ -6909,18 +2952,24 @@ function goalProbe(line: string): void {
 }
 
 function engineForgetSession(sessionID: string): void {
+  goalStopDeadline(sessionID)
+  goalStopNativeRecheck(sessionID)
+  goalNativeWatch.delete(sessionID)
+  // Keep accepted round history across pause/resume so late results cannot
+  // be attributed to a new call reusing the same child session.
+  goalBackgroundHeld.delete(sessionID)
+  crewNativeCeiling.delete(sessionID)
   const t = idleTimers.get(sessionID)
-  if (t) clearTimeout(t)
+  if (t) clearTimeout(t.timer)
   idleTimers.delete(sessionID)
   continuationInFlight.delete(sessionID)
   transportFails.delete(sessionID)
   noProgressStreak.delete(sessionID)
+  previousGoalEvidence.delete(sessionID)
+  const pending = pendingContinuationTurn.get(sessionID)
+  if (pending?.turn !== undefined) ledgerGoalTurn(pending)
   turnActivity.delete(sessionID)
   pendingContinuationTurn.delete(sessionID)
-}
-
-function engineForgetAll(): void {
-  for (const id of [...idleTimers.keys()]) engineForgetSession(id)
 }
 
 // ---------------------------------------------------------------------------
@@ -6939,7 +2988,7 @@ const CREW_NO_PROGRESS_LIMIT = 3
 // pendingContinuationTurn — only crew-continuation turns are evaluated).
 const crewPendingTurn = new Set<string>()
 // Per-crew-continuation-turn activity: task dispatches + write-family calls.
-const crewTurnActivity = new Map<string, { dispatches: number; writes: number }>()
+const crewTurnActivity = new Map<string, { dispatches: number; writes: number; seen?: Set<string> }>()
 // Consecutive activity-free crew continuation turns.
 const crewNoProgress = new Map<string, number>()
 // Sessions whose crew registration the engine stopped continuing (stall or
@@ -7067,6 +3116,20 @@ function crewReportNativeChildTerminal(sessionID: string, childID: string, outco
  * outcome is its own row's. An unreadable view observes nothing: unknown is
  * never "settled".
  */
+function crewNativeViewHeld(sessionID: string, view: NativeChildWalkView): boolean {
+  return !view.readable || view.inFlight.length > 0 || view.settled.some(row => !row.outcome && !crewNativeChildren.rows().get(row.childID)?.outcome) || (crewNativeWatch.get(sessionID)?.size ?? 0) > 0
+}
+
+function crewDiscloseNativeHold(sessionID: string, objective: string): void {
+  const now = crewGateNow()
+  const mark = crewNativeCeiling.get(sessionID)
+  if (!mark) crewNativeCeiling.set(sessionID, { firstSuppressedAt: now, disclosed: false })
+  else if (!mark.disclosed && now - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS) {
+    crewNativeCeiling.set(sessionID, { firstSuppressedAt: mark.firstSuppressedAt, disclosed: true })
+    console.warn(`[forge:crew-continue] native-child ceiling: crew "${objective.slice(0, 80)}" remains held; terminal evidence unavailable. No continuation authorized.`)
+  }
+}
+
 function crewObserveNativeWalk(sessionID: string, view: NativeChildWalkView): void {
   if (!view.readable) return
   const busy = new Set(view.inFlight)
@@ -7076,8 +3139,9 @@ function crewObserveNativeWalk(sessionID: string, view: NativeChildWalkView): vo
   const outcomes = new Map(view.settled.map((row) => [row.childID, row.outcome]))
   for (const childID of [...watched]) {
     if (busy.has(childID)) continue
-    // Absent from the scoped list altogether (deleted mid-run) ⇒ no row ⇒ no outcome.
-    crewReportNativeChildTerminal(sessionID, childID, outcomes.get(childID) ?? null, null)
+    // Missing or idle without a durable outcome is not verified settlement.
+    const outcome = outcomes.get(childID) ?? crewNativeChildren.rows().get(childID)?.outcome
+    if (outcome) crewReportNativeChildTerminal(sessionID, childID, outcome, null)
   }
 }
 
@@ -7092,9 +3156,10 @@ const CREW_NATIVE_CHILD_RECHECK_MS = Number(process.env.FORGE_CREW_NATIVE_CHILD_
 const crewNativeRecheck = new Map<string, { timer: ReturnType<typeof setTimeout>; client: GoalClient | null }>()
 
 function crewArmNativeRecheck(sessionID: string, client: GoalClient | null): void {
-  if (crewNativeRecheck.has(sessionID)) return
+  if ((client && disposedGoalClients.has(client)) || crewNativeRecheck.has(sessionID)) return
   if (!Number.isFinite(CREW_NATIVE_CHILD_RECHECK_MS) || CREW_NATIVE_CHILD_RECHECK_MS <= 0) return
   const timer = setTimeout(() => {
+    if (crewNativeRecheck.get(sessionID)?.timer !== timer) return
     crewNativeRecheck.delete(sessionID)
     void crewNativeRecheckTick(sessionID, client)
   }, CREW_NATIVE_CHILD_RECHECK_MS)
@@ -7112,23 +3177,19 @@ function crewStopNativeRecheck(sessionID: string): void {
 async function crewNativeRecheckTick(sessionID: string, client: GoalClient | null): Promise<void> {
   try {
     const crew = crews.get(sessionID)
-    if (!client || !crew || crew.mode !== "executing" || crewStalled.has(sessionID)) return
+    if (!client || disposedGoalClients.has(client) || !crew || crew.mode !== "executing" || crewStalled.has(sessionID)) return
     // A decision is already pending or running: it re-arms this timer itself
     // when the crew is still held.
     if (continuationInFlight.has(sessionID) || idleTimers.has(sessionID)) return
     const view = await walkNativeChildren(nativeChildWalkerOf(client), sessionID)
+    if (disposedGoalClients.has(client)) return
     crewObserveNativeWalk(sessionID, view)
-    if (!view.readable) {
-      crewArmNativeRecheck(sessionID, client) // nothing learned: look again
+    if (crewNativeViewHeld(sessionID, view)) {
+      crewDiscloseNativeHold(sessionID, crew.objective)
+      crewArmNativeRecheck(sessionID, client)
       return
     }
-    const mark = crewNativeCeiling.get(sessionID)
-    const expired = mark !== undefined && crewGateNow() - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS
-    if (view.inFlight.length > 0 && !expired) {
-      crewArmNativeRecheck(sessionID, client) // still held: look again
-      return
-    }
-    goalProbe(`crew native-child recheck clear session=${sessionID} inFlight=${view.inFlight.length} ceiling=${expired ? "expired" : "none"}`)
+    goalProbe(`crew native-child recheck clear session=${sessionID}`)
     scheduleIdleContinuation(client, sessionID, CREW_CHILD_RESUME_DEBOUNCE_MS)
   } catch {
     // Advisory: never a throw into the host.
@@ -7166,7 +3227,7 @@ export function noteCrewNativeChildEvent(type: string, fields: Record<string, un
       // D8: a waited-on child deleted mid-run emits no terminal edge — name
       // it gone the moment the plugin knows (no row ⇒ no outcome).
       const watchedBy = crewNativeWatchParentOf(id)
-      if (watchedBy) crewReportNativeChildTerminal(watchedBy, id, null, client)
+      if (watchedBy) crewArmNativeRecheck(watchedBy, client)
       return
     }
     const outcome = nativeChildEventOutcome(type)
@@ -7190,9 +3251,8 @@ export function noteCrewNativeChildEvent(type: string, fields: Record<string, un
       const st = fields.status
       const idle = type === "session.idle" || (st !== null && typeof st === "object" && (st as { type?: unknown }).type === "idle")
       if (!idle) return
-      const note = crewNativeChildren.terminalize(id, "succeeded")
-      const parentID = note?.parentID ?? crewNativeWatchParentOf(id)
-      if (parentID) crewReportNativeChildTerminal(parentID, id, "succeeded", client)
+      const parentID = crewNativeWatchParentOf(id)
+      if (parentID) crewArmNativeRecheck(parentID, client)
     }
   } catch {
     // Advisory warm set: never a throw into the host.
@@ -7212,7 +3272,7 @@ function crewContinueBrief(crew: CrewEntry, childDigest: ReadonlyArray<string> =
     ...(childDigest.length > 0
       ? [`Native child outcomes since the last brief (one line per child — an interrupted child is DEAD, never silently stranded):`, ...childDigest.map((l) => `- ${l}`)]
       : []),
-    `Next: dispatch the next wave (parallel task calls — forge-* workers from this session's pool, or the native general subagent when no forge worker fits), collect per-subtask evidence verdicts, at most one retry per subtask, then crew_close with the full report. Stalled or wrong decomposition? crew_close {abandon: true, reason} to re-shard.`,
+    `Wave discipline: ${CREW_WAVE_RULE} Collect verified per-subtask evidence verdicts from the reports; terminal status alone is not PASS. Keep at most one retry per subtask, then crew_close with the full report and existing approvals. Stalled or wrong decomposition? crew_close {abandon: true, reason} to re-shard.`,
   ].join("\n")
 }
 
@@ -7227,7 +3287,7 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
   // PENDING crews are the user's execution-mode decision seam — NEVER
   // auto-continued; ended crews (close/abandon/convert) were evicted from
   // the map, so this finds nothing and the engine stays silent.
-  if (!crew || crew.mode !== "executing") {
+  if (!crew || crew.mode !== "executing" || crew.goalGoverned) {
     goalProbe(`crew skip: no executing crew session=${sessionID}`)
     return
   }
@@ -7260,34 +3320,14 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
   // D8: one walk feeds both the gate and the outcome digest — children seen
   // in flight are what this registration waits on; waited-on children the
   // walk no longer sees in flight are named with their row's outcome.
+  if (disposedGoalClients.has(client) || crews.get(sessionID) !== crew || crew.goalGoverned || governingGoalFor(sessionID)) return
   crewObserveNativeWalk(sessionID, view)
-  if (view.inFlight.length > 0) {
-    const now = crewGateNow()
-    const mark = crewNativeCeiling.get(sessionID)
-    if (mark && mark.disclosed) {
-      // Past the ceiling for this registration: suppression already
-      // stopped — fall through and send.
-      goalProbe(`crew native-child ceiling already disclosed session=${sessionID}`)
-    } else if (mark && now - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS) {
-      // D4: send ONCE + one bounded disclosure; stop suppressing for this
-      // registration (a listed-but-silent child no longer blocks).
-      crewNativeCeiling.set(sessionID, { firstSuppressedAt: mark.firstSuppressedAt, disclosed: true })
-      console.warn(
-        `[forge:crew-continue] native-child ceiling: crew "${crew.objective.slice(0, 80)}" has been held ≥${CREW_NATIVE_CHILD_CEILING_MS}ms by native children that never report a terminal state — sending once and stopping suppression for this registration (fresh crew_begin re-arms the gate).`,
-      )
-      goalProbe(`crew native-child ceiling expired session=${sessionID}`)
-    } else {
-      if (!mark) crewNativeCeiling.set(sessionID, { firstSuppressedAt: now, disclosed: false })
-      // D8: the resume must not depend on a further idle edge or event.
-      crewArmNativeRecheck(sessionID, client)
-      goalProbe(`crew skip: native child in flight session=${sessionID}`)
-      return // BEFORE crewPendingTurn accounting — not a turn
-    }
-  } else {
-    // Gate open: the suppression episode ends (a later busy child starts a
-    // fresh, fully-ceilinged episode).
-    crewNativeCeiling.delete(sessionID)
+  if (crewNativeViewHeld(sessionID, view)) {
+    crewDiscloseNativeHold(sessionID, crew.objective)
+    crewArmNativeRecheck(sessionID, client)
+    return // BEFORE accounting — waiting or unknown is not a turn
   }
+  crewNativeCeiling.delete(sessionID)
   // Crew no-progress accounting (D3), only for turns the crew engine itself
   // started: task dispatches and write-family calls count as activity.
   if (crewPendingTurn.has(sessionID)) {
@@ -7339,6 +3379,7 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
       return
     }
   }
+  if (disposedGoalClients.has(client) || crews.get(sessionID) !== crew || crew.goalGoverned || governingGoalFor(sessionID) || !sessionIsForgeFamily(sessionID)) return
   try {
     // D7 defect-B: the digest collected during the suppression episode rides
     // this brief (one line per terminal child: id + outcome); cleared only
@@ -7348,6 +3389,7 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
       path: { id: sessionID },
       body: { parts: [{ type: "text", text: crewContinueBrief(crew, childDigest) }] },
     })
+    if (disposedGoalClients.has(client) || crews.get(sessionID) !== crew) return
     if (childDigest.length > 0) crewChildDigest.delete(sessionID)
     // D8: the episode ended with a delivered brief — a later busy child
     // starts a fresh, fully-ceilinged episode with its own re-check.
@@ -7357,6 +3399,7 @@ async function continueCrewIfEligible(client: GoalClient, state: SessionState, s
     crewTurnActivity.set(sessionID, { dispatches: 0, writes: 0 })
     goalProbe(`crew continued session=${sessionID} objective="${crew.objective.slice(0, 60)}"`)
   } catch (err) {
+    if (disposedGoalClients.has(client) || crews.get(sessionID) !== crew) return
     // Shared transport-failure map + cap (D1): repeated delivery failures
     // stop the crew engine too — bounded and disclosed, crew untouched.
     const n = (transportFails.get(sessionID) ?? 0) + 1
@@ -7377,7 +3420,7 @@ function goalBriefText(state: SessionState, goal: ActiveGoal): string {
   const d = goal.doc
   const structureText = [...d.criteria, d.constraints.trim()].filter(Boolean).join("\n")
   const structured = /\bforge-[a-z0-9-]+\b/.test(structureText) || /^\s*\d+[.).]/m.test(structureText)
-  const crewLayerBase = `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), dispatch forge-* waves, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Crew gates stay internal to this loop (your goal turns drive the crew — no separate crew idle briefs fire under this goal; standalone waves auto-advance on session idle until crew_close).`
+  const crewLayerBase = `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), follow the native subagent wave discipline below, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Preserve existing user approvals, host permissions and goal stop conditions. Your goal turns drive the crew — no separate crew idle briefs fire under this goal.`
   const crewLayerLine = structured
     ? `${crewLayerBase} The contract carries a subtask structure — PREFER re-registering it as a born-armed crew (one call, execution: "waves") over self-executing the whole plan in this session; drive the crew through your goal turns and keep per-subtask evidence for the close report.`
     : crewLayerBase
@@ -7388,19 +3431,21 @@ function goalBriefText(state: SessionState, goal: ActiveGoal): string {
       .map((c, i) => `${i + 1}. ${c.kind === "shell" ? `shell \`${c.cmd}\`` : `contains \`${c.file}\` :: \`${c.text}\``}`)
       .join("\n")}`,
     d.constraints.trim() ? `Constraints: ${d.constraints.trim()}` : "",
-    `Per-turn discipline: land at least one verification command (forge_shell) or a real write every turn — the Turn Ledger scores read-only turns as no-progress, and consecutive no-progress turns auto-pause the loop (goal-no-progress-honesty: re-running the checks IS progress).`,
-    `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. Work the criteria now; call goal_check when you believe they hold, then goal_complete (it re-runs every check itself and asks the user). If genuinely blocked, call goal_pause with the blocker — do not spin.`,
+    `Per-turn discipline: meaningful read-only reconnaissance and review, real changes, commits, and checks or failure diagnosis with new evidence are productive work, including outside git. No write, shell command, or git diff is required every turn. Repeating a check with the same input and complete result without new evidence or other activity is not progress; unknown or truncated evidence does not establish equality. Do not repeat checks merely to fill a turn. For genuine host waiting (outstanding child work, background commands, permissions or user responses), end your turn rather than polling or sleeping. Waiting is not work; the intended two-turn no-progress threshold applies only to clearly empty work turns.`,
+    `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. The wall-clock minute limit continues during waiting; stop on either budget limit or when goal authorization ends, and wait for the user's explicit decision before resuming. Do not start new autonomous work after a pause or loss of authorization, including crew fallback or session reuse; already accepted host work may finish. A goal-governed crew must not become standalone automatically. Call goal_check when criteria hold, then goal_complete (it re-runs every check itself and asks the user). If globally blocked, call goal_pause with the concrete blocker; if independent work remains, continue that work — do not spin.`,
     crewLayerLine,
+    `For a crew under this goal: ${CREW_WAVE_RULE} Treat verified waiting as distinct from work or no-progress; do not assume the host can observe every wait. Collect verified evidence for each declared subtask; a completion notification is not by itself PASS.`,
     `Goal file: ${relFrom(state.worktree, goal.path)}`,
   ]
     .filter((s) => s.length > 0)
     .join("\n")
 }
 
-function wrapupBriefText(goal: ActiveGoal, reason: StopReason): string {
+function wrapupBriefText(goal: ActiveGoal, reason: StopReason, repeatedEvidence = false): string {
   return [
     `[forge:goal-wrapup] The goal loop is stopping (stop_reason: ${reason}); the goal is now PAUSED.`,
     `Goal (revision ${goal.doc.revision}): ${goal.doc.goal}`,
+    ...(repeatedEvidence ? ["Repeated identical check input and result added no observable evidence; see the Turn Ledger."] : []),
     "Produce a concise handoff summary and nothing else: what is done, what remains, the single next concrete step. Do not continue working the goal in this turn.",
   ].join("\n")
 }
@@ -7410,13 +3455,14 @@ type GoalClient = {
     prompt: (opts: unknown) => Promise<unknown>
     get: (opts: unknown) => Promise<unknown>
     status?: (opts: unknown) => Promise<unknown>
+    context?: (opts: unknown) => Promise<unknown>
   }
 }
 
 // Auto-pause with an optional final wrap-up continuation. Pause happens
 // first (atomic, no race with another idle); the wrap-up prompt is
 // best-effort and does not count against the turn budget.
-async function autoPauseGoal(client: GoalClient, state: SessionState, goal: ActiveGoal, reason: StopReason, wrapup: boolean): Promise<void> {
+async function autoPauseGoal(client: GoalClient, state: SessionState, goal: ActiveGoal, reason: StopReason, wrapup: boolean, repeatedEvidence = false): Promise<void> {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`)
   atomicWrite(goal.path, transitionGoal(readFileSync(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }))
   engineForgetSession(state.sessionID)
@@ -7424,7 +3470,7 @@ async function autoPauseGoal(client: GoalClient, state: SessionState, goal: Acti
     try {
       await client.session.prompt({
         path: { id: goal.doc.session },
-        body: { parts: [{ type: "text", text: wrapupBriefText(goal, reason) }] },
+        body: { parts: [{ type: "text", text: wrapupBriefText(goal, reason, repeatedEvidence) }] },
       })
     } catch (err) {
       goalProbe(`wrapup delivery failed session=${state.sessionID} err=${String(err)}`)
@@ -7434,19 +3480,15 @@ async function autoPauseGoal(client: GoalClient, state: SessionState, goal: Acti
 
 // Full guard chain, then send one continuation. Any unexpected error inside
 // degrades to "skip this round" — the loop never fights the host.
-async function continueIfEligible(client: GoalClient, sessionID: string): Promise<void> {
-  // The disable knob must gate the autonomous loop hardest of all: with the
-  // goal tools removed the user could not even discard a leftover goal, so
-  // the engine must never inject continuation prompts while disabled.
-  if (forgeDisabled) {
-    goalProbe(`skip: forge disabled session=${sessionID}`)
-    return
-  }
+async function continueIfEligible(client: GoalClient, sessionID: string, backgroundWaiting = false): Promise<void> {
+  if (disposedGoalClients.has(client)) return
   if (continuationInFlight.has(sessionID)) return
   // Claim the in-flight slot BEFORE any await: two idles racing through the
   // lazy-seed path must not both send a continuation (double-briefing and
   // double turn accounting).
-  continuationInFlight.add(sessionID)
+  const flight = { client }
+  continuationInFlight.set(sessionID, flight)
+  const stillCurrent = () => !disposedGoalClients.has(client) && continuationInFlight.get(sessionID) === flight
   try {
     let state = sessions.get(sessionID)
     if (!state) {
@@ -7456,6 +3498,7 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
         const info = (await client.session.get({ path: { id: sessionID } })) as
           | { directory?: string; worktree?: string; location?: { directory?: string } }
           | undefined
+        if (!stillCurrent()) return
         const wt = effectiveWorktree(info?.worktree, info?.directory ?? info?.location?.directory)
         if (!wt) {
           goalProbe(`skip: no worktree for lazy seed session=${sessionID}`)
@@ -7468,47 +3511,81 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
         return
       }
     }
-    // Turn accounting FIRST, before the live-goal check: the previous
-    // continuation turn may have COMPLETED or paused the goal (that is the
-    // gate turn — exactly the one the ledger must not lose). The file is
-    // addressed directly via state.goalPath, which the engine sets when it
-    // sends a continuation, because a terminal goal is no longer discoverable
-    // through live-goal ranking.
-    let accountedContinuationTurn = false
-    let turnHadActivity = false
-    if (pendingContinuationTurn.has(sessionID)) {
-      accountedContinuationTurn = true
-      pendingContinuationTurn.delete(sessionID)
-      const act = turnActivity.get(sessionID)
-      turnHadActivity = !!act && (act.writes > 0 || act.checks > 0)
-      turnActivity.set(sessionID, { writes: 0, checks: 0 })
-      const ledgerPath = state.goalPath
-      if (ledgerPath && existsSync(ledgerPath)) {
-        try {
-          const fresh = parseGoalLoose(readFileSync(ledgerPath, "utf8"))
-          if (fresh && fresh.turnsUsed > 0) {
-            atomicWrite(
-              ledgerPath,
-              appendLedger(
-                readFileSync(ledgerPath, "utf8"),
-                { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 },
-                nowIso(),
-              ),
-            )
-          }
-        } catch (err) {
-          goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`)
-        }
+    if (!stillCurrent()) return
+    const ownedGoal = resolveLiveGoal(state)
+    const governedCrew = crews.get(sessionID)
+    backgroundWaiting ||= goalBackgroundHeld.has(sessionID)
+    if (ownedGoal?.doc.status === "active" && ownedGoal.doc.session === sessionID) goalArmDeadline(sessionID, client, ownedGoal)
+    if (backgroundWaiting) {
+      goalStopNativeRecheck(sessionID)
+      if (ownedGoal?.doc.status === "active" && ownedGoal.doc.session === sessionID) goalArmNativeRecheck(sessionID, client, ownedGoal, true)
+    }
+    if (ownedGoal?.doc.status === "active" && ownedGoal.doc.session === sessionID && !backgroundWaiting) {
+      const walker = nativeChildWalkerOf(client)
+      const view = await walkNativeChildren(walker, sessionID)
+      if (!stillCurrent()) return
+      // An idle callback can race a resumed or permission-blocked owner.
+      // Check the host active map before settling any pending work turn.
+      const ownerBusy = await nativeSessionBusy(walker, sessionID)
+      if (!stillCurrent()) return
+      const current = resolveLiveGoal(state)
+      if (!current || current.path !== ownedGoal.path || current.doc.status !== "active" || current.doc.session !== sessionID ||
+          current.doc.revision !== ownedGoal.doc.revision || current.doc.armedAt !== ownedGoal.doc.armedAt) return
+      // Goal ownership uses durable outcomes for both ordinary and crew
+      // turns; advisory crew events cannot settle a reused child round.
+      let roundHeld = false
+      const rounds = goalAcceptedCalls.get(sessionID)
+      if (rounds?.size) {
+        let settled = new Set<string>()
+        try { settled = settledGoalRounds(rounds, await client.session.context?.({ sessionID })) } catch {}
+        if (!stillCurrent()) return
+        const latest = resolveLiveGoal(state)
+        if (!latest || latest.path !== ownedGoal.path || latest.doc.status !== "active" || latest.doc.session !== sessionID || latest.doc.revision !== ownedGoal.doc.revision || latest.doc.armedAt !== ownedGoal.doc.armedAt) return
+        roundHeld = [...rounds.keys()].some(id => !settled.has(id))
+      }
+      backgroundWaiting = goalNativeViewHeld(sessionID, view) || ownerBusy !== false || roundHeld || goalBackgroundHeld.has(sessionID)
+      if (governedCrew?.goalGoverned) crewObserveNativeWalk(sessionID, view)
+      if (backgroundWaiting) {
+        crewDiscloseNativeHold(sessionID, governedCrew?.objective ?? ownedGoal.doc.goal)
+        goalArmNativeRecheck(sessionID, client, ownedGoal, goalBackgroundHeld.has(sessionID))
+      } else {
+        goalStopNativeRecheck(sessionID)
       }
     }
+    // Account a delivered turn against its captured file and arm, even if
+    // that goal is now terminal. Never attribute it to a different goal.
+    const pending = pendingContinuationTurn.get(sessionID)
+    let accountedContinuationTurn = false
+    let turnHadActivity = false
+    let repeatedEvidence = false
+    let uncertainActivity = false
+    // An owning wait edge is not a settlement edge. Retain late tool evidence
+    // only for the same active arm; terminal or replaced arms still settle as before.
+    const waitingGoal = backgroundWaiting ? resolveLiveGoal(state) : null
+    const deferSettlement = waitingGoal?.doc.status === "active" && waitingGoal.doc.session === sessionID &&
+      pending?.goal.path === waitingGoal.path && pending.goal.doc.revision === waitingGoal.doc.revision &&
+      pending.goal.doc.armedAt === waitingGoal.doc.armedAt
+    if (pending && deferSettlement) pending.waited = true
+    if (pending?.turn !== undefined && !deferSettlement) {
+      pendingContinuationTurn.delete(sessionID)
+      turnActivity.delete(sessionID)
+      const classification = ledgerGoalTurn(pending)
+      const currentGoal = resolveLiveGoal(state)
+      accountedContinuationTurn = currentGoal?.path === pending.goal.path &&
+        currentGoal.doc.revision === pending.goal.doc.revision &&
+        currentGoal.doc.armedAt === pending.goal.doc.armedAt && currentGoal.doc.session === sessionID
+      turnHadActivity = classification.activity
+      repeatedEvidence = classification.repeated
+      uncertainActivity = classification.uncertain === true
+      if (accountedContinuationTurn && classification.evidence) previousGoalEvidence.set(sessionID, classification.evidence)
+      else previousGoalEvidence.delete(sessionID)
+    }
     const goal = resolveLiveGoal(state)
+    if (goal?.doc.status === "paused" && goal.doc.session === sessionID) return
     // Crew branch (crew-autonomous-waves D1): the goal path owns the session
-    // ONLY when a live ACTIVE goal is owned by it — every other case (no
-    // goal, non-active, or owned elsewhere) falls to the crew branch, which
-    // sends a crew continuation ONLY for a waves-armed EXECUTING crew. The
-    // ordering makes double-briefing impossible by construction: a
-    // goal-governed session (including a goal-delegated born-armed crew)
-    // never receives a [forge:crew-continue] brief alongside the goal brief.
+    // A live owned goal drives its own turns. Only independently armed
+    // crews may fall back to standalone continuation; registration
+    // provenance survives disappearance of the governing goal.
     if (!goal || goal.doc.status !== "active" || !goal.doc.session || goal.doc.session !== sessionID) {
       goalProbe(`no live active goal owned by session=${sessionID} — crew branch`)
       await continueCrewIfEligible(client, state, sessionID)
@@ -7521,18 +3598,30 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
       goalProbe(`skip: agent switched to non-forge before send session=${sessionID}`)
       return
     }
+    // Explicit owning-session background evidence suppresses new Goal prompts,
+    // including wrap-ups, without skipping draft conflict or budget evaluation.
+    // No wake is installed; subsequent ordinary idle edges use their own evidence.
+    if (backgroundWaiting) {
+      if (resolveActivePlan(state)?.doc.status === "draft") {
+        await autoPauseGoal(client, state, goal, "draft-conflict", false)
+        return
+      }
+      const bs = budgetState(goal.doc)
+      if (bs !== "ok") await autoPauseGoal(client, state, goal, bs, false)
+      return
+    }
     // No-progress accounting, only for turns the engine itself started. The
     // finished turn's activity is also recorded in the goal's Turn Ledger
     // (auditable anti-batching evidence, visible at the completion gate).
     if (accountedContinuationTurn) {
       if (turnHadActivity) {
         noProgressStreak.delete(sessionID)
-      } else {
+      } else if (!pending?.waited && !uncertainActivity) {
         const n = (noProgressStreak.get(sessionID) ?? 0) + 1
         noProgressStreak.set(sessionID, n)
         goalProbe(`no-progress session=${sessionID} streak=${n}`)
         if (n >= NO_PROGRESS_LIMIT) {
-          await autoPauseGoal(client, state, goal, "no-progress", true)
+          await autoPauseGoal(client, state, goal, "no-progress", true, repeatedEvidence)
           return
         }
       }
@@ -7563,28 +3652,36 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
         return
       }
     }
+    const stillAuthorized = () => {
+      if (!stillCurrent()) return false
+      const fresh = parseGoalLoose(readFileSync(goal.path, "utf8"))
+      return fresh?.status === "active" && fresh.session === sessionID &&
+        fresh.revision === goal.doc.revision && fresh.armedAt === goal.doc.armedAt
+    }
+    if (!stillAuthorized()) return
+    const pendingTurn: PendingGoalTurn = {
+      client,
+      goal,
+      activity: { writes: 0, checks: 0, scope: JSON.stringify([state.worktree, goal.path, goal.doc.revision, goal.doc.armedAt]) },
+      previous: previousGoalEvidence.get(sessionID),
+    }
     try {
       const briefText = goalBriefText(state, goal)
-      // Pre-mark the turn BEFORE the await: the v2 promise-layer prompt
-      // BLOCKS until the whole turn completes, and the idle hook may fire
-      // during that await — the pendingContinuationTurn/turnActivity state
-      // must already be in place so the guard chain can ledger the turn.
-      pendingContinuationTurn.add(sessionID)
-      turnActivity.set(sessionID, { writes: 0, checks: 0 })
+      pendingContinuationTurn.set(sessionID, pendingTurn)
+      turnActivity.set(sessionID, pendingTurn.activity)
       await client.session.prompt({
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: briefText }] },
       })
-      transportFails.delete(sessionID)
-      // Remember which file this session's loop drives so the NEXT idle can
-      // ledger the turn even after the goal goes terminal.
-      state.goalPath = goal.path
-      atomicWrite(goal.path, incTurns(readFileSync(goal.path, "utf8"), nowIso()))
-      goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`)
     } catch (err) {
-      // Roll back the pre-send marks: no turn happened, and leaving them
-      // set would make the next idle ledger a phantom no-activity turn —
-      // the no-progress detector would outrun the transport counter.
+      if (!stillAuthorized()) {
+        if (pendingContinuationTurn.get(sessionID) === pendingTurn) {
+          pendingContinuationTurn.delete(sessionID)
+          turnActivity.delete(sessionID)
+        }
+        return
+      }
+      // No successful delivery: do not ledger or charge a phantom turn.
       pendingContinuationTurn.delete(sessionID)
       turnActivity.delete(sessionID)
       const n = (transportFails.get(sessionID) ?? 0) + 1
@@ -7593,77 +3690,70 @@ async function continueIfEligible(client: GoalClient, sessionID: string): Promis
       if (n >= TRANSPORT_FAILURE_LIMIT) {
         await autoPauseGoal(client, state, goal, "transport-failures", false)
       }
+      return
     }
+    // The host prompt can block through pause/complete. Charge the accepted
+    // turn on the same contract arm without changing its lifecycle fields.
+    // A re-arm/revision/owner change is not this callback's authorization.
+    const text = readFileSync(goal.path, "utf8")
+    const fresh = matchingGoalTurn(text, pendingTurn)
+    if (disposedGoalClients.has(client) || !fresh || (!stillCurrent() && fresh.status === "active")) {
+      if (pendingContinuationTurn.get(sessionID) === pendingTurn) {
+        pendingContinuationTurn.delete(sessionID)
+        turnActivity.delete(sessionID)
+      }
+      return
+    }
+    atomicWrite(goal.path, incTurns(text, nowIso()))
+    pendingTurn.turn = fresh.turnsUsed + 1
+    if (!stillCurrent() || fresh.status !== "active") {
+      ledgerGoalTurn(pendingTurn)
+      if (pendingContinuationTurn.get(sessionID) === pendingTurn) {
+        pendingContinuationTurn.delete(sessionID)
+        turnActivity.delete(sessionID)
+      }
+      return
+    }
+    transportFails.delete(sessionID)
+    goalProbe(`continued session=${sessionID} turn=${pendingTurn.turn}/${fresh.maxTurns}`)
   } catch (err) {
     goalProbe(`continuation aborted session=${sessionID} err=${String(err)}`)
   } finally {
-    continuationInFlight.delete(sessionID)
+    if (stillCurrent()) continuationInFlight.delete(sessionID)
   }
 }
 
-function scheduleIdleContinuation(client: GoalClient, sessionID: string, debounceMs: number = IDLE_DEBOUNCE_MS): void {
-  // Belt for the engine guard: a disabled plugin must not even arm a timer.
-  if (forgeDisabled) return
+function scheduleIdleContinuation(client: GoalClient, sessionID: string, debounceMs: number = IDLE_DEBOUNCE_MS, backgroundWaiting = false): void {
+  if (disposedGoalClients.has(client)) return
   // Family gate at scheduling time (tool-partition): a non-forge session's
   // idle never arms a timer — no continuation, not even a session.get probe.
   if (!sessionIsForgeFamily(sessionID)) {
     goalProbe(`skip: non-forge agent at schedule session=${sessionID}`)
     return
   }
+  const state = sessions.get(sessionID)
+  if (state) {
+    const goal = resolveLiveGoal(state)
+    if (goal?.doc.status === "paused" && goal.doc.session === sessionID) return
+  }
   const existing = idleTimers.get(sessionID)
-  if (existing) clearTimeout(existing)
-  idleTimers.set(
-    sessionID,
-    setTimeout(() => {
-      idleTimers.delete(sessionID)
-      void continueIfEligible(client, sessionID)
-    }, Math.max(0, debounceMs)),
-  )
+  if (existing) clearTimeout(existing.timer)
+  const pending = { client, timer: setTimeout(() => {
+    if (idleTimers.get(sessionID) !== pending) return
+    idleTimers.delete(sessionID)
+    void continueIfEligible(client, sessionID, backgroundWaiting)
+  }, Math.max(0, debounceMs)) }
+  idleTimers.set(sessionID, pending)
 }
 
 // session.deleted harvest (change v2-plugin-api-port task 5.1): the ONE
 // core both hosts call — the v1 event hook and the v2 event subscription
-// share it verbatim (parity by reuse). Owner session end kills its live
-// session-scoped jobs (unread completions ledgered), harvests its async
-// dispatches, flushes queued wishes without spawning, and evicts every
-// session-bounded map.
+// share it verbatim (parity by reuse) and evict session-bounded maps.
 function harvestSessionEnd(sessionID: string): void {
-  // Owner session ended: live session-scoped jobs are killed,
-  // unread completions ledgered (job-supervisor spec).
-  // fix-dispatch-dispose-kill D2: dispatch rows are KEPT after the kill —
-  // the queued aborted wake must stay deliverable (deliverWakesFor only
-  // traverses the live Map); the row self-clears via read-consumption.
-  jobManager.onSessionEnd(sessionID, isDispatchRow)
-  // Async-dispatch harvest (spec: Async dispatch lifecycle —
-  // "Owner death harvests children"): onSessionEnd above killed the
-  // session's live dispatch registry rows — each killTree aborted the
-  // child session via the SDK and the orphan landed in the
-  // diagnostics ledger. The handle map follows.
-  for (const [id, handle] of [...dispatchTasks]) {
-    if (handle.ownerSession === sessionID) dispatchTasks.delete(id)
-  }
-  // Fold D (owner-death queue flush): queued wishes flush WITHOUT
-  // spawning (no child exists) and their journal records
-  // terminalize (fold E pairing).
-  flushDispatchQueue(sessionID)
   // The frozen depth translation dies with its session (bounded table).
   sessionDepths.delete(sessionID)
-  // Undelivered progress notices die with their audience (lossy by
-  // design — the terminal-wake guarantee never rode this queue).
-  dispatchProgressQueue.delete(sessionID)
   // Same for the agent-family map (tool-partition).
   sessionAgents.delete(sessionID)
-  // worker-shell-session-allow: the rescue bookkeeping dies with its
-  // session (the injected session rule itself is host state and follows
-  // the session's own lifecycle).
-  sessionRescueInjected.delete(sessionID)
-  sessionRescueDisclosed.delete(sessionID)
-  sessionRescueAttached.delete(sessionID)
-  // And the session-model capture table (harden-dispatch-resilience D3).
-  sessionModels.delete(sessionID)
-  // And the exec-seal finding bounds (readonly-exec-seal).
-  sealFindings.delete(sessionID)
-  sealUnknownNotes.delete(sessionID)
   // Session-domain pool-gate disclosure bound (sole-pool-ownership).
   poolGateUnknownNotes.delete(sessionID)
   // Anchor-preference disclosure bound (anchor-pool-preference).
@@ -7683,1090 +3773,8 @@ function harvestSessionEnd(sessionID: string): void {
   // and stays).
   crews.delete(sessionID)
   crewEngineForgetSession(sessionID)
-}
-
-// ---------------------------------------------------------------------------
-// v1 server entry (the loader used by `opencode plugin` installs reads this)
-// ---------------------------------------------------------------------------
-
-export const server: Plugin = async (input, options) => {
-  const effectiveInitDir = effectiveWorktree(input.worktree, input.directory) || input.directory || ""
-  // Session-state fallback axis (plan/goal/crew record binding when a session
-  // carries no observable anchor): last-init-wins is honest here — the most
-  // recent initialization directory is the most likely current project. The
-  // POOL axis is deliberately different: every initialization directory joins
-  // the workspace registry (see hostAnchors) and pool membership re-resolves
-  // from disk truth on every call — deletions un-materialize.
-  hostWorktree = effectiveInitDir
-  // Pool axis (sole-pool-ownership): the host remembers every workspace
-  // directory it was initialized in; pool membership re-resolves per call
-  // (deletions un-materialize) and dispatch is session-scoped.
-  rememberHostAnchor(effectiveInitDir)
-  const client = input.client as unknown as GoalClient
-  // pool-gate-authoritative-anchor (D1/D2): the session anchor resolution the
-  // dispatch belts use lives at MODULE level (resolveSessionAnchorForPools)
-  // so the task interception belt and the task tool execute
-  // share one seam over the same client.
-  jobClient = input.client as unknown as JobClient
-  // fix-v2-crew-surface-drift task 1.1: seed the shared anchor-client seam
-  // at the same moment the dispatch belts get their client (the v1 task
-  // tool belt reads jobClient — one seam, one source).
-  anchorClientShared = (input.client as unknown as AnchorClient | null | undefined) ?? null
-  // Fold E (restart recovery): the LAUNCH-ANCHOR workspace's journal recovers
-  // at init; every other workspace recovers lazily on its first session
-  // (event handler). Fail-soft by construction.
-  if (effectiveInitDir && !isRootish(effectiveInitDir)) {
-    void recoverWorkspaceDispatches(input.client as unknown as DispatchClient, effectiveInitDir)
-  }
-  const jobsOpts = (options as { jobs?: { mode?: unknown; keepBuiltinShell?: unknown; survive?: unknown } } | undefined)?.jobs
-  if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native") jobsMode = jobsOpts.mode
-  jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true
-  if (jobsOpts?.survive === "never" || jobsOpts?.survive === "always" || jobsOpts?.survive === "deny") jobsSurviveMode = jobsOpts.survive
-  // Search pair (forge-search-tools D4): `search.rgPath` config override.
-  // Resolution re-runs per call against this value + PATH, so installing rg
-  // mid-session needs no restart; the override itself rides the same
-  // plugin-options surface as jobs/watchdog.
-  const searchOpts = (options as { search?: { rgPath?: unknown } } | undefined)?.search
-  searchRgPathOverride = typeof searchOpts?.rgPath === "string" && searchOpts.rgPath.trim().length > 0 ? searchOpts.rgPath : undefined
-
-  // hang-watchdog: invalid option values fall back to defaults and the
-  // fallback itself is ledgered (auditable misconfig, never a crash).
-  const wdOpts = (options as { watchdog?: { mode?: unknown; stallMs?: unknown } } | undefined)?.watchdog
-  const wdFallbacks: string[] = []
-  const wdMode = parseMode(wdOpts?.mode)
-  if (wdOpts?.mode !== undefined && wdOpts.mode !== wdMode) {
-    wdFallbacks.push(`invalid watchdog.mode ${JSON.stringify(String(wdOpts.mode))} — fell back to "${wdMode}"`)
-  }
-  const wdStallRaw = wdOpts?.stallMs
-  const wdStall = clampStallMs(typeof wdStallRaw === "number" ? wdStallRaw : undefined)
-  if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
-    wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`)
-  }
-
-  const watchdogLedger = createFileLedger(join(watchdogLogHome(), "log.jsonl"))
-  const rawLocator = createLocator()
-  const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1"
-  const probeLine = (text: string) => {
-    if (!probing()) return
-    try {
-      appendFileSync(join(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}\n`)
-    } catch {}
-  }
-  const diagnosticLocate = async (callID: string, t0: number, cmdNeedle?: string, phase2?: boolean) => {
-    const started = Date.now()
-    const hits = await rawLocator(callID, t0, cmdNeedle, phase2)
-    probeLine(`locate dur=${Date.now() - started}ms hits=${hits.length} phase2=${phase2 === true} needle=${JSON.stringify(cmdNeedle ?? null)}`)
-    if (hits.length === 0 && cmdNeedle) {
-      // Post-mortem aid: does the raw table even contain needle carriers,
-      // and where do they fall relative to the window?
-      try {
-        const raw = execFileSync("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress"], { encoding: "utf8", windowsHide: true, timeout: 15_000 })
-        const all = parseWindowsProcs(raw)
-        probeLine(`diag rawLen=${raw.length} procs=${all.length} windowStart=${new Date(t0 - 2000).toISOString()}`)
-        for (const p of all) {
-          if (p.cmd.includes(cmdNeedle)) probeLine(`diag needle-carrier pid=${p.pid} ppid=${p.ppid} created=${new Date(p.createdMs).toISOString()} cmd=${p.cmd.slice(0, 120)}`)
-        }
-      } catch (err) {
-        probeLine(`diag failed: ${String(err).slice(0, 150)}`)
-      }
-    }
-    return hits
-  }
-  const watchdog: Watchdog = createWatchdog({
-    mode: wdMode,
-    stallMs: wdStall,
-    sink: (entry) => watchdogLedger.append(entry),
-    locate: diagnosticLocate,
-    killTree: (pid) => killTree({ pid, kill: (sig) => process.kill(pid, sig as NodeJS.Signals) }),
-  })
-  for (const reason of wdFallbacks) {
-    const entry: LedgerEntry = {
-      ts: new Date().toISOString(),
-      event: "config-fallback",
-      callID: "-",
-      tool: "config",
-      t0: Date.now(),
-      mode: watchdog.mode,
-      reason,
-    }
-    watchdogLedger.append(entry)
-  }
-  return {
-    dispose: async () => {
-      // Diagnostics only: proof that the hook ran on THIS host generation and
-      // what its job table held. On a v2 host this line never appears — its
-      // absence is the observable half of the fact stated just below.
-      try {
-        const all = jobManager.list()
-        goalProbe(`plugin dispose hook: registry rows=${all.length} running=${all.filter((j) => j.state === "running").length} dispatch rows=${all.filter(isDispatchRow).length}`)
-      } catch {}
-      engineForgetAll()
-      // Exit matrix trigger (idempotent): graceful-then-force every live
-      // non-survive job, then end the fence watcher. Survive jobs keep
-      // running by contract — their registry entries await the next host.
-      // fix-dispatch-dispose-kill D1: dispatch rows are skipped in BOTH the
-      // exit matrix (createExitCleanup skip) and disposeAll — killing an
-      // in-flight dispatch here is pure destruction (journal aborted →
-      // recovery skips live children).
-      //
-      // WHO RUNS THIS (doc-plugin-unload-v2; verified 2026-11-25 against the
-      // opencode 2.4.0 sources): this `dispose` key is the V1 cleanup
-      // contract — `Hooks.dispose` of @opencode-ai/plugin 1.x — and only a
-      // v1 host calls it. A v2 host never does. Its loader reads just
-      // `default.id` and `default.setup` (or `default.effect`) from the
-      // package's ./server entry (packages/core/src/plugin/module.ts), and
-      // the only cleanup it runs on plugin unload is the function `setup`
-      // RESOLVES to — an async setup is first-class there
-      // (packages/plugin/src/promise/plugin.ts; adapter.ts acquireRelease).
-      // That is the cleanup at the end of v2Setup, and it only disposes this
-      // instance's registrations and stops its event loop: it clears no job.
-      // So on a v2 host NO plugin unload terminates a job — the host's own
-      // rule, "Jobs outlive the plugin that launched them". Live on 2.4.0:
-      // an evict of the owner location with live jobs and a dispatch in
-      // flight killed nothing; the dispatch completed with its wake.
-      // The hook stays for v1 hosts. It is not deleted for being
-      // unreachable on v2.
-      exitCleanup?.trigger("dispose")
-      jobManager.disposeAll(isDispatchRow)
-      watchdog.dispose()
-      sessions.clear()
-    },
-
-    config: async (cfg) => {
-      const agentSection = cfg.agent ?? (cfg.agent = {})
-      const forgeUserCfg = agentSection[FORGE_AGENT] as { disable?: boolean } | undefined
-      forgeDisabled = forgeUserCfg?.disable === true
-      if (forgeDisabled) return
-
-      // Host-aligned interpreter (align-shell-interpreter): a host-configured
-      // shell, when the merged config exposes one, takes precedence over the
-      // plugin's platform chain (fail-soft: absent/blank = platform chain).
-      setHostShell(typeof (cfg as { shell?: unknown }).shell === "string" ? (cfg as { shell?: string }).shell : undefined)
-
-      // Native build/plan agents are NOT disabled (partition era): forge
-      // coexists with them in the Tab cycle, and their isolation from forge
-      // tooling is handled by the tool-partition injections below.
-
-      // Default subject (D13): the host falls back to "build" once a build
-      // agent exists — coexistence must not flip the default away from
-      // forge. `??=` keeps an explicit user `default_agent` (any value) as
-      // the user's own choice.
-      ;(cfg as { default_agent?: string }).default_agent ??= FORGE_AGENT
-
-      // Register forge without clobbering user-set fields (model, temperature,
-      // permission overrides stay theirs; prompt/description/mode only when
-      // absent).
-      const existing = agentSection[FORGE_AGENT] as Record<string, unknown> | undefined
-      agentSection[FORGE_AGENT] = {
-        ...(existing ?? {}),
-        description:
-          (existing?.description as string | undefined) ??
-          "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with an approve confirmation gate, a plugin-verified fail-closed close that re-runs the frozen checks, and tick discipline enforced by tools and the permission layer).",
-        mode: (existing?.mode as "primary" | "subagent" | "all" | undefined) ?? "primary",
-        prompt:
-          (existing?.prompt as string | undefined) ??
-          // Channel mandate composed per gate (forge-shell-mandate): hard
-          // refusal while the partition holds, preference under
-          // keepBuiltinShell, bare prompt under retirement.
-          (jobStage() < 2 ? forgePromptText({ hardRefusal: !jobsKeepBuiltinShell }) : FORGE_PROMPT),
-      }
-
-      // Job-supervisor option sanity is unchanged; the capability probe is
-      // retired — no experimental-flag scan, no native-parameter sniffing.
-
-      // Exec partition (tool-partition): the forge agent's builtin shell is
-      // hidden unconditionally — probe-independent, and INCLUDING on a
-      // user-defined forge entry (key-merge: only shell/bash are written,
-      // every other field of the entry stands). jobs.keepBuiltinShell is the
-      // single escape hatch; supervisor retirement withdraws the hide
-      // together with the tool registration.
-      if (!jobsKeepBuiltinShell && jobStage() < 2) {
-        const entry = agentSection[FORGE_AGENT] as { tools?: Record<string, boolean> }
-        entry.tools = { ...(entry.tools ?? {}), shell: false, bash: false }
-      }
-
-      // /plan command — created only when the user has no command named
-      // "plan" of their own. The template carries the full plan discipline
-      // (the entry turn is the rulebook; no bundled skill).
-      cfg.command ??= {}
-      cfg.command["plan"] ??= {
-        template: PLAN_COMMAND_TEMPLATE,
-        description: "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline",
-      }
-
-      // /goal command — same no-clobber rule.
-      // /crew command is composed per config LATER in this hook (it needs the
-      // loaded agent set for the roster/init-gate templates).
-      cfg.command["goal"] ??= {
-        template: GOAL_COMMAND_TEMPLATE,
-        description:
-          "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)",
-      }
-
-      // /forge command — the roster levers (change forge-commands): one
-      // command routing on its argument (sync / init / init global / stop /
-      // help). Same no-clobber rule as /plan and /goal. The hyphenated
-      // lever family (forge-sync/forge-init/forge-init-global/forge-cancel)
-      // is RETIRED (command-surface-v2-cleanup D1) — one command, four
-      // argument forms; deletion means "no longer registered", never
-      // touching a user's same-named entry.
-      cfg.command["forge"] ??= {
-        template: FORGE_COMMAND_TEMPLATE,
-        description:
-          'forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session\'s in-flight async dispatches',
-      }
-
-      // Gate permission rules (shell-defang-default-open): the 6 doors keep
-      // the full "ask" rewrite — they stay real user confirmations (an
-      // explicit allow on a door is still rewritten to ask). forge_shell is
-      // NEVER rewritten: its posture passes through untouched — unconfigured
-      // inherits the host default (in practice allow everywhere, so the exec
-      // surface behaves exactly like the native shell tool in every mode),
-      // and an explicit user allow/deny/ask stands verbatim for the host to
-      // resolve (TUI dialog / run auto-reject / serve pending ask). No
-      // plugin-side classification anywhere on the posture path. The draft
-      // write-ban lives in tool.execute.before (phase-aware, no global
-      // tightening), so stock behavior outside planning is unchanged.
-      const perm = (cfg as { permission?: Record<string, unknown> }).permission
-      const permSection = perm ?? ((cfg as { permission?: Record<string, unknown> }).permission = {})
-      // Snapshot — capture the user's OWN explicit values for the gate keys.
-      // Anti-recapture guard: only "allow"/"deny" are captured, "ask" never
-      // is — the merged config object may be re-presented on later passes
-      // carrying the plugin's DOOR rewrites. Only forge_shell's entry is
-      // consumed (belt-in-depth enforcement of its explicit rule); the doors
-      // never read it.
-      for (const gateKey of GATE_PERMISSION_KEYS) {
-        const incoming = permSection[gateKey]
-        if (incoming === "allow" || incoming === "deny") gatePermissionSnapshot.set(gateKey, incoming)
-      }
-      // Door posture rewrite. forge_shell is deliberately absent: no
-      // injection, no rewrite — pass-through (spec: "Exec posture
-      // pass-through on the exec surface").
-      for (const gateKey of GATE_PERMISSION_KEYS) {
-        if (gateKey === "forge_shell") continue
-        const v = permSection[gateKey]
-        if (v !== "deny") permSection[gateKey] = "ask"
-      }
-
-      // forge subagents: load forge.json (hot-apply), materialize the static
-      // subagents WITH their pinned models, and compose the /crew command for
-      // the current agent set. Findings surface through the diagnostics log —
-      // never silently swallowed, never an AI-facing configuration invitation.
-      // Workspace pool ownership (sole-pool-ownership): the materialization
-      // set is the global fallback layer + every seen workspace's pool (one
-      // per anchor: its walk-up nearest file — nested files ignored); file
-      // truth (edits/creations/deletions) hot-applies through the resolver's
-      // mtime caches on every resolve, and a deleted pool file disappears.
-      // EVERY family materializes namespaced (forge-<ns>-<id>; the global
-      // fallback is forge-global-<id> — no plain-id family exists); each
-      // agent's description carries its pool provenance (change
-      // pool-namespace-contract D3); the task-dispatch guard scopes dispatch
-      // session-locally.
-      const resolution = resolvePools()
-      poolResolution = resolution
-      for (const finding of resolution?.findings ?? []) {
-        console.warn(`[forge:config] ${finding.level}: ${finding.message}`)
-      }
-      materializedSnapshot = {}
-      const globalMaterializationPath = globalPoolPathOf()
-      for (const [matId, agent] of Object.entries(resolution?.agents ?? {})) {
-        const id = `forge-${matId}`
-        if (agentSection[id] !== undefined) continue // no-clobber
-        const provenance = foldPath(agent.file) === foldPath(globalMaterializationPath) ? ({ global: true } as const) : { ns: agent.ns, file: agent.file }
-        // forge-prompt-shared D4: the agent's ORIGIN file's `shared` segment
-        // threads into the materialized prompt (strict prepend beneath the
-        // role chain); null/undefined = byte-identical no-shared build.
-        const entry = forgeAgentDef(matId, agent.def, provenance, agent.shared ?? undefined)
-        agentSection[id] = entry
-        materializedSnapshot[id] = entry
-      }
-
-      // Tool-partition injections (spec: tool-partition, design D3/D9). Runs
-      // after materialization so every forge-* entry — plugin-created or
-      // user-defined (family rules follow the name, not the author) — is
-      // covered. Key-merge only: user-written fields and explicit `true`
-      // entries outside the forge family stand.
-      // (a) forge-* workers: harness STATE tools are primary-only. Workers
-      // keep the exec pair AND the search pair (forge_grep/forge_glob,
-      // forge-search-tools D6) — readonly-safe, shape-independent.
-      for (const id of Object.keys(agentSection)) {
-        if (!id.startsWith("forge-")) continue
-        const entry = agentSection[id] as { tools?: Record<string, boolean> }
-        const tools = { ...(entry.tools ?? {}) }
-        for (const t of FORGE_STATE_TOOLS) if (tools[t] !== true) tools[t] = false
-        entry.tools = tools
-      }
-      // (b) every other agent: ALL plugin tools hidden (explicit `true`
-      // respected — the user's own opt-in wins).
-      for (const [id, entry] of Object.entries(agentSection)) {
-        if (id === FORGE_AGENT || id.startsWith("forge-")) continue
-        const e = entry as { tools?: Record<string, boolean> }
-        const tools = { ...(e.tools ?? {}) }
-        for (const t of FORGE_ALL_TOOLS) if (tools[t] !== true) tools[t] = false
-        e.tools = tools
-      }
-      // (c) native agents absent from config: minimal partition entries
-      // (host merges by name — probe-verified no native-definition loss).
-      for (const native of NATIVE_PARTITION_FALLBACKS) {
-        if (agentSection[native] !== undefined) continue
-        const tools: Record<string, boolean> = {}
-        for (const t of FORGE_ALL_TOOLS) tools[t] = false
-        agentSection[native] = { tools }
-      }
-
-      // Host agent vocabulary refresh (task-shadow full-parity non-forge
-      // path): everything the merged config knows, plus the native
-      // fallbacks — the task tool's non-forge target router truth-checks
-      // against this set ("Agent not found" otherwise).
-      knownHostAgents.clear()
-      for (const native of NATIVE_PARTITION_FALLBACKS) knownHostAgents.add(native)
-      for (const id of Object.keys(agentSection)) knownHostAgents.add(id)
-
-      // models.dev snapshot: optional ladder verification for depth injection.
-      // Unavailable -> null -> verbatim pass-through (the provider judges).
-      if (process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1") {
-        modelsDevCatalog = null
-      } else {
-        try {
-          const snapshot = await loadModelsDevSnapshot({ cacheDir: modelsDevCacheRoot() })
-          modelsDevCatalog = snapshot.catalog
-        } catch {
-          modelsDevCatalog = null
-        }
-      }
-
-      // /crew command — composed per config: orchestration rulebook with the
-      // live roster when agents exist; the initialization guidance (hard gate)
-      // when none do. Overwritten on every config hook while plugin-owned (a
-      // template marker prefixes our text), never while user-defined.
-      cfg.command ??= {}
-      const existingCrew = cfg.command["crew"] as { template?: string } | undefined
-      if (!existingCrew || String(existingCrew.template ?? "").startsWith("(forge crew")) {
-        const agentCount = Object.keys(resolution?.agents ?? {}).length
-        const primaryAnchorDir = hostAnchors[0] ?? undefined
-        const template =
-          agentCount > 0
-            ? crewOrchestrationTemplate(resolution ?? null)
-            : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}\n   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`)
-              .replaceAll("{template}", JSON.stringify({ pool: "namespace (REQUIRED for crew-governed dispatch, [a-z0-9-] up to 24 chars — every pool materializes as forge-<ns>-<id>; the global fallback materializes as forge-global-<id>)", agents: { research: { model: "provider/model", thoughtLevel: "low", shape: "readonly", prompt: "short role description — what this agent does" }, coder: { model: "provider/model", thoughtLevel: "low", shape: "write", prompt: "short role description — what this agent does" } } }, null, 2).split("\n").map((l) => "   " + l).join("\n"))
-        const description =
-          agentCount > 0
-            ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report"
-            : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance"
-        cfg.command["crew"] = { template, description }
-        crewCommandSnapshot = { template, description }
-      }
-    },
-    // Registry getter keeps the disable knob honest: forge disabled -> no
-    // harness tools at all.
-    get tool(): Record<string, ToolDefinition> {
-      return forgeDisabled ? {} : forgeTools()
-    },
-
-    // Draft write-ban, primary enforcement: tool.execute.before fires for
-    // every tool call (run mode included — unlike permission.ask, which never
-    // fires headless, verified 1.18.32). Throwing here aborts the call with
-    // the guidance message. Phase-aware, so no global permission tightening
-    // is needed and stock behavior is untouched outside the draft phase.
-    "tool.execute.before": async (input, output) => {
-      if (process.env.FORGE_PERM_PROBE) {
-        try {
-          appendFileSync(join(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input.tool)} session=${input.sessionID}\n`)
-        } catch {}
-      }
-      // hang-watchdog timing start (both builtin shell names count). The
-      // command text feeds the Windows locator's needle branch (CIM ppid is
-      // unreliable there — see src/proc-locate.ts). Family gate
-      // (tool-partition): only forge-family sessions are tracked — non-forge
-      // and unknown sessions carry no marker and are never intervened upon.
-      if (watchdog.mode !== "off" && (input.tool === "shell" || input.tool === "bash") && sessionIsForgeFamily(input.sessionID)) {
-        const a = (output?.args ?? {}) as { command?: unknown; cmd?: unknown }
-        const cmdText = typeof a.command === "string" ? a.command : typeof a.cmd === "string" ? a.cmd : undefined
-        watchdog.track(input.callID, input.sessionID, input.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined)
-        if (process.env.FORGE_WATCHDOG_PROBE) {
-          try {
-            appendFileSync(join(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}\n`)
-          } catch {}
-        }
-      }
-      // Dispatch belt (tool-partition): a non-forge session must not spawn
-      // forge-* workers (the task vocabulary is global; refusal is the only
-      // per-parent control). Unknown sessions fail open.
-      if (input.tool === "task") {
-        const a = (output?.args ?? {}) as { subagent_type?: unknown; agent?: unknown }
-        const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined
-        const speaker = sessionAgents.get(input.sessionID)
-        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
-          if (target && target.toLowerCase().startsWith("forge-")) {
-            throw new Error(
-              `[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use the native general/explore subagents, or switch to the forge agent to dispatch forge-* workers.`,
-            )
-          }
-        }
-        // Session-domain pool gate (sole-pool-ownership, spec:
-        // forge-subagents — "Workspace pool ownership and global fallback"):
-        // a task targeting a forge-* worker whose pool belongs to ANOTHER
-        // workspace is refused — the target's origin pool path is named,
-        // with the three exits. Shared predicate with the task tool execute
-        // (poolGateRefusal — same source, same copy).
-        if (target && target.toLowerCase().startsWith("forge-") && input.sessionID) {
-          const poolRefusal = await poolGateRefusal(client, input.sessionID, target)
-          if (poolRefusal) throw new Error(poolRefusal)
-        }
-        // Crew pending belt (crew-harness, change add-crew-execution-mode-gate):
-        // a registered-but-unarmed crew refuses EVERY task dispatch — the
-        // registration→execution seam is a user decision point. Pre-registration
-        // recon dispatches freely; armed and ended crews never pend here.
-        const pendingRefusal = crewPendingRefusal(input.sessionID)
-        if (pendingRefusal) throw new Error(pendingRefusal)
-        // Crew compliance belt (change pool-namespace-contract, spec:
-        // crew-harness — "Crew-governed dispatch pool-compliance gate"):
-        // for task dispatches to forge-* targets FROM a crew-governed
-        // session (PENDING or EXECUTING, including born-armed), re-run the
-        // file-level pool compliance check — a pool degraded mid-crew
-        // blocks further crew dispatches until repaired. Runs AFTER the
-        // session-domain pool gate above (a cross-pool target keeps its
-        // not-dispatchable copy — compliance never masks it) and composes
-        // with the pending-crew belt without replacing it. Native
-        // (non-forge) targets are unaffected; global-fallback sessions are
-        // exempt; an unknown session anchor keeps the fail-open posture.
-        if (target && target.toLowerCase().startsWith("forge-") && input.sessionID) {
-          const complianceRefusal = await crewComplianceRefusalFor(client, input.sessionID, target)
-          if (complianceRefusal) throw new Error(complianceRefusal)
-        }
-      }
-      // State-file boundary (tool-partition): non-forge sessions must not
-      // mutate the forge state directories. Reads stay unrestricted; this is
-      // a mis-touch guard, not a security boundary (those paths live inside
-      // the workspace). Unknown sessions fail open.
-      if ((input.tool === "write" || input.tool === "edit") && input.sessionID) {
-        const speaker = sessionAgents.get(input.sessionID)
-        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
-          const a = (output?.args ?? {}) as { filePath?: unknown; path?: unknown }
-          const raw = typeof a.filePath === "string" ? a.filePath : typeof a.path === "string" ? a.path : undefined
-          if (raw) {
-            const state = stateForBan(input.sessionID)
-            const base = state?.worktree ?? hostWorktree ?? ""
-            const abs = (isAbsolute(raw) ? raw : join(base, raw)).replaceAll("\\", "/").toLowerCase()
-            if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
-              throw new Error(
-                `[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`,
-              )
-            }
-          }
-        }
-      }
-      if (typeof input.tool === "string" && isWriteTool(input.tool)) {
-        const state = stateForBan(input.sessionID)
-        const active = state ? resolveActivePlan(state) : null
-        if (active && active.doc.status === "draft") {
-          // Session-scoped safety interop (tool-partition, D12): the draft
-          // protects shared session state, so the ban binds the session, not
-          // the speaker. The wording is agent-agnostic: a blocked non-forge
-          // agent cannot see plan_approve and must be told the real way out.
-          if (input.tool === "task") {
-            // allow-readonly-recon-during-plan-draft: the spawn carve-out is
-            // keyed on the TARGET's effective readonly shape, not a wholesale
-            // deny. Shared predicate with the task tool execute
-            // (draftDispatchRefusal — same source, same copy, both modes).
-            const a = (output?.args ?? {}) as { subagent_type?: unknown; agent?: unknown }
-            const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined
-            const refusal = draftDispatchRefusal(input.sessionID, target)
-            if (refusal) throw new Error(refusal)
-          } else {
-            throw new Error(
-              `[forge] A plan is in draft; write operations are denied (${input.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`,
-            )
-          }
-        }
-      }
-      // Exec seal (readonly-exec-seal, tool-partition — "Readonly workers
-      // execute on a sealed supervised-exec channel"): a session whose
-      // running forge-* worker has an EXPLICIT readonly shape
-      // (effectiveReadonlyShape — shape-default-open: an absent shape is
-      // write and is NEVER sealed) gets its forge_shell channel gated before
-      // spawn: WRITE-CLASS commands (pure-string classifier,
-      // src/exec-classify.ts) are denied with a bounded finding naming the
-      // shape, the indicator and the `shape: "write"` remedy. The primary
-      // forge session is never sealed; an UNKNOWN session fails open (belt
-      // posture) with a once-per-session disclosure. Composes with, never
-      // replaces, the draft-phase ask/deny posture above — that block treats
-      // forge_shell via permission.ask only and is untouched here.
-      if (input.tool === "forge_shell" && input.sessionID) {
-        const a = (output?.args ?? {}) as { command?: unknown }
-        const cmd = typeof a.command === "string" ? a.command : undefined
-        if (cmd) {
-          const speaker = sessionAgents.get(input.sessionID)
-          const workerId =
-            speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT ? speaker.slice("forge-".length) : undefined
-          if (workerId !== undefined) {
-            const def = resolvePools()?.agents[workerId]?.def
-            if (def !== undefined && effectiveReadonlyShape(def)) {
-              const verdict = classifyExecCommand(cmd)
-              if (verdict.klass === WRITE_CLASS) {
-                const seen = sealFindings.get(input.sessionID) ?? new Set<string>()
-                if (!seen.has(verdict.indicator!)) {
-                  seen.add(verdict.indicator!)
-                  sealFindings.set(input.sessionID, seen)
-                  console.warn(
-                    `[forge:seal] session ${input.sessionID} (readonly worker "${speaker}"): write-class forge_shell command denied — indicator "${verdict.indicator}" (${verdict.detail ?? cmd.slice(0, 60)}). Remedy: "shape": "write" on the agent when its job legitimately mutates.`,
-                  )
-                }
-                throw new Error(
-                  `[forge:seal] Exec refused: this session runs the readonly worker "${speaker}" (explicit "shape": "readonly") and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. READ-CLASS commands (inspection, search, read-only evals) flow normally. If this worker's job legitimately mutates, set "shape": "write" on its forge.json entry. Report this refusal VERBATIM — do not work around it.`,
-                )
-              }
-            }
-          } else if (speaker === undefined) {
-            // Unknown session: fail-open on the channel (the seal keys on
-            // the explicit readonly shape only), disclosed once per session.
-            const verdict = classifyExecCommand(cmd)
-            if (verdict.klass === WRITE_CLASS && !sealUnknownNotes.has(input.sessionID)) {
-              sealUnknownNotes.add(input.sessionID)
-              console.warn(
-                `[forge:seal] session ${input.sessionID}: a WRITE-CLASS forge_shell command (${verdict.indicator}) flowed UNSEALED — the session's agent is unknown (fail-open; the exec seal binds explicit-readonly forge-* workers only).`,
-              )
-            }
-          }
-        }
-      }
-      // Partition fallback belts (tool-partition fallback requirement): on
-      // hosts that ignore hook-injected tools maps (the owner's paseo build —
-      // E2E-verified), invisibility degrades to hard refusal. On hosts that
-      // honor the maps the hidden tools never reach a call, so these belts
-      // are dead code there. Placed AFTER the draft ban: during a draft the
-      // write ban's message is the more precise refusal for bash.
-      if (input.sessionID && typeof input.tool === "string") {
-        const speaker = sessionAgents.get(input.sessionID)
-        if (speaker !== undefined) {
-          if (!isForgeFamilyAgent(speaker) && FORGE_TOOL_SET.has(input.tool)) {
-            throw new Error(
-              `[forge:partition] Tool refused: "${input.tool}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`,
-            )
-          }
-          if (isForgeFamilyAgent(speaker) && (input.tool === "shell" || input.tool === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
-            throw new Error(
-              `[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`,
-            )
-          }
-          // R1-degradation third quadrant (tool-partition fallback): on
-          // ignore-host builds STATE tools stay visible to forge-* workers
-          // but must be unusable; the refusal fires before any execution or
-          // ask gate, so the call never reaches a user confirmation dialog.
-          // Unknown sessions fail open (same posture as every belt above);
-          // on hosts that honor injected tools maps these tools are already
-          // hidden from workers, so the belt is dead code there.
-          if (isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT && FORGE_STATE_TOOL_SET.has(input.tool)) {
-            throw new Error(
-              `[forge:partition] Tool refused: "${input.tool}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${input.tool} at the gate.`,
-            )
-          }
-        }
-      }
-      // Draft-phase subagent-spawn gate is INHERITED: the native task tool is
-      // in the write-ban class (isWriteTool covers "task"), and the block
-      // above carves out effective-readonly targets per
-      // allow-readonly-recon-during-plan-draft (spec: forge-subagents —
-      // "Native-task dispatch surface" shape-gated interop).
-    },
-
-    // Family-map primary source (tool-partition): chat.message carries the
-    // agent for every incoming turn (earliest per-request signal; the belt is
-    // chat.params in case this hook does not fire on some host shape).
-    "chat.message": async (input) => {
-      if (forgeDisabled) return
-      const raw = input as unknown as { sessionID?: unknown; agent?: unknown }
-      if (typeof raw.sessionID === "string" && raw.sessionID) {
-        // A turn just started in this session — it is busy until the next
-        // session.idle (wake-push gate, job-read-consumption D6).
-        idleJobSessions.delete(raw.sessionID)
-        if (typeof raw.agent === "string" && raw.agent) {
-          sessionAgents.set(raw.sessionID, raw.agent)
-        }
-      }
-    },
-
-    // Reasoning-depth injection for forge subagent sessions (spec:
-    // forge-subagents — "Pinned thoughtLevel injection keyed by agent name").
-    // Keyed by the AGENT NAME (stable across sessions and spawn paths — any
-    // session running a forge-* agent gets its pinned depth), not a
-    // per-dispatch table. The FIRST request of a session freezes the
-    // translation (never rewritten mid-session); the config is re-read per
-    // lookup (mtime-cached hot-apply) for NEW sessions. An untranslatable
-    // word on a word-shaped channel passes through VERBATIM (disclosed
-    // unverified — provider judges); the only dead ends (legacy budget,
-    // pure toggle) inject nothing and record a bounded once-per-agent
-    // finding; a provider absent from catalog and prefix map defaults to
-    // the effort word channel (pass-through, never silent).
-    "chat.params": async (input, output) => {
-      if (forgeDisabled) return
-      const raw = input as unknown as { sessionID?: string; agent?: unknown; model?: { providerID?: unknown; modelID?: unknown } }
-      const sessionID = raw.sessionID
-      if (!sessionID) return
-      const agentName = typeof raw.agent === "string" ? raw.agent : (raw.agent as { name?: unknown } | undefined)?.name
-      // Family-map upsert (tool-partition): fires for every request build,
-      // including task-spawned sessions (probe P1).
-      if (typeof agentName === "string" && agentName) sessionAgents.set(sessionID, agentName)
-      // Session-model capture (harden-dispatch-resilience D3): every
-      // request build reports the session's resolved model — the dispatch
-      // gate's session-model fallback for unpinned targets. Both host
-      // shapes accepted (modelID plugin-SDK shape, id host 1.18.34 shape);
-      // a missing model id records nothing.
-      {
-        const capObj = raw.model as { modelID?: unknown; id?: unknown } | undefined
-        const capProvider = typeof raw.model?.providerID === "string" ? raw.model.providerID : ""
-        const capModel = typeof capObj?.modelID === "string" ? capObj.modelID : typeof capObj?.id === "string" ? capObj.id : ""
-        if (capProvider && capModel) sessionModels.set(sessionID, { provider: capProvider, model: capModel })
-      }
-      if (typeof agentName !== "string" || !agentName.startsWith("forge-")) return
-      const frozen = sessionDepths.get(sessionID)
-      if (frozen) {
-        // Frozen hit (postrelease-hardening D2): a null translation is a
-        // frozen dead end — the session's FIRST resolution had no counterpart
-        // shape, so nothing is injected for the remainder of the session,
-        // even if forge.json is edited mid-session (new sessions re-resolve).
-        if (process.env.FORGE_DEPTH_PROBE) {
-          try {
-            appendFileSync(
-              join(probeTmp(), "forge-depth-probe.log"),
-              `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}\n`,
-            )
-          } catch {}
-        }
-        if (frozen.translation) applyDepthTranslation(output.options ?? (output.options = {}), frozen.translation)
-        return
-      }
-      const agentId = agentName.slice("forge-".length)
-      // Pool-set lookup (sole-pool-ownership): the key is the materialized
-      // name sans prefix (plain or <ns>-<id>); fresh resolve per lookup
-      // keeps the hot-apply contract.
-      const def: ForgeAgentDef | undefined = resolvePools()?.agents[agentId]?.def
-      if (!def?.thoughtLevel) return
-      const modelObj = raw.model as { modelID?: unknown; id?: unknown } | undefined
-      const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : ""
-      // Host shape (empirically, 1.18.34): chat.params carries the full ModelInfo
-      // with the model name under `id` — `modelID` is the plugin-SDK test shape.
-      // Accept both; an empty model id degrades to the prefix-family fallback.
-      const modelID =
-        typeof modelObj?.modelID === "string" ? modelObj.modelID : typeof modelObj?.id === "string" ? modelObj.id : ""
-      const channel = resolveDepthChannel(providerID, modelID)
-      const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel)
-      // Freeze FIRST (postrelease-hardening D2): BOTH outcomes freeze the
-      // session — a translation re-applies verbatim on later requests, a dead
-      // end (translation: null) keeps injecting nothing. Mid-session config
-      // edits only ever affect sessions created after them (sessionDepths
-      // evicts on session.deleted). The once-per-agent finding bound is
-      // unchanged: dead ends land here exactly once per agent.
-      sessionDepths.set(sessionID, { translation })
-      if (translation) {
-        applyDepthTranslation(output.options ?? (output.options = {}), translation)
-      } else if (findingMessage && !depthFindingNotes.has(agentId)) {
-        depthFindingNotes.set(agentId, findingMessage)
-        console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`)
-      }
-      // Env-gated trace (same style as FORGE_GOAL_PROBE): one line per depth
-      // resolution, for sandbox E2E attribution (verify/adaptive-key.md).
-      // `optionsAfter` is serialized AFTER the apply (postrelease-hardening
-      // task 4): it must reflect the options that actually ship — serializing
-      // before the apply made triage misread a dropped key as "never
-      // injected". Frozen hits trace separately (frozen-apply, above).
-      if (process.env.FORGE_DEPTH_PROBE) {
-        try {
-          appendFileSync(
-            join(probeTmp(), "forge-depth-probe.log"),
-            `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}\n` +
-              `    input=${JSON.stringify(raw).slice(0, 600)}\n` +
-              `    optionsAfter=${JSON.stringify(output.options ?? {})}\n`,
-          )
-        } catch {}
-      }
-    },
-
-    // Test seam (wiring tests drive server() with stubs; same pragmatic
-    // module-state style as FORGE_TEST_NO_FENCE). Not part of the plugin API.
-    __forgeSubagentsTest: {
-      crews: () => crews,
-      sealFindings: (sessionID: string) => [...(sealFindings.get(sessionID) ?? [])],
-      depthState: (sessionID: string) => sessionDepths.get(sessionID)?.translation ?? null,
-      depthFinding: (agentId: string) => depthFindingNotes.get(agentId) ?? null,
-      catalog: () => modelsDevCatalog,
-      setCatalog: (c: CatalogSnapshot | null) => {
-        modelsDevCatalog = c
-      },
-      crewCommand: () => crewCommandSnapshot,
-      materialized: () => materializedSnapshot,
-      // Workspace-registry seam (sole-pool-ownership): the registry is
-      // host-lifetime state; tests simulate a host restart by resetting.
-      resetAnchors: () => {
-        hostAnchors.length = 0
-        poolResolver = null
-        poolResolution = null
-      },
-      anchors: () => [...hostAnchors],
-      resolveNow: () => resolvePools(),
-      workspacePoolOf: (anchor: string) => sessionPoolFileOf(anchor),
-      // Async-dispatch seams (change async-dispatch wiring tests).
-      dispatchTasks: () => [...dispatchTasks.values()],
-      // harden-dispatch-resilience D2 seams (nested-dispatch guard wiring
-      // tests): seed the session-model capture (the anthropic-family input
-      // the guard resolves through dispatchModelIdentity) and reset it.
-      setSessionModel: (sessionID: string, identity: { provider: string; model: string } | null) => {
-        if (identity === null) sessionModels.delete(sessionID)
-        else sessionModels.set(sessionID, identity)
-      },
-      // Fold D seams: the per-session FIFO queues and the journal/recovery
-      // surfaces (tests inject an in-memory journal fs BEFORE dispatching).
-      dispatchQueues: () =>
-        [...dispatchQueues.entries()].flatMap(([owner, wishes]) => wishes.map((w) => ({ ownerSession: owner, jobId: w.jobId, agentID: w.agentID }))),
-      setDispatchJournalFs: (factory: ((filePath: string) => JournalFs) | null) => {
-        dispatchJournalFsFactory = factory
-        dispatchJournals.clear()
-        recoveredDispatchWorkspaces.clear()
-      },
-      dispatchRecoveredWorkspaces: () => [...recoveredDispatchWorkspaces],
-      dispatchJournalText: (worktree: string): string | null => {
-        try {
-          return journalFor(worktree).fs.read()
-        } catch {
-          return null
-        }
-      },
-      // Session-anchor ledger seams (pool-rebind-on-resume): inject the fs
-      // BEFORE binding sessions; the factory clears the disclosure bounds
-      // and the dedup memo (the LEDGER FILE itself survives — it is exactly
-      // what a host restart keeps).
-      setSessionAnchorLedgerFs: (factory: ((filePath: string) => SessionAnchorLedgerFs) | null) => {
-        sessionAnchorLedgerFsFactory = factory
-        poolGateLedgerNotes.clear()
-        sessionAnchorLedgerMemo.clear()
-        sessionAnchorLedgerAppends = 0
-      },
-      // Simulate a NEW PROCESS for the same session id (the restart-resume
-      // shape): the in-memory session table and the disclosure bounds all
-      // reset — only the LEDGER (injected fs) survives, which is exactly
-      // what a host restart keeps.
-      resetSessionBindings: () => {
-        sessions.clear()
-        anchorPrefNotes.clear()
-        poolGateUnknownNotes.clear()
-        poolGateLedgerNotes.clear()
-        sessionAnchorLedgerMemo.clear()
-        sessionAnchorLedgerAppends = 0
-      },
-      sessionAnchorLedgerText: (): string | null => {
-        try {
-          return sessionAnchorLedgerFs().read()
-        } catch {
-          return null
-        }
-      },
-      // Pending [forge:dispatch-progress] notices for a session (fold #2
-      // wiring tests observe the enqueue side of the lossy queue).
-      dispatchProgress: (sessionID: string) => (dispatchProgressQueue.get(sessionID) ?? []).map((notice) => notice.text),
-      // fix-stale-progress-notice: notices dropped at delivery time because
-      // what they reported was no longer true (newest last, bounded).
-      dispatchProgressDropped: (sessionID: string) => [...(dispatchProgressDropped.get(sessionID) ?? [])],
-      // Read-only view of one registry row's in-memory output tail (the
-      // wiring tests check that a dropped notice stays in the job's output).
-      jobTail: (jobId: string): string | null => jobManager.get(jobId)?.tail ?? null,
-      // Provider-gate seams (harden-dispatch-resilience D3): observe the
-      // host-process gate's counters/breaker, and reset module state for
-      // test isolation (server() calls share one process).
-      dispatchGateState: () => {
-        if (!dispatchGate) return null
-        const live = dispatchGate.liveCounts()
-        const providers = new Set([...Object.keys(live.provider), ...gateProvidersSeen])
-        const breakers: Record<string, { state: string; failures: number }> = {}
-        for (const p of providers) breakers[p] = dispatchGate.breakerState(p)
-        return { live, breakers }
-      },
-      resetDispatchGate: () => {
-        dispatchGate = null
-        admittedGate.clear()
-        gateProvidersSeen.clear()
-        sessionModels.clear()
-        dispatchConfigLoaders.clear()
-      },
-      jobLedger: () => jobManager.ledgerEntries(),
-      // Posture seams (shell-defang-default-open): the pre-rewrite permission
-      // snapshot and a reset for test isolation (module state is shared
-      // across server() calls in one test process).
-      gateSnapshot: () => Object.fromEntries(gatePermissionSnapshot),
-      resetGateSnapshot: () => {
-        gatePermissionSnapshot.clear()
-      },
-    },
-
-    // permission.ask belt: on hosts/sessions where permission requests ARE
-    // created for write tools (e.g. the user configured edit:"ask"), deny
-    // them during draft. The permission.ask hook itself never fires in
-    // `opencode run` mode (verified 1.18.32) — tool.execute.before above is
-    // the primary enforcement. Tool-name resolution follows the cross-version
-    // priority chain (metadata.tool -> permission -> id -> type).
-    "permission.ask": async (input, output) => {
-      const meta = (input.metadata ?? {}) as Record<string, unknown>
-      const permissionField = (input as unknown as { permission?: unknown }).permission
-      const name =
-        (typeof meta.tool === "string" ? meta.tool : undefined) ??
-        (typeof permissionField === "string" ? permissionField : undefined) ??
-        input.id ??
-        input.type
-      if (process.env.FORGE_PERM_PROBE) {
-        try {
-          appendFileSync(
-            join(probeTmp(), "forge-perm-probe.log"),
-            `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input.id)} type=${JSON.stringify(input.type)} meta=${JSON.stringify(input.metadata)}\n`,
-          )
-        } catch {}
-      }
-      if (name === "plan_approve" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
-        // Belt for FIVE of the doors: if a permission request ever surfaces
-        // for them (host starts evaluating plugin tools), keep it a real ask
-        // unless explicitly denied — user-confirmation doors are never
-        // auto-resolved in any mode (plan_close is plugin-verified, not a
-        // door — plan-close-verified). forge_shell is deliberately ABSENT
-        // (pass-through): its request carries whatever the host resolved
-        // from the user's verbatim rules — the plugin never rewrites,
-        // classifies, or forces it.
-        // crew_close is NOT in this list and never was (v1 logic left
-        // byte-identical by fix-crew-close-ask-door D7): on a v1 host the
-        // door is held by the config hook's "ask" rewrite of
-        // GATE_PERMISSION_KEYS and by the tool's own context.ask — the
-        // host's native dialog. The v2 belt derives its doors from that
-        // same key list (V2_PERMISSION_DOORS), so v2 cannot drift again.
-        if (output.status !== "deny") output.status = "ask"
-        return
-      }
-      if (typeof name === "string" && isWriteTool(name)) {
-        const state = stateForBan(input.sessionID)
-        const active = state ? resolveActivePlan(state) : null
-        if (active && active.doc.status === "draft") {
-          output.status = "deny"
-        }
-      }
-    },
-
-    // Seed the session map so the write-ban works from the first tool call,
-    // and drive the goal continuation loop on idle.
-    event: async ({ event }) => {
-      if (event.type === "session.created") {
-        const info = (event as unknown as {
-          properties: { info: { id: string; directory?: string; worktree?: string } }
-        }).properties.info
-        const worktree = effectiveWorktree(info.worktree, info.directory)
-        if (typeof worktree === "string" && worktree) {
-          ensureSession(info.id, worktree)
-          // Fold E (lazy per-workspace recovery scope): workspaces beyond
-          // the launch anchor recover on their FIRST session.
-          if (!isRootish(worktree)) void recoverWorkspaceDispatches(jobClient as unknown as DispatchClient | null, worktree)
-        }
-      }
-      if (event.type === "session.idle") {
-        const sessionID = (event as unknown as { properties: { sessionID: string } }).properties.sessionID
-        if (typeof sessionID === "string" && sessionID) {
-          goalProbe(`idle event session=${sessionID}`)
-          idleJobSessions.add(sessionID)
-          scheduleIdleContinuation(client, sessionID)
-          // Progress flushes BEFORE terminal wakes (design D6): older
-          // information lands first on the same idle edge.
-          void deliverDispatchProgress(sessionID).then(() => deliverJobWakes(sessionID))
-        }
-      }
-      if (event.type === "session.deleted") {
-        const info = (event as unknown as { properties: { info: { id?: string } } }).properties.info
-        if (typeof info?.id === "string" && info.id) harvestSessionEnd(info.id)
-      }
-      if ((event as unknown as { type?: string }).type === "session.moved") {
-        // Post-move anchor re-resolution: the host's live statement of the
-        // session's new workspace (the session.get seam stays pre-move).
-        // Typed defensively: "session.moved" is a 2.3.2 v2 event; older v1
-        // hosts never emit it (the branch simply never fires there).
-        try {
-          const props = (event as unknown as { properties?: Record<string, unknown>; location?: unknown }).properties ?? (event as unknown as Record<string, unknown>)
-          const f = movedEventFields(props)
-          noteSessionMoved(f.sessionID, f.directory)
-        } catch {
-          // Drifted moved payload: no-op, never a throw into the host.
-        }
-      }
-      // Host-signal completion routing (dispatch-v2-hostsignals 3.1): the
-      // v1 hook's bus delivers the same durable execution events where the
-      // host publishes them — routed into the child-keyed inbox (a Map-miss
-      // for non-children is a no-op). Defensively typed, never a throw.
-      const v1Type = (event as unknown as { type?: string }).type
-      const v1Props = ((event as unknown as { properties?: Record<string, unknown> }).properties ?? {}) as Record<string, unknown>
-      const v1Session = typeof v1Props.sessionID === "string" && v1Props.sessionID ? v1Props.sessionID : undefined
-      if (v1Session && (v1Type === "session.execution.succeeded" || v1Type === "session.execution.failed" || v1Type === "session.execution.interrupted")) {
-        const kind =
-          v1Type === "session.execution.succeeded" ? ("succeeded" as const) : v1Type === "session.execution.failed" ? ("failed" as const) : ("interrupted" as const)
-        const detail =
-          kind === "failed"
-            ? executionErrorDetail(v1Props.error)
-            : kind === "interrupted"
-              ? v1Props.reason !== undefined
-                ? String(v1Props.reason)
-                : undefined
-              : undefined
-        noteDispatchTerminalSignal(v1Session, kind, detail)
-        // Parent-interrupt disclosure (dispatch-cancel-lifecycle 2.1): the
-        // v1 hook's bus carries the same interrupted edge — disclose-only,
-        // deduped, never a throw into the host callback.
-        if (kind === "interrupted") {
-          try {
-            discloseInterruptedParent(v1Session)
-          } catch {}
-        }
-      } else if (v1Session && (v1Type === "session.execution.started" || v1Type === "session.step.started" || v1Type === "session.step.ended")) {
-        noteDispatchChildActivity(v1Session)
-      }
-    },
-
-    // Per-turn activity ledger for the goal no-progress detector: writes,
-    // plan ticks, and goal_check count as activity; only continuation turns
-    // are evaluated (turnActivity exists solely between a continuation send
-    // and the following idle).
-    // hang-watchdog hooks — an independent backstop for the BUILTIN shell in
-    // any session (primary or delegated). forge_shell jobs carry no marker
-    // and are never governed here (their own idle/maxwait/kill system owns
-    // the lifecycle).
-    "shell.env": async (input, output) => {
-      if (watchdog.mode === "off") return
-      // No callID → no marker and no timing for this call (a table keyed on
-      // undefined would mis-track); the command runs, just ungoverned.
-      if (!input.callID) return
-      // Family gate (tool-partition): only forge-family sessions carry the
-      // marker — non-forge sessions are entirely outside the watchdog, down
-      // to the (invisible) environment variable.
-      if (!sessionIsForgeFamily(input.sessionID)) return
-      output.env[WATCHDOG_ENV_MARK] = markerValue(input.callID)
-      watchdog.markSeen(input.callID)
-      if (process.env.FORGE_WATCHDOG_PROBE) {
-        try {
-          appendFileSync(join(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input.callID} hostpid=${process.pid}\n`)
-        } catch {}
-      }
-    },
-    "tool.execute.after": async (input) => {
-      if ((input.tool === "shell" || input.tool === "bash") && watchdog.has(input.callID)) {
-        watchdog.untrack(input.callID)
-        if (process.env.FORGE_WATCHDOG_PROBE) {
-          try {
-            appendFileSync(join(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input.callID}\n`)
-          } catch {}
-        }
-      }
-      if (typeof input.tool !== "string") return
-      const act = turnActivity.get(input.sessionID)
-      if (act) {
-        if (isWriteTool(input.tool) || input.tool === "plan_tick") act.writes++
-        // goal-no-progress-honesty: a verification command on an exec-class
-        // tool scores like goal_check — a turn that re-ran the contract's
-        // checks through forge_shell can never be scored no-progress.
-        if (input.tool === "goal_check" || input.tool === "forge_shell" || input.tool === "shell" || input.tool === "bash") act.checks++
-      }
-      // Crew-side counters (crew-autonomous-waves D3): task dispatches count
-      // as crew-turn activity (waves ARE the work) plus write-family calls;
-      // zero cost for sessions without an open crew-continuation turn.
-      const crewAct = crewTurnActivity.get(input.sessionID)
-      if (crewAct) {
-        if (input.tool === "task") crewAct.dispatches++
-        if (isWriteTool(input.tool)) crewAct.writes++
-      }
-    },
-
-    // Session-start notices + standing reminders: injected into the system
-    // prompt whenever the session has a non-terminal plan or a live goal
-    // (both coexist). The relay clause makes the first reply surface them to
-    // the user (no native banner API exists for plugins).
-    "experimental.chat.system.transform": async (input, output) => {
-      if (!input.sessionID) return
-      // Family gate (tool-partition): EVERY forge-authored system text —
-      // crew-active, job guidance, plan/goal notices — is forge-family-only.
-      // Unknown sessions receive nothing (fail-silent by design).
-      if (!sessionIsForgeFamily(input.sessionID)) return
-      // Job-supervisor guidance reaches every FORGE-FAMILY session including
-      // delegated ones (subagents are not in the `sessions` map — that is why
-      // this push happens before the state lookup); the family gate above
-      // keeps it out of all other agents' sessions.
-      const crewActive = crews.get(input.sessionID)
-      if (crewActive && !output.system.some((s) => s.startsWith("[forge:crew-active]"))) {
-        const modeText = crewActive.mode === "pending"
-          ? "PENDING (present the execution-mode choice; every task dispatch is refused until armed)"
-          : "armed (executing)"
-        output.system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict, or crew_close {abandon: true, reason} to re-shard.`)
-      }
-      if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
-        output.system.push(
-          jobsKeepBuiltinShell
-            ? "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion."
-            : "[forge:job-guidance] Every shell command — quick ones included — goes through forge_shell: the builtin shell/bash tools are refused on this agent, so never try them first. forge_shell returns on exit/success/idle with a jobId instead of blocking indefinitely; long-running or non-exiting commands use run_in_background. Manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.",
-        )
-      }
-      const state = sessions.get(input.sessionID)
-      if (!state) return
-      const active = resolveActivePlan(state)
-      if (active) {
-        const p = progressOf(active.doc)
-        const rel = relFrom(state.worktree, active.path)
-        const rule =
-          active.doc.status === "draft"
-            ? "while in draft, write operations are denied at the tool layer; present the plan then end your turn to await the user's review — on feedback revise via plan_write and re-present; call plan_approve only after the user explicitly approves in chat (their confirmation dialog is the final gate); /plan discard to abandon"
-            : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close — the plugin re-runs the frozen verification checks itself (fail-closed, no dialog) and writes an evidence summary the user reviews asynchronously"
-        output.system.push(
-          `[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`,
-        )
-      }
-      if (forgeDisabled) return
-      const goal = resolveLiveGoal(state)
-      if (goal) {
-        const rel = relFrom(state.worktree, goal.path)
-        const d = goal.doc
-        const rule =
-          d.status === "active"
-            ? "continue working the success criteria; call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself); if genuinely blocked call goal_pause with the blocker"
-            : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it"
-        output.system.push(
-          `[forge:goal-notice] This session is bound to a goal: ${rel} (status: ${d.status}${d.stopReason ? `, stopped: ${d.stopReason}` : ""}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Rule: ${rule}. If the user has not mentioned the goal yet, relay its path and status to them in one short line at the start of your reply.`,
-        )
-      }
-    },
-
-    // Goal facts survive compaction: the brief rides along in the compaction
-    // prompt so post-compaction turns still follow the goal.
-    "experimental.session.compacting": async (input, output) => {
-      if (forgeDisabled) return
-      if (!input.sessionID) return
-      // Family gate (tool-partition): the goal brief is forge-authored text.
-      if (!sessionIsForgeFamily(input.sessionID)) return
-      const state = sessions.get(input.sessionID)
-      if (!state) return
-      const goal = resolveLiveGoal(state)
-      if (!goal) return
-      const d = goal.doc
-      output.context.push(
-        `[forge:goal-brief] A live goal governs this session: ${relFrom(state.worktree, goal.path)} (status: ${d.status}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Goal: ${d.goal}. Success criteria:\n${d.criteria
-          .map((c, i) => `${i + 1}. ${c}`)
-          .join("\n")}\nPost-compaction turns must keep following this goal and its constraints.`,
-      )
-    },
-
-    // While the goal loop owns this session's continuation, suppress the
-    // host's synthetic compaction auto-continue (no double continuation).
-    // Scoped to live goals (active OR paused): a paused goal's loop is merely
-    // parked, not resigned — a compaction must not hand the wheel back to the
-    // host's synthetic continue behind the resume gate.
-    "experimental.compaction.autocontinue": async (input, output) => {
-      if (forgeDisabled) return
-      if (!input.sessionID) return
-      const state = sessions.get(input.sessionID)
-      if (!state) return
-      const goal = resolveLiveGoal(state)
-      // Family gate (tool-partition): suppression only while the session's
-      // current agent belongs to the forge family — a parked loop under a
-      // non-forge speaker must not suppress the host's native behavior.
-      if (goal && sessionIsForgeFamily(input.sessionID)) output.enabled = false
-    },
-  }
+  goalAcceptedCalls.delete(sessionID)
+  engineForgetSession(sessionID)
 }
 
 // ---------------------------------------------------------------------------
@@ -8796,12 +3804,15 @@ type V2ToolEditor = {
   add?(def: { name: string; description: string; input: Record<string, unknown>; execute: (args: unknown, toolCtx: unknown) => Promise<unknown> }): void
   list?(): Array<{ name: string }>
   get?(name: string): unknown
+  update?(name: string, update: (draft: Record<string, unknown>) => void): void
 }
 // Command-domain editor (task 4.3, W6a field reality — SDK 2.3.2
 // promise/command.d.ts): CommandDefinition is EXECUTE-based
 // {name, description?, execute({sessionID, prompt, delivery})} and the
 // editor exposes ONLY add() — no list/get/remove (the v1 create-only rule
-// is not implementable on this domain; documented drift in design.md).
+// is not implementable on this domain). In host v2.4.0, configured
+// commands are replayed after plugin registration and win name collisions;
+// editor-level add order alone does not determine the final host registry.
 // The template text rides the execute closure: invoking the command sends
 // the SAME constant text into the invoking session via the flat
 // {sessionID, text} prompt.
@@ -8810,11 +3821,11 @@ type V2CommandEditor = {
 }
 type V2PluginContext = {
   agent?: {
-    transform?(cb: (draft: V2AgentDraft) => void | Promise<void>): Promise<unknown>
+    transform?(cb: (draft: V2AgentDraft) => void): Promise<unknown>
   }
   tool?: {
-    transform?(cb: (editor: V2ToolEditor) => void | Promise<void>): Promise<unknown>
-    hook?(name: string, cb: (event: unknown) => void): void
+    transform?(cb: (editor: V2ToolEditor) => void): Promise<unknown>
+    hook?(name: string, cb: (event: unknown) => void): unknown
   }
   // W6a field realities (SDK 2.3.2 promise/permission.d.ts): the evaluate
   // hook hands the plugin a MUTABLE PermissionEvaluation ({sessionID, agent?,
@@ -8843,46 +3854,22 @@ type V2PluginContext = {
     get?(opts: unknown): Promise<unknown>
     prompt?(input: unknown): Promise<unknown>
     context?(opts: unknown): Promise<unknown>
-    // dispatch-v2-hostsignals 3.2 (protocol-verified 2.3.2): the one-shot
-    // idle latch — POST /api/experimental/session/:sessionID/wait
-    // (NoContent success; "Wait for a session agent loop to become idle").
-    wait?(input: unknown): Promise<unknown>
-    // fix-v2-crew-surface-drift D2 (sandbox-probed 2.3.2): the promise-layer
-    // session domain DOES expose create — flat single-object param, bare
-    // record response (see v2SessionClient's create adapter).
-    create?(input: unknown): Promise<unknown>
+    list?(opts: unknown): Promise<unknown>
+    interrupt?(opts: unknown): Promise<unknown>
     // worker-shell-session-allow (source-verified 2.3.2 plugin/host.ts):
     // update carries {sessionID, ...mutations} incl. `permissions` — the
     // whole session ruleset is REPLACED, so the rescue always read-back-
     // merges first. Guarded: a drifted host simply disables the rescue's
     // injection channel (the D5 fallback belt still covers workers).
     update?(input: unknown): Promise<unknown>
-    // fix-dispatch-dispose-kill D3 (live-host probe 2026-11-23, host 2.3.2
-    // GET /openapi.json: POST /api/session/{sessionID}/interrupt, optional
-    // resume query, 200 {interrupted:boolean}, idle interruption is a no-op;
-    // SDK v2 gen sdk.gen.d.ts:1743 session.interrupt — "Interrupt active
-    // execution owned by this OpenCode process"): the v2 stop surface. The
-    // adapter wires it as the dispatch `abort` seam (HTTP fallback when the
-    // promise layer does not expose it).
-    interrupt?(input: unknown): Promise<unknown>
   }
-  command?: { transform?(cb: (editor: V2CommandEditor) => void | Promise<void>): Promise<unknown> }
+  command?: { transform?(cb: (editor: V2CommandEditor) => void): Promise<unknown> }
   // W6a field realities (SDK 2.3.2 promise/event.d.ts): subscribe(options?)
   // returns an ASYNC ITERABLE of OpenCodeEvent envelopes {id, created, type,
   // data} — no handlers map, no abort return value. SubscribeOptions carries
   // {types?, signal?} (adapter.js makeStreams); cleanup = breaking the
   // for-await loop (iterator.return) and/or aborting the signal.
   event?: { subscribe?(options?: unknown): unknown }
-  // dispatch-v2-hostsignals 4.1 (promise/storage.d.ts, 2.3.2): the host
-  // plugin KV — get(key)→Json|undefined, set/remove, scan({prefix})→
-  // {entries:[{key,value}], next?}. The persisted dispatch registry rides
-  // it; a drifted/absent domain fails soft to the journal-only posture.
-  storage?: {
-    get?(key: string): Promise<unknown>
-    set?(key: string, value: unknown): Promise<void>
-    remove?(key: string): Promise<void>
-    scan?(options: { prefix: string; after?: string; limit?: number }): Promise<{ entries?: ReadonlyArray<{ key: string; value: unknown }>; next?: string } | undefined>
-  }
   skill?: { transform?(cb: (draft: unknown) => void | Promise<void>): Promise<unknown> }
   // SANDBOX-PENDING: ctx.location as the workspace/directory source follows
   // the conventions §3 mapping (directory/project → ctx.location.*); the
@@ -8924,7 +3911,7 @@ const v2HostAnchors = new Map<string, string>()
 // services) as the sole anchor, so pool workers never materialized outside
 // the sandbox (where serve's cwd happened to be the workspace). Accept both
 // shapes; never guess.
-function v2AnchorCandidates(ctx: V2PluginContext): string[] {
+function v2AnchorCandidates(ctx: V2PluginContext, includeCwd = true): string[] {
   const out: string[] = []
   try {
     for (const reader of [ctx.location?.worktree, ctx.location?.directory]) {
@@ -8934,7 +3921,7 @@ function v2AnchorCandidates(ctx: V2PluginContext): string[] {
   } catch {
     // Drifted location: cwd-only resolution (fail-soft).
   }
-  out.push(process.cwd())
+  if (includeCwd) out.push(process.cwd())
   return out
 }
 
@@ -8996,123 +3983,6 @@ function wrapV2ToolResult(res: unknown): { content: unknown; title?: unknown } {
 // session-bound map then the host anchor. metadata defaults to a no-op so
 // ungated cores run.
 type V2AssertFn = (input: unknown) => Promise<void>
-
-// worker-shell-session-allow D2/D4 — the documented session-rule rescue.
-// The host's permission assert evaluates the calling agent at the PLUGIN
-// HOST's location; a native worker md registers only at the project
-// location, so the assert falls back to a literal deny-all BEFORE any
-// rule/saved-approval/hook/ask is consulted (v2.3.2 permission.ts,
-// missingAgentPermissions — reports/research-plugin-tool-permission.md
-// §1). Session rules merge AFTER agent rules with last-match-wins, so one
-// appended allow rule restores the documented default-open posture in
-// exactly that geometry. Captured alongside the assert bridge; every call
-// site guards. The rule is scoped to the forge_shell action alone — it can
-// never affect a builtin tool or another plugin.
-let v2SessionRuleApi: {
-  get: (sessionID: string) => Promise<unknown>
-  update: (input: { sessionID: string; permissions: unknown }) => Promise<unknown>
-} | null = null
-
-const SESSION_RESCUE_RULE = { action: "forge_shell", resource: "*", effect: "allow" } as const
-const sessionRescueInjected = new Set<string>()
-const sessionRescueDisclosed = new Set<string>()
-
-function isSessionRescueRule(rule: unknown): boolean {
-  if (rule === null || typeof rule !== "object") return false
-  const o = rule as { action?: unknown; resource?: unknown; effect?: unknown }
-  return o.action === "forge_shell" && o.resource === "*" && o.effect === "allow"
-}
-
-// A forge WORKER session (the primary agent id is exactly "forge" — no
-// dash — so the prefix test excludes it). Unknown sessions (family-map
-// miss) are NOT workers: the rescue never fires for them.
-function isForgeWorkerSession(sessionID: string | undefined): boolean {
-  if (!sessionID) return false
-  const agent = sessionAgents.get(sessionID)
-  return typeof agent === "string" && agent.startsWith("forge-")
-}
-
-// D4: ensure the session's permission rules END with our allow rule —
-// read-back-merge (never clobbers existing rules), idempotent, disabled
-// entirely under an explicit user deny (D3: deny is sacred). Returns
-// whether the rule is in place after the call; every failure is fail-soft
-// (the D5 fallback belt owns the unavailable case).
-async function ensureSessionRescueRule(sessionID: string): Promise<boolean> {
-  if (!v2SessionRuleApi) return false
-  if (sessionRescueInjected.has(sessionID)) return true
-  if (explicitForgeShellPosture() === "deny") return false
-  try {
-    const record = await v2SessionRuleApi.get(sessionID)
-    const current =
-      record !== null && typeof record === "object" ? (record as Record<string, unknown>).permissions : undefined
-    const merged = Array.isArray(current) ? current.slice() : []
-    if (merged.some(isSessionRescueRule)) {
-      // already in place — mark idempotent, no write
-      sessionRescueInjected.add(sessionID)
-      return true
-    }
-    merged.push({ ...SESSION_RESCUE_RULE })
-    await v2SessionRuleApi.update({ sessionID, permissions: merged })
-    sessionRescueInjected.add(sessionID)
-    return true
-  } catch {
-    return false
-  }
-}
-
-// D5 disclosure bookkeeping: the fallback belt fires at most one
-// diagnostics line + one tool-call metadata title per session.
-function markSessionRescueDisclosed(sessionID: string): void {
-  if (sessionRescueDisclosed.has(sessionID)) return
-  sessionRescueDisclosed.add(sessionID)
-  console.warn(
-    `[forge:session-rescue] warn: worker session ${sessionID} — the host permission assert fell back to deny-all (cross-anchor agent resolution; README "Native mode — worker shell rescue"); the documented session-rule rescue let this call through.`,
-  )
-}
-
-// One-shot disclosure side-channel consumed by the forge_shell execute
-// (attaches the rescue note to the tool call's metadata title, once).
-const sessionRescueAttached = new Set<string>()
-function takeSessionRescueDisclosure(sessionID: string): string | null {
-  if (!sessionRescueDisclosed.has(sessionID) || sessionRescueAttached.has(sessionID)) return null
-  sessionRescueAttached.add(sessionID)
-  return "[forge:session-rescue] cross-anchor deny-all rescued via the session rule (see diagnostics)"
-}
-
-// Test surface (worker-shell-session-allow tasks 2.1–2.4): unit seams over
-// module state that production reaches only through host surfaces. Nothing
-// here runs in production paths.
-export const __workerShellRescueTestSurface = {
-  setPosture(value: "allow" | "deny" | "ask" | undefined) {
-    v2PostureTestOverride = { value }
-  },
-  clearPosture() {
-    v2PostureTestOverride = null
-  },
-  setHostSeen(value: boolean) {
-    v2HostSeen = value
-  },
-  setSessionRuleApi(api: {
-    get: (sessionID: string) => Promise<unknown>
-    update: (input: { sessionID: string; permissions: unknown }) => Promise<unknown>
-  } | null) {
-    v2SessionRuleApi = api
-  },
-  setFamily(sessionID: string, agent: string | undefined) {
-    if (agent === undefined) sessionAgents.delete(sessionID)
-    else sessionAgents.set(sessionID, agent)
-  },
-  ensure: ensureSessionRescueRule,
-  isWorker: isForgeWorkerSession,
-  gate: forgeShellGate,
-  markDisclosed: markSessionRescueDisclosed,
-  takeDisclosure: takeSessionRescueDisclosure,
-  resetState() {
-    sessionRescueInjected.clear()
-    sessionRescueDisclosed.clear()
-    sessionRescueAttached.clear()
-  },
-}
 
 // fix-multi-location-session-anchor (design D1 方案甲 item 2): the session's
 // directory straight from the HOST's own session record — the record's
@@ -9177,8 +4047,7 @@ async function v2ToolContext(raw: unknown, anchorClient: V2AnchorReader = anchor
     out.worktree = hostWorktree
     if (typeof out.sessionID === "string" && out.sessionID) defaultDirectory = hostWorktree || null
   }
-  // fix-ask-door-multi-directory-host D2: the ask behind every door and
-  // behind forge_shell goes through the interface the REGISTERING
+  // fix-ask-door-multi-directory-host D2: every door uses the interface the REGISTERING
   // initialization handed in — the one bound to the directory whose
   // sessions run this closure. Given none, no ask is synthesized and the
   // door refuses by name in gate() (fail-closed). There is deliberately NO
@@ -9215,11 +4084,35 @@ function nameDefaultDirectory(wrapped: { content: unknown; title?: unknown }, de
 // production path.
 export const __sessionAnchorTestSurface = {
   hostSessionDirectory,
+  resolveSessionAnchorForPools,
+  workspacePoolOf: sessionPoolFileOf,
+  resolvePools,
   resolveToolContext: (raw: unknown, anchorClient?: V2AnchorReader, assertFn?: V2AssertFn | null) => v2ToolContext(raw, anchorClient ?? undefined, assertFn ?? null),
   worktreeOf: (sessionID: string): string | null => sessions.get(sessionID)?.worktree ?? null,
   bindChildToDirectory,
   sessionAnchorLedgerPath,
   noteLedgerBinding: noteSessionAnchorLedgerBinding,
+  setSessionAnchorLedgerFs: (factory: ((filePath: string) => SessionAnchorLedgerFs) | null) => {
+    sessionAnchorLedgerFsFactory = factory
+    poolGateLedgerNotes.clear()
+    sessionAnchorLedgerMemo.clear()
+    sessionAnchorLedgerAppends = 0
+  },
+  resetSessionBindings: () => {
+    sessions.clear()
+    anchorPrefNotes.clear()
+    poolGateUnknownNotes.clear()
+    poolGateLedgerNotes.clear()
+    sessionAnchorLedgerMemo.clear()
+    sessionAnchorLedgerAppends = 0
+  },
+  sessionAnchorLedgerText: (): string | null => {
+    try {
+      return sessionAnchorLedgerFs().read()
+    } catch {
+      return null
+    }
+  },
   // fix-unknown-session-anchor-seed: the seed switch, the async resolver and
   // the boundary base, for the unit tests. Nothing here runs in a
   // production path.
@@ -9246,9 +4139,6 @@ export const __sessionAnchorTestSurface = {
 // refusal belts signal by throwing INSIDE the hook callback exactly like
 // v1 tool.execute.before; injection/mutation handlers are try/catch
 // fail-soft so a drifted event shape degrades to a no-op, never a throw.
-// The v1-only watchdog blocks are deliberately absent here (the watchdog
-// instance is created inside server(); a v2 watchdog rides a later wave
-// once ctx.options pin the option surface).
 // ---------------------------------------------------------------------------
 
 // String pick over an assumed-shape event (never throws).
@@ -9279,16 +4169,14 @@ function v2AgentNameOf(src: unknown): string | undefined {
 // ---------------------------------------------------------------------------
 
 // fix-crew-close-ask-door D2 — DERIVED from GATE_PERMISSION_KEYS, never
-// hand-listed. The user-confirmation doors are exactly the non-exec gate()
+// hand-listed. The user-confirmation doors are exactly the gate()
 // permission keys (six today: plan_approve, goal_write, goal_complete,
 // goal_resume, goal_discard, crew_close). On a v2 host a tool's ask IS the
 // host's ctx.permission.assert, so the dialog a door needs exists only if
 // THIS belt rewrites the host's "allow" to "ask" on every evaluation. This
 // set used to be a second, hand-copied list without crew_close — which let
 // crew_close end a crew without asking (present since the v2 port).
-// forge_shell is deliberately absent (pass-through, shell-defang-default-
-// open); plan_close is plugin-verified, not a door (plan-close-verified).
-const V2_PERMISSION_DOORS = new Set<string>(GATE_PERMISSION_KEYS.filter((key) => key !== "forge_shell"))
+const V2_PERMISSION_DOORS = new Set<string>(GATE_PERMISSION_KEYS)
 
 // Test surface (fix-crew-close-ask-door D4): the two lists above are
 // module-level constants production reaches only through gate() and the
@@ -9308,12 +4196,13 @@ function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
     // (permission.d.ts: `Schema.Literals<readonly ["allow", "deny", "ask"]>`).
     // Name chain (v1 parity, pruned to the fields the real type carries):
     // metadata.tool → action. No status/decision/outcome slot exists.
-    ctx.permission.hook("evaluate", async (raw: unknown) => {
+    // Registration may reject asynchronously; keep the same silent drift posture.
+    void Promise.resolve(ctx.permission.hook("evaluate", async (raw: unknown) => {
       try {
-        const evalInput = raw !== null && typeof raw === "object" ? (raw as { sessionID?: unknown; agent?: unknown; action?: unknown; metadata?: unknown; effect?: unknown; message?: unknown }) : null
+        const evalInput = raw !== null && typeof raw === "object" ? (raw as { sessionID?: unknown; agent?: unknown; action?: unknown; resources?: unknown; metadata?: unknown; effect?: unknown; message?: unknown }) : null
         if (!evalInput || typeof evalInput.effect !== "string") return
         const meta = (evalInput.metadata !== null && typeof evalInput.metadata === "object" ? evalInput.metadata : {}) as Record<string, unknown>
-        const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof evalInput.action === "string" ? evalInput.action : undefined)
+        const name = evalInput.action === NATIVE_TOOL_VOCAB.dispatchTool ? evalInput.action : (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof evalInput.action === "string" ? evalInput.action : undefined)
         if (process.env.FORGE_PERM_PROBE) {
           try {
             appendFileSync(join(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}\n`)
@@ -9322,7 +4211,7 @@ function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
         if (typeof name === "string" && V2_PERMISSION_DOORS.has(name)) {
           // Doors: keep it a REAL ask unless explicitly denied — the user
           // confirmation (the ask prompt the host raises for effect "ask")
-          // is the gate (v1 parity). forge_shell is deliberately absent
+          // is the gate (v1 parity). native shell is not a confirmation door
           // (pass-through, shell-defang-default-open).
           if (evalInput.effect !== "deny") evalInput.effect = "ask"
           return
@@ -9338,6 +4227,17 @@ function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
           const state = stateForBan(sessionID)
           const active = state ? resolveActivePlan(state) : null
           if (active && active.doc.status === "draft") {
+            // Native subagent asserts its actual agent id as the sole resource.
+            // Recheck the current draft roster, never lift the host's own deny/ask.
+            if (evalInput.action === NATIVE_TOOL_VOCAB.dispatchTool && state) {
+              const resources = evalInput.resources
+              const target = Array.isArray(resources) && resources.length === 1 && typeof resources[0] === "string" ? resources[0] : undefined
+              const refusal = nativeDraftDispatchRefusal(state, target)
+              if (!refusal) return
+              evalInput.effect = "deny"
+              evalInput.message = refusal
+              return
+            }
             evalInput.effect = "deny"
             evalInput.message = "[forge] A plan is in draft; write operations are denied. Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan."
           }
@@ -9345,7 +4245,7 @@ function v2RegisterPermissionBelt(ctx: V2PluginContext): void {
       } catch {
         // Belt posture: never throw into the host (fail-open on drift).
       }
-    })
+    })).catch(() => {})
   } catch {
     // Drifted permission domain: silent no-op.
   }
@@ -9390,10 +4290,10 @@ function v2AnchorClient(ctx: V2PluginContext): { session?: { get?: (opts: unknow
 function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { get?: (opts: unknown) => Promise<unknown> } } | null): void {
   if (typeof ctx.tool?.hook !== "function") return
   try {
-    // Port of the v1 "tool.execute.before" belt (watchdog block excepted —
-    // see the region comment). Refusals throw; every message is verbatim
-    // v1. Unknown sessions fail open on every belt.
-    ctx.tool.hook("execute.before", async (raw: unknown) => {
+    // Port of the v1 "tool.execute.before" belt. Refusals throw.
+    // Missing identity does not grant access to harness state tools.
+    // Handle each registration promise independently so an async rejection does not suppress its sibling.
+    void Promise.resolve(ctx.tool.hook("execute.before", async (raw: unknown) => {
       const { tool, sessionID, args } = v2ToolEventArgs(raw)
       // Strongest family-map source parity (tool context): an agent field
       // on the event is an authoritative speaker statement.
@@ -9404,8 +4304,18 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
           appendFileSync(join(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool)} session=${JSON.stringify(sessionID)}\n`)
         } catch {}
       }
-      // Dispatch belt (tool-partition): a non-forge session must not spawn
-      // forge-* workers. Unknown sessions fail open.
+      const nativeDispatch = tool === NATIVE_TOOL_VOCAB.dispatchTool
+      // Capture an already-known active arm before any anchor/pool awaits.
+      // A newly armed revision cannot authorize an older in-flight decision.
+      const goalWork = typeof tool === "string" && (isWriteTool(tool) || tool === "goal_check")
+      const initialState = goalWork && sessionID ? sessions.get(sessionID) : undefined
+      const initialGoal = initialState ? resolveLiveGoal(initialState) : null
+      const initialArm = initialGoal?.doc.session === sessionID ? initialGoal : null
+      const nativeTarget = nativeDispatch && typeof args.agent === "string" ? args.agent : undefined
+      // Bind the caller's own directory before judging even a missing target.
+      const nativeAnchor = nativeDispatch && sessionID ? await resolveSessionAnchorForPools(anchorClient, sessionID) : ""
+      if (nativeAnchor && sessionID) ensureSession(sessionID, nativeAnchor)
+      // Legacy dispatch belt pending v1 retirement.
       if (tool === "task") {
         const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined
         const speaker = sessionID ? sessionAgents.get(sessionID) : undefined
@@ -9432,30 +4342,27 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
         }
       }
       // State-file boundary (tool-partition).
-      if ((tool === "write" || tool === "edit") && sessionID) {
-        const speaker = sessionAgents.get(sessionID)
-        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
-          const raw = typeof args.filePath === "string" ? args.filePath : typeof args.path === "string" ? args.path : undefined
-          if (raw) {
-            // fix-unknown-session-anchor-seed (design D2/D3): the session is
-            // resolved from the host's own record (through THIS
-            // initialization's client) before it is judged; an unresolvable
-            // session has no base directory on a multi-directory process.
-            const state = await stateForCheck(sessionID, anchorClient)
-            const base = banBaseDirectory(state)
-            // No base (an unresolvable session on a multi-directory process):
-            // the relative path is judged by its OWN spelling, normalized
-            // against a neutral root — never joined onto another directory's.
-            // A path that names a state directory relative to ANY working
-            // directory (".opencode/plan/x.md") is still refused; one that
-            // would land there only from some particular directory
-            // ("../plan/y.md") cannot be judged here and passes.
-            const abs = (isAbsolute(raw) ? raw : join(base || "/", raw)).replaceAll("\\", "/").toLowerCase()
-            if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
-              throw new Error(
-                `[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`,
-              )
-            }
+      if (tool === "write" || tool === "edit") {
+        const raw = typeof args.filePath === "string" ? args.filePath : typeof args.path === "string" ? args.path : undefined
+        if (raw) {
+          // fix-unknown-session-anchor-seed (design D2/D3): the session is
+          // resolved from the host's own record (through THIS
+          // initialization's client) before it is judged; an unresolvable
+          // session has no base directory on a multi-directory process.
+          const state = sessionID ? await stateForCheck(sessionID, anchorClient) : null
+          const base = banBaseDirectory(state)
+          // No base (an unresolvable session on a multi-directory process):
+          // the relative path is judged by its OWN spelling, normalized
+          // against a neutral root — never joined onto another directory's.
+          // A path that names a state directory relative to ANY working
+          // directory (".opencode/plan/x.md") is still refused; one that
+          // would land there only from some particular directory
+          // ("../plan/y.md") cannot be judged here and passes.
+          const abs = (isAbsolute(raw) ? raw : join(base || "/", raw)).replaceAll("\\", "/").toLowerCase()
+          if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
+            throw new Error(
+              `[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`,
+            )
           }
         }
       }
@@ -9470,7 +4377,10 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
         const state = await stateForCheck(sessionID, anchorClient)
         const active = state ? resolveActivePlan(state) : null
         if (active && active.doc.status === "draft") {
-          if (tool === "task") {
+          if (nativeDispatch && state) {
+            const refusal = nativeDraftDispatchRefusal(state, nativeTarget)
+            if (refusal) throw new Error(refusal)
+          } else if (tool === "task") {
             // allow-readonly-recon: carve-out keyed on the TARGET's shape.
             const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined
             const refusal = draftDispatchRefusalForState(state, target)
@@ -9482,55 +4392,14 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
           }
         }
       }
-      // Exec seal (readonly-exec-seal): explicit-readonly forge-* workers
-      // get WRITE-CLASS forge_shell commands denied before spawn.
-      if (tool === "forge_shell" && sessionID) {
-        const cmd = typeof args.command === "string" ? args.command : undefined
-        if (cmd) {
-          const speaker = sessionAgents.get(sessionID)
-          const workerId =
-            speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT ? speaker.slice("forge-".length) : undefined
-          if (workerId !== undefined) {
-            const def = resolvePools()?.agents[workerId]?.def
-            if (def !== undefined && effectiveReadonlyShape(def)) {
-              const verdict = classifyExecCommand(cmd)
-              if (verdict.klass === WRITE_CLASS) {
-                const seen = sealFindings.get(sessionID) ?? new Set<string>()
-                if (!seen.has(verdict.indicator!)) {
-                  seen.add(verdict.indicator!)
-                  sealFindings.set(sessionID, seen)
-                  console.warn(
-                    `[forge:seal] session ${sessionID} (readonly worker "${speaker}"): write-class forge_shell command denied — indicator "${verdict.indicator}" (${verdict.detail ?? cmd.slice(0, 60)}). Remedy: "shape": "write" on the agent when its job legitimately mutates.`,
-                  )
-                }
-                throw new Error(
-                  `[forge:seal] Exec refused: this session runs the readonly worker "${speaker}" (explicit "shape": "readonly") and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. READ-CLASS commands (inspection, search, read-only evals) flow normally. If this worker's job legitimately mutates, set "shape": "write" on its forge.json entry. Report this refusal VERBATIM — do not work around it.`,
-                )
-              }
-            }
-          } else if (speaker === undefined) {
-            const verdict = classifyExecCommand(cmd)
-            if (verdict.klass === WRITE_CLASS && !sealUnknownNotes.has(sessionID)) {
-              sealUnknownNotes.add(sessionID)
-              console.warn(
-                `[forge:seal] session ${sessionID}: a WRITE-CLASS forge_shell command (${verdict.indicator}) flowed UNSEALED — the session's agent is unknown (fail-open; the exec seal binds explicit-readonly forge-* workers only).`,
-              )
-            }
-          }
-        }
-      }
       // Partition fallback belts (tool-partition fallback requirement).
+      assertHarnessAgent(tool, evAgent ?? (sessionID ? sessionAgents.get(sessionID) : undefined))
       if (sessionID && typeof tool === "string") {
         const speaker = sessionAgents.get(sessionID)
         if (speaker !== undefined) {
           if (!isForgeFamilyAgent(speaker) && FORGE_TOOL_SET.has(tool)) {
             throw new Error(
               `[forge:partition] Tool refused: "${tool}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`,
-            )
-          }
-          if (isForgeFamilyAgent(speaker) && (tool === "shell" || tool === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
-            throw new Error(
-              `[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`,
             )
           }
           // R1 third quadrant: STATE tools are primary-only.
@@ -9541,27 +4410,98 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
           }
         }
       }
-    })
-    // Port of the v1 "tool.execute.after" activity ledger (watchdog untrack
-    // excepted). Never throws.
-    ctx.tool.hook("execute.after", async (raw: unknown) => {
+      // The native tool remains host-owned. This preflight only refuses a
+      // stale generated roster for a known caller; it never executes a child.
+      let missingPoolRefusal: string | undefined
+      let dispatchAnchor = nativeAnchor
+      if (nativeDispatch && nativeTarget?.toLowerCase().startsWith("forge-") && sessionID) {
+        // Resolve once at the final gate, then make pool/compliance decisions
+        // synchronously on current recipes with no intervening await.
+        dispatchAnchor = await resolveSessionAnchorForPools(anchorClient, sessionID)
+        const poolRefusal = poolGateRefusalAtAnchor(dispatchAnchor, sessionID, nativeTarget, true, refusal => { missingPoolRefusal = refusal })
+        if (poolRefusal) throw new Error(poolRefusal)
+      }
+      // Pending registration is not authorization to start native work.
+      // Refuse it for every target, following the pool ownership check.
+      if (nativeDispatch) {
+        const pendingRefusal = crewPendingRefusal(sessionID)
+        if (pendingRefusal) throw new Error(pendingRefusal)
+      }
+      if (nativeDispatch && nativeTarget?.toLowerCase().startsWith("forge-") && sessionID && dispatchAnchor) {
+        const complianceRefusal = crewComplianceRefusalAtAnchor(dispatchAnchor, sessionID, nativeTarget)
+        if (complianceRefusal) throw new Error(complianceRefusal)
+        if (nativeRosterActive()) {
+          const stale = rosterStaleRefusal(dispatchAnchor)
+          if (stale) throw new Error(stale)
+        }
+      }
+      if (missingPoolRefusal) throw new Error(missingPoolRefusal)
+      // Last synchronous admission decision: the goal may have been paused,
+      // replaced or re-armed while native pool/compliance checks awaited.
+      // Read-only chat and explicit arming gates are deliberately outside
+      // this belt; already accepted host calls are not cancelled here.
+      if (goalWork && sessionID) {
+        const state = sessions.get(sessionID)
+        const fresh = state ? resolveLiveGoal(state) : null
+        const owns = fresh?.doc.session === sessionID
+        const forgeSpeaker = sessionIsForgeFamily(sessionID)
+        if ((forgeSpeaker && owns && fresh?.doc.status === "paused") ||
+            (crews.get(sessionID)?.goalGoverned && (!owns || fresh?.doc.status !== "active")) ||
+            (initialArm && (!owns || fresh?.doc.status !== "active" || fresh.path !== initialArm.path ||
+              fresh.doc.revision !== initialArm.doc.revision || fresh.doc.armedAt !== initialArm.doc.armedAt))) {
+          throw new Error("[forge:goal] Autonomous work refused: the goal is paused or its authorization changed. Ask the user to resume or explicitly re-arm before starting new work.")
+        }
+      }
+    })).catch(() => {})
+    // Port of the v1 "tool.execute.after" activity ledger. Never throws.
+    void Promise.resolve(ctx.tool.hook("execute.after", async (raw: unknown) => {
       try {
-        const { tool, sessionID } = v2ToolEventArgs(raw)
+        const { tool, sessionID, id, args } = v2ToolEventArgs(raw)
         if (typeof tool !== "string" || !sessionID) return
         const act = turnActivity.get(sessionID)
-        if (act) {
-          if (isWriteTool(tool) || tool === "plan_tick") act.writes++
-          // goal-no-progress-honesty: exec-class verification commands score
-          // like goal_check (mirror of the v1 activity ledger).
-          if (tool === "goal_check" || tool === "forge_shell" || tool === "shell" || tool === "bash") act.checks++
+        const event = raw as Record<string, unknown>
+        const activityEvent = {
+          messageID: typeof event.messageID === "string" ? event.messageID : undefined,
+          status: event.status,
+          codemode: typeof event.codemode === "boolean" ? event.codemode : undefined,
+        }
+        if (tool === "subagent") {
+          const result = event.result as Record<string, unknown> | undefined
+          const metadata = result?.metadata as Record<string, unknown> | undefined
+          const accepted = event.status === "completed" && id && metadata?.status === "running" && typeof metadata.sessionID === "string" && metadata.sessionID
+          const state = sessions.get(sessionID)
+          const goal = state && resolveLiveGoal(state)
+          const owns = goal?.doc.status === "active" && goal.doc.session === sessionID
+          const seen = goalAcceptedCalls.get(sessionID) ?? new Map<string, string>()
+          if (accepted && id && !seen.has(id)) {
+            if (owns) {
+              seen.set(id, metadata.sessionID as string)
+              goalAcceptedCalls.set(sessionID, seen)
+              const watched = goalNativeWatch.get(sessionID) ?? new Set<string>()
+              watched.add(metadata.sessionID as string)
+              goalNativeWatch.set(sessionID, watched)
+            }
+            if (act) observeGoalActivity(act, tool, isWriteTool(tool), id, args, result, activityEvent)
+          } else if (!accepted && act) observeGoalActivity(act, tool, isWriteTool(tool), id, args, undefined, activityEvent)
+        } else if (act) observeGoalActivity(act, tool, isWriteTool(tool), id,
+          event.codemode === true ? event.input : args, event.result ?? event.output, activityEvent)
+        const crew = crews.get(sessionID)
+        if (crew?.mode === "executing" && tool === NATIVE_TOOL_VOCAB.dispatchTool) {
+          const round = crewAcceptedRound(id, args, raw)
+          if (round && !crew.rounds?.some(r => r.id === round.id)) {
+            ;(crew.rounds ??= []).push(round)
+            appendCrewRecord(crew.recordPath, "wave dispatch", [`${round.description}: ${round.id} → ${round.childID} (${round.agent}${round.agent.startsWith("forge-") ? "" : ", native fallback"})`])
+          }
         }
         const crewAct = crewTurnActivity.get(sessionID)
         if (crewAct) {
-          if (tool === "task") crewAct.dispatches++
+          if (id && crewAct.seen?.has(id)) return
+          if (id) (crewAct.seen ??= new Set()).add(id)
+          if (tool === "subagent" || tool === "task") crewAct.dispatches++
           if (isWriteTool(tool)) crewAct.writes++
         }
       } catch {}
-    })
+    })).catch(() => {})
   } catch {
     // Drifted tool-hook surface: silent no-op (transform may still work).
   }
@@ -9577,27 +4517,11 @@ function v2RegisterToolHooks(ctx: V2PluginContext, anchorClient: { session?: { g
 // onto event.system) — Decision 3's event topology: capture happens in
 // prompt + execute.before; the context handler reads the map.
 function v2ContextInjection(raw: unknown): void {
-  if (forgeDisabled) return
   const o = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
   const sessionID = v2PickStr(o, "sessionID", "sessionId")
   if (!sessionID) return
   const agentName = v2AgentNameOf(o)
   if (agentName) sessionAgents.set(sessionID, agentName)
-  // worker-shell-session-allow D4 (inheritance channel): seed the rescue
-  // rule on the forge PRIMARY session — child worker sessions created
-  // AFTER this inherit the session rules in effect at creation (official
-  // semantics), so most workers never even reach the belt. Fire-and-forget:
-  // the first-turn race is covered by the worker-side belt in the
-  // forge_shell execute.
-  if (agentName === FORGE_AGENT) void ensureSessionRescueRule(sessionID).catch(() => {})
-  // Session-model capture (harden-dispatch-resilience D3, v2 port): the
-  // context payload's resolved model seeds the same session→model table.
-  {
-    const capObj = o.model as { providerID?: unknown; id?: unknown; modelID?: unknown } | undefined
-    const capProvider = typeof capObj?.providerID === "string" ? capObj.providerID : ""
-    const capModel = typeof capObj?.modelID === "string" ? capObj.modelID : typeof capObj?.id === "string" ? capObj.id : ""
-    if (capProvider && capModel) sessionModels.set(sessionID, { provider: capProvider, model: capModel })
-  }
   // --- depth injection (chat.params port) ---
   if (agentName && agentName.startsWith("forge-")) {
     const agentId = agentName.slice("forge-".length)
@@ -9622,8 +4546,7 @@ function v2ContextInjection(raw: unknown): void {
         // the new variant; anything else deletes it (a stale variant of a
         // different model is meaningless). Host contract
         // (fix-dispatch-model-pin-shape): the runner composes providerID +
-        // "/" + model.id — `id`/`modelID` stay BARE here, same as the
-        // dispatch-async create seam (guarded by unit tests there).
+        // "/" + model.id; keep id/modelID bare.
         const resolvedModel = typeof m.modelID === "string" ? m.modelID : typeof m.id === "string" ? m.id : ""
         const identityEquals =
           m.providerID === identity.provider && resolvedModel === identity.model
@@ -9682,16 +4605,9 @@ function v2ContextInjection(raw: unknown): void {
   const crewActive = crews.get(sessionID)
   if (crewActive && !system.some((s) => typeof s === "string" && s.startsWith("[forge:crew-active]"))) {
     const modeText = crewActive.mode === "pending"
-      ? "PENDING (present the execution-mode choice; every task dispatch is refused until armed)"
+      ? "PENDING (present the execution-mode choice; do not start subagent work until the user authorizes execution)"
       : "armed (executing)"
-    system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict, or crew_close {abandon: true, reason} to re-shard.`)
-  }
-  if (!forgeDisabled && jobStage() < 2 && !system.some((s) => typeof s === "string" && s.startsWith("[forge:job-guidance]"))) {
-    system.push(
-      jobsKeepBuiltinShell
-        ? "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion."
-        : "[forge:job-guidance] Every shell command — quick ones included — goes through forge_shell: the builtin shell/bash tools are refused on this agent, so never try them first. forge_shell returns on exit/success/idle with a jobId instead of blocking indefinitely; long-running or non-exiting commands use run_in_background. Manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.",
-    )
+    system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; wait without polling or sleeping for verified settlement of all work rounds and collect evidence for every declared subtask before crew_close (terminal status alone is not PASS), or crew_close {abandon: true, reason} to re-shard, subject to existing approvals.`)
   }
   const state = sessions.get(sessionID)
   if (!state) return
@@ -9707,15 +4623,14 @@ function v2ContextInjection(raw: unknown): void {
       `[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`,
     )
   }
-  if (forgeDisabled) return
   const goal = resolveLiveGoal(state)
   if (goal) {
     const rel = relFrom(state.worktree, goal.path)
     const d = goal.doc
     const rule =
       d.status === "active"
-        ? "continue working the success criteria; call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself); if genuinely blocked call goal_pause with the blocker"
-        : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it"
+        ? "work the success criteria within the approved contract and remaining budgets; wait for verified settlement of any outstanding crew rounds before advancing; during genuine host waiting end your turn without polling or sleeping, the minute budget still runs; meaningful read-only work, commits and checks with new evidence are productive, no write, shell command or git diff is required every turn, and repeated identical checks without new evidence are not progress; stop at either budget limit or loss of authorization, do not start further autonomous work (already accepted host work may finish); call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself and asks the user); if globally blocked call goal_pause with the concrete blocker, but if independent authorized work remains after a local issue continue that work"
+        : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it; do not start new autonomous work, including goal-governed crew work; already accepted host work may finish"
     system.push(
       `[forge:goal-notice] This session is bound to a goal: ${rel} (status: ${d.status}${d.stopReason ? `, stopped: ${d.stopReason}` : ""}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Rule: ${rule}. If the user has not mentioned the goal yet, relay its path and status to them in one short line at the start of your reply.`,
     )
@@ -9726,7 +4641,6 @@ function v2ContextInjection(raw: unknown): void {
 // facts ride along in the compaction context so post-compaction turns keep
 // following the goal (compression-safety carrier).
 function v2CompactionInjection(raw: unknown): void {
-  if (forgeDisabled) return
   const o = raw !== null && typeof raw === "object" ? (raw as Record<string, unknown>) : {}
   const sessionID = v2PickStr(o, "sessionID", "sessionId")
   if (!sessionID) return
@@ -9744,17 +4658,16 @@ function v2CompactionInjection(raw: unknown): void {
   )
 }
 
-function v2RegisterSessionHooks(ctx: V2PluginContext, goalClient: GoalClient | null): { disposables: Array<() => void>; idleHook: boolean } {
-  const out = { disposables: [] as Array<() => void>, idleHook: false }
+async function v2RegisterSessionHooks(ctx: V2PluginContext, goalClient: GoalClient | null): Promise<{ disposables: Array<() => unknown>; idleHook: boolean }> {
+  const out = { disposables: [] as Array<() => unknown>, idleHook: false }
   if (typeof ctx.session?.hook !== "function") return out
-  const register = (name: string, cb: (raw: unknown) => void): boolean => {
+  const register = async (name: string, cb: (raw: unknown) => void): Promise<boolean> => {
     try {
-      const registration = ctx.session!.hook!(name, cb)
-      // Registration is {dispose: () => Promise<void>} (registration.d.ts);
-      // collect whichever dispose-like shape the host handed back.
+      // The promise-layer hook resolves to Registration; keep its receiver
+      // and return the disposal result so cleanup can await it.
+      const registration = await ctx.session!.hook!(name, cb)
       if (registration !== null && typeof registration === "object" && typeof (registration as { dispose?: unknown }).dispose === "function") {
-        const dispose = (registration as { dispose: () => unknown }).dispose
-        out.disposables.push(() => void dispose())
+        out.disposables.push(() => (registration as { dispose: () => unknown }).dispose())
       }
       return true
     } catch {
@@ -9768,22 +4681,20 @@ function v2RegisterSessionHooks(ctx: V2PluginContext, goalClient: GoalClient | n
   // delivery} — NO agent field, so family capture rides the context hook
   // (SessionContext.agent) and execute.before's agent; the v1 agent
   // reader stays as a harmless pass-through.
-  register("prompt", async (raw: unknown) => {
+  await register("prompt", async (raw: unknown) => {
     try {
-      if (forgeDisabled) return
       const sessionID = v2PickStr(raw, "sessionID", "sessionId")
       if (!sessionID) return
-      idleJobSessions.delete(sessionID)
       const agent = v2AgentNameOf(raw)
       if (agent) sessionAgents.set(sessionID, agent)
     } catch {}
   })
-  register("context", async (raw: unknown) => {
+  await register("context", async (raw: unknown) => {
     try {
       v2ContextInjection(raw)
     } catch {}
   })
-  register("compaction", async (raw: unknown) => {
+  await register("compaction", async (raw: unknown) => {
     try {
       v2CompactionInjection(raw)
     } catch {}
@@ -9798,29 +4709,76 @@ function v2RegisterSessionHooks(ctx: V2PluginContext, goalClient: GoalClient | n
   // event-domain fallback (see v2SubscribeEvents). The work itself is
   // DETACHED (void) so the hook returns promptly — the host proceeds to
   // idle while the continuation/wake sends settle on their own.
-  out.idleHook = register("experimental.idle", async (raw: unknown) => {
+  out.idleHook = await register("experimental.idle", async (raw: unknown) => {
     const sessionID = v2PickStr(raw, "sessionID", "sessionId")
     if (!sessionID) return
-    v2HandleIdle(sessionID, goalClient)
+    if (hasIdleBackgroundShell(raw, sessionID)) goalBackgroundHeld.add(sessionID)
+    else if (idleBackgroundKnown(raw)) goalBackgroundHeld.delete(sessionID)
+    v2HandleIdle(sessionID, goalClient, goalBackgroundHeld.has(sessionID))
   })
   return out
 }
 // ---------------------------------------------------------------------------
-// Commands (task 4.3) — ctx.command.transform, create-only, templates
+// Commands (task 4.3) — ctx.command.transform, add-only editor, templates
 // byte-identical by construction (the SAME constants/functions the v1
 // config hook registers — they ship in dist unchanged).
 // ---------------------------------------------------------------------------
 
+async function v2StopNative(ctx: V2PluginContext, sessionID: string): Promise<string> {
+  const svc = discoverServiceHttp()
+  const request = async (path: string, method = "GET") => {
+    if (!svc) throw new Error("service unavailable")
+    const url = new URL(svc.url)
+    if (!["localhost", "127.0.0.1", "[::1]"].includes(url.hostname)) throw new Error("non-local service")
+    const res = await fetch(svc.url + path, {
+      method, redirect: "error", signal: AbortSignal.timeout(1500),
+      headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
+    })
+    if (!res.ok) throw new Error("stop service request failed")
+    return res.status === 204 ? undefined : await res.json()
+  }
+  let directory = ""
+  return stopNative(sessionID, {
+    children: async (parent, cursor) => {
+      if (ctx.session?.list) {
+        try { return await ctx.session.list({ parentID: parent, limit: STOP_LIST_LIMIT, ...(cursor ? { cursor } : {}) }) } catch { /* use local HTTP fallback */ }
+      }
+      return request(`/api/session?parentID=${encodeURIComponent(parent)}&limit=${STOP_LIST_LIMIT}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`)
+    },
+    context: async parent => {
+      if (!ctx.session?.context) throw new Error("context unavailable")
+      return ctx.session.context({ sessionID: parent })
+    },
+    shells: async () => {
+      if (!svc) throw new Error("service unavailable")
+      if (!directory) {
+        const rec = await ctx.session?.get?.({ sessionID }) as { location?: { directory?: string }; directory?: string } | undefined
+        directory = rec?.location?.directory ?? rec?.directory ?? ""
+      }
+      if (!directory) throw new Error("directory unknown")
+      return request(`/api/shell?location[directory]=${encodeURIComponent(directory)}`)
+    },
+    active: () => request("/api/session/active"),
+    removeShell: id => request(`/api/shell/${encodeURIComponent(id)}?location[directory]=${encodeURIComponent(directory)}`, "DELETE"),
+    interrupt: async id => {
+      if (!ctx.session?.interrupt) throw new Error("interrupt unavailable")
+      return ctx.session.interrupt({ sessionID: id })
+    },
+    wait: () => new Promise(resolve => setTimeout(resolve, 200)),
+  })
+}
+
 async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
   if (typeof ctx.command?.transform !== "function") return
   try {
-    await ctx.command.transform(async (editor) => {
+    await ctx.command.transform((editor) => {
       // W6a field reality (SDK 2.3.2 promise/command.d.ts + live host): the
       // v2 CommandDefinition is EXECUTE-based — {name, description?,
       // execute({sessionID, prompt, delivery})} — the editor exposes ONLY
-      // add() (no get), so the v1 create-only rule is NOT implementable on
-      // the v2 domain (documented drift in design.md; the host dedupes or
-      // last-wins). Each v1 template command becomes an executable that
+      // add() (no get), so the v1 create-only check is NOT implementable in
+      // the editor. In host v2.4.0, post-plugin config replay wins a same-name
+      // collision; editor add order alone is not final registry precedence.
+      // Each v1 template command becomes an executable that
       // sends the SAME template text into the invoking session — the
       // templates stay byte-identical by construction (same constants).
       const addFn = editor?.add
@@ -9842,7 +4800,20 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
             const promptShape = input?.prompt as { text?: unknown } | undefined
             const typed =
               promptShape && typeof promptShape === "object" && typeof promptShape.text === "string" ? promptShape.text : undefined
-            const text = composeCommandPrompt(template(), typed)
+            const stop = name === "forge" && typed?.trim() === "stop"
+            if (!stop) {
+              // CommandInvocation has no agent field. Read the documented
+              // SessionV2Info.agent fresh; a prior turn cannot prove identity.
+              let record: { agent?: unknown; parentID?: unknown } | undefined
+              try {
+                record = await ctx.session.get?.({ sessionID }) as typeof record
+              } catch { /* unknown identity fails closed */ }
+              if (record?.agent !== FORGE_AGENT || record.parentID !== undefined) {
+                throw new Error(`[forge:command] /${name} belongs to the primary forge agent. Switch to forge (Tab) and rerun it there.`)
+              }
+            }
+            // Stop runs before receipt delivery.
+            const text = stop ? await v2StopNative(ctx, sessionID) : composeCommandPrompt(template().split("\n").filter(line => !line.startsWith("FAMILY GUARD (step 0")).join("\n"), typed)
             const delivery = typeof input?.delivery === "string" && input.delivery ? input.delivery : undefined
             try {
               await ctx.session.prompt(delivery ? { sessionID, text, delivery } : { sessionID, text })
@@ -9887,7 +4858,7 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
         "crew",
         crewTemplate,
         registrationAgentCount > 0
-          ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report"
+          ? "forge crew orchestration: register a declared subtask plan, execute it in waves of native subagent calls, close with an evidence-checked report"
           : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance",
       )
       // /forge — the roster levers (change forge-commands): the SAME
@@ -9898,7 +4869,7 @@ async function v2RegisterCommands(ctx: V2PluginContext): Promise<void> {
       addTemplateCommand(
         "forge",
         () => FORGE_COMMAND_TEMPLATE,
-        "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight and queued async dispatches",
+        "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop requests cancellation of confirmed native children",
       )
     })
   } catch (e) {
@@ -9961,15 +4932,7 @@ type V2SessionClient = {
     prompt?: (opts: unknown) => Promise<unknown>
     promptAsync?: (opts: unknown) => Promise<unknown>
     get?: (opts: unknown) => Promise<unknown>
-    create?: (args: { body: Record<string, unknown>; query?: { directory?: string } }) => Promise<{ data?: unknown; error?: unknown }>
-    messages?: (args: { path: { id: string }; query?: { limit?: number } }) => Promise<{ data?: unknown[]; error?: unknown }>
-    /**
-     * fix-dispatch-dispose-kill D3: the dispatch abort seam — the 2.3.2
-     * stop surface (interrupt) translated into the v1 abort call shape
-     * ({path:{id}}) abortChild uses. Promise-layer ctx.session.interrupt
-     * where available, service.json HTTP interrupt endpoint otherwise.
-     */
-    abort?: (args: { path: { id: string }; query?: { directory?: string } }) => Promise<unknown>
+    context?: (opts: unknown) => Promise<unknown>
   }
   /**
    * crew-continue-native-child-gate 4.2 (sandbox E2E finding 2026-11-23):
@@ -10095,7 +5058,8 @@ function v2NativeChildWalker(): NativeChildClient {
         const parent = args !== null && typeof args === "object" && typeof (args as { parentID?: unknown }).parentID === "string"
           ? (args as { parentID: string }).parentID
           : ""
-        return await serviceHttpGet(svc, parent ? `/api/session?parentID=${encodeURIComponent(parent)}&limit=${NATIVE_CHILD_LIST_LIMIT}` : "/api/session")
+        const cursor = (args as { cursor?: unknown } | undefined)?.cursor
+        return await serviceHttpGet(svc, parent ? `/api/session?parentID=${encodeURIComponent(parent)}&limit=${NATIVE_CHILD_LIST_LIMIT}${typeof cursor === "string" && cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}` : "/api/session")
       },
       status: async () => {
         const svc = discoverServiceHttp()
@@ -10117,9 +5081,6 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
   const s = ctx.session
   if (s === null || typeof s !== "object") return null;
   const out: V2SessionClient["session"] = {}
-  // Per-child directory anchors for the HTTP messages reader (set at create).
-  const childDirs = new Map<string, string>()
-  let lastKnownDir: string | undefined
   if (typeof s.prompt === "function") {
     const send = async (opts: unknown) => {
       const input = v2PromptInputOf(opts)
@@ -10135,173 +5096,10 @@ function v2SessionClient(ctx: V2PluginContext): V2SessionClient | null {
       return sid !== undefined ? s.get!({ sessionID: sid }) : s.get!(opts)
     }
   }
-  // fix-v2-crew-surface-drift task 2.2 (design D2 — sandbox-probed
-  // 2026-11-21 on 2.3.2): the child-session creation seam EXISTS on the
-  // promise-layer session domain as ctx.session.create — same name, FLAT
-  // single-object param ({parentID?, title?, ...extras}) instead of the
-  // v1 {body, query} envelope, and it returns the BARE session record
-  // ({id, location:{directory}, ...}) with no {data,error} envelope. The
-  // adapter translates the v1 dispatch call shape into the flat form and
-  // re-wraps the bare record into the envelope createChildSession reads.
-  // parentID is honored (a nonexistent parent rejects with
-  // Session.NotFoundError); the directory anchor rides the flat object
-  // best-effort (the observed 2.3.2 host anchors to its own cwd when the
-  // key is dropped — fail-soft, never fatal).
-  if (typeof (s as { create?: unknown }).create === "function") {
-    const rawCreate = (s as unknown as { create: (input: Record<string, unknown>) => Promise<unknown> }).create
-    out.create = async (args) => {
-      const body = args?.body
-      const flat: Record<string, unknown> = {}
-      if (body && typeof body === "object") {
-        // dispatch-v2-hostsignals 2.1: `agent` + `model` join the allowlist —
-        // the agent-bound creation rides the flat object exactly like the
-        // host's own subagent tool ({parentID, title, agent, model}); the
-        // probe proved both keys land on the created record (model wants the
-        // {providerID, modelID, id} shape the dispatch core already sends).
-        for (const key of ["parentID", "title", "agent", "model", "permission", "permissions", "directory"] as const) {
-          const v = (body as Record<string, unknown>)[key]
-          if (v !== undefined) flat[key] = v
-        }
-      }
-      const directory = args?.query?.directory
-      if (typeof directory === "string" && directory !== "" && flat.directory === undefined) flat.directory = directory
-      const record = await rawCreate.call(s, flat)
-      // Bare record (observed) → envelope; already-enveloped stays as-is.
-      const envelope = record !== null && typeof record === "object" && ("data" in (record as Record<string, unknown>) || "error" in (record as Record<string, unknown>))
-        ? (record as { data?: unknown; error?: unknown })
-        : { data: record }
-      // fix-dispatch-view-capability: remember the child's directory so the
-      // HTTP messages reader can anchor its location query per child.
-      try {
-        const rec = (envelope.data ?? null) as { id?: unknown } | null
-        if (rec && typeof rec.id === "string" && typeof directory === "string" && directory) {
-          childDirs.set(rec.id, directory)
-          lastKnownDir = directory
-        }
-      } catch {}
-      return envelope
-    }
-  }
-  // fix-dispatch-view-capability: HTTP-backed messages reader (upstream
-  // #59566 sanctions the session-message HTTP surface). Wired whenever the
-  // adapter builds; discovery happens lazily per call and may still be
-  // PENDING at early boot (service.json can materialize after setup) — a
-  // pending discovery returns {capabilityPending: true}, which the core
-  // treats as leg-not-applicable (never view loss) until discovery
-  // succeeds. Directory anchors per child (captured at create), falling
-  // back to the last known one.
-  out.messages = async (args) => {
-    const sid = typeof args?.path?.id === "string" ? args.path.id : undefined
-    if (!sid) return { error: "messages reader: no session id in args" }
-    const svc = discoverServiceHttp()
-    if (!svc) return { capabilityPending: true }
-    const dir = childDirs.get(sid) ?? lastKnownDir
-    try {
-      const loc = dir ? `?location%5Bdirectory%5D=${encodeURIComponent(dir)}` : ""
-      const res = await fetch(`${svc.url}/api/session/${sid}/message${loc}`, {
-        headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
-      })
-      if (!res.ok) return { error: `HTTP ${res.status}` }
-      const parsed = JSON.parse(await res.text()) as unknown
-      const arr = Array.isArray(parsed) ? parsed : (parsed && typeof parsed === "object" && Array.isArray((parsed as { data?: unknown }).data) ? (parsed as { data: unknown[] }).data : undefined)
-      if (!Array.isArray(arr)) return { error: "unexpected message payload shape" }
-      // 0.32.3: the 2.3.2 surface ships BARE rows (type/content/time at top
-      // level, no info envelope) — translate into the v1-like shape the
-      // dispatch core reads, or latestAssistant() filters everything out
-      // and every wake reads "no assistant response found" (real-host
-      // proven 2026-11-23).
-      return { data: arr.map(normalizeV2MessageRow).filter((x): x is SessionMessageLike => x !== null) }
-    } catch (e) {
-      return { error: String(e) }
-    }
-  }
-  // fix-dispatch-dispose-kill D3 (live-host probe 2026-11-23 on host 2.3.2,
-  // GET /openapi.json — 142 paths, ZERO abort anywhere): the sanctioned stop
-  // surface is POST /api/session/{sessionID}/interrupt (operationId
-  // session.interrupt, optional `resume` query param, 200
-  // {interrupted:boolean} — "Whether an active execution owned by this
-  // OpenCode process was interrupted"; idle interruption is a no-op). ONE
-  // seam, two legs in order:
-  //   (1) the promise layer ctx.session.interrupt({sessionID, resume:false})
-  //       where the host exposes it (v2 plugin surface);
-  //   (2) the service.json HTTP channel — the SAME discoverServiceHttp()
-  //       reader the messages reader rides — POST {url}/api/session/{id}/interrupt.
-  // {interrupted:false} on an idle child is success-equivalent (the child
-  // already finished). The response body is parsed defensively (SDK 1.18.32
-  // types claim 204 void and no resume param — code against the LIVE shape).
-  // Future harder mode, deliberately NOT wired: DELETE /api/session/{id}
-  // (session.remove) "stops active execution and recursively deletes child
-  // sessions" — a candidate for a future cancel-hard semantics.
-  const rawInterrupt =
-    typeof (s as { interrupt?: unknown }).interrupt === "function"
-      ? (s as unknown as { interrupt: (input: Record<string, unknown>) => Promise<unknown> }).interrupt.bind(s)
-      : undefined
-  out.abort = async (args) => {
-    const sid =
-      v2SessionIdOf(args) ??
-      (args !== null && typeof args === "object" && typeof (args as { path?: { id?: unknown } }).path?.id === "string"
-        ? (args as { path: { id: string } }).path.id
-        : undefined)
-    if (!sid) throw new Error("abort seam: no session id in args")
-    if (rawInterrupt) {
-      return await rawInterrupt({ sessionID: sid, resume: false })
-    }
-    const svc = discoverServiceHttp()
-    if (!svc) {
-      throw new Error("abort unavailable on this session client (no promise-layer interrupt and service.json discovery failed)")
-    }
-    const res = await fetch(`${svc.url}/api/session/${sid}/interrupt?resume=false`, {
-      method: "POST",
-      headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` },
-    })
-    if (!res.ok) throw new Error(`session interrupt HTTP ${res.status}`)
-    // Live shape: 200 {interrupted:boolean}. interrupted:false on an idle
-    // child is success-equivalent — resolved (not thrown) either way.
-    try {
-      return JSON.parse(await res.text()) as unknown
-    } catch {
-      return undefined
-    }
-  }
+  if (typeof s.context === "function") out.context = opts => s.context!(opts)
   return Object.keys(out).length > 0 ? { session: out, nativeChildWalker: v2NativeChildWalker() } : null
 }
 
-// 0.32.3 row-shape reality (real-host capture, 2.3.2): the session-message
-// HTTP rows are BARE —
-//   assistant: {id, time:{created,firstToken,streamed,completed}, type:
-//              "assistant", agent, model, content: part[], finish,
-//              rawFinish, cost, tokens}
-//   user:      {id, time:{created}, type: "user", text: string}
-//   idle:      {id, time:{created}, type: "idle", outcome}   ← bookkeeping
-// The dispatch core (fetchFinalMessage/latestAssistant/pollChild) reads the
-// v1-like envelope {info:{role,finish,error,time:{created,completed}},parts}.
-// Translate one row; enveloped rows (info already present) pass through
-// untouched (upstream may revert to the enveloped shape); idle markers and
-// unclassifiable rows return null (dropped). The content array and the
-// v1 parts array share the {type,text} part spelling, so assistant content
-// maps 1:1; a user row's top-level text becomes a single text part.
-export function normalizeV2MessageRow(row: unknown): SessionMessageLike | null {
-  if (row === null || typeof row !== "object") return null
-  const r = row as Record<string, unknown>
-  if (r.info !== undefined && typeof r.info === "object") return r as unknown as SessionMessageLike
-  const type = typeof r.type === "string" ? r.type : undefined
-  if (!type || type === "idle") return null
-  const t = r.time as { created?: unknown; completed?: unknown } | number | undefined
-  const created = typeof t === "number"
-    ? t
-    : (t !== undefined && t !== null && typeof t === "object" && typeof t.created === "number" ? t.created : 0)
-  const parts = Array.isArray(r.parts)
-    ? (r.parts as Array<{ type?: string; text?: string }>)
-    : Array.isArray(r.content)
-      ? (r.content as Array<{ type?: string; text?: string }>)
-      : typeof r.text === "string" && r.text !== "" ? [{ type: "text", text: r.text }] : []
-  const info: NonNullable<SessionMessageLike["info"]> = { role: type, time: { created } }
-  if (typeof r.id === "string") info.id = r.id
-  if (typeof r.finish === "string") info.finish = r.finish
-  if (r.error !== undefined) info.error = r.error
-  if (t !== undefined && t !== null && typeof t === "object" && typeof t.completed === "number") info.time!.completed = t.completed
-  return { info, parts }
-}
 
 // W6a field reality (SDK 2.3.2 @opencode/protocol session-event.d.ts +
 // sandbox SSE capture): the subscription yields OpenCodeEvent envelopes
@@ -10315,18 +5113,14 @@ function v2EventFields(raw: unknown): Record<string, unknown> {
   return o
 }
 
-// The shared idle body (v1 session.idle port): idle bookkeeping
-// (wake-push gate), the debounced goal continuation (same engine, same
-// guards, same [forge:goal-continue] brief), then progress flushes BEFORE
-// terminal wakes (design D6) — all shared cores, one code path whether the
+// The shared idle body (v1 session.idle port): the debounced goal continuation
+// (same engine, guards and [forge:goal-continue] brief) — one code path whether the
 // edge arrives from the in-process experimental.idle hook or the SSE
 // session.execution.succeeded fallback.
-function v2HandleIdle(sessionID: string, goalClient: GoalClient | null): void {
+function v2HandleIdle(sessionID: string, goalClient: GoalClient | null, backgroundWaiting = false): void {
   try {
     goalProbe(`v2 idle session=${sessionID}`)
-    idleJobSessions.add(sessionID)
-    if (goalClient) scheduleIdleContinuation(goalClient, sessionID)
-    void deliverDispatchProgress(sessionID).then(() => deliverJobWakes(sessionID))
+    if (goalClient) scheduleIdleContinuation(goalClient, sessionID, IDLE_DEBOUNCE_MS, backgroundWaiting)
   } catch {
     // Drifted idle payload: no-op, never a throw into the host.
   }
@@ -10344,22 +5138,13 @@ function v2HandleIdle(sessionID: string, goalClient: GoalClient | null): void {
 // ctx.session.hook("experimental.idle") (in-process, no SSE race, richer
 // background info; see v2RegisterSessionHooks).
 //
-// dispatch-v2-hostsignals: the durable execution events now ALSO route into
-// the host-signal completion core (noteDispatchTerminalSignal /
-// noteDispatchChildActivity) — the durable terminal channel of task 3.1 —
-// and session.created seeds the session map + runs the LAZY per-workspace
-// journal recovery (v1-hook parity; the reload-adoption leg). The stream is
-// self-healing: an ended or errored stream RE-SUBSCRIBES with backoff
-// (task 3.4) until cleanup; the reconcile pass covers children whose
-// terminal events fired inside a gap. Returns the CLEANUP (abort the
-// controller + close the current iterator); a drifted event domain returns
-// null (slice disabled, no throw).
-function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, idleFallback: boolean): (() => void) | null {
+function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, idleFallback: boolean): (() => Promise<void>) | null {
   const subscribeFn = ctx.event?.subscribe?.bind(ctx.event)
   if (typeof subscribeFn !== "function") return null
+  const controller = new AbortController()
   const trySubscribe = (): AsyncIterator<unknown> | null => {
     try {
-      const sub = subscribeFn()
+      const sub = subscribeFn({ signal: controller.signal })
       if (sub !== null && typeof sub === "object" && typeof (sub as AsyncIterable<unknown>)[Symbol.asyncIterator] === "function") {
         return (sub as AsyncIterable<unknown>)[Symbol.asyncIterator]()
       }
@@ -10371,10 +5156,9 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
   try {
     let iterator = trySubscribe()
     if (!iterator) return null
-    const controller = new AbortController()
     const run = async () => {
       // Task 3.4: stream loss → re-subscribe loop (1s → 5s backoff) until
-      // cleanup or a dead domain; the reconcile pass covers the gap.
+      // cleanup or a dead domain.
       let backoffMs = 1_000
       while (!controller.signal.aborted) {
         const iter = iterator
@@ -10382,11 +5166,11 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
         try {
           for (;;) {
             const next = await iter.next()
+            if (controller.signal.aborted) return
             if (next.done) break
             const ev = next.value as { type?: unknown } | null
             const type = ev !== null && typeof ev === "object" && typeof ev.type === "string" ? ev.type : undefined
             if (!type) continue
-            if (controller.signal.aborted) return
             const fields = v2EventFields(ev)
             // crew-continue-native-child-gate 2.3: the native-child tracker
             // feed rides the SAME subscription (advisory warm set — the
@@ -10413,46 +5197,10 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
               } catch {
                 // Drifted moved payload: no-op, never a throw into the host.
               }
-            } else if (type === "session.execution.succeeded" || type === "session.execution.failed" || type === "session.execution.interrupted") {
-              // Task 3.1: the durable terminal channel — routed into the
-              // host-signal completion core (child-keyed inbox; non-children
-              // are a Map-miss no-op).
+            } else if (idleFallback && type === "session.execution.succeeded") {
               const sessionID = v2PickStr(fields, "sessionID", "sessionId")
-              if (sessionID) {
-                const kind =
-                  type === "session.execution.succeeded" ? "succeeded" : type === "session.execution.failed" ? "failed" : "interrupted"
-                const detail =
-                  kind === "failed"
-                    ? executionErrorDetail(fields.error)
-                    : kind === "interrupted"
-                      ? fields.reason !== undefined
-                        ? String(fields.reason)
-                        : undefined
-                      : undefined
-                noteDispatchTerminalSignal(sessionID, kind, detail)
-                // Parent-interrupt disclosure (dispatch-cancel-lifecycle
-                // 2.1): an interrupted OWNER session with children in flight
-                // gets the disclose-only notice (a child sessionID is a
-                // flight-miss no-op inside the helper).
-                if (kind === "interrupted") {
-                  try {
-                    discloseInterruptedParent(sessionID)
-                  } catch {}
-                }
-                // Idle parity: on hosts without the in-process idle hook,
-                // the succeeded edge IS the idle edge (existing fallback).
-                if (idleFallback && type === "session.execution.succeeded") v2HandleIdle(sessionID, goalClient)
-              }
-            } else if (type === "session.execution.started" || type === "session.step.started" || type === "session.step.ended") {
-              // Reconcile-confirmation pings: execution activity keeps the
-              // stream-lost verdict withheld for a live child.
-              const sessionID = v2PickStr(fields, "sessionID", "sessionId")
-              if (sessionID) noteDispatchChildActivity(sessionID)
+              if (sessionID) v2HandleIdle(sessionID, goalClient)
             } else if (type === "session.created") {
-              // Lazy per-workspace recovery + session-map seeding (v1-hook
-              // parity): workspaces beyond the launch anchor recover on
-              // their FIRST session; a hot-reloaded generation adopts the
-              // in-flight dispatch journal here.
               try {
                 const info = (fields.info ?? (fields as { session?: unknown }).session) as
                   | { id?: unknown; directory?: unknown; worktree?: unknown }
@@ -10464,7 +5212,6 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
                 )
                 if (id && typeof worktree === "string" && worktree) {
                   ensureSession(id, worktree)
-                  if (!isRootish(worktree)) void recoverWorkspaceDispatches(jobClient as unknown as DispatchClient | null, worktree)
                 }
               } catch {
                 // Drifted created payload: no-op, never a throw into the host.
@@ -10487,16 +5234,19 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
       }
     }
     void run()
-    let closed = false
+    let closing: Promise<void> | undefined
     return () => {
-      if (closed) return
-      closed = true
-      controller.abort()
-      try {
-        void iterator?.return?.()
-      } catch {
-        // Already-closed iterator: nothing to do.
+      if (!closing) {
+        controller.abort()
+        closing = (async () => {
+          try {
+            await iterator?.return?.()
+          } catch {
+            // Iterator close is best-effort, including asynchronous rejection.
+          }
+        })()
       }
+      return closing
     }
   } catch {
     // Drifted event domain: silent no-op.
@@ -10508,33 +5258,13 @@ function v2SubscribeEvents(ctx: V2PluginContext, goalClient: GoalClient | null, 
 // the v1 __forgeSubagentsTest): live references to the module maps the v2
 // handlers share with the v1 hooks, so tests seed and inspect without a
 // host. NOT part of the plugin API surface.
-export const v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, crewNativeChildren, crewNativeCeiling, crewChildDigest, crewNativeWatch, crewNativeRecheckArmed: (sessionID: string) => crewNativeRecheck.has(sessionID), crewNativeRecheckNow: (sessionID: string, client: GoalClient | null) => crewNativeRecheckTick(sessionID, client), resetHostAnchors: () => { hostAnchors.length = 0; poolResolver = null; poolResolution = null } }
+export const v2WiringSeam = { modelsDevCatalog: () => modelsDevCatalog, resolveDepthChannel, sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sessionMovedAnchors, crewNativeChildren, crewNativeCeiling, crewChildDigest, crewNativeWatch, crewNativeRecheckArmed: (sessionID: string) => crewNativeRecheck.has(sessionID), crewNativeRecheckNow: (sessionID: string, client: GoalClient | null) => crewNativeRecheckTick(sessionID, client), resetHostAnchors: () => { hostAnchors.length = 0; v2HostAnchors.clear(); observedRecipeFiles.clear(); poolResolver = null; poolResolution = null } }
 
 // ---- v2-single-agent-surface: single-agent-surface primitives (v2Setup
 // only — the v1 config-hook path never uses these) ----
 //
-// Host reality (binary + /api/agent, 2.3.2): v2 agent records carry
-// `permissions` as an ARRAY of {action, resource, effect} entries; per-agent
-// tool visibility is permission-driven (the host's tool inventory assembly
-// drops any tool whose action is blanket-denied, last-match-wins). The deny
-// front door for the builtin shell rides that array. HARD RULE: never deny
-// action "execute" — that is the Code Mode kill switch.
-const V2_SHELL_DENY: { action: string; resource: string; effect: string } = { action: "shell", resource: "*", effect: "deny" }
-
-function v2WithShellDeny(perms: unknown): Array<Record<string, unknown>> {
-  const arr: Array<Record<string, unknown>> = Array.isArray(perms) ? perms.filter((p) => p !== null && typeof p === "object") : []
-  if (!arr.some((p) => p.action === "shell")) arr.push({ ...V2_SHELL_DENY })
-  return arr
-}
-
-// Translate the v1 shape-derived permission record ({"task":"deny", ...})
-// into the v2 array form, always appending the shell-deny front door. The
-// readonly seal (MUTATING_TOOLS deny family) and the task:deny recursion ban
-// land in the array form — the old singular `permission` spelling was a
-// wrong field name on this domain and never reached the host.
 function v2PermissionArray(record: Record<string, string>): Array<Record<string, unknown>> {
   const arr = Object.entries(record).map(([action, effect]) => ({ action, resource: "*", effect }))
-  arr.push({ ...V2_SHELL_DENY })
   return arr
 }
 
@@ -10558,7 +5288,16 @@ function v2ReadHideNatives(deps?: V2SetupDeps): boolean {
   return true
 }
 
-export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise<void | (() => void)> {
+export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise<void | (() => Promise<void>)> {
+  for (const finding of legacyDispatchEnvFindings(process.env)) console.warn(`[forge:v2] ${finding.level}: ${finding.message}`)
+  // Load before registering any consumer of the depth catalog. Existing
+  // v2 harnesses did not fetch; keep node:test offline by default, with
+  // explicit "0" on the existing fetch switch for transport-fixture tests.
+  const noFetch = process.env.FORGE_TEST_NO_DISPATCH_FETCH
+  const nodeTest = !!process.env.NODE_TEST_CONTEXT || process.execArgv.some((a) => a === "--test" || a.startsWith("--test-"))
+  // Leave headroom for the host's bounded async setup registration window.
+  await refreshModelsDevCatalog(noFetch === "1" || (noFetch !== "0" && nodeTest), 2_000)
+
   // ---- host-axis parity (tasks 3.1/4.x): the belts and injections below
   // share the v1 module state, so seed the workspace registry + launch
   // anchor exactly like server() does — the shared predicates
@@ -10569,8 +5308,9 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // "last writer wins" value below — hostWorktree above all — belongs to
   // whichever directory initialized last, and session-directory decisions
   // go through stateForCheck (the host's session record) instead.
+  const explicitCandidates = [...(deps?.anchors ?? []), ...v2AnchorCandidates(ctx, false)]
+  const v2Candidates = [...explicitCandidates, process.cwd()]
   {
-    const v2Candidates = [...(deps?.anchors ?? []), ...v2AnchorCandidates(ctx)]
     for (const cand of v2Candidates) {
       const t = cand.trim()
       if (t) rememberHostAnchor(t)
@@ -10593,8 +5333,39 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // path below then runs exactly as before. Knob resolution: explicit
   // deps override (test seam) > GLOBAL forge.json layer > default.
   v2HostSeen = true
-  v2PostureHomeDir = deps?.homeDir ?? homedir()
-  const globalKnobs = readGlobalKnobs(deps)
+  const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir()
+  const globalPoolFile = forgeConfigPaths({ homeDir }).global
+  const readRecipe = deps?.readFile ?? ((path: string) => readFileSync(path, "utf8"))
+  const recipeStat = deps?.stat ?? recipeFileStat
+  const snapshots = new Map<string, string>()
+  const unreadable = new Set<string>()
+  const snapshotRead = (path: string): string => {
+    const previous = snapshots.get(path)
+    if (previous !== undefined) return previous
+    if (unreadable.has(path)) throw new Error(`Recipe unavailable in this sync snapshot: ${path}`)
+    try {
+      const text = readRecipe(path)
+      snapshots.set(path, text)
+      return text
+    } catch (err) {
+      unreadable.add(path)
+      throw err
+    }
+  }
+  const globalKnobs = readGlobalKnobs(globalPoolFile, { readFile: snapshotRead })
+  // Authorization must belong to exactly the recipe compiled by this pass.
+  // Recheck its presence and bytes immediately before any write or GC.
+  const stillAuthorized = (path: string): boolean => {
+    const text = snapshots.get(path)
+    if (text === undefined) return false
+    const parsed = parseForgeJsonc(text)
+    if (!parsed.ok || !parseTopLevelKnobs(parsed.config, path).syncAuto) return false
+    try {
+      return recipeStat(path) !== null && readRecipe(path) === text
+    } catch {
+      return false
+    }
+  }
   v2MaterializeMode = deps?.materialize ?? globalKnobs.materialize ?? "native"
   // ---- sync:"auto" opt-in (design D4): at session start, pools whose
   // OWN file declares sync:"auto" regenerate silently when stale, with a
@@ -10602,33 +5373,50 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // writes NOTHING uninvited — gate + in-band forge_sync only.
   if (v2MaterializeMode === "native") {
     try {
-      const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir()
-      const resolver = createPoolResolver({ homeDir, stat: deps?.stat, readFile: deps?.readFile })
-      const seen = new Map<string, string>()
-      for (const cand of [...(deps?.anchors ?? []), ...v2AnchorCandidates(ctx)]) {
-        const key = normalizeAnchorDir(cand)
-        if (key && !seen.has(key)) seen.set(key, cand.trim())
+      const resolver = createPoolResolver({ homeDir, stat: recipeStat, readFile: snapshotRead })
+      // Name against the same accumulated host anchors as explicit sync,
+      // but authorize only sources discovered by THIS setup (plus global).
+      // Cwd remains a host-union candidate, but is only an auto-sync
+      // source when no explicit setup location is available.
+      const explicitKeys = explicitCandidates.map(normalizeAnchorDir).filter(Boolean)
+      const currentKeys = new Set(explicitKeys.length ? explicitKeys : [normalizeAnchorDir(process.cwd())])
+      const currentFiles = new Set<string>([globalPoolFile])
+      for (const anchor of hostAnchors) {
+        if (!currentKeys.has(anchorKey(anchor))) continue
+        const file = resolver.workspacePoolOf(anchor)
+        if (file !== null) currentFiles.add(file)
       }
-      const resolution = resolver.resolve([...seen.values()])
-      const globalPoolFile = forgeConfigPaths({ homeDir }).global
-      const allPlans = planRosterSync(resolution, { globalPoolFile })
+      const resolution = resolver.resolve(hostAnchors)
+      for (const family of resolution.families) observedRecipeFiles.add(family.file)
+      const overrideDir = globalAgentDirFor({ homeDir, configDir: process.env.OPENCODE_CONFIG_DIR })
+      const rosterDirs = { globalPoolFile, globalAgentDir: overrideDir }
+      const allPlans = planRosterSync(resolution, rosterDirs)
       for (const family of resolution.families) {
-        let auto = false
-        try {
-          const text = deps?.readFile ? deps.readFile(family.file) : readFileSync(family.file, "utf8")
-          const parsed = parseForgeJsonc(text)
-          if (parsed.ok) auto = parseTopLevelKnobs(parsed.config, family.file).syncAuto
-        } catch {
-          // Unreadable pool file: the resolver's findings own that failure.
-        }
-        if (!auto) continue
-        const verdict = staleCheckForPool(family.file, family.materializedIds, realRosterFs(), rosterContentOf(resolution))
+        if (!currentFiles.has(family.file)) continue
+        const verdict = staleCheckForPool(family.file, family.materializedIds, realRosterFs(), (matId) => compileResolvedRosterEntry(resolution, matId, { globalPoolFile }).content, rosterAgentDirFor(family.file, rosterDirs))
         if (!verdict.stale) continue
+        if (!stillAuthorized(family.file)) {
+          console.warn(`[forge:sync] warn: ${verdict.reason}; call forge_sync to reconcile (no current auto opt-in).`)
+          continue
+        }
         const plans = allPlans.filter((p) => p.family.file === family.file)
         const outcome = executeRosterSync(plans, realRosterFs())
         console.warn(
           `[forge:sync] warn: sync:"auto" — stale roster regenerated at session start (${verdict.reason}); created ${outcome.created.length}, updated ${outcome.updated.length}, gc'd ${outcome.gced.length}${outcome.errors.length ? `, errors: ${outcome.errors.join("; ")}` : ""}`,
         )
+      }
+      // Overrides are independently authorized by the global recipe, even when
+      // it contributes no fallback workers. Inspect before deciding to write.
+      const overridePlan = planOverrideSync(resolution.overrides ?? {}, { dir: overrideDir, recipeFile: globalPoolFile })
+        ?? { kind: "override" as const, dir: overrideDir, files: [] }
+      const overrideFindings = overrideSyncFindings(overridePlan, realRosterFs())
+      if (overrideFindings.length) {
+        if (stillAuthorized(globalPoolFile)) {
+          const outcome = executeRosterSync([overridePlan], realRosterFs())
+          console.warn(`[forge:sync] warn: sync:"auto" — ${overrideFindings.join("; ")}; created ${outcome.created.length}, updated ${outcome.updated.length}, gc'd ${outcome.gced.length}${outcome.errors.length ? `, errors: ${outcome.errors.join("; ")}` : ""}`)
+        } else {
+          console.warn(`[forge:sync] warn: ${overrideFindings.join("; ")}; call forge_sync to reconcile (no auto opt-in).`)
+        }
       }
     } catch {
       // Auto-sync is best-effort: never a throw into the host.
@@ -10638,7 +5426,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // materialization (task 1.2 — parity with the v1 config hook, same
   // createPoolResolver + forgeAgentDef cores).
   if (typeof ctx.agent?.transform === "function") {
-    await ctx.agent.transform(async (draft) => {
+    await ctx.agent.transform((draft) => {
       if (typeof draft.get !== "function" || typeof draft.update !== "function") return
       if (draft.get(FORGE_AGENT) === undefined) {
         draft.update(FORGE_AGENT, (agent) => {
@@ -10647,17 +5435,6 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
           agent.system = FORGE_PROMPT
           agent.mode = "primary"
         })
-      }
-      // v2-single-agent-surface D4: the builtin-shell deny front door rides
-      // the PRIMARY record too — idempotent append, so a user-defined forge
-      // entry keeps every other field (tools-merge parity with the v1
-      // loader's user-entry semantics).
-      try {
-        draft.update(FORGE_AGENT, (agent) => {
-          agent.permissions = v2WithShellDeny(agent.permissions)
-        })
-      } catch (err) {
-        console.warn(`[forge:v2] error: shell deny not applied to the forge record: ${String(err)}`)
       }
       // ---- v2-single-agent-surface D1/D2: native primary suppression ----
       // Hide-only (records stay — existing build/plan sessions keep
@@ -10717,7 +5494,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
           const key = normalizeAnchorDir(cand)
           if (key && !v2HostAnchors.has(key)) v2HostAnchors.set(key, cand.trim())
         }
-        const resolver = createPoolResolver({ homeDir, stat: deps?.stat, readFile: deps?.readFile })
+        const resolver = createPoolResolver({ homeDir, stat: deps?.stat ?? recipeFileStat, readFile: deps?.readFile })
         const resolution = resolver.resolve([...v2HostAnchors.values()])
         for (const finding of resolution.findings) {
           console.warn(`[forge:v2] ${finding.level}: ${finding.message}`)
@@ -10793,7 +5570,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
     // an evicted instance) on a multi-directory host.
     const toolAnchor = v2AnchorClient(ctx)
     // fix-ask-door-multi-directory-host D2: the ask bridge behind every door
-    // and forge_shell is THIS initialization's own ctx.permission.assert —
+    // is THIS initialization's own ctx.permission.assert —
     // the interface bound to the directory instance whose sessions run these
     // closures. A module-level "latest init" seam sent every directory's
     // asks to the last-initialized directory's pending table (that other
@@ -10802,7 +5579,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
     // changed — this initialization, never the module.
     const toolAssert: V2AssertFn | null = typeof ctx.permission?.assert === "function" ? (input: unknown) => ctx.permission!.assert!(input) : null
     try {
-      await ctx.tool.transform(async (editor) => {
+      await ctx.tool.transform((editor) => {
         if (typeof editor?.add !== "function") return
         for (const [name, def] of Object.entries(forgeTools())) {
           const d = def as {
@@ -10816,6 +5593,15 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
             input: v2ToolInputSchema(d.args),
             async execute(args: unknown, toolCtx: unknown) {
               const { context, defaultDirectory } = await v2ToolContext(toolCtx, toolAnchor, toolAssert)
+              if (name === "crew_close" && typeof context.sessionID === "string") {
+                const sid = context.sessionID
+                context.crewCloseEvidence = async (): Promise<CrewCloseEvidence> => {
+                  const view = await walkNativeChildren(v2NativeChildWalker(), sid)
+                  let transcript: unknown = null
+                  try { transcript = await ctx.session?.context?.({ sessionID: sid }) } catch {}
+                  return { ...view, rounds: crews.get(sid)?.rounds ?? [], context: transcript }
+                }
+              }
               const res = await d.execute?.(args, context)
               return nameDefaultDirectory(wrapV2ToolResult(res), defaultDirectory)
             },
@@ -10827,9 +5613,111 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
     }
   }
 
+  // D9: v2.4.0 Location.Info carries workspaceID; absence binds the
+  // searchable local Environment (core/environment/environment.ts:60–85).
+  const searchLocation = ctx.location as unknown as { directory?: unknown; workspaceID?: unknown; project?: { directory?: unknown } } | undefined
+  const searchDirectory = searchLocation?.directory
+  const searchProject = searchLocation?.project?.directory
+  const searchWarn = (message: string) => console.warn(`[forge:search] ${message}; native tools retained`)
+  if (typeof searchDirectory === "string" && isAbsolute(searchDirectory) && typeof searchProject === "string" && isAbsolute(searchProject) && searchLocation?.workspaceID === undefined && typeof ctx.permission?.assert === "function" && typeof ctx.tool?.transform === "function") {
+    const ask = ctx.permission.assert.bind(ctx.permission)
+    try {
+      await ctx.tool.transform(editor => {
+        for (const kind of ["grep", "glob"] as const) {
+          const native = editor.get?.(kind) as Record<string, unknown> | undefined
+          if (!native || !editor.update || typeof native.execute !== "function" || !native.output) { searchWarn(`${kind} definition unavailable`); continue }
+          const output = native.output as { value?: { fields?: Record<string, unknown> }; type?: string; items?: { properties?: Record<string, unknown> } }
+          const outputFields = output.value?.fields ?? output.items?.properties
+          const requiredOutput = kind === "grep" ? ["entry", "line", "offset", "text", "submatches"] : ["path", "type"]
+          if (!outputFields || !requiredOutput.every(key => key in outputFields)) { searchWarn(`${kind} unknown output schema`); continue }
+          const executeNative = native.execute as (input: unknown, context: unknown) => Promise<unknown>
+          // Preserve every native field codec/annotation. For Effect Structs
+          // use the host object's own mapFields method and its optional Boolean
+          // field as the follow codec (no second Effect runtime imported).
+          const schema = native.input as { fields?: Record<string, any>; mapFields?: (f: (fields: Record<string, any>) => Record<string, any>) => unknown; properties?: Record<string, any>; type?: string } | undefined
+          let enhancedInput: unknown
+          if (schema?.fields && typeof schema.mapFields === "function") {
+            const bool = schema.fields[kind === "grep" ? "literal" : "hidden"]
+            if (typeof bool?.annotate !== "function") { searchWarn(`${kind} optional boolean schema unavailable`); continue }
+            enhancedInput = schema.mapFields(fields => ({ ...fields, ...(kind === "glob" ? { hidden: bool.annotate({ description: "Include hidden files and directories (default: true).", default: true }) } : {}), follow: bool.annotate({ description: "Follow symbolic links and junctions (default: true).", default: true }) }))
+          } else if (schema?.type === "object" && schema.properties) {
+            enhancedInput = { ...schema, properties: { ...schema.properties, ...(kind === "glob" ? { hidden: { ...schema.properties.hidden, default: true, description: "Include hidden files and directories (default: true)." } } : {}), follow: { type: "boolean", default: true, description: "Follow symbolic links and junctions (default: true)." } } }
+          } else { searchWarn(`${kind} unknown input schema`); continue }
+          try {
+            editor.update(kind, draft => {
+              draft.input = enhancedInput
+              draft.description = `${native.description ?? kind} Follows symbolic links and junctions by default.${kind === "glob" ? " Hidden directories are included by default." : ""}`
+              draft.execute = async (raw: SearchInput, invocation: SearchInvocation) => {
+                if (raw.path && ambiguousSearchPath(raw.path)) {
+                  // Machine path syntax belongs to the host, never local fs.
+                  const { follow: _follow, ...nativeInput } = raw
+                  return executeNative(nativeInput, invocation)
+                }
+                let rgConfig: { rgPath?: string } | undefined
+                for (const file of [forgeConfigPaths({ projectDir: searchProject }).project, globalPoolPathOf()]) {
+                  try {
+                    const parsed = parseForgeJsonc(readFileSync(file, "utf8"))
+                    const search = parsed.ok ? (parsed.config as { search?: { rgPath?: string } } | undefined)?.search : undefined
+                    if (typeof search?.rgPath === "string") { rgConfig = search; break }
+                  } catch { /* absent recipe */ }
+                }
+                const rg = resolveRgBinary(rgConfig)
+                let engine = rg.ok ? "ripgrep" : "builtin-js"
+                const startupFailed = (result: { error?: Error; status: number | null }) => result.error && result.status === null && ["ENOENT", "EACCES", "EPERM", "ENOEXEC"].includes((result.error as NodeJS.ErrnoException).code ?? "")
+                const grep = rg.ok ? ((bytes: Buffer, input: SearchInput): SearchMatch[] => {
+                  if (engine === "builtin-js") return jsGrep(bytes, input)
+                  const args = ["--no-config", "--no-ignore", "--json", ...(input.literal ? ["--fixed-strings"] : []), ...(input.caseSensitive === false ? ["--ignore-case"] : []), "--", input.pattern, "-"]
+                  // rg receives bytes only, never a search path: it cannot
+                  // open files or follow a link after permission checks.
+                  const result = spawnSync(rg.binary, args, { input: bytes, encoding: "utf8", windowsHide: true, timeout: 10000, maxBuffer: 32 * 1024 * 1024 })
+                  if (startupFailed(result)) { engine = "builtin-js"; return jsGrep(bytes, input) }
+                  if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error(result.error?.message ?? result.stderr ?? "ripgrep failed")
+                  return result.stdout.split(/\r?\n/).filter(Boolean).flatMap(line => {
+                    const event = JSON.parse(line)
+                    if (event.type !== "match") return []
+                    const d = event.data
+                    const text = d.lines.text ?? Buffer.from(d.lines.bytes, "base64").toString("utf8")
+                    return [{ line: d.line_number, offset: d.absolute_offset, text: text.length > 2000 ? text.slice(0, 2000) + "..." : text, submatches: d.submatches.slice(0, 100).map((m: { match: { text?: string; bytes?: string }; start: number; end: number }) => ({ text: m.match.text ?? Buffer.from(m.match.bytes ?? "", "base64").toString("utf8"), start: m.start, end: m.end })) }]
+                  })
+                }) : undefined
+                const glob = rg.ok ? ((pattern: string, paths: string[]): boolean[] => {
+                  // Match the already listed names as NUL-delimited data, never
+                  // give rg a directory or a file path to traverse independently.
+                  if (!paths.length) return []
+                  const fallback = () => paths.map(path => matchGlob(pattern, path))
+                  if (engine === "builtin-js") return fallback()
+                  const result = spawnSync(rg.binary, ["--no-config", "--no-ignore", "--null-data", "--line-number", "--no-filename", "--color", "never", "--", strictGlobToRegExp(pattern).source, "-"], { input: paths.join("\0") + "\0", encoding: "utf8", windowsHide: true, timeout: 10000, maxBuffer: 32 * 1024 * 1024 })
+                  if (startupFailed(result)) { engine = "builtin-js"; return fallback() }
+                  if (result.error || (result.status !== 0 && result.status !== 1)) throw new Error(result.error?.message ?? result.stderr ?? "ripgrep failed")
+                  const matched = new Set(result.stdout.split("\0").map(line => Number(line.slice(0, line.indexOf(":")))))
+                  return paths.map((_, i) => matched.has(i + 1))
+                }) : undefined
+                return authorizedSearch(kind, raw, invocation, searchDirectory, searchProject, { realpath: realpathSync, stat: lstatSync, list: readdirSync, read: path => {
+                  const fd = openSync(path, "r")
+                  try {
+                    const before = fstatSync(fd)
+                    if (!before.isFile() || before.size > MAX_FILE_BYTES || realpathSync(path) !== path) return Buffer.alloc(MAX_FILE_BYTES + 1)
+                    const bytes = Buffer.allocUnsafe(MAX_FILE_BYTES + 1)
+                    const n = readSync(fd, bytes, 0, bytes.length, 0)
+                    const after = fstatSync(fd)
+                    if (before.ino !== after.ino || before.dev !== after.dev || realpathSync(path) !== path) throw new Error("Search target changed")
+                    return bytes.subarray(0, n)
+                  } finally { closeSync(fd) }
+                }, assert: ask, grep, glob, engine: () => engine,
+                  globalIgnore: { home: (process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME) ?? "", xdg: process.env.XDG_CONFIG_HOME },
+                  delegateNative: () => { searchWarn("global ignore authorization or environment unavailable"); const { follow: _follow, ...nativeInput } = raw; return executeNative(nativeInput, invocation) }
+                })
+              }
+            })
+          } catch (error) { searchWarn(`${kind} update rejected: ${String(error)}`) }
+        }
+      })
+    } catch (error) { searchWarn(`tool transform rejected: ${String(error)}`) }
+  } else searchWarn("host availability or permission context unknown or non-local")
+
   // ---- permission domain (task 3.1): the belt on ctx.permission.hook
   // ("evaluate") — doors keep a REAL ask (explicit deny stands), draft
-  // write-freeze denies, forge_shell passes through untouched. Same
+  // write-freeze denies, native shell permissions otherwise pass through untouched. Same
   // decision table as the v1 permission.ask hook; W6a pinned the event to
   // the real PermissionEvaluation shape (effect mutation). The v1
   // ask-callback decision gates — plan_approve/goal_write(arm)/
@@ -10838,21 +5726,9 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // the tool block above (fix-ask-door-multi-directory-host), never here
   // as module state. Pure classification/refusal stays evaluate-mutation.
   v2RegisterPermissionBelt(ctx)
-  // worker-shell-session-allow D2/D4: capture the documented session-rule
-  // surface (source-verified on 2.3.2: host.ts routes update.permissions to
-  // sessions.setPermissions). The belt's read-back-merge lives in
-  // ensureSessionRescueRule; absence degrades to the D5 fallback.
-  if (typeof ctx.session?.get === "function" && typeof ctx.session.update === "function") {
-    const rawGet = ctx.session.get.bind(ctx.session)
-    const rawUpdate = ctx.session.update.bind(ctx.session)
-    v2SessionRuleApi = {
-      get: (sessionID) => rawGet({ sessionID }),
-      update: (input) => rawUpdate(input),
-    }
-  }
 
   // ---- tool hooks (task 4.1): activity marking (execute.after ledger) +
-  // the full dispatch-guard belt + the readonly-exec seal
+  // the full dispatch-guard belt
   // (execute.before), all over the shared module predicates. W6a: the
   // before payload is {tool, sessionID, agent, messageID, id, input} —
   // the call id is `id` (Tool.CallID), the arguments are `input`.
@@ -10860,54 +5736,20 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   anchorClientShared = v2Anchor
   v2RegisterToolHooks(ctx, v2Anchor)
 
-  // ---- session-domain client (task 5.1, W6a-resolved): one client feeds
-  // BOTH the goal continuation engine (prompt + get) and the module-level
-  // jobClient seam (promptAsync ≈ the blocking prompt send) — only ONE
-  // entry ever runs per host process, so the assignment is race-free.
+  // ---- session-domain client for goal continuation (prompt + get).
   const v2Client = v2SessionClient(ctx)
-  if (v2Client && (v2Client.session.promptAsync || v2Client.session.prompt)) jobClient = v2Client
   const goalClient =
     v2Client && typeof v2Client.session.prompt === "function" && typeof v2Client.session.get === "function" ? (v2Client as unknown as GoalClient) : null
 
-  // ---- host-signal completion seams (dispatch-v2-hostsignals 3.2/4.1):
-  // the one-shot wait latch (ctx.session.wait) and the persisted registry
-  // domain (ctx.storage). v2-only — v1 keeps its journal-only posture
-  // (design risk table: fail-soft to today's behavior).
-  v2SessionWaitSeam = typeof ctx.session?.wait === "function" ? (sessionID: string) => ctx.session!.wait!({ sessionID }) : null
-  v2DispatchStorage =
-    ctx.storage && typeof ctx.storage.scan === "function" && typeof ctx.storage.set === "function"
-      ? (ctx.storage as unknown as typeof v2DispatchStorage)
-      : null
-  // Launch-anchor journal recovery (task 4.2, server()-init parity): the
-  // reload-mid-dispatch leg — a hot-reloaded generation replays the launch
-  // anchor's journal exactly like a fresh v1 process does. Fail-soft.
-  try {
-    if (hostWorktree && !isRootish(hostWorktree)) {
-      void recoverWorkspaceDispatches(v2Client as unknown as DispatchClient, hostWorktree)
-    }
-  } catch {
-    // Recovery is best-effort by construction; never a throw into the host.
-  }
-  // Persisted-row adoption (task 4.2): scan ctx.storage rows for the
-  // launch anchor and re-arm watching for live children (watch-only — an
-  // adopted dispatch never re-spawns). Non-launch anchors adopt lazily via
-  // the session.created branch of the event subscription.
-  try {
-    if (hostWorktree && !isRootish(hostWorktree)) {
-      void adoptPersistedDispatchRows(v2Client as unknown as DispatchClient, hostWorktree)
-    }
-  } catch {
-    // Adoption is fail-soft; the journal recovery remains the durable path.
-  }
 
   // ---- session seams (task 4.2 + W6a idle choice): prompt (busy
   // marking) / context (thoughtLevel injection + family-gated system
-  // injections + channel mandate + plan/goal notices) / compaction
+  // injections + plan/goal notices) / compaction
   // (goal-brief reinjection) / experimental.idle (the PRIMARY idle edge —
   // goal continuation + job-wake delivery; SSE fallback below) —
   // Decision 3's event topology, fail-open on drift, registrations
   // collected for the setup cleanup.
-  const sessionHooks = v2RegisterSessionHooks(ctx, goalClient)
+  const sessionHooks = await v2RegisterSessionHooks(ctx, goalClient)
 
   // ---- command domain (task 4.3): /plan /goal /crew, create-only,
   // templates byte-identical to the v1 constants.
@@ -10922,23 +5764,17 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   const v2AbortEvents = v2SubscribeEvents(ctx, goalClient, !sessionHooks.idleHook)
   // doc-plugin-unload-v2: this combined cleanup is the ONLY cleanup a v2
   // host runs on plugin unload (2.4.0 registers the function `setup`
-  // resolves to — see the note on the v1 `dispose` hook). It tears down
-  // THIS instance only, and deliberately clears no job: jobs outlive the
-  // plugin instance, exactly as the host's own job table does. Anything
-  // that must happen to jobs at unload belongs here — and today nothing
-  // does (tests/v2-setup-cleanup.test.mjs pins it).
+  // resolves to). It tears down THIS instance only
+  // (tests/v2-setup-cleanup.test.mjs pins it).
   const disposables = [...sessionHooks.disposables, ...(v2AbortEvents ? [v2AbortEvents] : [])]
   return disposables.length > 0
-    ? () => {
-        for (const dispose of disposables) {
-          try {
-            dispose()
-          } catch {
-            // Cleanup is best-effort.
-          }
-        }
+    ? async () => {
+        if (goalClient) disposeGoalClient(goalClient)
+        // Start every disposal, including event abort, without waiting for
+        // another registration's asynchronous cleanup to settle.
+        await Promise.allSettled(disposables.map(async (dispose) => dispose()))
       }
     : undefined
 }
 
-export default { id: "forge", server, setup: v2Setup }
+export default { id: "forge", setup: v2Setup }

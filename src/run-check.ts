@@ -23,6 +23,8 @@ export type CheckOutcome = {
   ok: boolean
   detail: string
   durationMs: number
+  // Internal comparison only; never included in formatted output or check logs.
+  comparable?: string
 }
 
 export type ShellRunner = (
@@ -32,11 +34,9 @@ export type ShellRunner = (
 
 export const OUTPUT_LIMIT = 2048
 
-// Real shell execution: the host-aligned interpreter (spec: job-supervisor —
-// "Host-aligned shell interpreter selection"; PowerShell on Windows, the
-// login shell with bash preferred on POSIX — the SAME interpreter forge_shell
-// uses, so a check drafted under the model's shell expectations behaves
-// identically at the gate), stdout+stderr merged and truncated, hard kill on
+// Real shell execution for the Plan/Goal completion gates: configured
+// interpreter (PowerShell fallback on Windows, login-shell fallback on
+// POSIX), stdout+stderr merged and truncated, hard kill on
 // timeout. On Windows the kill escalates to `taskkill /F /T` (the direct
 // child is the interpreter wrapper; the command runs as a grand-child); on
 // POSIX the child is spawned detached so the whole process group can be
@@ -113,13 +113,16 @@ async function runShellItem(item: Extract<CheckItem, { kind: "shell" }>, index: 
   if (r.timedOut) {
     return { index, kind: "shell", label: item.cmd, ok: false, detail: `timed out after ${timeoutSec}s (partial output: ${truncateOutput(r.output) || "none"})`, durationMs }
   }
+  const displayed = truncateOutput(r.output)
   return {
     index,
     kind: "shell",
     label: item.cmd,
     ok: r.code === 0,
-    detail: `exit=${r.code} ${truncateOutput(r.output)}`.trim(),
+    detail: `exit=${r.code} ${displayed}`.trim(),
     durationMs,
+    comparable: Number.isInteger(r.code) && r.output.length <= OUTPUT_LIMIT && displayed.length <= OUTPUT_LIMIT
+      ? JSON.stringify([r.code, r.output]) : undefined,
   }
 }
 
@@ -144,6 +147,7 @@ function runContainsItem(item: Extract<CheckItem, { kind: "contains" }>, index: 
     ok,
     detail: ok ? `found in ${item.file} (${content.length} chars)` : `required text not found in ${item.file} (${content.length} chars)`,
     durationMs: Date.now() - started,
+    comparable: JSON.stringify([ok, content.length]),
   }
 }
 

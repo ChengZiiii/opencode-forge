@@ -85,6 +85,20 @@ test("v2 setup: silently skips on host shape drift without throwing", async () =
   )
 })
 
+test("v2 setup: rejected permission and tool hook registrations remain silent and siblings are attempted", async () => {
+  const attempted = []
+  const hook = async (name) => {
+    attempted.push(name)
+    await Promise.resolve()
+    if (name !== "execute.after") throw new Error("registration rejected")
+    return { dispose() {} }
+  }
+  await assert.doesNotReject(() => v2Setup({ permission: { hook }, tool: { hook } }))
+  // Let node:test observe any unhandled rejection from the registration promises.
+  await new Promise(setImmediate)
+  assert.deepEqual(attempted, ["evaluate", "execute.before", "execute.after"])
+})
+
 // Task 3.3 �� v2 parity (spec: forge-subagents): setup registers the static
 // subagents create-only from forge.json (process cwd), degrading silently on
 // any host-shape drift.
@@ -294,29 +308,33 @@ test("v2 setup: an unreadable global layer keeps the default (hide on)", withIso
   assert.equal(agents.get("build").hidden, true)
 }))
 
-test("v2 setup: primary + worker records carry the shell-deny front door (never execute)", withIsolatedHome(async (dir) => {
+test("v2 setup: primary + worker records do not receive a blanket shell-deny front door", withIsolatedHome(async (dir) => {
   mkdirSync(join(dir, ".opencode"), { recursive: true })
   writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "sas", agents: { research: { model: "zai/glm", thoughtLevel: "low" }, scout: { shape: "readonly" } } }))
   const { ctx, agents } = makeCtx()
   await v2Setup(ctx, { materialize: "runtime" })
   const primary = shellDenyOf(agents.get("forge"))
-  assert.ok(primary && primary.resource === "*" && primary.effect === "deny", "the primary record carries {action:shell,resource:*,effect:deny}")
+  assert.equal(primary, undefined, "primary native shell is host-managed")
   for (const id of ["forge-sas-research", "forge-sas-scout"]) {
     const rec = agents.get(id)
     assert.ok(rec, `${id} materializes`)
     const deny = shellDenyOf(rec)
-    assert.ok(deny && deny.resource === "*" && deny.effect === "deny", `${id} carries the shell deny`)
-    assert.equal((rec.permissions ?? []).some((p) => p.action === "execute"), false, `${id} never denies action "execute"`)
+    assert.equal(deny, undefined, `${id} has no injected shell deny`)
+    const effects = Object.fromEntries(rec.permissions.map(({ action, effect }) => [action, effect]))
+    assert.equal(effects.bash, undefined, `${id} has no legacy bash rule`)
+    assert.equal(effects.execute, id.endsWith("scout") ? "deny" : undefined)
+    for (const tool of ["task", "subagent", "question", "plan_write", "plan_tick", "plan_approve", "plan_close", "plan_reopen", "plan_discard", "goal_write", "goal_check", "goal_complete", "goal_pause", "goal_resume", "goal_discard", "crew_begin", "crew_close", "forge_sync"]) {
+      assert.equal(effects[tool], "deny", `${id} denies ${tool}`)
+    }
   }
-  // the readonly seal rides the same array (field-name fix)
+  // The readonly seal rides the same array.
   const scout = agents.get("forge-sas-scout")
-  for (const tool of ["write", "edit", "bash", "patch"]) {
+  for (const tool of ["write", "edit", "patch", "applypatch", "apply", "multiedit"]) {
     assert.ok(scout.permissions.some((p) => p.action === tool && p.effect === "deny"), `scout seals ${tool}`)
   }
-  assert.ok(agents.get("forge-sas-research").permissions.some((p) => p.action === "task" && p.effect === "deny"), "write-shape worker keeps task:deny")
 }))
 
-test("v2 setup: a user-defined forge entry keeps its fields but gains the shell deny", withIsolatedHome(async () => {
+test("v2 setup: a user-defined forge entry keeps its fields without an injected shell deny", withIsolatedHome(async () => {
   const { ctx, agents } = makeCtx()
   await ctx.agent.transform(async (draft) => {
     draft.update("forge", (a) => {
@@ -328,7 +346,7 @@ test("v2 setup: a user-defined forge entry keeps its fields but gains the shell 
   const rec = agents.get("forge")
   assert.equal(rec.system, "USER OWNED")
   assert.equal(rec.mode, "subagent")
-  assert.ok(shellDenyOf(rec), "the deny lands on the user-owned entry too (tools-merge semantics)")
+  assert.equal(shellDenyOf(rec), undefined, "no permission injected into user-owned entry")
 }))
 
 test("v2 setup: default setter called with forge under the typeof guard", withIsolatedHome(async () => {
@@ -347,16 +365,9 @@ test("v2 setup: a throwing default setter never escapes", withIsolatedHome(async
   await assert.doesNotReject(v2Setup(ctx))
 }))
 
-// ---- harden-tests wave: v2WithShellDeny defensive faces + knob JSONC boundary ----
-//
-// The user config can pre-set the forge record's `permissions` to anything
-// before the plugin's transform sees it. The merge (v2WithShellDeny) must
-// normalize every weird shape into a VALID v2 array while always landing the
-// shell-deny front door.
+// Host-owned permissions are preserved, not normalized by Forge.
 
-const DENY = { action: "shell", resource: "*", effect: "deny" }
-
-test("v2 setup: weird pre-set permissions shapes normalize to [shell deny] (defensive merge)", withIsolatedHome(async () => {
+test("v2 setup: weird pre-set permissions shapes are left to the host", withIsolatedHome(async () => {
   const weirds = [
     null,
     "nope",
@@ -374,12 +385,11 @@ test("v2 setup: weird pre-set permissions shapes normalize to [shell deny] (defe
     await v2Setup(ctx)
     const rec = agents.get("forge")
     assert.equal(rec.system, "USER OWNED", "other fields survive the normalize")
-    assert.ok(Array.isArray(rec.permissions), `permissions becomes an array (input: ${JSON.stringify(weird)})`)
-    assert.deepEqual(rec.permissions, [DENY], `null/non-array/junk-entry arrays collapse to the deny-only array (input: ${JSON.stringify(weird)})`)
+    assert.deepEqual(rec.permissions, weird, "host-owned fields are not normalized by Forge")
   }
 }))
 
-test("v2 setup: junk entries in a pre-set permissions array are filtered; real entries survive verbatim", withIsolatedHome(async () => {
+test("v2 setup: pre-set permissions array survives verbatim", withIsolatedHome(async () => {
   const { ctx, agents } = makeCtx()
   const editEntry = { action: "edit", resource: "src/**", effect: "deny" }
   const nopeEntry = { nope: true } // an object, so it survives (only null/non-objects are dropped)
@@ -391,11 +401,10 @@ test("v2 setup: junk entries in a pre-set permissions array are filtered; real e
   await v2Setup(ctx)
   const perms = agents.get("forge").permissions
   assert.ok(Array.isArray(perms))
-  // junk gone, object entries kept in order, deny appended
-  assert.deepEqual(perms, [nopeEntry, editEntry, DENY], "non-object entries dropped, object entries kept, deny appended")
+  assert.deepEqual(perms, [null, 42, "x", undefined, nopeEntry, editEntry])
 }))
 
-test("v2 setup: the appended shell deny is the LAST array slot (findLast — deny wins over anything merged in front)", withIsolatedHome(async () => {
+test("v2 setup: user permission order is unchanged", withIsolatedHome(async () => {
   const { ctx, agents } = makeCtx()
   await ctx.agent.transform(async (draft) => {
     draft.update("forge", (a) => {
@@ -405,8 +414,7 @@ test("v2 setup: the appended shell deny is the LAST array slot (findLast — den
   })
   await v2Setup(ctx)
   const perms = agents.get("forge").permissions
-  assert.deepEqual(perms[perms.length - 1], DENY, "the plugin's deny is appended at the end of the array")
-  assert.deepEqual(perms.findLast((p) => p.action === "shell"), DENY, "findLast(shell) resolves to the deny (last-match-wins hosts see the deny)")
+  assert.deepEqual(perms, [{ action: "edit", resource: "*", effect: "allow" }])
 }))
 
 test("v2 setup: a record already carrying a shell entry keeps it verbatim (idempotent append, no duplicate)", withIsolatedHome(async () => {
@@ -423,18 +431,18 @@ test("v2 setup: a record already carrying a shell entry keeps it verbatim (idemp
   assert.deepEqual(perms, [userShell], "the pre-existing shell entry is untouched (current idempotent-keep semantics)")
 }))
 
-test("v2 setup: readonly worker — the shell deny rides LAST after the seal family (findLast nail)", withIsolatedHome(async (dir) => {
+test("v2 setup: readonly worker retains explicit mutation denies without a blanket shell deny", withIsolatedHome(async (dir) => {
   mkdirSync(join(dir, ".opencode"), { recursive: true })
   writeFileSync(join(dir, ".opencode", "forge.json"), JSON.stringify({ pool: "harden", agents: { scout: { shape: "readonly" } } }))
   const { ctx, agents } = makeCtx()
   await v2Setup(ctx, { materialize: "runtime" })
   const perms = agents.get("forge-harden-scout").permissions
   assert.ok(Array.isArray(perms) && perms.length > 1)
-  assert.deepEqual(perms[perms.length - 1], DENY, "the seal entries and task:deny come first; the shell deny closes the array")
-  assert.deepEqual(perms.findLast((p) => p.action === "shell"), DENY)
+  for (const action of ["write", "edit", "patch"]) assert.equal(perms.findLast((p) => p.action === action)?.effect, "deny")
+  assert.equal(perms.findLast((p) => p.action === "shell"), undefined)
 }))
 
-test("v2 setup: native suppression and the shell-deny front door coexist in the same transform", withIsolatedHome(async () => {
+test("v2 setup: native suppression does not inject shell permissions", withIsolatedHome(async () => {
   const { ctx, agents, calls } = makeCtx()
   agents.set("build", { id: "build", mode: "primary", system: "NATIVE", hidden: false })
   agents.set("plan", { id: "plan", mode: "primary", system: "NATIVE", hidden: false })
@@ -443,7 +451,7 @@ test("v2 setup: native suppression and the shell-deny front door coexist in the 
   assert.equal(agents.get("build").hidden, true, "build suppressed")
   assert.equal(agents.get("plan").hidden, true, "plan suppressed")
   assert.ok(agents.has("forge"), "forge primary registered")
-  assert.deepEqual(shellDenyOf(agents.get("forge")), DENY, "shell-deny front door applied")
+  assert.equal(shellDenyOf(agents.get("forge")), undefined, "no shell-deny front door")
   assert.deepEqual(calls.default, ["forge"], "default setter still fired")
 }))
 
@@ -469,405 +477,3 @@ test("v2 setup: hideNativeAgents JSONC boundary — comments/trailing commas hon
     assert.equal(agents.get("plan").hidden, expectedHidden, `plan hidden=${expectedHidden} for config: ${JSON.stringify(content)}`)
   }
 }))
-
-// ---------------------------------------------------------------------------
-// fix-dispatch-view-capability: the v2 adapter's HTTP-backed messages reader.
-// The v2 session domain has NO messages method (probe: 18 methods, none
-// named messages) — the adapter provides one backed by the host's own HTTP
-// session-message surface, discovered from service.json (FORGE_SERVICE_FILE
-// override here). Absence of the file = capability absence, never a throw.
-// ---------------------------------------------------------------------------
-
-import { v2SessionClientForTests, resetServiceHttpDiscoveryForTests } from "../plugin.ts"
-import { fetchFinalMessage } from "../src/dispatch-async.ts"
-
-function svcCtx() {
-  return {
-    session: {
-      prompt: async () => {},
-      get: async () => ({}),
-      create: async (flat) => ({ id: flat.id ?? "ses_adapter_child" }),
-    },
-  }
-}
-
-test("v2 adapter messages: service.json discovered — HTTP reader hits the sanctioned surface with Basic auth (array shape)", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:47999/", password: "pw123" }))
-  process.env.FORGE_SERVICE_FILE = svcFile
-  resetServiceHttpDiscoveryForTests()
-  const prevFetch = globalThis.fetch
-  const hits = []
-  globalThis.fetch = async (url, init) => {
-    hits.push({ url: String(url), auth: init?.headers?.authorization })
-    return {
-      ok: true,
-      status: 200,
-      text: async () => JSON.stringify([{ info: { role: "assistant", finish: "stop" }, parts: [{ type: "text", text: "report" }] }]),
-    }
-  }
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    assert.ok(adapter?.session.messages, "messages reader present when service discovery succeeds")
-    const res = await adapter.session.messages({ path: { id: "ses_adapter_child" } })
-    assert.equal(res.error, undefined, "no error on the happy path")
-    assert.equal(res.data.length, 1)
-    assert.equal(hits.length, 1)
-    assert.equal(hits[0].url, "http://127.0.0.1:47999/api/session/ses_adapter_child/message", "the sanctioned HTTP surface, trailing slash folded")
-    assert.match(hits[0].auth, /^Basic /)
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-test("v2 adapter messages: {data} envelope shape tolerated; create() captures the directory anchor", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48001", password: "pw" }))
-  process.env.FORGE_SERVICE_FILE = svcFile
-  resetServiceHttpDiscoveryForTests()
-  const prevFetch = globalThis.fetch
-  const hits = []
-  globalThis.fetch = async (url) => {
-    hits.push(String(url))
-    return { ok: true, status: 200, text: async () => JSON.stringify({ data: [{ info: { role: "assistant" }, parts: [] }] }) }
-  }
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    // create with a directory anchor — the adapter must remember it per child
-    await adapter.session.create({ body: { title: "t" }, query: { directory: "C:/some/ws" } })
-    const res = await adapter.session.messages({ path: { id: "ses_adapter_child" } })
-    assert.equal(res.error, undefined)
-    assert.equal(res.data.length, 1)
-    assert.equal(hits.length, 1)
-    assert.ok(hits[0].includes("location%5Bdirectory%5D="), "the directory anchor rides the location query")
-    assert.ok(hits[0].includes("C%3A%2Fsome%2Fws"), "the captured directory is the one used")
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-test("v2 adapter messages: HTTP failure returns {error} (a PROVIDED capability failing — view-loss semantics apply)", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48002", password: "pw" }))
-  process.env.FORGE_SERVICE_FILE = svcFile
-  resetServiceHttpDiscoveryForTests()
-  const prevFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: false, status: 503, text: async () => "unavailable" })
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    const res = await adapter.session.messages({ path: { id: "ses_x" } })
-    assert.match(String(res.error), /HTTP 503/)
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-test("v2 adapter messages: no service.json yet — reader wired but capabilityPending (never a throw, never view loss)", async () => {
-  process.env.FORGE_SERVICE_FILE = join(tmpdir(), "forge-svc-nonexistent-", "service.json")
-  resetServiceHttpDiscoveryForTests()
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    assert.ok(typeof adapter?.session.messages === "function", "the reader is always wired; discovery is lazy")
-    const res = await adapter.session.messages({ path: { id: "ses_yet" } })
-    assert.equal(res.capabilityPending, true, "pending discovery returns capabilityPending, not an error")
-    assert.equal(res.error, undefined, "pending is NOT an error (never counts as view loss)")
-    assert.ok(adapter?.session.prompt, "the rest of the adapter is unaffected")
-  } finally {
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-// ---------------------------------------------------------------------------
-// 0.32.3 row-shape fix (real-host proven 2026-11-23): the 2.3.2 session-
-// message HTTP surface ships BARE rows — {id, time:{created,...},
-// type:"assistant"|"user"|"idle", content: part[] | text: string, finish?,
-// error?} — NOT the v1-like {info:{role,time},parts} envelope the dispatch
-// core reads. Un-normalized, latestAssistant() filtered EVERY row out and
-// every dispatch-complete wake read "no assistant response found" even
-// though the child's final text was in the store (the earlier tests in this
-// block mocked the enveloped shape and encoded the wrong assumption — they
-// now double as the passthrough contract).
-// ---------------------------------------------------------------------------
-
-function bareRowsFixture() {
-  return [
-    { id: "msg_idle", time: { created: 1795368263098 }, type: "idle", outcome: "success" },
-    {
-      id: "msg_asst",
-      time: { created: 1795368257609, firstToken: 1795368263070, streamed: 1795368263091, completed: 1795368263093 },
-      type: "assistant",
-      agent: "forge-sorenunitylabs-scout",
-      model: { id: "glm-5.3", providerID: "glm-coding-worker" },
-      content: [
-        { type: "reasoning", text: "thinking…" },
-        { type: "text", text: "the final report" },
-      ],
-      finish: "stop",
-      rawFinish: "stop",
-      cost: 0.01,
-      tokens: { input: 10, output: 5 },
-    },
-    { id: "msg_user", time: { created: 1795368257562 }, type: "user", text: "do the thing" },
-  ]
-}
-
-test("v2 adapter messages: BARE 2.3.2 rows (real-host shape) normalize into the v1-like envelope; idle markers drop", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48004", password: "pw" }))
-  process.env.FORGE_SERVICE_FILE = svcFile
-  resetServiceHttpDiscoveryForTests()
-  const prevFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(bareRowsFixture()) })
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    const res = await adapter.session.messages({ path: { id: "ses_bare" } })
-    assert.equal(res.error, undefined)
-    assert.equal(res.data.length, 2, "the idle bookkeeping marker is dropped, assistant+user remain")
-    const asst = res.data[0]
-    assert.equal(asst.info.role, "assistant")
-    assert.equal(asst.info.id, "msg_asst")
-    assert.equal(asst.info.finish, "stop")
-    assert.equal(asst.info.time.created, 1795368257609)
-    assert.equal(asst.info.time.completed, 1795368263093)
-    assert.deepEqual(asst.parts.filter((p) => p.type === "text").map((p) => p.text), ["the final report"], "assistant content maps 1:1 to parts")
-    const user = res.data[1]
-    assert.equal(user.info.role, "user")
-    assert.deepEqual(user.parts, [{ type: "text", text: "do the thing" }], "a user row's top-level text becomes a text part")
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-test("v2 adapter messages: fetchFinalMessage reads the final text from BARE rows (the real-host wake carrier)", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48005", password: "pw" }))
-  process.env.FORGE_SERVICE_FILE = svcFile
-  resetServiceHttpDiscoveryForTests()
-  const prevFetch = globalThis.fetch
-  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(bareRowsFixture()) })
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    const client = { session: { messages: adapter.session.messages } }
-    const fin = await fetchFinalMessage(client, "ses_bare")
-    assert.equal(fin.ok, true, "the wake carrier reads the child's real final text from bare rows")
-    assert.equal(fin.ok ? fin.text : "", "the final report")
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-test("v2 adapter messages: enveloped rows pass through untouched (upstream may revert to the info shape)", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48006", password: "pw" }))
-  process.env.FORGE_SERVICE_FILE = svcFile
-  resetServiceHttpDiscoveryForTests()
-  const prevFetch = globalThis.fetch
-  const enveloped = [{ info: { role: "assistant", time: { created: 5 } }, parts: [{ type: "text", text: "already enveloped" }] }]
-  globalThis.fetch = async () => ({ ok: true, status: 200, text: async () => JSON.stringify(enveloped) })
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    const res = await adapter.session.messages({ path: { id: "ses_env" } })
-    assert.deepEqual(res.data, enveloped, "an already-enveloped row is NOT re-wrapped")
-    const fin = await fetchFinalMessage({ session: { messages: adapter.session.messages } }, "ses_env")
-    assert.equal(fin.ok, true)
-    assert.equal(fin.ok ? fin.text : "", "already enveloped")
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-test("v2 adapter messages: numeric time tolerated; an assistant row with no text parts yields the honest empty-text error", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48007", password: "pw" }))
-  process.env.FORGE_SERVICE_FILE = svcFile
-  resetServiceHttpDiscoveryForTests()
-  const prevFetch = globalThis.fetch
-  globalThis.fetch = async () => ({
-    ok: true,
-    status: 200,
-    text: async () => JSON.stringify([{ id: "m", time: 1795368257609, type: "assistant", content: [], finish: "stop" }]),
-  })
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    const res = await adapter.session.messages({ path: { id: "ses_num" } })
-    assert.equal(res.data[0].info.time.created, 1795368257609, "numeric epoch time maps to created")
-    const fin = await fetchFinalMessage({ session: { messages: adapter.session.messages } }, "ses_num")
-    assert.equal(fin.ok, false)
-    assert.match(fin.ok ? "" : String(fin.error), /no assistant text output found/, "found-but-textless is its own honest error, distinct from not-found")
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-test("v2 adapter messages: discovery recovers after a late service.json (fail-then-succeed, 10s throttle bypassed by reset)", async () => {
-  process.env.FORGE_SERVICE_FILE = join(tmpdir(), "forge-svc-nonexistent2-", "service.json")
-  resetServiceHttpDiscoveryForTests()
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  const prevFetch = globalThis.fetch
-  const hits = []
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    const pending = await adapter.session.messages({ path: { id: "ses_late" } })
-    assert.equal(pending.capabilityPending, true, "pending before the file exists")
-    // The file materializes (boot-order reality)…
-    writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48003", password: "pw" }))
-    process.env.FORGE_SERVICE_FILE = svcFile
-    resetServiceHttpDiscoveryForTests()
-    globalThis.fetch = async (url) => {
-      hits.push(String(url))
-      return { ok: true, status: 200, text: async () => JSON.stringify([]) }
-    }
-    const res = await adapter.session.messages({ path: { id: "ses_late" } })
-    assert.equal(res.error, undefined, "the SAME reader recovers once discovery succeeds")
-    assert.deepEqual(res.data, [])
-    assert.equal(hits.length, 1)
-    assert.equal(hits[0], "http://127.0.0.1:48003/api/session/ses_late/message")
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-// ---------------------------------------------------------------------------
-// fix-dispatch-dispose-kill D3: the v2 abort seam = session.interrupt. The
-// 2.3.2 host ships NO abort endpoint (openapi.json probe: 142 paths, zero
-// abort); the sanctioned stop surface is POST /api/session/{id}/interrupt
-// (optional resume param, 200 {interrupted:boolean} — idle interruption is a
-// no-op). The adapter wires it as `abort` with two legs in order: the
-// promise layer ctx.session.interrupt({sessionID, resume:false}) first, the
-// service.json HTTP channel second. {interrupted:false} is
-// success-equivalent (the child already finished).
-// ---------------------------------------------------------------------------
-
-test("v2 adapter abort (interrupt seam): promise-layer interrupt wins — flat {sessionID, resume:false} spelling, {interrupted:true} resolves", async () => {
-  const interrupts = []
-  const ctx = {
-    session: {
-      prompt: async () => {},
-      get: async () => ({}),
-      create: async () => ({ id: "ses_x" }),
-      interrupt: async (input) => {
-        interrupts.push(input)
-        return { interrupted: true }
-      },
-    },
-  }
-  const adapter = v2SessionClientForTests(ctx)
-  assert.ok(typeof adapter?.session.abort === "function", "the interrupt seam is wired as abort")
-  const res = await adapter.session.abort({ path: { id: "ses_child_i" } })
-  assert.equal(interrupts.length, 1, "the promise-layer interrupt fired exactly once")
-  assert.deepEqual(interrupts[0], { sessionID: "ses_child_i", resume: false }, "the live-host flat spelling with resume:false")
-  assert.deepEqual(res, { interrupted: true }, "the interrupt response resolves through")
-})
-
-test("v2 adapter abort (interrupt seam): {interrupted:false} on an idle child is SUCCESS-EQUIVALENT (resolved, never thrown)", async () => {
-  const ctx = {
-    session: {
-      prompt: async () => {},
-      get: async () => ({}),
-      create: async () => ({ id: "ses_x" }),
-      interrupt: async () => ({ interrupted: false }),
-    },
-  }
-  const adapter = v2SessionClientForTests(ctx)
-  const res = await adapter.session.abort({ sessionID: "ses_idle_child" })
-  assert.deepEqual(res, { interrupted: false }, "no throw — the idle no-op is success-equivalent")
-})
-
-test("v2 adapter abort (interrupt seam): interrupt throwing REJECTS the seam (the kill path journals it as abort-unconfirmed)", async () => {
-  const ctx = {
-    session: {
-      prompt: async () => {},
-      get: async () => ({}),
-      create: async () => ({ id: "ses_x" }),
-      interrupt: async () => {
-        throw new Error("interrupt refused")
-      },
-    },
-  }
-  const adapter = v2SessionClientForTests(ctx)
-  await assert.rejects(
-    () => adapter.session.abort({ path: { id: "ses_refused" } }),
-    /interrupt refused/,
-    "a failed interrupt surfaces as a rejection — the caller's unconfirmed disclosure carries it",
-  )
-})
-
-test("v2 adapter abort (interrupt seam): no promise layer → HTTP fallback POSTs the sanctioned interrupt surface with Basic auth", async () => {
-  const dir = mkdtempSync(join(tmpdir(), "forge-svc-"))
-  const svcFile = join(dir, "service.json")
-  writeFileSync(svcFile, JSON.stringify({ url: "http://127.0.0.1:48010", password: "pw9" }))
-  process.env.FORGE_SERVICE_FILE = svcFile
-  resetServiceHttpDiscoveryForTests()
-  const prevFetch = globalThis.fetch
-  const hits = []
-  globalThis.fetch = async (url, init) => {
-    hits.push({ url: String(url), method: init?.method, auth: init?.headers?.authorization })
-    return { ok: true, status: 200, text: async () => JSON.stringify({ interrupted: true }) }
-  }
-  try {
-    const adapter = v2SessionClientForTests(svcCtx()) // no interrupt on the ctx session domain
-    const res = await adapter.session.abort({ path: { id: "ses_http_child" } })
-    assert.deepEqual(res, { interrupted: true }, "the live-shape 200 body parses through")
-    assert.equal(hits.length, 1)
-    assert.equal(hits[0].url, "http://127.0.0.1:48010/api/session/ses_http_child/interrupt?resume=false", "the sanctioned interrupt endpoint with resume=false")
-    assert.equal(hits[0].method, "POST")
-    assert.match(hits[0].auth, /^Basic /, "Basic auth rides the service channel")
-  } finally {
-    globalThis.fetch = prevFetch
-    rmSync(dir, { recursive: true, force: true })
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})
-
-test("v2 adapter abort (interrupt seam): NO interrupt and NO service discovery → the honest unavailable error (never a swallowed TypeError)", async () => {
-  process.env.FORGE_SERVICE_FILE = join(tmpdir(), "forge-svc-nonexistent3-", "service.json")
-  resetServiceHttpDiscoveryForTests()
-  try {
-    const adapter = v2SessionClientForTests(svcCtx())
-    await assert.rejects(
-      () => adapter.session.abort({ path: { id: "ses_none" } }),
-      (err) => {
-        assert.match(String(err?.message ?? err), /abort unavailable on this session client/, "the stable unavailable contract")
-        assert.match(String(err?.message ?? err), /service\.json discovery failed/, "the missing second leg is named")
-        return true
-      },
-    )
-  } finally {
-    delete process.env.FORGE_SERVICE_FILE
-    resetServiceHttpDiscoveryForTests()
-  }
-})

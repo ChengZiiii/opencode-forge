@@ -1,6 +1,7 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, readdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs"
+import fs, { mkdtempSync, readdirSync, readFileSync, writeFileSync, existsSync, rmSync } from "node:fs"
+import { syncBuiltinESMExports } from "node:module"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -144,6 +145,45 @@ test("transitionGoal: pause requires stop reason; resume rebinds owner and clear
   assert.throws(() => transitionGoal(queued, "paused", NOW, { stopReason: "user" }), /Illegal/)
 })
 
+test("frontmatter mutations preserve ordinary body fields byte for byte", () => {
+  const constraints = ["blocker: ordinary detail  ", "stop_reason: prose", "session: example", "armed_at: example", "status: example", "updated: example", "turns_used: example", "max_turns: example"].join("\n")
+  const now = "2026-09-25T13:00:00.000Z"
+  const blocker = 'Need "approval"\nfrom user ($&)'
+  for (const eol of ["\n", "\r\n"]) {
+    // Legacy files may omit fields that have parser defaults.
+    let queued = renderGoal(sampleInput({ constraints }), { now: NOW, status: "queued" })
+    for (const key of ["status", "updated", "turns_used", "max_turns"]) {
+      queued = queued.replace(new RegExp(`^${key}:.*\\n`, "m"), "")
+    }
+    queued = queued.replace(/\n/g, eol)
+    const bodyOf = (text) => text.slice(text.indexOf(`${eol}---${eol}`) + 3 + 2 * eol.length)
+    const body = bodyOf(queued)
+    const assertBody = (text) => assert.equal(bodyOf(text), body)
+    const armed = transitionGoal(queued, "active", now, { session: "ses_a" })
+    assertBody(armed)
+    assert.equal(parseGoal(armed).status, "active")
+    assert.equal(parseGoal(armed).session, "ses_a")
+    assert.equal(parseGoal(armed).armedAt, now)
+    assert.equal(parseGoal(armed).updated, now)
+    const counted = bumpBudget(incTurns(armed, now), 5, now)
+    assertBody(counted)
+    assert.equal(parseGoal(counted).turnsUsed, 1)
+    assert.equal(parseGoal(counted).maxTurns, 30)
+    const paused = transitionGoal(counted, "paused", now, { stopReason: "blocker", blocker })
+    assertBody(paused)
+    assert.equal(parseGoal(paused).stopReason, "blocker")
+    assert.equal(parseGoal(paused).blocker, blocker)
+    const resumed = transitionGoal(paused, "active", now, { session: "ses_b" })
+    assertBody(resumed)
+    assert.equal(parseGoal(resumed).session, "ses_b")
+    assert.doesNotMatch(resumed.slice(0, resumed.indexOf("## Goal")), /^(blocker|stop_reason):/m)
+    const legacyPaused = transitionGoal(armed, "paused", now, { stopReason: "user" })
+    assertBody(legacyPaused)
+    assert.equal(parseGoal(legacyPaused).blocker, undefined)
+    assertBody(transitionGoal(legacyPaused, "active", now, { session: "ses_b" }))
+  }
+})
+
 test("budget: turns and wall-clock tracks, first exhausted wins", () => {
   // budgetState compares against the real clock, so the base doc must carry a
   // fresh arm timestamp — the fixed NOW fixture would trip budget-time a day
@@ -257,6 +297,50 @@ test("atomic write: target always holds a complete document", () => {
     assert.equal(readdirSync(dir).filter((f) => f.endsWith(".md")).length, 1)
     atomicWrite(file, transitionGoal(renderActive(), "paused", NOW, { stopReason: "user" }))
     assert.equal(parseGoal(readFileSync(file, "utf8")).status, "paused")
+  } finally {
+    rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test("atomic write: failed rename preserves target bytes and removes only its temp", (t) => {
+  const dir = mkdtempSync(join(".", "goal-atomic-failure-"))
+  try {
+    const file = join(dir, "g.md")
+    const sibling = `${file}.other.tmp`
+    const old = Buffer.from(renderActive().replace(/\n/g, "\r\n"))
+    writeFileSync(file, old)
+    writeFileSync(sibling, "other writer")
+    const failure = new Error("forced rename failure")
+    const rename = t.mock.method(fs, "renameSync", (tmp, target) => {
+      assert.equal(target, file)
+      assert.notEqual(tmp, file)
+      assert.equal(readFileSync(tmp, "utf8"), "replacement")
+      throw failure
+    })
+    syncBuiltinESMExports()
+    try {
+      assert.throws(() => atomicWrite(file, "replacement"), (err) => err === failure)
+      assert.equal(rename.mock.callCount(), 1)
+      assert.deepEqual(readFileSync(file), old)
+      assert.equal(readFileSync(sibling, "utf8"), "other writer")
+      assert.deepEqual(readdirSync(dir).sort(), ["g.md", "g.md.other.tmp"])
+
+      const unlink = t.mock.method(fs, "unlinkSync", () => { throw new Error("forced cleanup failure") })
+      syncBuiltinESMExports()
+      try {
+        assert.throws(() => atomicWrite(file, "replacement"), (err) => err === failure)
+        assert.equal(unlink.mock.callCount(), 1)
+        assert.equal(unlink.mock.calls[0].arguments[0], rename.mock.calls[1].arguments[0])
+        assert.deepEqual(readFileSync(file), old)
+        assert.equal(readFileSync(sibling, "utf8"), "other writer")
+      } finally {
+        unlink.mock.restore()
+        syncBuiltinESMExports()
+      }
+    } finally {
+      rename.mock.restore()
+      syncBuiltinESMExports()
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true })
   }

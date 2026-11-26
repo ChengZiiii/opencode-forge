@@ -1,8 +1,9 @@
 import test from "node:test"
 import assert from "node:assert/strict"
-import { mkdtempSync, readFileSync, rmSync, readdirSync, existsSync } from "node:fs"
+import { mkdtempSync, readFileSync, writeFileSync, rmSync, readdirSync, existsSync } from "node:fs"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { createServer } from "node:http"
 
 // Task 5.1 (W6a field realities) — the v2 continuation engines on the REAL
 // SDK 2.3.2 surfaces: idle via ctx.session.hook("experimental.idle")
@@ -23,12 +24,38 @@ process.env.FORGE_GOAL_DEBOUNCE_MS = "10"
 process.env.FORGE_TEST_NO_FENCE = "1"
 // Sandbox the plugin's runtime-artifact home (session-anchor ledger etc.).
 process.env.FORGE_TEST_FORGE_HOME = mkdtempSync(join(tmpdir(), "v2-cont-home-"))
-const { v2Setup, v2WiringSeam } = await import("../plugin.ts")
+const { v2Setup, v2WiringSeam, resetServiceHttpDiscoveryForTests } = await import("../plugin.ts")
 import { parseGoal } from "../src/goal-file.ts"
 import { createV2MockContext } from "./lib/v2-mock-context.mjs"
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const allowAsk = async () => {}
+
+// The Goal waiting gate requires a positively readable host view, even when
+// there are no children. This host is local to the test process.
+const host = createServer((req, res) => {
+  res.setHeader("content-type", "application/json")
+  if (req.url.startsWith("/api/session/active")) res.end(JSON.stringify({}))
+  else if (req.url.startsWith("/api/session")) res.end(JSON.stringify([]))
+  else { res.statusCode = 404; res.end() }
+})
+const serviceDir = mkdtempSync(join(tmpdir(), "v2-cont-service-"))
+const previousService = process.env.FORGE_SERVICE_FILE
+test.before(async () => {
+  await new Promise(resolve => host.listen(0, "127.0.0.1", resolve))
+  const serviceFile = join(serviceDir, "service.json")
+  writeFileSync(serviceFile, JSON.stringify({ url: `http://127.0.0.1:${host.address().port}`, password: "test" }))
+  process.env.FORGE_SERVICE_FILE = serviceFile
+  resetServiceHttpDiscoveryForTests()
+})
+test.after(async () => {
+  host.closeAllConnections?.()
+  await new Promise(resolve => host.close(resolve))
+  if (previousService === undefined) delete process.env.FORGE_SERVICE_FILE
+  else process.env.FORGE_SERVICE_FILE = previousService
+  resetServiceHttpDiscoveryForTests()
+  rmSync(serviceDir, { recursive: true, force: true })
+})
 
 let sidCounter = 0
 const nextSid = () => `ses_v2cont-${++sidCounter}`
@@ -69,7 +96,6 @@ function goalFiles(worktree) {
 
 // The v2 execute wrapper returns { content } where content is the shared
 // core's output string (see wrapV2ToolResult).
-const outText = (res) => (typeof res?.content === "string" ? res.content : String(res?.content?.output ?? res?.content ?? ""))
 
 // The idle seam: the in-process experimental.idle hook (SessionIdle
 // {sessionID, background[]}).
@@ -101,6 +127,63 @@ test("registration: wired ctx registers the idle hook + an AsyncIterable subscri
   assert.ok(state.sessionHookDisposed.includes("experimental.idle"), "cleanup disposes the idle hook registration")
   cleanup()
   assert.equal(state.subscriptionsAborted, 1, "cleanup is idempotent")
+})
+
+test("cleanup cancels its pending Goal timer and ignores stale repeated idle without touching a sibling", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "v2-cleanup-goal-"))
+  const siblingWt = mkdtempSync(join(tmpdir(), "v2-cleanup-sibling-"))
+  const v2 = await makeV2()
+  const sibling = await makeV2()
+  try {
+    const { sid } = await armGoal(v2.state, wt)
+    const { sid: siblingSid } = await armGoal(sibling.state, siblingWt)
+    const before = goalFiles(wt)
+    assert.equal(before.length, 1)
+    await fireIdle(v2.state, sid)
+    await fireIdle(sibling.state, siblingSid)
+    v2.cleanup()
+    await fireIdle(v2.state, sid)
+    await fireIdle(v2.state, sid)
+    await sleep(100)
+    assert.equal(v2.state.prompts.length, 0)
+    assert.deepEqual(goalFiles(wt), before, "cleanup preserves the armed Goal bytes")
+    assert.equal(sibling.state.prompts.length, 1, "sibling timer remains live")
+    assert.equal(sibling.state.prompts[0].sessionID, siblingSid)
+  } finally {
+    v2.cleanup()
+    sibling.cleanup()
+    rmSync(wt, { recursive: true, force: true })
+    rmSync(siblingWt, { recursive: true, force: true })
+  }
+})
+
+test("cleanup invalidates an idle callback suspended in the lazy session read", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "v2-cleanup-read-"))
+  const mock = createV2MockContext()
+  let releaseRead
+  let startRead
+  const started = new Promise(resolve => { startRead = resolve })
+  mock.ctx.session.get = async () => {
+    startRead()
+    return new Promise(resolve => { releaseRead = resolve })
+  }
+  const cleanup = await v2Setup(mock.ctx)
+  try {
+    const { sid } = await armGoal(mock.state, wt)
+    const before = goalFiles(wt)
+    v2WiringSeam.sessions.delete(sid)
+    await fireIdle(mock.state, sid)
+    await Promise.race([started, sleep(500).then(() => { throw new Error("lazy read did not start") })])
+    cleanup()
+    releaseRead({ directory: wt, worktree: wt })
+    await fireIdle(mock.state, sid)
+    await sleep(50)
+    assert.equal(mock.state.prompts.length, 0)
+    assert.deepEqual(goalFiles(wt), before)
+  } finally {
+    cleanup()
+    rmSync(wt, { recursive: true, force: true })
+  }
 })
 
 test("drift: every event drift mode disables only the event slice — no subscription, no throw; idle hook still registered", async () => {
@@ -151,6 +234,18 @@ test("idle continuation: armed goal continues the owner session with the [forge:
     assert.match(brief, /\[forge:goal-continue\]/)
     assert.match(brief, /make the suite green/)
     assert.match(brief, /0\/25 turns used/)
+    assert.match(brief, /meaningful read-only reconnaissance and review, real changes, commits, and checks or failure diagnosis with new evidence/)
+    assert.match(brief, /Treat verified waiting as distinct from work or no-progress/)
+    assert.match(brief, /No write, shell command, or git diff is required every turn/)
+    assert.match(brief, /unknown or truncated evidence does not establish equality/)
+    assert.match(brief, /already accepted host work may finish/)
+    assert.match(brief, /wall-clock minute limit continues during waiting/)
+    assert.match(brief, /stop on either budget limit or when goal authorization ends/)
+    assert.match(brief, /every work round of the previous wave is verified settled/)
+    assert.match(brief, /duplicate observations of one round count once/)
+    assert.match(brief, /A diagnostic is not permission to launch another wave/)
+    assert.match(brief, /completion notification is not by itself PASS/)
+    assert.doesNotMatch(brief, /forge_shell|forge_jobs|subagent_type|run_in_background/)
     assert.match(goalFiles(wt)[0].text, /^turns_used: 1$/m)
     // Second idle evaluates turn 1 (ledger entry, no activity) and continues.
     await fireIdle(v2.state, sid)
@@ -160,6 +255,72 @@ test("idle continuation: armed goal continues the owner session with the [forge:
     assert.equal(parseGoal(goalFiles(wt)[0].text).turnsUsed, 2)
     v2.cleanup?.()
   } finally {
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("owning shell and unknown background hold Goal until a complete empty view", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "v2-goal-wait-"))
+  const v2 = await makeV2()
+  try {
+    const { sid } = await armGoal(v2.state, wt)
+    const shell = { kind: "shell", sessionID: sid, shellID: "sh_1", command: "npm test" }
+    for (let i = 0; i < 4; i++) {
+      await idleHook(v2.state)({ sessionID: sid, background: [shell] })
+      await sleep(60)
+    }
+    assert.equal(v2.state.prompts.length, 0)
+    assert.equal(parseGoal(goalFiles(wt)[0].text).turnsUsed, 0)
+    assert.equal(parseGoal(goalFiles(wt)[0].text).status, "active")
+    await idleHook(v2.state)({ sessionID: sid, background: [{ ...shell, sessionID: "other" }, { kind: "unknown" }] })
+    await sleep(100)
+    assert.equal(v2.state.prompts.length, 0, "unknown background cannot clear an established wait")
+    assert.equal(parseGoal(goalFiles(wt)[0].text).turnsUsed, 0)
+    await idleHook(v2.state)({ sessionID: sid, background: [] })
+    const deadline = Date.now() + 5000
+    while (v2.state.prompts.length < 1 && Date.now() < deadline) await sleep(10)
+    assert.equal(v2.state.prompts.length, 1, "complete empty background clears the wait")
+    await sleep(60)
+    assert.equal(v2.state.prompts.length, 1, "the resolved wait resumes only once")
+    assert.equal(parseGoal(goalFiles(wt)[0].text).turnsUsed, 1)
+  } finally {
+    v2.cleanup?.()
+    rmSync(wt, { recursive: true, force: true })
+  }
+})
+
+test("waiting idle still checks elapsed minutes and paused goals stay paused without prompts", async () => {
+  const wt = mkdtempSync(join(tmpdir(), "v2-goal-wait-budget-"))
+  const v2 = await makeV2()
+  try {
+    const { sid } = await armGoal(v2.state, wt, { maxMinutes: 1 })
+    const file = goalFiles(wt)[0]
+    writeFileSync(join(wt, ".opencode", "goal", file.name), file.text.replace(/^armed_at: .*$/m, "armed_at: 2020-01-01T00:00:00.000Z"))
+    const raw = { sessionID: sid, background: [{ kind: "shell", sessionID: sid, shellID: "sh_1", command: "npm test" }] }
+    await idleHook(v2.state)(raw)
+    await sleep(60)
+    const doc = parseGoal(goalFiles(wt)[0].text)
+    assert.equal(doc.status, "paused")
+    assert.equal(doc.stopReason, "budget-time")
+    await idleHook(v2.state)(raw)
+    await fireIdle(v2.state, sid)
+    await sleep(60)
+    assert.equal(v2.state.prompts.length, 0)
+    assert.equal(parseGoal(goalFiles(wt)[0].text).turnsUsed, 0)
+    // Native plugin unload/reload must not implicitly resume the parked goal.
+    v2.cleanup?.()
+    const reloaded = await makeV2()
+    try {
+      await fireIdle(reloaded.state, sid)
+      await sleep(60)
+      assert.equal(reloaded.state.prompts.length, 0)
+      assert.equal(parseGoal(goalFiles(wt)[0].text).status, "paused")
+      assert.equal(parseGoal(goalFiles(wt)[0].text).turnsUsed, 0)
+    } finally {
+      reloaded.cleanup?.()
+    }
+  } finally {
+    v2.cleanup?.()
     rmSync(wt, { recursive: true, force: true })
   }
 })
@@ -229,47 +390,6 @@ test("budget: turn exhaustion wraps up once and pauses with budget-turns", async
 })
 
 // ---------------------------------------------------------------------------
-// Job-wake delivery (port of the job-wiring wake-engine scenarios) — the
-// wakes ride the SAME SessionPrompt sends (promptAsync ≈ prompt in v2).
-// ---------------------------------------------------------------------------
-
-test("wake engine: exit queues, only the idle edge delivers, exactly once", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "v2-wake-"))
-  try {
-    const v2 = await makeV2()
-    const sid = nextSid()
-    const ctx = toolCtx(sid, wt)
-    const started = await v2.state.tools.get("forge_shell").execute(
-      { command: `node -e "setTimeout(()=>console.log('done'),150)"`, run_in_background: true },
-      ctx,
-    )
-    const jobId = /jobId: (j-\S+)/.exec(outText(started))[1]
-    // Wait until the job is terminal (bounded), asserting nothing delivered
-    // while the session was busy (no idle edge yet).
-    const lineOf = (txt) => txt.split("\n").find((l) => l.startsWith(jobId)) ?? ""
-    let terminal = false
-    for (let i = 0; i < 40 && !terminal; i++) {
-      const l = await v2.state.tools.get("forge_jobs").execute({ action: "list" }, ctx)
-      terminal = /\b(exited|killed|succeeded)\b/.test(lineOf(outText(l)))
-      if (!terminal) await sleep(100)
-    }
-    assert.ok(terminal, "job reached a terminal state within the bound")
-    assert.equal(v2.state.prompts.length, 0, "no delivery before the session goes idle")
-    await fireIdle(v2.state, sid)
-    await sleep(60)
-    assert.equal(v2.state.prompts.length, 1, "exactly one wake on idle")
-    assert.equal(v2.state.prompts[0].sessionID, sid)
-    assert.match(v2.state.prompts[0].text, /\[forge:job-complete\]/)
-    await fireIdle(v2.state, sid)
-    await sleep(60)
-    assert.equal(v2.state.prompts.length, 1, "no duplicate delivery on a second idle")
-    v2.cleanup?.()
-  } finally {
-    rmSync(wt, { recursive: true, force: true })
-  }
-})
-
-// ---------------------------------------------------------------------------
 // session.deleted harvest (the shared harvestSessionEnd core) — the SSE
 // AsyncIterable leg, payload under .data.
 // ---------------------------------------------------------------------------
@@ -279,47 +399,13 @@ test("session.deleted harvest: evicts every session-bounded map via the shared c
   const sid = nextSid()
   v2WiringSeam.sessionAgents.set(sid, "forge-worker-x")
   v2WiringSeam.sessionDepths.set(sid, { translation: { kind: "effort", value: "high" } })
-  v2WiringSeam.sealFindings.set(sid, new Set(["redirect"]))
   v2WiringSeam.crews.set(sid, { mode: "pending", objective: "o", startedAt: "t" })
   await fireDeleted(v2.state, sid)
   await sleep(30)
   assert.equal(v2WiringSeam.sessionAgents.get(sid), undefined, "agent-family map evicted")
   assert.equal(v2WiringSeam.sessionDepths.get(sid), undefined, "frozen depth table evicted")
-  assert.equal(v2WiringSeam.sealFindings.get(sid), undefined, "seal findings evicted")
   assert.equal(v2WiringSeam.crews.get(sid), undefined, "crew record ended with the session")
   v2.cleanup?.()
-})
-
-test("session.deleted harvest: a live session-scoped job is killed and ledgered", async () => {
-  const wt = mkdtempSync(join(tmpdir(), "v2-deleted-job-"))
-  try {
-    const v2 = await makeV2()
-    const sid = nextSid()
-    const ctx = toolCtx(sid, wt)
-    const started = await v2.state.tools.get("forge_shell").execute(
-      { command: `node -e "setTimeout(()=>{},30000)"`, run_in_background: true },
-      ctx,
-    )
-    const jobId = /jobId: (j-\S+)/.exec(outText(started))[1]
-    await fireDeleted(v2.state, sid)
-    // The kill is async (taskkill fires and forgets); give Windows a beat
-    // to reap the child before the assertions and the worktree removal.
-    await sleep(600)
-    // The harvest kills the live job AND removes the registry row (the
-    // orphan lands in the diagnostics ledger — job-supervisor spec).
-    const l = await v2.state.tools.get("forge_jobs").execute({ action: "list" }, ctx)
-    assert.ok(!outText(l).split("\n").some((x) => x.startsWith(jobId)), "the owner's live job left the registry")
-    const orphan = v2WiringSeam.jobLedger().find((e) => e.jobId === jobId && /owner session ended/.test(String(e.detail)))
-    assert.ok(orphan, `the kill is ledgered as an orphan: ${JSON.stringify(v2WiringSeam.jobLedger().filter((e) => e.jobId === jobId))}`)
-    v2.cleanup?.()
-  } finally {
-    try {
-      rmSync(wt, { recursive: true, force: true, maxRetries: 10, retryDelay: 200 })
-    } catch {
-      // A killed child's cwd can linger a moment on Windows; the temp dir
-      // cleaner owns it then.
-    }
-  }
 })
 
 test("session.deleted drift: a garbage envelope is a no-op, never a throw", async () => {

@@ -447,7 +447,7 @@ export type TerminalSectionOptions = {
 // Terminal lifecycle narrative (spec: "Terminal lifecycle narrative"): builds
 // a dated `## <now> — <kind>` section and appends it at END of file, returning
 // the new text. No fs here: the caller persists the returned text in the SAME
-// write as the frontmatter status flip (one atomic writeFileSync).
+// write as the frontmatter status flip (one atomic file replacement).
 //
 // Parser-inertness contract: the section never emits lines the plan parser
 // would misread (checkbox "- [x] N." / numbered "N." line starts, section

@@ -7,7 +7,7 @@ import assert from "node:assert/strict"
 // pins `model`, drops `hidden`, keeps the task recursion ban, and its
 // description is the task-tool vocabulary entry.
 
-import { materializeAgentPrompt, WORKER_MANDATES, withReportDelivery, REPORT_DELIVERY_LINE } from "../src/dispatch-prompt.ts"
+import { materializeAgentPrompt, WORKER_MANDATES } from "../src/dispatch-prompt.ts"
 import { rolePromptFor, forgeAgentDef, agentDescriptionFor, effectiveReadonlyShape, poolProvenanceLine } from "../src/dispatch-tiers.ts"
 
 test("role prompt layer 1: an explicit def.prompt overrides everything", () => {
@@ -27,7 +27,7 @@ test("role prompt layer 2: built-in roles (research/review) have curated default
 test("role prompt layer 3: a custom agent without a prompt gets the generic worker role", () => {
   const generic = rolePromptFor("summarizer", { model: "x/y" })
   assert.match(generic, /summarizer/)
-  assert.match(generic, /task/i)
+  assert.match(generic, /assigned work exactly as scoped/i)
 })
 
 test("the materialized prompt embeds the mandates (never replaceable)", () => {
@@ -35,13 +35,9 @@ test("the materialized prompt embeds the mandates (never replaceable)", () => {
   assert.match(p, /workspace-relative paths ONLY/)
   assert.match(p, /report the refusal VERBATIM/)
   assert.match(p, /evidence references/)
-  assert.match(p, /Run every shell command through the forge_shell tool/, "exec-partition mandate present")
-  assert.match(p, /builtin shell is not part of your toolset/, "the hide is stated as the design")
+  assert.match(p, /run commands with the builtin shell/)
   assert.match(p, /ROLE TEXT/, "the role text rides inside the frame")
-  // Search preference mandate (forge-search-tools D7): additive — the two
-  // pre-existing mandates stay verbatim alongside the new line.
-  assert.match(p, /Run every search through the forge_grep\/forge_glob tools first — the builtin grep\/glob tools are fallback only/, "search preference mandate present")
-  assert.match(p, /follow and hidden are on by default/, "the preference line teaches the defaults divergence")
+  assert.match(p, /Search with the builtin grep\/glob tools/)
   assert.ok(WORKER_MANDATES.includes("- Use workspace-relative paths ONLY. Never write to or read from absolute paths outside this workspace; the workspace root is where you were started, not the filesystem root."), "pre-existing mandate 1 verbatim")
   assert.ok(WORKER_MANDATES.includes("- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial."), "pre-existing mandate 3 verbatim")
   assert.ok(WORKER_MANDATES.includes("- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."), "pre-existing mandate 4 verbatim")
@@ -53,7 +49,7 @@ test("the frame differs by shape: readonly reports, write executes", () => {
   const ro = materializeAgentPrompt({ agent: "x", shape: "readonly", role: "r" })
   const wr = materializeAgentPrompt({ agent: "x", shape: "write", role: "r" })
   assert.match(ro, /readonly worker.*REPORT/s)
-  assert.match(wr, /executing scoped tasks/)
+  assert.match(wr, /executing scoped assignments/)
 })
 
 test("forgeAgentDef pins the model, drops hidden, and always denies task", () => {
@@ -65,7 +61,9 @@ test("forgeAgentDef pins the model, drops hidden, and always denies task", () =>
   assert.equal(permission.task, "deny")
   assert.equal(permission.write, "deny")
   assert.equal(permission.edit, "deny")
-  assert.equal(permission.bash, "deny")
+  assert.equal(permission.bash, undefined)
+  assert.equal(permission.execute, "deny")
+  assert.equal(permission.subagent, "deny")
 })
 
 // shape-default-open: an ABSENT shape defaults to WRITE (open permissions) —
@@ -84,7 +82,7 @@ test("forgeAgentDef: a write shape drops the mutating denies; an override never 
   assert.equal(w.permission.task, "deny")
 
   const o = forgeAgentDef("ops", { model: "prov/x", shape: "write", permission: { bash: "deny" } })
-  assert.equal(o.permission.bash, "deny")
+  assert.equal(o.permission.shell, "deny")
   assert.equal(o.permission.task, "deny")
 })
 
@@ -111,11 +109,11 @@ test("effectiveReadonlyShape: effectiveness matrix (explicit readonly only; fail
   assert.equal(effectiveReadonlyShape({ model: "prov/x", shape: "readonly", permission: { write: "deny" } }), true)
 })
 
-test("agent description names the role, shape, and pinned brain for the task vocabulary", () => {
+test("agent description names the role, shape, and pinned brain for the native subagent vocabulary", () => {
   const d = agentDescriptionFor("research", { model: "prov/x" })
   assert.match(d, /research/)
   assert.match(d, /prov\/x/)
-  assert.match(d, /task tool/)
+  assert.match(d, /subagent tool with agent "forge-research"/)
   assert.match(d, /forge-research/)
   assert.match(d, /write/, "an absent shape is described as the write default")
 })
@@ -139,7 +137,9 @@ test("forgeAgentDef: the readonly deny face covers the patch family; task stays 
   }
   assert.equal(permission.write, "deny")
   assert.equal(permission.edit, "deny")
-  assert.equal(permission.bash, "deny")
+  assert.equal(permission.bash, undefined)
+  assert.equal(permission.execute, "deny")
+  assert.equal(permission.subagent, "deny")
   assert.equal(permission.task, "deny", "the recursion ban survives every shape")
 })
 
@@ -195,7 +195,7 @@ test("description provenance: ABSENT provenance leaves the description byte-iden
   )
   assert.equal(
     agentDescriptionFor("research", def),
-    `forge subagent "research" (readonly, pinned prov/x) — dispatch via the task tool with subagent_type "forge-research".`,
+    `forge subagent "research" (readonly, pinned prov/x) — dispatch via the subagent tool with agent "forge-research".`,
     "no provenance sentence is appended",
   )
   // The materialization path is equally inert without provenance.
@@ -244,7 +244,7 @@ test("rolePromptFor: shared is a strict prepend — shared + blank line + the un
   // Layer 3 (generic one-liner) beneath shared.
   assert.equal(
     rolePromptFor("summarizer", {}, seg),
-    `${seg}\n\nYou are a summarizer worker. Execute the assigned task exactly as scoped.`,
+    `${seg}\n\nYou are a summarizer worker. Execute the assigned work exactly as scoped.`,
   )
   // An explicit prompt still overrides role defaults — shared suppresses
   // nothing and never competes with any layer.
@@ -269,7 +269,7 @@ test("forgeAgentDef: sharedSeg enters the ROLE slot below the mandates; descript
   assert.ok(withSeg.prompt.indexOf(`${seg}\n\nAudit licenses.`) < withSeg.prompt.indexOf("Mandates"), "the role slot (shared included) sits below the mandates in reading order")
   for (const m of [
     "Use workspace-relative paths ONLY",
-    "Run every shell command through the forge_shell tool",
+    "run commands with the builtin shell",
     "report the refusal VERBATIM",
     "evidence references",
   ]) {
@@ -292,42 +292,30 @@ test("materializeAgentPrompt composition order: shared-primed role keeps mandate
   // every pre-existing assertion about the frame still holds verbatim.
   assert.ok(p.indexOf(`${seg}\n\n`) < p.indexOf("Mandates"), "shared is innermost — the frame wraps it like any role text")
   assert.match(p, /workspace-relative paths ONLY/)
-  assert.match(p, /Run every shell command through the forge_shell tool/)
+  assert.match(p, /run commands with the builtin shell/)
   assert.match(p, /readonly worker.*REPORT/s)
 })
 
 // ---------------------------------------------------------------------------
-// dispatch-stream-loss-honesty task 3 (spec scenario "Worker report survives
-// view loss"): the standing report-file delivery contract — the mandates
-// carry the convention, and withReportDelivery names the concrete
-// caller-provided path idempotently.
-
-test("the mandates carry the standing report-file delivery line (reliability contract)", () => {
-  assert.match(WORKER_MANDATES, /Report-file delivery \(reliability contract\)/, "the standing mandate names the contract")
-  assert.match(WORKER_MANDATES, /reports\/<task>-report\.md/, "the convention path appears verbatim")
-  assert.match(WORKER_MANDATES, /result stream is lost/, "the line states WHY (recovery after view loss)")
-  assert.match(WORKER_MANDATES, /Readonly workers skip this/, "readonly workers are told the reply is the report")
-  // The materialized prompt embeds the standing line for both shapes.
-  for (const shape of ["readonly", "write"]) {
-    const p = materializeAgentPrompt({ agent: "x", shape, role: "r" })
-    assert.match(p, /Report-file delivery \(reliability contract\)/, `${shape} shape embeds the standing line`)
+// retire-plugin-runtime 3.4: both shapes and all default roles use the
+// native dispatch vocabulary. The legacy wrapper below remains for its
+// still-live runtime caller, not for materialized agents.
+test("compiled worker text teaches the native lifecycle without retired surfaces", () => {
+  for (const agent of ["pool-research", "pool-review", "pool-builder", "research", "review"]) {
+    for (const shape of ["readonly", "write", undefined]) {
+      const { prompt, description } = forgeAgentDef(agent, { shape })
+      assert.match(description, /subagent tool/)
+      assert.ok(description.includes(`agent "forge-${agent}"`))
+      assert.match(prompt, /background subagent/)
+      assert.match(prompt, /Your final message is your report/)
+      assert.match(prompt, /cannot ask the user questions/)
+      assert.match(prompt, /builtin grep\/glob tools/)
+      assert.match(prompt, /builtin shell/)
+      assert.match(prompt, /shell's background parameter/)
+      assert.match(prompt, /host wakes you when the command exits/)
+      assert.match(prompt, /Never poll or sleep/)
+      assert.match(prompt, /-m \/ --no-edit when committing/)
+      assert.doesNotMatch(`${description}\n${prompt}`, /\btask\b|subagent_type|run_in_background|forge_shell|forge_jobs|forge_grep|forge_glob|completion wakes?|report[- ]files?|reports\//i)
+    }
   }
-})
-
-test("withReportDelivery: appends the contract naming the concrete agreed path", () => {
-  const out = withReportDelivery("Do the thing.", "job-123")
-  assert.ok(out.startsWith("Do the thing."), "the original prompt is preserved verbatim as the prefix")
-  assert.match(out, /Report delivery contract \(reliability\):[^\n]*reports\/job-123-report\.md/, "the contract names the concrete caller-provided path")
-  assert.match(out, /workspace-relative/, "the path is workspace-relative by contract")
-  assert.match(out, /result stream is lost/, "the line states the recovery rationale")
-  assert.match(out, /no file write access, skip this/, "readonly workers skip honestly")
-})
-
-test("withReportDelivery: idempotent — re-wrapping strips the old line and keeps exactly one contract", () => {
-  const once = withReportDelivery("Do the thing.", "job-a")
-  const twice = withReportDelivery(once, "job-b")
-  assert.equal((twice.match(/Report delivery contract \(reliability\):/g) ?? []).length, 1, "exactly one contract line after re-wrap")
-  assert.match(twice, /reports\/job-b-report\.md/, "the CURRENT task id wins")
-  assert.ok(!twice.includes("job-a"), "the stale path is stripped, not duplicated")
-  assert.ok(twice.startsWith("Do the thing."), "the original prompt survives both wraps")
 })

@@ -7,10 +7,8 @@
 //
 // Output contract per entry (probe evidence:
 // reports/probe-native-agent-surface.md, host 2.3.2, 2026-11-21):
-//   - frontmatter carries ONLY probe-proven keys: description, mode,
-//     model, tools. Unknown keys are dropped by the host once
-//     `permissions` is present (probe §3) — and `permissions` itself is
-//     deliberately NOT emitted (the tools face expresses the seals).
+//   - frontmatter uses probe-confirmed description, mode, model and either
+//     native permissions (workers) or the legacy tools map (builtin overrides).
 //   - `mode: subagent` is ALWAYS stamped: the default is primary, and a
 //     primary worker makes task dispatch silently fall back to general
 //     (probe §6 — the single nastiest hand-writer trap).
@@ -20,12 +18,9 @@
 //     per-spawn chat.params injection (design D3) and emit nothing here.
 //     Auto workers (no model) emit no model key — the host inherits the
 //     parent session's model.
-//   - tools face per shape in the CURRENT host vocabulary (probe §5):
-//     readonly seals the mutating family + the `execute` Code-Mode shell
-//     channel + `task` (which the host maps to its real dispatch tool
-//     `subagent`); write workers seal `task` and the legacy shell keys —
-//     execution belongs to the forge_shell partition, which stays
-//     name-keyed on the `forge-` prefix.
+//   - namespaced worker permissions deny recursive dispatch and primary-only
+//     harness actions; readonly adds write-family and execute denies. Shell
+//     policy remains host-owned unless a recipe states an explicit effect.
 //   - prompt body: the dispatch mandates + shape frame + role prompt are
 //     BAKED at compile time (native workers have no runtime injection).
 //   - a GENERATED header directs edits to the recipe, never the file.
@@ -33,39 +28,44 @@
 // Sync semantics (design D4): atomic writes (temp+rename), garbage
 // collection of orphaned forge-* files for entries that left the recipe
 // (only OUR generated files — hand-written files are never touched), and
-// a staleness predicate (recipe mtime vs newest matching artifact mtime,
-// or artifacts missing while the recipe is non-empty).
+// a staleness predicate (expected compiled content, or recipe mtime vs
+// newest matching artifact mtime without a content oracle; missing artifacts
+// while the recipe is non-empty are always stale).
 
 import type { ForgeAgentDef, PoolFamilyOrigin, PoolResolution } from "./forge-config.ts"
 import { BUILTIN_OVERRIDE_IDS } from "./forge-config.ts"
-import { MUTATING_TOOLS, agentDescriptionFor, rolePromptFor, type PoolProvenance } from "./dispatch-tiers.ts"
+import { MUTATING_TOOLS, PRIMARY_ONLY_WORKER_TOOLS, workerPermissionFor, agentDescriptionFor, rolePromptFor, type PoolProvenance } from "./dispatch-tiers.ts"
 import { materializeAgentPrompt } from "./dispatch-prompt.ts"
 
 // ---------------------------------------------------------------------------
 // NATIVE_TOOL_VOCAB (design D6): the SINGLE constant collecting every host
 // tool name the compiler may emit. Vocabulary drift is a first-class risk —
-// the host renamed bash→execute and task→subagent within one minor era —
-// so a drift-mirror test (tests/roster-compile.test.mjs) locks this
-// constant to the probe evidence verbatim. forge_sync re-emits from here
+// native dispatch is `subagent`, shell is `shell`, and Code Mode is a
+// separate `execute` entry (retire-plugin-runtime design, v2.4.0 source).
+// The drift-mirror tests lock these recorded spellings; a live registry
+// check is separate. forge_sync re-emits from here
 // after a host rename; the README documents the current names.
 // ---------------------------------------------------------------------------
 export const NATIVE_TOOL_VOCAB = {
   // Probe §1/§5: the host's dispatch tool is named `subagent` (the
   // frontmatter key `task:false` is MAPPED to it by the host).
   dispatchTool: "subagent",
+  shell: "shell",
+  question: "question",
+  grep: "grep",
+  glob: "glob",
   // Probe §5: `tools.task:false` maps to the dispatch-tool deny action.
   taskKey: "task",
-  // Probe §5: the host's current shell channel is the Code Mode runtime
-  // `execute`; the legacy `bash:false → shell deny` mapping does NOT
-  // cover it, so readonly workers must deny `execute` explicitly.
+  // Probe §5: the Code Mode runtime `execute` is separate from native
+  // `shell`; legacy `bash:false → shell deny` does NOT cover it.
+  // The v2.4.0 source records shell access through full Code Mode.
   shellChannel: "execute",
-  // Legacy shell keys hidden on EVERY worker (execution belongs to the
-  // forge_shell partition; the `forge-` id prefix still triggers the
-  // plugin's tool-partition injections on v1 hosts).
+  // Recipe shell aliases; the independent legacy override still emits both.
   legacyShellKeys: ["shell", "bash"],
   // The full mutating family (postrelease-hardening D3 — mirrors
   // dispatch-tiers MUTATING_TOOLS; the drift test locks the equality).
   mutatingFamily: [...MUTATING_TOOLS],
+  primaryOnly: [...PRIMARY_ONLY_WORKER_TOOLS],
 } as const
 
 // Design D3: recipe depth words that map to model VARIANT values compile
@@ -94,6 +94,12 @@ export function generatedHeader(recipeFile: string): string {
   return `${GENERATED_MARKER} — edit the recipe (${recipeFile}), not this file. -->`
 }
 
+// Git checkout line endings do not change the Markdown projection. Do not
+// normalize other content (including the provenance of a moved checkout).
+function sameProjection(existing: string, expected: string): boolean {
+  return existing.replace(/\r\n/g, "\n") === expected.replace(/\r\n/g, "\n")
+}
+
 // Model string for one definition: `provider/model[#variant]` for pinned
 // workers whose depth word maps to a variant; plain `provider/model` for
 // pinned workers on non-variant words; undefined for Auto workers (no
@@ -106,13 +112,8 @@ export function modelStringFor(def: ForgeAgentDef): string | undefined {
   return def.model
 }
 
-// Tools face per shape, in NATIVE_TOOL_VOCAB spellings:
-//   readonly — mutating family + `execute` + `task` all false (a readonly
-//     child then genuinely has no write tool at all — probe §5);
-//   write (the default — shape-default-open) — `task` false (recursion
-//     ban) + the legacy shell keys false (forge_shell owns execution;
-//     the `forge-` prefix still keys the plugin-side tool partition).
-export function toolsFaceFor(shape: AgentShapeOrWrite): Record<string, boolean> {
+// Independent legacy builtin override face: preserve its bytes and ordering.
+function overrideToolsFaceFor(shape: AgentShapeOrWrite): Record<string, boolean> {
   const face: Record<string, boolean> = {}
   face[NATIVE_TOOL_VOCAB.taskKey] = false
   for (const k of NATIVE_TOOL_VOCAB.legacyShellKeys) face[k] = false
@@ -124,13 +125,28 @@ export function toolsFaceFor(shape: AgentShapeOrWrite): Record<string, boolean> 
 }
 type AgentShapeOrWrite = "readonly" | "write"
 
+// Namespaced workers use the probe-confirmed native permissions array so
+// explicit ask rules survive compilation; overrides retain their old tools map.
+export function toolsFaceFor(shape: AgentShapeOrWrite, permission?: ForgeAgentDef["permission"]): Record<string, string> {
+  const { task: _legacy, ...native } = workerPermissionFor({ shape, permission })
+  return native
+}
+
 // Frontmatter block (probe-proven keys ONLY — description, mode, model,
-// tools; YAML double-quoted strings via JSON.stringify, nested tools map).
-function frontmatterFor(input: { description: string; model?: string; tools: Record<string, boolean> }): string {
+// tools or permissions; YAML double-quoted strings via JSON.stringify).
+function frontmatterFor(input: { description: string; model?: string; tools?: Record<string, boolean>; permissions?: Record<string, string> }): string {
   const lines = ["---", `description: ${JSON.stringify(input.description)}`, "mode: subagent"]
   if (input.model !== undefined) lines.push(`model: ${JSON.stringify(input.model)}`)
-  lines.push("tools:")
-  for (const [k, v] of Object.entries(input.tools)) lines.push(`  ${k}: ${v}`)
+  if (input.tools) {
+    lines.push("tools:")
+    for (const [k, v] of Object.entries(input.tools)) lines.push(`  ${k}: ${v}`)
+  }
+  if (input.permissions) {
+    lines.push("permissions:")
+    for (const [action, effect] of Object.entries(input.permissions)) {
+      lines.push(`  - action: ${JSON.stringify(action)}`, '    resource: "*"', `    effect: ${JSON.stringify(effect)}`)
+    }
+  }
   lines.push("---")
   return lines.join("\n")
 }
@@ -145,7 +161,7 @@ export function compileRosterEntry(input: {
   const shape: AgentShapeOrWrite = input.def.shape === "readonly" ? "readonly" : "write"
   const description = agentDescriptionFor(input.matId, input.def, input.provenance)
   const model = modelStringFor(input.def)
-  const tools = toolsFaceFor(shape)
+  const permissions = toolsFaceFor(shape, input.def.permission)
   const recipeFile = "global" in input.provenance ? "the global fallback layer" : input.provenance.file
   const body = materializeAgentPrompt({
     agent: input.matId,
@@ -154,7 +170,7 @@ export function compileRosterEntry(input: {
   })
   return {
     fileName: `forge-${input.matId}.md`,
-    content: `${frontmatterFor({ description, model, tools })}\n\n${generatedHeader(recipeFile)}\n\n${body}\n`,
+    content: `${frontmatterFor({ description, model, permissions })}\n\n${generatedHeader(recipeFile)}\n\n${body}\n`,
   }
 }
 
@@ -167,7 +183,7 @@ export function compileRosterEntry(input: {
 // truly override the built-ins; a capitalized variant creates an ambiguous
 // duplicate entry (the negative form) and is NEVER emitted (compileOverride
 // returns null for any id outside BUILTIN_OVERRIDE_IDS). model+variant and
-// the tools face follow the SAME rules as workers; the GC predicate for
+// the legacy tools face remain independent of workers; the GC predicate for
 // override files keys on the in-content GENERATED marker (they carry no
 // `forge-` prefix).
 // ---------------------------------------------------------------------------
@@ -188,7 +204,7 @@ export function compileOverrideEntry(input: { id: string; def: ForgeAgentDef; re
   const shape: AgentShapeOrWrite = input.def.shape === "readonly" ? "readonly" : "write"
   const description = `Built-in ${input.id} override — pinned by the global forge.json "override" node (${input.def.model !== undefined ? "pinned model" : "Auto worker"}).`
   const model = modelStringFor(input.def)
-  const tools = toolsFaceFor(shape)
+  const tools = overrideToolsFaceFor(shape)
   const body = input.def.prompt !== undefined && input.def.prompt.trim().length > 0 ? input.def.prompt : OVERRIDE_DEFAULT_PROMPTS[input.id]
   return {
     fileName: `${input.id}.md`,
@@ -199,9 +215,8 @@ export function compileOverrideEntry(input: { id: string; def: ForgeAgentDef; re
 // The agent directory holding a pool file's compiled artifacts: the
 // sibling `agent` directory of the `.opencode` (or config) directory the
 // recipe lives in — workspace pools compile into
-// `<ws>/.opencode/agent/`, the global fallback layer into
-// `<home>/.config/opencode/agent/` (the host's global agent layer,
-// probe §7).
+// `<ws>/.opencode/agent/`. The global recipe sibling is only the default
+// global agent directory; use the host-resolved directory for global workers.
 export function agentDirFor(poolFile: string): string {
   const sep = poolFile.includes("\\") && !poolFile.includes("/") ? "\\" : "/"
   const parts = poolFile.split(/[\\/]/)
@@ -215,8 +230,8 @@ export function agentDirFor(poolFile: string): string {
 // §修正1): the host's GLOBAL agent dir mirrors the host's own resolution —
 // `OPENCODE_CONFIG_DIR` set → `$CONFIG_DIR/agent` (the fake home's
 // `.config` path is NOT read in that mode); unset →
-// `<home>/.config/opencode/agent`. Override artifacts (general.md /
-// explore.md) land HERE, which may differ from agentDirFor(globalPoolFile)
+// `<home>/.config/opencode/agent`. Global workers and override artifacts
+// (general.md / explore.md) land HERE, which may differ from agentDirFor(globalPoolFile)
 // on hosts that point OPENCODE_CONFIG_DIR elsewhere.
 export function globalAgentDirFor(opts: { homeDir: string; configDir?: string | null }): string {
   const cfg = (opts.configDir ?? "").trim()
@@ -267,25 +282,60 @@ export function planOverrideSync(overrides: Record<string, ForgeAgentDef>, opts:
   return files.length > 0 ? { kind: "override", dir: opts.dir, files } : null
 }
 
+// Inspect only the two independently owned builtin destinations. No writes.
+export function overrideSyncFindings(plan: OverrideSyncPlan, deps: RosterFsDeps): string[] {
+  const findings: string[] = []
+  for (const id of BUILTIN_OVERRIDE_IDS) {
+    const name = `${id}.md`
+    const dest = joinPath(plan.dir, name)
+    const expected = plan.files.find((file) => file.fileName === name)
+    try {
+      if (deps.stat?.(dest) == null) {
+        if (expected) findings.push(`missing override artifact: ${dest}`)
+        continue
+      }
+      const existing = deps.readFile!(dest)
+      if (!existing.includes(GENERATED_MARKER)) {
+        if (expected) findings.push(`override collision: hand-written file ${dest}`)
+      } else if (!expected || existing !== expected.content) {
+        findings.push(`stale generated override: ${dest}`)
+      }
+    } catch {
+      findings.push(`unreadable override artifact: ${dest}`)
+    }
+  }
+  return findings
+}
+
 // Provenance for one family (same rule as the v1 config hook: the global
 // fallback file's ns is FIXED to "global" and its provenance names the
 // global layer, not a file).
-function provenanceFor(family: PoolFamilyOrigin, globalPoolFile: string): PoolProvenance {
-  return family.file === globalPoolFile ? { global: true } : { ns: family.ns, file: family.file }
+function provenanceFor(origin: { file: string; ns: string }, globalPoolFile: string, platform: string): PoolProvenance {
+  const fold = (p: string) => platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p
+  return fold(origin.file) === fold(globalPoolFile) ? { global: true } : { ns: origin.ns, file: origin.file }
+}
+
+// Resolve the same family directory for materialization and freshness/GC.
+export function rosterAgentDirFor(poolFile: string, opts: { globalPoolFile: string; globalAgentDir?: string; platform?: string }): string {
+  return "global" in provenanceFor({ file: poolFile, ns: "" }, opts.globalPoolFile, opts.platform ?? process.platform)
+    ? opts.globalAgentDir ?? agentDirFor(poolFile)
+    : agentDirFor(poolFile)
+}
+
+// Share the exact compiler input between sync and the staleness oracle.
+export function compileResolvedRosterEntry(resolution: PoolResolution, matId: string, opts: { globalPoolFile: string; platform?: string }) {
+  const agent = resolution.agents[matId]
+  const provenance = provenanceFor(agent, opts.globalPoolFile, opts.platform ?? process.platform)
+  return compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined })
 }
 
 // Plan the WHOLE sync (all families of a resolution). Pure: no fs. The
 // executor (below) writes the plan.
-export function planRosterSync(resolution: PoolResolution, opts: { globalPoolFile: string }): FamilySyncPlan[] {
+export function planRosterSync(resolution: PoolResolution, opts: { globalPoolFile: string; globalAgentDir?: string; platform?: string }): FamilySyncPlan[] {
   const plans: FamilySyncPlan[] = []
   for (const family of resolution.families) {
-    const provenance = provenanceFor(family, opts.globalPoolFile)
-    const files = family.materializedIds.map((matId) => {
-      const agent = resolution.agents[matId]
-      const compiled = compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined })
-      return { matId, ...compiled }
-    })
-    plans.push({ kind: "family", family, dir: agentDirFor(family.file), files })
+    const files = family.materializedIds.map((matId) => ({ matId, ...compileResolvedRosterEntry(resolution, matId, opts) }))
+    plans.push({ kind: "family", family, dir: rosterAgentDirFor(family.file, opts), files })
   }
   return plans
 }
@@ -303,10 +353,9 @@ function joinPath(dir: string, name: string): string {
   return dir.endsWith(sep) ? `${dir}${name}` : `${dir}${sep}${name}`
 }
 
-// Execute a sync plan: atomic writes (temp + rename; the rename falls
-// back to unlink+rename on platforms where rename refuses an existing
-// destination — the temp file means a FAILED write never leaves a
-// half-written artifact), plus GC of orphaned generated forge-*.md files.
+// Execute a sync plan: atomic writes (temp + rename; a failed rename
+// never triggers deletion of the existing destination), plus GC of
+// orphaned generated forge-*.md files.
 // Fail-soft per file: one bad file records an error, its siblings still
 // apply. Override plans (kind:"override") add the collision redline (a
 // hand-written same-name file is refused + disclosed, never overwritten)
@@ -343,26 +392,22 @@ export function executeRosterSync(plans: SyncPlan[], deps: RosterFsDeps = {}): S
         // Collision redline (builtin-override D4): an existing destination
         // WITHOUT the GENERATED marker is hand-written — refuse + disclose,
         // never overwrite (byte-identical preserved), siblings still apply.
-        if (plan.kind === "override" && existing !== null && !existing.includes(GENERATED_MARKER)) {
-          out.errors.push(`${dest}: collision refused — a hand-written file of this exact name already exists; sync never overwrites it. Fold your changes into the global recipe's "override" entry, or rename/remove the hand-written file.`)
+        if (existing !== null && !existing.includes(GENERATED_MARKER)) {
+          out.errors.push(`${dest}: collision refused — a hand-written file of this exact name already exists; sync never overwrites it. Fold your changes into the recipe, or rename/remove the hand-written file.`)
           continue
         }
-        if (existing === file.content) {
+        if (existing !== null && (plan.kind === "family" ? sameProjection(existing, file.content) : existing === file.content)) {
           out.unchanged.push(dest)
           continue
         }
-        tmp = `${dest}.new`
-        writeFile(tmp, file.content)
-        try {
-          rename(tmp, dest)
-        } catch {
-          // Destination exists and the platform refuses the overwrite
-          // (win32 EEXIST/EPERM): clear it, then land the temp file.
-          try {
-            unlink(dest)
-          } catch {}
-          rename(tmp, dest)
+        const tempPath = `${dest}.new`
+        if (stat(tempPath) !== null) {
+          out.errors.push(`${tempPath}: temporary file already exists; sync leaves it untouched`)
+          continue
         }
+        tmp = tempPath
+        writeFile(tmp, file.content)
+        rename(tmp, dest)
         tmp = null // landed — nothing to clean up
         if (existing === null) out.created.push(dest)
         else out.updated.push(dest)
@@ -418,20 +463,19 @@ export type StaleVerdict = {
   reason: string
 }
 
-// Staleness for ONE pool (design D4): stale iff artifacts are missing
-// while the recipe contributes agents, or the recipe is newer than the
-// newest artifact AND the compiled content actually differs (mtime is the
-// cheap trigger; when `expectedContentOf` is supplied the final verdict
-// is CONTENT-based — an mtime-newer recipe whose compiled output is
-// byte-identical, e.g. a touched file or a checkout with skewed mtimes,
-// is NOT stale, so a sync round-trip can always clear the gate). A pool
-// with no agents is never stale (nothing to compile). A missing/unstatable
-// recipe file is never stale (the resolver owns that failure mode).
+// Staleness for ONE pool: stale if artifacts are missing while the recipe
+// contributes agents. When `expectedContentOf` is supplied, compare content
+// regardless of mtime (an old projection can have the same timestamp and
+// byte-identical output is current even after a touch or checkout skew).
+// With the content oracle, orphaned generated files also count as stale,
+// including when the recipe disappears. Without the oracle retain the
+// legacy recipe-vs-newest-artifact mtime check and empty-pool exemption.
 export function staleCheckForPool(
   poolFile: string | null,
   expectedMatIds: string[],
   deps: RosterFsDeps = {},
   expectedContentOf?: (matId: string) => string,
+  artifactDir?: string,
 ): StaleVerdict {
   if (poolFile === null) return { stale: false, reason: "no workspace pool — global-fallback roster, no per-workspace artifacts gate" }
   const stat = deps.stat ?? (() => null)
@@ -439,9 +483,23 @@ export function staleCheckForPool(
     throw new Error("readFile unavailable")
   })
   const recipe = stat(poolFile)
+  const dir = artifactDir ?? agentDirFor(poolFile)
+  if (expectedContentOf) {
+    const wanted = new Set(expectedMatIds.map((id) => `forge-${id}.md`))
+    for (const name of deps.readdir?.(dir) ?? []) {
+      if (!name.startsWith("forge-") || !name.endsWith(".md") || wanted.has(name)) continue
+      try {
+        if (readFile(joinPath(dir, name)).includes(GENERATED_MARKER)) {
+          return { stale: true, reason: `orphaned generated artifact: ${joinPath(dir, name)} — ${recipe === null ? "recipe missing" : "entry removed from recipe"}` }
+        }
+      } catch {
+        return { stale: true, reason: `artifact ${joinPath(dir, name)} unreadable` }
+      }
+    }
+    if (recipe === null && expectedMatIds.length > 0) return { stale: true, reason: `recipe missing: ${poolFile}` }
+  }
   if (recipe === null) return { stale: false, reason: "recipe file not statable" }
   if (expectedMatIds.length === 0) return { stale: false, reason: "recipe contributes no agents" }
-  const dir = agentDirFor(poolFile)
   let newest = -Infinity
   let missing: string[] = []
   for (const matId of expectedMatIds) {
@@ -452,19 +510,23 @@ export function staleCheckForPool(
   if (missing.length > 0) {
     return { stale: true, reason: `missing artifact(s): ${missing.join(", ")} — the recipe has agents but no compiled file for them` }
   }
-  if (recipe.mtimeMs > newest) {
-    if (expectedContentOf) {
-      for (const matId of expectedMatIds) {
-        try {
-          if (readFile(joinPath(dir, `forge-${matId}.md`)) !== expectedContentOf(matId)) {
-            return { stale: true, reason: `recipe ${poolFile} changed — the compiled forge-${matId}.md differs from what it compiles to` }
-          }
-        } catch {
-          return { stale: true, reason: `artifact for forge-${matId} unreadable` }
+  if (expectedContentOf) {
+    for (const matId of expectedMatIds) {
+      try {
+        const existing = readFile(joinPath(dir, `forge-${matId}.md`))
+        if (!existing.includes(GENERATED_MARKER)) {
+          return { stale: true, reason: `hand-written collision: ${joinPath(dir, `forge-${matId}.md`)} differs from what it compiles to` }
         }
+        if (!sameProjection(existing, expectedContentOf(matId))) {
+          return { stale: true, reason: `recipe ${poolFile} — the compiled forge-${matId}.md differs from what it compiles to` }
+        }
+      } catch {
+        return { stale: true, reason: `artifact for forge-${matId} unreadable` }
       }
-      return { stale: false, reason: "recipe mtime is newer but the compiled content is current (touch/skew, not a change)" }
     }
+    return { stale: false, reason: "compiled content is current" }
+  }
+  if (recipe.mtimeMs > newest) {
     return { stale: true, reason: `recipe ${poolFile} is newer (mtime ${recipe.mtimeMs}) than the newest compiled artifact (mtime ${newest})` }
   }
   return { stale: false, reason: "artifacts are at least as new as the recipe" }

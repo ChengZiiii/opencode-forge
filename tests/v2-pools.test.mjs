@@ -38,7 +38,7 @@ function fakeFs(initialFiles = {}) {
 }
 
 const json = (o) => JSON.stringify(o)
-const MUTATING = ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"]
+const MUTATING = ["write", "edit", "patch", "applypatch", "apply", "multiedit", "execute"]
 
 // One host init: fresh mock ctx (fresh agent draft = a new host, mirroring
 // the v1 wiring tests' startServer registry reset) resolving over the given
@@ -80,7 +80,7 @@ test("v2 pools: workspace pool materializes NAMESPACED with provenance, task den
   // ride the array now.
   assert.ok(Array.isArray(r.permissions), "worker permissions are the v2 array form")
   assert.ok(r.permissions.some((p) => p.action === "task" && p.resource === "*" && p.effect === "deny"), "recursion ban always forced")
-  assert.ok(r.permissions.some((p) => p.action === "shell" && p.resource === "*" && p.effect === "deny"), "shell-deny front door rides the array")
+  assert.ok(!r.permissions.some((p) => p.action === "shell" && p.resource === "*" && p.effect === "deny"), "no blanket shell deny")
   assert.equal("permission" in r, false, "the singular permission key is gone")
   assert.match(r.description, /Pool 'alpha' — origin/)
   assert.ok(r.description.includes("C:/WsA/.opencode/forge.json"), "origin path rides the description")
@@ -103,8 +103,9 @@ test("v2 pools: readonly shape denies the mutating family; absent shape defaults
   const wr = state.agents.get("forge-beta-coder").permissions
   for (const t of MUTATING) assert.ok(ro.some((p) => p.action === t && p.effect === "deny"), `readonly denies ${t}`)
   for (const t of MUTATING) assert.equal(wr.some((p) => p.action === t), false, `write default leaves ${t} alone`)
+  assert.ok(!ro.some((p) => p.action === "shell" && p.effect === "deny"), "readonly has no blanket shell deny")
   assert.ok(wr.some((p) => p.action === "task" && p.effect === "deny"), "task deny is forced on every shape")
-  assert.ok(wr.some((p) => p.action === "shell" && p.effect === "deny"), "every worker carries the shell-deny front door")
+  assert.ok(!wr.some((p) => p.action === "shell" && p.effect === "deny"), "no blanket shell deny")
 })
 
 // 3. Global fallback when the workspace has no pool
@@ -268,4 +269,35 @@ test("v2 pools: drifted agent domain degrades to no-op, never throws", async () 
     await assert.doesNotReject(v2Setup(ctx, { anchors: ["C:/WsG"], homeDir: "C:/v2home-none", stat: fs.stat, readFile: fs.readFile }))
     assert.equal(state.agents.size, 0, `${mode}: nothing registered`)
   }
+})
+
+
+test("v2 pools: malformed agent is skipped without suppressing its valid sibling", async () => {
+  const fs = fakeFs()
+  fs.writeFile("C:/Wire/.opencode/forge.json", json({ pool: "wire", agents: { good: { model: "p/good", thoughtLevel: "low" }, bad: { thoughtLevel: "low" } } }))
+  const state = await hostInit(fs, ["C:/Wire"], "C:/v2home-none")
+  assert.ok(state.agents.has("forge-wire-good"))
+  assert.equal(state.agents.has("forge-wire-bad"), false)
+})
+
+test("v2 pools: prefixed ids self-heal without doubling", async () => {
+  const fs = fakeFs()
+  fs.writeFile("C:/Wire/.opencode/forge.json", json({ pool: "wire", agents: { "forge-coder": { model: "zai/glm", thoughtLevel: "low" } } }))
+  const state = await hostInit(fs, ["C:/Wire"], "C:/v2home-none")
+  assert.ok(state.agents.has("forge-wire-coder"))
+  assert.equal(state.agents.has("forge-wire-forge-coder"), false)
+})
+
+test("v2 pools: shared role text materializes before the intact mandates", async () => {
+  const fs = fakeFs()
+  const shared = "Project X conventions: use bun; cite file:line evidence."
+  fs.writeFile("C:/Wire/.opencode/forge.json", json({ pool: "wp", shared, agents: { auditor: { model: "x/y", thoughtLevel: "low", prompt: "Audit licenses." } } }))
+  const state = await hostInit(fs, ["C:/Wire"], "C:/v2home-none")
+  const entry = state.agents.get("forge-wp-auditor")
+  assert.ok(entry)
+  assert.ok(entry.system.includes(`${shared}
+
+Audit licenses.`))
+  assert.ok(entry.system.indexOf(shared) < entry.system.indexOf("Mandates"))
+  assert.match(entry.system, /workspace-relative paths ONLY/)
 })

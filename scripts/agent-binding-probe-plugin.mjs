@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): companion to historical binding probe; not current native dispatch acceptance.
 // dispatch-v2-hostsignals task 1.1 probe plugin: create child sessions with
 // `agent` / `model` keys on the v2 promise-layer session domain and read the
 // records back. Runs as a COMMAND (invoked via HTTP) — doing session.create

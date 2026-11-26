@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): historical goal driver; retained assertions require review against the current goal contract.
 // Deterministic live-loop E2E driver (run against `opencode serve`).
 //
 // Sequencing (avoids the title-generation idle racing the bootstrap reply):

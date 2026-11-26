@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): historical pool driver; not current acceptance; obsolete config handling must not be run.
 // Sandbox E2E — hierarchical-pool-materialization (task 4.2).
 // Drives a REAL opencode host (serve) on a multi-pool workspace with the
 // plugin installed from the packed tarball into an ISOLATED config dir

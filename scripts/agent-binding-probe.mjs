@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): old plugin-owned dispatch binding probe; not current native dispatch acceptance.
 // dispatch-v2-hostsignals task 1.1 probe: do `agent` / `model` keys on the
 // v2 promise-layer session.create LAND, what does the record read back, and
 // does a bogus agent get refused?

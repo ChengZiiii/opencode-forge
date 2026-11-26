@@ -34,7 +34,7 @@
 // State machine: queued -> active (arm/promote gate); active <-> paused;
 // active -> completed (completion gate); queued/active/paused -> abandoned.
 
-import { renameSync, writeFileSync } from "node:fs"
+import { renameSync, unlinkSync, writeFileSync } from "node:fs"
 
 export class GoalError extends Error {
   constructor(message: string) {
@@ -83,6 +83,7 @@ export type GoalDoc = {
   turnsUsed: number
   maxMinutes: number
   stopReason?: StopReason
+  blocker?: string
   goal: string
   criteria: string[]
   checks: CheckItem[]
@@ -189,8 +190,15 @@ export function goalFileName(date: string, slug: string, existingNames: string[]
 // tools + the continuation engine) never share a tmp file.
 export function atomicWrite(file: string, text: string): void {
   const tmp = `${file}.${process.pid}-${Math.random().toString(36).slice(2, 6)}.tmp`
-  writeFileSync(tmp, text)
-  renameSync(tmp, file)
+  writeFileSync(tmp, text, { flag: "wx" })
+  try {
+    renameSync(tmp, file)
+  } catch (err) {
+    // Only remove our successfully written temp, never the target. Cleanup
+    // itself may fail; keep the original rename error for the caller.
+    try { unlinkSync(tmp) } catch { /* best effort */ }
+    throw err
+  }
 }
 
 export function validateGoalInput(input: Partial<GoalInput>): string[] {
@@ -243,6 +251,7 @@ function frontmatterBlock(meta: {
   maxMinutes: number
   armedAt?: string
   stopReason?: StopReason
+  blocker?: string
 }): string {
   const lines = [
     "---",
@@ -255,6 +264,7 @@ function frontmatterBlock(meta: {
   if (meta.session) lines.push(`session: ${meta.session}`)
   lines.push(`max_turns: ${meta.maxTurns}`, `turns_used: ${meta.turnsUsed}`, `max_minutes: ${meta.maxMinutes}`)
   if (meta.status === "paused" && meta.stopReason) lines.push(`stop_reason: ${meta.stopReason}`)
+  if (meta.status === "paused" && meta.blocker) lines.push(`blocker: ${JSON.stringify(meta.blocker)}`)
   lines.push("---", "")
   return lines.join("\n")
 }
@@ -270,6 +280,7 @@ export function renderGoal(
     turnsUsed?: number
     armedAt?: string
     stopReason?: StopReason
+    blocker?: string
   },
 ): string {
   const missing = validateGoalInput(input)
@@ -289,7 +300,7 @@ export function renderGoal(
       turnsUsed: meta.turnsUsed ?? 0,
       maxMinutes: input.maxMinutes ?? DEFAULT_MAX_MINUTES,
       ...(meta.armedAt ? { armedAt: meta.armedAt } : {}),
-      ...(meta.status === "paused" && meta.stopReason ? { stopReason: meta.stopReason } : {}),
+      ...(meta.status === "paused" && meta.stopReason ? { stopReason: meta.stopReason, blocker: meta.blocker } : {}),
     }),
     "## Goal",
     "",
@@ -323,7 +334,7 @@ export function renderGoal(
   return parts.join("\n")
 }
 
-function parseFrontmatter(text: string): { fm: Record<string, string>; body: string } {
+function parseFrontmatter(text: string): { fm: Record<string, string>; header: string; body: string } {
   const m = text.match(/^---\r?\n([\s\S]*?)\r?\n---\r?\n?/)
   if (!m) throw new GoalError("goal file is missing frontmatter")
   const fm: Record<string, string> = {}
@@ -331,7 +342,7 @@ function parseFrontmatter(text: string): { fm: Record<string, string>; body: str
     const kv = line.match(/^([A-Za-z_][\w-]*):\s*(.*)$/)
     if (kv) fm[kv[1]] = kv[2].trim()
   }
-  return { fm, body: text.slice(m[0].length) }
+  return { fm, header: m[0], body: text.slice(m[0].length) }
 }
 
 function matchSectionHeader(line: string): string | null {
@@ -422,6 +433,10 @@ export function parseGoal(text: string): GoalDoc {
     const n = Number(v)
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt
   }
+  let blocker: string | undefined
+  if (status === "paused" && fm.blocker) {
+    try { const value: unknown = JSON.parse(fm.blocker); if (typeof value === "string") blocker = value } catch {}
+  }
   return {
     status,
     created: fm.created ?? "",
@@ -433,6 +448,7 @@ export function parseGoal(text: string): GoalDoc {
     turnsUsed: num(fm.turns_used, 0),
     maxMinutes: Math.max(1, num(fm.max_minutes, DEFAULT_MAX_MINUTES)),
     ...(status === "paused" && fm.stop_reason ? { stopReason: fm.stop_reason as StopReason } : {}),
+    ...(blocker !== undefined ? { blocker } : {}),
     goal: (sections.get("Goal") ?? "").split(/\r?\n/)[0]?.trim() ?? "",
     criteria,
     checks,
@@ -454,10 +470,17 @@ export function parseGoalLoose(text: string): GoalDoc | null {
   }
 }
 
+// Use the same header boundary as the parser; body prose may contain field names.
 function setFm(text: string, key: string, value: string): string {
-  const re = new RegExp(`^${key}:.*$`, "m")
-  if (re.test(text)) return text.replace(re, `${key}: ${value}`)
-  return text.replace(/^---\r?\n/, `---\n${key}: ${value}\n`)
+  const { header, body } = parseFrontmatter(text)
+  const re = new RegExp(`^${key}:[^\\r\\n]*`, "m")
+  if (re.test(header)) return header.replace(re, () => `${key}: ${value}`) + body
+  return header.replace(/^---(\r?\n)/, (_, eol) => `---${eol}${key}: ${value}${eol}`) + body
+}
+
+function deleteFm(text: string, key: string): string {
+  const { header, body } = parseFrontmatter(text)
+  return header.replace(new RegExp(`^${key}:[^\\r\\n]*\\r?\\n`, "gm"), "") + body
 }
 
 function setUpdated(text: string, now: string): string {
@@ -470,7 +493,7 @@ export function transitionGoal(
   text: string,
   to: GoalStatus,
   now: string,
-  opts: { session?: string; stopReason?: StopReason } = {},
+  opts: { session?: string; stopReason?: StopReason; blocker?: string } = {},
 ): string {
   const { fm } = parseFrontmatter(text)
   const from = (fm.status ?? "queued") as GoalStatus
@@ -480,10 +503,11 @@ export function transitionGoal(
       `Illegal goal status transition: ${from} -> ${to} (legal paths: queued -> active; active <-> paused; active -> completed; queued/active/paused -> abandoned)`,
     )
   }
-  let next = text.replace(/^status:.*$/m, `status: ${to}`)
+  let next = setFm(text, "status", to)
   if (to === "paused") {
     if (!opts.stopReason) throw new GoalError("Pausing requires a stop reason (user/blocker/no-progress/budget-turns/budget-time/draft-conflict/transport-failures)")
     next = setFm(next, "stop_reason", opts.stopReason)
+    if (opts.blocker) next = setFm(next, "blocker", JSON.stringify(opts.blocker))
   }
   if (to === "active") {
     if (!opts.session) throw new GoalError("Arming/resuming requires the owning session id")
@@ -493,7 +517,8 @@ export function transitionGoal(
     // passes an ask gate, so a user re-arming a budget-time goal is
     // explicitly granting a fresh window.
     next = setFm(next, "armed_at", now)
-    next = next.replace(/^stop_reason:.*$\r?\n?/m, "")
+    next = deleteFm(next, "blocker")
+    next = deleteFm(next, "stop_reason")
   }
   return setUpdated(next, now)
 }

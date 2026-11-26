@@ -13,6 +13,1054 @@ var __export = (target, all) => {
     });
 };
 
+// src/stop-scope.ts
+function selectStopScope(invokingSession, children, childEnumeration, commands, commandEnumeration) {
+  const findings = [];
+  const eligible = new Set;
+  let unknownChildren = !invokingSession || childEnumeration !== "complete";
+  let unknownCommands = commandEnumeration !== "complete";
+  if (!invokingSession)
+    findings.push("Invoking session unknown");
+  if (childEnumeration !== "complete")
+    findings.push(`Child enumeration ${childEnumeration}; remaining count unknown`);
+  if (unknownCommands)
+    findings.push(`Shell enumeration ${commandEnumeration}; remaining count unknown`);
+  for (const child of children) {
+    if (child.id === invokingSession || child.lineage === "excluded" || child.dispatch === "excluded")
+      continue;
+    if (invokingSession && child.id && child.lineage === "confirmed" && child.dispatch === "confirmed" && children.every((other) => other.id !== child.id || other.lineage === "confirmed" && other.dispatch === "confirmed")) {
+      eligible.add(child.id);
+    } else {
+      unknownChildren = true;
+      findings.push(`Child ${child.id || "(unknown ID)"}: scope not confirmed`);
+    }
+  }
+  const selected = new Map;
+  for (const command of commands) {
+    if (command.backgroundShell === "excluded" || command.ownership === "excluded")
+      continue;
+    if (command.ownership === "confirmed" && command.owner && !eligible.has(command.owner))
+      continue;
+    if (command.id && eligible.has(command.owner) && command.ownership === "confirmed" && command.backgroundShell === "confirmed" && commands.every((other) => other.id !== command.id || other.owner === command.owner && other.ownership === "confirmed" && other.backgroundShell === "confirmed")) {
+      selected.set(command.id, command.owner);
+    } else {
+      unknownCommands = true;
+      findings.push(`Command ${command.id || "(unknown ID)"}: scope not confirmed`);
+    }
+  }
+  return {
+    children: [...eligible],
+    commands: [...selected].map(([id, owner]) => ({ id, owner })),
+    unknownChildren,
+    unknownCommands: unknownCommands || unknownChildren,
+    nothingToStop: !unknownChildren && eligible.size === 0,
+    findings
+  };
+}
+
+// src/stop-native.ts
+var record = (value) => value && typeof value === "object" ? value : {};
+var unwrap = (value) => record(value).data ?? value;
+var rows = (value) => {
+  const data = unwrap(value);
+  if (!Array.isArray(data))
+    throw new Error("invalid enumeration");
+  return data;
+};
+var STOP_LIST_LIMIT = 500;
+async function stopNative(root, client) {
+  const findings = new Set;
+  const deadline = Date.now() + (client.deadlineMs ?? 8000);
+  const bounded = async (call) => {
+    const remaining = Math.min(client.timeoutMs ?? 1500, deadline - Date.now());
+    if (remaining <= 0)
+      throw new Error("deadline");
+    let timer;
+    try {
+      return await Promise.race([Promise.resolve().then(call), new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error("timeout")), remaining);
+      })]);
+    } finally {
+      if (timer !== undefined)
+        clearTimeout(timer);
+    }
+  };
+  const receipts = new Map;
+  const receipt = (id, text) => {
+    if (!receipts.has(id))
+      receipts.set(id, new Set);
+    receipts.get(id).add(text);
+  };
+  let empty = false;
+  const requestedShells = new Map;
+  const requestedInterrupts = new Set;
+  for (let round = 0;round < 3; round++) {
+    const candidates = [];
+    let enumeration = "complete";
+    const queue = [root];
+    const visited = new Set(queue);
+    const parents = new Map;
+    for (let index = 0;index < queue.length && index < STOP_LIST_LIMIT; index++) {
+      const parent = queue[index];
+      try {
+        const children = [];
+        const cursors = new Set;
+        let cursor;
+        for (;; ) {
+          try {
+            const rawChildren = await bounded(() => client.children(parent, cursor));
+            const page = rows(rawChildren);
+            const next = record(record(rawChildren).cursor).next;
+            if (typeof next === "string" && cursors.has(next)) {
+              enumeration = "truncated";
+              break;
+            }
+            children.push(...page.slice(0, STOP_LIST_LIMIT - children.length));
+            if (children.length >= STOP_LIST_LIMIT) {
+              enumeration = "truncated";
+              break;
+            }
+            if (next == null)
+              break;
+            if (typeof next !== "string" || !next || !page.length) {
+              enumeration = "truncated";
+              break;
+            }
+            cursors.add(next);
+            cursor = next;
+          } catch {
+            enumeration = "partial";
+            findings.add(`Child enumeration unavailable for ${parent}`);
+            break;
+          }
+        }
+        if (!children.length)
+          continue;
+        let proof = new Set;
+        try {
+          for (const message of rows(await bounded(() => client.context(parent)))) {
+            const m = record(message);
+            if (m.type !== "assistant" && record(m.info).role !== "assistant" && m.role !== "assistant")
+              continue;
+            const parts = m.parts ?? m.content;
+            for (const part of Array.isArray(parts) ? parts : []) {
+              const p = record(part), state = record(p.state), metadata = record(state.metadata);
+              if (p.type === "tool" && (p.name ?? p.tool) === "subagent" && state.status === "completed" && metadata.status === "running" && typeof metadata.sessionID === "string")
+                proof.add(metadata.sessionID);
+            }
+          }
+        } catch {
+          enumeration = "partial";
+          findings.add(`Dispatch evidence unavailable for ${parent}`);
+        }
+        for (const raw of children) {
+          const child = record(raw);
+          if (typeof child.id !== "string" || child.parentID !== parent || visited.has(child.id)) {
+            enumeration = "partial";
+            if (typeof child.id === "string")
+              candidates.push({ id: child.id, lineage: "unknown", dispatch: "unknown" });
+            continue;
+          }
+          const confirmed = proof.has(child.id);
+          candidates.push({ id: child.id, lineage: "confirmed", dispatch: confirmed ? "confirmed" : "unknown" });
+          if (confirmed) {
+            visited.add(child.id);
+            parents.set(child.id, parent);
+            queue.push(child.id);
+          }
+        }
+      } catch {
+        enumeration = "partial";
+        findings.add(`Child enumeration unavailable for ${parent}`);
+      }
+    }
+    const disputed = new Set(candidates.filter((c) => c.lineage !== "confirmed" || c.dispatch !== "confirmed").map((c) => c.id));
+    for (const candidate of candidates) {
+      let ancestor = parents.get(candidate.id);
+      while (ancestor && ancestor !== root) {
+        if (disputed.has(ancestor)) {
+          candidate.lineage = "unknown";
+          break;
+        }
+        ancestor = parents.get(ancestor);
+      }
+    }
+    if (queue.length > STOP_LIST_LIMIT)
+      enumeration = "truncated";
+    let commands = [], shellEnumeration = "complete";
+    try {
+      commands = rows(await bounded(() => client.shells())).map((raw) => {
+        const shell = record(raw), owner = record(shell.metadata).sessionID;
+        return { id: typeof shell.id === "string" ? shell.id : "", owner: typeof owner === "string" ? owner : "", ownership: typeof owner === "string" ? "confirmed" : "unknown", backgroundShell: "confirmed" };
+      });
+    } catch {
+      shellEnumeration = "unavailable";
+    }
+    if (shellEnumeration === "complete" && commands.every((command) => command.id)) {
+      for (const [id, owner] of requestedShells) {
+        if (!commands.some((command) => command.id === id))
+          receipt(owner, `Shell ${id}: confirmed no longer running after termination request`);
+      }
+    }
+    const scope = selectStopScope(root, candidates, enumeration, commands, shellEnumeration);
+    for (const finding of scope.findings)
+      findings.add(finding);
+    empty = scope.nothingToStop;
+    const owners = new Set(scope.commands.map((c) => c.owner));
+    for (const command of scope.commands) {
+      if (requestedShells.get(command.id) === command.owner)
+        continue;
+      try {
+        await bounded(() => client.removeShell(command.id));
+        requestedShells.set(command.id, command.owner);
+        receipt(command.owner, `Shell ${command.id}: termination requested (terminal outcome unconfirmed at request time)`);
+      } catch {
+        receipt(command.owner, `Shell ${command.id}: termination request failed or timed out; outcome unknown`);
+      }
+    }
+    let active;
+    try {
+      const value = unwrap(await bounded(() => client.active()));
+      if (!value || typeof value !== "object" || Array.isArray(value))
+        throw new Error("invalid active map");
+      active = record(value);
+    } catch {
+      findings.add("Active session enumeration unavailable; terminal outcomes unknown");
+    }
+    for (const id of scope.children) {
+      if (active && !(id in active) && !owners.has(id) && shellEnumeration === "complete" && commands.every((c) => c.ownership === "confirmed")) {
+        receipt(id, requestedInterrupts.has(id) ? "Confirmed not running after interrupt request (not proof of task success)" : "Observed idle (not proof of cancellation or terminal outcome)");
+        continue;
+      }
+      try {
+        const result = record(unwrap(await bounded(() => client.interrupt(id))));
+        requestedInterrupts.add(id);
+        receipt(id, result.interrupted === false ? "Interrupt requested; host returned interrupted=false" : result.interrupted === true ? "Interrupt requested; host confirmed interrupt (not task success)" : "Interrupt requested; terminal outcome unconfirmed");
+      } catch {
+        receipt(id, "Interrupt request failed or timed out; outcome unknown");
+      }
+    }
+    if (round < 2)
+      try {
+        await bounded(() => client.wait());
+      } catch {
+        findings.add("Revisit deadline reached; remaining outcomes unknown");
+        break;
+      }
+  }
+  return [
+    "[forge stop receipt] Relay these observations; do not start more work.",
+    ...empty && !receipts.size && !findings.size ? ["No native children to stop."] : [],
+    ...[...receipts].map(([id, notes]) => `${id}: ${[...notes].join("; ")}`),
+    ...findings,
+    "Only explicit confirmations above establish observed stopped activity; task success is not established. The host may interrupt other activity as a collateral effect of a child interrupt; the scope above covers only explicit requests. In a sandbox observation, interrupting a child left its active parent running; this is not a general collateral-behavior guarantee. Interrupting the parent does not guarantee children stop; use /forge stop to request explicit child cancellation."
+  ].join(`
+`);
+}
+
+// src/search-authorized.ts
+import { dirname, isAbsolute, join, normalize, parse, relative, resolve, sep } from "node:path";
+
+// src/search-js.ts
+function escapeReChar(c) {
+  return /[.+^${}()|[\]\\]/.test(c) ? "\\" + c : c;
+}
+function translateGlob(pat, strict = false) {
+  let out = "";
+  let i = 0;
+  while (i < pat.length) {
+    const c = pat[i];
+    if (c === "*") {
+      let stars = 0;
+      while (pat[i] === "*") {
+        stars++;
+        i++;
+      }
+      if (stars >= 2 && pat[i] === "/") {
+        i++;
+        out += "(?:[^/]*/)*";
+      } else if (stars >= 2) {
+        out += ".*";
+      } else if (pat[i] === "/") {
+        i++;
+        out += "[^/]*/";
+      } else {
+        out += "[^/]*";
+      }
+    } else if (c === "?") {
+      i++;
+      out += "[^/]";
+    } else if (c === "[") {
+      let j = i + 1;
+      let negated = false;
+      if (pat[j] === "!" || pat[j] === "^") {
+        negated = true;
+        j++;
+      }
+      let close = -1;
+      for (let k = j;k < pat.length; ) {
+        if (pat[k] === "\\") {
+          k += 2;
+          continue;
+        }
+        if (pat[k] === "]") {
+          close = k;
+          break;
+        }
+        k++;
+      }
+      if (close === -1 || close === j) {
+        if (strict)
+          throw new Error("Invalid glob: unclosed or empty character class");
+        out += "\\[";
+        i++;
+        continue;
+      }
+      let body = "";
+      for (let m = j;m < close; m++) {
+        const ch = pat[m];
+        if (ch === "\\") {
+          m++;
+          const escaped = pat[m];
+          if (escaped === undefined)
+            break;
+          body += escaped === "\\" || escaped === "]" ? "\\" + escaped : escaped;
+          continue;
+        }
+        body += ch === "]" || ch === "\\" ? "\\" + ch : ch;
+      }
+      if (body.length === 0) {
+        out += "\\[";
+        i++;
+        continue;
+      }
+      out += "[" + (negated ? "^" : "") + body + "]";
+      i = close + 1;
+    } else if (c === "{") {
+      const close = pat.indexOf("}", i + 1);
+      if (close === -1) {
+        if (strict)
+          throw new Error("Invalid glob: unclosed alternative");
+        out += "\\{";
+        i++;
+        continue;
+      }
+      const alts = pat.slice(i + 1, close).split(",");
+      out += "(?:" + alts.map((a) => translateGlob(a, strict)).join("|") + ")";
+      i = close + 1;
+    } else {
+      out += escapeReChar(c);
+      i++;
+    }
+  }
+  return out;
+}
+var globRegexCache = new Map;
+function globToRegExp(pattern) {
+  const cached = globRegexCache.get(pattern);
+  if (cached !== undefined)
+    return cached;
+  const source = translateGlob(pattern);
+  const anchored = pattern.includes("/");
+  const prefix = anchored ? "^" : "(?:^|/)";
+  let re;
+  try {
+    re = new RegExp(prefix + source + "$");
+  } catch {
+    re = /$^/;
+  }
+  globRegexCache.set(pattern, re);
+  return re;
+}
+function strictGlobToRegExp(pattern, anchored = pattern.includes("/")) {
+  return new RegExp((anchored ? "^" : "(?:^|/)") + translateGlob(pattern, true) + "$");
+}
+function matchGlob(pattern, relPathFwd) {
+  return globToRegExp(pattern).test(relPathFwd);
+}
+var MAX_WALK_ENTRIES = 200000;
+var MAX_FILE_BYTES = 8 * 1024 * 1024;
+var BINARY_SNIFF_BYTES = 8 * 1024;
+
+// src/search-authorized.ts
+var slash = (s) => s.split(sep).join("/");
+var contains = (root, path) => {
+  const r = relative(root, path);
+  return r === "" || !isAbsolute(r) && r !== ".." && !r.startsWith(".." + sep);
+};
+var git = (p) => slash(p).split("/").some((part) => part === ".git" || process.platform === "win32" && part.toLowerCase() === ".git");
+function ambiguousSearchPath(path) {
+  return path.startsWith("~") || /^\\\\[?.]\\/.test(path) || process.platform === "win32" && /^\/(?:[a-z]:?|cygdrive\/[a-z]|mnt\/[a-z])(?:\/|$)/i.test(path) || /^[^/\\:]+:/.test(path) && !(process.platform === "win32" && /^[a-z]:[/\\]/i.test(path));
+}
+function parseGlobalExcludes(bytes) {
+  for (const line of bytes.toString("utf8").split(String.fromCharCode(10))) {
+    const value = line.trim();
+    if (/^[#;]/.test(value) || !/excludesfile/i.test(value))
+      continue;
+    const match = /^excludesfile\s*=\s*(?:"([^"\s]+)"|([^"\s]+))$/i.exec(value);
+    if (!match)
+      throw new Error("Ambiguous global ignore config");
+    const path = match[1] ?? match[2];
+    if (path.includes("~") && !(path.startsWith("~/") && !path.slice(1).includes("~")))
+      throw new Error("Ambiguous global ignore tilde expansion");
+    return path;
+  }
+  return;
+}
+function jsGrep(bytes, input) {
+  if (bytes.subarray(0, 8192).includes(0))
+    return [];
+  const pattern = input.literal ? input.pattern.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") : input.pattern;
+  const regex = new RegExp(pattern, input.caseSensitive === false ? "giu" : "gu");
+  const lines = bytes.toString("utf8").match(/[^\n]*\n|[^\n]+$/g) ?? [];
+  let offset = 0;
+  const result = [];
+  for (let i = 0;i < lines.length; i++) {
+    const text = lines[i];
+    const body = text.replace(/\r?\n$/, "");
+    const submatches = [];
+    for (const m of body.matchAll(regex)) {
+      const start = Buffer.byteLength(body.slice(0, m.index));
+      submatches.push({ text: m[0], start, end: start + Buffer.byteLength(m[0]) });
+      if (submatches.length === 100)
+        break;
+    }
+    if (submatches.length)
+      result.push({ line: i + 1, offset, text: text.length > 2000 ? text.slice(0, 2000) + "..." : text, submatches });
+    if (result.length >= (input.limit ?? 100))
+      break;
+    offset += Buffer.byteLength(text);
+  }
+  return result;
+}
+async function authorizedSearch(kind, input, invocation, directory, project, seams) {
+  const source = { type: "tool", messageID: invocation.messageID, id: invocation.id };
+  const permission = { sessionID: invocation.sessionID, agent: invocation.agent, source };
+  if (!invocation.sessionID || !invocation.agent || !invocation.messageID || !invocation.id)
+    throw new Error("Search invocation context unavailable");
+  const path = kind === "glob" && (input.path === "undefined" || input.path === "null") ? undefined : input.path;
+  if (path && ambiguousSearchPath(path))
+    throw new Error("Search path cannot be resolved in the local environment");
+  if (kind === "grep" && !input.pattern || input.limit !== undefined && (!Number.isSafeInteger(input.limit) || input.limit < 1))
+    throw new Error("Invalid search input");
+  if (kind === "glob")
+    strictGlobToRegExp(input.pattern);
+  if (input.include)
+    strictGlobToRegExp(input.include);
+  const root = resolve(directory, path ?? ".");
+  const checked = new Set, outside = new Set, skipped = new Set;
+  const internal = (p) => contains(directory, p) || project !== parse(project).root && contains(project, p);
+  async function authorize(p, dir, report = true) {
+    if (internal(p))
+      return true;
+    const boundary = dir ? p : dirname(p);
+    const resource = slash(join(boundary, "*"));
+    if (checked.has(resource)) {
+      if (report)
+        outside.add(p);
+      return true;
+    }
+    await seams.assert({ ...permission, action: "external_directory", resources: [resource], save: [resource] });
+    checked.add(resource);
+    if (report)
+      outside.add(p);
+    return true;
+  }
+  const rootReal = seams.realpath(root);
+  const rootDir = seams.stat(rootReal).isDirectory();
+  await authorize(root, kind === "glob" || rootDir);
+  await seams.assert({ ...permission, action: kind, resources: [input.pattern], save: ["*"], metadata: kind === "grep" ? { root: ".", path, include: input.include, literal: input.literal, caseSensitive: input.caseSensitive, limit: input.limit } : { root: path ?? ".", path, hidden: input.hidden, limit: input.limit } });
+  const records = [];
+  const limit = input.limit ?? 100;
+  const recordCap = Math.min(limit + 1, Number.MAX_SAFE_INTEGER);
+  const recorded = new Map;
+  const keyOf = (r) => JSON.stringify([r.real, r.match?.line]);
+  const compare = (a, b) => a.path < b.path ? -1 : a.path > b.path ? 1 : (a.match?.line ?? 0) - (b.match?.line ?? 0);
+  const positions = new Map;
+  function swap(a, b) {
+    const x = records[a], y = records[b];
+    records[a] = y;
+    records[b] = x;
+    positions.set(x, b);
+    positions.set(y, a);
+  }
+  function down(i) {
+    while (2 * i + 1 < records.length) {
+      let j = 2 * i + 1;
+      if (j + 1 < records.length && compare(records[j + 1], records[j]) > 0)
+        j++;
+      if (compare(records[i], records[j]) >= 0)
+        break;
+      swap(i, j);
+      i = j;
+    }
+  }
+  let duplicates = 0, collectionCapped = false;
+  function record2(path2, real, match) {
+    const value = { path: path2, real, match }, key = keyOf(value);
+    const previous = recorded.get(key);
+    if (previous) {
+      duplicates++;
+      if (path2 < previous.path) {
+        previous.path = path2;
+        down(positions.get(previous));
+      }
+      return;
+    }
+    if (records.length >= recordCap) {
+      collectionCapped = true;
+      if (compare(value, records[0]) >= 0)
+        return;
+      const removed = records[0];
+      recorded.delete(keyOf(removed));
+      positions.delete(removed);
+      records[0] = value;
+      positions.set(value, 0);
+      recorded.set(key, value);
+      down(0);
+      return;
+    }
+    recorded.set(key, value);
+    let i = records.length;
+    records.push(value);
+    positions.set(value, i);
+    while (i > 0) {
+      const parent = Math.floor((i - 1) / 2);
+      if (compare(records[parent], value) >= 0)
+        break;
+      swap(i, parent);
+      i = parent;
+    }
+  }
+  const ancestors = new Set;
+  let visited = 0, capped = false;
+  const hidden = kind === "grep" || input.hidden !== false;
+  const follow = input.follow !== false;
+  const equal = (a, b) => normalize(a) === normalize(b);
+  function ignored(rules, logical, directory2, anyGit2) {
+    let excluded = false;
+    for (const rule of rules) {
+      if (rule.global && !anyGit2)
+        continue;
+      const path2 = slash(relative(rule.base, logical));
+      if (rule.directory && !directory2)
+        continue;
+      if (rule.matcher.test(path2))
+        excluded = !rule.negate;
+    }
+    return excluded;
+  }
+  function parseIgnoreRules(bytes, logical, rules) {
+    for (let line of bytes.toString("utf8").split(/\r?\n/)) {
+      line = line.trimEnd();
+      if (!line || line.startsWith("#"))
+        continue;
+      const negate = line.startsWith("!");
+      if (negate)
+        line = line.slice(1);
+      const directory2 = line.endsWith("/");
+      if (directory2)
+        line = line.slice(0, -1);
+      const anchored = line.startsWith("/") || line.includes("/");
+      if (line.startsWith("/"))
+        line = line.slice(1);
+      if (line) {
+        try {
+          rules.push({ base: logical, matcher: strictGlobToRegExp(line, anchored), negate, directory: directory2 });
+        } catch {}
+      }
+    }
+  }
+  function loadIgnoreRules(logical, real, entries, rules) {
+    if (kind === "grep" && !input.include) {
+      for (const ignoreName of [".gitignore", ".ignore", ".rgignore"]) {
+        if (!entries.includes(ignoreName))
+          continue;
+        const ignorePath = join(real, ignoreName);
+        try {
+          const info = seams.stat(ignorePath);
+          if (info.isSymbolicLink() || !info.isFile() || seams.realpath(ignorePath) !== ignorePath || (info.size ?? 0) > MAX_FILE_BYTES)
+            continue;
+          const bytes = seams.read(ignorePath);
+          if (bytes.length > MAX_FILE_BYTES)
+            continue;
+          parseIgnoreRules(bytes, logical, rules);
+        } catch {}
+      }
+    }
+  }
+  async function visit(logical, candidate, explicit = false, rules = [], globMatch, anyGit2 = false) {
+    if (++visited > MAX_WALK_ENTRIES) {
+      capped = true;
+      return;
+    }
+    if (git(logical) || git(candidate))
+      return;
+    const name = relative(root, logical) || relative(dirname(root), logical);
+    if (!explicit && !hidden && name.split(sep).some((s) => s.startsWith(".")))
+      return;
+    let real, st;
+    try {
+      const lexical = seams.stat(candidate);
+      if (lexical.isSymbolicLink() && !follow && !explicit)
+        return;
+      real = seams.realpath(candidate);
+      if (git(real))
+        return;
+      st = seams.stat(real);
+    } catch {
+      return;
+    }
+    try {
+      await authorize(real, st.isDirectory());
+    } catch (error) {
+      if (explicit || !(error instanceof Error) || !(["Tool.Error", "ToolError"].includes(error.name) || error._tag === "Tool.Error"))
+        throw error;
+      skipped.add(real);
+      return;
+    }
+    try {
+      if (!equal(seams.realpath(candidate), real) || !equal(seams.realpath(real), real)) {
+        skipped.add(logical);
+        return;
+      }
+    } catch {
+      skipped.add(logical);
+      return;
+    }
+    if (explicit && kind === "glob" && !st.isDirectory())
+      throw new Error("Search path is not a directory");
+    if (!explicit && ignored(rules, logical, st.isDirectory(), anyGit2) && (st.isDirectory() || kind === "grep" && !input.include))
+      return;
+    if (st.isDirectory()) {
+      if (ancestors.has(real))
+        return;
+      ancestors.add(real);
+      try {
+        let entries;
+        try {
+          entries = seams.list(real).sort();
+        } catch {
+          return;
+        }
+        anyGit2 ||= entries.includes(".git");
+        const localRules = [...rules];
+        loadIgnoreRules(logical, real, entries, localRules);
+        const matches = kind === "glob" && seams.glob ? seams.glob(input.pattern, entries.map((entry) => slash(relative(root, join(logical, entry))))) : undefined;
+        for (let i = 0;i < entries.length; i++) {
+          if (capped)
+            break;
+          const entry = entries[i];
+          await visit(join(logical, entry), join(real, entry), false, localRules, matches?.[i], anyGit2);
+        }
+      } finally {
+        ancestors.delete(real);
+      }
+    } else if (st.isFile()) {
+      if (kind === "glob") {
+        if (globMatch ?? matchGlob(input.pattern, slash(name)))
+          record2(logical, real);
+      } else if (!input.include || matchGlob(input.include, slash(name))) {
+        if (typeof st.size === "number" && st.size > MAX_FILE_BYTES) {
+          skipped.add(logical);
+          return;
+        }
+        let bytes;
+        try {
+          bytes = seams.read(real);
+        } catch {
+          return;
+        }
+        if (bytes.length > MAX_FILE_BYTES) {
+          skipped.add(logical);
+          return;
+        }
+        for (const match of (seams.grep ?? jsGrep)(bytes, { ...input, limit: recordCap + 1 })) {
+          record2(logical, real, match);
+        }
+      }
+    }
+  }
+  if (kind === "glob" && !rootDir)
+    throw new Error("Search path is not a directory");
+  const inherited = [];
+  let anyGit = false;
+  if (kind === "grep" && !input.include) {
+    if (seams.globalIgnore) {
+      const source2 = seams.globalIgnore;
+      const cwd = rootDir ? root : dirname(root);
+      for (let p = cwd;; p = dirname(p)) {
+        try {
+          const marker = seams.stat(join(p, ".git"));
+          if (marker.isFile() || marker.isDirectory() || marker.isSymbolicLink()) {
+            anyGit = true;
+            break;
+          }
+        } catch {}
+        if (p === dirname(p))
+          break;
+      }
+      async function readOptional(path2) {
+        try {
+          seams.stat(path2);
+        } catch (error) {
+          if (error.code === "ENOENT")
+            return;
+          throw error;
+        }
+        await authorize(path2, false, false);
+        const real = seams.realpath(path2);
+        await authorize(real, false, false);
+        const st = seams.stat(real);
+        if (!st.isFile() || (st.size ?? 0) > MAX_FILE_BYTES || !equal(seams.realpath(path2), real))
+          throw new Error("Global ignore source unavailable");
+        const bytes = seams.read(real);
+        if (bytes.length > MAX_FILE_BYTES || !equal(seams.realpath(path2), real))
+          throw new Error("Global ignore source changed");
+        return bytes;
+      }
+      try {
+        if (!isAbsolute(source2.home) || source2.xdg && !isAbsolute(source2.xdg))
+          throw new Error("Unknown global ignore environment");
+        const configDir = source2.xdg || join(source2.home, ".config");
+        let excludes;
+        for (const config of [join(source2.home, ".gitconfig"), join(configDir, "git", "config")]) {
+          const bytes2 = await readOptional(config);
+          if (bytes2 !== undefined)
+            excludes = (source2.parseConfig ?? parseGlobalExcludes)(bytes2);
+          if (excludes !== undefined)
+            break;
+        }
+        const file = excludes === undefined ? join(configDir, "git", "ignore") : excludes.startsWith("~/") ? resolve(source2.home, excludes.slice(2)) : resolve(cwd, excludes);
+        if (excludes !== undefined && (!excludes || ambiguousSearchPath(excludes) && !excludes.startsWith("~/")))
+          throw new Error("Unknown global ignore path");
+        const bytes = await readOptional(file);
+        if (bytes !== undefined) {
+          parseIgnoreRules(bytes, cwd, inherited);
+          for (const rule of inherited)
+            rule.global = true;
+        }
+      } catch (error) {
+        if (seams.delegateNative)
+          return seams.delegateNative();
+        throw error;
+      }
+    }
+    const parents = [];
+    for (let p = dirname(root);p !== dirname(p) && internal(p); p = dirname(p))
+      parents.unshift(p);
+    for (const p of parents) {
+      try {
+        if (seams.realpath(p) !== p)
+          continue;
+        loadIgnoreRules(p, p, seams.list(p), inherited);
+      } catch {}
+    }
+  }
+  await visit(root, root, true, inherited, undefined, anyGit);
+  records.sort(compare);
+  const shown = records.slice(0, limit), truncated = records.length > shown.length || capped || collectionCapped;
+  const outputRoot = path !== undefined && rootDir ? root : directory;
+  const displayPath = (p) => path !== undefined && rootDir ? relative(root, p) : p;
+  const output = shown.map((r) => {
+    const entry = { path: relative(outputRoot, r.path), type: "file" };
+    return r.match ? { entry, ...r.match } : entry;
+  });
+  const lines = kind === "grep" ? [shown.length ? `Found ${shown.length} matches` : "No matches found"] : shown.length ? [] : ["No files found"];
+  let current = "";
+  for (const r of shown) {
+    if (!r.match)
+      lines.push(displayPath(r.path));
+    else {
+      if (current !== r.path) {
+        if (current)
+          lines.push("");
+        lines.push(displayPath(r.path) + ":");
+        current = r.path;
+      }
+      lines.push(`  Line ${r.match.line}: ${r.match.text}`);
+    }
+  }
+  if (truncated)
+    lines.push("", `(Results are truncated: showing first ${shown.length} results. Consider using a more specific path or pattern.)`);
+  for (const p of outside)
+    lines.push(`outside-workspace target searched: ${p}`);
+  for (const p of skipped)
+    lines.push(`skipped target: ${p}`);
+  if (duplicates)
+    lines.push(`+${duplicates} duplicate paths merged`);
+  lines.push(`(forge search: ${seams.engine?.() ?? ((kind === "grep" ? seams.grep : seams.glob) ? "ripgrep" : "builtin-js")})`);
+  return { output, content: lines.join(`
+`), metadata: { [kind === "grep" ? "matches" : "count"]: shown.length, truncated } };
+}
+
+// src/search-core.ts
+import { join as winJoin } from "node:path";
+import { join as posixJoin } from "node:path/posix";
+import { existsSync as fsExistsSync } from "node:fs";
+var RG_MISSING_REMEDIES = "install ripgrep (or set search.rgPath in forge config to an existing rg binary), or fall back to the builtin grep/glob tools for this search";
+function resolveRgBinary(config, seams) {
+  const platform = seams?.platform ?? process.platform;
+  const sep2 = seams?.pathSep ?? (platform === "win32" ? ";" : ":");
+  const exists = seams?.existsSync ?? fsExistsSync;
+  const pathEnv = seams?.pathEnv ?? (process.env.PATH ?? "");
+  if (typeof config?.rgPath === "string" && config.rgPath.length > 0 && exists(config.rgPath)) {
+    return { ok: true, binary: config.rgPath, source: "config" };
+  }
+  const exe = platform === "win32" ? "rg.exe" : "rg";
+  const join2 = platform === "win32" ? winJoin : posixJoin;
+  for (const dir of pathEnv.split(sep2)) {
+    if (dir.length === 0)
+      continue;
+    const candidate = join2(dir, exe);
+    if (exists(candidate))
+      return { ok: true, binary: candidate, source: "path" };
+  }
+  return {
+    ok: false,
+    error: `ripgrep (rg) not found — ${RG_MISSING_REMEDIES}`
+  };
+}
+
+// plugin.ts
+import { spawnSync as spawnSync3 } from "node:child_process";
+
+// src/goal-activity.ts
+import { createHash } from "node:crypto";
+import { isDeepStrictEqual } from "node:util";
+function hasIdleBackgroundShell(raw, sessionID) {
+  const background = raw?.background;
+  return Array.isArray(background) && background.some((entry) => {
+    if (!entry || typeof entry !== "object")
+      return false;
+    const e = entry;
+    return e.kind === "shell" && e.sessionID === sessionID && typeof e.shellID === "string" && e.shellID.length > 0 && typeof e.command === "string";
+  });
+}
+function idleBackgroundKnown(raw) {
+  const background = raw?.background;
+  return Array.isArray(background) && background.every((entry) => {
+    if (!entry || typeof entry !== "object")
+      return false;
+    const e = entry;
+    return e.kind === "shell" && typeof e.sessionID === "string" && typeof e.shellID === "string" && !!e.shellID && typeof e.command === "string";
+  });
+}
+function settledGoalRounds(rounds, context) {
+  const object = (x) => x && typeof x === "object" ? x : {};
+  const messages = object(context).data ?? context;
+  const settled = new Set;
+  if (!Array.isArray(messages))
+    return settled;
+  const created = (m) => object(object(m).time).created;
+  if (!messages.every((m) => typeof created(m) === "number"))
+    return settled;
+  const current = new Map;
+  const ambiguous = new Set, seen = new Set;
+  for (const raw of [...messages].sort((a, b) => Number(created(a)) - Number(created(b)))) {
+    const m = object(raw);
+    if (m.type === "assistant" && Array.isArray(m.content))
+      for (const rawPart of m.content) {
+        const p = object(rawPart), state = object(p.state), meta2 = object(state.metadata);
+        const id2 = p.callID ?? p.id, child2 = meta2.sessionID;
+        if (p.type !== "tool" || p.name !== "subagent" || state.status !== "completed" || typeof id2 !== "string" || typeof child2 !== "string")
+          continue;
+        if (rounds.has(id2) && rounds.get(id2) !== child2) {
+          ambiguous.add(child2);
+          continue;
+        }
+        const previous = current.get(child2);
+        if (previous && previous !== id2 && !settled.has(previous))
+          ambiguous.add(child2);
+        current.set(child2, id2);
+      }
+    if (m.type !== "synthetic" || typeof m.id !== "string" || seen.has(m.id))
+      continue;
+    seen.add(m.id);
+    const meta = object(m.metadata), child = meta.childID;
+    if (meta.source !== "subagent" || typeof child !== "string" || ambiguous.has(child))
+      continue;
+    const id = current.get(child);
+    if (!id || settled.has(id) || typeof m.text !== "string")
+      continue;
+    const match = /^<background-result kind="subagent" sessionID="([^"]+)" state="(completed|error|cancelled)" description="[^"]*">[\s\S]*<\/background-result>$/.exec(m.text);
+    if (match && match[1] === child && match[2] === meta.state)
+      settled.add(id);
+  }
+  return settled;
+}
+function record2(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : undefined;
+}
+function singleText(content) {
+  if (!Array.isArray(content) || content.length !== 1)
+    return;
+  const part = record2(content[0]);
+  return part?.type === "text" && typeof part.text === "string" ? part.text : undefined;
+}
+function checkInput(value) {
+  const input = record2(value);
+  if (!input)
+    return;
+  if (!Object.keys(input).length)
+    return "{}";
+  if (Object.keys(input).length !== 1 || !Array.isArray(input.items) || !input.items.every((n) => Number.isSafeInteger(n) && n > 0))
+    return;
+  return JSON.stringify({ items: input.items });
+}
+function completeResult(result) {
+  const metadata = record2(result?.metadata);
+  return !!result && [result.truncated, metadata?.truncated, result.error, metadata?.error].every((t) => t === undefined || t === false) && result.status !== "error" && metadata?.status !== "error";
+}
+function singleCompletedCheck(calls) {
+  if (!Array.isArray(calls) || calls.length !== 1)
+    return;
+  const call = record2(calls[0]);
+  return call?.tool === "goal_check" && call.status === "completed" ? checkInput(call.input) : undefined;
+}
+function consumeCheckWrapper(act, id, result, event) {
+  const r = record2(result), output = record2(r?.output), metadata = record2(r?.metadata);
+  if (!id || !event?.messageID || event.status !== "completed" || event.codemode !== false || !completeResult(r) || !completeResult(output))
+    return false;
+  if (!Array.isArray(output?.files) || output.files.length !== 0 || typeof output.output !== "string" || singleText(r?.content) !== output.output)
+    return false;
+  const input = singleCompletedCheck(metadata?.toolCalls);
+  if (input === undefined || input !== singleCompletedCheck(output.toolCalls))
+    return false;
+  const matches = act.checkReceipts?.filter((p) => p.id !== id && p.messageID === event.messageID && p.input === input && p.output === output.output);
+  if (matches?.length !== 1)
+    return false;
+  act.checkReceipts.splice(act.checkReceipts.indexOf(matches[0]), 1);
+  return true;
+}
+function wrapperOtherActivity(result, event) {
+  const r = record2(result), output = record2(r?.output), metadata = record2(r?.metadata);
+  if (event?.status !== "completed" || !completeResult(r) || !completeResult(output))
+    return false;
+  const calls = metadata?.toolCalls;
+  if (!Array.isArray(calls) || !isDeepStrictEqual(calls, output?.toolCalls))
+    return false;
+  return calls.some((raw) => {
+    const call = record2(raw);
+    return typeof call?.tool === "string" && call.tool !== "goal_check" && call.status === "completed";
+  }) || Array.isArray(output?.files) && output.files.length > 0;
+}
+function rememberGoalCheck(act, selected, outcomes, output) {
+  const complete = selected.length === outcomes.length && outcomes.every((o, i) => o.index === selected[i].n && o.comparable !== undefined);
+  const evidence = complete ? createHash("sha256").update(JSON.stringify([act.scope, selected, outcomes.map((o) => o.comparable)])).digest("hex") : undefined;
+  (act.goalChecks ??= []).push({ output, evidence });
+}
+function observeGoalActivity(act, tool, write, id, args, result, event) {
+  if (tool === "subagent") {
+    const r2 = record2(result), m2 = record2(r2?.metadata);
+    if (!id || m2?.status !== "running" || typeof m2.sessionID !== "string" || !m2.sessionID || r2?.status === "error" || event?.status !== undefined && event.status !== "completed") {
+      act.uncertain = true;
+      return;
+    }
+  }
+  if (id) {
+    const key = JSON.stringify([event?.messageID, id, tool]);
+    const observation = [args, result, event, write];
+    const seen = act.seen ??= new Map;
+    if (seen.has(key)) {
+      if (!isDeepStrictEqual(seen.get(key), observation))
+        act.uncertain = true;
+      return;
+    }
+    for (const previous of seen.keys()) {
+      const [messageID, callID, name] = JSON.parse(previous);
+      if (messageID === (event?.messageID ?? null) && callID === id && name !== tool)
+        act.uncertain = true;
+    }
+    try {
+      seen.set(key, structuredClone(observation));
+    } catch {
+      act.uncertain = true;
+    }
+  }
+  if (tool === "subagent") {
+    act.dispatches = (act.dispatches ?? 0) + 1;
+    if (write)
+      act.writes++;
+    act.other = true;
+    return;
+  }
+  const check = ["goal_check", "shell", "bash"].includes(tool);
+  if (write || tool === "plan_tick")
+    act.writes++;
+  if (check)
+    act.checks++;
+  if (!check) {
+    if (tool === "execute" && !write) {
+      if (consumeCheckWrapper(act, id, result, event))
+        return;
+      if (wrapperOtherActivity(result, event))
+        act.other = true;
+      else
+        act.uncertain = true;
+      return;
+    }
+    act.other = true;
+    return;
+  }
+  const a = args;
+  const r = result;
+  const m = r?.metadata;
+  if (tool === "goal_check") {
+    const content = r?.output ?? r?.content;
+    const output = typeof content === "string" ? content : singleText(content);
+    const matches = act.goalChecks?.filter((pending2) => pending2.output === output);
+    const pending = matches?.length === 1 ? matches[0] : undefined;
+    const completed = event?.status === "completed" || typeof content === "string" && event?.status === undefined;
+    if (pending && typeof output === "string" && completeResult(r) && completed) {
+      act.goalChecks.splice(act.goalChecks.indexOf(pending), 1);
+      if (pending.evidence) {
+        (act.evidence ??= []).push(pending.evidence);
+        const input = checkInput(args);
+        if (event?.codemode === true) {
+          if (id && event.messageID && event.status === "completed" && r?.output === undefined && singleText(r?.content) === output && input !== undefined) {
+            (act.checkReceipts ??= []).push({ id, messageID: event.messageID, input, output });
+          } else
+            act.uncertain = true;
+        } else if (event?.codemode !== false && typeof content !== "string")
+          act.uncertain = true;
+      } else
+        act.uncertain = true;
+    } else {
+      act.uncertain = true;
+    }
+    return;
+  }
+  const command = a?.command ?? a?.cmd;
+  const verification = typeof command === "string" && /^(?:npm test|npm run (?:test|typecheck)|npx tsc --noEmit|pytest)(?: -- [\w .-]+)?$/.test(command);
+  if (!verification) {
+    act.other = true;
+    return;
+  }
+  if (!a || !Object.keys(a).length || !completeResult(r) || typeof r?.output !== "string" || m?.truncated !== false || !Number.isInteger(m.exitCode) || event?.status !== undefined && event.status !== "completed") {
+    act.uncertain = true;
+    return;
+  }
+  try {
+    (act.evidence ??= []).push(JSON.stringify([act.scope, tool, a, m.exitCode, r.output]));
+  } catch {
+    act.uncertain = true;
+  }
+}
+function classifyGoalActivity(act, previous) {
+  if (!act)
+    return { activity: false, repeated: false, uncertain: true };
+  if (act.other)
+    return { activity: true, repeated: false };
+  if (act.uncertain || act.goalChecks?.length || act.checkReceipts?.length)
+    return { activity: false, repeated: false, uncertain: true };
+  if (act.evidence?.length) {
+    const evidence = JSON.stringify(act.evidence);
+    return { activity: evidence !== previous, repeated: evidence === previous, evidence };
+  }
+  return { activity: act.writes > 0 || act.checks > 0, repeated: false };
+}
+
 // node_modules/zod/v4/classic/external.js
 var exports_external = {};
 __export(exports_external, {
@@ -60,7 +1108,7 @@ __export(exports_external, {
   regexes: () => exports_regexes,
   regex: () => _regex,
   refine: () => refine,
-  record: () => record,
+  record: () => record3,
   readonly: () => readonly,
   property: () => _property,
   promise: () => promise,
@@ -71,7 +1119,7 @@ __export(exports_external, {
   pipe: () => pipe,
   partialRecord: () => partialRecord,
   parseAsync: () => parseAsync2,
-  parse: () => parse3,
+  parse: () => parse4,
   overwrite: () => _overwrite,
   optional: () => optional,
   object: () => object,
@@ -261,7 +1309,7 @@ __export(exports_core2, {
   regexes: () => exports_regexes,
   prettifyError: () => prettifyError,
   parseAsync: () => parseAsync,
-  parse: () => parse,
+  parse: () => parse2,
   locales: () => exports_locales,
   isValidJWT: () => isValidJWT,
   isValidBase64URL: () => isValidBase64URL,
@@ -1360,7 +2408,7 @@ var _parse = (_Err) => (schema, value, _ctx, _params) => {
   }
   return result.value;
 };
-var parse = /* @__PURE__ */ _parse($ZodRealError);
+var parse2 = /* @__PURE__ */ _parse($ZodRealError);
 var _parseAsync = (_Err) => async (schema, value, _ctx, params) => {
   const ctx = _ctx ? Object.assign(_ctx, { async: true }) : { async: true };
   let result = schema._zod.run({ value, issues: [] }, ctx);
@@ -3878,10 +4926,10 @@ var $ZodFunction = /* @__PURE__ */ $constructor("$ZodFunction", (inst, def) => {
       throw new Error("implement() must be called with a function");
     }
     return function(...args) {
-      const parsedArgs = inst._def.input ? parse(inst._def.input, args) : args;
+      const parsedArgs = inst._def.input ? parse2(inst._def.input, args) : args;
       const result = Reflect.apply(func, this, parsedArgs);
       if (inst._def.output) {
-        return parse(inst._def.output, result);
+        return parse2(inst._def.output, result);
       }
       return result;
     };
@@ -11289,7 +12337,7 @@ var ZodRealError = $constructor("ZodError", initializer2, {
 });
 
 // node_modules/zod/v4/classic/parse.js
-var parse3 = /* @__PURE__ */ _parse(ZodRealError);
+var parse4 = /* @__PURE__ */ _parse(ZodRealError);
 var parseAsync2 = /* @__PURE__ */ _parseAsync(ZodRealError);
 var safeParse2 = /* @__PURE__ */ _safeParse(ZodRealError);
 var safeParseAsync2 = /* @__PURE__ */ _safeParseAsync(ZodRealError);
@@ -11323,7 +12371,7 @@ var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
     reg.add(inst, meta);
     return inst;
   };
-  inst.parse = (data, params) => parse3(inst, data, params, { callee: inst.parse });
+  inst.parse = (data, params) => parse4(inst, data, params, { callee: inst.parse });
   inst.safeParse = (data, params) => safeParse2(inst, data, params);
   inst.parseAsync = async (data, params) => parseAsync2(inst, data, params, { callee: inst.parseAsync });
   inst.safeParseAsync = async (data, params) => safeParseAsync2(inst, data, params);
@@ -11886,7 +12934,7 @@ var ZodRecord = /* @__PURE__ */ $constructor("ZodRecord", (inst, def) => {
   inst.keyType = def.keyType;
   inst.valueType = def.valueType;
 });
-function record(keyType, valueType, params) {
+function record3(keyType, valueType, params) {
   return new ZodRecord({
     type: "record",
     keyType,
@@ -12270,7 +13318,7 @@ var stringbool = (...args) => _stringbool({
 }, ...args);
 function json(params) {
   const jsonSchema = lazy(() => {
-    return union([string2(params), number2(), boolean2(), _null3(), array(jsonSchema), record(string2(), jsonSchema)]);
+    return union([string2(params), number2(), boolean2(), _null3(), array(jsonSchema), record3(string2(), jsonSchema)]);
   });
   return jsonSchema;
 }
@@ -12334,11 +13382,9 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // plugin.ts
-import { execFileSync as execFileSync3, spawn as spawn6 } from "node:child_process";
-import { open as fsOpen, readdir as fsReaddir, stat as fsStat } from "node:fs/promises";
-import { appendFileSync as appendFileSync2, existsSync as existsSync3, mkdirSync as mkdirSync6, readdirSync as readdirSync4, readFileSync as readFileSync9, realpathSync, renameSync as renameSync2, statSync as statSync5, unlinkSync as unlinkSync3, writeFileSync as writeFileSync6 } from "node:fs";
-import { basename as basename2, dirname as dirname5, isAbsolute as isAbsolute2, join as join6, relative as relative2 } from "node:path";
-import { tmpdir as tmpdir3, homedir } from "node:os";
+import { closeSync, fstatSync, openSync, readSync, appendFileSync, existsSync, lstatSync, mkdirSync as mkdirSync2, readdirSync, readFileSync as readFileSync4, realpathSync as realpathSync2, renameSync as renameSync2, statSync as statSync3, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
+import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, relative as relative3 } from "node:path";
+import { tmpdir as tmpdir2, homedir } from "node:os";
 
 // src/plan-file.ts
 class PlanError extends Error {
@@ -12505,12 +13551,12 @@ function parseChecksSection(section) {
       checks3.push({ kind: "shell", cmd: shell[2], ...shell[3] ? { timeoutSec: Number(shell[3]) } : {} });
       continue;
     }
-    const contains = line.match(PLAN_CONTAINS_LINE_RE);
-    if (contains) {
-      if (seen.has(Number(contains[1])))
-        throw new PlanError(`Duplicate verification item number: ${contains[1]}`);
-      seen.add(Number(contains[1]));
-      checks3.push({ kind: "contains", file: contains[2], text: contains[3] });
+    const contains2 = line.match(PLAN_CONTAINS_LINE_RE);
+    if (contains2) {
+      if (seen.has(Number(contains2[1])))
+        throw new PlanError(`Duplicate verification item number: ${contains2[1]}`);
+      seen.add(Number(contains2[1]));
+      checks3.push({ kind: "contains", file: contains2[2], text: contains2[3] });
     }
   }
   return checks3;
@@ -12762,7 +13808,7 @@ function rankActivePlans(entries) {
 }
 
 // src/goal-file.ts
-import { renameSync, writeFileSync } from "node:fs";
+import { renameSync, unlinkSync, writeFileSync } from "node:fs";
 
 class GoalError extends Error {
   constructor(message) {
@@ -12841,8 +13887,15 @@ function goalFileName(date5, slug, existingNames = []) {
 }
 function atomicWrite(file2, text) {
   const tmp = `${file2}.${process.pid}-${Math.random().toString(36).slice(2, 6)}.tmp`;
-  writeFileSync(tmp, text);
-  renameSync(tmp, file2);
+  writeFileSync(tmp, text, { flag: "wx" });
+  try {
+    renameSync(tmp, file2);
+  } catch (err) {
+    try {
+      unlinkSync(tmp);
+    } catch {}
+    throw err;
+  }
 }
 function validateGoalInput(input) {
   const missing = [];
@@ -12898,6 +13951,8 @@ function frontmatterBlock2(meta) {
   lines.push(`max_turns: ${meta.maxTurns}`, `turns_used: ${meta.turnsUsed}`, `max_minutes: ${meta.maxMinutes}`);
   if (meta.status === "paused" && meta.stopReason)
     lines.push(`stop_reason: ${meta.stopReason}`);
+  if (meta.status === "paused" && meta.blocker)
+    lines.push(`blocker: ${JSON.stringify(meta.blocker)}`);
   lines.push("---", "");
   return lines.join(`
 `);
@@ -12920,7 +13975,7 @@ function renderGoal(input, meta) {
       turnsUsed: meta.turnsUsed ?? 0,
       maxMinutes: input.maxMinutes ?? DEFAULT_MAX_MINUTES,
       ...meta.armedAt ? { armedAt: meta.armedAt } : {},
-      ...meta.status === "paused" && meta.stopReason ? { stopReason: meta.stopReason } : {}
+      ...meta.status === "paused" && meta.stopReason ? { stopReason: meta.stopReason, blocker: meta.blocker } : {}
     }),
     "## Goal",
     "",
@@ -12967,7 +14022,7 @@ function parseFrontmatter2(text) {
     if (kv)
       fm[kv[1]] = kv[2].trim();
   }
-  return { fm, body: text.slice(m[0].length) };
+  return { fm, header: m[0], body: text.slice(m[0].length) };
 }
 function matchSectionHeader2(line) {
   const trimmed = line.trim();
@@ -13037,12 +14092,12 @@ function parseGoal(text) {
       checks3.push({ kind: "shell", cmd: shell[2], ...shell[3] ? { timeoutSec: Number(shell[3]) } : {} });
       continue;
     }
-    const contains = line.match(CONTAINS_LINE_RE);
-    if (contains) {
-      if (seenCheck.has(Number(contains[1])))
-        throw new GoalError(`Duplicate verification item number: ${contains[1]}`);
-      seenCheck.add(Number(contains[1]));
-      checks3.push({ kind: "contains", file: contains[2], text: contains[3] });
+    const contains2 = line.match(CONTAINS_LINE_RE);
+    if (contains2) {
+      if (seenCheck.has(Number(contains2[1])))
+        throw new GoalError(`Duplicate verification item number: ${contains2[1]}`);
+      seenCheck.add(Number(contains2[1]));
+      checks3.push({ kind: "contains", file: contains2[2], text: contains2[3] });
     }
   }
   if (checks3.length === 0)
@@ -13059,6 +14114,14 @@ function parseGoal(text) {
     const n = Number(v);
     return Number.isFinite(n) && n >= 0 ? Math.floor(n) : dflt;
   };
+  let blocker;
+  if (status === "paused" && fm.blocker) {
+    try {
+      const value = JSON.parse(fm.blocker);
+      if (typeof value === "string")
+        blocker = value;
+    } catch {}
+  }
   return {
     status,
     created: fm.created ?? "",
@@ -13070,6 +14133,7 @@ function parseGoal(text) {
     turnsUsed: num(fm.turns_used, 0),
     maxMinutes: Math.max(1, num(fm.max_minutes, DEFAULT_MAX_MINUTES)),
     ...status === "paused" && fm.stop_reason ? { stopReason: fm.stop_reason } : {},
+    ...blocker !== undefined ? { blocker } : {},
     goal: (sections.get("Goal") ?? "").split(/\r?\n/)[0]?.trim() ?? "",
     criteria,
     checks: checks3,
@@ -13087,12 +14151,15 @@ function parseGoalLoose(text) {
   }
 }
 function setFm(text, key, value) {
-  const re = new RegExp(`^${key}:.*$`, "m");
-  if (re.test(text))
-    return text.replace(re, `${key}: ${value}`);
-  return text.replace(/^---\r?\n/, `---
-${key}: ${value}
-`);
+  const { header, body } = parseFrontmatter2(text);
+  const re = new RegExp(`^${key}:[^\\r\\n]*`, "m");
+  if (re.test(header))
+    return header.replace(re, () => `${key}: ${value}`) + body;
+  return header.replace(/^---(\r?\n)/, (_, eol) => `---${eol}${key}: ${value}${eol}`) + body;
+}
+function deleteFm(text, key) {
+  const { header, body } = parseFrontmatter2(text);
+  return header.replace(new RegExp(`^${key}:[^\\r\\n]*\\r?\\n`, "gm"), "") + body;
 }
 function setUpdated2(text, now) {
   return setFm(text, "updated", now);
@@ -13105,18 +14172,21 @@ function transitionGoal(text, to, now, opts = {}) {
   if (!canTransitionGoal(from, to)) {
     throw new GoalError(`Illegal goal status transition: ${from} -> ${to} (legal paths: queued -> active; active <-> paused; active -> completed; queued/active/paused -> abandoned)`);
   }
-  let next = text.replace(/^status:.*$/m, `status: ${to}`);
+  let next = setFm(text, "status", to);
   if (to === "paused") {
     if (!opts.stopReason)
       throw new GoalError("Pausing requires a stop reason (user/blocker/no-progress/budget-turns/budget-time/draft-conflict/transport-failures)");
     next = setFm(next, "stop_reason", opts.stopReason);
+    if (opts.blocker)
+      next = setFm(next, "blocker", JSON.stringify(opts.blocker));
   }
   if (to === "active") {
     if (!opts.session)
       throw new GoalError("Arming/resuming requires the owning session id");
     next = setFm(next, "session", opts.session);
     next = setFm(next, "armed_at", now);
-    next = next.replace(/^stop_reason:.*$\r?\n?/m, "");
+    next = deleteFm(next, "blocker");
+    next = deleteFm(next, "stop_reason");
   }
   return setUpdated2(next, now);
 }
@@ -13237,7 +14307,7 @@ function completeCheckFailures(doc2, attestations) {
 // src/run-check.ts
 import { spawn as spawn2 } from "node:child_process";
 import { readFileSync } from "node:fs";
-import { join as join2, resolve, sep } from "node:path";
+import { join as join3, resolve as resolve2, sep as sep2 } from "node:path";
 
 // src/proc.ts
 import { spawn, spawnSync as spawnSync2 } from "node:child_process";
@@ -13245,13 +14315,9 @@ import { spawn, spawnSync as spawnSync2 } from "node:child_process";
 // src/shell-select.ts
 import { spawnSync } from "node:child_process";
 import { statSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname as dirname2, join as join2 } from "node:path";
 var hostConfiguredShell;
 var memo;
-function setHostShell(shell) {
-  hostConfiguredShell = shell && shell.trim() ? shell.trim() : undefined;
-  memo = undefined;
-}
 var DENY = new Set(["fish", "nu"]);
 function shellName(bin) {
   return basename(bin).replace(/\.exe$/i, "").toLowerCase();
@@ -13285,10 +14351,10 @@ function defaultStat(file2) {
   return statSync(file2, { throwIfNoEntry: false }) ?? undefined;
 }
 function gitBash(which, stat) {
-  const git = which("git");
-  if (!git)
+  const git2 = which("git");
+  if (!git2)
     return;
-  const candidate = join(dirname(dirname(git)), "bin", "bash.exe");
+  const candidate = join2(dirname2(dirname2(git2)), "bin", "bash.exe");
   return stat(candidate)?.isFile() ? candidate : undefined;
 }
 function resolveShell(deps = {}) {
@@ -13368,49 +14434,6 @@ function killTree(child, opts = {}) {
     }
   }
 }
-function pidAlive(pid) {
-  if (!pid || pid <= 0)
-    return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err.code === "EPERM";
-  }
-}
-function terminateTreeSync(pid, opts = {}) {
-  const graceMs = Math.max(0, opts.graceMs ?? 0);
-  const platform = opts.platform ?? process.platform;
-  const sync = opts.spawnSyncFn ?? spawnSync2;
-  const wait = opts.wait ?? true;
-  const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-  const run = (force) => {
-    const plan = treeKillPlan(platform, pid, force);
-    if (plan.kind === "taskkill") {
-      try {
-        sync("taskkill", plan.args, { windowsHide: true, stdio: "ignore", timeout: 1e4 });
-      } catch {}
-    } else {
-      try {
-        process.kill(-pid, plan.signal);
-      } catch {
-        try {
-          process.kill(pid, plan.signal);
-        } catch {}
-      }
-    }
-  };
-  if (graceMs > 0) {
-    run(false);
-    if (wait) {
-      const deadline = Date.now() + graceMs;
-      while (Date.now() < deadline && pidAlive(pid))
-        sleep(Math.min(100, deadline - Date.now()));
-    }
-  }
-  run(true);
-  return { graceful: graceMs > 0, forced: true };
-}
 
 // src/run-check.ts
 var OUTPUT_LIMIT = 2048;
@@ -13456,9 +14479,9 @@ function truncateOutput(output) {
   return flat.length > OUTPUT_LIMIT ? `${flat.slice(0, OUTPUT_LIMIT)}…` : flat;
 }
 function insideWorktree(worktree, file2) {
-  const root = resolve(worktree);
-  const abs = resolve(root, file2);
-  return abs === root || abs.startsWith(root + sep);
+  const root = resolve2(worktree);
+  const abs = resolve2(root, file2);
+  return abs === root || abs.startsWith(root + sep2);
 }
 async function runShellItem(item, index, worktree) {
   const timeoutSec = Math.min(item.timeoutSec ?? DEFAULT_TIMEOUT_SEC, MAX_TIMEOUT_SEC);
@@ -13471,13 +14494,15 @@ async function runShellItem(item, index, worktree) {
   if (r.timedOut) {
     return { index, kind: "shell", label: item.cmd, ok: false, detail: `timed out after ${timeoutSec}s (partial output: ${truncateOutput(r.output) || "none"})`, durationMs };
   }
+  const displayed = truncateOutput(r.output);
   return {
     index,
     kind: "shell",
     label: item.cmd,
     ok: r.code === 0,
-    detail: `exit=${r.code} ${truncateOutput(r.output)}`.trim(),
-    durationMs
+    detail: `exit=${r.code} ${displayed}`.trim(),
+    durationMs,
+    comparable: Number.isInteger(r.code) && r.output.length <= OUTPUT_LIMIT && displayed.length <= OUTPUT_LIMIT ? JSON.stringify([r.code, r.output]) : undefined
   };
 }
 function runContainsItem(item, index, worktree) {
@@ -13486,7 +14511,7 @@ function runContainsItem(item, index, worktree) {
   if (!insideWorktree(worktree, item.file)) {
     return { index, kind: "contains", label, ok: false, detail: "path escapes the workspace boundary", durationMs: Date.now() - started };
   }
-  const abs = join2(worktree, item.file);
+  const abs = join3(worktree, item.file);
   let content;
   try {
     content = readFileSync(abs, "utf8");
@@ -13500,7 +14525,8 @@ function runContainsItem(item, index, worktree) {
     label,
     ok,
     detail: ok ? `found in ${item.file} (${content.length} chars)` : `required text not found in ${item.file} (${content.length} chars)`,
-    durationMs: Date.now() - started
+    durationMs: Date.now() - started,
+    comparable: JSON.stringify([ok, content.length])
   };
 }
 async function runChecks(checks3, worktree) {
@@ -13520,1491 +14546,16 @@ function formatOutcomes(outcomes) {
 `);
 }
 
-// src/job-manager.ts
-var DEFAULT_MAX_FINISHED_JOBS = 50;
-var DEFAULT_MAX_TAIL_CHARS = 8192;
-var DEFAULT_MAX_REGISTRY_CHARS = 524288;
-var DEFAULT_WAKE_WINDOW_MS = 600000;
-var DEFAULT_MAX_LEDGER_ENTRIES = 200;
-function iso(now) {
-  return new Date(now()).toISOString();
-}
-function createJobManager(opts = {}) {
-  const now = opts.now ?? Date.now;
-  const maxFinishedJobs = opts.maxFinishedJobs ?? DEFAULT_MAX_FINISHED_JOBS;
-  const maxTailChars = opts.maxTailChars ?? DEFAULT_MAX_TAIL_CHARS;
-  const maxRegistryChars = opts.maxRegistryChars ?? DEFAULT_MAX_REGISTRY_CHARS;
-  const wakeWindowMs = opts.wakeWindowMs ?? DEFAULT_WAKE_WINDOW_MS;
-  const maxLedgerEntries = opts.maxLedgerEntries ?? DEFAULT_MAX_LEDGER_ENTRIES;
-  const jobs = new Map;
-  const ledger = [];
-  function emit(kind, job, detail) {
-    const entry = { at: iso(now), kind, jobId: job.id, session: job.ownerSession, detail };
-    ledger.push(entry);
-    if (ledger.length > maxLedgerEntries)
-      ledger.splice(0, ledger.length - maxLedgerEntries);
-    try {
-      opts.sink?.(entry);
-    } catch {}
-  }
-  function totalRegistryChars() {
-    let n = 0;
-    for (const j of jobs.values())
-      n += j.tail.length;
-    return n;
-  }
-  function isTerminal2(job) {
-    return job.state !== "running";
-  }
-  function enforceCaps() {
-    const finished = [...jobs.values()].filter(isTerminal2).sort((a, b) => (a.endedAt ?? a.startedAt) - (b.endedAt ?? b.startedAt));
-    let over = jobs.size - (maxFinishedJobs + countRunning());
-    let chars = totalRegistryChars();
-    for (const j of finished) {
-      if (over <= 0 && chars <= maxRegistryChars)
-        break;
-      emit("evicted", j, `evicted from registry (state ${j.state})`);
-      jobs.delete(j.id);
-      over--;
-      chars -= j.tail.length;
-    }
-  }
-  function countRunning() {
-    let n = 0;
-    for (const j of jobs.values())
-      if (!isTerminal2(j))
-        n++;
-    return n;
-  }
-  function create(input) {
-    const t = now();
-    const job = {
-      ...input,
-      scope: "session",
-      state: "running",
-      exitCode: null,
-      startedAt: t,
-      endedAt: null,
-      lastOutputAt: t,
-      tail: "",
-      outLen: 0,
-      pollCursor: 0,
-      readAfterEnd: false,
-      succeededAt: null,
-      wakeState: "none",
-      wakeQueuedAt: null
-    };
-    jobs.set(job.id, job);
-    enforceCaps();
-    return job;
-  }
-  function setPid(job, pid) {
-    job.pid = pid;
-  }
-  function get(id) {
-    return jobs.get(id);
-  }
-  function list() {
-    return [...jobs.values()].sort((a, b) => b.startedAt - a.startedAt);
-  }
-  function appendOutput(job, chunk) {
-    if (!chunk)
-      return;
-    job.outLen += chunk.length;
-    job.lastOutputAt = now();
-    const next = job.tail + chunk;
-    job.tail = next.length > maxTailChars ? next.slice(next.length - maxTailChars) : next;
-  }
-  function markTerminal(job, state, exitCode) {
-    if (isTerminal2(job))
-      return;
-    job.state = state;
-    job.exitCode = exitCode;
-    job.endedAt = now();
-    if (job.notify && job.wakeState === "none" && !job.terminalEvidence) {
-      job.wakeState = "queued";
-      job.wakeQueuedAt = now();
-      try {
-        opts.onWakeQueued?.(job);
-      } catch {}
-    }
-    if (job.terminalEvidence) {
-      jobs.delete(job.id);
-      rememberConsumed(job.id);
-    }
-    enforceCaps();
-  }
-  const consumedIds = new Set;
-  function rememberConsumed(id) {
-    if (consumedIds.has(id))
-      return;
-    consumedIds.add(id);
-    if (consumedIds.size > maxFinishedJobs) {
-      const oldest = consumedIds.values().next().value;
-      if (oldest !== undefined)
-        consumedIds.delete(oldest);
-    }
-  }
-  function consumed(id) {
-    return consumedIds.has(id);
-  }
-  function kill(job) {
-    if (isTerminal2(job))
-      return;
-    try {
-      job.killTree();
-    } catch {}
-    markTerminal(job, "killed", null);
-  }
-  function poll(job) {
-    if (isTerminal2(job)) {
-      job.readAfterEnd = true;
-      jobs.delete(job.id);
-      rememberConsumed(job.id);
-    }
-    const cursor = job.outLen;
-    const start = job.pollCursor;
-    const newOutput = sliceFromCursor(job, start);
-    job.pollCursor = cursor;
-    return {
-      state: job.state,
-      exitCode: job.exitCode,
-      newOutput,
-      cursor,
-      succeeded: job.succeededAt !== null,
-      logPath: job.logPath
-    };
-  }
-  function sliceFromCursor(job, cursor) {
-    const startOffset = Math.max(0, cursor - (job.outLen - job.tail.length));
-    return job.tail.slice(startOffset);
-  }
-  function clear(id) {
-    const job = jobs.get(id);
-    if (!job || !isTerminal2(job))
-      return false;
-    jobs.delete(id);
-    return true;
-  }
-  function handoff(id, toSession) {
-    const job = jobs.get(id);
-    if (!job)
-      return;
-    job.scope = "global";
-    if (toSession)
-      job.ownerSession = toSession;
-    return job;
-  }
-  function onSessionEnd(sessionID, keep) {
-    for (const job of [...jobs.values()]) {
-      if (job.ownerSession !== sessionID)
-        continue;
-      if (job.survive)
-        continue;
-      if (keep?.(job)) {
-        if (!isTerminal2(job)) {
-          if (job.scope === "global")
-            continue;
-          kill(job);
-          emit("orphan-job", job, `owner session ended; registry kill issued (row kept for wake delivery — was: ${job.cmd.slice(0, 120)})`);
-        }
-        continue;
-      }
-      if (!isTerminal2(job)) {
-        if (job.scope === "global")
-          continue;
-        kill(job);
-        emit("orphan-job", job, `owner session ended; tree killed (was: ${job.cmd.slice(0, 120)})`);
-      } else if (!job.readAfterEnd) {
-        emit("unread-completion", job, `owner session ended before the completion was read (state ${job.state}, exit ${job.exitCode})`);
-      }
-      jobs.delete(job.id);
-    }
-  }
-  function disposeAll(skip) {
-    for (const job of [...jobs.values()]) {
-      if (job.survive)
-        continue;
-      if (skip?.(job))
-        continue;
-      if (!isTerminal2(job)) {
-        kill(job);
-        emit("orphan-job", job, "plugin dispose; tree killed");
-      }
-      jobs.delete(job.id);
-    }
-  }
-  function deliverWakesFor(sessionID) {
-    abandonStaleWakes();
-    const ready = [];
-    for (const job of jobs.values()) {
-      if (job.wakeState === "queued" && job.ownerSession === sessionID) {
-        job.wakeState = "delivered";
-        ready.push(job);
-      }
-    }
-    return ready;
-  }
-  function abandonStaleWakes() {
-    const t = now();
-    for (const job of jobs.values()) {
-      if (job.wakeState === "queued" && job.wakeQueuedAt !== null && t - job.wakeQueuedAt > wakeWindowMs) {
-        job.wakeState = "abandoned";
-        emit("wake-timeout", job, `session stayed busy past the ${wakeWindowMs}ms delivery window (state ${job.state}, exit ${job.exitCode})`);
-      }
-    }
-  }
-  function ledgerEntries() {
-    return [...ledger];
-  }
-  return {
-    create,
-    setPid,
-    get,
-    list,
-    appendOutput,
-    markTerminal,
-    kill,
-    poll,
-    clear,
-    handoff,
-    onSessionEnd,
-    disposeAll,
-    deliverWakesFor,
-    abandonStaleWakes,
-    ledgerEntries,
-    consumed,
-    size: () => jobs.size
-  };
-}
-function newJobId(now = Date.now) {
-  const d = new Date(now());
-  const p = (n, w = 2) => String(n).padStart(w, "0");
-  const rand = Math.random().toString(36).slice(2, 8);
-  return `j-${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}-${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}-${rand}`;
-}
-
-// src/job-runner.ts
-import { spawn as spawn3 } from "node:child_process";
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, readFileSync as readFileSync2, statSync as statSync2, unlinkSync } from "node:fs";
-import { join as join3 } from "node:path";
-import { tmpdir } from "node:os";
-var DEFAULT_IDLE_MS = 60000;
-var DEFAULT_MAX_WAIT_MS = 120000;
-var HARD_MAX_WAIT_MS = 600000;
-var POLL_WAIT_MAX_MS = 30000;
-var DEFAULT_LOG_KEEP = 50;
-var JOB_ENV_MARKER = "FORGE_JOB_ID";
-var TAIL_POLL_MS = 200;
-var ADOPT_LIVENESS_MS = 1000;
-function jobsLogDir(base) {
-  return join3(base ?? join3(tmpdir(), "opencode-forge"), "jobs");
-}
-var TAIL_CHUNK_BYTES = 4 * 1024 * 1024;
-function createFileTail(logPath, onText, pollMs = TAIL_POLL_MS) {
-  let pos = existsSync(logPath) ? statSync2(logPath).size : 0;
-  let stopped = false;
-  const flush = () => {
-    if (stopped)
-      return;
-    try {
-      let size = existsSync(logPath) ? statSync2(logPath).size : 0;
-      if (size < pos)
-        pos = size;
-      const fd = openSync(logPath, "r");
-      try {
-        const buf = Buffer.allocUnsafe(TAIL_CHUNK_BYTES);
-        while (pos < size) {
-          const want = Math.min(TAIL_CHUNK_BYTES, size - pos);
-          let read = 0;
-          while (read < want) {
-            const n = readSync(fd, buf, read, want - read, pos + read);
-            if (n <= 0)
-              break;
-            read += n;
-          }
-          if (read <= 0)
-            break;
-          pos += read;
-          onText(buf.toString("utf8", 0, read));
-          size = existsSync(logPath) ? statSync2(logPath).size : size;
-          if (stopped)
-            break;
-        }
-      } finally {
-        closeSync(fd);
-      }
-    } catch {}
-  };
-  const timer = setInterval(flush, pollMs);
-  timer.unref?.();
-  return {
-    flush,
-    stop() {
-      stopped = true;
-      clearInterval(timer);
-    }
-  };
-}
-var liveTails = new Map;
-function flushJobOutput(job) {
-  liveTails.get(job.id)?.flush();
-}
-function startJob(manager, opts) {
-  const idleMs = Math.max(0, opts.idleMs ?? DEFAULT_IDLE_MS);
-  const maxWaitMs = Math.min(Math.max(0, opts.maxWaitMs ?? DEFAULT_MAX_WAIT_MS), HARD_MAX_WAIT_MS);
-  mkdirSync(opts.logDir, { recursive: true });
-  const id = newJobId();
-  const logPath = join3(opts.logDir, `${id}.log`);
-  let child;
-  let settled = false;
-  let exiting = false;
-  let idleTimer = null;
-  const maxWaitTimer = setTimeout(() => {
-    resolveStillRunning();
-  }, maxWaitMs);
-  maxWaitTimer.unref?.();
-  let resolveSettle = () => {};
-  const settle = new Promise((res) => {
-    resolveSettle = res;
-  });
-  const armIdle = () => {
-    if (idleTimer)
-      clearTimeout(idleTimer);
-    idleTimer = setTimeout(() => resolveStillRunning(), idleMs);
-    idleTimer.unref?.();
-  };
-  const stopTimers = () => {
-    if (idleTimer)
-      clearTimeout(idleTimer);
-    idleTimer = null;
-    clearTimeout(maxWaitTimer);
-  };
-  const firstOutputHooks = [];
-  const foregroundWatch = !opts.runInBackground;
-  const stampTerminalEvidence = () => {
-    if (foregroundWatch && !settled)
-      job.terminalEvidence = true;
-  };
-  function resolveStillRunning() {
-    if (settled)
-      return;
-    settled = true;
-    stopTimers();
-    resolveSettle({ status: "still-running", idleForMs: Date.now() - job.lastOutputAt, outputTail: job.tail });
-  }
-  const job = manager.create({
-    id,
-    cmd: opts.cmd,
-    worktree: opts.worktree,
-    ownerSession: opts.ownerSession,
-    logPath,
-    notify: opts.notify ?? true,
-    killTree: () => {
-      killTree(child);
-      if (opts.survive)
-        opts.registry?.remove(id);
-    },
-    ...opts.survive ? { survive: true } : {}
-  });
-  let wfd;
-  try {
-    wfd = openSync(logPath, "a");
-    child = shellSpawn(opts.spawnFn ?? spawn3, opts.cmd, {
-      shell: opts.shell,
-      cwd: opts.cwd,
-      env: { ...opts.env ?? {}, [JOB_ENV_MARKER]: id },
-      stdio: ["ignore", wfd, wfd]
-    });
-  } catch (err) {
-    if (wfd !== undefined) {
-      try {
-        closeSync(wfd);
-      } catch {}
-    }
-    stampTerminalEvidence();
-    manager.markTerminal(job, "killed", null);
-    maxWaitTimer && clearTimeout(maxWaitTimer);
-    job.spawnError = String(err);
-    resolveSettle({ status: "exited", exitCode: null, outputTail: "", spawnError: String(err) });
-    return { job, settle };
-  }
-  if (wfd !== undefined) {
-    try {
-      closeSync(wfd);
-    } catch {}
-  }
-  manager.setPid(job, child.pid ?? 0);
-  if (opts.survive) {
-    opts.registry?.add({ id, pid: child.pid ?? 0, cmd: opts.cmd, logPath, startedAt: job.startedAt, ownerSession: opts.ownerSession, hostPid: process.pid });
-  } else if (opts.fence) {
-    opts.fence.assign(child.pid ?? 0);
-    let reinforced = false;
-    const reinforce = () => {
-      if (reinforced)
-        return;
-      (async () => {
-        const kid = await opts.relocateAsync?.(child.pid ?? 0) ?? opts.relocate?.(child.pid ?? 0) ?? null;
-        if (kid !== null && kid > 0) {
-          reinforced = true;
-          opts.fence?.assign(kid);
-          manager.setPid(job, kid);
-        }
-      })();
-    };
-    for (const delay of [50, 400, 1500]) {
-      const t = setTimeout(reinforce, delay);
-      t.unref?.();
-    }
-    firstOutputHooks.push(reinforce);
-  }
-  const onChunk = (text) => {
-    if (firstOutputHooks.length > 0) {
-      for (const hook of firstOutputHooks.splice(0))
-        hook();
-    }
-    manager.appendOutput(job, text);
-    if (opts.successPattern && !settled && job.succeededAt === null) {
-      const m = opts.successPattern.exec(text) ?? opts.successPattern.exec(job.tail);
-      if (m) {
-        settled = true;
-        stopTimers();
-        job.succeededAt = Date.now();
-        const keptAlive = opts.keepAlive !== false;
-        if (!keptAlive) {
-          killTree(child);
-          if (opts.survive)
-            opts.registry?.remove(id);
-          if (foregroundWatch)
-            job.terminalEvidence = true;
-          manager.markTerminal(job, "succeeded", null);
-        }
-        resolveSettle({ status: "succeeded", matched: m[0], outputTail: job.tail, keptAlive });
-      }
-    }
-  };
-  const tail = createFileTail(logPath, onChunk);
-  liveTails.set(id, tail);
-  child.on("exit", (code) => {
-    if (exiting)
-      return;
-    exiting = true;
-    stopTimers();
-    let finished = false;
-    const finish = () => {
-      if (finished)
-        return;
-      finished = true;
-      tail.flush();
-      tail.stop();
-      liveTails.delete(id);
-      stampTerminalEvidence();
-      manager.markTerminal(job, "exited", code);
-      if (opts.survive)
-        opts.registry?.remove(id);
-      rotateLogs(opts.logDir);
-      if (!settled) {
-        settled = true;
-        resolveSettle({ status: "exited", exitCode: code, outputTail: job.tail });
-      }
-    };
-    const graceTimer = setTimeout(finish, opts.exitGraceMs ?? 500);
-    graceTimer.unref?.();
-  });
-  child.on("error", (err) => {
-    tail.stop();
-    liveTails.delete(id);
-    if (opts.survive)
-      opts.registry?.remove(id);
-    if (!settled) {
-      stampTerminalEvidence();
-      settled = true;
-      stopTimers();
-      manager.markTerminal(job, "killed", null);
-      job.spawnError = err.message;
-      resolveSettle({ status: "exited", exitCode: null, outputTail: job.tail, spawnError: err.message });
-    }
-  });
-  if (opts.runInBackground) {
-    stopTimers();
-  } else {
-    armIdle();
-  }
-  return { job, settle };
-}
-async function pollJob(manager, jobId, waitMs = 0) {
-  const job = manager.get(jobId);
-  if (!job)
-    return;
-  const deadline = Date.now() + Math.min(Math.max(0, waitMs), POLL_WAIT_MAX_MS);
-  while (job.outLen === job.pollCursor && job.state === "running" && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 25));
-    flushJobOutput(job);
-  }
-  flushJobOutput(job);
-  return manager.poll(job);
-}
-function adoptSurvivor(manager, entry, opts) {
-  const kill = () => {
-    let pid = entry.pid;
-    for (let hop = 0;hop < 3 && !pidAlive(pid); hop++) {
-      const kid = opts.relocate?.(pid) ?? null;
-      if (kid === null || kid <= 0)
-        break;
-      pid = kid;
-    }
-    killTree({ pid, kill: (sig) => process.kill(pid, sig) });
-    opts.registry.remove(entry.id);
-  };
-  const job = manager.create({
-    id: entry.id,
-    cmd: entry.cmd,
-    worktree: opts.logDir,
-    ownerSession: entry.ownerSession,
-    logPath: entry.logPath,
-    notify: false,
-    killTree: kill,
-    survive: true,
-    previousRun: true
-  });
-  manager.setPid(job, entry.pid);
-  const tail = createFileTail(entry.logPath, (t) => manager.appendOutput(job, t));
-  liveTails.set(job.id, tail);
-  const watcher = setInterval(() => {
-    if (!pidAlive(entry.pid)) {
-      clearInterval(watcher);
-      tail.flush();
-      tail.stop();
-      liveTails.delete(job.id);
-      opts.registry.remove(entry.id);
-      manager.markTerminal(job, "exited", null);
-      rotateLogs(opts.logDir);
-    }
-  }, ADOPT_LIVENESS_MS);
-  watcher.unref?.();
-  return job;
-}
-var LOG_READ_MAX_BYTES = 8 * 1024 * 1024;
-function readJobLog(logPath, opts = {}) {
-  const limit = Math.max(1, opts.limit ?? 200);
-  let raw = "";
-  let windowed = false;
-  try {
-    if (existsSync(logPath)) {
-      const size = statSync2(logPath).size;
-      if (size > LOG_READ_MAX_BYTES) {
-        const fd = openSync(logPath, "r");
-        try {
-          const buf = Buffer.allocUnsafe(LOG_READ_MAX_BYTES);
-          let read = 0;
-          while (read < LOG_READ_MAX_BYTES) {
-            const n = readSync(fd, buf, read, LOG_READ_MAX_BYTES - read, size - LOG_READ_MAX_BYTES + read);
-            if (n <= 0)
-              break;
-            read += n;
-          }
-          const text = buf.toString("utf8", 0, read);
-          raw = text.slice(text.indexOf(`
-`) + 1);
-          windowed = true;
-        } finally {
-          closeSync(fd);
-        }
-      } else {
-        raw = readFileSync2(logPath, "utf8");
-      }
-    }
-  } catch {
-    raw = "";
-  }
-  const lines = raw.length === 0 ? [] : raw.split(/\r?\n/);
-  if (lines.length > 0 && lines[lines.length - 1] === "")
-    lines.pop();
-  const total = lines.length;
-  const offset = opts.offset !== undefined ? Math.max(0, Math.min(opts.offset, total)) : Math.max(0, total - limit);
-  return { lines: lines.slice(offset, offset + limit), total, offset, ...windowed ? { windowed: true } : {} };
-}
-function rotateLogs(logDir, keep = DEFAULT_LOG_KEEP) {
-  let entries = [];
-  try {
-    entries = readdirSync(logDir).filter((f) => f.endsWith(".log")).map((name) => {
-      try {
-        return { name, mtime: statSync2(join3(logDir, name)).mtimeMs };
-      } catch {
-        return { name, mtime: 0 };
-      }
-    });
-  } catch {
-    return;
-  }
-  const excess = entries.length - keep;
-  if (excess <= 0)
-    return;
-  entries.sort((a, b) => a.mtime - b.mtime);
-  for (const e of entries.slice(0, excess)) {
-    try {
-      unlinkSync(join3(logDir, e.name));
-    } catch {}
-  }
-}
-
-// src/job-fence.ts
-import { spawn as spawn4 } from "node:child_process";
-var FENCE_PS_SCRIPT = String.raw`
-Add-Type -TypeDefinition @"
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Runtime.InteropServices;
-using System.Threading;
-public static class ForgeJobFence {
-  [StructLayout(LayoutKind.Sequential)]
-  public struct BASIC_LIMITS {
-    public long PerProcessUserTimeLimit;
-    public long PerJobUserTimeLimit;
-    public uint LimitFlags;
-    public UIntPtr MinimumWorkingSetSize;
-    public UIntPtr MaximumWorkingSetSize;
-    public uint ActiveProcessLimit;
-    public UIntPtr Affinity;
-    public uint PriorityClass;
-    public uint SchedulingClass;
-  }
-  [StructLayout(LayoutKind.Sequential)]
-  public struct IO_COUNTERS {
-    public ulong ReadOperationCount;
-    public ulong WriteOperationCount;
-    public ulong OtherOperationCount;
-    public ulong ReadTransferCount;
-    public ulong WriteTransferCount;
-    public ulong OtherTransferCount;
-  }
-  [StructLayout(LayoutKind.Sequential)]
-  public struct EXTENDED_LIMITS {
-    public BASIC_LIMITS Basic;
-    public IO_COUNTERS IoInfo;
-    public UIntPtr ProcessMemoryLimit;
-    public UIntPtr JobMemoryLimit;
-    public UIntPtr PeakProcessMemoryUsed;
-    public UIntPtr PeakJobMemoryUsed;
-  }
-  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
-  public struct PE32 {
-    public uint dwSize;
-    public uint cntUsage;
-    public uint th32ProcessID;
-    public IntPtr th32DefaultHeapID;
-    public uint th32ModuleID;
-    public uint cntThreads;
-    public uint th32ParentProcessID;
-    public int pcPriClassBase;
-    public uint dwFlags;
-    [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
-    public string szExeFile;
-  }
-  [DllImport("kernel32.dll", SetLastError = true)]
-  static extern IntPtr CreateJobObject(IntPtr a, string n);
-  [DllImport("kernel32.dll", SetLastError = true)]
-  static extern bool SetInformationJobObject(IntPtr hJob, int infoClass, IntPtr lpInfo, int cbInfo);
-  [DllImport("kernel32.dll", SetLastError = true)]
-  static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProcess);
-  [DllImport("kernel32.dll")]
-  static extern IntPtr OpenProcess(uint access, bool inherit, int pid);
-  [DllImport("kernel32.dll")]
-  static extern bool CloseHandle(IntPtr h);
-  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-  static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
-  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-  static extern bool Process32FirstW(IntPtr h, ref PE32 e);
-  [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-  static extern bool Process32NextW(IntPtr h, ref PE32 e);
-
-  const int EXTENDED_LIMITS_CLASS = 9;
-  const uint KILL_ON_JOB_CLOSE = 0x2000;
-  const uint PROCESS_ALL_ACCESS = 0x1FFFFF;
-  const uint SNAP_PROCESS = 0x2;
-  // Descendant walk bound: deep enough for wrapper -> command -> children,
-  // shallow enough that a recycled ancestor pid cannot pull unrelated
-  // processes into the kill-on-close job.
-  const int MAX_DEPTH = 4;
-
-  static IntPtr _job = IntPtr.Zero;
-  static readonly HashSet<uint> _roots = new HashSet<uint>();
-  static readonly HashSet<uint> _fenced = new HashSet<uint>();
-  static readonly object _gate = new object();
-  static Timer _sweep;
-
-  static void Sweep(object state) {
-    try {
-      var parents = new Dictionary<uint, uint>();
-      var h = CreateToolhelp32Snapshot(SNAP_PROCESS, 0);
-      if (h != IntPtr.Zero && h != new IntPtr(-1)) {
-        var e = new PE32();
-        e.dwSize = (uint)Marshal.SizeOf(typeof(PE32));
-        if (Process32FirstW(h, ref e)) {
-          do { parents[e.th32ProcessID] = e.th32ParentProcessID; } while (Process32NextW(h, ref e));
-        }
-        CloseHandle(h);
-      }
-      lock (_gate) {
-        if (_job == IntPtr.Zero) return;
-        foreach (var kv in parents) {
-          if (_fenced.Contains(kv.Key)) continue;
-          uint p = kv.Key;
-          int depth = 0;
-          bool tracked = false;
-          while (p != 0 && depth <= MAX_DEPTH) {
-            if (_roots.Contains(p)) { tracked = true; break; }
-            uint up;
-            if (parents.TryGetValue(p, out up)) { p = up; } else { p = 0; }
-            depth++;
-          }
-          if (!tracked) continue;
-          var ph = OpenProcess(PROCESS_ALL_ACCESS, false, (int)kv.Key);
-          if (ph != IntPtr.Zero) {
-            if (AssignProcessToJobObject(_job, ph)) _fenced.Add(kv.Key);
-            CloseHandle(ph);
-          }
-        }
-      }
-    } catch { }
-  }
-
-  public static int Run() {
-    _job = CreateJobObject(IntPtr.Zero, null);
-    if (_job == IntPtr.Zero) return 2;
-    var info = Marshal.AllocHGlobal(Marshal.SizeOf(typeof(EXTENDED_LIMITS)));
-    try {
-      Marshal.WriteInt32(info, 16, (int)KILL_ON_JOB_CLOSE);  // Basic.LimitFlags offset
-      if (!SetInformationJobObject(_job, EXTENDED_LIMITS_CLASS, info, Marshal.SizeOf(typeof(EXTENDED_LIMITS)))) return 3;
-    } finally {
-      Marshal.FreeHGlobal(info);
-    }
-    _sweep = new Timer(Sweep, null, 0, 400);
-    string line;
-    while ((line = Console.In.ReadLine()) != null) {
-      uint pid;
-      var t = line.Trim();
-      if (t.Length > 0 && uint.TryParse(t, out pid) && pid > 0) {
-        lock (_gate) { _roots.Add(pid); }
-        var ph = OpenProcess(PROCESS_ALL_ACCESS, false, (int)pid);
-        if (ph != IntPtr.Zero) {
-          if (AssignProcessToJobObject(_job, ph)) {
-            lock (_gate) { _fenced.Add(pid); }
-          }
-          CloseHandle(ph);
-        }
-      }
-    }
-    return 0;  // stdin EOF: the host is gone -> exit -> handle closes -> kernel kills
-  }
-}
-"@
-[ForgeJobFence]::Run()
-exit $LASTEXITCODE
-`;
-function createJobFence(opts = {}) {
-  const platform = opts.platform ?? process.platform;
-  if (platform !== "win32")
-    return null;
-  const spawnFn = opts.spawnFn ?? spawn4;
-  let child;
-  try {
-    child = spawnFn("powershell", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", FENCE_PS_SCRIPT], {
-      windowsHide: true,
-      stdio: ["pipe", "ignore", "ignore"]
-    });
-  } catch (err) {
-    opts.onDegrade?.(`job fence not started: spawn failed (${String(err).slice(0, 120)})`);
-    return null;
-  }
-  const stdin = child.stdin;
-  if (!stdin) {
-    opts.onDegrade?.("job fence not started: watcher has no stdin");
-    return null;
-  }
-  let healthy = true;
-  child.on("exit", () => {
-    healthy = false;
-  });
-  child.on("error", () => {
-    healthy = false;
-  });
-  let reported = false;
-  const fail = (why) => {
-    healthy = false;
-    if (reported)
-      return;
-    reported = true;
-    opts.onDegrade?.(why);
-  };
-  return {
-    assign(pid) {
-      if (!healthy || !stdin.writable) {
-        fail("job fence watcher gone; job relies on the JS exit matrix only");
-        return;
-      }
-      try {
-        stdin.write(`${pid}
-`);
-      } catch (err) {
-        fail(`job fence write failed (${String(err).slice(0, 120)})`);
-      }
-    },
-    dispose() {
-      try {
-        stdin.end();
-      } catch {}
-    },
-    get healthy() {
-      return healthy;
-    }
-  };
-}
-
-// src/job-registry.ts
-import { closeSync as closeSync2, existsSync as existsSync2, mkdirSync as mkdirSync2, openSync as openSync2, readFileSync as readFileSync3, readdirSync as readdirSync2, statSync as statSync3, unlinkSync as unlinkSync2, writeFileSync as writeFileSync2 } from "node:fs";
-import { execFileSync, spawn as spawn5 } from "node:child_process";
-import { dirname as dirname2, join as join4 } from "node:path";
-var REGISTRY_KEEP = 100;
-function structuralRelocate(deadPid, platform = process.platform) {
-  if (deadPid <= 0)
-    return null;
-  if (platform === "win32") {
-    for (let attempt = 0;attempt < 2; attempt++) {
-      if (attempt > 0)
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);
-      try {
-        const raw = execFileSync("powershell", ["-NoProfile", "-Command", `Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq ${deadPid} -and $_.Name -ne 'conhost.exe' } | Select-Object -First 1 -ExpandProperty ProcessId`], { encoding: "utf8", windowsHide: true, timeout: 1e4 });
-        const pid = Number(String(raw).trim());
-        if (Number.isInteger(pid) && pid > 0)
-          return pid;
-      } catch {}
-    }
-    return null;
-  }
-  try {
-    for (const ent of readdirSync2("/proc")) {
-      if (!/^\d+$/.test(ent))
-        continue;
-      try {
-        const m = /^(\d+) \((.*)\) (\w) (\d+)/.exec(readFileSync3(`/proc/${ent}/stat`, "utf8"));
-        if (m && Number(m[4]) === deadPid)
-          return Number(m[1]);
-      } catch {}
-    }
-  } catch {
-    return null;
-  }
-  return null;
-}
-function structuralRelocateAsync(deadPid, platform = process.platform) {
-  if (deadPid <= 0)
-    return Promise.resolve(null);
-  if (platform !== "win32")
-    return Promise.resolve(structuralRelocate(deadPid, platform));
-  return new Promise((resolve2) => {
-    let out = "";
-    let settled = false;
-    const done = (pid) => {
-      if (settled)
-        return;
-      settled = true;
-      clearTimeout(timer);
-      const n = Number(String(out).trim());
-      resolve2(Number.isInteger(n) && n > 0 ? n : pid);
-    };
-    const child = spawn5("powershell", ["-NoProfile", "-Command", `Get-CimInstance Win32_Process | Where-Object { $_.ParentProcessId -eq ${deadPid} -and $_.Name -ne 'conhost.exe' } | Select-Object -First 1 -ExpandProperty ProcessId`], { windowsHide: true, stdio: ["ignore", "pipe", "ignore"] });
-    const timer = setTimeout(() => {
-      try {
-        child.kill();
-      } catch {}
-      done(null);
-    }, 1e4);
-    child.stdout?.on("data", (d) => {
-      out += d;
-    });
-    child.on("error", () => done(null));
-    child.on("exit", () => done(null));
-  });
-}
-function acquireLock(lockPath, timeoutMs = 2000) {
-  const deadline = Date.now() + timeoutMs;
-  for (;; ) {
-    try {
-      const fd = openSync2(lockPath, "wx");
-      return {
-        release: () => {
-          try {
-            closeSync2(fd);
-            unlinkSync2(lockPath);
-          } catch {}
-        }
-      };
-    } catch (err) {
-      if (err.code !== "EEXIST")
-        throw err;
-      try {
-        if (Date.now() - statSync3(lockPath).mtimeMs > 5000) {
-          unlinkSync2(lockPath);
-          continue;
-        }
-      } catch {}
-      if (Date.now() >= deadline)
-        return null;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50);
-    }
-  }
-}
-function readRaw(path) {
-  try {
-    const raw = existsSync2(path) ? readFileSync3(path, "utf8") : "";
-    if (!raw.trim())
-      return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed.entries))
-      return [];
-    return parsed.entries.filter((e) => typeof e?.id === "string" && Number.isFinite(e?.pid) && e.pid > 0);
-  } catch {
-    return [];
-  }
-}
-function writeRaw(path, entries) {
-  mkdirSync2(dirname2(path), { recursive: true });
-  writeFileSync2(path, `${JSON.stringify({ version: 1, entries: entries.slice(0, REGISTRY_KEEP) }, null, 2)}
-`);
-}
-function createJobRegistry(registryPath) {
-  const lockPath = `${registryPath}.lock`;
-  try {
-    mkdirSync2(dirname2(registryPath), { recursive: true });
-  } catch {}
-  const mutate = (fn) => {
-    const lock = acquireLock(lockPath);
-    if (!lock)
-      return false;
-    try {
-      writeRaw(registryPath, fn(readRaw(registryPath)));
-      return true;
-    } finally {
-      lock.release();
-    }
-  };
-  return {
-    add(entry) {
-      mutate((entries) => [entry, ...entries.filter((e) => e.id !== entry.id)].slice(0, REGISTRY_KEEP));
-    },
-    remove(id) {
-      mutate((entries) => entries.filter((e) => e.id !== id));
-    },
-    list() {
-      return readRaw(registryPath);
-    },
-    rescan(isAlive, relocate) {
-      const entries = readRaw(registryPath);
-      const adopted = [];
-      const dead = [];
-      for (const e of entries) {
-        if (isAlive(e.pid)) {
-          adopted.push(e);
-          continue;
-        }
-        const relocated = relocate?.(e.pid) ?? null;
-        if (relocated !== null && relocated !== e.pid && isAlive(relocated)) {
-          adopted.push({ ...e, pid: relocated });
-        } else {
-          dead.push(e);
-        }
-      }
-      const lock = acquireLock(lockPath);
-      if (lock) {
-        try {
-          writeRaw(registryPath, adopted);
-        } finally {
-          lock.release();
-        }
-      }
-      return { adopted, dead };
-    }
-  };
-}
-function registryPathFor(jobsDir) {
-  return join4(jobsDir, "registry.json");
-}
-
-// src/host-exit.ts
-function createExitCleanup(manager, opts = {}) {
-  const graceMs = opts.graceMs ?? 3000;
-  let sequenced = false;
-  let forceIssued = false;
-  let afterRan = false;
-  const installed = [];
-  const liveTargets = () => {
-    const targets = [];
-    for (const job of manager.list()) {
-      if (job.state === "running" && !job.survive && !opts.skip?.(job))
-        targets.push(job);
-    }
-    return targets;
-  };
-  const exemptRows = () => manager.list().filter((job) => job.state === "running" && Boolean(opts.skip?.(job))).length;
-  const trace = (line) => {
-    try {
-      opts.trace?.(line);
-    } catch {}
-  };
-  const killOne = (job, graceful) => {
-    if (opts.skip?.(job))
-      return;
-    const pid = job.pid ?? 0;
-    trace(`kill job=${job.id} pid=${pid} owner=${job.ownerSession} graceful=${graceful ? "yes" : "no"}`);
-    if (pid > 0) {
-      terminateTreeSync(pid, {
-        graceMs: graceful ? graceMs : 0,
-        spawnSyncFn: opts.spawnSyncFn,
-        platform: opts.platform,
-        ...opts.noWait ? { wait: false } : {}
-      });
-    }
-    try {
-      job.killTree();
-    } catch {}
-    manager.markTerminal(job, "killed", null);
-  };
-  const forcePass = () => {
-    if (forceIssued)
-      return;
-    forceIssued = true;
-    for (const job of liveTargets())
-      killOne(job, false);
-  };
-  const trigger = (kind) => {
-    if (kind === "dispose") {
-      if (sequenced) {
-        trace("dispose: ignored (sequenced latch already set)");
-        return;
-      }
-      sequenced = true;
-      const targets = liveTargets();
-      trace(`dispose: live targets=${targets.length} exempt rows=${exemptRows()}`);
-      for (const job of targets)
-        killOne(job, true);
-      forcePass();
-      if (!afterRan) {
-        afterRan = true;
-        opts.after?.();
-      }
-      return;
-    }
-    if (!forceIssued)
-      trace(`${kind}: live targets=${liveTargets().length} exempt rows=${exemptRows()}`);
-    forcePass();
-  };
-  const onSignal = (kind) => () => trigger(kind);
-  const wired = [
-    ["SIGINT", onSignal("SIGINT")],
-    ["SIGTERM", onSignal("SIGTERM")],
-    ["exit", onSignal("exit")],
-    ["uncaughtException", onSignal("uncaughtException")],
-    ["unhandledRejection", onSignal("unhandledRejection")]
-  ];
-  for (const [ev, fn] of wired) {
-    process.on(ev, fn);
-    installed.push([ev, fn]);
-  }
-  return {
-    trigger,
-    uninstall() {
-      for (const [ev, fn] of installed) {
-        try {
-          process.removeListener(ev, fn);
-        } catch {}
-      }
-    }
-  };
-}
-
-// src/watchdog.ts
-import { mkdirSync as mkdirSync3, readFileSync as readFileSync4, writeFileSync as writeFileSync3 } from "node:fs";
-import { dirname as dirname3 } from "node:path";
-var WATCHDOG_ENV_MARK = "FORGE_WATCHDOG_MARK";
-var DEFAULT_STALL_MS = 600000;
-var MIN_STALL_MS = 60000;
-var DEFAULT_INTERVAL_MS = 30000;
-var DEFAULT_OBSERVE_MS = 60000;
-var WARN_RATIO = 0.8;
-function clampStallMs(raw, min = MIN_STALL_MS) {
-  const n = typeof raw === "number" && Number.isFinite(raw) ? raw : DEFAULT_STALL_MS;
-  return Math.max(min, Math.floor(n));
-}
-function parseMode(raw) {
-  return raw === "off" || raw === "dry-run" || raw === "kill" ? raw : "kill";
-}
-function createWatchdog(opts = {}) {
-  const mode = parseMode(opts.mode);
-  const stallMs = clampStallMs(opts.stallMs, opts.minStallMs ?? MIN_STALL_MS);
-  const intervalMs = Math.max(1, opts.intervalMs ?? DEFAULT_INTERVAL_MS);
-  const observeMs = opts.observeMs ?? DEFAULT_OBSERVE_MS;
-  const now = opts.now ?? Date.now;
-  const sink = opts.sink ?? (() => {});
-  const locate = opts.locate ?? (async () => []);
-  const killTree2 = opts.killTree ?? (() => {});
-  const isAlive = opts.isAlive ?? ((pid) => {
-    try {
-      process.kill(pid, 0);
-      return true;
-    } catch {
-      return false;
-    }
-  });
-  const setIntervalFn = opts.setIntervalFn ?? setInterval;
-  const clearIntervalFn = opts.clearIntervalFn ?? clearInterval;
-  let currentMode = mode;
-  const table = new Map;
-  const markerSeenIDs = new Set;
-  let timer = null;
-  const write = (event, rec, extra = {}) => {
-    sink({
-      ts: new Date(now()).toISOString(),
-      event,
-      callID: rec.callID,
-      ...rec.sessionID !== undefined ? { sessionID: rec.sessionID } : {},
-      tool: rec.tool,
-      t0: rec.t0,
-      elapsedMs: now() - rec.t0,
-      mode: currentMode,
-      ...extra
-    });
-  };
-  const ensureTimer = () => {
-    if (currentMode === "off" || timer)
-      return;
-    timer = setIntervalFn(() => {
-      scan();
-    }, intervalMs);
-    timer.unref?.();
-  };
-  const maybeStopTimer = () => {
-    if (timer && table.size === 0) {
-      clearIntervalFn(timer);
-      timer = null;
-    }
-  };
-  const act = async (rec) => {
-    rec.acted = true;
-    try {
-      if (!rec.markerSeen) {
-        const pids2 = await locate(rec.callID, rec.t0, rec.cmdNeedle);
-        write("dry-run-candidate", rec, {
-          pids: pids2,
-          reason: "marker-missing (shell.env hook did not fire) — degraded to dry-run"
-        });
-        return;
-      }
-      const pidsA = await locate(rec.callID, rec.t0, rec.cmdNeedle, false);
-      let pids = pidsA;
-      if (pidsA.length === 0 && rec.cmdNeedle !== undefined) {
-        const pidsB = await locate(rec.callID, rec.t0, rec.cmdNeedle, true);
-        if (pidsB.length > 0) {
-          pids = pidsB;
-          rec.wave = 2;
-        }
-      }
-      if (pids.length === 0) {
-        write("unresolved", rec, { reason: "no matching process found" });
-        return;
-      }
-      if (currentMode === "dry-run") {
-        write("dry-run-candidate", rec, { pids, candidates: pidsA });
-        return;
-      }
-      const killed = [];
-      for (const p of pids) {
-        try {
-          killTree2(p.pid);
-          killed.push(p);
-        } catch {}
-      }
-      rec.killedAt = now();
-      if (rec.wave === 0)
-        rec.wave = 1;
-      write("kill", rec, {
-        pids: killed,
-        candidates: pids,
-        reason: pids === pidsA ? "wave 1 — host subtree / command match" : "workspace scope (call's own chain already exited)"
-      });
-    } catch (err) {
-      write("unresolved", rec, { reason: `intervention failed: ${String(err)}` });
-    }
-  };
-  const scan = async () => {
-    if (currentMode === "off")
-      return;
-    const nowMs = now();
-    for (const rec of table.values()) {
-      const elapsed = nowMs - rec.t0;
-      if (rec.acted && rec.killedAt !== undefined && !rec.unresolvedReported) {
-        if (nowMs - rec.killedAt >= observeMs) {
-          if (currentMode === "kill" && rec.wave === 1 && rec.cmdNeedle !== undefined) {
-            const wave2 = await locate(rec.callID, rec.t0, rec.cmdNeedle, true);
-            const stillAlive = wave2.filter((p) => isAlive(p.pid));
-            if (stillAlive.length > 0) {
-              const killed2 = [];
-              for (const p of stillAlive) {
-                try {
-                  killTree2(p.pid);
-                  killed2.push(p);
-                } catch {}
-              }
-              rec.killedAt = now();
-              rec.wave = 2;
-              write("kill", rec, { pids: killed2, reason: "wave 2 — workspace scope (wave 1 did not unblock the call)" });
-              return;
-            }
-          }
-          rec.unresolvedReported = true;
-          write("unresolved", rec, { reason: "no tool.execute.after within the observation window after kill" });
-        }
-        continue;
-      }
-      if (rec.acted)
-        continue;
-      if (elapsed >= stallMs) {
-        await act(rec);
-        continue;
-      }
-      if (elapsed >= WARN_RATIO * stallMs && !rec.warned) {
-        rec.warned = true;
-        write("warn", rec);
-      }
-    }
-    maybeStopTimer();
-  };
-  return {
-    get mode() {
-      return currentMode;
-    },
-    get stallMs() {
-      return stallMs;
-    },
-    track(callID, sessionID, tool3, t0 = now(), cmdNeedle) {
-      if (currentMode === "off")
-        return;
-      table.set(callID, {
-        callID,
-        sessionID,
-        tool: tool3,
-        t0,
-        markerSeen: markerSeenIDs.has(callID),
-        warned: false,
-        acted: false,
-        wave: 0,
-        ...cmdNeedle !== undefined && cmdNeedle.length > 0 ? { cmdNeedle } : {}
-      });
-      ensureTimer();
-    },
-    markSeen(callID) {
-      markerSeenIDs.add(callID);
-      const rec = table.get(callID);
-      if (rec)
-        rec.markerSeen = true;
-    },
-    untrack(callID) {
-      table.delete(callID);
-      maybeStopTimer();
-    },
-    has: (callID) => table.has(callID),
-    size: () => table.size,
-    scan,
-    setMode(next) {
-      currentMode = next;
-      if (next === "off") {
-        if (timer) {
-          clearIntervalFn(timer);
-          timer = null;
-        }
-        table.clear();
-      } else {
-        ensureTimer();
-      }
-    },
-    dispose() {
-      if (timer) {
-        clearIntervalFn(timer);
-        timer = null;
-      }
-      table.clear();
-    }
-  };
-}
-function watchdogLogDir(base) {
-  const tmp = base ?? (process.env.TMPDIR ?? process.env.TEMP ?? process.env.TMP ?? "/tmp");
-  return `${tmp.replace(/[\\/]+$/, "")}/opencode-forge/watchdog`;
-}
-function createFileLedger(logPath, maxEntries = 200, maxBytes = 1e6) {
-  const append = (entry) => {
-    try {
-      mkdirSync3(dirname3(logPath), { recursive: true });
-      let lines = [];
-      try {
-        lines = readFileSync4(logPath, "utf8").split(`
-`).filter((l) => l.trim().length > 0);
-      } catch {}
-      if (lines.length >= maxEntries)
-        lines = lines.slice(lines.length - maxEntries + 1);
-      lines.push(JSON.stringify(entry));
-      let text = lines.join(`
-`) + `
-`;
-      if (text.length > maxBytes) {
-        const keep = Math.max(1, Math.floor(maxEntries / 2));
-        text = lines.slice(-keep).join(`
-`) + `
-`;
-      }
-      writeFileSync3(logPath, text, "utf8");
-    } catch {}
-  };
-  const entries = () => {
-    try {
-      return readFileSync4(logPath, "utf8").split(`
-`).filter((l) => l.trim().length > 0).map((l) => JSON.parse(l));
-    } catch {
-      return [];
-    }
-  };
-  return { append, entries, path: logPath };
-}
-
-// src/proc-locate.ts
-import { execFileSync as execFileSync2 } from "node:child_process";
-import { readdirSync as readdirSync3, readFileSync as readFileSync5 } from "node:fs";
-function commandNeedle(command) {
-  const trimmed = command.trim().replace(/^["']|["']$/g, "");
-  if (trimmed.length === 0)
-    return "";
-  const tokens = trimmed.split(/\s+/);
-  const longest = tokens.reduce((a, b) => b.length > a.length ? b : a, "");
-  return longest.length >= 6 ? longest : trimmed;
-}
-function markerValue(callID) {
-  return `opencode-forge:${callID}`;
-}
-function createPosixLocator(deps = {}) {
-  const listPids = deps.listPids ?? (() => readdirSync3("/proc").map(Number).filter((n) => Number.isInteger(n) && n > 0));
-  const readEnv = deps.readEnv ?? ((pid) => {
-    try {
-      return readFileSync5(`/proc/${pid}/environ`);
-    } catch {
-      return null;
-    }
-  });
-  const readCmd = deps.readCmd ?? ((pid) => {
-    try {
-      return readFileSync5(`/proc/${pid}/cmdline`).toString("utf8").split("\x00").filter(Boolean).join(" ");
-    } catch {
-      return String(pid);
-    }
-  });
-  return async (callID, _t0) => {
-    const want = `${WATCHDOG_ENV_MARK}=${markerValue(callID)}`;
-    const hits = [];
-    for (const pid of listPids()) {
-      const env = readEnv(pid);
-      if (!env)
-        continue;
-      if (env.toString("utf8").split("\x00").includes(want))
-        hits.push({ pid, cmd: readCmd(pid) });
-    }
-    return hits;
-  };
-}
-var PS_LIST_PROCS = "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; " + "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate " + "| ConvertTo-Json -Compress";
-function parseWindowsProcs(raw) {
-  let parsed;
-  try {
-    parsed = JSON.parse(raw);
-  } catch {
-    return [];
-  }
-  const arr = Array.isArray(parsed) ? parsed : [parsed];
-  const out = [];
-  for (const p of arr) {
-    const pid = Number(p?.ProcessId ?? p?.pid);
-    const ppid = Number(p?.ParentProcessId ?? p?.ppid);
-    if (!Number.isInteger(pid) || pid <= 0 || !Number.isInteger(ppid))
-      continue;
-    const cmd = typeof p?.CommandLine === "string" ? p.CommandLine : "";
-    let createdMs = Number.NaN;
-    const cd = p?.CreationDate ?? p?.createdMs;
-    if (typeof cd === "number")
-      createdMs = cd;
-    else if (typeof cd === "string") {
-      const slash = /\/Date\((\d+)\)\//.exec(cd);
-      if (slash)
-        createdMs = Number(slash[1]);
-      else {
-        const t = Date.parse(cd);
-        if (!Number.isNaN(t))
-          createdMs = t;
-      }
-    }
-    if (Number.isNaN(createdMs))
-      continue;
-    out.push({ pid, ppid, cmd, createdMs });
-  }
-  return out;
-}
-var WINDOW_SLACK_MS = 2000;
-function createWindowsLocator(deps = {}) {
-  const hostPid = deps.hostPid ?? process.pid;
-  const execFn = deps.execFn ?? ((cmd) => execFileSync2("powershell", ["-NoProfile", "-Command", cmd], { encoding: "utf8", windowsHide: true, timeout: 15000 }));
-  return async (callID, t0, cmdNeedle, phase2 = false) => {
-    let raw = "[]";
-    try {
-      raw = execFn(PS_LIST_PROCS);
-    } catch {
-      return [];
-    }
-    const procs = parseWindowsProcs(raw);
-    const children = new Map;
-    for (const p of procs) {
-      const list = children.get(p.ppid) ?? [];
-      list.push(p.pid);
-      children.set(p.ppid, list);
-    }
-    const descendants = new Set;
-    const queue = [hostPid];
-    while (queue.length > 0) {
-      const cur = queue.pop();
-      for (const child of children.get(cur) ?? []) {
-        if (!descendants.has(child)) {
-          descendants.add(child);
-          queue.push(child);
-        }
-      }
-    }
-    const windowStart = t0 - WINDOW_SLACK_MS;
-    const norm = (s) => s.replace(/\\/g, "/");
-    const slash = cmdNeedle !== undefined ? cmdNeedle.lastIndexOf("/") : -1;
-    const dirNeedle = phase2 && cmdNeedle !== undefined && slash > 0 ? norm(cmdNeedle.slice(0, slash)) : undefined;
-    return procs.filter((p) => p.createdMs >= windowStart && p.pid !== hostPid && !/Win32_Process/.test(p.cmd) && !/conhost\.exe/i.test(p.cmd) && (descendants.has(p.pid) || cmdNeedle !== undefined && cmdNeedle.length >= 6 && p.cmd.includes(cmdNeedle) || dirNeedle !== undefined && dirNeedle.length >= 6 && norm(p.cmd).includes(dirNeedle))).map((p) => ({ pid: p.pid, cmd: p.cmd, createdMs: p.createdMs }));
-  };
-}
-function createLocator(platform = process.platform, posix = {}, win = {}) {
-  return platform === "win32" ? createWindowsLocator(win) : createPosixLocator(posix);
-}
-
 // src/models-dev.ts
-import { mkdirSync as mkdirSync4, readFileSync as readFileSync6, writeFileSync as writeFileSync4 } from "node:fs";
-import { join as join5 } from "node:path";
-import { tmpdir as tmpdir2 } from "node:os";
+import { mkdirSync, readFileSync as readFileSync2, writeFileSync as writeFileSync2 } from "node:fs";
+import { join as join4, resolve as resolve3 } from "node:path";
+import { tmpdir } from "node:os";
 var DEFAULT_MODELS_DEV_URL = "https://models.dev/api.json";
 function parseIdentity(identity) {
-  const slash = identity.indexOf("/");
-  if (slash <= 0 || slash === identity.length - 1)
+  const slash2 = identity.indexOf("/");
+  if (slash2 <= 0 || slash2 === identity.length - 1)
     return null;
-  return { provider: identity.slice(0, slash), model: identity.slice(slash + 1) };
+  return { provider: identity.slice(0, slash2), model: identity.slice(slash2 + 1) };
 }
 function modelDepthShape(catalog, identity) {
   if (!catalog)
@@ -15024,11 +14575,11 @@ function modelDepthShape(catalog, identity) {
   return null;
 }
 function modelsDevCacheDir(base) {
-  return join5(base ?? join5(tmpdir2(), "opencode-forge"), "models-dev");
+  return join4(base ?? join4(tmpdir(), "opencode-forge"), "models-dev");
 }
-function namedLevels(rows) {
+function namedLevels(rows2) {
   const out = [];
-  for (const r of rows) {
+  for (const r of rows2) {
     if (r && typeof r === "object" && r.type === "effort") {
       const values = r.values;
       if (Array.isArray(values)) {
@@ -15040,8 +14591,8 @@ function namedLevels(rows) {
   }
   return out;
 }
-function shapeOf(rows) {
-  for (const r of rows) {
+function shapeOf(rows2) {
+  for (const r of rows2) {
     if (r && typeof r === "object") {
       const t = r.type;
       if (t === "effort" || t === "toggle" || t === "budget_tokens")
@@ -15056,15 +14607,19 @@ function reduceModelsDev(raw) {
   if (!providers)
     return catalog;
   for (const [providerID, provider] of Object.entries(providers)) {
+    if (!provider || typeof provider !== "object" || Array.isArray(provider))
+      continue;
     const models = provider.models;
-    if (!models || typeof models !== "object")
+    if (!models || typeof models !== "object" || Array.isArray(models))
       continue;
     const out = { models: {} };
     for (const [modelID, model] of Object.entries(models)) {
+      if (!model || typeof model !== "object" || Array.isArray(model))
+        continue;
       const m = model;
-      const rows = Array.isArray(m.reasoning_options) ? m.reasoning_options : undefined;
-      const shape = rows !== undefined ? shapeOf(rows) : undefined;
-      const options = rows !== undefined && shape === "effort" ? namedLevels(rows) : undefined;
+      const rows2 = Array.isArray(m.reasoning_options) ? m.reasoning_options : undefined;
+      const shape = rows2 !== undefined ? shapeOf(rows2) : undefined;
+      const options = rows2 !== undefined && shape === "effort" ? namedLevels(rows2) : undefined;
       const cost = m.cost && typeof m.cost === "object" ? m.cost : undefined;
       out.models[modelID] = {
         ...shape !== undefined ? { reasoningShape: shape } : {},
@@ -15079,7 +14634,7 @@ function reduceModelsDev(raw) {
 async function loadModelsDevSnapshot(opts = {}) {
   const url2 = opts.url ?? process.env.OPENCODE_MODELS_URL ?? DEFAULT_MODELS_DEV_URL;
   const cacheDir = modelsDevCacheDir(opts.cacheDir);
-  const cacheFile = join5(cacheDir, "snapshot.json");
+  const cacheFile = join4(cacheDir, "snapshot.json");
   const fetcher = opts.fetcher;
   if (fetcher) {
     try {
@@ -15089,19 +14644,34 @@ async function loadModelsDevSnapshot(opts = {}) {
     } catch {}
     return { catalog: { providers: {} }, degraded: true, source: "fetch-failed" };
   }
+  const timeoutMs = opts.timeoutMs ?? 8000;
+  const key = JSON.stringify([resolve3(cacheDir), url2, timeoutMs]);
+  const pending = pendingLoads.get(key);
+  if (pending)
+    return pending;
+  const load = loadCachedSnapshot(url2, cacheDir, cacheFile, timeoutMs);
+  pendingLoads.set(key, load);
   try {
-    const res = await fetch(url2, { signal: AbortSignal.timeout(opts.timeoutMs ?? 8000) });
+    return await load;
+  } finally {
+    pendingLoads.delete(key);
+  }
+}
+var pendingLoads = new Map;
+async function loadCachedSnapshot(url2, cacheDir, cacheFile, timeoutMs) {
+  try {
+    const res = await fetch(url2, { signal: AbortSignal.timeout(timeoutMs) });
     if (res.ok) {
       const catalog = reduceModelsDev(JSON.parse(await res.text()));
       try {
-        mkdirSync4(cacheDir, { recursive: true });
-        writeFileSync4(cacheFile, JSON.stringify(catalog));
+        mkdirSync(cacheDir, { recursive: true });
+        writeFileSync2(cacheFile, JSON.stringify(catalog));
       } catch {}
       return { catalog, degraded: false, source: url2 };
     }
   } catch {}
   try {
-    const cached2 = JSON.parse(readFileSync6(cacheFile, "utf8"));
+    const cached2 = JSON.parse(readFileSync2(cacheFile, "utf8"));
     if (cached2 && typeof cached2 === "object" && cached2.providers)
       return { catalog: cached2, degraded: true, source: "cache" };
   } catch {}
@@ -15109,6 +14679,104 @@ async function loadModelsDevSnapshot(opts = {}) {
 }
 
 // src/crew-gate.ts
+var object2 = (x) => x && typeof x === "object" ? x : {};
+function crewAcceptedRound(id, args, raw) {
+  const event = object2(raw), result = object2(event.result), metadata = object2(result.metadata);
+  if (!id || event.status !== "completed" || metadata.status !== "running" || typeof metadata.sessionID !== "string" || typeof args.agent !== "string")
+    return null;
+  return { id, childID: metadata.sessionID, agent: args.agent, description: String(args.description ?? ""), prompt: String(args.prompt ?? "") };
+}
+function crossCheckCrewEvidence(report, declared, evidence) {
+  const gaps = [];
+  if (!evidence.readable || evidence.inFlight.length)
+    gaps.push("native session enumeration is incomplete or work remains in flight");
+  const messages = object2(evidence.context).data ?? evidence.context;
+  const rounds = evidence.rounds;
+  for (const sub of report)
+    for (const id of sub.rounds ?? []) {
+      if (!rounds.some((r) => r.id === id))
+        gaps.push(`${sub.title}: unknown dispatch reference ${id}`);
+    }
+  if (!Array.isArray(messages))
+    return rounds.length ? [...gaps, "native result context unavailable"] : gaps;
+  const assigned = new Map;
+  for (const round of rounds) {
+    const explicit = report.filter((s) => s.rounds?.includes(round.id));
+    const matches = explicit.length ? declared.filter((s) => explicit.some((r) => normTitle(r.title) === normTitle(s.title))) : declared.filter((s) => normTitle(round.description) === normTitle(s.title) || round.prompt.toLowerCase().includes(`subtask: ${normTitle(s.title)}
+`));
+    if (matches.length !== 1) {
+      gaps.push(`dispatch ${round.id}: cannot associate a unique declared subtask`);
+      continue;
+    }
+    const key = normTitle(matches[0].title);
+    assigned.set(key, [...assigned.get(key) ?? [], round]);
+  }
+  const results = new Map;
+  const current = new Map;
+  const seenNotifications = new Set;
+  const ambiguous = new Set;
+  const created = (raw) => object2(object2(raw).time).created;
+  const ordered = messages.every((m) => typeof created(m) === "number") ? [...messages].sort((a, b) => Number(created(a)) - Number(created(b))) : messages;
+  for (const raw of ordered) {
+    const m = object2(raw);
+    if (m.type === "assistant" && Array.isArray(m.content))
+      for (const rawPart of m.content) {
+        const p = object2(rawPart), state = object2(p.state), metadata = object2(state.metadata);
+        const id = p.callID ?? p.id;
+        const childID = metadata.sessionID;
+        if (p.type === "tool" && p.name === "subagent" && state.status === "completed" && metadata.status === "running" && typeof id === "string" && typeof childID === "string") {
+          const known = rounds.find((r) => r.id === id);
+          if (known && known.childID !== childID) {
+            ambiguous.add(known.childID);
+            continue;
+          }
+          const previous = current.get(childID);
+          if (previous && previous.id !== id && !results.has(previous.id))
+            ambiguous.add(childID);
+          current.set(childID, { id, childID });
+        }
+      }
+    if (m.type !== "synthetic")
+      continue;
+    const meta = object2(m.metadata), text = typeof m.text === "string" ? m.text : "";
+    if (meta.source !== "subagent" || typeof meta.childID !== "string")
+      continue;
+    if (typeof m.id === "string") {
+      if (seenNotifications.has(m.id))
+        continue;
+      seenNotifications.add(m.id);
+    }
+    const round = current.get(meta.childID);
+    const match = /^<background-result kind="subagent" sessionID="[^"]+" state="(completed|error|cancelled)" description="[^"]*">\s*([\s\S]*?)\s*<\/background-result>$/.exec(text);
+    if (round && !ambiguous.has(round.childID) && match && meta.state === match[1] && !results.has(round.id))
+      results.set(round.id, { state: match[1], text: match[2] });
+  }
+  for (const sub of report) {
+    const related = assigned.get(normTitle(sub.title)) ?? [];
+    if (!related.length) {
+      if (sub.rounds?.length)
+        gaps.push(`${sub.title}: referenced native dispatch evidence is missing`);
+      continue;
+    }
+    if (related.length > 2) {
+      gaps.push(`${sub.title}: at most one retry`);
+      continue;
+    }
+    if (related.some((r) => !r.agent.startsWith("forge-")) && !/\bnative\b/i.test(sub.evidence))
+      gaps.push(`${sub.title}: native fallback must be disclosed`);
+    const last = related[related.length - 1], result = results.get(last.id);
+    const row = evidence.settled.find((r) => r.childID === last.childID);
+    if (related.some((r) => !evidence.settled.some((child) => child.childID === r.childID)))
+      gaps.push(`${sub.title}: accepted work is missing from the settled host view`);
+    if (related.length === 2 && sub.attempts?.length !== 2)
+      gaps.push(`${sub.title}: record both attempts`);
+    if (sub.verdict.toUpperCase() === "PASS") {
+      if (related.some((r) => !results.has(r.id)) || result?.state !== "completed" || row?.outcome !== "succeeded" || !result.text.trim() || result.text === "Subagent completed without a text response.")
+        gaps.push(`${sub.title}: PASS requires verified successful round evidence, not merely a terminal session`);
+    }
+  }
+  return gaps;
+}
 function normTitle(t) {
   return String(t ?? "").trim().toLowerCase();
 }
@@ -15169,30 +14837,80 @@ async function walkNativeChildren(client, sessionID) {
   if (!sessionID)
     return unreadable();
   try {
-    const raw = await client?.session?.list?.({ parentID: sessionID });
-    const body = raw?.data ?? raw;
-    const list = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : null;
-    if (list === null)
+    const deadline = Date.now() + (client.deadlineMs ?? 8000);
+    const bounded = async (call) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0)
+        throw new Error("native child walk deadline");
+      let timer;
+      try {
+        return await Promise.race([Promise.resolve().then(call), new Promise((_, reject) => {
+          timer = setTimeout(() => reject(new Error("native child walk timeout")), remaining);
+        })]);
+      } finally {
+        if (timer !== undefined)
+          clearTimeout(timer);
+      }
+    };
+    if (typeof client?.session?.list !== "function")
       return unreadable();
-    const rows = [];
-    for (const s of list) {
-      if (!s || typeof s.id !== "string" || !s.id)
-        continue;
-      if (s.parentID !== sessionID)
-        continue;
-      rows.push({ childID: s.id, outcome: nativeChildOutcome(s.outcome) });
+    const rows2 = [];
+    const cursors = new Set;
+    const ids = new Set;
+    let cursor;
+    let count = 0;
+    for (let page = 0;; page++) {
+      if (page >= 500)
+        return unreadable();
+      const raw = await bounded(() => client.session.list({ parentID: sessionID, ...cursor ? { cursor } : {} }));
+      const envelope = raw;
+      const body = envelope?.data ?? raw;
+      const list = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : null;
+      let next;
+      for (const layer of body === raw ? [envelope] : [envelope, body]) {
+        if (layer?.truncated || layer?.partial || layer?.error)
+          return unreadable();
+        if (layer?.cursor === undefined)
+          continue;
+        const metadata = layer.cursor;
+        if (!metadata || typeof metadata !== "object" || Array.isArray(metadata))
+          return unreadable();
+        const token = metadata.next ?? null;
+        if (token !== null && (typeof token !== "string" || !token))
+          return unreadable();
+        if (next !== undefined && next !== token)
+          return unreadable();
+        next = token;
+      }
+      if (list === null || (count += list.length) >= 500 || list.some((row) => !row || typeof row.id !== "string" || !row.id))
+        return unreadable();
+      for (const s of list) {
+        const id = s.id;
+        if (ids.has(id))
+          return unreadable();
+        ids.add(id);
+        if (s.parentID !== sessionID)
+          continue;
+        rows2.push({ childID: id, outcome: nativeChildOutcome(s.outcome) });
+      }
+      if (next == null)
+        break;
+      if (!list.length || cursors.has(next))
+        return unreadable();
+      cursors.add(next);
+      cursor = next;
     }
-    if (rows.length === 0)
+    if (rows2.length === 0)
       return { readable: true, inFlight: [], settled: [] };
     if (typeof client?.session?.status !== "function")
       return unreadable();
-    const st = await client.session.status();
+    const st = await bounded(() => client.session.status());
     const map2 = st?.data;
-    if (!map2 || typeof map2 !== "object")
+    if (!map2 || typeof map2 !== "object" || Array.isArray(map2))
       return unreadable();
     const inFlight = [];
     const settled = [];
-    for (const row of rows) {
+    for (const row of rows2) {
       if (entryInFlight(map2[row.childID]))
         inFlight.push(row.childID);
       else
@@ -15211,7 +14929,7 @@ async function nativeSessionBusy(client, sessionID) {
       return null;
     const st = await client.session.status();
     const map2 = st?.data;
-    if (!map2 || typeof map2 !== "object")
+    if (!map2 || typeof map2 !== "object" || Array.isArray(map2))
       return null;
     return entryInFlight(map2[sessionID]);
   } catch {
@@ -15291,22 +15009,15 @@ function nativeChildDigestLine(childID, outcome) {
 var WORKER_MANDATES = [
   "Mandates (non-negotiable):",
   "- Use workspace-relative paths ONLY. Never write to or read from absolute paths outside this workspace; the workspace root is where you were started, not the filesystem root.",
-  "- Run every shell command through the forge_shell tool (the builtin shell is not part of your toolset by design). Long-running or non-exiting commands: forge_shell with run_in_background, then collect results via forge_jobs poll before yielding.",
-  "- Run every search through the forge_grep/forge_glob tools first — the builtin grep/glob tools are fallback only. forge_grep/forge_glob see through symlinks/junctions and dot-directories because follow and hidden are on by default.",
+  "- You are a background subagent. Your final message is your report. You cannot ask the user questions; report blockers to your caller instead.",
+  "- Search with the builtin grep/glob tools and run commands with the builtin shell, within your permissions. For long-running commands use the shell's background parameter; the host wakes you when the command exits. Never poll or sleep to wait for completion.",
+  "- Use -m / --no-edit when committing, so no interactive editor opens; editor and pager behavior belongs to the host's builtin shell.",
   "- If any tool call is refused or denied, report the refusal VERBATIM in your final answer and stop that line of work. Never improvise a workaround around a permission denial.",
-  "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced).",
-  "- Report-file delivery (reliability contract): when the dispatch prompt names a report path (convention: `reports/<task>-report.md`, workspace-relative), write your final report there in addition to replying on the result stream — the caller may need to recover your result from that file if the live result stream is lost. Readonly workers skip this: the reply is the report."
+  "- End with conclusions backed by evidence references (file:line, command output, or the exact file/content you produced)."
 ].join(`
 `);
-var REPORT_DELIVERY_LINE = (taskId) => `Report delivery contract (reliability): in addition to replying on the result stream, write your final report to \`reports/${taskId}-report.md\` (workspace-relative; create the directory if needed) — the caller may need to recover your result from that file if the live result stream is lost. If your toolset has no file write access, skip this: your reply is the report.`;
-function withReportDelivery(promptText, taskId) {
-  const stripped = promptText.replace(/\n+Report delivery contract \(reliability\):[\s\S]*$/, "");
-  return `${stripped}
-
-${REPORT_DELIVERY_LINE(taskId)}`;
-}
 var READONLY_DISCIPLINE = (agent) => `You are forge-${agent}, a readonly worker: you gather, read, run read-only checks, and REPORT. Your restrictions are the design, not obstacles — do not attempt to work around them; report what you found instead.`;
-var WRITE_DISCIPLINE = (agent) => `You are forge-${agent}, a worker executing scoped tasks handed to you through the task tool. Do exactly the task, nothing else: no refactoring beyond scope, no unrelated files, no side quests.`;
+var WRITE_DISCIPLINE = (agent) => `You are forge-${agent}, a worker executing scoped assignments handed to you through the subagent tool. Do exactly the assigned work, nothing else: no refactoring beyond scope, no unrelated files, no side quests.`;
 function materializeAgentPrompt(input) {
   const frame = input.shape === "readonly" ? READONLY_DISCIPLINE(input.agent) : WRITE_DISCIPLINE(input.agent);
   return [frame, "", "Your role:", input.role.trim(), "", WORKER_MANDATES].join(`
@@ -15314,13 +15025,55 @@ function materializeAgentPrompt(input) {
 }
 
 // src/dispatch-tiers.ts
-var MUTATING_TOOLS = ["write", "edit", "bash", "patch", "applypatch", "apply", "multiedit"];
+var MUTATING_TOOLS = ["write", "edit", "patch", "applypatch", "apply", "multiedit"];
+var PRIMARY_ONLY_WORKER_TOOLS = [
+  "plan_write",
+  "plan_tick",
+  "plan_approve",
+  "plan_close",
+  "plan_reopen",
+  "plan_discard",
+  "goal_write",
+  "goal_check",
+  "goal_complete",
+  "goal_pause",
+  "goal_resume",
+  "goal_discard",
+  "crew_begin",
+  "crew_close",
+  "forge_sync"
+];
+function workerPermissionFor(def) {
+  const explicit = def.permission ?? {};
+  const permission = {};
+  if (Object.hasOwn(explicit, "*"))
+    permission["*"] = explicit["*"];
+  permission.question = "deny";
+  if (def.shape === "readonly") {
+    for (const tool3 of MUTATING_TOOLS)
+      permission[tool3] = "deny";
+    permission.execute = "deny";
+  }
+  for (const [tool3, effect] of Object.entries(explicit)) {
+    if (tool3 !== "*" && tool3 !== "shell" && tool3 !== "bash" && tool3 !== "task" && tool3 !== "subagent" && !PRIMARY_ONLY_WORKER_TOOLS.includes(tool3)) {
+      Object.defineProperty(permission, tool3, { value: effect, enumerable: true, writable: true, configurable: true });
+    }
+  }
+  const shell = explicit.shell === "deny" || explicit.bash === "deny" ? "deny" : explicit.shell ?? explicit.bash;
+  if (shell !== undefined)
+    permission.shell = shell;
+  permission.task = "deny";
+  permission.subagent = "deny";
+  for (const tool3 of PRIMARY_ONLY_WORKER_TOOLS)
+    permission[tool3] = "deny";
+  return permission;
+}
 var ROLE_PROMPTS = {
   research: "You are a research worker: search, read, and run read-only checks to answer the assigned question. Report findings as a compact brief with sources and file:line evidence; state plainly what could not be verified.",
   review: "You are a review worker: read the diff or files under review, run read-only checks/tests, and report findings as a prioritized list, each with file:line evidence and a concrete fix suggestion. End with a single-line verdict."
 };
 function rolePromptFor(agentId, def, shared) {
-  const chain = def?.prompt && def.prompt.trim().length > 0 ? def.prompt : ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned task exactly as scoped.`;
+  const chain = def?.prompt && def.prompt.trim().length > 0 ? def.prompt : ROLE_PROMPTS[agentId] ?? `You are a ${agentId} worker. Execute the assigned work exactly as scoped.`;
   return shared === undefined ? chain : `${shared}
 
 ${chain}`;
@@ -15334,18 +15087,12 @@ function poolProvenanceLine(provenance) {
 function agentDescriptionFor(agentId, def, provenance) {
   const shape = def.shape === "readonly" ? "readonly" : "write";
   const brain = def.model !== undefined ? `pinned ${def.model}` : "auto — inherits the parent session's model at dispatch";
-  const base = `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the task tool with subagent_type "forge-${agentId}".`;
+  const base = `forge subagent "${agentId}" (${shape}, ${brain}) — dispatch via the subagent tool with agent "forge-${agentId}".`;
   return provenance === undefined ? base : `${base} ${poolProvenanceLine(provenance)}`;
 }
 function forgeAgentDef(agentId, def, provenance, sharedSeg) {
-  const permission = { task: "deny" };
   const shape = def.shape ?? "write";
-  if (shape === "readonly") {
-    for (const t of MUTATING_TOOLS)
-      permission[t] = "deny";
-  }
-  Object.assign(permission, def.permission ?? {});
-  permission.task = "deny";
+  const permission = workerPermissionFor(def);
   const entry = {
     description: agentDescriptionFor(agentId, def, provenance),
     mode: "subagent",
@@ -15354,8 +15101,7 @@ function forgeAgentDef(agentId, def, provenance, sharedSeg) {
       shape,
       role: rolePromptFor(agentId, def, sharedSeg)
     }),
-    permission,
-    tools: { shell: false, bash: false }
+    permission
   };
   if (def.model !== undefined)
     entry.model = def.model;
@@ -15365,303 +15111,12 @@ function effectiveReadonlyShape(def) {
   if (def.shape !== "readonly")
     return false;
   const perm = def.permission ?? {};
-  for (const t of MUTATING_TOOLS) {
+  for (const t of [...MUTATING_TOOLS, "bash", "shell", "execute"]) {
     const v = perm[t];
     if (v !== undefined && v !== "deny")
       return false;
   }
   return true;
-}
-
-// src/exec-classify.ts
-var READ_CLASS = "READ";
-var WRITE_CLASS = "WRITE";
-var REDIRECT_INDICATOR = "redirect";
-var MUTATING_CMDLETS = [
-  "Set-Content",
-  "Out-File",
-  "New-Item",
-  "Remove-Item",
-  "Move-Item",
-  "Copy-Item",
-  "Add-Content",
-  "Clear-Content"
-];
-var GIT_MUTATING_SUBCOMMANDS = [
-  "add",
-  "commit",
-  "push",
-  "reset",
-  "checkout",
-  "rebase",
-  "merge",
-  "clean",
-  "rm"
-];
-var PKG_MUTATING_COMMANDS = ["npm publish", "npm install", "bun add", "pip install"];
-var PKG_MUTATING_PATTERNS = [
-  /\bnpm\s+(?:publish|install|i|ci|add)\b/i,
-  /\bbun\s+(?:add|install)\b/i,
-  /\bpip3?\s+install\b/i
-];
-var WRITE_TARGET_FLAGS = [
-  "--out",
-  "--output",
-  "--out-file",
-  "--outfile",
-  "--outFile",
-  "--dest",
-  "--destination",
-  "-o"
-];
-var O_FLAG_WRITER_BINARIES = [
-  "gcc",
-  "g++",
-  "cc",
-  "c++",
-  "clang",
-  "clang++",
-  "ld",
-  "rustc",
-  "go",
-  "curl",
-  "sort",
-  "psql",
-  "dotnet"
-];
-var EXEC_SEAL_INDICATORS = [
-  { id: REDIRECT_INDICATOR, covers: "`>` `>>` and fd forms (`2>` `*>`) — bash and the PowerShell family share the operators" },
-  { id: "mutating-cmdlet", covers: MUTATING_CMDLETS.join(", ") },
-  { id: "git-mutation", covers: `git ${GIT_MUTATING_SUBCOMMANDS.join("/")}` },
-  { id: "pkg-mutation", covers: PKG_MUTATING_COMMANDS.join(", ") + " (with common aliases: npm i/ci/add, bun install, pip3 install)" },
-  { id: "workspace-write", covers: `output-target flags ${WRITE_TARGET_FLAGS.join(" ")} whose parsed value is a workspace-relative path (or an absolute path under the provided workspaceRoot); the short -o counts only when the head binary is a known -o writer (${O_FLAG_WRITER_BINARIES.join(", ")})` }
-];
-function stripQuoted(cmd) {
-  let out = "";
-  let quote = null;
-  for (const ch of cmd) {
-    if (quote) {
-      if (ch === quote)
-        quote = null;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      quote = ch;
-      continue;
-    }
-    out += ch;
-  }
-  return out;
-}
-function tokenizeCommand(cmd) {
-  const tokens = [];
-  let text = "";
-  let quoted = false;
-  let mode = null;
-  let sawAny = false;
-  const flush = () => {
-    if (sawAny)
-      tokens.push({ text, quoted });
-    text = "";
-    quoted = false;
-    sawAny = false;
-  };
-  for (const ch of cmd) {
-    if (mode) {
-      if (ch === mode) {
-        mode = null;
-        continue;
-      }
-      text += ch;
-      sawAny = true;
-      continue;
-    }
-    if (ch === '"' || ch === "'") {
-      mode = ch;
-      quoted = true;
-      sawAny = true;
-      continue;
-    }
-    if (ch === " " || ch === "\t" || ch === "\r" || ch === `
-`) {
-      flush();
-      continue;
-    }
-    text += ch;
-    sawAny = true;
-  }
-  flush();
-  return tokens;
-}
-function resolveHeadBinary(tokens) {
-  let i = tokens.length > 0 && !tokens[0].quoted && tokens[0].text === "&" ? 1 : 0;
-  const head = tokens[i];
-  if (!head)
-    return "";
-  const parts = head.text.split(/[\\/]/);
-  let bin = parts[parts.length - 1].toLowerCase();
-  if (bin.endsWith(".exe"))
-    bin = bin.slice(0, -4);
-  return bin;
-}
-function redirectMatch(cmd) {
-  const bare = stripQuoted(cmd).replace(/\r?\n/g, " ");
-  const m = /(?:^|[^>&])>{1,2}(?!&)[^\s;&|]*/.exec(bare);
-  if (m)
-    return { detail: m[0].trim() };
-  return null;
-}
-function wordMatch(cmd, needle) {
-  const re = new RegExp(`(^|[\\s;&|(])${needle.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "i");
-  const m = re.exec(cmd);
-  if (m)
-    return { detail: m[0].trim() };
-  return null;
-}
-function gitMutationMatch(cmd) {
-  const bare = stripQuoted(cmd);
-  for (const sub of GIT_MUTATING_SUBCOMMANDS) {
-    const m = new RegExp(`(?:^|[\\s;&|(])git\\s+${sub}\\b`, "i").exec(bare);
-    if (m)
-      return { detail: m[0].trim() };
-  }
-  return null;
-}
-function pkgMutationMatch(cmd) {
-  const bare = stripQuoted(cmd);
-  for (const re of PKG_MUTATING_PATTERNS) {
-    const m = re.exec(bare);
-    if (m)
-      return { detail: m[0].trim() };
-  }
-  return null;
-}
-function isDriveRelative(p) {
-  return /^[a-zA-Z]:/.test(p);
-}
-function pathLike(p) {
-  return /^[^;&|<>]+$/.test(p) && /[./\\]/.test(p);
-}
-function insideWorkspace(value, workspaceRoot) {
-  const norm = (s) => s.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
-  if (!isDriveRelative(value) && !value.startsWith("/") && !value.startsWith("\\\\")) {
-    return true;
-  }
-  if (workspaceRoot === undefined)
-    return false;
-  return norm(value).startsWith(`${norm(workspaceRoot)}/`) || norm(value) === norm(workspaceRoot);
-}
-function workspaceWriteMatch(cmd, workspaceRoot) {
-  const tokens = tokenizeCommand(cmd);
-  const headBinary = resolveHeadBinary(tokens);
-  const headIsWriter = O_FLAG_WRITER_BINARIES.includes(headBinary);
-  for (let i = 0;i < tokens.length; i++) {
-    const tok = tokens[i];
-    if (tok.quoted)
-      continue;
-    let flag = "";
-    let valueText;
-    const text = tok.text;
-    const eq = text.indexOf("=");
-    if (eq > 0 && text.startsWith("--")) {
-      flag = text.slice(0, eq);
-      valueText = text.slice(eq + 1);
-    } else if (WRITE_TARGET_FLAGS.includes(text)) {
-      if (text === "-o" && !headIsWriter)
-        continue;
-      flag = text;
-      const next = tokens[i + 1];
-      valueText = next?.text;
-    }
-    if (!flag || valueText === undefined)
-      continue;
-    if (valueText.startsWith("-"))
-      continue;
-    if (pathLike(valueText) && insideWorkspace(valueText, workspaceRoot)) {
-      return { detail: `${flag} ${valueText}` };
-    }
-  }
-  return null;
-}
-function classifyExecCommand(cmd, opts) {
-  if (typeof cmd !== "string" || cmd.length === 0)
-    return { klass: READ_CLASS };
-  const r = redirectMatch(cmd);
-  if (r)
-    return { klass: WRITE_CLASS, indicator: REDIRECT_INDICATOR, detail: r.detail };
-  for (const cmdlet of MUTATING_CMDLETS) {
-    const m = wordMatch(cmd, cmdlet);
-    if (m)
-      return { klass: WRITE_CLASS, indicator: "mutating-cmdlet", detail: m.detail };
-  }
-  const g = gitMutationMatch(cmd);
-  if (g)
-    return { klass: WRITE_CLASS, indicator: "git-mutation", detail: g.detail };
-  const p = pkgMutationMatch(cmd);
-  if (p)
-    return { klass: WRITE_CLASS, indicator: "pkg-mutation", detail: p.detail };
-  const w = workspaceWriteMatch(cmd, opts?.workspaceRoot);
-  if (w)
-    return { klass: WRITE_CLASS, indicator: "workspace-write", detail: w.detail };
-  return { klass: READ_CLASS };
-}
-var KNOWN_INTERACTIVE_COMMANDS = [
-  "npm login",
-  "npm adduser",
-  "pnpm login",
-  "yarn login",
-  "bun login",
-  "cargo login",
-  "docker login",
-  "podman login",
-  "gh auth login",
-  "az login",
-  "gcloud auth login",
-  "aws sso login",
-  "heroku login",
-  "netlify login",
-  "vercel login",
-  "supabase login",
-  "sudo",
-  "su",
-  "passwd",
-  "ssh",
-  "sftp",
-  "ftp",
-  "telnet",
-  "vim",
-  "vi",
-  "nano",
-  "emacs",
-  "top",
-  "htop",
-  "less",
-  "more",
-  "man"
-];
-function interactiveBanner(cmd) {
-  if (typeof cmd !== "string" || cmd.length === 0)
-    return null;
-  const segments = cmd.split(/\|\|?|&&|;|&/).map((s) => s.trim()).filter((s) => s.length > 0);
-  for (const seg of segments) {
-    const tokens = seg.split(/\s+/).filter((t) => t.length > 0 && !/^[A-Za-z_][A-Za-z0-9_]*=/.test(t));
-    for (const entry of KNOWN_INTERACTIVE_COMMANDS) {
-      const words = entry.split(" ");
-      if (words.length > tokens.length)
-        continue;
-      let ok = true;
-      for (let j = 0;j < words.length; j++) {
-        if (tokens[j] !== words[j]) {
-          ok = false;
-          break;
-        }
-      }
-      if (ok) {
-        return `[forge:interactive] "${entry}" is known to prompt interactively (credential / password / full-screen UI). It still runs — the spawn env already carries the non-interactive fallbacks (EDITOR=: GIT_PAGER=cat GIT_MERGE_AUTOEDIT=no) — but an interactive prompt cannot be answered here: prefer non-interactive flags (--yes / --non-interactive / token env vars) or the call may sit waiting until its wait budget expires.`;
-      }
-    }
-  }
-  return null;
 }
 
 // src/dispatch-depth.ts
@@ -15747,7 +15202,8 @@ function resolvePinnedDepth(thoughtLevel, channel) {
 }
 
 // src/forge-config.ts
-import { readFileSync as readFileSync7, statSync as statSync4 } from "node:fs";
+import { readFileSync as readFileSync3, realpathSync, statSync as statSync2 } from "node:fs";
+import { isAbsolute as isAbsolute2, relative as relative2 } from "node:path";
 function sanitizeJsonc(text) {
   const out = [];
   let i = 0;
@@ -16105,74 +15561,6 @@ function validateOverrideNode(raw, label) {
   }
   return { overrides, findings: validated.findings };
 }
-function isPositiveInt(v) {
-  return typeof v === "number" && Number.isInteger(v) && v >= 1;
-}
-function parseLimitMap(raw, label, findings) {
-  if (raw === undefined || raw === null)
-    return {};
-  if (!isRecord(raw)) {
-    findings.push({ level: "warn", code: "dispatch-map-invalid", message: `${label} must be an object mapping keys to positive-integer limits — field ignored` });
-    return null;
-  }
-  const out = {};
-  for (const [key, value] of Object.entries(raw)) {
-    const k = key.trim();
-    if (!k) {
-      findings.push({ level: "warn", code: "dispatch-map-key-invalid", message: `${label}: an empty key cannot carry a limit — entry ignored` });
-      continue;
-    }
-    if (!isPositiveInt(value)) {
-      findings.push({ level: "warn", code: "dispatch-map-value-invalid", message: `${label}.${key} must be a positive integer — entry ignored (fail-soft, never a throw)` });
-      continue;
-    }
-    out[k] = value;
-  }
-  return out;
-}
-function validateDispatchNode(raw, label) {
-  const findings = [];
-  if (raw === undefined || raw === null)
-    return { config: null, findings };
-  if (!isRecord(raw)) {
-    findings.push({ level: "warn", code: "dispatch-node-invalid", message: `${label} must be an object ({providerConcurrency, modelConcurrency, circuitBreaker}) — the whole node is ignored` });
-    return { config: null, findings };
-  }
-  const providerConcurrency = parseLimitMap(raw.providerConcurrency, `${label}.providerConcurrency`, findings);
-  const modelConcurrency = parseLimitMap(raw.modelConcurrency, `${label}.modelConcurrency`, findings);
-  const cbRaw = raw.circuitBreaker;
-  const circuitBreaker = {};
-  if (cbRaw !== undefined && cbRaw !== null) {
-    if (!isRecord(cbRaw)) {
-      findings.push({ level: "warn", code: "dispatch-breaker-invalid", message: `${label}.circuitBreaker must be an object ({consecutiveFailures, cooldownMs}) — field ignored` });
-    } else {
-      if (cbRaw.consecutiveFailures !== undefined) {
-        if (isPositiveInt(cbRaw.consecutiveFailures))
-          circuitBreaker.consecutiveFailures = cbRaw.consecutiveFailures;
-        else
-          findings.push({ level: "warn", code: "dispatch-breaker-failures-invalid", message: `${label}.circuitBreaker.consecutiveFailures must be a positive integer — field ignored` });
-      }
-      if (cbRaw.cooldownMs !== undefined) {
-        if (isPositiveInt(cbRaw.cooldownMs))
-          circuitBreaker.cooldownMs = cbRaw.cooldownMs;
-        else
-          findings.push({ level: "warn", code: "dispatch-breaker-cooldown-invalid", message: `${label}.circuitBreaker.cooldownMs must be a positive integer — field ignored` });
-      }
-    }
-  }
-  return { config: { providerConcurrency: providerConcurrency ?? {}, modelConcurrency: modelConcurrency ?? {}, circuitBreaker }, findings };
-}
-function mergeDispatchNodes(base, override) {
-  if (base === null && override === null)
-    return null;
-  const b = base ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: {} };
-  const o = override ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: {} };
-  return {
-    providerConcurrency: { ...b.providerConcurrency, ...o.providerConcurrency },
-    modelConcurrency: { ...b.modelConcurrency, ...o.modelConcurrency },
-    circuitBreaker: { ...b.circuitBreaker, ...o.circuitBreaker }
-  };
-}
 function parseMaterializeKnob(v, label) {
   if (v === undefined || v === null)
     return { value: undefined, findings: [] };
@@ -16193,6 +15581,36 @@ function parseSyncKnob(v, label) {
     findings: [{ level: "warn", code: "sync-invalid", message: `${label}.sync must be "auto" (the only opt-in) — field ignored; the default posture applies (staleness gate + in-band forge_sync)` }]
   };
 }
+function legacyRuntimeOptionFindings(top, label, recipe = true) {
+  const findings = [];
+  for (const key of recipe ? ["jobs", "watchdog", "dispatch"] : ["jobs", "watchdog"]) {
+    if (isRecord(top) && Object.prototype.hasOwnProperty.call(top, key)) {
+      findings.push({ level: "warn", code: "legacy-runtime-option-in-recipe", message: `${label}: top-level "${key}" configures a retired runtime — ignored` });
+    }
+  }
+  return findings;
+}
+function legacyDispatchEnvFindings(env) {
+  return [
+    "DEBUG",
+    "JOURNAL_MAX",
+    "MAX_ATTEMPTS",
+    "NOTIFY_INTERVAL_MS",
+    "POLL_INTERVAL_MS",
+    "POLL_SLICE_MS",
+    "POLL_TIMEOUT_MS",
+    "QUEUE_MAX",
+    "RECONCILE_FLOOR_MS",
+    "RETRY_BACKOFF_MS",
+    "STALE_FLOOR_MS",
+    "STALE_MODE",
+    "STALE_MS"
+  ].map((suffix) => `FORGE_DISPATCH_${suffix}`).filter((key) => env[key] !== undefined).map((key) => ({
+    level: "warn",
+    code: "legacy-dispatch-env",
+    message: `${key} configures a retired runtime — ignored`
+  }));
+}
 function parseTopLevelKnobs(top, label) {
   const findings = [];
   const rec = top !== null && typeof top === "object" ? top : {};
@@ -16203,9 +15621,9 @@ function parseTopLevelKnobs(top, label) {
   return { materialize: mat.value, syncAuto: sync.auto, findings };
 }
 function forgeConfigPaths(opts) {
-  const sep2 = opts.projectDir?.includes("\\") && !opts.projectDir?.includes("/") ? "\\" : "/";
-  const project = opts.projectDir ? `${opts.projectDir}${sep2}.opencode${sep2}forge.json` : "";
-  const global = opts.homeDir ? `${opts.homeDir}${sep2}.config${sep2}opencode${sep2}forge.json` : "";
+  const sep3 = opts.projectDir?.includes("\\") && !opts.projectDir?.includes("/") ? "\\" : "/";
+  const project = opts.projectDir ? `${opts.projectDir}${sep3}.opencode${sep3}forge.json` : "";
+  const global = opts.homeDir ? `${opts.homeDir}${sep3}.config${sep3}opencode${sep3}forge.json` : "";
   return { project, global };
 }
 function isFsRoot(p) {
@@ -16227,9 +15645,9 @@ function parentDirOf(p) {
   return parent === "" ? null : parent;
 }
 function forgeCandidateAt(dir) {
-  const sep2 = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
-  const base = dir.endsWith("/") || dir.endsWith("\\") ? dir : `${dir}${sep2}`;
-  return `${base}.opencode${sep2}forge.json`;
+  const sep3 = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  const base = dir.endsWith("/") || dir.endsWith("\\") ? dir : `${dir}${sep3}`;
+  return `${base}.opencode${sep3}forge.json`;
 }
 function discoverProjectFileWith(stat, anchor) {
   let dir = (anchor ?? "").trim();
@@ -16245,16 +15663,23 @@ function discoverProjectFileWith(stat, anchor) {
     dir = parent;
   }
 }
-function createForgeConfigLoader(deps) {
-  const stat = deps.stat ?? ((path) => {
-    try {
-      const s = statSync4(path);
-      return { mtimeMs: s.mtimeMs, size: s.size };
-    } catch {
-      return null;
+function recipeFileStat(path) {
+  try {
+    const root = process.env.FORGE_TEST_FIXTURE_ROOT;
+    if (root) {
+      const within = (rel) => rel !== ".." && !rel.startsWith("../") && !rel.startsWith("..\\") && !isAbsolute2(rel);
+      if (!within(relative2(root, path)) || !within(relative2(realpathSync(root), realpathSync(path))))
+        return null;
     }
-  });
-  const readFile = deps.readFile ?? ((path) => readFileSync7(path, "utf8"));
+    const s = statSync2(path);
+    return { mtimeMs: s.mtimeMs, size: s.size };
+  } catch {
+    return null;
+  }
+}
+function createForgeConfigLoader(deps) {
+  const stat = deps.stat ?? recipeFileStat;
+  const readFile = deps.readFile ?? ((path) => readFileSync3(path, "utf8"));
   const globalPath = forgeConfigPaths({ homeDir: deps.homeDir }).global;
   const cache = new Map;
   const readCandidate = (path, source) => {
@@ -16296,9 +15721,7 @@ function createForgeConfigLoader(deps) {
       } else {
         const validated = validateAgentSet(top === undefined ? undefined : top.agents);
         result = { agents: validated.agents, source, path, projectPath: source === "project" ? path : null, findings: validated.findings };
-        const dispatchNode = validateDispatchNode(top === undefined ? undefined : top.dispatch, `${path}: dispatch`);
-        result.dispatch = dispatchNode.config;
-        result.findings.push(...dispatchNode.findings);
+        result.findings.push(...legacyRuntimeOptionFindings(top, path));
       }
     }
     cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result });
@@ -16315,14 +15738,13 @@ function createForgeConfigLoader(deps) {
           source: "project+global",
           path: project.path,
           projectPath: project.path,
-          findings: [...global.findings, ...project.findings],
-          dispatch: mergeDispatchNodes(global.dispatch ?? null, project.dispatch ?? null)
+          findings: [...global.findings, ...project.findings]
         };
       }
       if (project)
-        return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings, dispatch: project.dispatch ?? null };
+        return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings };
       if (global)
-        return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings, dispatch: global.dispatch ?? null };
+        return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings };
       return { agents: {}, source: "none", path: null, projectPath: null, findings: [] };
     }
   };
@@ -16360,15 +15782,8 @@ function codepointCompare(a, b) {
   return a < b ? -1 : a > b ? 1 : 0;
 }
 function createPoolResolver(deps) {
-  const stat = deps.stat ?? ((path) => {
-    try {
-      const s = statSync4(path);
-      return { mtimeMs: s.mtimeMs, size: s.size };
-    } catch {
-      return null;
-    }
-  });
-  const readFile = deps.readFile ?? ((path) => readFileSync7(path, "utf8"));
+  const stat = deps.stat ?? recipeFileStat;
+  const readFile = deps.readFile ?? ((path) => readFileSync3(path, "utf8"));
   const globalPath = forgeConfigPaths({ homeDir: deps.homeDir }).global;
   const fileCache = new Map;
   const readPool = (path) => {
@@ -16402,6 +15817,7 @@ function createPoolResolver(deps) {
     } else {
       const top = doc2.config === undefined ? undefined : doc2.config;
       const validated = validateAgentSet(top === undefined ? undefined : top.agents);
+      validated.findings.push(...legacyRuntimeOptionFindings(top, path));
       let overrides = null;
       if (top?.override !== undefined && top.override !== null) {
         if (path === globalPath) {
@@ -16453,6 +15869,10 @@ function createPoolResolver(deps) {
       }
       if (globalPath && globalParsed)
         uniqueFiles.add(globalPath);
+      for (const file2 of fileCache.keys()) {
+        if (!uniqueFiles.has(file2))
+          fileCache.delete(file2);
+      }
       const orderedFiles = [...uniqueFiles].sort(codepointCompare);
       const families = [];
       for (const file2 of orderedFiles) {
@@ -16529,15 +15949,25 @@ function parentDirLabel(filePath) {
 // src/roster-compile.ts
 var NATIVE_TOOL_VOCAB = {
   dispatchTool: "subagent",
+  shell: "shell",
+  question: "question",
+  grep: "grep",
+  glob: "glob",
   taskKey: "task",
   shellChannel: "execute",
   legacyShellKeys: ["shell", "bash"],
-  mutatingFamily: [...MUTATING_TOOLS]
+  mutatingFamily: [...MUTATING_TOOLS],
+  primaryOnly: [...PRIMARY_ONLY_WORKER_TOOLS]
 };
 var VARIANT_DEPTH_WORDS = ["low", "medium", "high"];
 var GENERATED_MARKER = "<!-- GENERATED BY forge_sync";
 function generatedHeader(recipeFile) {
   return `${GENERATED_MARKER} — edit the recipe (${recipeFile}), not this file. -->`;
+}
+function sameProjection(existing, expected) {
+  return existing.replace(/\r\n/g, `
+`) === expected.replace(/\r\n/g, `
+`);
 }
 function modelStringFor(def) {
   if (def.model === undefined)
@@ -16547,7 +15977,7 @@ function modelStringFor(def) {
   }
   return def.model;
 }
-function toolsFaceFor(shape) {
+function overrideToolsFaceFor(shape) {
   const face = {};
   face[NATIVE_TOOL_VOCAB.taskKey] = false;
   for (const k of NATIVE_TOOL_VOCAB.legacyShellKeys)
@@ -16559,13 +15989,25 @@ function toolsFaceFor(shape) {
   }
   return face;
 }
+function toolsFaceFor(shape, permission) {
+  const { task: _legacy, ...native } = workerPermissionFor({ shape, permission });
+  return native;
+}
 function frontmatterFor(input) {
   const lines = ["---", `description: ${JSON.stringify(input.description)}`, "mode: subagent"];
   if (input.model !== undefined)
     lines.push(`model: ${JSON.stringify(input.model)}`);
-  lines.push("tools:");
-  for (const [k, v] of Object.entries(input.tools))
-    lines.push(`  ${k}: ${v}`);
+  if (input.tools) {
+    lines.push("tools:");
+    for (const [k, v] of Object.entries(input.tools))
+      lines.push(`  ${k}: ${v}`);
+  }
+  if (input.permissions) {
+    lines.push("permissions:");
+    for (const [action, effect] of Object.entries(input.permissions)) {
+      lines.push(`  - action: ${JSON.stringify(action)}`, '    resource: "*"', `    effect: ${JSON.stringify(effect)}`);
+    }
+  }
   lines.push("---");
   return lines.join(`
 `);
@@ -16574,7 +16016,7 @@ function compileRosterEntry(input) {
   const shape = input.def.shape === "readonly" ? "readonly" : "write";
   const description = agentDescriptionFor(input.matId, input.def, input.provenance);
   const model = modelStringFor(input.def);
-  const tools = toolsFaceFor(shape);
+  const permissions = toolsFaceFor(shape, input.def.permission);
   const recipeFile = "global" in input.provenance ? "the global fallback layer" : input.provenance.file;
   const body = materializeAgentPrompt({
     agent: input.matId,
@@ -16583,7 +16025,7 @@ function compileRosterEntry(input) {
   });
   return {
     fileName: `forge-${input.matId}.md`,
-    content: `${frontmatterFor({ description, model, tools })}
+    content: `${frontmatterFor({ description, model, permissions })}
 
 ${generatedHeader(recipeFile)}
 
@@ -16601,7 +16043,7 @@ function compileOverrideEntry(input) {
   const shape = input.def.shape === "readonly" ? "readonly" : "write";
   const description = `Built-in ${input.id} override — pinned by the global forge.json "override" node (${input.def.model !== undefined ? "pinned model" : "Auto worker"}).`;
   const model = modelStringFor(input.def);
-  const tools = toolsFaceFor(shape);
+  const tools = overrideToolsFaceFor(shape);
   const body = input.def.prompt !== undefined && input.def.prompt.trim().length > 0 ? input.def.prompt : OVERRIDE_DEFAULT_PROMPTS[input.id];
   return {
     fileName: `${input.id}.md`,
@@ -16614,22 +16056,22 @@ ${body}
   };
 }
 function agentDirFor(poolFile) {
-  const sep2 = poolFile.includes("\\") && !poolFile.includes("/") ? "\\" : "/";
+  const sep3 = poolFile.includes("\\") && !poolFile.includes("/") ? "\\" : "/";
   const parts = poolFile.split(/[\\/]/);
   parts.pop();
   const dirName = parts.pop();
-  const base = parts.join(sep2);
-  return `${base}${sep2}${dirName}${sep2}agent`;
+  const base = parts.join(sep3);
+  return `${base}${sep3}${dirName}${sep3}agent`;
 }
 function globalAgentDirFor(opts) {
   const cfg = (opts.configDir ?? "").trim();
   if (cfg) {
-    const sep3 = cfg.includes("\\") && !cfg.includes("/") ? "\\" : "/";
-    return cfg.endsWith(sep3) ? `${cfg}agent` : `${cfg}${sep3}agent`;
+    const sep4 = cfg.includes("\\") && !cfg.includes("/") ? "\\" : "/";
+    return cfg.endsWith(sep4) ? `${cfg}agent` : `${cfg}${sep4}agent`;
   }
-  const sep2 = opts.homeDir.includes("\\") && !opts.homeDir.includes("/") ? "\\" : "/";
-  const base = opts.homeDir.endsWith(sep2) ? opts.homeDir : `${opts.homeDir}${sep2}`;
-  return `${base}.config${sep2}opencode${sep2}agent`;
+  const sep3 = opts.homeDir.includes("\\") && !opts.homeDir.includes("/") ? "\\" : "/";
+  const base = opts.homeDir.endsWith(sep3) ? opts.homeDir : `${opts.homeDir}${sep3}`;
+  return `${base}.config${sep3}opencode${sep3}agent`;
 }
 function planOverrideSync(overrides, opts) {
   const files = [];
@@ -16643,25 +16085,54 @@ function planOverrideSync(overrides, opts) {
   }
   return files.length > 0 ? { kind: "override", dir: opts.dir, files } : null;
 }
-function provenanceFor(family, globalPoolFile) {
-  return family.file === globalPoolFile ? { global: true } : { ns: family.ns, file: family.file };
+function overrideSyncFindings(plan, deps) {
+  const findings = [];
+  for (const id of BUILTIN_OVERRIDE_IDS) {
+    const name = `${id}.md`;
+    const dest = joinPath(plan.dir, name);
+    const expected = plan.files.find((file2) => file2.fileName === name);
+    try {
+      if (deps.stat?.(dest) == null) {
+        if (expected)
+          findings.push(`missing override artifact: ${dest}`);
+        continue;
+      }
+      const existing = deps.readFile(dest);
+      if (!existing.includes(GENERATED_MARKER)) {
+        if (expected)
+          findings.push(`override collision: hand-written file ${dest}`);
+      } else if (!expected || existing !== expected.content) {
+        findings.push(`stale generated override: ${dest}`);
+      }
+    } catch {
+      findings.push(`unreadable override artifact: ${dest}`);
+    }
+  }
+  return findings;
+}
+function provenanceFor(origin, globalPoolFile, platform) {
+  const fold = (p) => platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p;
+  return fold(origin.file) === fold(globalPoolFile) ? { global: true } : { ns: origin.ns, file: origin.file };
+}
+function rosterAgentDirFor(poolFile, opts) {
+  return "global" in provenanceFor({ file: poolFile, ns: "" }, opts.globalPoolFile, opts.platform ?? process.platform) ? opts.globalAgentDir ?? agentDirFor(poolFile) : agentDirFor(poolFile);
+}
+function compileResolvedRosterEntry(resolution, matId, opts) {
+  const agent = resolution.agents[matId];
+  const provenance = provenanceFor(agent, opts.globalPoolFile, opts.platform ?? process.platform);
+  return compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined });
 }
 function planRosterSync(resolution, opts) {
   const plans = [];
   for (const family of resolution.families) {
-    const provenance = provenanceFor(family, opts.globalPoolFile);
-    const files = family.materializedIds.map((matId) => {
-      const agent = resolution.agents[matId];
-      const compiled = compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined });
-      return { matId, ...compiled };
-    });
-    plans.push({ kind: "family", family, dir: agentDirFor(family.file), files });
+    const files = family.materializedIds.map((matId) => ({ matId, ...compileResolvedRosterEntry(resolution, matId, opts) }));
+    plans.push({ kind: "family", family, dir: rosterAgentDirFor(family.file, opts), files });
   }
   return plans;
 }
 function joinPath(dir, name) {
-  const sep2 = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
-  return dir.endsWith(sep2) ? `${dir}${name}` : `${dir}${sep2}${name}`;
+  const sep3 = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  return dir.endsWith(sep3) ? `${dir}${name}` : `${dir}${sep3}${name}`;
 }
 function executeRosterSync(plans, deps = {}) {
   const stat = deps.stat ?? (() => null);
@@ -16690,24 +16161,22 @@ function executeRosterSync(plans, deps = {}) {
       let tmp = null;
       try {
         const existing = stat(dest) !== null ? readFile(dest) : null;
-        if (plan.kind === "override" && existing !== null && !existing.includes(GENERATED_MARKER)) {
-          out.errors.push(`${dest}: collision refused — a hand-written file of this exact name already exists; sync never overwrites it. Fold your changes into the global recipe's "override" entry, or rename/remove the hand-written file.`);
+        if (existing !== null && !existing.includes(GENERATED_MARKER)) {
+          out.errors.push(`${dest}: collision refused — a hand-written file of this exact name already exists; sync never overwrites it. Fold your changes into the recipe, or rename/remove the hand-written file.`);
           continue;
         }
-        if (existing === file2.content) {
+        if (existing !== null && (plan.kind === "family" ? sameProjection(existing, file2.content) : existing === file2.content)) {
           out.unchanged.push(dest);
           continue;
         }
-        tmp = `${dest}.new`;
-        writeFile(tmp, file2.content);
-        try {
-          rename(tmp, dest);
-        } catch {
-          try {
-            unlink(dest);
-          } catch {}
-          rename(tmp, dest);
+        const tempPath = `${dest}.new`;
+        if (stat(tempPath) !== null) {
+          out.errors.push(`${tempPath}: temporary file already exists; sync leaves it untouched`);
+          continue;
         }
+        tmp = tempPath;
+        writeFile(tmp, file2.content);
+        rename(tmp, dest);
         tmp = null;
         if (existing === null)
           out.created.push(dest);
@@ -16752,7 +16221,7 @@ function executeRosterSync(plans, deps = {}) {
   }
   return out;
 }
-function staleCheckForPool(poolFile, expectedMatIds, deps = {}, expectedContentOf) {
+function staleCheckForPool(poolFile, expectedMatIds, deps = {}, expectedContentOf, artifactDir) {
   if (poolFile === null)
     return { stale: false, reason: "no workspace pool — global-fallback roster, no per-workspace artifacts gate" };
   const stat = deps.stat ?? (() => null);
@@ -16760,11 +16229,27 @@ function staleCheckForPool(poolFile, expectedMatIds, deps = {}, expectedContentO
     throw new Error("readFile unavailable");
   });
   const recipe = stat(poolFile);
+  const dir = artifactDir ?? agentDirFor(poolFile);
+  if (expectedContentOf) {
+    const wanted = new Set(expectedMatIds.map((id) => `forge-${id}.md`));
+    for (const name of deps.readdir?.(dir) ?? []) {
+      if (!name.startsWith("forge-") || !name.endsWith(".md") || wanted.has(name))
+        continue;
+      try {
+        if (readFile(joinPath(dir, name)).includes(GENERATED_MARKER)) {
+          return { stale: true, reason: `orphaned generated artifact: ${joinPath(dir, name)} — ${recipe === null ? "recipe missing" : "entry removed from recipe"}` };
+        }
+      } catch {
+        return { stale: true, reason: `artifact ${joinPath(dir, name)} unreadable` };
+      }
+    }
+    if (recipe === null && expectedMatIds.length > 0)
+      return { stale: true, reason: `recipe missing: ${poolFile}` };
+  }
   if (recipe === null)
     return { stale: false, reason: "recipe file not statable" };
   if (expectedMatIds.length === 0)
     return { stale: false, reason: "recipe contributes no agents" };
-  const dir = agentDirFor(poolFile);
   let newest = -Infinity;
   let missing = [];
   for (const matId of expectedMatIds) {
@@ -16777,1259 +16262,26 @@ function staleCheckForPool(poolFile, expectedMatIds, deps = {}, expectedContentO
   if (missing.length > 0) {
     return { stale: true, reason: `missing artifact(s): ${missing.join(", ")} — the recipe has agents but no compiled file for them` };
   }
-  if (recipe.mtimeMs > newest) {
-    if (expectedContentOf) {
-      for (const matId of expectedMatIds) {
-        try {
-          if (readFile(joinPath(dir, `forge-${matId}.md`)) !== expectedContentOf(matId)) {
-            return { stale: true, reason: `recipe ${poolFile} changed — the compiled forge-${matId}.md differs from what it compiles to` };
-          }
-        } catch {
-          return { stale: true, reason: `artifact for forge-${matId} unreadable` };
+  if (expectedContentOf) {
+    for (const matId of expectedMatIds) {
+      try {
+        const existing = readFile(joinPath(dir, `forge-${matId}.md`));
+        if (!existing.includes(GENERATED_MARKER)) {
+          return { stale: true, reason: `hand-written collision: ${joinPath(dir, `forge-${matId}.md`)} differs from what it compiles to` };
         }
+        if (!sameProjection(existing, expectedContentOf(matId))) {
+          return { stale: true, reason: `recipe ${poolFile} — the compiled forge-${matId}.md differs from what it compiles to` };
+        }
+      } catch {
+        return { stale: true, reason: `artifact for forge-${matId} unreadable` };
       }
-      return { stale: false, reason: "recipe mtime is newer but the compiled content is current (touch/skew, not a change)" };
     }
+    return { stale: false, reason: "compiled content is current" };
+  }
+  if (recipe.mtimeMs > newest) {
     return { stale: true, reason: `recipe ${poolFile} is newer (mtime ${recipe.mtimeMs}) than the newest compiled artifact (mtime ${newest})` };
   }
   return { stale: false, reason: "artifacts are at least as new as the recipe" };
-}
-
-// src/search-core.ts
-import { join as winJoin } from "node:path";
-import { join as posixJoin } from "node:path/posix";
-import { relative, isAbsolute } from "node:path";
-import { existsSync as fsExistsSync } from "node:fs";
-var GIT_EXCLUSION_GLOB = "--glob=!**/.git/**";
-function buildRgArgv(params) {
-  const { kind, pattern, path, include } = params;
-  const follow = params.follow !== false;
-  const hidden = params.hidden !== false;
-  const argv = ["--no-config", "--json"];
-  if (hidden)
-    argv.push("--hidden");
-  if (follow)
-    argv.push("--follow");
-  argv.push(GIT_EXCLUSION_GLOB);
-  if (typeof include === "string" && include.length > 0) {
-    argv.push(`--glob=${include}`);
-  }
-  argv.push("--");
-  argv.push(pattern);
-  if (typeof path === "string" && path.length > 0)
-    argv.push(path);
-  return argv;
-}
-function buildRgFilesArgv(params) {
-  const follow = params.follow !== false;
-  const hidden = params.hidden !== false;
-  const argv = ["--no-config", "--files"];
-  if (hidden)
-    argv.push("--hidden");
-  if (follow)
-    argv.push("--follow");
-  argv.push(`--glob=${params.pattern}`);
-  argv.push(GIT_EXCLUSION_GLOB);
-  if (typeof params.path === "string" && params.path.length > 0)
-    argv.push(params.path);
-  return argv;
-}
-function parseRgFilesList(stdout) {
-  if (typeof stdout !== "string" || stdout.length === 0)
-    return [];
-  return stdout.split(/\r?\n/).filter((l) => l.length > 0).map((p) => ({ path: p, line: 0, text: "" }));
-}
-var MAX_STREAM_LINE_LENGTH = 1048576;
-function parseRgJsonStream(stdout) {
-  const out = { records: [], garbageLines: 0, oversizedLines: 0 };
-  if (typeof stdout !== "string" || stdout.length === 0)
-    return out;
-  const lines = stdout.split(/\r?\n/);
-  for (const raw of lines) {
-    if (raw.length === 0)
-      continue;
-    if (raw.length > MAX_STREAM_LINE_LENGTH) {
-      out.oversizedLines++;
-      continue;
-    }
-    let ev;
-    try {
-      ev = JSON.parse(raw);
-    } catch {
-      out.garbageLines++;
-      continue;
-    }
-    if (ev === null || typeof ev !== "object" || ev.type !== "match")
-      continue;
-    const data = ev.data;
-    if (data === null || typeof data !== "object")
-      continue;
-    const pathText = data?.path?.text;
-    const lineNumber = data?.line_number;
-    const lineText = data?.lines?.text;
-    if (typeof pathText !== "string" || typeof lineNumber !== "number" || typeof lineText !== "string")
-      continue;
-    out.records.push({ path: pathText, line: lineNumber, text: lineText });
-  }
-  return out;
-}
-function createMemoizedResolver(resolve2) {
-  const cache = new Map;
-  return (p) => {
-    const hit = cache.get(p);
-    if (hit !== undefined)
-      return hit;
-    const v = resolve2(p);
-    cache.set(p, v);
-    return v;
-  };
-}
-function isOutsideWorktree(resolved, root) {
-  const norm = (s) => s.replaceAll("\\", "/").replace(/\/+$/, "").toLowerCase();
-  const r = norm(root);
-  const v = norm(resolved);
-  if (v === r)
-    return false;
-  const rel = relative(r, v);
-  return rel.startsWith("..") || isAbsolute(rel);
-}
-function dedupeFollowMatches(records, opts) {
-  if (!opts.follow)
-    return { records: [...records], mergedDuplicates: 0, outsideTargets: [] };
-  const resolve2 = createMemoizedResolver(opts.resolvePath);
-  const seen = new Map;
-  const outside = new Set;
-  let merged = 0;
-  for (const rec of records) {
-    const real = resolve2(rec.path);
-    if (isOutsideWorktree(real, opts.worktreeRoot))
-      outside.add(real);
-    const bucket = seen.get(real);
-    if (bucket === undefined) {
-      seen.set(real, [rec]);
-      continue;
-    }
-    const sameLine = bucket.find((k) => k.line === rec.line);
-    if (sameLine !== undefined) {
-      merged++;
-      if (rec.path < sameLine.path)
-        sameLine.path = rec.path;
-      continue;
-    }
-    if (rec.path < bucket[0].path)
-      bucket[0].path = rec.path;
-    bucket.push(rec);
-  }
-  const kept = [];
-  for (const bucket of seen.values()) {
-    const firstPath = bucket.reduce((m, r) => r.path < m ? r.path : m, bucket[0].path);
-    for (const r of bucket)
-      kept.push({ ...r, path: firstPath });
-  }
-  kept.sort((a, b) => a.path === b.path ? a.line - b.line : a.path < b.path ? -1 : 1);
-  return { records: kept, mergedDuplicates: merged, outsideTargets: [...outside].sort() };
-}
-var RG_MISSING_REMEDIES = "install ripgrep (or set search.rgPath in forge config to an existing rg binary), or fall back to the builtin grep/glob tools for this search";
-function resolveRgBinary(config2, seams) {
-  const platform = seams?.platform ?? process.platform;
-  const sep2 = seams?.pathSep ?? (platform === "win32" ? ";" : ":");
-  const exists = seams?.existsSync ?? fsExistsSync;
-  const pathEnv = seams?.pathEnv ?? (process.env.PATH ?? "");
-  if (typeof config2?.rgPath === "string" && config2.rgPath.length > 0 && exists(config2.rgPath)) {
-    return { ok: true, binary: config2.rgPath, source: "config" };
-  }
-  const exe = platform === "win32" ? "rg.exe" : "rg";
-  const join6 = platform === "win32" ? winJoin : posixJoin;
-  for (const dir of pathEnv.split(sep2)) {
-    if (dir.length === 0)
-      continue;
-    const candidate = join6(dir, exe);
-    if (exists(candidate))
-      return { ok: true, binary: candidate, source: "path" };
-  }
-  return {
-    ok: false,
-    error: `ripgrep (rg) not found — ${RG_MISSING_REMEDIES}`
-  };
-}
-var MAX_RESULTS = 100;
-function formatSearchOutput(records, opts) {
-  const lines = [];
-  const total = records.length;
-  if (total === 0) {
-    lines.push("No files found");
-  } else if (opts.kind === "glob") {
-    const unique = [];
-    const seen = new Set;
-    for (const r of records) {
-      if (!seen.has(r.path)) {
-        seen.add(r.path);
-        unique.push(r.path);
-      }
-    }
-    for (const p of unique.slice(0, MAX_RESULTS))
-      lines.push(p);
-    if (unique.length > MAX_RESULTS) {
-      lines.push(`(truncated at ${MAX_RESULTS} results — narrow the path or pattern)`);
-    }
-  } else {
-    lines.push(`Found ${total} matches`);
-    const shown = records.slice(0, MAX_RESULTS);
-    for (const r of shown)
-      lines.push(`${r.path}: Line ${r.line}: ${r.text.replace(/\r?\n$/, "")}`);
-    if (total > MAX_RESULTS) {
-      lines.push(`(truncated at ${MAX_RESULTS} results of ${total} — narrow the path or pattern)`);
-    }
-  }
-  for (const t of opts.outsideTargets ?? []) {
-    lines.push(`outside-workspace target searched via link: ${t}`);
-  }
-  const merged = opts.mergedDuplicates ?? 0;
-  if (merged > 0)
-    lines.push(`+${merged} duplicate paths merged`);
-  return lines.join(`
-`);
-}
-
-// src/search-js.ts
-function escapeReChar(c) {
-  return /[.+^${}()|[\]\\]/.test(c) ? "\\" + c : c;
-}
-function translateGlob(pat) {
-  let out = "";
-  let i = 0;
-  while (i < pat.length) {
-    const c = pat[i];
-    if (c === "*") {
-      let stars = 0;
-      while (pat[i] === "*") {
-        stars++;
-        i++;
-      }
-      if (stars >= 2 && pat[i] === "/") {
-        i++;
-        out += "(?:[^/]*/)*";
-      } else if (stars >= 2) {
-        out += ".*";
-      } else if (pat[i] === "/") {
-        i++;
-        out += "[^/]*/";
-      } else {
-        out += "[^/]*";
-      }
-    } else if (c === "?") {
-      i++;
-      out += "[^/]";
-    } else if (c === "[") {
-      let j = i + 1;
-      let negated = false;
-      if (pat[j] === "!" || pat[j] === "^") {
-        negated = true;
-        j++;
-      }
-      let close = -1;
-      for (let k = j;k < pat.length; ) {
-        if (pat[k] === "\\") {
-          k += 2;
-          continue;
-        }
-        if (pat[k] === "]") {
-          close = k;
-          break;
-        }
-        k++;
-      }
-      if (close === -1 || close === j) {
-        out += "\\[";
-        i++;
-        continue;
-      }
-      let body = "";
-      for (let m = j;m < close; m++) {
-        const ch = pat[m];
-        if (ch === "\\") {
-          m++;
-          const escaped = pat[m];
-          if (escaped === undefined)
-            break;
-          body += escaped === "\\" || escaped === "]" ? "\\" + escaped : escaped;
-          continue;
-        }
-        body += ch === "]" || ch === "\\" ? "\\" + ch : ch;
-      }
-      if (body.length === 0) {
-        out += "\\[";
-        i++;
-        continue;
-      }
-      out += "[" + (negated ? "^" : "") + body + "]";
-      i = close + 1;
-    } else if (c === "{") {
-      const close = pat.indexOf("}", i + 1);
-      if (close === -1) {
-        out += "\\{";
-        i++;
-        continue;
-      }
-      const alts = pat.slice(i + 1, close).split(",");
-      out += "(?:" + alts.map((a) => translateGlob(a)).join("|") + ")";
-      i = close + 1;
-    } else {
-      out += escapeReChar(c);
-      i++;
-    }
-  }
-  return out;
-}
-var globRegexCache = new Map;
-function globToRegExp(pattern) {
-  const cached2 = globRegexCache.get(pattern);
-  if (cached2 !== undefined)
-    return cached2;
-  const source = translateGlob(pattern);
-  const anchored = pattern.includes("/");
-  const prefix = anchored ? "^" : "(?:^|/)";
-  let re;
-  try {
-    re = new RegExp(prefix + source + "$");
-  } catch {
-    re = /$^/;
-  }
-  globRegexCache.set(pattern, re);
-  return re;
-}
-function matchGlob(pattern, relPathFwd) {
-  return globToRegExp(pattern).test(relPathFwd);
-}
-var MAX_WALK_ENTRIES = 200000;
-var MAX_FILE_BYTES = 8 * 1024 * 1024;
-var MAX_RECORDS = 1e4;
-var BINARY_SNIFF_BYTES = 8 * 1024;
-function realOf(ctx, p) {
-  const hit = ctx.realCache.get(p);
-  if (hit !== undefined)
-    return hit;
-  const v = ctx.seams.realpath(p);
-  ctx.realCache.set(p, v);
-  return v;
-}
-function pushRecord(ctx, path, line, text) {
-  ctx.records.push({ path, line, text });
-  if (ctx.records.length >= MAX_RECORDS)
-    ctx.aborted = true;
-}
-async function scanFile(ctx, full, relFwd, outPath) {
-  const include = ctx.params.include;
-  if (typeof include === "string" && include.length > 0 && !matchGlob(include, relFwd))
-    return;
-  let buf;
-  try {
-    buf = await ctx.seams.readFilePrefix(full, MAX_FILE_BYTES);
-  } catch {
-    return;
-  }
-  if (buf.length > MAX_FILE_BYTES) {
-    ctx.oversizedSkips++;
-    return;
-  }
-  if (buf.subarray(0, BINARY_SNIFF_BYTES).includes(0))
-    return;
-  const re = ctx.lineRe;
-  if (re === null)
-    return;
-  const lines = buf.toString("utf8").split(/\r?\n/);
-  for (let i = 0;i < lines.length; i++) {
-    if (ctx.aborted)
-      return;
-    if (re.test(lines[i]))
-      pushRecord(ctx, outPath, i + 1, lines[i]);
-  }
-}
-function listFile(ctx, relFwd, outPath) {
-  if (matchGlob(ctx.params.pattern, relFwd))
-    pushRecord(ctx, outPath, 0, "");
-}
-async function handleFile(ctx, full, relFwd) {
-  if (ctx.params.kind === "grep") {
-    await scanFile(ctx, full, relFwd, relFwd.split("/").join(ctx.params.pathSeparator));
-  } else {
-    listFile(ctx, relFwd, relFwd.split("/").join(ctx.params.pathSeparator));
-  }
-}
-async function walkDir(ctx, full, relFwd) {
-  let entries;
-  try {
-    entries = await ctx.seams.readdir(full);
-  } catch {
-    return;
-  }
-  entries.sort((a, b) => a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
-  for (const e of entries) {
-    if (ctx.aborted || ctx.capped)
-      return;
-    ctx.visited++;
-    if (ctx.visited > ctx.maxWalkEntries) {
-      ctx.capped = true;
-      return;
-    }
-    if (e.isDirectory && e.name === ".git")
-      continue;
-    if (!ctx.params.hidden && e.name.startsWith("."))
-      continue;
-    const childFull = full + ctx.params.pathSeparator + e.name;
-    const childRel = relFwd === "" ? e.name : relFwd + "/" + e.name;
-    if (e.isSymbolicLink) {
-      if (!ctx.params.follow)
-        continue;
-      let st;
-      try {
-        st = await ctx.seams.stat(childFull);
-      } catch {
-        continue;
-      }
-      if (st.isDirectory) {
-        const real = realOf(ctx, childFull);
-        if (ctx.seen.has(real))
-          continue;
-        ctx.seen.add(real);
-        await walkDir(ctx, childFull, childRel);
-      } else if (st.isFile) {
-        await handleFile(ctx, childFull, childRel);
-      }
-    } else if (e.isDirectory) {
-      const real = realOf(ctx, childFull);
-      if (ctx.seen.has(real))
-        continue;
-      ctx.seen.add(real);
-      await walkDir(ctx, childFull, childRel);
-    } else if (e.isFile) {
-      await handleFile(ctx, childFull, childRel);
-    }
-  }
-}
-async function jsSearch(params, seams, maxWalkEntries = MAX_WALK_ENTRIES) {
-  let lineRe = null;
-  if (params.kind === "grep") {
-    let firstError = null;
-    try {
-      lineRe = new RegExp(params.pattern);
-    } catch (err) {
-      firstError = err;
-    }
-    if (lineRe === null) {
-      try {
-        lineRe = new RegExp(params.pattern, "u");
-      } catch (err2) {
-        return {
-          records: [],
-          notices: [],
-          error: "[forge:search] pattern is not a valid regular expression in the builtin-js engine (dialect difference) — install ripgrep or set search.rgPath for full rg-pattern support: " + String(err2?.message ?? err2 ?? firstError)
-        };
-      }
-    }
-  }
-  let rootSt;
-  try {
-    rootSt = await seams.stat(params.root);
-  } catch {
-    return { records: [], notices: [], error: `[forge:search] root path is not accessible: ${params.root}` };
-  }
-  const ctx = {
-    params,
-    seams,
-    records: [],
-    lineRe,
-    seen: new Set,
-    realCache: new Map,
-    visited: 0,
-    oversizedSkips: 0,
-    aborted: false,
-    capped: false,
-    maxWalkEntries
-  };
-  const collectNotices = () => {
-    const out = [];
-    if (ctx.capped) {
-      out.push(`(js engine: walk capped at ${maxWalkEntries} entries — narrow the path)`);
-    }
-    if (ctx.aborted && ctx.records.length >= MAX_RECORDS) {
-      out.push(`(js engine: capped at ${MAX_RECORDS} recorded matches — narrow the pattern)`);
-    }
-    if (ctx.oversizedSkips > 0) {
-      out.push(`(js engine: skipped ${ctx.oversizedSkips} files over 8 MiB)`);
-    }
-    return out;
-  };
-  if (rootSt.isFile) {
-    const relFwd = params.root.split(params.pathSeparator).join("/");
-    if (params.kind === "glob") {
-      if (matchGlob(params.pattern, relFwd))
-        pushRecord(ctx, params.root, 0, "");
-    } else {
-      await scanFile(ctx, params.root, relFwd, params.root);
-    }
-    return { records: ctx.records, notices: collectNotices() };
-  }
-  if (!rootSt.isDirectory) {
-    return { records: [], notices: [] };
-  }
-  ctx.seen.add(realOf(ctx, params.root));
-  await walkDir(ctx, params.root, "");
-  return { records: ctx.records, notices: collectNotices() };
-}
-
-// src/dispatch-async.ts
-var QUESTION_DENY_PERMISSION = [{ permission: "question", action: "deny", pattern: "*" }];
-var QUESTION_DENY_PERMISSIONS_V2 = [{ action: "question", resource: "*", effect: "deny" }];
-var TASK_DENY_PERMISSIONS_V2 = [{ action: "task", resource: "*", effect: "deny" }];
-var ACTIVE_STATUS_TYPES = new Set(["busy", "retry", "running"]);
-var defaultNow = () => Date.now();
-var defaultSleep = (ms) => new Promise((resolve2) => setTimeout(resolve2, ms));
-function childSessionTitle(description, agentID) {
-  return `${description} (@${agentID} subagent)`;
-}
-var TASK_CREATE_SEAM_ABSENT = "task-create-seam-absent";
-function assertBoundRecord(record2, sessionID, input) {
-  if (!input.assertBinding)
-    return { ok: true, sessionID };
-  const bound = record2?.agent;
-  if (typeof bound !== "string" || bound === "") {
-    return {
-      ok: false,
-      error: `binding-lost: created child ${sessionID} reports no bound agent (requested ${input.agentID}) — refusing to prompt an unbound child`
-    };
-  }
-  if (bound !== input.agentID) {
-    return {
-      ok: false,
-      error: `binding-lost: created child ${sessionID} reports agent ${bound} (requested ${input.agentID}) — refusing to prompt the mismatched child`
-    };
-  }
-  return { ok: true, sessionID };
-}
-async function createChildSession(client, input) {
-  if (!client || typeof client.session?.create !== "function") {
-    return { ok: false, error: TASK_CREATE_SEAM_ABSENT };
-  }
-  let result;
-  try {
-    result = await client.session.create({
-      body: {
-        parentID: input.parentSessionID,
-        title: childSessionTitle(input.description, input.agentID),
-        agent: input.agentID,
-        ...input.modelPin ? {
-          model: {
-            providerID: input.modelPin.providerID,
-            modelID: input.modelPin.modelID,
-            id: input.modelPin.modelID,
-            ...input.modelPin.variant ? { variant: input.modelPin.variant } : {}
-          }
-        } : {},
-        ...input.questionDeny === true ? { permission: QUESTION_DENY_PERMISSION } : {},
-        ...input.questionDeny === true || input.taskDeny === true ? {
-          permissions: [
-            ...input.questionDeny === true ? QUESTION_DENY_PERMISSIONS_V2 : [],
-            ...input.taskDeny === true ? TASK_DENY_PERMISSIONS_V2 : []
-          ]
-        } : {}
-      },
-      query: { directory: input.parentDirectory }
-    });
-  } catch (e) {
-    return { ok: false, error: `session.create threw: ${String(e)}` };
-  }
-  if (result !== null && typeof result === "object" && (("data" in result) || ("error" in result))) {
-    if (result.error !== undefined) {
-      return { ok: false, error: `session.create failed: ${String(result.error)}` };
-    }
-    const id = result.data?.id;
-    if (typeof id !== "string" || id === "") {
-      return { ok: false, error: "session.create returned no session id" };
-    }
-    return assertBoundRecord(result.data, id, input);
-  }
-  const bare = result;
-  const bareId = bare?.id;
-  if (typeof bareId !== "string" || bareId === "") {
-    return { ok: false, error: "session.create returned no session id" };
-  }
-  return assertBoundRecord(bare, bareId, input);
-}
-function buildPromptArgs(input) {
-  return {
-    path: { id: input.sessionID },
-    body: {
-      agent: input.agentID,
-      parts: [{ type: "text", text: input.prompt }]
-    },
-    ...input.directory !== undefined ? { query: { directory: input.directory } } : {}
-  };
-}
-async function sendPrompt(client, input) {
-  const args = buildPromptArgs(input);
-  try {
-    if (typeof client.session.promptAsync === "function") {
-      await client.session.promptAsync(args);
-    } else if (typeof client.session.prompt === "function") {
-      await client.session.prompt(args);
-    } else {
-      return { ok: false, error: "client has no session.promptAsync or session.prompt endpoint" };
-    }
-  } catch (e) {
-    return { ok: false, error: `prompt send threw: ${String(e)}` };
-  }
-  return { ok: true };
-}
-var DEFAULT_POLL_INTERVAL_MS = 1000;
-var DEFAULT_POLL_TIMEOUT_MS = 600000;
-var MAX_POLL_TIMEOUT_MS = 3600000;
-function resolvePollTimeoutMs(env = process.env) {
-  const raw = env.FORGE_DISPATCH_POLL_TIMEOUT_MS;
-  if (raw === undefined || raw === "")
-    return DEFAULT_POLL_TIMEOUT_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1)
-    return DEFAULT_POLL_TIMEOUT_MS;
-  return Math.min(Math.round(parsed), MAX_POLL_TIMEOUT_MS);
-}
-function resolveNotifyIntervalMs(env = process.env) {
-  const raw = env.FORGE_DISPATCH_NOTIFY_INTERVAL_MS;
-  if (raw === undefined || raw === "")
-    return DEFAULT_POLL_TIMEOUT_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1)
-    return DEFAULT_POLL_TIMEOUT_MS;
-  return Math.min(Math.round(parsed), MAX_POLL_TIMEOUT_MS);
-}
-var DEFAULT_STALE_MS = 2700000;
-var MIN_STALE_RUNTIME_MS = 60000;
-function resolveStaleMs(env = process.env) {
-  const raw = env.FORGE_DISPATCH_STALE_MS;
-  if (raw === undefined || raw === "")
-    return DEFAULT_STALE_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1)
-    return DEFAULT_STALE_MS;
-  return Math.max(Math.round(parsed), MIN_STALE_RUNTIME_MS);
-}
-function resolveStaleMode(env = process.env) {
-  const raw = (env.FORGE_DISPATCH_STALE_MODE ?? "").trim().toLowerCase();
-  return raw === "observe" ? "observe" : "kill";
-}
-function resolveStaleFloorMs(env = process.env) {
-  const raw = env.FORGE_DISPATCH_STALE_FLOOR_MS;
-  if (raw === undefined || raw === "")
-    return MIN_STALE_RUNTIME_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0)
-    return MIN_STALE_RUNTIME_MS;
-  return Math.round(parsed);
-}
-function sessionNotFoundSignal(error45) {
-  let text = "";
-  let status;
-  if (typeof error45 === "string") {
-    text = error45;
-  } else if (error45 && typeof error45 === "object") {
-    const rec = error45;
-    for (const key of ["statusCode", "status", "code"]) {
-      const val = rec[key];
-      if (typeof val === "number" && val >= 100 && val < 600)
-        status = val;
-      if (typeof val === "string" && /^\d{3}$/.test(val))
-        status = Number(val);
-    }
-    text = [String(rec.name ?? ""), String(rec.message ?? "")].join(" ");
-  }
-  if (status === 404)
-    return true;
-  return /not found|missing/i.test(text);
-}
-function readTimeUpdated(record2) {
-  if (!record2 || typeof record2 !== "object")
-    return null;
-  const rec = record2;
-  const time3 = rec.time && typeof rec.time === "object" ? rec.time : undefined;
-  for (const candidate of [time3?.updated, rec.time_updated]) {
-    if (typeof candidate === "number" && Number.isFinite(candidate) && candidate >= 0)
-      return candidate;
-  }
-  return null;
-}
-async function sessionGet(client, sessionID) {
-  if (typeof client.session.get !== "function")
-    return { exists: null, timeUpdated: null };
-  let result;
-  try {
-    result = await client.session.get({ path: { id: sessionID } });
-  } catch (e) {
-    if (process.env.FORGE_DISPATCH_DEBUG === "1")
-      console.error(`[forge-dbg] sessionGet threw: ${String(e).slice(0, 300)}`);
-    return sessionNotFoundSignal(e) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null };
-  }
-  if (result !== null && typeof result === "object" && (("error" in result) || ("data" in result))) {
-    const env = result;
-    if (env.error !== undefined && env.error !== null) {
-      if (process.env.FORGE_DISPATCH_DEBUG === "1")
-        console.error(`[forge-dbg] sessionGet error envelope: ${JSON.stringify(env.error).slice(0, 300)}`);
-      return sessionNotFoundSignal(env.error) ? { exists: false, timeUpdated: null } : { exists: null, timeUpdated: null };
-    }
-    if (env.data == null)
-      return { exists: false, timeUpdated: null };
-    return { exists: true, timeUpdated: readTimeUpdated(env.data) };
-  }
-  if (result == null)
-    return { exists: false, timeUpdated: null };
-  return { exists: true, timeUpdated: readTimeUpdated(result) };
-}
-function staleAnchor(state, startedAt) {
-  return state.lastActivity ?? startedAt;
-}
-function staleThresholdCrossed(state, now, startedAt, staleMs, floorMs) {
-  return now - startedAt >= floorMs && now - staleAnchor(state, startedAt) >= staleMs;
-}
-function applyStaleProbe(state, probe) {
-  if (probe.exists !== true)
-    return;
-  const t = probe.timeUpdated;
-  if (t === null)
-    return;
-  if (state.lastActivity === null || t > state.lastActivity) {
-    state.lastActivity = t;
-    state.staleNotified = false;
-  }
-}
-function decideStaleSweep(probe, state, mode) {
-  if (probe.exists === null)
-    return { action: "skip" };
-  if (probe.exists === false)
-    return { action: "gone" };
-  if (mode === "observe")
-    return state.staleNotified ? { action: "quiet" } : { action: "notify" };
-  return { action: "kill" };
-}
-function staleSilentMinutes(state, now, startedAt) {
-  return Math.max(1, Math.round((now - staleAnchor(state, startedAt)) / 60000));
-}
-function isActiveStatus(status) {
-  return status !== undefined && status.type !== undefined && ACTIVE_STATUS_TYPES.has(status.type);
-}
-var TERMINAL_STABILITY_TICKS = 3;
-var ACTIVE_TEXTFUL_OVERRIDE_NOTE = "completion established from the message stream while the status view lagged";
-var DEFAULT_VIEW_LOSS_TICKS = 30;
-function latestAssistant(messages) {
-  let best;
-  let bestCreated = -Infinity;
-  for (const m of messages) {
-    if (m.info?.role !== "assistant")
-      continue;
-    const created = m.info.time?.created ?? 0;
-    if (created >= bestCreated) {
-      best = m;
-      bestCreated = created;
-    }
-  }
-  return best;
-}
-function describeError(error45) {
-  if (error45 && typeof error45 === "object" && "name" in error45) {
-    const named = error45;
-    const detail = named.data?.message ?? "";
-    return `${String(named.name)}${detail ? `: ${String(detail)}` : ""}`;
-  }
-  return String(error45);
-}
-async function pollChild(client, input, seams = {}) {
-  const now = seams.now ?? defaultNow;
-  const sleep = seams.sleep ?? defaultSleep;
-  const intervalMs = input.intervalMs ?? DEFAULT_POLL_INTERVAL_MS;
-  const timeoutMs = input.timeoutMs ?? DEFAULT_POLL_TIMEOUT_MS;
-  const deadline = now() + timeoutMs;
-  const stability = input.stability ?? { stableTicks: 0 };
-  let polls = 0;
-  for (;; ) {
-    await sleep(intervalMs);
-    polls++;
-    if (input.signal?.aborted) {
-      return { status: "aborted", sessionID: input.sessionID, polls };
-    }
-    let statusMap;
-    if (typeof client.session.status !== "function") {} else {
-      try {
-        const statusResult = await client.session.status();
-        if (statusResult.error === undefined && statusResult.data && typeof statusResult.data === "object") {
-          statusMap = statusResult.data;
-        }
-      } catch {
-        statusMap = undefined;
-      }
-    }
-    let active;
-    if (statusMap === undefined) {
-      active = true;
-    } else {
-      const entry = statusMap[input.sessionID];
-      active = entry === undefined ? false : isActiveStatus(entry);
-    }
-    let messages = [];
-    let messagesFailed = false;
-    if (typeof client.session.messages !== "function") {} else {
-      try {
-        const msgResult = await client.session.messages({
-          path: { id: input.sessionID },
-          query: { limit: 100 }
-        });
-        if (msgResult?.capabilityPending === true) {
-          messages = [];
-        } else if (msgResult.error === undefined && Array.isArray(msgResult.data)) {
-          messages = msgResult.data;
-        } else {
-          messagesFailed = true;
-        }
-      } catch {
-        messages = [];
-        messagesFailed = true;
-      }
-    }
-    const viewLossLimit = input.viewLossTicks ?? DEFAULT_VIEW_LOSS_TICKS;
-    if (statusMap === undefined && messagesFailed) {
-      stability.viewLossTicks = (stability.viewLossTicks ?? 0) + 1;
-      if (stability.viewLossTicks >= viewLossLimit) {
-        return { status: "stream-lost", sessionID: input.sessionID, polls };
-      }
-    } else {
-      stability.viewLossTicks = 0;
-    }
-    const last = latestAssistant(messages);
-    if (last?.info?.error != null) {
-      return { status: "error", error: describeError(last.info.error), polls };
-    }
-    const finished = Boolean(last?.info?.finish);
-    const textful = last !== undefined && (last.parts ?? []).some((p) => p.type === "text" && typeof p.text === "string" && p.text !== "");
-    if (!active && finished && textful) {
-      stability.stableTicks++;
-      stability.activeTextfulTicks = 0;
-      if (stability.stableTicks >= TERMINAL_STABILITY_TICKS) {
-        return { status: "completed", polls };
-      }
-    } else if (active && statusMap !== undefined && finished && textful) {
-      stability.stableTicks = 0;
-      stability.activeTextfulTicks = (stability.activeTextfulTicks ?? 0) + 1;
-      if (stability.activeTextfulTicks >= TERMINAL_STABILITY_TICKS) {
-        return { status: "completed", polls, via: "active-textful" };
-      }
-    } else {
-      stability.stableTicks = 0;
-      stability.activeTextfulTicks = 0;
-    }
-    if (active || finished && textful) {
-      stability.textlessIdleSince = undefined;
-    } else if (stability.textlessIdleSince === undefined) {
-      stability.textlessIdleSince = now();
-    }
-    if (now() >= deadline) {
-      return { status: "timeout", sessionID: input.sessionID, timeoutMs, polls };
-    }
-  }
-}
-async function fetchFinalMessage(client, sessionID) {
-  if (typeof client.session.messages !== "function") {
-    return { ok: false, error: "no messages capability on this dispatch client (signal-core completion owns the wake text)" };
-  }
-  let messages;
-  try {
-    const result = await client.session.messages({ path: { id: sessionID } });
-    if (result?.capabilityPending === true) {
-      return { ok: false, error: "messages capability pending (service discovery has not succeeded yet)" };
-    }
-    if (result.error !== undefined) {
-      return { ok: false, error: `session.messages failed: ${String(result.error)}` };
-    }
-    messages = Array.isArray(result.data) ? result.data : [];
-  } catch (e) {
-    return { ok: false, error: `session.messages threw: ${String(e)}` };
-  }
-  const last = latestAssistant(messages);
-  if (last === undefined) {
-    return { ok: false, error: `no assistant response found in child session ${sessionID}` };
-  }
-  const text = (last.parts ?? []).filter((p) => p.type === "text").map((p) => p.text ?? "").filter(Boolean).join(`
-`);
-  if (text === "") {
-    return { ok: false, error: `no assistant text output found in child session ${sessionID}` };
-  }
-  return { ok: true, text };
-}
-async function abortChild(client, sessionID) {
-  if (typeof client.session.abort !== "function") {
-    return { ok: false, error: "abort unavailable on this session client" };
-  }
-  try {
-    await client.session.abort({ path: { id: sessionID } });
-  } catch (e) {
-    return { ok: false, error: `session.abort threw: ${String(e)}` };
-  }
-  return { ok: true };
-}
-
-// src/dispatch-retry.ts
-var RETRYABLE_ERROR_PATTERNS = [
-  /unable to connect/i,
-  /econnrefused/i,
-  /econnreset/i,
-  /enotfound/i,
-  /socket hang up/i,
-  /fetch failed/i,
-  /network(?:\s|_)?error/i,
-  /not connected/i,
-  /connection (?:closed|refused|reset)/i,
-  /etimedout/i,
-  /timed?\s?-?out/i,
-  /timeout/i,
-  /overloaded/i,
-  /rate[\s_-]?limit/i,
-  /too many requests/i,
-  /internal server error/i,
-  /bad gateway/i,
-  /service unavailable/i,
-  /gateway timeout/i,
-  /\b(?:429|500|502|503|504)\b/
-];
-var RETRYABLE_STATUS_CODES = new Set([429, 500, 502, 503, 504]);
-var DETERMINISTIC_ERROR_PATTERNS = [
-  /no provider available/i,
-  /provider not (?:available|found|configured)/i,
-  /provider is forbidden/i,
-  /selected provider is forbidden/i,
-  /unknown provider/i,
-  /model not supported/i,
-  /model_not_supported/i,
-  /model[_\s-]*not[_\s-]*found/i,
-  /(?:no|missing)[_\s-]*(?:api|auth(?:entication)?)[_\s-]*key/i,
-  /(?:api|auth(?:entication)?)[_\s-]*key(?:[_\s-]+is)?[_\s-]*(?:missing|not[_\s-]*(?:found|configured)|required)/i,
-  /no models available/i,
-  /no connected providers/i,
-  /all providers (?:are )?(?:unavailable|disconnected|exhausted)/i,
-  /unauthorized/i,
-  /forbidden/i,
-  /invalid[\s_-]*(?:request|argument|parameter)/i,
-  /bad request/i,
-  /\b(?:400|401|403)\b/
-];
-var DETERMINISTIC_STATUS_CODES = new Set([400, 401, 403, 404, 405, 409, 422]);
-function classifyText(error45) {
-  if (typeof error45 === "string")
-    return error45;
-  if (!error45)
-    return "";
-  if (error45 instanceof Error)
-    return `${error45.name}: ${error45.message}`;
-  if (typeof error45 === "object") {
-    const rec = error45;
-    const parts = [];
-    if (typeof rec.name === "string")
-      parts.push(rec.name);
-    const data = rec.data;
-    if (data && typeof data === "object") {
-      const d = data;
-      if (typeof d.message === "string")
-        parts.push(d.message);
-      if (typeof d.error === "string")
-        parts.push(d.error);
-    }
-    if (typeof rec.message === "string")
-      parts.push(rec.message);
-    if (parts.length > 0)
-      return parts.join(": ");
-    try {
-      return JSON.stringify(error45);
-    } catch {
-      return String(error45);
-    }
-  }
-  return String(error45);
-}
-function extractStatusCode(error45) {
-  if (!error45 || typeof error45 !== "object")
-    return;
-  const rec = error45;
-  for (const key of ["statusCode", "status", "code"]) {
-    const val = rec[key];
-    if (typeof val === "number" && val >= 100 && val < 600)
-      return val;
-    if (typeof val === "string" && /^\d{3}$/.test(val))
-      return Number(val);
-  }
-  const response = rec.response;
-  if (response && typeof response === "object") {
-    const respStatus = response.status;
-    if (typeof respStatus === "number" && respStatus >= 100 && respStatus < 600)
-      return respStatus;
-    if (typeof respStatus === "string" && /^\d{3}$/.test(respStatus))
-      return Number(respStatus);
-  }
-  return;
-}
-function classifyDispatchError(err) {
-  const text = classifyText(err);
-  if (DETERMINISTIC_ERROR_PATTERNS.some((p) => p.test(text)))
-    return "deterministic";
-  const status = extractStatusCode(err);
-  if (status !== undefined && DETERMINISTIC_STATUS_CODES.has(status))
-    return "deterministic";
-  if (RETRYABLE_ERROR_PATTERNS.some((p) => p.test(text)))
-    return "retryable";
-  if (status !== undefined && RETRYABLE_STATUS_CODES.has(status))
-    return "retryable";
-  return "deterministic";
-}
-var RESUME_PREAMBLE = "Note: a previous attempt at this task may have partially completed the work. Before acting, inspect the current workspace state (files, git status) to see what is already done, then CONTINUE the work — do not redo what is already done.";
-function buildRetryPrompt(originalPrompt) {
-  return `${RESUME_PREAMBLE}
-
---- Original task ---
-${originalPrompt}`;
-}
-var DEFAULT_MAX_ATTEMPTS = 2;
-var MAX_ATTEMPTS_CEILING = 10;
-function resolveMaxAttempts(env = process.env) {
-  const raw = env.FORGE_DISPATCH_MAX_ATTEMPTS;
-  if (raw === undefined || raw === "")
-    return DEFAULT_MAX_ATTEMPTS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1)
-    return DEFAULT_MAX_ATTEMPTS;
-  return Math.min(Math.round(parsed), MAX_ATTEMPTS_CEILING);
-}
-var RETRY_BACKOFF_MS = 1e4;
-function resolveRetryBackoffMs(env = process.env) {
-  const raw = env.FORGE_DISPATCH_RETRY_BACKOFF_MS;
-  if (raw === undefined || raw === "")
-    return RETRY_BACKOFF_MS;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 0)
-    return RETRY_BACKOFF_MS;
-  return Math.round(parsed);
-}
-
-// src/dispatch-gate.ts
-function modelKey(identity) {
-  return `${identity.provider}/${identity.model}`;
-}
-function concurrencyRefusal(dimension, key, live, limit) {
-  return `[forge:dispatch-gate] Dispatch refused by the ${dimension} concurrency gate: ${live}/${limit} live dispatch children already run on ${dimension} "${key}". ` + `Recovery: a live child on that ${dimension} finishing frees a slot — its [forge:dispatch-complete] wake announces it. ` + `This is the plugin's own throttle, not a provider error — do not retry the provider.`;
-}
-function breakerRefusal(provider, failures, threshold, cooldownMs, msLeft) {
-  return `[forge:dispatch-gate] Dispatch refused by the provider circuit breaker: provider "${provider}" is OPEN after ${failures} consecutive failed dispatch terminals (threshold ${threshold}). ` + `Recovery: the breaker half-opens when the ${cooldownMs}ms cooldown elapses (${msLeft}ms left) and admits one probe dispatch; its success closes the breaker, its failure re-opens it. ` + `This is the plugin's own throttle, not a provider error — it is never retried as one.`;
-}
-function breakerHalfOpenRefusal(provider) {
-  return `[forge:dispatch-gate] Dispatch refused by the provider circuit breaker: provider "${provider}" is HALF-OPEN and its one probe dispatch is already in flight. ` + `Recovery: the probe's terminal outcome closes the breaker (success) or re-opens it (failure). ` + `This is the plugin's own throttle, not a provider error — it is never retried as one.`;
-}
-function createDispatchGate(config2 = null, clock = { now: () => Date.now() }) {
-  let cfg = config2 ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: { consecutiveFailures: 0, cooldownMs: 0 } };
-  const liveProvider = new Map;
-  const liveModel = new Map;
-  const breakers = new Map;
-  const breakerFor = (provider) => {
-    let cell = breakers.get(provider);
-    if (!cell) {
-      cell = { state: "closed", failures: 0, openedAt: 0, probeInFlight: false };
-      breakers.set(provider, cell);
-    }
-    return cell;
-  };
-  const bump = (map2, key, delta) => {
-    const next = Math.max(0, (map2.get(key) ?? 0) + delta);
-    if (next === 0)
-      map2.delete(key);
-    else
-      map2.set(key, next);
-  };
-  return {
-    updateConfig(next) {
-      cfg = next ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: { consecutiveFailures: 0, cooldownMs: 0 } };
-    },
-    config() {
-      return cfg;
-    },
-    admit(identity) {
-      const cell = breakerFor(identity.provider);
-      if (cell.state === "open") {
-        const elapsed = clock.now() - cell.openedAt;
-        if (cfg.circuitBreaker.cooldownMs > 0 && cfg.circuitBreaker.consecutiveFailures > 0 && elapsed >= cfg.circuitBreaker.cooldownMs) {
-          cell.state = "half-open";
-          cell.probeInFlight = false;
-        } else {
-          const msLeft = Math.max(0, cfg.circuitBreaker.cooldownMs - elapsed);
-          return { ok: false, refusal: breakerRefusal(identity.provider, cell.failures, cfg.circuitBreaker.consecutiveFailures, cfg.circuitBreaker.cooldownMs, msLeft) };
-        }
-      }
-      if (cell.state === "half-open" && cell.probeInFlight) {
-        return { ok: false, refusal: breakerHalfOpenRefusal(identity.provider) };
-      }
-      const pLimit = cfg.providerConcurrency[identity.provider];
-      if (typeof pLimit === "number" && pLimit >= 1) {
-        const live = liveProvider.get(identity.provider) ?? 0;
-        if (live >= pLimit) {
-          return { ok: false, refusal: concurrencyRefusal("provider", identity.provider, live, pLimit) };
-        }
-      }
-      const mk = modelKey(identity);
-      const mLimit = cfg.modelConcurrency[mk];
-      if (typeof mLimit === "number" && mLimit >= 1) {
-        const live = liveModel.get(mk) ?? 0;
-        if (live >= mLimit) {
-          return { ok: false, refusal: concurrencyRefusal("provider/model", mk, live, mLimit) };
-        }
-      }
-      bump(liveProvider, identity.provider, 1);
-      bump(liveModel, mk, 1);
-      if (cell.state === "half-open")
-        cell.probeInFlight = true;
-      return { ok: true };
-    },
-    release(identity) {
-      bump(liveProvider, identity.provider, -1);
-      bump(liveModel, modelKey(identity), -1);
-    },
-    recordTerminal(identity, outcome) {
-      this.release(identity);
-      const cell = breakerFor(identity.provider);
-      if (cell.state === "half-open") {
-        cell.probeInFlight = false;
-        if (outcome === "completed") {
-          cell.state = "closed";
-          cell.failures = 0;
-        } else if (outcome === "failed") {
-          cell.failures++;
-          cell.state = "open";
-          cell.openedAt = clock.now();
-        }
-        return;
-      }
-      if (cell.state === "closed") {
-        if (outcome === "completed") {
-          cell.failures = 0;
-        } else if (outcome === "failed") {
-          cell.failures++;
-          const threshold = cfg.circuitBreaker.consecutiveFailures;
-          if (threshold > 0 && cell.failures >= threshold) {
-            cell.state = "open";
-            cell.openedAt = clock.now();
-          }
-        }
-      }
-    },
-    liveCounts() {
-      return { provider: Object.fromEntries(liveProvider), model: Object.fromEntries(liveModel) };
-    },
-    breakerState(provider) {
-      const cell = breakerFor(provider);
-      return { state: cell.state, failures: cell.failures };
-    }
-  };
-}
-
-// src/dispatch-journal.ts
-import { appendFileSync, mkdirSync as mkdirSync5, readFileSync as readFileSync8, writeFileSync as writeFileSync5 } from "node:fs";
-import { dirname as dirname4 } from "node:path";
-var DEFAULT_JOURNAL_MAX = 200;
-function resolveJournalMax(env = process.env) {
-  const raw = env.FORGE_DISPATCH_JOURNAL_MAX;
-  if (raw === undefined || raw === "")
-    return DEFAULT_JOURNAL_MAX;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1)
-    return DEFAULT_JOURNAL_MAX;
-  return Math.round(parsed);
-}
-function defaultJournalFs(filePath) {
-  return {
-    read: () => {
-      try {
-        return readFileSync8(filePath, "utf8");
-      } catch {
-        return null;
-      }
-    },
-    append: (line) => {
-      try {
-        mkdirSync5(dirname4(filePath), { recursive: true });
-        appendFileSync(filePath, line + `
-`);
-      } catch {}
-    },
-    rewrite: (lines) => {
-      try {
-        mkdirSync5(dirname4(filePath), { recursive: true });
-        writeFileSync5(filePath, lines.length === 0 ? "" : lines.map((l) => l + `
-`).join(""));
-      } catch {}
-    }
-  };
-}
-function parseJournalLines(text) {
-  if (!text)
-    return [];
-  const byId = new Map;
-  for (const line of text.split(`
-`)) {
-    const trimmed = line.trim();
-    if (trimmed === "")
-      continue;
-    let parsed;
-    try {
-      parsed = JSON.parse(trimmed);
-    } catch {
-      continue;
-    }
-    if (!parsed || typeof parsed !== "object")
-      continue;
-    const rec = parsed;
-    if (typeof rec.id !== "string" || rec.id === "")
-      continue;
-    if (rec.state !== "dispatched" && rec.state !== "queued" && rec.state !== "started" && rec.state !== "retry-pending" && rec.state !== "terminal") {
-      continue;
-    }
-    byId.set(rec.id, rec);
-  }
-  return [...byId.values()];
-}
-function compactJournalRecords(records, max) {
-  if (records.length <= max)
-    return records;
-  const kept = [...records];
-  const terminals = kept.filter((r) => r.state === "terminal").sort((a, b) => (a.updatedAt ?? 0) - (b.updatedAt ?? 0));
-  let drop = kept.length - max;
-  const dropped = new Set;
-  for (const t of terminals) {
-    if (drop <= 0)
-      break;
-    dropped.add(t.id);
-    drop--;
-  }
-  return kept.filter((r) => !dropped.has(r.id));
-}
-function createDispatchJournal(filePath, opts = {}) {
-  const fs = opts.fs ?? defaultJournalFs(filePath);
-  const max = opts.maxRecords ?? DEFAULT_JOURNAL_MAX;
-  const load = () => parseJournalLines(fs.read());
-  return {
-    fs,
-    append: (record2) => {
-      fs.append(JSON.stringify(record2));
-      const records = load();
-      if (records.length > max) {
-        const kept = compactJournalRecords(records, max);
-        if (kept.length < records.length) {
-          fs.rewrite(kept.map((r) => JSON.stringify(r)));
-        }
-      }
-    },
-    load,
-    nonTerminal: () => load().filter((r) => r.state !== "terminal")
-  };
 }
 
 // plugin.ts
@@ -18051,48 +16303,37 @@ var FORGE_STATE_TOOLS = [
   "crew_close",
   "forge_sync"
 ];
-var FORGE_EXEC_TOOLS = ["forge_shell", "forge_jobs"];
-var FORGE_SEARCH_TOOLS = ["forge_grep", "forge_glob"];
-var FORGE_ALL_TOOLS = [...FORGE_STATE_TOOLS, ...FORGE_EXEC_TOOLS, ...FORGE_SEARCH_TOOLS];
-var FORGE_TOOL_SET = new Set(FORGE_ALL_TOOLS);
+var FORGE_TOOL_SET = new Set(FORGE_STATE_TOOLS);
 var FORGE_STATE_TOOL_SET = new Set(FORGE_STATE_TOOLS);
-var NATIVE_PARTITION_FALLBACKS = ["build", "plan", "general", "explore"];
 var FORGE_PROMPT = `You are forge — the single general-purpose coding agent. You handle every task directly: exploration, planning, implementation, and verification. There is no agent switching.
 
 Workflow modes are strictly user-initiated. Never enter plan or goal mode — and never call a plan_* or goal_* tool — unless the user ran /plan or /goal, unmistakably asked for that mode (e.g. "plan first", "set a goal"), or the session already carries a [forge:plan-notice] / [forge:goal-notice] for a mode they started. Ordinary task requests are normal work. Mode-specific rules arrive with those commands and notices; when a notice is present, follow it.
 
-Subagent dispatch (task tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch a host agent through the task tool instead.`;
-function forgePromptText(opts) {
-  const mandate = opts.hardRefusal ? "Exec surface: every shell command — quick ones included — runs through the forge_shell tool. The builtin shell/bash tools are refused on this agent; never try them first, not even for trivial commands." : "Exec surface: prefer the forge_shell tool for every shell command — quick ones included; it is this agent's exec surface, and the builtin shell exists only as an explicit escape hatch.";
-  return `${FORGE_PROMPT}
-
-${mandate} Long-running or non-exiting commands: forge_shell with run_in_background, then collect results via forge_jobs.`;
-}
+Subagent dispatch (native \`subagent\` tool): when the work suits a scoped worker, prefer a configured \`forge-*\` subagent whose description matches the job. If none matches, say so plainly to the user and dispatch a host agent through the native \`subagent\` tool instead, subject to existing permissions and approvals. Native calls run in the background; use available host completion messages and session records as evidence, not repeated polling. Never assume unknown outcomes are settled. For ordinary commands, use the host shell when permitted; long commands can use \`background\` and host completion notifications rather than polling or sleeping. Git commits should use \`-m\` or \`--no-edit\`. Never create or edit files under .opencode/plan/ or .opencode/goal/ directly; use their state tools within the user-authorized mode.`;
 var PLAN_COMMAND_TEMPLATE = [
   '(forge plan harness routing. Argument: "$ARGUMENTS")',
   "",
   "FAMILY GUARD (step 0, before anything else): if you do not have the plan_write tool in your available tools, you are not in a forge session — STOP now: execute nothing below (including the directory listing), and tell the user that /plan belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
   "",
-  "Current .opencode/plan/ directory:",
-  "!`ls -1 .opencode/plan 2>/dev/null || echo '(empty)'`",
+  "Inspect the current .opencode/plan/ directory using read/glob when needed for routing; treat an absent directory as empty.",
   "",
   "Route on the argument above (decide silently; do not recite this routing text to the user):",
-  "- Argument empty: for every non-terminal plan (status draft or approved) in the directory above, read its frontmatter and task checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.",
-  '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked tasks to the user in one short list, then continue executing it — tick each task the moment it is done (plan_tick). If none exists, say so.',
+  "- Argument empty: for every non-terminal plan (status draft or approved) in that directory, read its frontmatter and numbered checkboxes, then report to the user: path, status, progress (x/y ticked). Ask whether to resume one or start something new.",
+  '- Argument "resume": pick the most recently updated non-terminal plan, summarize its remaining unticked steps to the user in one short list, then continue according to its status: if draft, remain read-only and follow user review and approval below; if approved, execute the remaining steps — tick each step the moment it is done (plan_tick). If none exists, say so.',
   '- Argument "discard": call the plan_discard tool with a short reason, then tell the user the plan was abandoned and writes are restored. If the work is NOT ending but moving to another harness — crew orchestration (/crew) or a goal contract (/goal) — pass supersede with the successor artifact path (e.g. ".opencode/crew/2026-10-01-....md") so the plan is marked superseded instead, with the successor recorded in the plan file.',
-  "- Any other argument: treat it as the task goal — you are now in planning mode for this goal. Follow the plan discipline below end to end.",
+  "- Any other argument: treat it as the plan goal — you are now in planning mode for this goal. Follow the plan discipline below end to end.",
   "",
   "## Plan discipline",
   "",
-  "Plans are short-horizon, single-task-goal documents (.opencode/plan/<date>-<slug>.md). The harness enforces the hard parts (draft write-ban, approval/close dialogs); you supply the engineering judgment. Never edit or create plan files by hand — every change goes through the plan_* tools.",
+  "Plans are short-horizon, single-goal documents (.opencode/plan/<date>-<slug>.md). The harness enforces the hard parts (draft write-ban, approval gate, verification at close); you supply the engineering judgment. Never edit or create plan files by hand — every change goes through the plan_* tools.",
   "",
-  "1. Reconnaissance and alignment (read-only): explore with read/grep/glob, and dispatch readonly-shape forge scouts (task tool) for breadth evidence — reconnaissance dispatch to effective-readonly workers keeps this session's context lean and is allowed both BEFORE and DURING the draft. All write tools and bash are DENIED while a draft exists, and so is dispatching write-shaped workers or native agents; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous or leaves meaningful choices open (scope, approach, acceptance), settle them with the user FIRST — 1-3 focused questions — and only write the draft once the shape is agreed; never plan against assumptions the user could settle in one line.",
+  "1. Reconnaissance and alignment (read-only): explore with read/grep/glob, and use the native subagent tool for breadth evidence from effective-readonly forge scouts both BEFORE and DURING the draft. Only dispatch workers with a current, compatible definition and effective host permissions that match an explicitly readonly recipe, deny all file-mutating tools (write/edit/patch family), and explicitly deny shell. Respect ordinary host permissions; if eligibility is unknown or denied, stay with permitted read tools and disclose the limitation. The host delivers the background scout's findings in its completion message. Remain read-only: all write tools and the builtin shell are DENIED while a draft exists (plan_* tools manage the plan). Write-shaped workers, readonly workers with shell, and non-forge agents must wait for approval; do not attempt them, do not ask the user to bypass. Gather concrete evidence with file:line references (verified findings, not guesses). If the goal is ambiguous or leaves meaningful choices open (scope, approach, acceptance), settle them with the user FIRST — 1-3 focused questions — and only write the draft once the shape is agreed; never plan against assumptions the user could settle in one line.",
   "2. Draft (plan_write): call plan_write with structured fields; the tool renders and validates the fixed sections, so a malformed plan cannot exist. Quality bar: goal = one line, the outcome not the activity; context = verified findings with file:line evidence, including what you ruled out and why; approach = the chosen approach AND at least one rejected alternative with the reason (a plan with no considered alternative is a guess); tasks = 3-8 concrete, independently verifiable steps, each doable in one sitting ('improve the code' is invalid; 'extract the timeout constant into config.ts and default it to 3000' is valid); risks = what could break, blast radius, rollback path; acceptance = criteria verifiable by a command, a file, or an observable behavior (vague criteria will fail the close); nonGoals = explicit out-of-scope items. To revise after feedback, call plan_write again — while in draft it overwrites the same file.",
-  `3. User review, then approval (plan_approve): after plan_write, present the plan in chat — goal, chosen approach with one line why, the numbered task list, the acceptance criteria — then STOP: end your turn and wait. The user owns the review, at their own pace: feedback → revise with plan_write, re-present, and wait again; rejection → /plan discard (or re-plan together); explicit go-ahead (e.g. "execute", "批准", "looks good") → call plan_approve — its confirmation dialog is the final hard gate, and the user's Allow starts execution. Never call plan_approve in the same turn that presents a draft, and never implement before approval succeeds.`,
-  "4. Execution (tick as you go): work tasks in order; call plan_tick with the task number immediately after EACH task's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected task or ask about revising (/plan with the same goal re-enters planning).",
+  `3. User review, then approval (plan_approve): after plan_write, present the plan in chat — goal, chosen approach with one line why, the numbered steps, the acceptance criteria — then STOP: end your turn and wait. The user owns the review, at their own pace: feedback → revise with plan_write, re-present, and wait again; rejection → /plan discard (or re-plan together); explicit go-ahead (e.g. "execute", "批准", "looks good") → call plan_approve — its confirmation dialog is the final hard gate, and the user's Allow starts execution. Never call plan_approve in the same turn that presents a draft, and never implement before approval succeeds.`,
+  "4. Execution (tick as you go): after approval succeeds, execute directly or dispatch via the native subagent tool, subject to ordinary host permissions. Work tasks in order; call plan_tick with the numbered step immediately after EACH step's work is actually done — never batch ticks, never tick ahead of reality (tick timestamps are an audit trail). If the plan turns out wrong mid-execution, do not silently improvise: tell the user what changed and either finish the affected step or ask about revising (/plan with the same goal re-enters planning).",
   "5. Completion (plan_close): when all tasks are ticked, self-check EVERY acceptance criterion with concrete evidence (file:line, command output, test result), then call plan_close — NO confirmation dialog appears. If the plan declares Verification Checks, the plugin itself re-runs the frozen check set on the host (fail-closed: a failing check refuses the close, records the run in the plan's Check Log, and the plan stays approved — that is the design working, not an inconvenience); otherwise your per-criterion self-checks gate the close. Either way an evidence summary is written into the plan file for the user to review asynchronously.",
   "",
-  "Boundaries: /plan discard abandons the plan (terminal, file kept as history, writes restored) — pass supersede (the successor artifact path) when the work moves to crew/goal rather than ends, marking it superseded; /plan resume continues an unfinished plan from its remaining tasks. Work expected to span multiple sessions or days of multi-file change is spec work (e.g. OpenSpec), not plan work — say so once and let the user choose.",
+  "Boundaries: /plan discard abandons the plan (terminal, file kept as history, writes restored) — pass supersede (the successor artifact path) when the work moves to crew/goal rather than ends, marking it superseded; /plan resume continues an unfinished plan from its remaining tasks. Work expected to span multiple sessions or days of multi-file change, or needing multi-round requirement review, is spec work (e.g. OpenSpec), not plan work — say so once and let the user choose.",
   ""
 ].join(`
 `);
@@ -18106,7 +16347,7 @@ var GOAL_COMMAND_TEMPLATE = [
   "",
   "Route on the argument above (decide silently; do not recite this routing text to the user):",
   "- Argument empty: for every non-terminal goal in the directory above, read its frontmatter and report to the user: path, status (queued/active/paused + stop_reason), revision, turns_used/max_turns budget. Mention queued goals and the /goal next promotion option. Ask whether to resume/promote one or arm something new.",
-  '- Argument "pause": call the goal_pause tool (with the blocker text as `blocker` when there is one), then tell the user the loop is stopped and how to resume.',
+  '- Argument "pause": call the goal_pause tool (with the blocker text as `blocker` when there is one), then tell the user the goal is paused, that already accepted work may finish, and how to resume.',
   `- Argument "resume": call the goal_resume tool for the session's paused goal (optionally with addTurns if the user asked for more budget). If no live goal exists but queued goals do, promote the oldest via goal_resume instead. The user confirms in a dialog.`,
   '- Argument "next": promote the oldest queued goal via the goal_resume tool (no live goal must remain). The user confirms in a dialog.',
   '- Argument "discard" (also "stop"/"cancel"/"off"): call the goal_discard tool. The user confirms in a dialog.',
@@ -18158,10 +16399,10 @@ var INIT_WORKSPACE_LEAD = "draft THIS workspace's recipe (.opencode/forge.json) 
 var INIT_FLOW_BODY = "First check whether the file already exists — if it does, REFUSE to change it: read it, present a review of the existing recipe (pool namespace, roles, shapes, pinned models) and offer edits the user must explicitly approve; NEVER overwrite or rewrite it. When it does not exist: interview the user briefly (or infer from the project context — language, build system, the roles the work needs) and propose a JSONC recipe covering the pool namespace, the roles (ids as plain role words WITHOUT the forge- prefix), each agent's shape (readonly for read-only roles, write for implementers), and the model+thoughtLevel atomic pair (both to pin, neither for an Auto worker). Show the proposed file, then write it ONLY on the user's explicit go-ahead — the write goes through the normal write tool so it lands in the transcript. The file hot-applies at the next config hook; no restart is needed, and a crew retry then passes.";
 var INIT_GLOBAL_SCAFFOLD_NOTE = "The global scaffold ships the built-in override entries (general/explore) fully COMMENTED OUT — inert until the user uncomments and fills one (activating an override replaces the built-in's prompt wholesale; the scaffold's inline comments say the same).";
 var INIT_GLOBAL_BODY = `same drafting flow for the GLOBAL recipe (~/.config/opencode/forge.json) — refuse-and-review when it already exists, draft in-band otherwise, write only on explicit go-ahead. ${INIT_GLOBAL_SCAFFOLD_NOTE}`;
-var FORGE_HELP_ROUTE_LINE = "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (cancel THIS session's in-flight and queued async dispatches) — and stop.";
+var FORGE_HELP_ROUTE_LINE = "- Argument empty or unknown: tell the user the four forms in one short list — /forge sync (force a roster sync NOW and show the diff), /forge init (draft this workspace's forge.json in-band), /forge init global (draft the global forge.json with commented built-in override entries), /forge stop (request stop of confirmed native child sessions) — and stop.";
 var STOP_LEVER_BODY = [
-  '- Argument "stop": call forge_jobs with action "stop" (no other parameters) and relay the tool result verbatim — it cancels every in-flight ASYNC DISPATCH owned by THIS session (each child session is aborted and CONFIRMED idle; each dispatch settles as aborted and is never retried) and every QUEUED wish of this session (removed from the queue before it can spawn — nothing was running for it; it is never dispatched). A dispatch owned by another session is NOT touched: name its task id only if the user asks, and cancel it with the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"}. Then STOP: no re-dispatch, no replacement work.',
-  "Boundaries: cancellation is USER intent only — never stop dispatches on your own initiative; a stopped dispatch is NEVER retried by any resilience path (retry, stale reap, adoption); the aborted journal entries and the owner wakes are delivered by the plugin's terminal path, not by you."
+  '- Argument "stop": relay the command receipt for confirmed native child sessions; do not issue additional cancellation requests. Do not claim anything was stopped without confirmation. Do not launch further work.',
+  "Boundaries: cancellation is USER intent only; do not touch unrelated sessions or commands. Interrupting the parent does not guarantee children stop; use /forge stop for explicit child cancellation. Report unknown outcomes honestly."
 ].join(`
 `);
 var FORGE_COMMAND_TEMPLATE = [
@@ -18213,13 +16454,22 @@ function movedEventFields(fields) {
   return { sessionID: fields.sessionID ?? fields.sessionId, directory };
 }
 var sessionAgents = new Map;
-var sealFindings = new Map;
-var sealUnknownNotes = new Set;
 function isForgeFamilyAgent(name) {
   if (typeof name !== "string")
     return false;
   const n = name.toLowerCase();
   return n === FORGE_AGENT || n.startsWith("forge-");
+}
+function assertHarnessAgent(tool3, speaker) {
+  if (!tool3 || !FORGE_STATE_TOOL_SET.has(tool3) || speaker === FORGE_AGENT)
+    return;
+  if (speaker && !isForgeFamilyAgent(speaker)) {
+    throw new Error(`[forge:partition] Tool refused: "${tool3}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`);
+  }
+  if (speaker?.toLowerCase().startsWith("forge-")) {
+    throw new Error(`[forge:partition] Tool refused: "${tool3}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${tool3} at the gate.`);
+  }
+  throw new Error(`[forge:partition] Tool refused: "${tool3}" is reserved for the primary forge agent; primary identity is not established. Switch to forge (Tab) to use forge tooling.`);
 }
 function sessionIsForgeFamily(sessionID) {
   if (!sessionID)
@@ -18231,8 +16481,8 @@ function noteToolAgent(context) {
     sessionAgents.set(context.sessionID, context.agent);
   }
 }
-var forgeDisabled = false;
 var hostAnchors = [];
+var observedRecipeFiles = new Set;
 var poolResolver = null;
 var poolResolution = null;
 var poolGateUnknownNotes = new Set;
@@ -18247,33 +16497,84 @@ function nativeRosterActive() {
   return v2HostSeen && v2MaterializeMode === "native";
 }
 function realRosterFs() {
+  const fixtureRoot = process.env.FORGE_TEST_FIXTURE_ROOT;
+  const checkPath = (path) => {
+    if (!fixtureRoot)
+      return;
+    const within = (root2, candidate) => {
+      const rel = relative3(root2, candidate);
+      return !isAbsolute3(rel) && rel !== ".." && !rel.startsWith("../") && !rel.startsWith("..\\");
+    };
+    const refused = () => new Error(`test fixture root refused roster path: ${path}`);
+    if (!within(fixtureRoot, path))
+      throw refused();
+    const root = realpathSync2(fixtureRoot);
+    let cursor = path;
+    while (true) {
+      try {
+        lstatSync(cursor);
+      } catch (err) {
+        if (err.code !== "ENOENT")
+          throw err;
+        const parent = dirname3(cursor);
+        if (parent === cursor || !within(fixtureRoot, parent))
+          throw refused();
+        cursor = parent;
+        continue;
+      }
+      if (!within(root, realpathSync2(cursor)))
+        throw refused();
+      return;
+    }
+  };
   return {
     stat: (path) => {
       try {
-        const s = statSync5(path);
+        checkPath(path);
+        const s = statSync3(path);
         return { mtimeMs: s.mtimeMs, size: s.size };
       } catch {
         return null;
       }
     },
-    readFile: (path) => readFileSync9(path, "utf8"),
-    writeFile: (path, data) => writeFileSync6(path, data),
-    rename: (from, to) => renameSync2(from, to),
-    unlink: (path) => unlinkSync3(path),
+    readFile: (path) => {
+      checkPath(path);
+      return readFileSync4(path, "utf8");
+    },
+    writeFile: (path, data) => {
+      checkPath(dirname3(path));
+      checkPath(path);
+      writeFileSync3(path, data);
+    },
+    rename: (from, to) => {
+      checkPath(dirname3(from));
+      checkPath(from);
+      checkPath(dirname3(to));
+      checkPath(to);
+      renameSync2(from, to);
+    },
+    unlink: (path) => {
+      checkPath(dirname3(path));
+      checkPath(path);
+      unlinkSync2(path);
+    },
     readdir: (path) => {
       try {
-        return readdirSync4(path);
+        checkPath(path);
+        return readdirSync(path);
       } catch {
         return null;
       }
     },
-    mkdir: (path) => mkdirSync6(path, { recursive: true })
+    mkdir: (path) => {
+      checkPath(path);
+      mkdirSync2(path, { recursive: true });
+    }
   };
 }
-function readGlobalKnobs(deps) {
+function readGlobalKnobs(path, deps) {
   try {
-    const path = globalPoolPathOf();
-    const text = deps?.readFile ? deps.readFile(path) : readFileSync9(path, "utf8");
+    const text = deps?.readFile ? deps.readFile(path) : readFileSync4(path, "utf8");
     const parsed = parseForgeJsonc(text);
     if (!parsed.ok)
       return { materialize: undefined, syncAuto: false };
@@ -18288,17 +16589,40 @@ function readGlobalKnobs(deps) {
 function runRosterSync() {
   const resolution = resolvePools();
   const overrideDir = globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR });
+  const rosterDirs = { globalPoolFile: globalPoolPathOf(), globalAgentDir: overrideDir };
   const overridePlan = resolution ? planOverrideSync(resolution.overrides ?? {}, {
     dir: overrideDir,
     recipeFile: globalPoolPathOf()
   }) : null;
-  if (!resolution || resolution.families.length === 0 && overridePlan === null) {
+  if (!resolution) {
     return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection)."], errorCount: 0 };
   }
-  const plans = [...planRosterSync(resolution, { globalPoolFile: globalPoolPathOf() })];
-  plans.push(overridePlan ?? { kind: "override", dir: overrideDir, files: [] });
+  const missingRecipeNotes = [];
+  const candidateFiles = new Set([globalPoolPathOf(), ...observedRecipeFiles, ...hostAnchors.map((anchor) => forgeConfigPaths({ projectDir: anchor }).project)]);
+  for (const file2 of candidateFiles) {
+    const fixtureRoot = process.env.FORGE_TEST_FIXTURE_ROOT;
+    if (fixtureRoot) {
+      const rel = relative3(fixtureRoot, file2);
+      if (isAbsolute3(rel) || rel === ".." || rel.startsWith("../") || rel.startsWith("..\\"))
+        continue;
+    }
+    if (recipeFileStat(file2) !== null)
+      continue;
+    const verdict = staleCheckForPool(file2, [], realRosterFs(), rosterContentOf(resolution), rosterAgentDirFor(file2, rosterDirs));
+    if (verdict.stale)
+      missingRecipeNotes.push(`  finding [warn]: ${verdict.reason}; restore the recipe or explicitly manage its generated files (sync leaves them untouched).`);
+  }
+  if (resolution.families.length === 0 && overridePlan === null) {
+    return { lines: ["[forge:sync] No forge.json recipe is visible to this host — nothing to compile (the recipe is the authority; native files are only its projection).", ...missingRecipeNotes], errorCount: 0 };
+  }
+  const recipeUsable = (file2) => recipeFileStat(file2) !== null && !resolution.findings.some((f) => (f.code === "config-parse-error" || f.code === "config-not-object") && f.message.startsWith(`${file2}:`));
+  const plans = planRosterSync(resolution, rosterDirs).filter((p) => recipeUsable(p.family.file));
+  if (recipeUsable(globalPoolPathOf()))
+    plans.push(overridePlan ?? { kind: "override", dir: overrideDir, files: [] });
   const outcome = executeRosterSync(plans, realRosterFs());
-  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.filter((p) => p.files.length > 0).length} pool(s):`];
+  const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.filter((p) => p.files.length > 0).length} pool(s):`, ...missingRecipeNotes];
+  if (foldPath(agentDirFor(rosterDirs.globalPoolFile)) !== foldPath(overrideDir))
+    lines.push(`  global artifacts use ${overrideDir}; former recipe-sibling path ${agentDirFor(rosterDirs.globalPoolFile)} is not scanned or cleaned by this global sync.`);
   if (outcome.created.length)
     lines.push(`  created: ${outcome.created.join(", ")}`);
   if (outcome.updated.length)
@@ -18320,61 +16644,48 @@ function runRosterSync() {
   return { lines, errorCount: outcome.errors.length + resolution.findings.filter((f) => f.level === "error").length };
 }
 function rosterContentOf(resolution) {
-  const globalPath = globalPoolPathOf();
-  return (matId) => {
-    const agent = resolution.agents[matId];
-    const provenance = foldPath(agent.file) === foldPath(globalPath) ? { global: true } : { ns: agent.ns, file: agent.file };
-    return compileRosterEntry({ matId, def: agent.def, provenance, shared: agent.shared ?? undefined }).content;
-  };
+  const globalPoolFile = globalPoolPathOf();
+  return (matId) => compileResolvedRosterEntry(resolution, matId, { globalPoolFile }).content;
 }
 function rosterStaleRefusal(anchor) {
   const resolution = resolvePools();
   const poolFile = anchor ? sessionPoolFileOf(anchor) : null;
   const fam = resolution?.families.find((f) => foldPath(f.file) === foldPath(poolFile ?? globalPoolPathOf()));
-  const verdict = staleCheckForPool(fam ? fam.file : poolFile, fam ? fam.materializedIds : [], realRosterFs(), resolution ? rosterContentOf(resolution) : undefined);
+  const file2 = fam ? fam.file : poolFile;
+  const verdict = staleCheckForPool(file2, fam ? fam.materializedIds : [], realRosterFs(), resolution ? rosterContentOf(resolution) : undefined, file2 === null ? undefined : rosterAgentDirFor(file2, { globalPoolFile: globalPoolPathOf(), globalAgentDir: globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR }) }));
   if (!verdict.stale)
     return null;
   return `[forge:crew] Roster stale refused: this session's native roster artifacts are out of date with the recipe — ${verdict.reason}. ` + `One-step fix: call the forge_sync tool NOW (it recompiles .opencode/agent/forge-*.md atomically, in-band, transcript-visible; the host hot-applies without a restart), then retry this registration. ` + `The recipe (forge.json) stays the authority — the gate only refuses dispatching against a stale projection.`;
 }
-function nativeRosterSyncHint() {
-  if (!nativeRosterActive())
-    return null;
-  const resolution = resolvePools();
-  if (!resolution)
-    return null;
-  const deps = realRosterFs();
-  const contentOf = rosterContentOf(resolution);
-  for (const fam of resolution.families) {
-    const verdict = staleCheckForPool(fam.file, fam.materializedIds, deps, contentOf);
-    if (verdict.stale) {
-      return ` Native-roster hint: this host materializes workers from compiled .opencode/agent/forge-*.md files and they are stale or missing (${verdict.reason}). ` + `Call the forge_sync tool to regenerate them, then retry.`;
-    }
-  }
-  return null;
-}
-function normalizeAnchorDir(dir) {
-  let p = (dir ?? "").trim();
+function anchorPath(dir) {
+  const p = (dir ?? "").trim();
   if (!p)
     return "";
   try {
-    p = realpathSync(p);
-  } catch {}
-  if (process.platform === "win32")
-    return p.replace(/\//g, "\\").toLowerCase();
-  return p;
+    return realpathSync2(p);
+  } catch {
+    return p;
+  }
+}
+function anchorKey(path) {
+  return process.platform === "win32" ? path.replace(/\//g, "\\").toLowerCase() : path;
+}
+function normalizeAnchorDir(dir) {
+  return anchorKey(anchorPath(dir));
 }
 function rememberHostAnchor(dir) {
   if (process.env.FORGE_ANCHOR_PROBE) {
     try {
-      appendFileSync2(join6(probeTmp(), "forge-anchor-probe.log"), `${new Date().toISOString()} rememberHostAnchor(${JSON.stringify(dir)}) cwd=${JSON.stringify(process.cwd())}
+      appendFileSync(join5(probeTmp(), "forge-anchor-probe.log"), `${new Date().toISOString()} rememberHostAnchor(${JSON.stringify(dir)}) cwd=${JSON.stringify(process.cwd())}
 `);
     } catch {}
   }
-  const normalized = normalizeAnchorDir(dir);
+  const path = anchorPath(dir);
+  const normalized = anchorKey(path);
   if (!normalized)
     return;
-  if (!hostAnchors.includes(normalized))
-    hostAnchors.push(normalized);
+  if (!hostAnchors.some((anchor) => anchorKey(anchor) === normalized))
+    hostAnchors.push(path);
   if (!poolResolver) {
     poolResolver = createPoolResolver({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
   }
@@ -18382,13 +16693,16 @@ function rememberHostAnchor(dir) {
 function resolvePools() {
   if (process.env.FORGE_ANCHOR_PROBE) {
     try {
-      appendFileSync2(join6(probeTmp(), "forge-anchor-probe.log"), `${new Date().toISOString()} resolvePools: resolver=${poolResolver ? "set" : "null"} anchors=${JSON.stringify([...hostAnchors])}
+      appendFileSync(join5(probeTmp(), "forge-anchor-probe.log"), `${new Date().toISOString()} resolvePools: resolver=${poolResolver ? "set" : "null"} anchors=${JSON.stringify([...hostAnchors])}
 `);
     } catch {}
   }
   if (!poolResolver || hostAnchors.length === 0)
     return null;
-  return poolResolver.resolve(hostAnchors);
+  const resolution = poolResolver.resolve(hostAnchors);
+  for (const family of resolution.families)
+    observedRecipeFiles.add(family.file);
+  return resolution;
 }
 var sessionAnchorLoaders = new Map;
 function loaderForAnchor(anchor) {
@@ -18417,7 +16731,7 @@ function crewPoolComplianceRefusal(anchor) {
     return null;
   let text;
   try {
-    text = readFileSync9(poolFile, "utf8");
+    text = readFileSync4(poolFile, "utf8");
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) could not be read (${reason}). ` + `Repair the file so it is readable JSONC declaring a valid top-level "pool" namespace ([a-z0-9-], 1-24 chars) — REQUIRED for crew-governed dispatch. ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
@@ -18430,25 +16744,26 @@ function crewPoolComplianceRefusal(anchor) {
   if (verdict.compliant)
     return null;
   const fam = resolvePools()?.families.find((f) => foldPath(f.file) === foldPath(poolFile));
-  const suggested = fam?.ns ?? sanitizeNamespace(basename2(dirname5(dirname5(poolFile))));
+  const suggested = fam?.ns ?? sanitizeNamespace(basename2(dirname3(dirname3(poolFile))));
   return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) is non-compliant — ${verdict.violation}. ` + `Minimal fix: add or repair the top-level "pool": "${suggested}" field (a [a-z0-9-] string, 1-24 chars — REQUIRED for crew-governed dispatch). ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
 }
-var CREW_NATIVE_FALLBACK_RULE = "Native fallback: when the pool offers no forge worker fitting a subtask (or forge-* dispatch is blocked by a degraded pool), dispatch the native general subagent with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native).";
-var CREW_COMPLIANCE_NATIVE_EXIT = " Native exit: while the pool is being repaired, the affected subtask may dispatch through the NATIVE task channel with the same relay contract — this compliance belt gates forge-* dispatch only, never the crew's existence.";
+var CREW_WAVE_RULE = "A wave is the set of native `subagent` calls made together by the orchestrating session (agent = the selected worker). Reuse of a sessionID starts another work round; duplicate observations of one round count once. Children work in the background; use host completion messages and available session evidence to verify settlement. Launch the next wave ONLY after every work round of the previous wave is verified settled. Partial, truncated or unknown views, idle or missing sessions, and unresolved outcomes do not establish settlement; end your turn and wait for the rest, without polling or sleeping. A diagnostic is not permission to launch another wave.";
+var CREW_NATIVE_FALLBACK_RULE = "Native fallback: when the pool offers no forge worker fitting a subtask or the pool is degraded, disclose the gap and suggest configuring the missing role; use the native `subagent` tool for a non-forge agent (e.g. general) only when permitted, with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native). Respect all approvals and host permissions.";
+var CREW_COMPLIANCE_NATIVE_EXIT = " Repair the pool before retrying the refused operation; respect existing approvals and permissions.";
 var crews = new Map;
 function crewRecordPathFor(worktree, objective) {
-  const dir = join6(worktree, ".opencode", "crew");
+  const dir = join5(worktree, ".opencode", "crew");
   const date5 = localDateNow();
   const slug = slugifyGoal(objective) || "crew";
   let name = `${date5}-${slug}.md`;
   let n = 2;
-  while (existsSync3(join6(dir, name)))
+  while (existsSync(join5(dir, name)))
     name = `${date5}-${slug}-${n++}.md`;
-  return join6(dir, name);
+  return join5(dir, name);
 }
 function writeCrewRecord(path, objective, anchor, subtasks, lineage) {
-  mkdirSync6(join6(path, ".."), { recursive: true });
-  writeFileSync6(path, [
+  mkdirSync2(join5(path, ".."), { recursive: true });
+  writeFileSync3(path, [
     `# Crew Record: ${objective}`,
     "",
     `- registered: ${nowIso()}`,
@@ -18466,7 +16781,7 @@ function appendCrewRecord(path, heading, lines) {
   if (!path)
     return;
   try {
-    appendFileSync2(path, [`## ${nowIso()} — ${heading}`, ...lines, ""].join(`
+    appendFileSync(path, [`## ${nowIso()} — ${heading}`, ...lines, ""].join(`
 `) + `
 `, "utf8");
   } catch {}
@@ -18482,17 +16797,15 @@ function governingGoalFor(sessionID) {
 }
 function crewPendingChoiceLines() {
   return [
-    "[forge:crew] The crew is PENDING — execution has NOT started. Present the execution-mode choice to the user and END YOUR TURN (every task dispatch is refused while the crew pends):",
+    "[forge:crew] The crew is PENDING — execution has NOT started. Present the execution-mode choice to the user and END YOUR TURN (do not start any subagent work while the crew pends):",
     `RELAY FIRST: tell the user the crew record path (it leads this output) alongside this choice — the record is on disk from the registration moment, and the user must hear it.`,
-    `  1. supervised waves NOW — when the user says go, call crew_begin {execution: "waves"} and run the wave discipline; waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard);`,
+    `  1. supervised waves NOW — when the user says go, call crew_begin {execution: "waves"} and run the wave discipline; waves auto-advance on session idle until crew_close only after verified settlement of the previous wave (the engine stops after a stall — nudge or re-shard);`,
     `  2. convert to a goal contract — call crew_begin {execution: "goal"} (the crew ends as a conversion record; no extra dialog here), then draft goal_write with arm=true folding the declared subtasks into criteria/checks — the arm dialog is the user's gate;`,
     `  3. standby — no call; the crew waits until armed or abandoned.`
   ];
 }
 var modelsDevCatalog = null;
 var depthFindingNotes = new Map;
-var crewCommandSnapshot = null;
-var materializedSnapshot = {};
 var sessionDepths = new Map;
 var OPENAI_FAMILY = new Set(["openai", "opencode", "openrouter", "groq", "xai", "azure", "github-copilot", "deepseek", "together", "vercel", "opus"]);
 var ANTHROPIC_FAMILY = new Set(["anthropic"]);
@@ -18534,296 +16847,42 @@ function resolveDepthChannel(providerID, modelID) {
     return { kind: "toggle" };
   return { kind: "effort", ladder: null };
 }
-var jobsMode = "auto";
-var jobsKeepBuiltinShell = false;
-var jobsSurviveMode = "never";
-function effectiveSurvive(config2, param) {
-  if (config2 === "deny") {
-    if (param === true)
-      throw new Error("[forge] jobs.survive is explicitly denied in config; a per-call survive=true cannot override it.");
-    return false;
-  }
-  if (param !== undefined)
-    return param;
-  return config2 === "always";
-}
-var jobFence = null;
-var jobRegistry = null;
-var exitCleanup = null;
-var jobsLifecycleStarted = false;
-function ensureJobLifecycle() {
-  if (jobsLifecycleStarted)
-    return { registry: jobRegistry, fence: jobFence };
-  jobsLifecycleStarted = true;
-  const registry2 = createJobRegistry(registryPathFor(jobLogDir()));
-  jobRegistry = registry2;
-  const { adopted, dead } = registry2.rescan(pidAlive, structuralRelocate);
-  for (const entry of adopted) {
-    adoptSurvivor(jobManager, entry, { registry: registry2, logDir: jobLogDir(), relocate: structuralRelocate });
-  }
-  for (const entry of dead) {
-    jobLedgerSink({ at: new Date().toISOString(), kind: "orphan-job", jobId: entry.id, session: entry.ownerSession, detail: `previous-run survivor pid ${entry.pid} is dead (cmd: ${entry.cmd.slice(0, 120)})` });
-  }
-  jobFence = process.env.FORGE_TEST_NO_FENCE === "1" ? null : createJobFence({
-    onDegrade: (reason) => {
-      jobLedgerSink({ at: new Date().toISOString(), kind: "fence-degraded", jobId: "-", session: "-", detail: reason });
-    }
-  });
-  exitCleanup = createExitCleanup(jobManager, {
-    graceMs: 3000,
-    skip: isDispatchRow,
-    trace: (line) => goalProbe(`exit-cleanup ${line}`),
-    after: () => {
-      jobFence?.dispose();
-    }
-  });
-  return { registry: registry2, fence: jobFence };
-}
-function jobStage() {
-  if (jobsMode === "native")
-    return 2;
-  return 0;
-}
-function jobLogDir() {
-  return jobsLogDir(forgeRuntimeRoot());
-}
-function jobLedgerSink(entry) {
-  try {
-    mkdirSync6(jobLogDir(), { recursive: true });
-    const jobLedgerPath = join6(jobLogDir(), "ledger.jsonl");
-    if (existsSync3(jobLedgerPath) && statSync5(jobLedgerPath).size > 1e6)
-      writeFileSync6(jobLedgerPath, "");
-    appendFileSync2(jobLedgerPath, `${JSON.stringify(entry)}
-`);
-  } catch {}
-}
-var jobManager = createJobManager({
-  sink: jobLedgerSink,
-  onWakeQueued: (job) => {
-    if (idleJobSessions.has(job.ownerSession)) {
-      deliverDispatchProgress(job.ownerSession).then(() => deliverJobWakes(job.ownerSession));
-    }
-  }
-});
-var dispatchProgressQueue = new Map;
-var dispatchProgressDropped = new Map;
-function dispatchStillLive(jobId) {
-  const row = jobManager.get(jobId);
-  if (row)
-    return row.state === "running";
-  for (const queue of dispatchQueues.values()) {
-    if (queue.some((wish) => wish.jobId === jobId))
-      return true;
-  }
-  for (const pumps of pumpInFlight.values()) {
-    for (const run of pumps)
-      if (run.wishId === jobId)
-        return true;
-  }
-  return false;
-}
-function queueDispatchProgress(sessionID, text, isLive) {
-  const notice = isLive ? { text, isLive } : { text };
-  const queued = dispatchProgressQueue.get(sessionID);
-  if (queued)
-    queued.push(notice);
-  else
-    dispatchProgressQueue.set(sessionID, [notice]);
-}
-async function deliverDispatchProgress(sessionID) {
-  if (forgeDisabled)
-    return;
-  const pending = dispatchProgressQueue.get(sessionID);
-  if (!pending || pending.length === 0)
-    return;
-  dispatchProgressQueue.delete(sessionID);
-  if (!jobClient || typeof jobClient.session.promptAsync !== "function")
-    return;
-  for (const notice of pending) {
-    if (notice.isLive) {
-      let live = true;
-      try {
-        live = notice.isLive();
-      } catch {}
-      if (!live) {
-        dispatchProgressDropped.set(sessionID, [...dispatchProgressDropped.get(sessionID) ?? [], notice.text].slice(-20));
-        continue;
-      }
-    }
-    try {
-      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: notice.text }] } });
-    } catch {}
-  }
-}
-var jobClient = null;
 var anchorClientShared = null;
 function sharedAnchorClient() {
   return anchorClientShared;
-}
-var idleJobSessions = new Set;
-function isDispatchRow(job) {
-  return job.dispatch != null;
-}
-var abortUnconfirmedNotes = new Map;
-var abortInFlight = new Map;
-var KILL_ABORT_VERDICT_WAIT_MS = 2000;
-var KILL_ABORT_PENDING_NOTE = `the abort call had not returned within ${KILL_ABORT_VERDICT_WAIT_MS / 1000} s`;
-async function awaitAbortVerdict(jobId) {
-  const pending = abortInFlight.get(jobId);
-  if (!pending)
-    return;
-  await new Promise((resolve2) => {
-    const timer = setTimeout(() => resolve2(), KILL_ABORT_VERDICT_WAIT_MS);
-    const done = () => {
-      clearTimeout(timer);
-      resolve2();
-    };
-    pending.then(done, done);
-  });
-  if (abortInFlight.get(jobId) === pending)
-    abortUnconfirmedNotes.set(jobId, KILL_ABORT_PENDING_NOTE);
-}
-function dispatchKillTreeHook(client, jobId, childSessionID) {
-  return () => {
-    const job = jobManager.get(jobId);
-    const meta = job ? job.dispatch : undefined;
-    if (meta && meta.outcome !== "stream-lost/unknown") {
-      meta.outcome = "aborted";
-      meta.abortReason = meta.abortReason ?? REGISTRY_KILL_ABORT_REASON;
-    }
-    const sid = childSessionID();
-    if (!sid)
-      return;
-    const pending = abortChild(client, sid).then((res) => {
-      if (!res.ok)
-        abortUnconfirmedNotes.set(jobId, res.error);
-    });
-    abortInFlight.set(jobId, pending);
-    const drop = () => {
-      if (abortInFlight.get(jobId) === pending)
-        abortInFlight.delete(jobId);
-    };
-    pending.then(drop, drop);
-  };
-}
-var DISPATCH_NOTICE_MEMORY = 30;
-function appendDispatchNotice(job, notice) {
-  jobManager.appendOutput(job, notice);
-  const memo2 = job;
-  if (!memo2.progressNotices)
-    memo2.progressNotices = [];
-  memo2.progressNotices.push(notice);
-  if (memo2.progressNotices.length > DISPATCH_NOTICE_MEMORY)
-    memo2.progressNotices.splice(0, memo2.progressNotices.length - DISPATCH_NOTICE_MEMORY);
-}
-function dispatchReportTail(job) {
-  const memo2 = job.progressNotices;
-  if (!memo2 || memo2.length === 0)
-    return job.tail;
-  let cut = -1;
-  for (const notice of memo2) {
-    const at = job.tail.lastIndexOf(notice);
-    if (at !== -1)
-      cut = Math.max(cut, at + notice.length);
-  }
-  return cut === -1 ? job.tail : job.tail.slice(cut);
-}
-function jobWakeText(job) {
-  const dispatch = job.dispatch;
-  if (dispatch) {
-    if (dispatch.outcome === "stream-lost/unknown") {
-      return [
-        `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — RESULT STREAM LOST (task ${job.id}, child session ${dispatch.childSessionID}): the dispatch view broke before a final report arrived; child state UNKNOWN (possibly still running).`,
-        `Last observation:
-${job.tail.slice(-2500) || "(no output)"}`,
-        `Ground-truth recovery: read reports/${job.id}-report.md in the workspace BEFORE considering a re-dispatch; the child session stays inspectable and natively abortable in the host TUI.`
-      ].join(`
-`);
-    }
-    if (job.state === "killed" || dispatch.outcome === "aborted") {
-      const reason = dispatch.abortReason ?? REGISTRY_KILL_ABORT_REASON;
-      const unconfirmed = abortUnconfirmedNotes.get(job.id);
-      return [
-        `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} — ABORTED (task ${job.id}, child session ${dispatch.childSessionID}): ${reason}.`,
-        unconfirmed ? `abort unconfirmed — child may still be running (${unconfirmed}); inspect or abort it natively in the host TUI.` : `The child session was aborted; this dispatch did NOT finish and produced no final report.`,
-        `Ground truth if needed: reports/${job.id}-report.md in the workspace, or the child transcript in the host TUI.`
-      ].join(`
-`);
-    }
-    return [
-      `[forge:dispatch-complete] task dispatch to ${dispatch.agentID} finished (task ${job.id}, child session ${dispatch.childSessionID}).`,
-      `Final report:
-${dispatchReportTail(job).slice(-2500) || "(no output)"}`,
-      "The dispatch is complete — read the report above; no polling, no re-dispatch needed."
-    ].join(`
-`);
-  }
-  return [
-    `[forge:job-complete] Background job ${job.id} finished (${job.state}${job.exitCode !== null ? `, exit ${job.exitCode}` : ""}).`,
-    `Command: ${job.cmd}`,
-    `Recent output:
-${job.tail.slice(-1500) || "(none)"}`,
-    "Details via forge_jobs (poll/log); the job stays in the registry until cleared."
-  ].join(`
-`);
-}
-async function deliverJobWakes(sessionID) {
-  if (forgeDisabled)
-    return;
-  if (!jobClient || typeof jobClient.session.promptAsync !== "function")
-    return;
-  for (const job of jobManager.deliverWakesFor(sessionID)) {
-    if (abortInFlight.has(job.id))
-      await awaitAbortVerdict(job.id);
-    try {
-      await jobClient.session.promptAsync({ path: { id: sessionID }, body: { parts: [{ type: "text", text: jobWakeText(job) }] } });
-    } catch {
-      job.wakeState = "queued";
-    }
-  }
-}
-async function handoffTarget(sessionID) {
-  if (!jobClient || typeof jobClient.session.get !== "function")
-    return;
-  let current = sessionID;
-  for (let depth = 0;depth < 10; depth++) {
-    try {
-      const info = await jobClient.session.get({ path: { id: current } });
-      if (!info?.parentID)
-        return current === sessionID ? undefined : current;
-      current = info.parentID;
-    } catch {
-      return;
-    }
-  }
-  return current === sessionID ? undefined : current;
 }
 function forgeRuntimeTmp() {
   return process.env.FORGE_TEST_RUNTIME_DIR || undefined;
 }
 function forgeRuntimeRoot() {
-  return join6(forgeRuntimeTmp() ?? tmpdir3(), "opencode-forge");
+  return join5(forgeRuntimeTmp() ?? tmpdir2(), "opencode-forge");
 }
 function sessionAnchorLedgerPath() {
-  return join6(process.env.FORGE_TEST_FORGE_HOME ?? forgeRuntimeTmp() ?? tmpdir3(), "opencode-forge", "session-anchors.jsonl");
+  return join5(process.env.FORGE_TEST_FORGE_HOME ?? forgeRuntimeTmp() ?? tmpdir2(), "opencode-forge", "session-anchors.jsonl");
 }
 function modelsDevCacheRoot() {
   return forgeRuntimeRoot();
 }
-function watchdogLogHome() {
-  return watchdogLogDir(forgeRuntimeTmp());
+async function refreshModelsDevCatalog(skipFetch = process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1", timeoutMs) {
+  if (skipFetch) {
+    modelsDevCatalog = null;
+    return;
+  }
+  try {
+    const snapshot = await loadModelsDevSnapshot({ cacheDir: modelsDevCacheRoot(), timeoutMs });
+    modelsDevCatalog = snapshot.catalog;
+  } catch {
+    modelsDevCatalog = null;
+  }
 }
 function probeTmp() {
-  return forgeRuntimeTmp() ?? tmpdir3();
+  return forgeRuntimeTmp() ?? tmpdir2();
 }
 var __runtimeNamespaceTestSurface = {
   tmp: forgeRuntimeTmp,
   root: forgeRuntimeRoot,
-  jobLogDir: () => jobLogDir(),
-  jobLedgerPath: () => join6(jobLogDir(), "ledger.jsonl"),
   modelsDevCacheRoot,
   modelsDevCacheDir: () => modelsDevCacheDir(modelsDevCacheRoot()),
-  watchdogLogDir: watchdogLogHome,
   probeTmp,
   sessionAnchorLedgerPath
 };
@@ -18840,18 +16899,18 @@ function sessionAnchorLedgerFs() {
   return {
     read: () => {
       try {
-        return readFileSync9(filePath, "utf8");
+        return readFileSync4(filePath, "utf8");
       } catch {
         return "";
       }
     },
     write: (text) => {
-      mkdirSync6(dirname5(filePath), { recursive: true });
-      writeFileSync6(filePath, text, "utf8");
+      mkdirSync2(dirname3(filePath), { recursive: true });
+      writeFileSync3(filePath, text, "utf8");
     },
     append: (text) => {
-      mkdirSync6(dirname5(filePath), { recursive: true });
-      appendFileSync2(filePath, text, "utf8");
+      mkdirSync2(dirname3(filePath), { recursive: true });
+      appendFileSync(filePath, text, "utf8");
     }
   };
 }
@@ -18919,7 +16978,7 @@ function noteSessionAnchorLedgerBinding(sessionID, worktree) {
 }
 function anchorProbeLog(kind, sessionID, payload) {
   try {
-    appendFileSync2(process.env.FORGE_ANCHOR_PROBE, JSON.stringify({ t: new Date().toISOString(), kind, sessionID, ...payload }) + `
+    appendFileSync(process.env.FORGE_ANCHOR_PROBE, JSON.stringify({ t: new Date().toISOString(), kind, sessionID, ...payload }) + `
 `);
   } catch {}
 }
@@ -18976,13 +17035,16 @@ function resolveAnchorViaLedger(sessionID, resolved) {
   }
   return hit;
 }
-async function poolGateRefusal(anchorClient, sessionID, target) {
+async function poolGateRefusal(anchorClient, sessionID, target, requireEntry = false, deferMissing) {
+  const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID);
+  return poolGateRefusalAtAnchor(anchor, sessionID, target, requireEntry, deferMissing);
+}
+function poolGateRefusalAtAnchor(anchor, sessionID, target, requireEntry = false, deferMissing) {
   const resolution = resolvePools();
   const agentId = target.slice("forge-".length);
   const entry = resolution?.agents[agentId];
-  if (!(resolution && entry))
+  if (!entry && !requireEntry)
     return null;
-  const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID);
   if (!anchor) {
     if (!poolGateUnknownNotes.has(sessionID)) {
       poolGateUnknownNotes.add(sessionID);
@@ -18992,6 +17054,15 @@ async function poolGateRefusal(anchorClient, sessionID, target) {
   }
   const sessionPool = sessionPoolFileOf(anchor);
   const allowed = sessionPool ?? globalPoolPathOf();
+  if (!entry) {
+    const stale = nativeRosterActive() ? rosterStaleRefusal(anchor) : null;
+    const refusal = stale ?? `[forge:pool] Dispatch refused: "${target}" is not a materialized forge subagent and is not dispatchable from this session. ` + `This session's dispatchable roster is ${sessionPool ? `its workspace pool (${sessionPool})` : `the global fallback (${globalPoolPathOf()})`}. ` + `Exits: open a session in the role's workspace, or configure the role into this workspace's pool (its .opencode/forge.json), or into the global layer (${globalPoolPathOf()}).`;
+    if (deferMissing) {
+      deferMissing(refusal);
+      return null;
+    }
+    return refusal;
+  }
   if (allowed === null || foldPath(entry.file) !== foldPath(allowed)) {
     return `[forge:pool] Dispatch refused: "${target}" belongs to the pool ${entry.file} — not dispatchable from this session. ` + `This session's dispatchable roster is ${sessionPool ? `its workspace pool (${sessionPool})` : `the global fallback (${globalPoolPathOf()})`}. ` + `Exits: open a session in that pool's workspace, or configure the role into this workspace's pool (its .opencode/forge.json), or into the global layer (${globalPoolPathOf()}).`;
   }
@@ -19011,7 +17082,13 @@ async function crewComplianceRefusalFor(anchorClient, sessionID, target) {
   if (!(crew && (crew.mode === "pending" || crew.mode === "executing")))
     return null;
   const anchor = await resolveSessionAnchorForPools(anchorClient, sessionID);
-  if (!anchor)
+  return crewComplianceRefusalAtAnchor(anchor, sessionID, target);
+}
+function crewComplianceRefusalAtAnchor(anchor, sessionID, target) {
+  if (!anchor || !target.toLowerCase().startsWith("forge-"))
+    return null;
+  const crew = crews.get(sessionID);
+  if (!(crew && (crew.mode === "pending" || crew.mode === "executing")))
     return null;
   const complianceRefusal = crewPoolComplianceRefusal(anchor);
   return complianceRefusal ? complianceRefusal + CREW_COMPLIANCE_NATIVE_EXIT : null;
@@ -19035,10 +17112,21 @@ function draftDispatchRefusalForState(state, target) {
   roster.sort();
   return `[forge] A plan is in draft; dispatch is denied for this target. ` + (roster.length > 0 ? `Readonly recon scouts ARE dispatchable during draft: ${roster.join(", ")}. ` : `No readonly worker is configured — define one in forge.json with an explicit "shape": "readonly" to enable draft-phase reconnaissance. `) + `Write-shaped workers and native agents wait for approval (plan_approve); /plan discard to abandon the plan.`;
 }
-function draftDispatchRefusal(sessionID, target) {
-  return draftDispatchRefusalForState(stateForBan(sessionID), target);
+function nativeDraftDispatchRefusal(state, target) {
+  const pool = sessionPoolFileOf(state.worktree) ?? globalPoolPathOf();
+  const resolution = resolvePools();
+  const scouts = Object.entries(resolution?.agents ?? {}).filter(([, entry]) => pool !== null && foldPath(entry.file) === foldPath(pool) && effectiveReadonlyShape(entry.def) && (entry.def.permission?.shell === "deny" || entry.def.permission?.bash === "deny"));
+  const roster = rosterStaleRefusal(state.worktree) ? [] : scouts.map(([id]) => "forge-" + id).sort();
+  if (target && roster.includes(target))
+    return null;
+  return "[forge] A plan is in draft; dispatch is denied for this target. " + (roster.length ? "Qualified readonly recon scouts: " + roster.join(", ") + ". " : "No current qualified shell-denied readonly scout. Define a readonly worker in forge.json with explicit shape readonly and shell permission deny. ") + "Wait for plan_approve or /plan discard.";
 }
-var WRITE_TOOLS = new Set(["write", "edit", "bash", "task", "apply", "applypatch", "patch", "multiedit"]);
+var WRITE_TOOLS = new Set([
+  ...NATIVE_TOOL_VOCAB.mutatingFamily,
+  ...NATIVE_TOOL_VOCAB.legacyShellKeys,
+  NATIVE_TOOL_VOCAB.dispatchTool,
+  NATIVE_TOOL_VOCAB.taskKey
+]);
 function isWriteTool(name) {
   const n = name.toLowerCase();
   return WRITE_TOOLS.has(n) || n.includes("patch");
@@ -19047,13 +17135,13 @@ function nowIso() {
   return new Date().toISOString();
 }
 function planDirOf(worktree) {
-  return join6(worktree, ".opencode", "plan");
+  return join5(worktree, ".opencode", "plan");
 }
 function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
-  if (!existsSync3(dir))
+  if (!existsSync(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync9(join6(dir, name), "utf8") }));
+  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync4(join5(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -19081,8 +17169,8 @@ function worktreeFor(context) {
   return sessionAnchor(context) || context.worktree;
 }
 function resolveActivePlan(state) {
-  if (state.planPath && existsSync3(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync9(state.planPath, "utf8"));
+  if (state.planPath && existsSync(state.planPath)) {
+    const doc2 = parsePlanLoose(readFileSync4(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -19090,12 +17178,12 @@ function resolveActivePlan(state) {
   const ranked = rankActivePlans(readPlanDir(state.worktree));
   if (ranked.length === 0)
     return null;
-  const path = join6(planDirOf(state.worktree), ranked[0].name);
+  const path = join5(planDirOf(state.worktree), ranked[0].name);
   state.planPath = path;
   return { path, doc: ranked[0].doc };
 }
 function relFrom(worktree, path) {
-  const rel = relative2(worktree, path);
+  const rel = relative3(worktree, path);
   return rel && !rel.startsWith("..") ? rel.replaceAll("\\", "/") : path;
 }
 var planWriteTool = tool({
@@ -19138,13 +17226,13 @@ var planWriteTool = tool({
       throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
       const dir = planDirOf(state.worktree);
-      mkdirSync6(dir, { recursive: true });
-      path = join6(dir, planFileName(localDate(), slugify(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md"))));
+      mkdirSync2(dir, { recursive: true });
+      path = join5(dir, planFileName(localDate(), slugify(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
     const { checks: rawChecks, ...fields } = args;
     const text = renderPlan({ ...fields, ...checks3 && checks3.length > 0 ? { checks: checks3 } : {} }, now, created);
-    writeFileSync6(path, text);
+    atomicWrite(path, text);
     state.planPath = path;
     const doc2 = parsePlan(text);
     context.metadata({ title: `${mode === "created" ? "Create" : "Revise"} plan: ${doc2.goal}` });
@@ -19173,8 +17261,8 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync9(active.path, "utf8"), args.n, nowIso());
-    writeFileSync6(active.path, next);
+    const next = tickTask(readFileSync4(active.path, "utf8"), args.n, nowIso());
+    atomicWrite(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
     context.metadata({ title: `Tick task ${args.n} (${p.done}/${p.total})` });
@@ -19228,108 +17316,8 @@ var GATE_PERMISSION_KEYS = [
   "goal_complete",
   "goal_resume",
   "goal_discard",
-  "forge_shell",
   "crew_close"
 ];
-var gatePermissionSnapshot = new Map;
-async function forgeShellGate(ask, command, sessionID) {
-  const explicit = explicitForgeShellPosture();
-  if (explicit === "deny") {
-    throw new Error(`[forge] forge_shell is explicitly denied by user configuration (permission forge_shell: "deny"). Nothing was executed. Remove or change the deny rule to re-enable the exec surface.`);
-  }
-  if (explicit === "allow") {
-    return;
-  }
-  try {
-    await gate(ask, "forge_shell", `forge_shell: ${command.slice(0, 100)}`);
-  } catch (err) {
-    if (v2HostSeen && isForgeWorkerSession(sessionID) && err?.message === "Permission denied: forge_shell") {
-      markSessionRescueDisclosed(sessionID);
-      return;
-    }
-    throw err;
-  }
-}
-function resolveForgeShellPosture(documents) {
-  let resolved;
-  for (const text of documents) {
-    if (typeof text !== "string" || !text.trim())
-      continue;
-    const parsed = parseForgeJsonc(text);
-    if (!parsed.ok)
-      continue;
-    const cfg = parsed.config;
-    if (Array.isArray(cfg.permissions)) {
-      let hit;
-      for (const rule of cfg.permissions) {
-        if (rule === null || typeof rule !== "object")
-          continue;
-        const r = rule;
-        if (r.effect !== "allow" && r.effect !== "deny" && r.effect !== "ask")
-          continue;
-        if (!ruleMatchesForgeShellAssert(r.action, r.resource))
-          continue;
-        hit = r.effect;
-      }
-      if (hit !== undefined) {
-        resolved = hit;
-        continue;
-      }
-    }
-    const legacy = cfg.permission;
-    const v = legacy !== null && typeof legacy === "object" ? legacy.forge_shell : undefined;
-    if (v === "allow" || v === "deny" || v === "ask")
-      resolved = v;
-  }
-  return resolved;
-}
-function ruleMatchesForgeShellAssert(action, resource) {
-  return wildcardMatchValue("forge_shell", action) && wildcardMatchValue("*", resource);
-}
-function wildcardMatchValue(value, pattern) {
-  if (typeof pattern !== "string" || pattern === "")
-    return false;
-  const re = new RegExp("^" + pattern.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".") + "$", "i");
-  return re.test(value);
-}
-function hostConfigDocumentsFor(homeDir, workspace) {
-  const docs = [];
-  const pushDir = (dir) => {
-    if (!dir)
-      return;
-    let pushed = false;
-    for (const name of ["opencode.json", "opencode.jsonc"]) {
-      try {
-        docs.push(readFileSync9(join6(dir, name), "utf8"));
-        pushed = true;
-        break;
-      } catch {}
-    }
-    if (!pushed)
-      docs.push(null);
-  };
-  const cfgEnv = (process.env.OPENCODE_CONFIG_DIR ?? "").trim();
-  const sep2 = homeDir.includes("\\") && !homeDir.includes("/") ? "\\" : "/";
-  pushDir(cfgEnv || join6(homeDir, ".config", "opencode"));
-  if (workspace) {
-    pushDir(workspace);
-    pushDir(join6(workspace, ".opencode"));
-  }
-  return docs;
-}
-var v2PostureHomeDir = null;
-var v2PostureTestOverride = null;
-function explicitForgeShellPosture() {
-  if (v2PostureTestOverride !== null)
-    return v2PostureTestOverride.value;
-  if (!v2HostSeen)
-    return gatePermissionSnapshot.get("forge_shell");
-  const home = v2PostureHomeDir ?? homedir();
-  const resolved = resolveForgeShellPosture(hostConfigDocumentsFor(home, hostWorktree));
-  if (resolved === "allow" || resolved === "deny")
-    gatePermissionSnapshot.set("forge_shell", resolved);
-  return resolved;
-}
 var planApproveTool = tool({
   description: "Approve the session's draft plan (draft -> approved). Call it ONLY after presenting the plan and receiving the user's explicit go-ahead in chat — never in the same turn that presents the draft. The permission layer pins this call to a confirmation dialog — the user's Allow is the final hard gate and lifts the draft-phase write ban. Optionally pass a one-line summary of what changed since the last revision.",
   args: {
@@ -19344,7 +17332,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    writeFileSync6(active.path, transitionStatus(readFileSync9(active.path, "utf8"), "approved", nowIso()));
+    atomicWrite(active.path, transitionStatus(readFileSync4(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -19380,13 +17368,13 @@ Tick every task before closing.`);
       const outcomes = await runChecks(active.doc.checks, state.worktree);
       if (!outcomesAllOk(outcomes)) {
         const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-        atomicWrite(active.path, appendPlanCheckLog(readFileSync9(active.path, "utf8"), runId, outcomes, nowIso()));
+        atomicWrite(active.path, appendPlanCheckLog(readFileSync4(active.path, "utf8"), runId, outcomes, nowIso()));
         throw new PlanError(`Completion gate: verification re-run failed (fail-closed). The plan stays approved; the failing run is recorded in the plan's Check Log.
 ${formatOutcomes(outcomes.filter((o) => !o.ok))}
 Fix the work and retry — the frozen check set is re-run at every close and cannot be changed here.`);
       }
       const selfChecks = args.checks ?? [];
-      const closed2 = appendTerminalSection(transitionStatus(readFileSync9(active.path, "utf8"), "done", closedAt), "closed", {
+      const closed2 = appendTerminalSection(transitionStatus(readFileSync4(active.path, "utf8"), "done", closedAt), "closed", {
         reason: "completion gate passed (plugin-verified)",
         ...selfChecks.length > 0 ? { checks: selfChecks } : {},
         outcomes: outcomes.map((o) => ({ index: o.index, ok: o.ok, label: o.label, detail: o.detail, durationMs: o.durationMs })),
@@ -19410,7 +17398,7 @@ Fix the work and retry — the frozen check set is re-run at every close and can
 - `)}
 Fix the implementation and retry, or revise the plan first.`);
     }
-    const closed = appendTerminalSection(transitionStatus(readFileSync9(active.path, "utf8"), "done", closedAt), "closed", { reason: "completion gate passed (plugin-verified)", checks: args.checks }, closedAt);
+    const closed = appendTerminalSection(transitionStatus(readFileSync4(active.path, "utf8"), "done", closedAt), "closed", { reason: "completion gate passed (plugin-verified)", checks: args.checks }, closedAt);
     atomicWrite(active.path, closed);
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
@@ -19427,21 +17415,21 @@ var planReopenTool = tool({
   execute: async (args, context) => {
     const state = ensureSession(context.sessionID, worktreeFor(context));
     let target = null;
-    if (state.planPath && existsSync3(state.planPath)) {
-      const doc2 = parsePlanLoose(readFileSync9(state.planPath, "utf8"));
+    if (state.planPath && existsSync(state.planPath)) {
+      const doc2 = parsePlanLoose(readFileSync4(state.planPath, "utf8"));
       if (doc2)
         target = { path: state.planPath, doc: doc2 };
     }
     if (!target || target.doc.status !== "done") {
       const done = readPlanDir(state.worktree).map((e) => ({ name: e.name, doc: parsePlanLoose(e.text) })).filter((e) => e.doc !== null && e.doc.status === "done").sort((a, b) => a.doc.updated < b.doc.updated ? 1 : a.doc.updated > b.doc.updated ? -1 : a.name.localeCompare(b.name))[0];
       if (done)
-        target = { path: join6(planDirOf(state.worktree), done.name), doc: done.doc };
+        target = { path: join5(planDirOf(state.worktree), done.name), doc: done.doc };
     }
     if (!target || target.doc.status !== "done") {
       throw new PlanError("No done plan to reopen in this workspace (only a closed plan can be reopened).");
     }
     const now = nowIso();
-    const next = appendReopenSection(transitionStatus(readFileSync9(target.path, "utf8"), "approved", now), now, args.reason);
+    const next = appendReopenSection(transitionStatus(readFileSync4(target.path, "utf8"), "approved", now), now, args.reason);
     atomicWrite(target.path, next);
     state.planPath = target.path;
     const p = progressOf(target.doc);
@@ -19467,8 +17455,8 @@ var planDiscardTool = tool({
     const superseding = successor.length > 0;
     const target = superseding ? "superseded" : "abandoned";
     const exitedAt = nowIso();
-    const next = appendTerminalSection(transitionStatus(readFileSync9(active.path, "utf8"), target, exitedAt), superseding ? "superseded" : "abandoned", { reason: args.reason, ...superseding ? { successor } : {} }, exitedAt);
-    writeFileSync6(active.path, next);
+    const next = appendTerminalSection(transitionStatus(readFileSync4(active.path, "utf8"), target, exitedAt), superseding ? "superseded" : "abandoned", { reason: args.reason, ...superseding ? { successor } : {} }, exitedAt);
+    atomicWrite(active.path, next);
     state.planPath = undefined;
     const section = `## ${exitedAt} — ${target}`;
     context.metadata({ title: superseding ? `Plan superseded: ${active.doc.goal}` : `Plan abandoned: ${active.doc.goal}` });
@@ -19479,24 +17467,24 @@ var planDiscardTool = tool({
   }
 });
 function goalDirOf(worktree) {
-  return join6(worktree, ".opencode", "goal");
+  return join5(worktree, ".opencode", "goal");
 }
 function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
-  if (!existsSync3(dir))
+  if (!existsSync(dir))
     return [];
-  return readdirSync4(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync9(join6(dir, name), "utf8") }));
+  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync4(join5(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
-  if (state.goalPath && existsSync3(state.goalPath)) {
-    const doc2 = parseGoalLoose(readFileSync9(state.goalPath, "utf8"));
+  if (state.goalPath && existsSync(state.goalPath)) {
+    const doc2 = parseGoalLoose(readFileSync4(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
   }
   const live = rankLiveGoals(readGoalDir(state.worktree))[0];
   if (live) {
-    const path = join6(goalDirOf(state.worktree), live.name);
+    const path = join5(goalDirOf(state.worktree), live.name);
     state.goalPath = path;
     return { path, doc: live.doc };
   }
@@ -19506,9 +17494,9 @@ function resolveLiveGoal(state) {
   const g = resolveSessionGoal(state);
   return g && (g.doc.status === "active" || g.doc.status === "paused") ? g : null;
 }
-function coerceChecks(rows) {
+function coerceChecks(rows2) {
   const items = [];
-  for (const c of rows) {
+  for (const c of rows2) {
     if ([c.shell, c.containsFile, c.containsText].some((v) => typeof v === "string" && v.includes("`"))) {
       throw new GoalError("Verification items must not contain backticks (they break the goal file format)");
     }
@@ -19570,10 +17558,17 @@ var goalWriteTool = tool({
         ...existing.doc.session ? { session: existing.doc.session } : {},
         turnsUsed: existing.doc.turnsUsed,
         ...existing.doc.armedAt ? { armedAt: existing.doc.armedAt } : {},
-        ...existing.doc.status === "paused" && existing.doc.stopReason ? { stopReason: existing.doc.stopReason } : {}
+        ...existing.doc.status === "paused" && existing.doc.stopReason ? { stopReason: existing.doc.stopReason, blocker: existing.doc.blocker } : {}
       }), existing.doc);
       atomicWrite(existing.path, text2);
       const doc3 = parseGoal(text2);
+      const retry = goalNativeRecheck.get(doc3.session);
+      const flight = continuationInFlight.get(doc3.session) ?? goalDeadlineTimers.get(doc3.session);
+      if (doc3.status === "active" && (retry || flight)) {
+        goalStopNativeRecheck(doc3.session);
+        goalArmNativeRecheck(doc3.session, (retry || flight).client, { path: existing.path, doc: doc3 }, retry ? retry.deadlineOnly : false);
+        goalArmDeadline(doc3.session, (retry || flight).client, { path: existing.path, doc: doc3 });
+      }
       context.metadata({ title: `Revise goal (rev ${doc3.revision}): ${doc3.goal}` });
       return {
         title: `goal revised (rev ${doc3.revision})`,
@@ -19593,9 +17588,9 @@ var goalWriteTool = tool({
       await gate(context.ask, "goal_write", `Arm goal: ${args.goal}`);
     }
     const dir = goalDirOf(state.worktree);
-    mkdirSync6(dir, { recursive: true });
-    const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync4(dir).filter((f) => f.endsWith(".md")));
-    const path = join6(dir, name);
+    mkdirSync2(dir, { recursive: true });
+    const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md")));
+    const path = join5(dir, name);
     const text = renderGoal(input, {
       now,
       status: arm ? "active" : "queued",
@@ -19609,7 +17604,7 @@ var goalWriteTool = tool({
       title: `goal ${arm ? "armed" : "queued"}: ${doc2.goal}`,
       output: arm ? [
         `Goal armed: ${relFrom(state.worktree, path)} (revision 1, ${doc2.criteria.length} criteria, ${doc2.checks.length} verification items, budget ${doc2.maxTurns} turns / ${doc2.maxMinutes} min).`,
-        "The loop continues this session on idle until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If blocked, goal_pause with the blocker."
+        "The loop is intended to continue this session on eligible idle turns until the goal completes, pauses, or the budget runs out. Work the criteria; call goal_check whenever you believe they hold; goal_complete re-runs every check itself and asks the user. If globally blocked with no independent authorized work remaining, call goal_pause with the concrete blocker. If a local issue leaves independent authorized work, continue that work. End your turn during genuine host waiting rather than polling."
       ].join(`
 `) : `Goal queued (inert): ${relFrom(state.worktree, path)}. It never runs until promoted via /goal next or goal_resume (user dialog).`
     };
@@ -19630,24 +17625,25 @@ var goalCheckTool = tool({
     const selected = goal.doc.checks.map((c, i) => ({ c, n: i + 1 })).filter((x) => !wanted || wanted.has(x.n));
     if (selected.length === 0)
       throw new GoalError("None of the given item numbers exist in this goal's Verification Checks.");
+    const activity = turnActivity.get(context.sessionID);
     const outcomes = await runChecks(selected.map((x) => x.c), state.worktree);
     outcomes.forEach((o, i) => {
       o.index = selected[i].n;
     });
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = appendCheckLog(readFileSync9(goal.path, "utf8"), runId, outcomes, nowIso());
+    const next = appendCheckLog(readFileSync4(goal.path, "utf8"), runId, outcomes, nowIso());
     atomicWrite(goal.path, next);
     const ok = outcomesAllOk(outcomes);
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
-    return {
-      title: `goal_check ${ok ? "all pass" : "failing"}`,
-      output: [
-        `Host verification run (revision ${goal.doc.revision}), recorded in the Check Log:`,
-        formatOutcomes(outcomes),
-        ok ? "All selected items pass. Proceed to goal_complete (it re-runs everything itself at the gate)." : "Failing items remain — fix the work, then re-run goal_check."
-      ].join(`
-`)
-    };
+    const output = [
+      `Host verification run (revision ${goal.doc.revision}), recorded in the Check Log:`,
+      formatOutcomes(outcomes),
+      ok ? "All selected items pass. Proceed to goal_complete (it re-runs everything itself at the gate)." : "Failing items remain — fix the work, then re-run goal_check."
+    ].join(`
+`);
+    if (activity && turnActivity.get(context.sessionID) === activity)
+      rememberGoalCheck(activity, selected, outcomes, output);
+    return { title: `goal_check ${ok ? "all pass" : "failing"}`, output };
   }
 });
 var goalCompleteTool = tool({
@@ -19669,7 +17665,7 @@ var goalCompleteTool = tool({
     const failures = outcomes.filter((o) => !o.ok);
     if (failures.length > 0) {
       const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-      atomicWrite(goal.path, appendCheckLog(readFileSync9(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      atomicWrite(goal.path, appendCheckLog(readFileSync4(goal.path, "utf8"), runId2, outcomes, nowIso()));
       throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
 ${formatOutcomes(failures)}
 Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
@@ -19682,7 +17678,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
     }
     await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    let text = appendCheckLog(readFileSync9(goal.path, "utf8"), runId, outcomes, nowIso());
+    let text = appendCheckLog(readFileSync4(goal.path, "utf8"), runId, outcomes, nowIso());
     text = transitionGoal(text, "completed", nowIso());
     atomicWrite(goal.path, text);
     context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
@@ -19693,7 +17689,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
   }
 });
 var goalPauseTool = tool({
-  description: "Pause the session's live goal (active -> paused); the continuation loop stops immediately. Always safe, no confirmation needed. Pass the blocker text when pausing because you are stuck (stop_reason blocker); omit it for a user-requested pause.",
+  description: "Pause the session's live goal (active -> paused); do not start further autonomous work. Already accepted host work may finish; cancellation is not promised. Always safe, no confirmation needed. Pass the blocker text when pausing because you are stuck (stop_reason blocker); omit it for a user-requested pause.",
   args: {
     blocker: tool.schema.string().optional().describe("Specific blocker that prevents progress (recorded as stop_reason blocker)")
   },
@@ -19703,13 +17699,15 @@ var goalPauseTool = tool({
     if (!goal || goal.doc.status !== "active") {
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
     }
-    const stopReason = args.blocker ? "blocker" : "user";
-    atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "paused", nowIso(), { stopReason }));
+    const stopReason = args.blocker?.trim() ? "blocker" : "user";
+    atomicWrite(goal.path, transitionGoal(readFileSync4(goal.path, "utf8"), "paused", nowIso(), { stopReason, blocker: args.blocker?.trim() }));
     engineForgetSession(context.sessionID);
+    if (goal.doc.session && goal.doc.session !== context.sessionID)
+      engineForgetSession(goal.doc.session);
     context.metadata({ title: `Goal paused (${stopReason}): ${goal.doc.goal}` });
     return {
       title: `goal paused (${stopReason})`,
-      output: `Goal paused: ${relFrom(state.worktree, goal.path)} (stop_reason: ${stopReason}${args.blocker ? ` — ${args.blocker}` : ""}). Continuation is stopped; /goal resume or an explicit "continue" from the user re-arms it through a confirmation dialog.`
+      output: `Goal paused: ${relFrom(state.worktree, goal.path)} (stop_reason: ${stopReason}${args.blocker ? ` — ${args.blocker}` : ""}). Do not start further autonomous work; already accepted host work may finish. /goal resume or an explicit "continue" from the user re-arms it through a confirmation dialog.`
     };
   }
 });
@@ -19724,7 +17722,7 @@ var goalResumeTool = tool({
     if (!goal || goal.doc.status === "queued") {
       const oldest = rankQueuedGoals(readGoalDir(state.worktree))[0];
       if (oldest) {
-        const path = join6(goalDirOf(state.worktree), oldest.name);
+        const path = join5(goalDirOf(state.worktree), oldest.name);
         state.goalPath = path;
         goal = { path, doc: oldest.doc };
       }
@@ -19734,7 +17732,11 @@ var goalResumeTool = tool({
     }
     const promoting = goal.doc.status === "queued";
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
-    let text = readFileSync9(goal.path, "utf8");
+    let text = readFileSync4(goal.path, "utf8");
+    const confirmed = parseGoalLoose(text);
+    if (!confirmed || confirmed.status !== goal.doc.status || confirmed.revision !== goal.doc.revision || confirmed.armedAt !== goal.doc.armedAt || confirmed.session !== goal.doc.session || confirmed.created !== goal.doc.created) {
+      throw new GoalError("Goal authorization changed while awaiting confirmation; retry goal_resume.");
+    }
     if (args.addTurns)
       text = bumpBudget(text, args.addTurns, nowIso());
     text = transitionGoal(text, "active", nowIso(), { session: context.sessionID });
@@ -19760,7 +17762,7 @@ var goalDiscardTool = tool({
     if (!goal)
       throw new GoalError("No goal to discard in this workspace.");
     await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
-    atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "abandoned", nowIso()));
+    atomicWrite(goal.path, transitionGoal(readFileSync4(goal.path, "utf8"), "abandoned", nowIso()));
     state.goalPath = undefined;
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
@@ -19770,2351 +17772,11 @@ var goalDiscardTool = tool({
     };
   }
 });
-var FORGE_SHELL_DESCRIPTION = [
-  "Run a shell command without ever blocking the session indefinitely. The call completes on the FIRST of: process exit (bound to the exit event — a detached grandchild holding the stdio pipes cannot suspend the call); success_pattern matching new output (opt-in regex); idle_ms with no new output (default 60000); max_wait_ms hard cap (default 120000, max 600000 — returns still-running, never kills).",
-  "Idle/max-wait return `still-running` with a jobId — the process stays alive; keep watching with forge_jobs poll / log, stop it with forge_jobs kill. run_in_background returns {jobId, logPath} immediately.",
-  "success_pattern semantics: a match completes the call as success; the process is kept alive by default (server semantics — the thing you just verified keeps running); pass keep_alive=false to kill its tree on match. Common patterns: dev servers `listening on|ready in|Local:`, builds `Compiled successfully|Done in`, test suites `passed|all tests`.",
-  "This tool is the forge agent's exec surface for every shell command — quick ones included. Long-running or possibly non-exiting commands (dev servers, watchers, installers, anything spawning detached children) should start with run_in_background and collect results via forge_jobs.",
-  "Interpreter: commands run under the host-preferred shell — the PowerShell family on Windows (git-bash only on machines without PowerShell), the login shell with bash preferred on POSIX — the same interpreter the host's builtin shell tool uses."
-].join(`
-`);
-var forgeShellExecute = async (args, context) => {
-  if (jobStage() >= 2) {
-    throw new Error("[forge] The job supervisor is retired on this host (native backgrounding confirmed complete) — use the shell tool's run_in_background parameter.");
-  }
-  const state = ensureSession(context.sessionID, worktreeFor(context));
-  if (isForgeWorkerSession(context.sessionID))
-    await ensureSessionRescueRule(context.sessionID);
-  await forgeShellGate(context.ask, args.command, context.sessionID);
-  const rescueNote = takeSessionRescueDisclosure(context.sessionID);
-  if (rescueNote)
-    context.metadata({ title: rescueNote });
-  const survive = effectiveSurvive(jobsSurviveMode, args.survive);
-  let successPattern = null;
-  if (args.success_pattern) {
-    try {
-      successPattern = new RegExp(args.success_pattern);
-    } catch (err) {
-      throw new Error(`Invalid success_pattern: ${err.message}`);
-    }
-  }
-  const { registry: registry2, fence } = ensureJobLifecycle();
-  const cwd = args.workdir ? isAbsolute2(args.workdir) ? args.workdir : join6(state.worktree, args.workdir) : state.worktree;
-  const started = startJob(jobManager, {
-    cmd: args.command,
-    cwd,
-    ownerSession: context.sessionID,
-    worktree: state.worktree,
-    logDir: jobLogDir(),
-    runInBackground: args.run_in_background === true,
-    ...args.idle_ms !== undefined ? { idleMs: args.idle_ms } : {},
-    ...args.max_wait_ms !== undefined ? { maxWaitMs: args.max_wait_ms } : {},
-    successPattern,
-    ...args.keep_alive !== undefined ? { keepAlive: args.keep_alive } : {},
-    ...args.notify !== undefined ? { notify: args.notify } : {},
-    ...survive ? { survive: true, registry: registry2 ?? undefined } : { fence, relocate: structuralRelocate, relocateAsync: structuralRelocateAsync }
-  });
-  if (survive) {
-    return {
-      title: `job started (survives host exit): ${started.job.id}`,
-      output: [
-        `[forge:job] Started in background — SURVIVES host exit (no fence, no exit kill).`,
-        `jobId: ${started.job.id}`,
-        `logPath: ${started.job.logPath}`,
-        "Recorded in the persistent registry: the next opencode run can poll/log/kill it via forge_jobs. Stop it explicitly when done."
-      ].join(`
-`)
-    };
-  }
-  context.metadata({ title: `forge_shell: ${args.command.slice(0, 60)}` });
-  if (args.run_in_background === true) {
-    return {
-      title: `job started: ${started.job.id}`,
-      output: [`[forge:job] Started in background.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `logPath: ${started.job.logPath}`, "Track with forge_jobs poll; a [forge:job-complete] message arrives on exit."].join(`
-`)
-    };
-  }
-  const r = await started.settle;
-  if (r.status === "exited") {
-    if (r.spawnError) {
-      return {
-        title: `not started`,
-        output: [`[forge:job] NOT STARTED — spawn failed; nothing was executed.`, `cwd: ${cwd}`, `jobId: ${started.job.id}`, `spawn error: ${r.spawnError}`].join(`
-`)
-      };
-    }
-    return {
-      title: `exit ${r.exitCode ?? "?"}`,
-      output: [
-        `[forge:job] Command finished (exit=${r.exitCode ?? "none"}).`,
-        `cwd: ${cwd}`,
-        `jobId: ${started.job.id}`,
-        `Output was delivered in full above — terminal evidence: the job self-cleared from the registry (no wake fires, no forge_jobs clear needed).`,
-        ...r.spawnError ? [`spawn error: ${r.spawnError}`] : [],
-        `output:
-${r.outputTail || "(none)"}`
-      ].join(`
-`)
-    };
-  }
-  if (r.status === "succeeded") {
-    return {
-      title: `success: ${r.matched}`,
-      output: [
-        `[forge:job] Success pattern matched: "${r.matched}".`,
-        `cwd: ${cwd}`,
-        r.keptAlive ? `The process was kept alive as job ${started.job.id} (stop it with forge_jobs kill when done).` : `The process tree was terminated (keep_alive=false) — terminal evidence: job ${started.job.id} self-cleared from the registry (no wake, no clear needed).`,
-        `output:
-${r.outputTail}`
-      ].join(`
-`)
-    };
-  }
-  return {
-    title: `still running (${Math.round(r.idleForMs / 1000)}s idle)`,
-    output: [
-      `[forge:job] Still running — ${Math.round(r.idleForMs / 1000)}s without new output (or the wait budget ran out). The process is alive as job ${started.job.id}.`,
-      `cwd: ${cwd}`,
-      `logPath: ${started.job.logPath}`,
-      `recent output:
-${r.outputTail || "(none yet)"}`,
-      "Next: forge_jobs poll to keep waiting, forge_jobs log for history, forge_jobs kill to stop."
-    ].join(`
-`)
-  };
-};
-var forgeShellTool = tool({
-  description: FORGE_SHELL_DESCRIPTION,
-  args: {
-    command: tool.schema.string().describe("The shell command to run"),
-    workdir: tool.schema.string().optional().describe("Working directory (workspace-relative, or absolute)"),
-    run_in_background: tool.schema.boolean().optional().describe("Return {jobId, logPath} immediately, without waiting for any output or exit"),
-    idle_ms: tool.schema.number().int().nonnegative().optional().describe("No-new-output early-return threshold in ms (default 60000)"),
-    max_wait_ms: tool.schema.number().int().nonnegative().optional().describe("Hard cap on this call's wait in ms (default 120000, clamped to 600000); returns still-running, never kills"),
-    success_pattern: tool.schema.string().optional().describe("Regex; a match against new output completes the call as success immediately"),
-    keep_alive: tool.schema.boolean().optional().describe("After a success match: keep the process alive (default) or kill its tree (false)"),
-    notify: tool.schema.boolean().optional().describe("Send a [forge:job-complete] message into this session when the job exits (default true)"),
-    survive: tool.schema.boolean().optional().describe("Opt this job OUT of dying with the host: it keeps running after opencode exits, recorded in the persistent registry so the next run can poll/kill it (config jobs.survive sets the default; an explicit config deny cannot be overridden)")
-  },
-  execute: async (args, context) => {
-    const res = await forgeShellExecute(args, context);
-    const banner = interactiveBanner(args.command);
-    return banner ? { ...res, output: `${banner}
-${res.output}` } : res;
-  }
-});
-var FORGE_JOBS_ACTIONS = ["list", "poll", "log", "kill", "cancel", "stop", "clear", "handoff"];
-var forgeJobsTool = tool({
-  description: "Manage forge_shell jobs. Actions: list (all jobs, newest first); poll {jobId, waitMs<=30000} — bounded wait for NEW output or exit, drains it (polling a finished job consumes it: the entry self-clears and no wake fires); log {jobId, offset?, limit?} — line paging over the on-disk log (omitted offset = tail window, default 200 lines); kill {jobId} — terminate the job's whole process tree; cancel {jobId} — cancel ONE in-flight ASYNC DISPATCH by explicit task id, including one owned by ANOTHER session (the deliberate cross-session escape hatch behind no ownership check; its child session is aborted and CONFIRMED idle; the dispatch settles as aborted and is never retried); stop — cancel EVERY in-flight async dispatch AND every queued wish owned by THIS session only (the /forge stop lever; session-scoped by construction, other sessions' dispatches are untouched; the queued wishes leave the queue first, so none spawns into a slot a cancelled dispatch frees; nothing in flight and nothing queued = honest no-op report); clear {jobId} — drop a finished job from the registry (only un-polled early-returned/background jobs need this — synchronously consumed jobs self-clear at completion, and a terminal poll consumes the entry); handoff {jobId} — rebind ownership to the root session so the job survives this (sub)session's end. A delegated agent MUST poll its jobs before yielding its conclusion.",
-  args: {
-    action: tool.schema.string().describe(`One of: ${FORGE_JOBS_ACTIONS.join(", ")}`),
-    jobId: tool.schema.string().optional().describe("Job id from forge_shell (required for every action except list and stop)"),
-    waitMs: tool.schema.number().int().nonnegative().optional().describe("poll: bounded in-call wait (clamped to 30000)"),
-    offset: tool.schema.number().int().nonnegative().optional().describe("log: first line index; omitted = tail window"),
-    limit: tool.schema.number().int().positive().optional().describe("log: max lines (default 200)")
-  },
-  execute: async (args, context) => {
-    if (jobStage() >= 2)
-      throw new Error("[forge] The job supervisor is retired on this host.");
-    noteToolAgent(context);
-    const action = String(args.action ?? "");
-    if (!FORGE_JOBS_ACTIONS.includes(action)) {
-      throw new Error(`Unknown action "${action}" — use one of: ${FORGE_JOBS_ACTIONS.join(", ")}.`);
-    }
-    if (action === "list") {
-      ensureJobLifecycle();
-      const rows = jobManager.list().map((j) => `${j.id}  ${j.state}${j.exitCode !== null ? `(${j.exitCode})` : ""}${j.succeededAt ? "*" : ""}  ${j.previousRun ? "previous-run" : j.survive ? "survive" : j.scope}  ${j.cmd.slice(0, 60)}`);
-      return { title: `jobs (${rows.length})`, output: rows.length > 0 ? rows.join(`
-`) : "(no jobs)" };
-    }
-    if (action === "stop") {
-      const client = dispatchClient();
-      if (!client)
-        throw new Error("[forge] stop: no dispatch client on this host.");
-      const sid = context.sessionID;
-      const epoch = stopEpoch(sid) + 1;
-      stopEpochs.set(sid, epoch);
-      stopWaiting.add(sid);
-      let landed;
-      let stillLanding = 0;
-      let flight;
-      let queuedCancelled;
-      try {
-        queuedCancelled = cancelQueuedWishes(sid);
-        landed = await settlePumps(sid);
-        stillLanding = inTransitWishes(sid).length;
-        flight = inFlightAsyncDispatches(sid);
-      } finally {
-        stopWaiting.delete(sid);
-      }
-      queuedCancelled.push(...stopDequeued.get(sid) ?? []);
-      stopDequeued.delete(sid);
-      if (flight.length === 0 && queuedCancelled.length === 0 && stillLanding === 0) {
-        return { title: "stop", output: `[forge:job] No async dispatches in flight for this session (${sid}) — nothing to stop.` };
-      }
-      const results = [];
-      for (const taskId of flight) {
-        const res = await stopSerialCancel(sid, () => cancelDispatch(client, taskId));
-        results.push(`- ${res.text}`);
-      }
-      return stopReceipt(sid, flight.length, results, queuedCancelled, landed === "timeout" ? stillLanding : 0, stopSettleMs());
-    }
-    if (!args.jobId)
-      throw new Error(`Action "${action}" requires jobId.`);
-    if (action === "cancel" && String(args.jobId).trim().toLowerCase() === "all") {
-      throw new Error(`[forge] cancel "all" is retired — use action "stop" (cancels THIS session's in-flight and queued dispatches) or cancel an explicit task id.`);
-    }
-    const job = jobManager.get(args.jobId);
-    if (!job) {
-      throw new Error(jobManager.consumed(args.jobId) ? `Job ${args.jobId} was already consumed: a terminal-evidence foreground return delivered its complete output inline, so it self-cleared from the registry — no wake fires and no clear is needed.` : `No job ${args.jobId} in the registry (finished jobs age out; the on-disk log may still exist).`);
-    }
-    if (action === "poll") {
-      const p = await pollJob(jobManager, args.jobId, args.waitMs ?? 0);
-      if (!p)
-        throw new Error(`No job ${args.jobId}.`);
-      if (job.spawnError) {
-        return {
-          title: `${job.id}: not started`,
-          output: [
-            `[forge:job] ${job.id}: NOT STARTED — spawn failed; nothing was executed (terminal state: ${p.state}).`,
-            `spawn error: ${job.spawnError}`,
-            `new output:
-${p.newOutput || "(none in this window)"}`,
-            `logPath: ${p.logPath}`
-          ].join(`
-`)
-        };
-      }
-      return {
-        title: `${job.id}: ${p.state}`,
-        output: [
-          `[forge:job] ${job.id}: ${p.state}${p.exitCode !== null ? ` exit=${p.exitCode}` : ""}${p.succeeded ? " (success pattern matched)" : ""}`,
-          `new output:
-${p.newOutput || "(none in this window)"}`,
-          `logPath: ${p.logPath}`
-        ].join(`
-`)
-      };
-    }
-    if (action === "log") {
-      const page = readJobLog(job.logPath, {
-        ...args.offset !== undefined ? { offset: args.offset } : {},
-        ...args.limit !== undefined ? { limit: args.limit } : {}
-      });
-      return {
-        title: `${job.id} log ${page.offset}-${page.offset + page.lines.length}/${page.total}`,
-        output: [
-          ...page.windowed ? [`(log exceeds ${8}MB — showing the most recent window; read the file directly for full history: ${job.logPath})`] : [],
-          page.lines.length > 0 ? page.lines.join(`
-`) : "(empty)"
-        ].join(`
-`)
-      };
-    }
-    if (action === "kill") {
-      {
-        const meta = job.dispatch;
-        if (meta && meta.outcome !== "stream-lost/unknown")
-          meta.abortReason = EXPLICIT_KILL_ABORT_REASON;
-      }
-      jobManager.kill(job);
-      return { title: `${job.id} killed`, output: `[forge:job] ${job.id}: tree kill issued (state: killed).` };
-    }
-    if (action === "cancel") {
-      const client = dispatchClient();
-      if (!client)
-        throw new Error("[forge] cancel: no dispatch client on this host.");
-      const res = await cancelDispatch(client, args.jobId);
-      if (!res.ok)
-        return { title: `${args.jobId} not cancellable`, output: `[forge:job] ${res.text}` };
-      return { title: `${args.jobId} cancelled (${res.idle})`, output: `[forge:job] ${res.text}` };
-    }
-    if (action === "clear") {
-      const ok = jobManager.clear(args.jobId);
-      return ok ? { title: `${job.id} cleared`, output: `[forge:job] ${job.id} removed from the registry (log file untouched).` } : { title: `${job.id} not cleared`, output: `[forge:job] ${job.id} is still running — kill it first.` };
-    }
-    const target = await handoffTarget(context.sessionID);
-    jobManager.handoff(args.jobId, target);
-    return {
-      title: `${job.id} handed off`,
-      output: `[forge:job] ${job.id}: promoted to plugin-global scope${target ? ` and rebound to root session ${target}` : ""}; it now survives this session's end.`
-    };
-  }
-});
-var knownHostAgents = new Set(["general", ...NATIVE_PARTITION_FALLBACKS]);
-var ASYNC_DISPATCH_CAP = 3;
-var sessionModels = new Map;
-var dispatchGate = null;
-var admittedGate = new Map;
-var gateProvidersSeen = new Set;
-var dispatchConfigLoaders = new Map;
-function dispatchConfigFor(anchor) {
-  const key = anchor || "-";
-  let l = dispatchConfigLoaders.get(key);
-  if (!l) {
-    l = createForgeConfigLoader({ projectDir: anchor, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() });
-    dispatchConfigLoaders.set(key, l);
-    while (dispatchConfigLoaders.size > 8) {
-      const oldest = dispatchConfigLoaders.keys().next().value;
-      if (oldest === undefined)
-        break;
-      dispatchConfigLoaders.delete(oldest);
-    }
-  }
-  return l.load().dispatch ?? null;
-}
-function gateFor(anchor) {
-  if (!dispatchGate)
-    dispatchGate = createDispatchGate();
-  const node = dispatchConfigFor(anchor);
-  dispatchGate.updateConfig(node ? {
-    providerConcurrency: node.providerConcurrency,
-    modelConcurrency: node.modelConcurrency,
-    circuitBreaker: { consecutiveFailures: node.circuitBreaker.consecutiveFailures ?? 0, cooldownMs: node.circuitBreaker.cooldownMs ?? 0 }
-  } : null);
-  return dispatchGate;
-}
-function dispatchModelIdentity(agentID, ownerSession, childSessionID) {
-  if (agentID.toLowerCase().startsWith("forge-")) {
-    const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def;
-    if (def?.model) {
-      const identity = parseIdentity(def.model);
-      if (identity)
-        return { provider: identity.provider, model: identity.model };
-    }
-  }
-  if (childSessionID && sessionModels.has(childSessionID))
-    return sessionModels.get(childSessionID) ?? null;
-  return sessionModels.get(ownerSession) ?? null;
-}
-function rosterModelPin(agentID) {
-  if (!agentID.toLowerCase().startsWith("forge-"))
-    return null;
-  const def = resolvePools()?.agents[agentID.slice("forge-".length)]?.def;
-  if (!def?.model)
-    return null;
-  const identity = parseIdentity(def.model);
-  if (!identity)
-    return null;
-  const depth = typeof def.thoughtLevel === "string" ? def.thoughtLevel : "";
-  return VARIANT_DEPTH_WORDS.includes(depth) ? { providerID: identity.provider, modelID: identity.model, variant: depth } : { providerID: identity.provider, modelID: identity.model };
-}
-function forgeTargetUnresolved(agentID) {
-  if (!agentID.toLowerCase().startsWith("forge-"))
-    return null;
-  const resolution = resolvePools();
-  if (resolution?.agents[agentID.slice("forge-".length)])
-    return null;
-  return `"${agentID}" does not resolve in the live roster (pool source: ` + `${resolution ? "the workspace pool resolution" : "none — no forge.json in scope for this host"}); ` + `refusing to spawn a default-agent child — re-sync the roster (/forge sync) or correct the target`;
-}
-function nestedTaskDenyFor(agentID, ownerSession, childSessionID) {
-  const id = agentID.toLowerCase();
-  if (id === "forge" || id.startsWith("forge-"))
-    return false;
-  const identity = dispatchModelIdentity(agentID, ownerSession, childSessionID);
-  return identity !== null && dispatchProviderFamily(identity.provider) === "anthropic";
-}
-function releaseGateAdmission(jobId) {
-  const identity = admittedGate.get(jobId);
-  if (!identity)
-    return;
-  admittedGate.delete(jobId);
-  try {
-    dispatchGate?.release(identity);
-  } catch {}
-}
-var dispatchTasks = new Map;
 function bindChildToDirectory(childSessionID, directory) {
   if (!childSessionID || !directory || isRootish(directory))
     return;
   ensureSession(childSessionID, directory);
 }
-async function createChildSessionBound(client, input) {
-  const created = await createChildSession(client, input);
-  if (created.ok)
-    bindChildToDirectory(created.sessionID, input.parentDirectory);
-  return created;
-}
-function registerDispatchTask(handle, directory) {
-  dispatchTasks.set(handle.jobId, handle);
-  bindChildToDirectory(handle.childSessionID, directory);
-}
-function inFlightAsyncDispatches(sessionID) {
-  const ids = [];
-  for (const [id, handle] of dispatchTasks) {
-    if (handle.ownerSession !== sessionID)
-      continue;
-    const job = jobManager.get(id);
-    if (job) {
-      if (job.state === "running")
-        ids.push(id);
-    } else {
-      dispatchTasks.delete(id);
-    }
-  }
-  return ids;
-}
-var DEFAULT_DISPATCH_QUEUE_MAX = 10;
-function resolveDispatchQueueMax(env = process.env) {
-  const raw = env.FORGE_DISPATCH_QUEUE_MAX;
-  if (raw === undefined || raw === "")
-    return DEFAULT_DISPATCH_QUEUE_MAX;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed < 1)
-    return DEFAULT_DISPATCH_QUEUE_MAX;
-  return Math.round(parsed);
-}
-var dispatchQueues = new Map;
-var stopEpochs = new Map;
-var stopWaiting = new Set;
-var pumpInFlight = new Map;
-var stopDequeued = new Map;
-var stopEpoch = (sessionID) => stopEpochs.get(sessionID) ?? 0;
-var stoppedSince = (sessionID, epoch) => stopEpoch(sessionID) !== epoch;
-function inTransitWishes(sessionID) {
-  const ids = [];
-  for (const run of pumpInFlight.get(sessionID) ?? [])
-    if (run.wishId)
-      ids.push(run.wishId);
-  return ids;
-}
-function stopSettleMs() {
-  const raw = Number(process.env.FORGE_STOP_SETTLE_MS);
-  return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 60000) : 15000;
-}
-async function settlePumps(sessionID) {
-  const pumps = [...pumpInFlight.get(sessionID) ?? []];
-  if (pumps.length === 0)
-    return "settled";
-  let timer;
-  try {
-    return await Promise.race([
-      Promise.allSettled(pumps.map((run) => run.done)).then(() => "settled"),
-      new Promise((resolve2) => {
-        timer = setTimeout(() => resolve2("timeout"), stopSettleMs());
-      })
-    ]);
-  } finally {
-    if (timer)
-      clearTimeout(timer);
-  }
-}
-var stopCancelTails = new Map;
-function stopSerialCancel(sessionID, cancel) {
-  const next = (stopCancelTails.get(sessionID) ?? Promise.resolve()).then(cancel);
-  const settled = next.then(() => {
-    return;
-  }, () => {
-    return;
-  });
-  stopCancelTails.set(sessionID, settled);
-  settled.then(() => {
-    if (stopCancelTails.get(sessionID) === settled)
-      stopCancelTails.delete(sessionID);
-  });
-  return next;
-}
-function queuedAsyncDispatchIds(sessionID) {
-  return (dispatchQueues.get(sessionID) ?? []).map((w) => w.jobId);
-}
-function announceQueuedStart(ownerSession, notice, jobId) {
-  queueDispatchProgress(ownerSession, notice, () => dispatchStillLive(jobId));
-  if (idleJobSessions.has(ownerSession))
-    deliverDispatchProgress(ownerSession);
-}
-function failQueuedWishHonestly(wish, reason) {
-  const job = jobManager.create({
-    id: wish.jobId,
-    cmd: `dispatch ${wish.agentID}: ${wish.description} (queued, refused at spawn)`,
-    worktree: wish.directory,
-    ownerSession: wish.ownerSession,
-    logPath: join6(jobLogDir(), "dispatch", `${wish.jobId}.txt`),
-    notify: true,
-    killTree: () => {}
-  });
-  job.dispatch = {
-    agentID: wish.agentID,
-    childSessionID: "",
-    description: wish.description
-  };
-  const text = `(spawn refused at queue pump: ${reason} — the queued wish never spawned)`;
-  jobManager.appendOutput(job, text);
-  jobManager.markTerminal(job, "exited", 1);
-  journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory }, "error", text);
-}
-function pumpDispatchQueue(client, sessionID) {
-  const run = { wishId: null, done: Promise.resolve() };
-  let pumps = pumpInFlight.get(sessionID);
-  if (!pumps)
-    pumpInFlight.set(sessionID, pumps = new Set);
-  pumps.add(run);
-  run.done = pumpDequeuedWishes(client, sessionID, run).finally(() => {
-    run.wishId = null;
-    const left = pumpInFlight.get(sessionID);
-    if (!left)
-      return;
-    left.delete(run);
-    if (left.size === 0)
-      pumpInFlight.delete(sessionID);
-  });
-  return run.done;
-}
-function cancelDequeuedByStop(client, wish, child) {
-  releaseGateAdmission(wish.jobId);
-  if (child)
-    dispatchKillTreeHook(client, wish.jobId, () => child)();
-  journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, description: wish.description, questionDeny: wish.questionDeny }, "aborted", STOP_DEQUEUED_REASON);
-  const sessionID = wish.ownerSession;
-  if (!stopWaiting.has(sessionID))
-    return;
-  const notes = stopDequeued.get(sessionID) ?? [];
-  notes.push(wish.jobId);
-  stopDequeued.set(sessionID, notes.slice(-50));
-}
-async function pumpDequeuedWishes(client, sessionID, run) {
-  for (;; ) {
-    run.wishId = null;
-    const queue = dispatchQueues.get(sessionID);
-    if (!queue || queue.length === 0)
-      return;
-    if (inFlightAsyncDispatches(sessionID).length + inTransitWishes(sessionID).length >= ASYNC_DISPATCH_CAP)
-      return;
-    const wish = queue.shift();
-    if (queue.length === 0)
-      dispatchQueues.delete(sessionID);
-    if (!wish)
-      return;
-    run.wishId = wish.jobId;
-    const stopEpochAtDequeue = stopEpoch(sessionID);
-    if (wish.agentID.toLowerCase().startsWith("forge-")) {
-      const agentId = wish.agentID.slice("forge-".length);
-      const resolution = resolvePools();
-      if (!resolution || !resolution.agents[agentId]) {
-        failQueuedWishHonestly(wish, `"${wish.agentID}" is no longer a materialized forge subagent on this host (the roster changed while the wish was queued)`);
-        continue;
-      }
-    }
-    const crewRefusal = crewPendingRefusal(sessionID) ?? await crewComplianceRefusalFor(jobClient, sessionID, wish.agentID);
-    if (crewRefusal) {
-      failQueuedWishHonestly(wish, crewRefusal);
-      continue;
-    }
-    if (stoppedSince(sessionID, stopEpochAtDequeue)) {
-      cancelDequeuedByStop(client, wish, undefined);
-      continue;
-    }
-    const draftRefusal = draftDispatchRefusalForState(await stateForCheck(sessionID, anchorReaderOf(client)), wish.agentID);
-    if (draftRefusal) {
-      failQueuedWishHonestly(wish, draftRefusal);
-      continue;
-    }
-    const gate2 = gateFor(wish.directory);
-    const wishIdentity = dispatchModelIdentity(wish.agentID, wish.ownerSession);
-    if (wishIdentity) {
-      const admission = gate2.admit(wishIdentity);
-      if (!admission.ok) {
-        failQueuedWishHonestly(wish, admission.refusal);
-        continue;
-      }
-      gateProvidersSeen.add(wishIdentity.provider);
-      admittedGate.set(wish.jobId, wishIdentity);
-    }
-    const created = await createChildSessionBound(client, {
-      parentSessionID: wish.ownerSession,
-      parentDirectory: wish.directory,
-      agentID: wish.agentID,
-      description: wish.description,
-      questionDeny: wish.questionDeny,
-      modelPin: rosterModelPin(wish.agentID),
-      assertBinding: v2HostSeen,
-      taskDeny: nestedTaskDenyFor(wish.agentID, wish.ownerSession)
-    });
-    if (!created.ok) {
-      releaseGateAdmission(wish.jobId);
-      failQueuedWishHonestly(wish, `child session creation failed: ${created.error}`);
-      continue;
-    }
-    if (stoppedSince(sessionID, stopEpochAtDequeue)) {
-      cancelDequeuedByStop(client, wish, created.sessionID);
-      continue;
-    }
-    const sent = await sendPrompt(client, {
-      sessionID: created.sessionID,
-      agentID: wish.agentID,
-      prompt: wish.prompt,
-      directory: wish.directory
-    });
-    if (!sent.ok) {
-      releaseGateAdmission(wish.jobId);
-      failQueuedWishHonestly(wish, `prompt send to child session ${created.sessionID} failed: ${sent.error}`);
-      continue;
-    }
-    const job = jobManager.create({
-      id: wish.jobId,
-      cmd: `dispatch ${wish.agentID}: ${wish.description}`,
-      worktree: wish.directory,
-      ownerSession: wish.ownerSession,
-      logPath: join6(jobLogDir(), "dispatch", `${wish.jobId}.txt`),
-      notify: true,
-      killTree: dispatchKillTreeHook(client, wish.jobId, () => created.sessionID)
-    });
-    job.dispatch = { agentID: wish.agentID, childSessionID: created.sessionID, description: wish.description };
-    registerDispatchTask({ jobId: wish.jobId, childSessionID: created.sessionID, agentID: wish.agentID, ownerSession: wish.ownerSession, description: wish.description }, wish.directory);
-    journalTransition(wish.directory, journalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, questionDeny: wish.questionDeny, description: wish.description, prompt: wish.prompt }, "started", { childSessionId: created.sessionID }));
-    announceQueuedStart(wish.ownerSession, `[forge:dispatch-progress] wish ${wish.jobId} spawned from the queue (agent ${wish.agentID}, child session ${created.sessionID}) — tracking as a normal async dispatch; the single [forge:dispatch-complete] wake reports when it finishes.`, wish.jobId);
-    runAsyncDispatchPoller(client, job, created.sessionID, {
-      prompt: wish.prompt,
-      directory: wish.directory,
-      questionDeny: wish.questionDeny
-    });
-    if (stoppedSince(sessionID, stopEpochAtDequeue) && !stopWaiting.has(sessionID)) {
-      stopSerialCancel(sessionID, () => cancelDispatch(client, wish.jobId)).catch((err) => {
-        console.warn(`[forge:dispatch] stop: the late-landing task ${wish.jobId} could not be cancelled by its own pump: ${String(err)}`);
-      });
-    }
-  }
-}
-function flushDispatchQueue(sessionID) {
-  const queue = dispatchQueues.get(sessionID);
-  if (!queue)
-    return;
-  dispatchQueues.delete(sessionID);
-  for (const wish of queue) {
-    journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory }, "aborted", `owner session ${sessionID} ended before the queued wish spawned — flushed without spawning`);
-  }
-}
-var STOP_QUEUED_REASON = "cancelled by the user lever (/forge stop) — the wish was still queued: nothing was spawned and the dispatch is never retried";
-var STOP_DEQUEUED_REASON = "cancelled by the user lever (/forge stop) — the wish was leaving the queue when stop arrived: it was never prompted and the dispatch is never retried";
-function cancelQueuedWishes(sessionID) {
-  const queue = dispatchQueues.get(sessionID);
-  if (!queue || queue.length === 0)
-    return [];
-  dispatchQueues.delete(sessionID);
-  const ids = [];
-  for (const wish of queue) {
-    ids.push(wish.jobId);
-    journalTerminalRecord({ id: wish.jobId, agent: wish.agentID, ownerSession: wish.ownerSession, workspace: wish.directory, description: wish.description, questionDeny: wish.questionDeny }, "aborted", STOP_QUEUED_REASON);
-  }
-  return ids;
-}
-function stopReceipt(sessionID, flightCount, rows, queuedCancelled, stillLanding = 0, settleMs = 0) {
-  const queuedNote = queuedCancelled.length > 0 ? `
-[forge:job] Cancelled ${queuedCancelled.length} queued wish(es) of this session — removed from the queue before they could spawn (nothing was running for them): ${queuedCancelled.join(", ")}` : "";
-  const landingNote = stillLanding > 0 ? `
-[forge:job] ${stillLanding} queued wish(es) of this session were still being started when the lever stopped waiting (${Math.max(1, Math.round(settleMs / 1000))} s) — each is cancelled the moment it lands; nothing of them is left running.` : "";
-  if (flightCount === 0) {
-    return {
-      title: queuedCancelled.length > 0 ? `${queuedCancelled.length} queued wish(es) cancelled` : "stop",
-      output: `[forge:job] No async dispatches in flight for this session (${sessionID}).${queuedNote}${landingNote}`
-    };
-  }
-  return {
-    title: `${flightCount} dispatch(es) stopped`,
-    output: `[forge:job] Stopped ${flightCount} in-flight dispatch(es) of this session:
-${rows.join(`
-`)}${queuedNote}${landingNote}`
-  };
-}
-var dispatchJournals = new Map;
-var dispatchJournalFsFactory = null;
-function journalFor(worktree) {
-  let j = dispatchJournals.get(worktree);
-  if (!j) {
-    const filePath = join6(worktree, ".opencode", "forge", "dispatch-log.jsonl");
-    const fs = dispatchJournalFsFactory ? dispatchJournalFsFactory(filePath) : undefined;
-    j = createDispatchJournal(filePath, { fs, maxRecords: resolveJournalMax() });
-    dispatchJournals.set(worktree, j);
-  }
-  return j;
-}
-function journalRecord(base, state, extra = {}) {
-  const now = Date.now();
-  return {
-    id: base.id,
-    agent: base.agent,
-    ownerSession: base.ownerSession,
-    workspace: base.workspace,
-    state,
-    attempts: 1,
-    createdAt: now,
-    updatedAt: now,
-    ...base.description !== undefined ? { description: base.description } : {},
-    ...base.questionDeny !== undefined ? { questionDeny: base.questionDeny } : {},
-    ...base.prompt !== undefined ? { prompt: base.prompt } : {},
-    ...extra
-  };
-}
-function journalTransition(worktree, record2) {
-  try {
-    journalFor(worktree).append(record2);
-  } catch {}
-}
-function journalTerminalRecord(base, outcome, reason) {
-  const admitted = admittedGate.get(base.id);
-  if (admitted) {
-    admittedGate.delete(base.id);
-    try {
-      dispatchGate?.recordTerminal(admitted, outcome === "completed" ? "completed" : outcome === "error" || outcome === "stream-lost/unknown" ? "failed" : "neutral");
-    } catch {}
-  }
-  journalTransition(base.workspace, { ...journalRecord(base, "terminal"), prompt: undefined, outcome, reason });
-  removeDispatchStorageRow(base.id);
-}
-var recoveredDispatchWorkspaces = new Set;
-async function recoverWorkspaceDispatches(client, workspace) {
-  if (!client || !workspace)
-    return;
-  if (recoveredDispatchWorkspaces.has(workspace))
-    return;
-  recoveredDispatchWorkspaces.add(workspace);
-  let records;
-  try {
-    records = journalFor(workspace).nonTerminal();
-  } catch {
-    return;
-  }
-  for (const rec of records) {
-    try {
-      await recoverOneDispatchRecord(client, workspace, rec);
-    } catch {}
-  }
-}
-async function recoverOneDispatchRecord(client, workspace, rec) {
-  if (dispatchTasks.has(rec.id) || jobManager.get(rec.id))
-    return;
-  if (isDispatchCancelled(rec.id)) {
-    journalTerminalRecord({ id: rec.id, agent: rec.agent, ownerSession: rec.ownerSession, workspace, description: rec.description ?? "" }, "aborted", "cancelled by the user lever (/forge stop) — recovery refuses to respawn a cancelled dispatch");
-    return;
-  }
-  const base = {
-    id: rec.id,
-    agent: rec.agent,
-    ownerSession: rec.ownerSession,
-    workspace,
-    prompt: rec.prompt,
-    description: rec.description,
-    questionDeny: rec.questionDeny ?? true
-  };
-  const prompt = typeof rec.prompt === "string" ? rec.prompt : "";
-  const attempts = typeof rec.attempts === "number" && rec.attempts >= 1 ? rec.attempts : 1;
-  if (rec.state === "started" && typeof rec.childSessionId === "string" && rec.childSessionId !== "") {
-    const childId = rec.childSessionId;
-    const probe = await sessionGet(client, childId);
-    if (probe.exists === false) {
-      journalTerminalRecord(base, "error", `child session ${childId} no longer exists at recovery — dispatch finalized honestly (no report fabricated)`);
-      console.warn(`[forge:dispatch] recovery: task ${rec.id} (child session ${childId}) is gone — journal terminalized honestly.`);
-      return;
-    }
-    let active = true;
-    try {
-      if (typeof client.session.status !== "function")
-        throw new Error("no status capability");
-      const st = await client.session.status();
-      if (st.error === undefined && st.data && typeof st.data === "object") {
-        const entry = st.data[childId];
-        active = entry !== undefined && ["busy", "retry", "running"].includes(entry?.type ?? "");
-      }
-    } catch {
-      active = true;
-    }
-    if (!active) {
-      const fin = await fetchFinalMessage(client, childId);
-      if (fin.ok) {
-        const job2 = jobManager.create({
-          id: rec.id,
-          cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered)`,
-          worktree: workspace,
-          ownerSession: rec.ownerSession,
-          logPath: join6(jobLogDir(), "dispatch", `${rec.id}.txt`),
-          notify: true,
-          killTree: dispatchKillTreeHook(client, rec.id, () => childId)
-        });
-        job2.dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" };
-        jobManager.appendOutput(job2, fin.text);
-        jobManager.markTerminal(job2, "exited", 0);
-        journalTerminalRecord(base, "completed", `final report recovered after host restart (child session ${childId})`);
-        try {
-          if (typeof client.session.status !== "function")
-            throw new Error("no status capability");
-          const st2 = await client.session.status();
-          const ownerEntry = st2.data?.[rec.ownerSession];
-          if (!ownerEntry || !["busy", "retry", "running"].includes(ownerEntry?.type ?? "")) {
-            await deliverJobWakes(rec.ownerSession);
-          }
-        } catch {}
-        return;
-      }
-    }
-    const job = jobManager.create({
-      id: rec.id,
-      cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered, re-armed)`,
-      worktree: workspace,
-      ownerSession: rec.ownerSession,
-      logPath: join6(jobLogDir(), "dispatch", `${rec.id}.txt`),
-      notify: true,
-      killTree: dispatchKillTreeHook(client, rec.id, () => childId)
-    });
-    job.dispatch = { agentID: rec.agent, childSessionID: childId, description: rec.description ?? "" };
-    registerDispatchTask({ jobId: rec.id, childSessionID: childId, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace);
-    journalTransition(workspace, journalRecord(base, "started", { childSessionId: childId, attempts, prompt }));
-    runAsyncDispatchPoller(client, job, childId, {
-      prompt,
-      directory: workspace,
-      questionDeny: base.questionDeny ?? true,
-      attemptOffset: attempts - 1
-    });
-    return;
-  }
-  if (rec.state === "queued" || rec.state === "dispatched") {
-    const owner = await sessionGet(client, rec.ownerSession);
-    if (owner.exists === true) {
-      const queue = dispatchQueues.get(rec.ownerSession) ?? [];
-      queue.push({
-        jobId: rec.id,
-        agentID: rec.agent,
-        ownerSession: rec.ownerSession,
-        description: rec.description ?? "",
-        prompt,
-        directory: workspace,
-        questionDeny: true,
-        enqueuedAt: Date.now()
-      });
-      dispatchQueues.set(rec.ownerSession, queue);
-      announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] queued wish ${rec.id} (agent ${rec.agent}) re-entered the queue after host restart — it spawns when a slot frees.`, rec.id);
-      await pumpDispatchQueue(client, rec.ownerSession);
-    } else {
-      journalTerminalRecord(base, "aborted", `owner session ${rec.ownerSession} no longer resolves at recovery — queued wish terminalized without spawning`);
-      console.warn(`[forge:dispatch] recovery: queued wish ${rec.id} owner ${rec.ownerSession} unresolvable — journal terminalized honestly.`);
-    }
-    return;
-  }
-  if (rec.state === "retry-pending") {
-    const maxAttempts = resolveMaxAttempts();
-    if (attempts <= maxAttempts && prompt !== "") {
-      const refusal = crewPendingRefusal(rec.ownerSession) ?? draftDispatchRefusalForState(await stateForCheck(rec.ownerSession, anchorReaderOf(client)), rec.agent) ?? forgeTargetUnresolved(rec.agent);
-      if (refusal) {
-        journalTerminalRecord(base, "error", `retry refused at recovery: ${refusal}`);
-        return;
-      }
-      const respawn = await createChildSessionBound(client, {
-        parentSessionID: rec.ownerSession,
-        parentDirectory: workspace,
-        agentID: rec.agent,
-        description: rec.description ?? "",
-        questionDeny: base.questionDeny ?? true,
-        modelPin: rosterModelPin(rec.agent),
-        assertBinding: v2HostSeen,
-        taskDeny: nestedTaskDenyFor(rec.agent, rec.ownerSession, typeof rec.childSessionId === "string" ? rec.childSessionId : undefined)
-      });
-      if (!respawn.ok) {
-        journalTerminalRecord(base, "error", `retry spawn failed at recovery: ${respawn.error}`);
-        return;
-      }
-      const sent = await sendPrompt(client, {
-        sessionID: respawn.sessionID,
-        agentID: rec.agent,
-        prompt: buildRetryPrompt(prompt),
-        directory: workspace
-      });
-      if (!sent.ok) {
-        journalTerminalRecord(base, "error", `retry prompt send failed at recovery: ${sent.error}`);
-        return;
-      }
-      const job = jobManager.create({
-        id: rec.id,
-        cmd: `dispatch ${rec.agent}: ${rec.description ?? ""} (recovered retry)`,
-        worktree: workspace,
-        ownerSession: rec.ownerSession,
-        logPath: join6(jobLogDir(), "dispatch", `${rec.id}.txt`),
-        notify: true,
-        killTree: dispatchKillTreeHook(client, rec.id, () => respawn.sessionID)
-      });
-      job.dispatch = { agentID: rec.agent, childSessionID: respawn.sessionID, description: rec.description ?? "" };
-      registerDispatchTask({ jobId: rec.id, childSessionID: respawn.sessionID, agentID: rec.agent, ownerSession: rec.ownerSession, description: rec.description ?? "" }, workspace);
-      const nextAttempt = attempts;
-      journalTransition(workspace, journalRecord(base, "started", { childSessionId: respawn.sessionID, attempts: nextAttempt, prompt }));
-      announceQueuedStart(rec.ownerSession, `[forge:dispatch-progress] task ${rec.id} retry attempt ${nextAttempt}/${maxAttempts} resumed after host restart — child session ${respawn.sessionID}.`, rec.id);
-      runAsyncDispatchPoller(client, job, respawn.sessionID, {
-        prompt,
-        directory: workspace,
-        questionDeny: base.questionDeny ?? true,
-        attemptOffset: attempts - 1
-      });
-    } else {
-      journalTerminalRecord(base, "error", `attempts exhausted at recovery (${attempts}/${maxAttempts}) — no respawn`);
-    }
-    return;
-  }
-}
-function dispatchClient() {
-  return jobClient;
-}
-var cancelledDispatchIds = new Set;
-var USER_LEVER_ABORT_REASON = "cancelled by the user lever (/forge stop) — the child was aborted and the dispatch is never retried";
-var REGISTRY_KILL_ABORT_REASON = "registry kill (owner session ended) — the child was aborted and the dispatch is never retried";
-var EXPLICIT_KILL_ABORT_REASON = "killed by the explicit forge_jobs kill action — the child was aborted and the dispatch is never retried";
-function cancelIdleAssertionMs() {
-  const raw = Number(process.env.FORGE_CANCEL_IDLE_ASSERTION_MS);
-  return Number.isFinite(raw) && raw > 0 ? raw : 1e4;
-}
-function inFlightDispatchList() {
-  const rows = [];
-  for (const row of dispatchTasks.values()) {
-    const job = jobManager.get(row.jobId);
-    if (!job || job.state !== "running") {
-      dispatchTasks.delete(row.jobId);
-      continue;
-    }
-    rows.push({
-      taskId: row.jobId,
-      agent: row.agentID,
-      childSessionID: row.childSessionID,
-      ownerSession: row.ownerSession,
-      description: row.description ?? "",
-      ageMs: job?.startedAt ? Date.now() - job.startedAt : null
-    });
-  }
-  return rows;
-}
-function formatInFlightDispatchList() {
-  const rows = inFlightDispatchList();
-  if (rows.length === 0)
-    return "(no async dispatches in flight)";
-  return rows.map((r) => {
-    const age = r.ageMs !== null ? ` — running ${Math.max(1, Math.round(r.ageMs / 1000))}s` : "";
-    const desc = r.description ? ` — ${r.description.slice(0, 80)}` : "";
-    return `- ${r.taskId}  agent ${r.agent}  child session ${r.childSessionID}${age}${desc}`;
-  }).join(`
-`);
-}
-var interruptDisclosureSeen = new Set;
-function disclosedInterruptFlights() {
-  return interruptDisclosureSeen.size;
-}
-function discloseInterruptedParent(sessionID) {
-  const flight = inFlightAsyncDispatches(sessionID);
-  if (flight.length === 0)
-    return false;
-  const key = `${sessionID}:${flight.slice().sort().join(",")}`;
-  if (interruptDisclosureSeen.has(key))
-    return false;
-  interruptDisclosureSeen.add(key);
-  queueDispatchProgress(sessionID, `[forge:dispatch-notice] Your turn was interrupted, but ${flight.length} async dispatch(es) REMAIN IN FLIGHT (host children are independent sessions — ESC does not stop them):
-${formatInFlightDispatchList()}
-Cancel with /forge stop (cancels every in-flight and queued dispatch of THIS session) or the explicit per-id lever forge_jobs {action: "cancel", jobId: "<task-id>"} (the cross-session escape hatch). Nothing was cancelled automatically.`, () => inFlightAsyncDispatches(sessionID).length > 0);
-  return true;
-}
-function activeSessionView(client) {
-  const own = client.session?.status;
-  if (typeof own === "function") {
-    const read = own;
-    return async () => {
-      const st = await read.call(client.session);
-      const map2 = st?.data;
-      return map2 && typeof map2 === "object" ? map2 : undefined;
-    };
-  }
-  if (!discoverServiceHttp())
-    return null;
-  const walker = v2NativeChildWalker();
-  const status = walker.session?.status;
-  if (typeof status !== "function")
-    return null;
-  return async () => {
-    const st = await status.call(walker.session);
-    const map2 = st?.data;
-    return map2 && typeof map2 === "object" ? map2 : undefined;
-  };
-}
-async function assertChildIdleAfterAbort(client, childSessionID) {
-  const view = activeSessionView(client);
-  if (!view)
-    return "unresolved";
-  const assertionMs = cancelIdleAssertionMs();
-  const deadline = Date.now() + assertionMs;
-  const readWithin = async (ms) => {
-    let timer;
-    const cap = new Promise((resolve2) => {
-      timer = setTimeout(() => resolve2("timeout"), Math.max(1, ms));
-    });
-    try {
-      return await Promise.race([view(), cap]);
-    } finally {
-      if (timer)
-        clearTimeout(timer);
-    }
-  };
-  while (Date.now() < deadline) {
-    await new Promise((resolve2) => setTimeout(resolve2, 400));
-    try {
-      const map2 = await readWithin(Math.max(1, deadline - Date.now()));
-      if (map2 !== "timeout" && map2 && typeof map2 === "object" && map2[childSessionID] === undefined)
-        return "idle";
-    } catch {}
-  }
-  try {
-    const map2 = await readWithin(2000);
-    if (!map2 || map2 === "timeout")
-      return "unresolved";
-    return map2[childSessionID] === undefined ? "idle" : "resisted";
-  } catch {
-    return "unresolved";
-  }
-}
-async function cancelDispatch(client, taskId) {
-  const row = dispatchTasks.get(taskId);
-  const job = jobManager.get(taskId);
-  if (!row || !job) {
-    return {
-      ok: false,
-      idle: "not-asserted",
-      text: `"${taskId}" is not an in-flight async dispatch — nothing to cancel.
-In flight now:
-${formatInFlightDispatchList()}`
-    };
-  }
-  cancelledDispatchIds.add(taskId);
-  {
-    const meta = job.dispatch;
-    if (meta && meta.outcome !== "stream-lost/unknown")
-      meta.abortReason = USER_LEVER_ABORT_REASON;
-  }
-  jobManager.kill(job);
-  const idle = await assertChildIdleAfterAbort(client, row.childSessionID);
-  const assertionMs = cancelIdleAssertionMs();
-  const idleNote = idle === "idle" ? `the child session ${row.childSessionID} is confirmed idle (the cancellation is REAL, not bookkeeping)` : idle === "resisted" ? `the child session ${row.childSessionID} did NOT reach idle within ${Math.round(assertionMs / 1000)}s — it may have resisted cancellation; inspect or abort it natively in the host TUI` : `the child session ${row.childSessionID}'s state could not be read to confirm idle — verify it natively in the host TUI`;
-  return {
-    ok: true,
-    childSessionID: row.childSessionID,
-    idle,
-    text: `Cancelled ${taskId} (agent ${row.agentID}, child session ${row.childSessionID}) — cancelled by the user lever; never retried. ${idleNote}.`
-  };
-}
-function isDispatchCancelled(taskId) {
-  return cancelledDispatchIds.has(taskId);
-}
-var dispatchTerminalInbox = new Map;
-var dispatchChildActivityAt = new Map;
-function executionErrorDetail(error45) {
-  try {
-    return executionErrorDetailInner(error45);
-  } catch {
-    return;
-  }
-}
-function executionErrorDetailInner(error45) {
-  if (error45 === undefined || error45 === null)
-    return;
-  if (typeof error45 === "string")
-    return error45 || undefined;
-  if (typeof error45 === "number" || typeof error45 === "boolean")
-    return String(error45);
-  if (typeof error45 !== "object")
-    return;
-  const dig = (v, depth) => {
-    if (v === undefined || v === null)
-      return;
-    if (typeof v === "string")
-      return v || undefined;
-    if (typeof v === "number" || typeof v === "boolean")
-      return String(v);
-    if (typeof v !== "object" || depth <= 0)
-      return;
-    const o2 = v;
-    for (const key of ["message", "error", "reason", "data", "name"]) {
-      const got = dig(o2[key], depth - 1);
-      if (got)
-        return got;
-    }
-    return;
-  };
-  const o = error45;
-  const name = typeof o.name === "string" && o.name ? o.name : undefined;
-  const message = dig(o.message, 4) ?? dig(o.data, 4) ?? dig(o.error, 4) ?? dig(o.reason, 4);
-  if (name && message && message !== name)
-    return `${name}: ${message}`;
-  if (message)
-    return message;
-  if (name)
-    return name;
-  const found = dig(error45, 4);
-  if (found)
-    return found;
-  try {
-    const s = JSON.stringify(error45);
-    if (s && s !== "{}")
-      return s.length > 300 ? `${s.slice(0, 300)}…` : s;
-    if (s === "{}")
-      return;
-  } catch {}
-  return;
-}
-function noteDispatchTerminalSignal(sessionID, kind, detail) {
-  dispatchChildActivityAt.set(sessionID, Date.now());
-  if (dispatchTerminalInbox.has(sessionID))
-    return;
-  dispatchTerminalInbox.set(sessionID, { kind, detail, at: Date.now() });
-}
-function noteDispatchChildActivity(sessionID) {
-  dispatchChildActivityAt.set(sessionID, Date.now());
-}
-function takeDispatchTerminalSignal(sessionID) {
-  const signal = dispatchTerminalInbox.get(sessionID);
-  if (signal)
-    dispatchTerminalInbox.delete(sessionID);
-  return signal ?? null;
-}
-function recentDispatchChildActivity(sessionID, withinMs) {
-  const at = dispatchChildActivityAt.get(sessionID);
-  return at !== undefined && Date.now() - at <= withinMs;
-}
-function forgetDispatchSignals(sessionID) {
-  dispatchTerminalInbox.delete(sessionID);
-  dispatchChildActivityAt.delete(sessionID);
-}
-var v2SessionWaitSeam = null;
-function setDispatchWaitSeamForTests(seam) {
-  v2SessionWaitSeam = seam;
-}
-function armDispatchWaitWatcher(sessionID) {
-  const wait = v2SessionWaitSeam;
-  if (!wait)
-    return;
-  wait(sessionID).then(() => {
-    if (!dispatchTerminalInbox.has(sessionID))
-      noteDispatchTerminalSignal(sessionID, "succeeded", "wait-latch");
-  }).catch(() => {});
-}
-var DISPATCH_STORAGE_PREFIX = "forge-dispatch/";
-var v2DispatchStorage = null;
-function setDispatchStorageForTests(storage) {
-  v2DispatchStorage = storage;
-}
-async function writeDispatchStorageRow(row) {
-  const storage = v2DispatchStorage;
-  if (!storage)
-    return;
-  try {
-    await storage.set(DISPATCH_STORAGE_PREFIX + row.taskId, row);
-  } catch {}
-}
-async function removeDispatchStorageRow(taskId) {
-  const storage = v2DispatchStorage;
-  if (!storage)
-    return;
-  try {
-    await storage.remove(DISPATCH_STORAGE_PREFIX + taskId);
-  } catch {}
-}
-async function findChildByParentWalk(client, ownerSession, agent) {
-  try {
-    const raw = await client.session?.list?.({});
-    const body = raw?.data ?? raw;
-    const list = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : [];
-    const hits = [];
-    for (const s of list) {
-      if (!s || typeof s.id !== "string")
-        continue;
-      if (s.parentID !== ownerSession)
-        continue;
-      if (agent && s.agent !== agent)
-        continue;
-      const t = Number(s.time?.created ?? 0);
-      hits.push({ id: s.id, created: Number.isFinite(t) ? t : 0 });
-    }
-    hits.sort((a, b) => b.created - a.created);
-    return hits[0]?.id ?? null;
-  } catch {
-    return null;
-  }
-}
-function rearmDispatchWatch(client, input) {
-  const job = jobManager.create({
-    id: input.id,
-    cmd: `dispatch ${input.agent}: ${input.description || "(adopted)"} (adopted, re-armed)`,
-    worktree: input.workspace,
-    ownerSession: input.ownerSession,
-    logPath: join6(jobLogDir(), "dispatch", `${input.id}.txt`),
-    notify: true,
-    killTree: dispatchKillTreeHook(client, input.id, () => input.childId)
-  });
-  job.dispatch = { agentID: input.agent, childSessionID: input.childId, description: input.description };
-  registerDispatchTask({ jobId: input.id, childSessionID: input.childId, agentID: input.agent, ownerSession: input.ownerSession, description: input.description }, input.workspace);
-  journalTransition(input.workspace, {
-    id: input.id,
-    agent: input.agent,
-    ownerSession: input.ownerSession,
-    workspace: input.workspace,
-    state: "started",
-    childSessionId: input.childId,
-    attempts: input.attempts,
-    createdAt: Date.now(),
-    updatedAt: Date.now(),
-    prompt: input.prompt,
-    questionDeny: input.questionDeny,
-    description: input.description
-  });
-  runAsyncDispatchPoller(client, job, input.childId, {
-    prompt: input.prompt,
-    directory: input.workspace,
-    questionDeny: input.questionDeny,
-    attemptOffset: Math.max(0, input.attempts - 1)
-  });
-}
-async function adoptPersistedDispatchRows(client, workspace) {
-  if (!client || !workspace || isRootish(workspace))
-    return 0;
-  const storage = v2DispatchStorage;
-  let adopted = 0;
-  if (storage) {
-    try {
-      const scanned = await storage.scan({ prefix: DISPATCH_STORAGE_PREFIX });
-      for (const entry of scanned?.entries ?? []) {
-        const row = entry?.value;
-        if (!row || typeof row !== "object")
-          continue;
-        if (normalizeAnchorDir(String(row.workspace ?? "")) !== normalizeAnchorDir(workspace))
-          continue;
-        const taskId = String(row.taskId ?? "");
-        if (!taskId || dispatchTasks.has(taskId))
-          continue;
-        if (isDispatchCancelled(taskId)) {
-          journalTerminalRecord({ id: taskId, agent: String(row.agent ?? ""), ownerSession: String(row.ownerSession ?? ""), workspace, description: String(row.description ?? "") }, "aborted", "cancelled by the user lever (/forge stop) — adoption refuses to re-arm a cancelled dispatch");
-          continue;
-        }
-        const owner = String(row.ownerSession ?? "");
-        const agent = String(row.agent ?? "");
-        let childId = String(row.childSessionID ?? "");
-        if (!childId) {
-          childId = await findChildByParentWalk(client, owner, agent) ?? "";
-        }
-        if (!childId)
-          continue;
-        const probe = await sessionGet(client, childId);
-        if (probe.exists === false) {
-          journalTerminalRecord({ id: taskId, agent, ownerSession: owner, workspace, description: String(row.description ?? "") }, "error", `adopted row's child session ${childId} no longer exists — finalized honestly at adoption`);
-          continue;
-        }
-        rearmDispatchWatch(client, {
-          id: taskId,
-          agent,
-          ownerSession: owner,
-          workspace,
-          childId,
-          description: String(row.description ?? ""),
-          prompt: String(row.prompt ?? ""),
-          questionDeny: row.questionDeny !== false,
-          attempts: Number.isFinite(Number(row.attempts)) && Number(row.attempts) > 0 ? Number(row.attempts) : 1
-        });
-        adopted++;
-      }
-    } catch {}
-  }
-  detectOrphanDispatchChildren(client, workspace).catch(() => {});
-  return adopted;
-}
-var orphanDisclosuresSeen = new Set;
-function observedOrphanDispatches() {
-  return orphanDisclosuresSeen.size;
-}
-async function detectOrphanDispatchChildren(client, workspace) {
-  const trackedChildren = new Set;
-  for (const h of dispatchTasks.values())
-    trackedChildren.add(h.childSessionID);
-  let listed = [];
-  try {
-    const raw = await client.session?.list?.({});
-    const body = raw?.data ?? raw;
-    listed = Array.isArray(body) ? body : Array.isArray(body?.sessions) ? body.sessions : [];
-  } catch {
-    return 0;
-  }
-  if (listed.length === 0)
-    return 0;
-  let active;
-  try {
-    if (typeof client.session.status !== "function")
-      return 0;
-    const st = await client.session.status();
-    const map2 = st?.data;
-    if (!map2 || typeof map2 !== "object")
-      return 0;
-    active = new Set(Object.keys(map2));
-  } catch {
-    return 0;
-  }
-  let found = 0;
-  for (const s of listed) {
-    const id = typeof s?.id === "string" ? s.id : "";
-    if (!id || trackedChildren.has(id) || orphanDisclosuresSeen.has(id))
-      continue;
-    const agent = typeof s.agent === "string" ? s.agent : "";
-    const parent = typeof s.parentID === "string" ? s.parentID : "";
-    if (!parent || !agent.startsWith("forge-"))
-      continue;
-    if (!active.has(id))
-      continue;
-    orphanDisclosuresSeen.add(id);
-    found++;
-    let taskId = "(unknown)";
-    try {
-      const rec = journalFor(workspace).nonTerminal().find((r) => r.childSessionId === id);
-      if (rec)
-        taskId = rec.id;
-    } catch {}
-    console.warn(`[forge:orphan-dispatch] warn: forge child ${id} (agent ${agent}, parent ${parent}) is STREAMING with no live dispatch row (task id ${taskId}) — adoption gap. Adopt: restart the host or touch the workspace to re-run recovery; Cancel: /forge stop (this session's dispatches) or forge_jobs action=cancel with the task id.`);
-    queueDispatchProgress(parent, `[forge:dispatch-notice] Orphaned dispatch child detected: forge child ${id} (agent ${agent}, task id ${taskId}) is running with no live dispatch row. It will NOT deliver an outcome on its own — recover it (restart/touch to re-run adoption) or cancel it (forge_jobs action=cancel jobId=${taskId === "(unknown)" ? "<task-id>" : taskId}; or /forge stop when it belongs to this session).`);
-  }
-  return found;
-}
-async function runAsyncDispatchPoller(client, job, initialChildSessionID, retryCtx) {
-  const intervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
-  const sliceMs = Math.max(intervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5000), v2HostSeen ? Number(process.env.FORGE_DISPATCH_RECONCILE_FLOOR_MS ?? 1e4) : 0);
-  const viewLossTicks = sliceMs >= 1e4 ? 12 : undefined;
-  const notifyIntervalMs = resolveNotifyIntervalMs();
-  const staleMs = resolveStaleMs();
-  const staleMode = resolveStaleMode();
-  const staleFloorMs = resolveStaleFloorMs();
-  const maxAttempts = resolveMaxAttempts();
-  const retryBackoffMs = resolveRetryBackoffMs();
-  const dispatch = job.dispatch;
-  const agentID = dispatch?.agentID ?? "unknown";
-  let childSessionID = initialChildSessionID;
-  let attempt = 1 + (retryCtx.attemptOffset ?? 0);
-  let startedAt = Date.now();
-  let lastNotifiedMultiple = 0;
-  let text = "";
-  let exitCode = 0;
-  let streamLost = false;
-  let activeOverride = false;
-  const stability = { stableTicks: 0 };
-  const stale = { lastActivity: null, staleNotified: false };
-  armDispatchWaitWatcher(childSessionID);
-  writeDispatchStorageRow({
-    taskId: job.id,
-    childSessionID,
-    agent: agentID,
-    ownerSession: job.ownerSession,
-    workspace: retryCtx.directory,
-    description: dispatch?.description ?? "",
-    prompt: retryCtx.prompt,
-    questionDeny: retryCtx.questionDeny,
-    attempts: attempt,
-    startedAt,
-    updatedAt: Date.now()
-  });
-  const flushProgress = (notice) => {
-    appendDispatchNotice(job, notice);
-    queueDispatchProgress(job.ownerSession, notice, () => dispatchStillLive(job.id));
-    if (idleJobSessions.has(job.ownerSession))
-      deliverDispatchProgress(job.ownerSession);
-  };
-  let reconcileHoldNotified = false;
-  const settleKilled = async () => {
-    if (job.state === "running")
-      return false;
-    dispatchTasks.delete(job.id);
-    await awaitAbortVerdict(job.id);
-    forgetDispatchSignals(childSessionID);
-    const unconfirmed = abortUnconfirmedNotes.get(job.id);
-    const suffix = unconfirmed ? ` — abort unconfirmed — child may still be running (${unconfirmed})` : "";
-    const stamped = job.dispatch?.abortReason;
-    journalTerminalRecord({ id: job.id, agent: agentID, ownerSession: job.ownerSession, workspace: retryCtx.directory, description: dispatch?.description ?? "" }, "aborted", (stamped ?? (isDispatchCancelled(job.id) ? USER_LEVER_ABORT_REASON : REGISTRY_KILL_ABORT_REASON)) + suffix);
-    pumpDispatchQueue(client, job.ownerSession);
-    return true;
-  };
-  for (;; ) {
-    if (await settleKilled())
-      return;
-    const signal = takeDispatchTerminalSignal(childSessionID);
-    if (signal) {
-      if (await settleKilled())
-        return;
-      forgetDispatchSignals(childSessionID);
-      if (signal.kind === "failed") {
-        text = `(child session ended in error: ${signal.detail ?? "session.execution.failed"})`;
-        exitCode = 1;
-        break;
-      }
-      if (signal.kind === "interrupted" && signal.detail === "user") {
-        text = `(child session ${childSessionID} was interrupted by the user — dispatch finalized honestly; the transcript stays inspectable and natively abortable in the host TUI)`;
-        exitCode = 1;
-        break;
-      }
-      if (signal.kind === "succeeded") {
-        const fin = await fetchFinalMessage(client, childSessionID);
-        text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`;
-        break;
-      }
-      noteDispatchChildActivity(childSessionID);
-    }
-    const poll = await pollChild(client, { sessionID: childSessionID, intervalMs, timeoutMs: sliceMs, stability, viewLossTicks });
-    if (await settleKilled())
-      return;
-    if (poll.status === "completed") {
-      activeOverride = poll.via === "active-textful";
-      const fin = await fetchFinalMessage(client, childSessionID);
-      text = fin.ok ? fin.text : `(final message unavailable: ${fin.error})`;
-      if (activeOverride)
-        text += `
-(${ACTIVE_TEXTFUL_OVERRIDE_NOTE})`;
-      break;
-    }
-    if (poll.status === "error") {
-      if (attempt < maxAttempts && job.state === "running" && classifyDispatchError(poll.error) === "retryable") {
-        const errorHead = poll.error.split(`
-`)[0].slice(0, 160);
-        attempt++;
-        journalTransition(retryCtx.directory, {
-          id: job.id,
-          agent: agentID,
-          ownerSession: job.ownerSession,
-          workspace: retryCtx.directory,
-          state: "retry-pending",
-          childSessionId: undefined,
-          attempts: attempt,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          prompt: retryCtx.prompt,
-          questionDeny: retryCtx.questionDeny,
-          description: dispatch?.description ?? ""
-        });
-        flushProgress(`[forge:dispatch-progress] attempt ${attempt}/${maxAttempts} starting after ${errorHead}… — ` + `respawning ${agentID} (task ${job.id}, previous child session ${childSessionID}) with the resume preamble; ` + `the single [forge:dispatch-complete] wake reports when the last attempt settles.`);
-        await new Promise((resolve2) => setTimeout(resolve2, retryBackoffMs));
-        if (job.state !== "running") {
-          if (await settleKilled())
-            return;
-        }
-        const refusal = crewPendingRefusal(job.ownerSession) ?? draftDispatchRefusalForState(await stateForCheck(job.ownerSession, anchorReaderOf(client)), agentID) ?? forgeTargetUnresolved(agentID);
-        if (refusal) {
-          text = `(retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
-          exitCode = 1;
-          break;
-        }
-        const respawn = await createChildSessionBound(client, {
-          parentSessionID: job.ownerSession,
-          parentDirectory: retryCtx.directory,
-          agentID,
-          description: dispatch?.description ?? "",
-          questionDeny: retryCtx.questionDeny,
-          modelPin: rosterModelPin(agentID),
-          assertBinding: v2HostSeen,
-          taskDeny: nestedTaskDenyFor(agentID, job.ownerSession, childSessionID)
-        });
-        if (!respawn.ok) {
-          text = `(retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
-          exitCode = 1;
-          break;
-        }
-        const settleRespawnKill = async (bindFresh) => {
-          const fresh = respawn.sessionID;
-          if (bindFresh) {
-            const previousMeta = job.dispatch;
-            job.dispatch = {
-              ...previousMeta ?? { agentID, description: dispatch?.description ?? "" },
-              childSessionID: fresh
-            };
-            job.killTree = dispatchKillTreeHook(client, job.id, () => fresh);
-            job.killTree();
-          } else {
-            dispatchKillTreeHook(client, job.id, () => fresh)();
-          }
-          forgetDispatchSignals(fresh);
-          await settleKilled();
-        };
-        if (job.state !== "running") {
-          await settleRespawnKill(false);
-          return;
-        }
-        const sent = await sendPrompt(client, {
-          sessionID: respawn.sessionID,
-          agentID,
-          prompt: buildRetryPrompt(retryCtx.prompt),
-          directory: retryCtx.directory
-        });
-        if (!sent.ok) {
-          text = `(retry prompt send failed: ${sent.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead})`;
-          exitCode = 1;
-          break;
-        }
-        if (job.state !== "running") {
-          await settleRespawnKill(true);
-          return;
-        }
-        const previousChild = childSessionID;
-        childSessionID = respawn.sessionID;
-        forgetDispatchSignals(previousChild);
-        armDispatchWaitWatcher(childSessionID);
-        writeDispatchStorageRow({
-          taskId: job.id,
-          childSessionID,
-          agent: agentID,
-          ownerSession: job.ownerSession,
-          workspace: retryCtx.directory,
-          description: dispatch?.description ?? "",
-          prompt: retryCtx.prompt,
-          questionDeny: retryCtx.questionDeny,
-          attempts: attempt,
-          startedAt,
-          updatedAt: Date.now()
-        });
-        job.dispatch = { agentID, childSessionID, description: dispatch?.description ?? "" };
-        registerDispatchTask({ jobId: job.id, childSessionID, agentID, ownerSession: job.ownerSession, description: dispatch?.description ?? "" }, retryCtx.directory);
-        journalTransition(retryCtx.directory, {
-          id: job.id,
-          agent: agentID,
-          ownerSession: job.ownerSession,
-          workspace: retryCtx.directory,
-          state: "started",
-          childSessionId: childSessionID,
-          attempts: attempt,
-          createdAt: Date.now(),
-          updatedAt: Date.now(),
-          prompt: retryCtx.prompt,
-          questionDeny: retryCtx.questionDeny,
-          description: dispatch?.description ?? ""
-        });
-        job.killTree = dispatchKillTreeHook(client, job.id, () => childSessionID);
-        stability.stableTicks = 0;
-        stability.activeTextfulTicks = 0;
-        stability.textlessIdleSince = undefined;
-        startedAt = Date.now();
-        lastNotifiedMultiple = 0;
-        stale.lastActivity = null;
-        stale.staleNotified = false;
-        continue;
-      }
-      text = `(child session ended in error: ${poll.error})`;
-      exitCode = 1;
-      break;
-    }
-    if (poll.status === "stream-lost") {
-      if (recentDispatchChildActivity(childSessionID, notifyIntervalMs)) {
-        if (!reconcileHoldNotified) {
-          reconcileHoldNotified = true;
-          flushProgress(`[forge:dispatch-progress] the dispatch view (status + messages) is unreadable for child session ${childSessionID}, but host execution signals keep arriving — the child stays in flight (stream-lost verdict withheld; reconcile confirmation active).`);
-        }
-        await new Promise((resolve2) => setTimeout(resolve2, sliceMs));
-        continue;
-      }
-      reconcileHoldNotified = false;
-      streamLost = true;
-      const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString();
-      text = `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` + `the dispatch view (status + messages) was unreadable for the sustained poll streak; last observed activity ${lastObserved}. ` + `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` + `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`;
-      break;
-    }
-    if (stability.textlessIdleSince !== undefined && Date.now() - stability.textlessIdleSince >= notifyIntervalMs) {
-      if (recentDispatchChildActivity(childSessionID, notifyIntervalMs)) {
-        await new Promise((resolve2) => setTimeout(resolve2, sliceMs));
-        continue;
-      }
-      streamLost = true;
-      const lastObserved = new Date(stale.lastActivity ?? startedAt).toISOString();
-      text = `[stream-lost/unknown] result stream lost — child session ${childSessionID} state UNKNOWN (possibly still running): ` + `the result stream ended before a final report arrived (last observed activity ${lastObserved}); ` + `the dispatch view cannot confirm completion. ` + `Ground-truth recovery: read reports/${job.id}-report.md in the workspace (its mtime shows whether the worker landed its report) ` + `BEFORE considering a re-dispatch; inspect or abort the child natively in the host TUI.`;
-      break;
-    }
-    if (stability.textlessIdleSince === undefined) {
-      const probe = await sessionGet(client, childSessionID);
-      applyStaleProbe(stale, probe);
-      if (staleThresholdCrossed(stale, Date.now(), startedAt, staleMs, staleFloorMs)) {
-        const decision = decideStaleSweep(probe, stale, staleMode);
-        if (decision.action === "gone") {
-          text = `(stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(stale, Date.now(), startedAt)} min without activity — dispatch finalized honestly)`;
-          exitCode = 1;
-          break;
-        }
-        if (decision.action === "notify") {
-          stale.staleNotified = true;
-          flushProgress(`[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) shows no activity for ` + `${staleSilentMinutes(stale, Date.now(), startedAt)} min (stale threshold crossed; FORGE_DISPATCH_STALE_MODE=observe — not killing).`);
-        } else if (decision.action === "kill") {
-          const minutes = staleSilentMinutes(stale, Date.now(), startedAt);
-          const ab = await abortChild(client, childSessionID);
-          if (!ab.ok) {
-            const reprobe = await sessionGet(client, childSessionID);
-            if (reprobe.exists === false) {
-              text = `(stale: child session ${childSessionID} no longer exists after ${minutes} min without activity — dispatch finalized honestly)`;
-              exitCode = 1;
-              break;
-            }
-          } else {
-            text = `(stale: aborted after ${minutes} min without activity — child session ${childSessionID} was killed by the stale reap (FORGE_DISPATCH_STALE_MS=${staleMs}); inspect its transcript in the host TUI)`;
-            exitCode = 1;
-            break;
-          }
-        }
-      }
-    }
-    const multiple = Math.floor((Date.now() - startedAt) / notifyIntervalMs);
-    if (stability.textlessIdleSince === undefined && multiple > lastNotifiedMultiple) {
-      lastNotifiedMultiple = multiple;
-      const minutes = Math.max(1, Math.round((Date.now() - startedAt) / 60000));
-      const notice = `[forge:dispatch-progress] task dispatch to ${agentID} (task ${job.id}, child session ${childSessionID}) is still running after ${minutes} min — ` + `tracking continues; the final [forge:dispatch-complete] wake with the report arrives when it finishes. ` + `Inspect/abort in the host TUI if this looks stuck.`;
-      appendDispatchNotice(job, notice);
-      queueDispatchProgress(job.ownerSession, notice, () => dispatchStillLive(job.id));
-      if (idleJobSessions.has(job.ownerSession))
-        deliverDispatchProgress(job.ownerSession);
-    }
-  }
-  if (attempt > 1)
-    text += `
-(after ${attempt} attempt(s))`;
-  forgetDispatchSignals(childSessionID);
-  jobManager.appendOutput(job, text);
-  if (streamLost) {
-    exitCode = null;
-    const meta = job.dispatch;
-    if (meta)
-      meta.outcome = "stream-lost/unknown";
-  }
-  if (await settleKilled())
-    return;
-  jobManager.markTerminal(job, "exited", exitCode);
-  dispatchTasks.delete(job.id);
-  journalTerminalRecord({
-    id: job.id,
-    agent: agentID,
-    ownerSession: job.ownerSession,
-    workspace: retryCtx.directory,
-    description: dispatch?.description ?? ""
-  }, streamLost ? "stream-lost/unknown" : exitCode === 0 ? "completed" : "error", streamLost ? `${text.split(`
-`)[0].slice(0, 200)} — last observed activity ${new Date(stale.lastActivity ?? startedAt).toISOString()}` : activeOverride ? `${text.split(`
-`)[0].slice(0, 200)} (${ACTIVE_TEXTFUL_OVERRIDE_NOTE})` : text.split(`
-`)[0].slice(0, 200));
-  pumpDispatchQueue(client, job.ownerSession);
-}
-var TASK_SEAM_DEGRADED_ERROR = "[forge:dispatch] child-session creation is unavailable on this host (the client exposes no session.create seam) — use the NATIVE task tool as the dispatch surface for subagent dispatches.";
-var TASK_DESCRIPTION = [
-  "Dispatch a subagent as a REAL child session on this host (SDK session.create with parentID): the call renders in the host session tree with native subagent affordances — the live task panel, progress, expandable transcript, user abort — and runs the target agent with its own permission map. This is the single dispatch surface: ANY materialized target dispatches through here — configured `forge-*` subagents AND every other host agent.",
-  "run_in_background is YOUR dispatch-time decision: omit it (sync) when your very next step depends on the result — the call blocks until the child finishes and returns its final report (native parity: the child MAY ask the user questions; the user is present at the panel). Set run_in_background: true (async) when the result does NOT block your next steps — the call returns a task handle immediately and the child is created with the question tool denied session-wide (unattended: it never blocks on human input; an unanswered permission ask degrades to the honest poll-timeout finding naming the child session id, which stays inspectable and natively abortable in the TUI).",
-  `async discipline: after an async dispatch, END YOUR TURN. Interim [forge:dispatch-progress] notices may arrive while the child runs (informational only); the single [forge:dispatch-complete] message carrying the worker's final report is injected when it finishes — however long it takes (idle-only, at-most-once, delivery window). NEVER poll, re-dispatch, or "check on" an async dispatch before that wake arrives — pre-wake polling is a BLOCKING anti-pattern.`,
-  "Sync dispatches carry abort parity: aborting the dispatching turn aborts the child session via the SDK. Async children intentionally SURVIVE turn aborts (session-scoped; they die at owner-session death, orphan-recorded).",
-  "Forge roster guidance: prefer a configured `forge-*` subagent whose description matches the job (each materialized description carries its pool provenance; .opencode/forge.json is the source). Gates on forge-* targets: session-domain pool gate (cross-pool targets refused with the three exits), crew pending/compliance belts, the plan-draft readonly-recon exemption (readonly scouts pass in BOTH modes during a draft; write targets wait for approval), and primary-only (forge-* workers cannot dispatch — recursion is banned at their permission map). Non-forge host targets dispatch with native parity (no forge pool gate; the session-keyed crew pending belt and the plan-draft write-class deny still apply, exactly as for the native task tool). Cap: 3 concurrent async dispatches per session; a wish arriving beyond the cap QUEUES FIFO instead of refusing (per-session bound FORGE_DISPATCH_QUEUE_MAX, default 10) and spawns automatically when a slot frees — its handle reads QUEUED (queue position N) until spawn, and only a full queue refuses the call (listing every in-flight and queued task id)."
-].join(`
-`);
-var taskDispatchTool = tool({
-  description: TASK_DESCRIPTION,
-  args: {
-    subagent_type: tool.schema.string().describe('Target agent id — a materialized forge-* subagent (e.g. "forge-plugindev-spec-reviewer") or any other configured host agent id'),
-    prompt: tool.schema.string().describe("The complete task prompt for the worker (self-contained: it carries the artifact paths/slices and the evidence demands)"),
-    description: tool.schema.string().optional().describe("Short task description used as the child session's title in the host UI (defaults to the prompt's first words)"),
-    run_in_background: tool.schema.boolean().optional().describe("Dispatch-time decision: omit for sync (block this call until the child finishes and return its final report — the child may ask questions, native parity) or true for async (return a task handle immediately; interim [forge:dispatch-progress] notices may arrive while the child runs, and a single [forge:dispatch-complete] wake with the final report is guaranteed when it finishes, however long it takes — the child is sealed against human input)")
-  },
-  execute: async (args, context) => {
-    noteToolAgent(context);
-    const target = String(args.subagent_type ?? "").trim();
-    const promptRaw = String(args.prompt ?? "");
-    const dispatchId = newJobId();
-    const prompt = promptRaw ? withReportDelivery(promptRaw, dispatchId) : "";
-    const runInBackground = args.run_in_background === true;
-    if (!target || !prompt)
-      throw new Error("[forge:dispatch] subagent_type and prompt are both required.");
-    await stateForCheck(context.sessionID, sharedAnchorClient());
-    const forgeTarget = target.toLowerCase().startsWith("forge-");
-    const speaker = sessionAgents.get(context.sessionID);
-    if (speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT) {
-      throw new Error(`[forge:partition] Tool refused: "task" dispatch is reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent dispatches at the gate.`);
-    }
-    if (speaker !== undefined && !isForgeFamilyAgent(speaker) && forgeTarget) {
-      throw new Error(`[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use non-forge host subagents, or switch to the forge agent to dispatch forge-* workers.`);
-    }
-    const pendingRefusal = crewPendingRefusal(context.sessionID);
-    if (pendingRefusal)
-      throw new Error(pendingRefusal);
-    if (forgeTarget) {
-      const agentId = target.slice("forge-".length);
-      const resolution = resolvePools();
-      if (!resolution || !resolution.agents[agentId]) {
-        const hint = nativeRosterSyncHint();
-        throw new Error(`[forge:dispatch] "${target}" is not a materialized forge subagent on this host. Check the roster in the agent descriptions (or .opencode/forge.json), or dispatch a host agent instead.${hint ?? ""}`);
-      }
-      const poolRefusal = await poolGateRefusal(jobClient, context.sessionID, target);
-      if (poolRefusal)
-        throw new Error(poolRefusal);
-      const complianceRefusal = await crewComplianceRefusalFor(jobClient, context.sessionID, target);
-      if (complianceRefusal)
-        throw new Error(complianceRefusal);
-    } else {
-      if (!knownHostAgents.has(target)) {
-        throw new Error(`Agent not found: "${target}" is neither a materialized forge-* subagent nor a configured host agent. Check the agent id against the TUI agent list (or the forge roster in the agent descriptions) and retry.`);
-      }
-    }
-    const draftRefusal = draftDispatchRefusalForState(await stateForCheck(context.sessionID, sharedAnchorClient()), target);
-    if (draftRefusal)
-      throw new Error(draftRefusal);
-    let queueAfterCap = false;
-    if (runInBackground) {
-      const inFlight = inFlightAsyncDispatches(context.sessionID);
-      if (inFlight.length >= ASYNC_DISPATCH_CAP) {
-        const queuedIds = queuedAsyncDispatchIds(context.sessionID);
-        const queueMax = resolveDispatchQueueMax();
-        if (queuedIds.length >= queueMax) {
-          throw new Error(`[forge:dispatch] Async dispatch refused: this session already has ${inFlight.length} async dispatches in flight (cap ${ASYNC_DISPATCH_CAP}): ${inFlight.join(", ")} — and the dispatch queue is full (bound ${queueMax}): ${queuedIds.join(", ")}. ` + `Wait for their [forge:dispatch-complete] wakes (they arrive on their own — never poll), or dispatch this one without run_in_background.`);
-        }
-        queueAfterCap = true;
-      }
-    }
-    const client = dispatchClient();
-    if (!client)
-      throw new Error("[forge:dispatch] no host client available — dispatch cannot create a child session.");
-    if (typeof client.session?.create !== "function")
-      throw new Error(TASK_SEAM_DEGRADED_ERROR);
-    const anchorSeam = sharedAnchorClient();
-    const anchorDir = anchorSeam && typeof anchorSeam.session?.get === "function" ? await resolveSessionAnchorForPools(anchorSeam, context.sessionID) || sessionAnchor(context) || context.worktree : sessionAnchor(context) || context.worktree;
-    const state = ensureSession(context.sessionID, anchorDir);
-    const description = typeof args.description === "string" && args.description.trim() ? args.description.trim().slice(0, 80) : prompt.replace(/\s+/g, " ").slice(0, 60);
-    const gate2 = gateFor(state.worktree);
-    const gateIdentity = dispatchModelIdentity(target, context.sessionID);
-    if (gateIdentity) {
-      const admission = gate2.admit(gateIdentity);
-      if (!admission.ok)
-        throw new Error(admission.refusal);
-      gateProvidersSeen.add(gateIdentity.provider);
-      if (queueAfterCap)
-        dispatchGate?.release(gateIdentity);
-      else
-        admittedGate.set(dispatchId, gateIdentity);
-    }
-    if (queueAfterCap) {
-      const jobId2 = dispatchId;
-      const queue = dispatchQueues.get(context.sessionID) ?? [];
-      const position = queue.length + 1;
-      queue.push({ jobId: jobId2, agentID: target, ownerSession: context.sessionID, description, prompt, directory: state.worktree, questionDeny: true, enqueuedAt: Date.now() });
-      dispatchQueues.set(context.sessionID, queue);
-      journalTransition(state.worktree, {
-        id: jobId2,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        state: "queued",
-        attempts: 1,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        prompt,
-        questionDeny: true,
-        description
-      });
-      const queuedMeta = {
-        agent: target,
-        sessionId: "",
-        taskId: jobId2,
-        run_in_background: true,
-        description,
-        prompt,
-        queued: true
-      };
-      context.metadata({ title: `${target}: dispatch queued (${jobId2})`, metadata: { ...queuedMeta } });
-      return {
-        title: `${target}: dispatch queued (${jobId2})`,
-        metadata: { ...queuedMeta },
-        output: [
-          `[forge:dispatch] Dispatched ${target} in async mode — the session is at the async dispatch cap (${ASYNC_DISPATCH_CAP} running), so this wish is QUEUED (queue position ${position}).`,
-          `task id: ${jobId2}`,
-          `agent: ${target}`,
-          `queued: position ${position} — the wish spawns automatically when a slot frees (a [forge:dispatch-progress] notice announces its start; the roster, draft gate, and crew belt are re-checked at spawn time).`,
-          `Next: END YOUR TURN. Exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when the spawned child finishes — however long it takes. Never poll or re-dispatch to check on it.`
-        ].join(`
-`)
-      };
-    }
-    const asyncJobId = runInBackground ? dispatchId : "";
-    if (asyncJobId) {
-      journalTransition(state.worktree, {
-        id: asyncJobId,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        state: "dispatched",
-        attempts: 1,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        prompt,
-        questionDeny: true,
-        description
-      });
-    }
-    const rosterRefusal = forgeTargetUnresolved(target);
-    if (rosterRefusal) {
-      releaseGateAdmission(dispatchId);
-      throw new Error(`[forge:dispatch] target refused: ${rosterRefusal}`);
-    }
-    const created = await createChildSessionBound(client, {
-      parentSessionID: context.sessionID,
-      parentDirectory: state.worktree,
-      agentID: target,
-      description,
-      questionDeny: runInBackground,
-      modelPin: rosterModelPin(target),
-      assertBinding: v2HostSeen,
-      taskDeny: nestedTaskDenyFor(target, context.sessionID)
-    });
-    if (!created.ok) {
-      releaseGateAdmission(dispatchId);
-      throw new Error(`[forge:dispatch] child session creation failed: ${created.error}`);
-    }
-    const sent = await sendPrompt(client, { sessionID: created.sessionID, agentID: target, prompt, directory: state.worktree });
-    if (!sent.ok) {
-      releaseGateAdmission(dispatchId);
-      throw new Error(`[forge:dispatch] prompt send to child session ${created.sessionID} failed: ${sent.error} — the child exists and is natively abortable in the TUI.`);
-    }
-    const taskMetadata = {
-      agent: target,
-      sessionId: created.sessionID,
-      taskId: "",
-      run_in_background: runInBackground,
-      description,
-      prompt
-    };
-    if (!runInBackground) {
-      const syncIntervalMs = Number(process.env.FORGE_DISPATCH_POLL_INTERVAL_MS ?? DEFAULT_POLL_INTERVAL_MS);
-      const syncSliceMs = Math.max(syncIntervalMs, Number(process.env.FORGE_DISPATCH_POLL_SLICE_MS ?? 5000));
-      const syncTimeoutMs = resolvePollTimeoutMs();
-      const staleMsSync = resolveStaleMs();
-      const staleModeSync = resolveStaleMode();
-      const staleFloorSync = resolveStaleFloorMs();
-      const maxAttemptsSync = resolveMaxAttempts();
-      const retryBackoffSync = resolveRetryBackoffMs();
-      const syncStability = { stableTicks: 0 };
-      const syncStale = { lastActivity: null, staleNotified: false };
-      taskMetadata.taskId = dispatchId;
-      const syncJobId = dispatchId;
-      const syncJournalBase = { id: syncJobId, agent: target, ownerSession: context.sessionID, workspace: state.worktree, prompt, description, questionDeny: false };
-      journalTransition(state.worktree, {
-        id: syncJobId,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        state: "dispatched",
-        attempts: 1,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        prompt,
-        questionDeny: false,
-        description
-      });
-      journalTransition(state.worktree, {
-        id: syncJobId,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        state: "started",
-        childSessionId: created.sessionID,
-        attempts: 1,
-        createdAt: Date.now(),
-        updatedAt: Date.now(),
-        prompt,
-        questionDeny: false,
-        description
-      });
-      let childSessionID = created.sessionID;
-      let attemptSync = 1;
-      let syncStartedAt = Date.now();
-      const waitStartedAt = Date.now();
-      let syncCompleted = false;
-      let syncStreamLost = false;
-      let syncOverride = false;
-      let syncError = null;
-      const syncDbg = process.env.FORGE_DISPATCH_DEBUG === "1";
-      let syncSliceCount = 0;
-      armDispatchWaitWatcher(childSessionID);
-      writeDispatchStorageRow({
-        taskId: syncJobId,
-        childSessionID,
-        agent: target,
-        ownerSession: context.sessionID,
-        workspace: state.worktree,
-        description,
-        prompt,
-        questionDeny: false,
-        attempts: attemptSync,
-        startedAt: syncStartedAt,
-        updatedAt: Date.now()
-      });
-      syncWait:
-        for (;; ) {
-          const signal = takeDispatchTerminalSignal(childSessionID);
-          if (signal) {
-            forgetDispatchSignals(childSessionID);
-            if (signal.kind === "failed") {
-              syncError = signal.detail ?? "session.execution.failed";
-              break syncWait;
-            }
-            if (signal.kind === "interrupted" && signal.detail === "user") {
-              const ab = await abortChild(client, childSessionID);
-              journalTerminalRecord(syncJournalBase, "aborted", `child session ${childSessionID} was interrupted by the user (execution.interrupted)`);
-              context.metadata({ title: `${target}: dispatch interrupted`, metadata: { ...taskMetadata } });
-              return {
-                title: `${target}: dispatch interrupted`,
-                metadata: { ...taskMetadata },
-                output: [
-                  `[forge:dispatch] Child session ${childSessionID} was interrupted by the user${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`} — dispatch finalized honestly.`,
-                  `task id: ${syncJobId}`
-                ].join(`
-`)
-              };
-            }
-            if (signal.kind === "succeeded") {
-              syncCompleted = true;
-              break syncWait;
-            }
-            noteDispatchChildActivity(childSessionID);
-          }
-          const poll = await pollChild(client, {
-            sessionID: childSessionID,
-            intervalMs: syncIntervalMs,
-            timeoutMs: syncSliceMs,
-            stability: syncStability,
-            signal: context.abort
-          });
-          if (poll.status === "aborted") {
-            const ab = await abortChild(client, childSessionID);
-            journalTerminalRecord(syncJournalBase, "aborted", `dispatching turn aborted — child session ${childSessionID} aborted via the SDK`);
-            context.metadata({ title: `${target}: dispatch aborted`, metadata: { ...taskMetadata } });
-            return {
-              title: `${target}: dispatch aborted`,
-              metadata: { ...taskMetadata },
-              output: [
-                `[forge:dispatch] The dispatching turn was aborted — child session ${childSessionID} was aborted via the SDK${ab.ok ? "" : ` (abort call failed honestly: ${ab.error})`}.`,
-                `task id: ${syncJobId}`
-              ].join(`
-`)
-            };
-          }
-          if (poll.status === "error") {
-            if (attemptSync < maxAttemptsSync && classifyDispatchError(poll.error) === "retryable") {
-              const errorHead = poll.error.split(`
-`)[0].slice(0, 160);
-              attemptSync++;
-              journalTransition(state.worktree, {
-                id: syncJobId,
-                agent: target,
-                ownerSession: context.sessionID,
-                workspace: state.worktree,
-                state: "retry-pending",
-                attempts: attemptSync,
-                createdAt: Date.now(),
-                updatedAt: Date.now(),
-                prompt,
-                questionDeny: false,
-                description
-              });
-              queueDispatchProgress(context.sessionID, `[forge:dispatch-progress] attempt ${attemptSync}/${maxAttemptsSync} starting after ${errorHead}… — respawning ${target} (previous child session ${childSessionID}) with the resume preamble.`, () => dispatchStillLive(syncJobId));
-              await new Promise((resolve2) => setTimeout(resolve2, retryBackoffSync));
-              const refusal = crewPendingRefusal(context.sessionID) ?? draftDispatchRefusalForState(await stateForCheck(context.sessionID, sharedAnchorClient()), target) ?? forgeTargetUnresolved(target);
-              if (refusal) {
-                journalTerminalRecord(syncJournalBase, "error", `retry refused at respawn: ${refusal}`);
-                throw new Error(`[forge:dispatch] retry refused at respawn: ${refusal} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
-              }
-              const respawn = await createChildSessionBound(client, {
-                parentSessionID: context.sessionID,
-                parentDirectory: state.worktree,
-                agentID: target,
-                description,
-                questionDeny: false,
-                modelPin: rosterModelPin(target),
-                assertBinding: v2HostSeen,
-                taskDeny: nestedTaskDenyFor(target, context.sessionID, childSessionID)
-              });
-              if (!respawn.ok) {
-                journalTerminalRecord(syncJournalBase, "error", `retry spawn failed: ${respawn.error}`);
-                throw new Error(`[forge:dispatch] retry spawn failed: ${respawn.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
-              }
-              const sent2 = await sendPrompt(client, {
-                sessionID: respawn.sessionID,
-                agentID: target,
-                prompt: buildRetryPrompt(prompt),
-                directory: state.worktree
-              });
-              if (!sent2.ok) {
-                journalTerminalRecord(syncJournalBase, "error", `retry prompt send failed: ${sent2.error}`);
-                throw new Error(`[forge:dispatch] retry prompt send failed: ${sent2.error} — previous attempt (child session ${childSessionID}) ended in error: ${errorHead}`);
-              }
-              forgetDispatchSignals(childSessionID);
-              childSessionID = respawn.sessionID;
-              armDispatchWaitWatcher(childSessionID);
-              writeDispatchStorageRow({
-                taskId: syncJobId,
-                childSessionID,
-                agent: target,
-                ownerSession: context.sessionID,
-                workspace: state.worktree,
-                description,
-                prompt,
-                questionDeny: false,
-                attempts: attemptSync,
-                startedAt: syncStartedAt,
-                updatedAt: Date.now()
-              });
-              taskMetadata.sessionId = childSessionID;
-              journalTransition(state.worktree, {
-                id: syncJobId,
-                agent: target,
-                ownerSession: context.sessionID,
-                workspace: state.worktree,
-                state: "started",
-                childSessionId: childSessionID,
-                attempts: attemptSync,
-                createdAt: Date.now(),
-                updatedAt: Date.now(),
-                prompt,
-                questionDeny: false,
-                description
-              });
-              syncStartedAt = Date.now();
-              syncStale.lastActivity = null;
-              syncStale.staleNotified = false;
-              syncStability.stableTicks = 0;
-              syncStability.activeTextfulTicks = 0;
-              syncStability.textlessIdleSince = undefined;
-              continue syncWait;
-            }
-            syncError = attemptSync > 1 ? `${poll.error} — after ${attemptSync} attempt(s)` : poll.error;
-            break syncWait;
-          }
-          if (poll.status === "timeout") {
-            if (Date.now() - waitStartedAt >= syncTimeoutMs)
-              break syncWait;
-            if (syncDbg) {
-              syncSliceCount++;
-              if (syncSliceCount === 1) {
-                const names = [];
-                let cur = client.session;
-                while (cur && cur !== Object.prototype) {
-                  names.push(...Object.getOwnPropertyNames(cur));
-                  cur = Object.getPrototypeOf(cur);
-                }
-                console.error(`[forge-dbg] client.session methods: ${[...new Set(names)].filter((n) => n !== "constructor").join(",")}`);
-              }
-              console.error(`[forge-dbg] slice ${syncSliceCount}: status=timeout idle=${syncStability.textlessIdleSince === undefined ? "undef" : "set"} staleMs=${staleMsSync} floor=${staleFloorSync} mode=${staleModeSync} elapsed=${Math.round((Date.now() - syncStartedAt) / 1000)}s`);
-            }
-            if (syncStability.textlessIdleSince === undefined) {
-              const probe = await sessionGet(client, childSessionID);
-              applyStaleProbe(syncStale, probe);
-              if (syncDbg)
-                console.error(`[forge-dbg] probe: exists=${probe.exists} timeUpdated=${probe.timeUpdated} anchor=${syncStale.lastActivity}`);
-              if (staleThresholdCrossed(syncStale, Date.now(), syncStartedAt, staleMsSync, staleFloorSync)) {
-                const decision = decideStaleSweep(probe, syncStale, staleModeSync);
-                if (decision.action === "gone") {
-                  journalTerminalRecord(syncJournalBase, "stale", `child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly`);
-                  context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } });
-                  return {
-                    title: `${target}: dispatch stale-finalized`,
-                    metadata: { ...taskMetadata },
-                    output: [
-                      `[forge:dispatch] (stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly).`,
-                      `task id: ${syncJobId}`
-                    ].join(`
-`)
-                  };
-                }
-                if (decision.action === "kill") {
-                  const ab = await abortChild(client, childSessionID);
-                  if (ab.ok) {
-                    journalTerminalRecord(syncJournalBase, "stale", `aborted after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — child session ${childSessionID} killed by the stale reap`);
-                    context.metadata({ title: `${target}: dispatch stale-reaped`, metadata: { ...taskMetadata } });
-                    return {
-                      title: `${target}: dispatch stale-reaped`,
-                      metadata: { ...taskMetadata },
-                      output: [
-                        `[forge:dispatch] (stale: aborted after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — child session ${childSessionID} was killed by the stale reap (FORGE_DISPATCH_STALE_MS=${staleMsSync}); inspect its transcript in the host TUI).`,
-                        `task id: ${syncJobId}`
-                      ].join(`
-`)
-                    };
-                  }
-                  const reprobe = await sessionGet(client, childSessionID);
-                  if (reprobe.exists === false) {
-                    journalTerminalRecord(syncJournalBase, "stale", `child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly`);
-                    context.metadata({ title: `${target}: dispatch stale-finalized`, metadata: { ...taskMetadata } });
-                    return {
-                      title: `${target}: dispatch stale-finalized`,
-                      metadata: { ...taskMetadata },
-                      output: [
-                        `[forge:dispatch] (stale: child session ${childSessionID} no longer exists after ${staleSilentMinutes(syncStale, Date.now(), syncStartedAt)} min without activity — dispatch finalized honestly).`,
-                        `task id: ${syncJobId}`
-                      ].join(`
-`)
-                    };
-                  }
-                }
-              }
-            }
-            continue syncWait;
-          }
-          if (poll.status === "stream-lost") {
-            syncStreamLost = true;
-            break syncWait;
-          }
-          syncCompleted = true;
-          syncOverride = poll.via === "active-textful";
-          break syncWait;
-        }
-      forgetDispatchSignals(childSessionID);
-      if (syncCompleted) {
-        const fin = await fetchFinalMessage(client, childSessionID);
-        if (!fin.ok) {
-          journalTerminalRecord(syncJournalBase, "error", fin.error);
-          throw new Error(`[forge:dispatch] ${fin.error}`);
-        }
-        journalTerminalRecord(syncJournalBase, "completed", `${target} finished (child session ${childSessionID})${syncOverride ? ` (${ACTIVE_TEXTFUL_OVERRIDE_NOTE})` : ""}`);
-        context.metadata({ title: `${target}: dispatch complete`, metadata: { ...taskMetadata } });
-        const recoveredNote = attemptSync > 1 ? ` — recovered on attempt ${attemptSync}/${maxAttemptsSync} (previous child session(s) died with transient errors and were respawned; the [forge:dispatch-progress] notice lands in this transcript when the session idles)` : "";
-        const overrideNote = syncOverride ? ` — ${ACTIVE_TEXTFUL_OVERRIDE_NOTE}` : "";
-        return {
-          title: `${target}: dispatch complete`,
-          metadata: { ...taskMetadata },
-          output: [`[forge:dispatch] ${target} finished (child session ${childSessionID})${recoveredNote}${overrideNote}.`, `Final report:
-${fin.text}`].join(`
-`)
-        };
-      }
-      if (syncError !== null) {
-        journalTerminalRecord(syncJournalBase, "error", `child session ${childSessionID} ended in error: ${syncError}`.slice(0, 200));
-        throw new Error(`[forge:dispatch] child session ${childSessionID} ended in error: ${syncError}`);
-      }
-      const armSyncTracker = () => {
-        const job2 = jobManager.create({
-          id: syncJobId,
-          cmd: `dispatch ${target}: ${description} (sync wait ended, armed)`,
-          worktree: state.worktree,
-          ownerSession: context.sessionID,
-          logPath: join6(jobLogDir(), "dispatch", `${syncJobId}.txt`),
-          notify: true,
-          killTree: dispatchKillTreeHook(client, syncJobId, () => childSessionID)
-        });
-        job2.dispatch = { agentID: target, childSessionID, description };
-        registerDispatchTask({ jobId: syncJobId, childSessionID, agentID: target, ownerSession: context.sessionID, description }, state.worktree);
-        runAsyncDispatchPoller(client, job2, childSessionID, { prompt, directory: state.worktree, questionDeny: false });
-        context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
-      };
-      if (syncStreamLost) {
-        armSyncTracker();
-        const attemptNoteLost = attemptSync > 1 ? `${attemptSync} attempt(s) so far; tracking continues in the armed tracker.` : "";
-        return {
-          title: `${target}: dispatch continues (result stream lost)`,
-          metadata: { ...taskMetadata },
-          output: [
-            `[forge:dispatch] Result stream lost before a final report — child session ${childSessionID} state UNKNOWN (possibly still running). The dispatch continues in the background; collect with forge_jobs.`,
-            `task id: ${syncJobId}${attemptNoteLost ? ` — ${attemptNoteLost}` : ""}`,
-            `Ground-truth recovery: read reports/${syncJobId}-report.md in the workspace BEFORE considering a re-dispatch.`,
-            `If the view recovers and the child finishes, exactly one [forge:dispatch-complete] wake carries the outcome; the child session stays inspectable and natively abortable in the host TUI.`
-          ].join(`
-`)
-        };
-      }
-      armSyncTracker();
-      const attemptNote = attemptSync > 1 ? ` ${attemptSync} attempt(s) so far; retries continue in the armed tracker.` : "";
-      return {
-        title: `${target}: dispatch continues in background`,
-        metadata: { ...taskMetadata },
-        output: [
-          `[forge:dispatch] Sync wait budget ended (${syncTimeoutMs}ms) — the dispatch continues in the background; collect with forge_jobs.`,
-          `task id: ${syncJobId}${attemptNote}`,
-          `child session: ${childSessionID} — it remains a real session: inspect or abort it natively in the host TUI.`,
-          `Report path (ground truth): reports/${syncJobId}-report.md.`,
-          `The completion contract: exactly one [forge:dispatch-complete] wake carrying the final report arrives when the child finishes (interim [forge:dispatch-progress] notices may arrive meanwhile), however long it takes; do not poll or re-dispatch in the meantime.`
-        ].join(`
-`)
-      };
-    }
-    const jobId = asyncJobId || newJobId();
-    taskMetadata.taskId = jobId;
-    const job = jobManager.create({
-      id: jobId,
-      cmd: `dispatch ${target}: ${description}`,
-      worktree: state.worktree,
-      ownerSession: context.sessionID,
-      logPath: join6(jobLogDir(), "dispatch", `${jobId}.txt`),
-      notify: true,
-      killTree: dispatchKillTreeHook(client, jobId, () => created.sessionID)
-    });
-    job.dispatch = { agentID: target, childSessionID: created.sessionID, description };
-    registerDispatchTask({ jobId, childSessionID: created.sessionID, agentID: target, ownerSession: context.sessionID, description }, state.worktree);
-    journalTransition(state.worktree, {
-      id: jobId,
-      agent: target,
-      ownerSession: context.sessionID,
-      workspace: state.worktree,
-      state: "started",
-      childSessionId: created.sessionID,
-      attempts: 1,
-      createdAt: Date.now(),
-      updatedAt: Date.now(),
-      prompt,
-      questionDeny: true,
-      description
-    });
-    runAsyncDispatchPoller(client, job, created.sessionID, { prompt, directory: state.worktree, questionDeny: true });
-    context.metadata({ title: `${target}: dispatch async`, metadata: { ...taskMetadata } });
-    return {
-      title: `${target}: dispatch async (${jobId})`,
-      metadata: { ...taskMetadata },
-      output: [
-        `[forge:dispatch] Dispatched ${target} in async mode — the child session runs in the background.`,
-        `task id: ${jobId}`,
-        `agent: ${target}`,
-        `child session: ${created.sessionID} (visible in the host session tree; natively abortable)`,
-        `Next: END YOUR TURN. Interim [forge:dispatch-progress] notices may arrive while the child runs (informational only); exactly one [forge:dispatch-complete] message carrying the worker's final report arrives when it finishes — however long it takes. Never poll or re-dispatch to check on it. Cap: ${ASYNC_DISPATCH_CAP} concurrent async dispatches per session.`
-      ].join(`
-`)
-    };
-  }
-});
-var searchRgPathOverride;
-var FORGE_SEARCH_PREFERENCE_LINE = "Prefer forge_grep/forge_glob over the builtin grep/glob — follow and hidden are on by default (symlinks/junctions and dot-directories are in scope; the builtin pair is blind to both).";
-var FORGE_GREP_DESCRIPTION = [
-  "Fast content search (ripgrep when it resolves, the plugin's bundled JS engine otherwise — a trailing engine line discloses which) that sees through symlinks/junctions and dot-directories where the builtin pair is blind. Readonly by construction: the pattern and path reach the serving engine as single literal values — no shell exists, so shell metacharacters can neither redirect output nor alter execution.",
-  "Output matches the builtin grep's format: `Found N matches` header + `path: Line n: content` blocks, truncated at 100 results with a notice. With follow on (default), a file reachable through multiple paths reports once and the output ends with a `+N duplicate paths merged` line; links whose targets lie outside the workspace are followed and the resolved outside target is disclosed.",
-  FORGE_SEARCH_PREFERENCE_LINE
-].join(`
-`);
-var FORGE_GLOB_DESCRIPTION = [
-  "Fast file-pattern search (ripgrep when it resolves, the plugin's bundled JS engine otherwise — a trailing engine line discloses which) that lists matching paths — including EMPTY files — and paths behind symlinks/junctions and inside dot-directories where the builtin glob is blind. Readonly by construction — no shell ever exists.",
-  "Output matches the builtin glob's format: a plain unique path list (`No files found` when empty), truncated at 100 results with a notice. With follow on (default), duplicate link-path hits merge and the output ends with a `+N duplicate paths merged` line.",
-  FORGE_SEARCH_PREFERENCE_LINE
-].join(`
-`);
-function reportedPathResolver(worktree) {
-  return (p) => {
-    try {
-      return realpathSync.native(isAbsolute2(p) ? p : join6(worktree, p)).toString();
-    } catch {
-      return p;
-    }
-  };
-}
-var realJsSeams = {
-  readdir: async (dir) => {
-    const entries = await fsReaddir(dir, { withFileTypes: true });
-    return entries.map((e) => ({
-      name: e.name,
-      isFile: e.isFile(),
-      isDirectory: e.isDirectory(),
-      isSymbolicLink: e.isSymbolicLink()
-    }));
-  },
-  stat: (p) => fsStat(p).then((s) => ({ isFile: s.isFile(), isDirectory: s.isDirectory() })),
-  readFilePrefix: async (p, maxBytes) => {
-    const fh = await fsOpen(p, "r");
-    try {
-      const buf = Buffer.alloc(maxBytes + 1);
-      const { bytesRead } = await fh.read(buf, 0, maxBytes + 1, 0);
-      return buf.subarray(0, bytesRead);
-    } finally {
-      await fh.close();
-    }
-  },
-  realpath: (p) => {
-    try {
-      return realpathSync.native(p).toString();
-    } catch {
-      return p;
-    }
-  }
-};
-var ENGINE_FOOTNOTE_MISS = "(engine: builtin-js — ripgrep not found; install ripgrep or set search.rgPath for the faster engine)";
-var engineFootnoteFailure = (reason) => `(engine: builtin-js — rg failed to serve the call (${reason}); install ripgrep or set search.rgPath)`;
-async function runSearch(kind, args, context) {
-  const resolution = resolveRgBinary(searchRgPathOverride !== undefined ? { rgPath: searchRgPathOverride } : undefined);
-  const state = ensureSession(context.sessionID, worktreeFor(context));
-  const follow = args.follow !== false;
-  const hidden = args.hidden !== false;
-  const targetPath = typeof args.path === "string" && args.path.length > 0 ? isAbsolute2(args.path) ? args.path : join6(state.worktree, args.path) : undefined;
-  let targetIsDir = false;
-  if (targetPath !== undefined) {
-    try {
-      targetIsDir = (await fsStat(targetPath)).isDirectory();
-    } catch {}
-  }
-  context.metadata?.({ title: `forge_${kind}: ${args.pattern.slice(0, 60)}` });
-  let records = [];
-  let jsNotices = [];
-  let engineFootnote;
-  if (resolution.ok) {
-    const rgCwd = targetIsDir && targetPath !== undefined ? targetPath : state.worktree;
-    const searchPath = targetIsDir ? "." : targetPath ?? ".";
-    const argv = kind === "glob" ? buildRgFilesArgv({ pattern: args.pattern, path: searchPath, follow, hidden }) : buildRgArgv({ kind, pattern: args.pattern, include: args.include, path: searchPath, follow, hidden });
-    const child = spawn6(resolution.binary, argv, { cwd: rgCwd, shell: false, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] });
-    let stdout = "";
-    let stderr = "";
-    let spawnError;
-    child.on("error", (err) => {
-      spawnError = err;
-    });
-    child.stdout?.on("data", (d) => {
-      stdout += d.toString("utf8");
-    });
-    child.stderr?.on("data", (d) => {
-      stderr += d.toString("utf8");
-    });
-    const code = await new Promise((resolve2) => {
-      child.on("close", (c) => resolve2(c));
-    });
-    if (spawnError !== undefined) {
-      engineFootnote = engineFootnoteFailure(spawnError.message);
-    } else if (code !== null && code > 1) {
-      engineFootnote = engineFootnoteFailure(`exit ${code}`);
-    } else {
-      const stripDotPrefix = (p) => p.replace(/^\.(?:\\|\/)/, "");
-      const rawRecords = kind === "glob" ? parseRgFilesList(stdout) : parseRgJsonStream(stdout).records;
-      records = rawRecords.map((r) => ({ ...r, path: stripDotPrefix(r.path) }));
-    }
-  } else {
-    engineFootnote = ENGINE_FOOTNOTE_MISS;
-  }
-  if (engineFootnote !== undefined) {
-    const root = targetPath ?? state.worktree;
-    const js = await jsSearch({ kind, root, pattern: args.pattern, include: args.include, follow, hidden, pathSeparator: process.platform === "win32" ? "\\" : "/" }, realJsSeams);
-    if (js.error !== undefined) {
-      return { title: "search engine error", output: js.error };
-    }
-    records = targetPath === undefined || targetIsDir ? js.records : js.records.map((r) => isAbsolute2(r.path) ? r : { ...r, path: join6(root, r.path) });
-    jsNotices = js.notices;
-  }
-  const effectiveRoot = targetIsDir && targetPath !== undefined ? targetPath : state.worktree;
-  const deduped = dedupeFollowMatches(records, {
-    worktreeRoot: state.worktree,
-    resolvePath: reportedPathResolver(effectiveRoot),
-    follow
-  });
-  const body = formatSearchOutput(deduped.records, {
-    kind,
-    mergedDuplicates: deduped.mergedDuplicates,
-    outsideTargets: deduped.outsideTargets
-  });
-  const output = [body, ...jsNotices, ...engineFootnote !== undefined ? [engineFootnote] : []].join(`
-`);
-  return {
-    title: `${deduped.records.length} result${deduped.records.length === 1 ? "" : "s"}`,
-    output
-  };
-}
-var forgeGrepTool = tool({
-  description: FORGE_GREP_DESCRIPTION,
-  args: {
-    pattern: tool.schema.string().describe("The regular expression to search for (passed to ripgrep verbatim as a single literal argument)"),
-    path: tool.schema.string().optional().describe("Optional target file or directory (workspace-relative, or absolute). Defaults to the session worktree"),
-    include: tool.schema.string().optional().describe('File filter glob (e.g. "*.ts") — only matching files are searched'),
-    follow: tool.schema.boolean().optional().describe("Follow symlinks/junctions during traversal (default TRUE — diverges from the builtin pair by design)"),
-    hidden: tool.schema.boolean().optional().describe("Search dot-directories (default TRUE — diverges from the builtin pair by design)")
-  },
-  execute: async (args, context) => {
-    noteToolAgent(context);
-    return runSearch("grep", { pattern: args.pattern, path: args.path, include: args.include, follow: args.follow, hidden: args.hidden }, context);
-  }
-});
-var forgeGlobTool = tool({
-  description: FORGE_GLOB_DESCRIPTION,
-  args: {
-    pattern: tool.schema.string().describe(`The file-pattern glob to list (e.g. "**/*.ts") — rides ripgrep's --glob filter verbatim`),
-    path: tool.schema.string().optional().describe("Optional target directory (workspace-relative, or absolute). Defaults to the session worktree"),
-    follow: tool.schema.boolean().optional().describe("Follow symlinks/junctions during traversal (default TRUE — diverges from the builtin pair by design)"),
-    hidden: tool.schema.boolean().optional().describe("List dot-directories' files (default TRUE — diverges from the builtin pair by design)")
-  },
-  execute: async (args, context) => {
-    noteToolAgent(context);
-    return runSearch("glob", { pattern: args.pattern, path: args.path, follow: args.follow, hidden: args.hidden }, context);
-  }
-});
 var CREW_INIT_TEMPLATE = [
   '(forge crew orchestration. Argument: "$ARGUMENTS")',
   "",
@@ -22147,21 +17809,21 @@ function crewOrchestrationTemplate(resolution) {
     "",
     "FAMILY GUARD (step 0, before anything else): if you do not have the crew_begin tool in your available tools, you are not in a forge session — STOP now and tell the user that /crew belongs to the forge agent, who should switch to forge (Tab) and rerun it there.",
     "",
-    "Configured forge subagents (task-tool vocabulary). ROSTER OWNERSHIP (sole ownership): THIS session's dispatchable roster is its WORKSPACE pool — the nearest .opencode/forge.json walking up from this session's worktree — or, when the workspace has none, the GLOBAL fallback layer (a fallback, not a merge; forge.json files nested deeper in the workspace subtree are ignored, same as opencode's native MCP config). Check this workspace's pool:",
+    "Configured forge subagents (native subagent tool). ROSTER OWNERSHIP (sole ownership): THIS session's dispatchable roster is its WORKSPACE pool — the nearest .opencode/forge.json walking up from this session's worktree — or, when the workspace has none, the GLOBAL fallback layer (a fallback, not a merge; forge.json files nested deeper in the workspace subtree are ignored, same as opencode's native MCP config). Check this workspace's pool:",
     '  - this workspace pool (when the path prints, its agents ARE the roster): !`ls .opencode/forge.json 2>/dev/null || echo "(no workspace pool — the global fallback applies)"`',
     `  - global fallback layer: ${globalPath} — dispatchable ONLY when the workspace has no pool of its own`,
     ...otherLines.length > 0 ? ["Other pools materialized on this host — each NOT dispatchable from this session (open a session in that workspace, or configure the role into this workspace's pool / the global layer):", ...otherLines] : [],
     "",
     "You are entering CREW ORCHESTRATION discipline for this session (single subject: do not switch agents). The macro contract above the crew may come from an approved plan, a spec change, or inline text — the discipline is identical in all three cases and never requires a plan. Follow it exactly:",
     "",
-    '1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). When the macro contract descends from a plan artifact, pass its path as the optional `lineage` argument (e.g. lineage: ".opencode/plan/2026-10-01-my-plan.md") — the descent is recorded as a first-class line in the crew record header; lineage is never inferred. Reconnaissance BEFORE registration is free (task calls included). If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. A wrong plan is fixed by abandoning and re-crewing (crew_close {abandon: true, reason}), never by improvising outside the declared plan.',
-    `2. THE PAUSE: registration enters a PENDING crew — execution has NOT started. STOP and present the user the three execution-mode choices (supervised waves now / convert to a goal contract / standby), then END YOUR TURN. Arm per the user's choice: waves → crew_begin {execution: "waves"} (waves then auto-advance on session idle until crew_close — the engine stops after a stall, nudge or re-shard); conversion → crew_begin {execution: "goal"} followed by goal_write (arm=true — its dialog is the user's gate) folding the declared subtasks into criteria/checks; standby → no call. EXCEPTION: while a live active goal governs this session, register with execution: "waves" in the SAME call — the crew is born armed (the goal contract already authorized orchestration) and crew_close / abandon stay ask-free under that goal.`,
-    "3. WAVES, NEVER FLOODS (armed crews only): execute subtasks in waves of parallel native `task` calls (subagent_type = the matching forge-* agent; a wave's results return within the calling turn). Launch the next wave ONLY after the previous wave's results are in. GUI / computer-use subtasks are mutually exclusive within a wave (the desktop is a singleton resource — at most ONE in flight; non-GUI subtasks still parallelize freely), and GUI walkthroughs use the `computer` tool rather than DIY shell screenshot pipelines. Native fallback: when the pool offers no forge worker fitting a subtask (or forge-* dispatch is blocked by a degraded pool), dispatch the native general subagent with the same relay contract (artifact path, scoped prompt, evidence demands) and RECORD the fallback (wave notes + the subtask's close evidence says it ran native).",
+    '1. REGISTER: call `crew_begin` with the objective AND the declared subtask plan (subtasks[]: one {title} per subtask, optionally naming the intended forge-* agent). When the macro contract descends from a plan artifact, pass its path as the optional `lineage` argument (e.g. lineage: ".opencode/plan/2026-10-01-my-plan.md") — the descent is recorded as a first-class line in the crew record header; lineage is never inferred. Reconnaissance BEFORE registration is subject to ordinary host permissions and existing approvals. If crew_begin refuses (a crew is already active here, or a plan draft is active), STOP and tell the user why — never start a second crew. A wrong plan is fixed by abandoning and re-crewing (crew_close {abandon: true, reason}), never by improvising outside the declared plan.',
+    `2. THE PAUSE: registration enters a PENDING crew — execution has NOT started. STOP and present the user the three execution-mode choices (supervised waves now / convert to a goal contract / standby), then END YOUR TURN. Arm per the user's choice: waves → crew_begin {execution: "waves"} (waves then continue on session idle only after verified settlement and while authorization remains — if stalled, seek the user’s decision or re-shard within existing approvals); conversion → crew_begin {execution: "goal"} followed by goal_write (arm=true — its dialog is the user's gate) folding the declared subtasks into criteria/checks; standby → no call. EXCEPTION: while a live active goal governs this session, register with execution: "waves" in the SAME call — the crew is born armed (the goal contract already authorized orchestration) and crew_close / abandon stay ask-free under that goal.`,
+    `3. WAVES, NEVER FLOODS (armed crews only): ${CREW_WAVE_RULE} GUI / computer-use subtasks are mutually exclusive within a wave (the desktop is a singleton resource — at most ONE in flight; non-GUI subtasks still parallelize freely), and GUI walkthroughs use the \`computer\` tool rather than DIY shell screenshot pipelines. ${CREW_NATIVE_FALLBACK_RULE}`,
     "4. CONTRACT RELAY (lineage-descended crews): when the macro contract descends from an on-disk artifact (the lineage names a plan artifact, a spec change directory, or a goal contract), every subtask's dispatch prompt MUST explicitly carry that artifact's path — or the exact slice the subtask works from (a delta file path, a quoted criteria section) — so the dispatched worker reads the contract itself, never your paraphrase of it. A large artifact is relayed by its exact slice; it is NEVER dropped for being too long to inline. Every close-report evidence statement MUST name the contract (or slice) the subtask worked against.",
-    "5. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, run that subtask through a native task call anyway AND tell the user about the gap — suggest configuring the missing role in forge.json.",
-    "6. VERIFY: judge each subtask strictly against its acceptance-evidence statement from the task result text. A result that does not meet the statement is a failure even if the worker sounded confident.",
-    "7. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or agent. If the retry also fails, record the subtask as FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
-    "8. CLOSE: when every declared subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks the report against the declared plan — a declared subtask missing from the report refuses the close, and so does an undeclared one. The user confirms the closing dialog (ask-free while a goal governs the session)."
+    "5. MISSING ROLE: when a subtask needs a role no configured forge-* agent matches, tell the user about the gap — suggest configuring the missing role in forge.json. Use only an authorized native subagent for that work.",
+    "6. VERIFY: judge each subtask strictly against its acceptance-evidence statement using the child's report and verified evidence. Associate the declared title with the work rounds (including a reused session), attempts and any recorded fallback. A host terminal outcome alone does not establish PASS; unknown or incomplete evidence cannot establish PASS.",
+    "7. RETRY AT MOST ONCE: a failed subtask may be retried once with an adjusted prompt or agent, subject to existing approvals. Keep both attempts visible; only verified successful evidence supports PASS after a failure. If the retry also fails, record FAIL with BOTH failure reports visible (attempts[]). Do not retry twice, do not paper over a failure.",
+    "8. CLOSE: when all work rounds are verified settled and every declared subtask has a verdict, call `crew_close` with the full report (title/verdict/evidence per subtask; attempts[] for FAILs). The gate cross-checks the report against the declared plan — a declared subtask missing from the report refuses the close, and so does an undeclared one. The user confirms the closing dialog under existing approval rules."
   ].join(`
 `);
 }
@@ -22249,16 +17911,17 @@ var crewBeginTool = tool({
 `)
         };
       }
+      crew.goalGoverned = governingGoalFor(context.sessionID);
       crew.mode = "executing";
       appendCrewRecord(crew.recordPath, "armed (waves)", ["The user chose supervised waves; the dispatch belt is lifted."]);
       return {
         title: `crew armed: ${crew.objective.slice(0, 60)}`,
         output: [
           `[forge:crew] Crew ARMED for supervised waves: ${crew.objective}`,
-          `Waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard).`,
+          `Waves auto-advance on session idle until crew_close only after verified settlement of the previous wave (the engine stops after a stall — nudge or re-shard).`,
           `Declared plan (${crew.subtasks.length}):`,
           ...crew.subtasks.map((s, i) => `  ${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`),
-          "Proceed with the wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.",
+          `Proceed with the wave discipline: ${CREW_WAVE_RULE} Record per-subtask evidence verdicts, at most one retry, then crew_close with the full report covering every declared subtask under existing user approval rules.`,
           CREW_NATIVE_FALLBACK_RULE
         ].join(`
 `)
@@ -22317,7 +17980,7 @@ var crewBeginTool = tool({
       }
     }
     crewEngineForgetSession(context.sessionID);
-    crews.set(context.sessionID, { objective: objectiveText, startedAt: nowIso(), subtasks, mode: governed ? "executing" : "pending", recordPath });
+    crews.set(context.sessionID, { objective: objectiveText, startedAt: nowIso(), subtasks, mode: governed ? "executing" : "pending", recordPath, goalGoverned: governed });
     appendCrewRecord(recordPath, governed ? "registered (born armed under a governing goal)" : "registered (pending)", subtasks.map((s, i) => `${i + 1}. ${s.title}${s.agent ? ` → ${s.agent}` : ""}`));
     let disclosure = "";
     if (sessionProject && !sessionCovered) {
@@ -22354,7 +18017,7 @@ var crewBeginTool = tool({
       ...disclosure ? [disclosure] : []
     ];
     if (governed) {
-      lines.push("Goal-delegated orchestration: the governing goal contract already authorized this crew — run the wave discipline NOW (crew gates stay internal to the loop; crew_close and abandon are ask-free under this goal), and re-shard via crew_close {abandon: true, reason} + a fresh one-call crew_begin when the decomposition proves wrong.", "This crew is driven by the goal engine's own continuations (no separate crew briefs); standalone waves auto-advance on session idle until crew_close (the engine stops after a stall — nudge or re-shard).", "Wave discipline: waves of parallel native task calls (next wave after the previous results) → per-subtask evidence verdicts → at most one retry → crew_close with the full report covering every declared subtask.", CREW_NATIVE_FALLBACK_RULE);
+      lines.push("Goal-delegated orchestration: the governing goal contract already authorized this crew — run the wave discipline NOW (crew gates stay internal to the loop; crew_close and abandon are ask-free under this goal), and re-shard via crew_close {abandon: true, reason} + a fresh one-call crew_begin when the decomposition proves wrong.", "This crew is driven by the goal engine's own continuations (no separate crew briefs); standalone waves auto-advance on session idle until crew_close only after verified settlement of the previous wave (the engine stops after a stall — nudge or re-shard).", `Wave discipline: ${CREW_WAVE_RULE} Record per-subtask evidence verdicts, at most one retry, then crew_close with the full report covering every declared subtask under existing approval rules.`, CREW_NATIVE_FALLBACK_RULE);
     } else {
       lines.push(...crewPendingChoiceLines());
     }
@@ -22372,7 +18035,8 @@ var crewCloseTool = tool({
       title: tool.schema.string().describe("Subtask title — must match a title declared at crew_begin"),
       verdict: tool.schema.string().describe("PASS or FAIL"),
       evidence: tool.schema.string().describe("Acceptance evidence: what the result contained that satisfies the acceptance statement"),
-      attempts: tool.schema.array(tool.schema.string()).optional().describe("For FAIL: both failure reports (attempt and retry)")
+      attempts: tool.schema.array(tool.schema.string()).optional().describe("Both attempts when retried, including both failure reports for FAIL"),
+      rounds: tool.schema.array(tool.schema.string()).optional().describe("Optional native dispatch call IDs when the dispatch description does not identify this declared title")
     })).optional().describe("The full crew report — one entry per declared subtask (not needed when abandoning)"),
     abandon: tool.schema.boolean().optional().describe("true = abandon the crew (re-shard / standby-cancel): ends it with an abandonment record, no verdicts required"),
     reason: tool.schema.string().optional().describe("Why the crew is abandoned (recorded in the crew record)")
@@ -22401,6 +18065,12 @@ var crewCloseTool = tool({
     }
     const report = args.report ?? [];
     const check2 = validateCrewReport(report, crew.subtasks);
+    if (check2.ok) {
+      const read = context.crewCloseEvidence;
+      const evidence = read ? await read() : { rounds: crew.rounds ?? [], readable: false, inFlight: [], settled: [], context: null };
+      check2.gaps.push(...crossCheckCrewEvidence(report, crew.subtasks, evidence));
+      check2.ok = check2.gaps.length === 0;
+    }
     if (!check2.ok) {
       throw new Error(`[forge:crew] crew_close refused — the report does not match the declared plan:
 ${check2.gaps.map((g) => `- ${g}`).join(`
@@ -22455,17 +18125,20 @@ function forgeTools() {
     goal_resume: goalResumeTool,
     goal_discard: goalDiscardTool
   };
-  if (jobStage() < 2) {
-    tools.forge_shell = forgeShellTool;
-    tools.forge_jobs = forgeJobsTool;
-  }
-  tools.forge_grep = forgeGrepTool;
-  tools.forge_glob = forgeGlobTool;
-  if (!forgeDisabled) {
-    tools.crew_begin = crewBeginTool;
-    tools.crew_close = crewCloseTool;
-    tools.forge_sync = forgeSyncTool;
-    tools.task = taskDispatchTool;
+  tools.crew_begin = crewBeginTool;
+  tools.crew_close = crewCloseTool;
+  tools.forge_sync = forgeSyncTool;
+  for (const [name, def] of Object.entries(tools)) {
+    if (!FORGE_STATE_TOOL_SET.has(name))
+      continue;
+    tools[name] = {
+      ...def,
+      async execute(args, context) {
+        const speaker = v2AgentNameOf(context) ?? sessionAgents.get(context.sessionID);
+        assertHarnessAgent(name, speaker);
+        return def.execute(args, context);
+      }
+    };
   }
   return tools;
 }
@@ -22498,38 +18171,180 @@ async function stateForCheck(sessionID, anchorClient) {
 function banBaseDirectory(state) {
   return state?.worktree ?? (banSeedAllowed() ? hostWorktree : "");
 }
-function anchorReaderOf(client) {
-  return client;
-}
 var IDLE_DEBOUNCE_MS = Number(process.env.FORGE_GOAL_DEBOUNCE_MS ?? 2000);
 var idleTimers = new Map;
-var continuationInFlight = new Set;
+var continuationInFlight = new Map;
+var disposedGoalClients = new WeakSet;
+function disposeGoalClient(client) {
+  disposedGoalClients.add(client);
+  for (const [id, pending] of idleTimers) {
+    if (pending.client !== client)
+      continue;
+    clearTimeout(pending.timer);
+    idleTimers.delete(id);
+  }
+  for (const [id, flight] of continuationInFlight) {
+    if (flight.client !== client)
+      continue;
+    continuationInFlight.delete(id);
+    const pending = pendingContinuationTurn.get(id);
+    if (pending?.client === client && pending.turn === undefined) {
+      pendingContinuationTurn.delete(id);
+      turnActivity.delete(id);
+    }
+  }
+  for (const [id, pending] of goalDeadlineTimers) {
+    if (pending.client === client)
+      goalStopDeadline(id);
+  }
+  for (const [id, pending] of goalNativeRecheck) {
+    if (pending.client === client) {
+      goalStopNativeRecheck(id);
+      goalNativeWatch.delete(id);
+    }
+  }
+  for (const [id, pending] of crewNativeRecheck) {
+    if (pending.client === client)
+      crewStopNativeRecheck(id);
+  }
+}
+var goalNativeWatch = new Map;
+var goalAcceptedCalls = new Map;
+var goalBackgroundHeld = new Set;
+var goalDeadlineTimers = new Map;
+function goalStopDeadline(sessionID) {
+  const pending = goalDeadlineTimers.get(sessionID);
+  if (pending)
+    clearTimeout(pending.timer);
+  goalDeadlineTimers.delete(sessionID);
+}
+function goalArmDeadline(sessionID, client, goal) {
+  goalStopDeadline(sessionID);
+  const deadline = Date.parse(goal.doc.armedAt || goal.doc.created) + goal.doc.maxMinutes * 60000;
+  const timer = setTimeout(() => {
+    if (goalDeadlineTimers.get(sessionID)?.timer !== timer)
+      return;
+    goalDeadlineTimers.delete(sessionID);
+    if (disposedGoalClients.has(client))
+      return;
+    const state = sessions.get(sessionID);
+    const fresh = state && resolveLiveGoal(state);
+    if (!state || !fresh || fresh.path !== goal.path || fresh.doc.status !== "active" || fresh.doc.session !== sessionID || fresh.doc.revision !== goal.doc.revision || fresh.doc.armedAt !== goal.doc.armedAt)
+      return;
+    if (budgetState(fresh.doc) === "budget-time")
+      autoPauseGoal(client, state, fresh, "budget-time", false);
+    else if (Date.now() <= deadline)
+      goalArmDeadline(sessionID, client, fresh);
+  }, Math.max(1, deadline - Date.now() + 1));
+  timer.unref?.();
+  goalDeadlineTimers.set(sessionID, { timer, client });
+}
+var goalNativeRecheck = new Map;
+function goalStopNativeRecheck(sessionID) {
+  const pending = goalNativeRecheck.get(sessionID);
+  if (pending)
+    clearTimeout(pending.timer);
+  goalNativeRecheck.delete(sessionID);
+}
+function goalNativeViewHeld(sessionID, view) {
+  if (!view.readable)
+    return true;
+  const watched = goalNativeWatch.get(sessionID) ?? new Set;
+  for (const child of view.inFlight)
+    watched.add(child);
+  for (const row of view.settled) {
+    if (row.outcome)
+      watched.delete(row.childID);
+    else
+      watched.add(row.childID);
+  }
+  if (watched.size)
+    goalNativeWatch.set(sessionID, watched);
+  else
+    goalNativeWatch.delete(sessionID);
+  return watched.size > 0 || view.settled.some((row) => !row.outcome);
+}
+function goalArmNativeRecheck(sessionID, client, goal, deadlineOnly = false) {
+  if (goalNativeRecheck.has(sessionID) || disposedGoalClients.has(client))
+    return;
+  const deadline = Date.parse(goal.doc.armedAt || goal.doc.created) + goal.doc.maxMinutes * 60000;
+  const remaining = Math.max(1, deadline - Date.now() + 1);
+  const ceiling = crewNativeCeiling.get(sessionID)?.disclosed;
+  const interval = CREW_NATIVE_CHILD_RECHECK_MS > 0 ? CREW_NATIVE_CHILD_RECHECK_MS : remaining;
+  const delay = ceiling || deadlineOnly ? remaining : Math.min(interval, remaining);
+  const timer = setTimeout(() => {
+    if (goalNativeRecheck.get(sessionID)?.timer !== timer)
+      return;
+    goalNativeRecheck.delete(sessionID);
+    const state = sessions.get(sessionID);
+    const fresh = state && resolveLiveGoal(state);
+    if (!fresh || fresh.path !== goal.path || fresh.doc.status !== "active" || fresh.doc.session !== sessionID || fresh.doc.revision !== goal.doc.revision || fresh.doc.armedAt !== goal.doc.armedAt)
+      return;
+    if (!idleTimers.has(sessionID))
+      continueIfEligible(client, sessionID, deadlineOnly);
+  }, delay);
+  timer.unref?.();
+  goalNativeRecheck.set(sessionID, { timer, client, deadlineOnly });
+}
 var transportFails = new Map;
 var noProgressStreak = new Map;
 var turnActivity = new Map;
-var pendingContinuationTurn = new Set;
+var previousGoalEvidence = new Map;
+var pendingContinuationTurn = new Map;
+function matchingGoalTurn(text, pending) {
+  const fresh = parseGoalLoose(text);
+  const admitted = pending.goal.doc;
+  return fresh && fresh.created === admitted.created && fresh.revision === admitted.revision && fresh.session === admitted.session && fresh.armedAt === admitted.armedAt ? fresh : null;
+}
+function ledgerGoalTurn(pending) {
+  const act = pending.activity;
+  const classification = classifyGoalActivity(act, pending.previous);
+  if (pending.turn !== undefined) {
+    try {
+      const text = readFileSync4(pending.goal.path, "utf8");
+      if (matchingGoalTurn(text, pending)) {
+        atomicWrite(pending.goal.path, appendLedger(text, {
+          turn: pending.turn,
+          revision: pending.goal.doc.revision,
+          at: nowIso(),
+          activity: classification.activity,
+          writes: act.writes,
+          checks: act.checks
+        }, nowIso()));
+      }
+    } catch (err) {
+      goalProbe(`ledger append failed session=${pending.goal.doc.session} err=${String(err)}`);
+    }
+  }
+  return classification;
+}
 function goalProbe(line) {
   if (process.env.FORGE_GOAL_PROBE) {
     try {
-      appendFileSync2(join6(probeTmp(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
+      appendFileSync(join5(probeTmp(), "forge-goal-probe.log"), `${new Date().toISOString()} ${line}
 `);
     } catch {}
   }
 }
 function engineForgetSession(sessionID) {
+  goalStopDeadline(sessionID);
+  goalStopNativeRecheck(sessionID);
+  goalNativeWatch.delete(sessionID);
+  goalBackgroundHeld.delete(sessionID);
+  crewNativeCeiling.delete(sessionID);
   const t = idleTimers.get(sessionID);
   if (t)
-    clearTimeout(t);
+    clearTimeout(t.timer);
   idleTimers.delete(sessionID);
   continuationInFlight.delete(sessionID);
   transportFails.delete(sessionID);
   noProgressStreak.delete(sessionID);
+  previousGoalEvidence.delete(sessionID);
+  const pending = pendingContinuationTurn.get(sessionID);
+  if (pending?.turn !== undefined)
+    ledgerGoalTurn(pending);
   turnActivity.delete(sessionID);
   pendingContinuationTurn.delete(sessionID);
-}
-function engineForgetAll() {
-  for (const id of [...idleTimers.keys()])
-    engineForgetSession(id);
 }
 var CREW_NO_PROGRESS_LIMIT = 3;
 var crewPendingTurn = new Set;
@@ -22588,6 +18403,19 @@ function crewReportNativeChildTerminal(sessionID, childID, outcome, client) {
     scheduleIdleContinuation(client, sessionID, CREW_CHILD_RESUME_DEBOUNCE_MS);
   }
 }
+function crewNativeViewHeld(sessionID, view) {
+  return !view.readable || view.inFlight.length > 0 || view.settled.some((row) => !row.outcome && !crewNativeChildren.rows().get(row.childID)?.outcome) || (crewNativeWatch.get(sessionID)?.size ?? 0) > 0;
+}
+function crewDiscloseNativeHold(sessionID, objective) {
+  const now = crewGateNow();
+  const mark = crewNativeCeiling.get(sessionID);
+  if (!mark)
+    crewNativeCeiling.set(sessionID, { firstSuppressedAt: now, disclosed: false });
+  else if (!mark.disclosed && now - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS) {
+    crewNativeCeiling.set(sessionID, { firstSuppressedAt: mark.firstSuppressedAt, disclosed: true });
+    console.warn(`[forge:crew-continue] native-child ceiling: crew "${objective.slice(0, 80)}" remains held; terminal evidence unavailable. No continuation authorized.`);
+  }
+}
 function crewObserveNativeWalk(sessionID, view) {
   if (!view.readable)
     return;
@@ -22601,17 +18429,21 @@ function crewObserveNativeWalk(sessionID, view) {
   for (const childID of [...watched]) {
     if (busy.has(childID))
       continue;
-    crewReportNativeChildTerminal(sessionID, childID, outcomes.get(childID) ?? null, null);
+    const outcome = outcomes.get(childID) ?? crewNativeChildren.rows().get(childID)?.outcome;
+    if (outcome)
+      crewReportNativeChildTerminal(sessionID, childID, outcome, null);
   }
 }
 var CREW_NATIVE_CHILD_RECHECK_MS = Number(process.env.FORGE_CREW_NATIVE_CHILD_RECHECK_MS ?? 5000);
 var crewNativeRecheck = new Map;
 function crewArmNativeRecheck(sessionID, client) {
-  if (crewNativeRecheck.has(sessionID))
+  if (client && disposedGoalClients.has(client) || crewNativeRecheck.has(sessionID))
     return;
   if (!Number.isFinite(CREW_NATIVE_CHILD_RECHECK_MS) || CREW_NATIVE_CHILD_RECHECK_MS <= 0)
     return;
   const timer = setTimeout(() => {
+    if (crewNativeRecheck.get(sessionID)?.timer !== timer)
+      return;
     crewNativeRecheck.delete(sessionID);
     crewNativeRecheckTick(sessionID, client);
   }, CREW_NATIVE_CHILD_RECHECK_MS);
@@ -22628,23 +18460,20 @@ function crewStopNativeRecheck(sessionID) {
 async function crewNativeRecheckTick(sessionID, client) {
   try {
     const crew = crews.get(sessionID);
-    if (!client || !crew || crew.mode !== "executing" || crewStalled.has(sessionID))
+    if (!client || disposedGoalClients.has(client) || !crew || crew.mode !== "executing" || crewStalled.has(sessionID))
       return;
     if (continuationInFlight.has(sessionID) || idleTimers.has(sessionID))
       return;
     const view = await walkNativeChildren(nativeChildWalkerOf(client), sessionID);
+    if (disposedGoalClients.has(client))
+      return;
     crewObserveNativeWalk(sessionID, view);
-    if (!view.readable) {
+    if (crewNativeViewHeld(sessionID, view)) {
+      crewDiscloseNativeHold(sessionID, crew.objective);
       crewArmNativeRecheck(sessionID, client);
       return;
     }
-    const mark = crewNativeCeiling.get(sessionID);
-    const expired = mark !== undefined && crewGateNow() - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS;
-    if (view.inFlight.length > 0 && !expired) {
-      crewArmNativeRecheck(sessionID, client);
-      return;
-    }
-    goalProbe(`crew native-child recheck clear session=${sessionID} inFlight=${view.inFlight.length} ceiling=${expired ? "expired" : "none"}`);
+    goalProbe(`crew native-child recheck clear session=${sessionID}`);
     scheduleIdleContinuation(client, sessionID, CREW_CHILD_RESUME_DEBOUNCE_MS);
   } catch {}
 }
@@ -22669,7 +18498,7 @@ function noteCrewNativeChildEvent(type, fields, client) {
       crewNativeChildren.drop(id);
       const watchedBy = crewNativeWatchParentOf(id);
       if (watchedBy)
-        crewReportNativeChildTerminal(watchedBy, id, null, client);
+        crewArmNativeRecheck(watchedBy, client);
       return;
     }
     const outcome = nativeChildEventOutcome(type);
@@ -22691,10 +18520,9 @@ function noteCrewNativeChildEvent(type, fields, client) {
       const idle = type === "session.idle" || st !== null && typeof st === "object" && st.type === "idle";
       if (!idle)
         return;
-      const note = crewNativeChildren.terminalize(id, "succeeded");
-      const parentID = note?.parentID ?? crewNativeWatchParentOf(id);
+      const parentID = crewNativeWatchParentOf(id);
       if (parentID)
-        crewReportNativeChildTerminal(parentID, id, "succeeded", client);
+        crewArmNativeRecheck(parentID, client);
     }
   } catch {}
 }
@@ -22704,13 +18532,13 @@ function crewContinueBrief(crew, childDigest = []) {
     `Declared plan (every subtask needs a verdict at close):`,
     ...crew.subtasks.map((s, i) => `${i + 1}. ${s.title}`),
     ...childDigest.length > 0 ? [`Native child outcomes since the last brief (one line per child — an interrupted child is DEAD, never silently stranded):`, ...childDigest.map((l) => `- ${l}`)] : [],
-    `Next: dispatch the next wave (parallel task calls — forge-* workers from this session's pool, or the native general subagent when no forge worker fits), collect per-subtask evidence verdicts, at most one retry per subtask, then crew_close with the full report. Stalled or wrong decomposition? crew_close {abandon: true, reason} to re-shard.`
+    `Wave discipline: ${CREW_WAVE_RULE} Collect verified per-subtask evidence verdicts from the reports; terminal status alone is not PASS. Keep at most one retry per subtask, then crew_close with the full report and existing approvals. Stalled or wrong decomposition? crew_close {abandon: true, reason} to re-shard.`
   ].join(`
 `);
 }
 async function continueCrewIfEligible(client, state, sessionID) {
   const crew = crews.get(sessionID);
-  if (!crew || crew.mode !== "executing") {
+  if (!crew || crew.mode !== "executing" || crew.goalGoverned) {
     goalProbe(`crew skip: no executing crew session=${sessionID}`);
     return;
   }
@@ -22724,26 +18552,15 @@ async function continueCrewIfEligible(client, state, sessionID) {
   }
   const walker = nativeChildWalkerOf(client);
   const view = await walkNativeChildren(walker, sessionID);
+  if (disposedGoalClients.has(client) || crews.get(sessionID) !== crew || crew.goalGoverned || governingGoalFor(sessionID))
+    return;
   crewObserveNativeWalk(sessionID, view);
-  if (view.inFlight.length > 0) {
-    const now = crewGateNow();
-    const mark = crewNativeCeiling.get(sessionID);
-    if (mark && mark.disclosed) {
-      goalProbe(`crew native-child ceiling already disclosed session=${sessionID}`);
-    } else if (mark && now - mark.firstSuppressedAt >= CREW_NATIVE_CHILD_CEILING_MS) {
-      crewNativeCeiling.set(sessionID, { firstSuppressedAt: mark.firstSuppressedAt, disclosed: true });
-      console.warn(`[forge:crew-continue] native-child ceiling: crew "${crew.objective.slice(0, 80)}" has been held ≥${CREW_NATIVE_CHILD_CEILING_MS}ms by native children that never report a terminal state — sending once and stopping suppression for this registration (fresh crew_begin re-arms the gate).`);
-      goalProbe(`crew native-child ceiling expired session=${sessionID}`);
-    } else {
-      if (!mark)
-        crewNativeCeiling.set(sessionID, { firstSuppressedAt: now, disclosed: false });
-      crewArmNativeRecheck(sessionID, client);
-      goalProbe(`crew skip: native child in flight session=${sessionID}`);
-      return;
-    }
-  } else {
-    crewNativeCeiling.delete(sessionID);
+  if (crewNativeViewHeld(sessionID, view)) {
+    crewDiscloseNativeHold(sessionID, crew.objective);
+    crewArmNativeRecheck(sessionID, client);
+    return;
   }
+  crewNativeCeiling.delete(sessionID);
   if (crewPendingTurn.has(sessionID)) {
     crewPendingTurn.delete(sessionID);
     const act = crewTurnActivity.get(sessionID);
@@ -22780,12 +18597,16 @@ async function continueCrewIfEligible(client, state, sessionID) {
       return;
     }
   }
+  if (disposedGoalClients.has(client) || crews.get(sessionID) !== crew || crew.goalGoverned || governingGoalFor(sessionID) || !sessionIsForgeFamily(sessionID))
+    return;
   try {
     const childDigest = crewChildDigest.get(sessionID) ?? [];
     await client.session.prompt({
       path: { id: sessionID },
       body: { parts: [{ type: "text", text: crewContinueBrief(crew, childDigest) }] }
     });
+    if (disposedGoalClients.has(client) || crews.get(sessionID) !== crew)
+      return;
     if (childDigest.length > 0)
       crewChildDigest.delete(sessionID);
     crewStopNativeRecheck(sessionID);
@@ -22794,6 +18615,8 @@ async function continueCrewIfEligible(client, state, sessionID) {
     crewTurnActivity.set(sessionID, { dispatches: 0, writes: 0 });
     goalProbe(`crew continued session=${sessionID} objective="${crew.objective.slice(0, 60)}"`);
   } catch (err) {
+    if (disposedGoalClients.has(client) || crews.get(sessionID) !== crew)
+      return;
     const n = (transportFails.get(sessionID) ?? 0) + 1;
     transportFails.set(sessionID, n);
     goalProbe(`crew transport failure session=${sessionID} count=${n} err=${String(err)}`);
@@ -22810,7 +18633,7 @@ function goalBriefText(state, goal) {
   const structureText = [...d.criteria, d.constraints.trim()].filter(Boolean).join(`
 `);
   const structured = /\bforge-[a-z0-9-]+\b/.test(structureText) || /^\s*\d+[.).]/m.test(structureText);
-  const crewLayerBase = `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), dispatch forge-* waves, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Crew gates stay internal to this loop (your goal turns drive the crew — no separate crew idle briefs fire under this goal; standalone waves auto-advance on session idle until crew_close).`;
+  const crewLayerBase = `Crew layer: you own it under this goal — when parallel decomposition serves a criterion, register crews with crew_begin {objective, subtasks, execution: "waves"} in ONE call (born armed; no pause mid-loop), follow the native subagent wave discipline below, and re-shard a wrong decomposition via crew_close {abandon: true, reason} plus a fresh registration. Preserve existing user approvals, host permissions and goal stop conditions. Your goal turns drive the crew — no separate crew idle briefs fire under this goal.`;
   const crewLayerLine = structured ? `${crewLayerBase} The contract carries a subtask structure — PREFER re-registering it as a born-armed crew (one call, execution: "waves") over self-executing the whole plan in this session; drive the crew through your goal turns and keep per-subtask evidence for the close report.` : crewLayerBase;
   return [
     `[forge:goal-continue] Continue the active goal (revision ${d.revision}): ${d.goal}`,
@@ -22821,49 +18644,53 @@ ${d.criteria.map((c, i) => `${i + 1}. ${c}`).join(`
 ${d.checks.map((c, i) => `${i + 1}. ${c.kind === "shell" ? `shell \`${c.cmd}\`` : `contains \`${c.file}\` :: \`${c.text}\``}`).join(`
 `)}`,
     d.constraints.trim() ? `Constraints: ${d.constraints.trim()}` : "",
-    `Per-turn discipline: land at least one verification command (forge_shell) or a real write every turn — the Turn Ledger scores read-only turns as no-progress, and consecutive no-progress turns auto-pause the loop (goal-no-progress-honesty: re-running the checks IS progress).`,
-    `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. Work the criteria now; call goal_check when you believe they hold, then goal_complete (it re-runs every check itself and asks the user). If genuinely blocked, call goal_pause with the blocker — do not spin.`,
+    `Per-turn discipline: meaningful read-only reconnaissance and review, real changes, commits, and checks or failure diagnosis with new evidence are productive work, including outside git. No write, shell command, or git diff is required every turn. Repeating a check with the same input and complete result without new evidence or other activity is not progress; unknown or truncated evidence does not establish equality. Do not repeat checks merely to fill a turn. For genuine host waiting (outstanding child work, background commands, permissions or user responses), end your turn rather than polling or sleeping. Waiting is not work; the intended two-turn no-progress threshold applies only to clearly empty work turns.`,
+    `Budget: ${d.turnsUsed}/${d.maxTurns} turns used. The wall-clock minute limit continues during waiting; stop on either budget limit or when goal authorization ends, and wait for the user's explicit decision before resuming. Do not start new autonomous work after a pause or loss of authorization, including crew fallback or session reuse; already accepted host work may finish. A goal-governed crew must not become standalone automatically. Call goal_check when criteria hold, then goal_complete (it re-runs every check itself and asks the user). If globally blocked, call goal_pause with the concrete blocker; if independent work remains, continue that work — do not spin.`,
     crewLayerLine,
+    `For a crew under this goal: ${CREW_WAVE_RULE} Treat verified waiting as distinct from work or no-progress; do not assume the host can observe every wait. Collect verified evidence for each declared subtask; a completion notification is not by itself PASS.`,
     `Goal file: ${relFrom(state.worktree, goal.path)}`
   ].filter((s) => s.length > 0).join(`
 `);
 }
-function wrapupBriefText(goal, reason) {
+function wrapupBriefText(goal, reason, repeatedEvidence = false) {
   return [
     `[forge:goal-wrapup] The goal loop is stopping (stop_reason: ${reason}); the goal is now PAUSED.`,
     `Goal (revision ${goal.doc.revision}): ${goal.doc.goal}`,
+    ...repeatedEvidence ? ["Repeated identical check input and result added no observable evidence; see the Turn Ledger."] : [],
     "Produce a concise handoff summary and nothing else: what is done, what remains, the single next concrete step. Do not continue working the goal in this turn."
   ].join(`
 `);
 }
-async function autoPauseGoal(client, state, goal, reason, wrapup) {
+async function autoPauseGoal(client, state, goal, reason, wrapup, repeatedEvidence = false) {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
-  atomicWrite(goal.path, transitionGoal(readFileSync9(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  atomicWrite(goal.path, transitionGoal(readFileSync4(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
   engineForgetSession(state.sessionID);
   if (wrapup && goal.doc.session) {
     try {
       await client.session.prompt({
         path: { id: goal.doc.session },
-        body: { parts: [{ type: "text", text: wrapupBriefText(goal, reason) }] }
+        body: { parts: [{ type: "text", text: wrapupBriefText(goal, reason, repeatedEvidence) }] }
       });
     } catch (err) {
       goalProbe(`wrapup delivery failed session=${state.sessionID} err=${String(err)}`);
     }
   }
 }
-async function continueIfEligible(client, sessionID) {
-  if (forgeDisabled) {
-    goalProbe(`skip: forge disabled session=${sessionID}`);
+async function continueIfEligible(client, sessionID, backgroundWaiting = false) {
+  if (disposedGoalClients.has(client))
     return;
-  }
   if (continuationInFlight.has(sessionID))
     return;
-  continuationInFlight.add(sessionID);
+  const flight = { client };
+  continuationInFlight.set(sessionID, flight);
+  const stillCurrent = () => !disposedGoalClients.has(client) && continuationInFlight.get(sessionID) === flight;
   try {
     let state = sessions.get(sessionID);
     if (!state) {
       try {
         const info = await client.session.get({ path: { id: sessionID } });
+        if (!stillCurrent())
+          return;
         const wt = effectiveWorktree(info?.worktree, info?.directory ?? info?.location?.directory);
         if (!wt) {
           goalProbe(`skip: no worktree for lazy seed session=${sessionID}`);
@@ -22876,27 +18703,79 @@ async function continueIfEligible(client, sessionID) {
         return;
       }
     }
-    let accountedContinuationTurn = false;
-    let turnHadActivity = false;
-    if (pendingContinuationTurn.has(sessionID)) {
-      accountedContinuationTurn = true;
-      pendingContinuationTurn.delete(sessionID);
-      const act = turnActivity.get(sessionID);
-      turnHadActivity = !!act && (act.writes > 0 || act.checks > 0);
-      turnActivity.set(sessionID, { writes: 0, checks: 0 });
-      const ledgerPath = state.goalPath;
-      if (ledgerPath && existsSync3(ledgerPath)) {
+    if (!stillCurrent())
+      return;
+    const ownedGoal = resolveLiveGoal(state);
+    const governedCrew = crews.get(sessionID);
+    backgroundWaiting ||= goalBackgroundHeld.has(sessionID);
+    if (ownedGoal?.doc.status === "active" && ownedGoal.doc.session === sessionID)
+      goalArmDeadline(sessionID, client, ownedGoal);
+    if (backgroundWaiting) {
+      goalStopNativeRecheck(sessionID);
+      if (ownedGoal?.doc.status === "active" && ownedGoal.doc.session === sessionID)
+        goalArmNativeRecheck(sessionID, client, ownedGoal, true);
+    }
+    if (ownedGoal?.doc.status === "active" && ownedGoal.doc.session === sessionID && !backgroundWaiting) {
+      const walker = nativeChildWalkerOf(client);
+      const view = await walkNativeChildren(walker, sessionID);
+      if (!stillCurrent())
+        return;
+      const ownerBusy = await nativeSessionBusy(walker, sessionID);
+      if (!stillCurrent())
+        return;
+      const current = resolveLiveGoal(state);
+      if (!current || current.path !== ownedGoal.path || current.doc.status !== "active" || current.doc.session !== sessionID || current.doc.revision !== ownedGoal.doc.revision || current.doc.armedAt !== ownedGoal.doc.armedAt)
+        return;
+      let roundHeld = false;
+      const rounds = goalAcceptedCalls.get(sessionID);
+      if (rounds?.size) {
+        let settled = new Set;
         try {
-          const fresh = parseGoalLoose(readFileSync9(ledgerPath, "utf8"));
-          if (fresh && fresh.turnsUsed > 0) {
-            atomicWrite(ledgerPath, appendLedger(readFileSync9(ledgerPath, "utf8"), { turn: fresh.turnsUsed, revision: fresh.revision, at: nowIso(), activity: turnHadActivity, writes: act?.writes ?? 0, checks: act?.checks ?? 0 }, nowIso()));
-          }
-        } catch (err) {
-          goalProbe(`ledger append failed session=${sessionID} err=${String(err)}`);
-        }
+          settled = settledGoalRounds(rounds, await client.session.context?.({ sessionID }));
+        } catch {}
+        if (!stillCurrent())
+          return;
+        const latest = resolveLiveGoal(state);
+        if (!latest || latest.path !== ownedGoal.path || latest.doc.status !== "active" || latest.doc.session !== sessionID || latest.doc.revision !== ownedGoal.doc.revision || latest.doc.armedAt !== ownedGoal.doc.armedAt)
+          return;
+        roundHeld = [...rounds.keys()].some((id) => !settled.has(id));
+      }
+      backgroundWaiting = goalNativeViewHeld(sessionID, view) || ownerBusy !== false || roundHeld || goalBackgroundHeld.has(sessionID);
+      if (governedCrew?.goalGoverned)
+        crewObserveNativeWalk(sessionID, view);
+      if (backgroundWaiting) {
+        crewDiscloseNativeHold(sessionID, governedCrew?.objective ?? ownedGoal.doc.goal);
+        goalArmNativeRecheck(sessionID, client, ownedGoal, goalBackgroundHeld.has(sessionID));
+      } else {
+        goalStopNativeRecheck(sessionID);
       }
     }
+    const pending = pendingContinuationTurn.get(sessionID);
+    let accountedContinuationTurn = false;
+    let turnHadActivity = false;
+    let repeatedEvidence = false;
+    let uncertainActivity = false;
+    const waitingGoal = backgroundWaiting ? resolveLiveGoal(state) : null;
+    const deferSettlement = waitingGoal?.doc.status === "active" && waitingGoal.doc.session === sessionID && pending?.goal.path === waitingGoal.path && pending.goal.doc.revision === waitingGoal.doc.revision && pending.goal.doc.armedAt === waitingGoal.doc.armedAt;
+    if (pending && deferSettlement)
+      pending.waited = true;
+    if (pending?.turn !== undefined && !deferSettlement) {
+      pendingContinuationTurn.delete(sessionID);
+      turnActivity.delete(sessionID);
+      const classification = ledgerGoalTurn(pending);
+      const currentGoal = resolveLiveGoal(state);
+      accountedContinuationTurn = currentGoal?.path === pending.goal.path && currentGoal.doc.revision === pending.goal.doc.revision && currentGoal.doc.armedAt === pending.goal.doc.armedAt && currentGoal.doc.session === sessionID;
+      turnHadActivity = classification.activity;
+      repeatedEvidence = classification.repeated;
+      uncertainActivity = classification.uncertain === true;
+      if (accountedContinuationTurn && classification.evidence)
+        previousGoalEvidence.set(sessionID, classification.evidence);
+      else
+        previousGoalEvidence.delete(sessionID);
+    }
     const goal = resolveLiveGoal(state);
+    if (goal?.doc.status === "paused" && goal.doc.session === sessionID)
+      return;
     if (!goal || goal.doc.status !== "active" || !goal.doc.session || goal.doc.session !== sessionID) {
       goalProbe(`no live active goal owned by session=${sessionID} — crew branch`);
       await continueCrewIfEligible(client, state, sessionID);
@@ -22906,15 +18785,25 @@ async function continueIfEligible(client, sessionID) {
       goalProbe(`skip: agent switched to non-forge before send session=${sessionID}`);
       return;
     }
+    if (backgroundWaiting) {
+      if (resolveActivePlan(state)?.doc.status === "draft") {
+        await autoPauseGoal(client, state, goal, "draft-conflict", false);
+        return;
+      }
+      const bs2 = budgetState(goal.doc);
+      if (bs2 !== "ok")
+        await autoPauseGoal(client, state, goal, bs2, false);
+      return;
+    }
     if (accountedContinuationTurn) {
       if (turnHadActivity) {
         noProgressStreak.delete(sessionID);
-      } else {
+      } else if (!pending?.waited && !uncertainActivity) {
         const n = (noProgressStreak.get(sessionID) ?? 0) + 1;
         noProgressStreak.set(sessionID, n);
         goalProbe(`no-progress session=${sessionID} streak=${n}`);
         if (n >= NO_PROGRESS_LIMIT) {
-          await autoPauseGoal(client, state, goal, "no-progress", true);
+          await autoPauseGoal(client, state, goal, "no-progress", true, repeatedEvidence);
           return;
         }
       }
@@ -22942,19 +18831,36 @@ async function continueIfEligible(client, sessionID) {
         return;
       }
     }
+    const stillAuthorized = () => {
+      if (!stillCurrent())
+        return false;
+      const fresh2 = parseGoalLoose(readFileSync4(goal.path, "utf8"));
+      return fresh2?.status === "active" && fresh2.session === sessionID && fresh2.revision === goal.doc.revision && fresh2.armedAt === goal.doc.armedAt;
+    };
+    if (!stillAuthorized())
+      return;
+    const pendingTurn = {
+      client,
+      goal,
+      activity: { writes: 0, checks: 0, scope: JSON.stringify([state.worktree, goal.path, goal.doc.revision, goal.doc.armedAt]) },
+      previous: previousGoalEvidence.get(sessionID)
+    };
     try {
       const briefText = goalBriefText(state, goal);
-      pendingContinuationTurn.add(sessionID);
-      turnActivity.set(sessionID, { writes: 0, checks: 0 });
+      pendingContinuationTurn.set(sessionID, pendingTurn);
+      turnActivity.set(sessionID, pendingTurn.activity);
       await client.session.prompt({
         path: { id: sessionID },
         body: { parts: [{ type: "text", text: briefText }] }
       });
-      transportFails.delete(sessionID);
-      state.goalPath = goal.path;
-      atomicWrite(goal.path, incTurns(readFileSync9(goal.path, "utf8"), nowIso()));
-      goalProbe(`continued session=${sessionID} turn=${goal.doc.turnsUsed + 1}/${goal.doc.maxTurns}`);
     } catch (err) {
+      if (!stillAuthorized()) {
+        if (pendingContinuationTurn.get(sessionID) === pendingTurn) {
+          pendingContinuationTurn.delete(sessionID);
+          turnActivity.delete(sessionID);
+        }
+        return;
+      }
       pendingContinuationTurn.delete(sessionID);
       turnActivity.delete(sessionID);
       const n = (transportFails.get(sessionID) ?? 0) + 1;
@@ -22963,44 +18869,63 @@ async function continueIfEligible(client, sessionID) {
       if (n >= TRANSPORT_FAILURE_LIMIT) {
         await autoPauseGoal(client, state, goal, "transport-failures", false);
       }
+      return;
     }
+    const text = readFileSync4(goal.path, "utf8");
+    const fresh = matchingGoalTurn(text, pendingTurn);
+    if (disposedGoalClients.has(client) || !fresh || !stillCurrent() && fresh.status === "active") {
+      if (pendingContinuationTurn.get(sessionID) === pendingTurn) {
+        pendingContinuationTurn.delete(sessionID);
+        turnActivity.delete(sessionID);
+      }
+      return;
+    }
+    atomicWrite(goal.path, incTurns(text, nowIso()));
+    pendingTurn.turn = fresh.turnsUsed + 1;
+    if (!stillCurrent() || fresh.status !== "active") {
+      ledgerGoalTurn(pendingTurn);
+      if (pendingContinuationTurn.get(sessionID) === pendingTurn) {
+        pendingContinuationTurn.delete(sessionID);
+        turnActivity.delete(sessionID);
+      }
+      return;
+    }
+    transportFails.delete(sessionID);
+    goalProbe(`continued session=${sessionID} turn=${pendingTurn.turn}/${fresh.maxTurns}`);
   } catch (err) {
     goalProbe(`continuation aborted session=${sessionID} err=${String(err)}`);
   } finally {
-    continuationInFlight.delete(sessionID);
+    if (stillCurrent())
+      continuationInFlight.delete(sessionID);
   }
 }
-function scheduleIdleContinuation(client, sessionID, debounceMs = IDLE_DEBOUNCE_MS) {
-  if (forgeDisabled)
+function scheduleIdleContinuation(client, sessionID, debounceMs = IDLE_DEBOUNCE_MS, backgroundWaiting = false) {
+  if (disposedGoalClients.has(client))
     return;
   if (!sessionIsForgeFamily(sessionID)) {
     goalProbe(`skip: non-forge agent at schedule session=${sessionID}`);
     return;
   }
+  const state = sessions.get(sessionID);
+  if (state) {
+    const goal = resolveLiveGoal(state);
+    if (goal?.doc.status === "paused" && goal.doc.session === sessionID)
+      return;
+  }
   const existing = idleTimers.get(sessionID);
   if (existing)
-    clearTimeout(existing);
-  idleTimers.set(sessionID, setTimeout(() => {
+    clearTimeout(existing.timer);
+  const pending = { client, timer: setTimeout(() => {
+    if (idleTimers.get(sessionID) !== pending)
+      return;
     idleTimers.delete(sessionID);
-    continueIfEligible(client, sessionID);
-  }, Math.max(0, debounceMs)));
+    continueIfEligible(client, sessionID, backgroundWaiting);
+  }, Math.max(0, debounceMs)) };
+  idleTimers.set(sessionID, pending);
 }
 function harvestSessionEnd(sessionID) {
-  jobManager.onSessionEnd(sessionID, isDispatchRow);
-  for (const [id, handle] of [...dispatchTasks]) {
-    if (handle.ownerSession === sessionID)
-      dispatchTasks.delete(id);
-  }
-  flushDispatchQueue(sessionID);
   sessionDepths.delete(sessionID);
-  dispatchProgressQueue.delete(sessionID);
   sessionAgents.delete(sessionID);
-  sessionRescueInjected.delete(sessionID);
-  sessionRescueDisclosed.delete(sessionID);
-  sessionRescueAttached.delete(sessionID);
-  sessionModels.delete(sessionID);
-  sealFindings.delete(sessionID);
-  sealUnknownNotes.delete(sessionID);
   poolGateUnknownNotes.delete(sessionID);
   anchorPrefNotes.delete(sessionID);
   poolGateLedgerNotes.delete(sessionID);
@@ -23009,669 +18934,11 @@ function harvestSessionEnd(sessionID) {
   anchorMovedNotes.delete(sessionID);
   crews.delete(sessionID);
   crewEngineForgetSession(sessionID);
+  goalAcceptedCalls.delete(sessionID);
+  engineForgetSession(sessionID);
 }
-var server = async (input, options) => {
-  const effectiveInitDir = effectiveWorktree(input.worktree, input.directory) || input.directory || "";
-  hostWorktree = effectiveInitDir;
-  rememberHostAnchor(effectiveInitDir);
-  const client = input.client;
-  jobClient = input.client;
-  anchorClientShared = input.client ?? null;
-  if (effectiveInitDir && !isRootish(effectiveInitDir)) {
-    recoverWorkspaceDispatches(input.client, effectiveInitDir);
-  }
-  const jobsOpts = options?.jobs;
-  if (jobsOpts?.mode === "auto" || jobsOpts?.mode === "forge" || jobsOpts?.mode === "native")
-    jobsMode = jobsOpts.mode;
-  jobsKeepBuiltinShell = jobsOpts?.keepBuiltinShell === true;
-  if (jobsOpts?.survive === "never" || jobsOpts?.survive === "always" || jobsOpts?.survive === "deny")
-    jobsSurviveMode = jobsOpts.survive;
-  const searchOpts = options?.search;
-  searchRgPathOverride = typeof searchOpts?.rgPath === "string" && searchOpts.rgPath.trim().length > 0 ? searchOpts.rgPath : undefined;
-  const wdOpts = options?.watchdog;
-  const wdFallbacks = [];
-  const wdMode = parseMode(wdOpts?.mode);
-  if (wdOpts?.mode !== undefined && wdOpts.mode !== wdMode) {
-    wdFallbacks.push(`invalid watchdog.mode ${JSON.stringify(String(wdOpts.mode))} — fell back to "${wdMode}"`);
-  }
-  const wdStallRaw = wdOpts?.stallMs;
-  const wdStall = clampStallMs(typeof wdStallRaw === "number" ? wdStallRaw : undefined);
-  if (wdStallRaw !== undefined && wdStallRaw !== wdStall) {
-    wdFallbacks.push(`watchdog.stallMs ${JSON.stringify(String(wdStallRaw))} adjusted to ${wdStall} (floor/default applied)`);
-  }
-  const watchdogLedger = createFileLedger(join6(watchdogLogHome(), "log.jsonl"));
-  const rawLocator = createLocator();
-  const probing = () => process.env.FORGE_WATCHDOG_PROBE === "1";
-  const probeLine = (text) => {
-    if (!probing())
-      return;
-    try {
-      appendFileSync2(join6(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} ${text}
-`);
-    } catch {}
-  };
-  const diagnosticLocate = async (callID, t0, cmdNeedle, phase2) => {
-    const started = Date.now();
-    const hits = await rawLocator(callID, t0, cmdNeedle, phase2);
-    probeLine(`locate dur=${Date.now() - started}ms hits=${hits.length} phase2=${phase2 === true} needle=${JSON.stringify(cmdNeedle ?? null)}`);
-    if (hits.length === 0 && cmdNeedle) {
-      try {
-        const raw = execFileSync3("powershell", ["-NoProfile", "-Command", "[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,CreationDate | ConvertTo-Json -Compress"], { encoding: "utf8", windowsHide: true, timeout: 15000 });
-        const all = parseWindowsProcs(raw);
-        probeLine(`diag rawLen=${raw.length} procs=${all.length} windowStart=${new Date(t0 - 2000).toISOString()}`);
-        for (const p of all) {
-          if (p.cmd.includes(cmdNeedle))
-            probeLine(`diag needle-carrier pid=${p.pid} ppid=${p.ppid} created=${new Date(p.createdMs).toISOString()} cmd=${p.cmd.slice(0, 120)}`);
-        }
-      } catch (err) {
-        probeLine(`diag failed: ${String(err).slice(0, 150)}`);
-      }
-    }
-    return hits;
-  };
-  const watchdog = createWatchdog({
-    mode: wdMode,
-    stallMs: wdStall,
-    sink: (entry) => watchdogLedger.append(entry),
-    locate: diagnosticLocate,
-    killTree: (pid) => killTree({ pid, kill: (sig) => process.kill(pid, sig) })
-  });
-  for (const reason of wdFallbacks) {
-    const entry = {
-      ts: new Date().toISOString(),
-      event: "config-fallback",
-      callID: "-",
-      tool: "config",
-      t0: Date.now(),
-      mode: watchdog.mode,
-      reason
-    };
-    watchdogLedger.append(entry);
-  }
-  return {
-    dispose: async () => {
-      try {
-        const all = jobManager.list();
-        goalProbe(`plugin dispose hook: registry rows=${all.length} running=${all.filter((j) => j.state === "running").length} dispatch rows=${all.filter(isDispatchRow).length}`);
-      } catch {}
-      engineForgetAll();
-      exitCleanup?.trigger("dispose");
-      jobManager.disposeAll(isDispatchRow);
-      watchdog.dispose();
-      sessions.clear();
-    },
-    config: async (cfg) => {
-      const agentSection = cfg.agent ?? (cfg.agent = {});
-      const forgeUserCfg = agentSection[FORGE_AGENT];
-      forgeDisabled = forgeUserCfg?.disable === true;
-      if (forgeDisabled)
-        return;
-      setHostShell(typeof cfg.shell === "string" ? cfg.shell : undefined);
-      cfg.default_agent ??= FORGE_AGENT;
-      const existing = agentSection[FORGE_AGENT];
-      agentSection[FORGE_AGENT] = {
-        ...existing ?? {},
-        description: existing?.description ?? "forge — the single general-purpose coding agent: takes implementation tasks directly; planning goes through /plan into the plan harness (plans land in .opencode/plan/, with an approve confirmation gate, a plugin-verified fail-closed close that re-runs the frozen checks, and tick discipline enforced by tools and the permission layer).",
-        mode: existing?.mode ?? "primary",
-        prompt: existing?.prompt ?? (jobStage() < 2 ? forgePromptText({ hardRefusal: !jobsKeepBuiltinShell }) : FORGE_PROMPT)
-      };
-      if (!jobsKeepBuiltinShell && jobStage() < 2) {
-        const entry = agentSection[FORGE_AGENT];
-        entry.tools = { ...entry.tools ?? {}, shell: false, bash: false };
-      }
-      cfg.command ??= {};
-      cfg.command["plan"] ??= {
-        template: PLAN_COMMAND_TEMPLATE,
-        description: "forge plan harness: no argument lists in-progress plans; resume continues the latest; discard abandons it; a goal enters planning discipline"
-      };
-      cfg.command["goal"] ??= {
-        template: GOAL_COMMAND_TEMPLATE,
-        description: "forge goal harness (autonomous, host-verified): no argument lists goals; pause/resume/discard drive the loop; add queues; next promotes; an objective drafts a contract and arms it (--check/--contains markers become verification items)"
-      };
-      cfg.command["forge"] ??= {
-        template: FORGE_COMMAND_TEMPLATE,
-        description: "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight async dispatches"
-      };
-      const perm = cfg.permission;
-      const permSection = perm ?? (cfg.permission = {});
-      for (const gateKey of GATE_PERMISSION_KEYS) {
-        const incoming = permSection[gateKey];
-        if (incoming === "allow" || incoming === "deny")
-          gatePermissionSnapshot.set(gateKey, incoming);
-      }
-      for (const gateKey of GATE_PERMISSION_KEYS) {
-        if (gateKey === "forge_shell")
-          continue;
-        const v = permSection[gateKey];
-        if (v !== "deny")
-          permSection[gateKey] = "ask";
-      }
-      const resolution = resolvePools();
-      poolResolution = resolution;
-      for (const finding of resolution?.findings ?? []) {
-        console.warn(`[forge:config] ${finding.level}: ${finding.message}`);
-      }
-      materializedSnapshot = {};
-      const globalMaterializationPath = globalPoolPathOf();
-      for (const [matId, agent] of Object.entries(resolution?.agents ?? {})) {
-        const id = `forge-${matId}`;
-        if (agentSection[id] !== undefined)
-          continue;
-        const provenance = foldPath(agent.file) === foldPath(globalMaterializationPath) ? { global: true } : { ns: agent.ns, file: agent.file };
-        const entry = forgeAgentDef(matId, agent.def, provenance, agent.shared ?? undefined);
-        agentSection[id] = entry;
-        materializedSnapshot[id] = entry;
-      }
-      for (const id of Object.keys(agentSection)) {
-        if (!id.startsWith("forge-"))
-          continue;
-        const entry = agentSection[id];
-        const tools = { ...entry.tools ?? {} };
-        for (const t of FORGE_STATE_TOOLS)
-          if (tools[t] !== true)
-            tools[t] = false;
-        entry.tools = tools;
-      }
-      for (const [id, entry] of Object.entries(agentSection)) {
-        if (id === FORGE_AGENT || id.startsWith("forge-"))
-          continue;
-        const e = entry;
-        const tools = { ...e.tools ?? {} };
-        for (const t of FORGE_ALL_TOOLS)
-          if (tools[t] !== true)
-            tools[t] = false;
-        e.tools = tools;
-      }
-      for (const native of NATIVE_PARTITION_FALLBACKS) {
-        if (agentSection[native] !== undefined)
-          continue;
-        const tools = {};
-        for (const t of FORGE_ALL_TOOLS)
-          tools[t] = false;
-        agentSection[native] = { tools };
-      }
-      knownHostAgents.clear();
-      for (const native of NATIVE_PARTITION_FALLBACKS)
-        knownHostAgents.add(native);
-      for (const id of Object.keys(agentSection))
-        knownHostAgents.add(id);
-      if (process.env.FORGE_TEST_NO_DISPATCH_FETCH === "1") {
-        modelsDevCatalog = null;
-      } else {
-        try {
-          const snapshot = await loadModelsDevSnapshot({ cacheDir: modelsDevCacheRoot() });
-          modelsDevCatalog = snapshot.catalog;
-        } catch {
-          modelsDevCatalog = null;
-        }
-      }
-      cfg.command ??= {};
-      const existingCrew = cfg.command["crew"];
-      if (!existingCrew || String(existingCrew.template ?? "").startsWith("(forge crew")) {
-        const agentCount = Object.keys(resolution?.agents ?? {}).length;
-        const primaryAnchorDir = hostAnchors[0] ?? undefined;
-        const template = agentCount > 0 ? crewOrchestrationTemplate(resolution ?? null) : CREW_INIT_TEMPLATE.replaceAll("{paths}", `   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).project}
-   - ${forgeConfigPaths({ projectDir: primaryAnchorDir, homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global}`).replaceAll("{template}", JSON.stringify({ pool: "namespace (REQUIRED for crew-governed dispatch, [a-z0-9-] up to 24 chars — every pool materializes as forge-<ns>-<id>; the global fallback materializes as forge-global-<id>)", agents: { research: { model: "provider/model", thoughtLevel: "low", shape: "readonly", prompt: "short role description — what this agent does" }, coder: { model: "provider/model", thoughtLevel: "low", shape: "write", prompt: "short role description — what this agent does" } } }, null, 2).split(`
-`).map((l) => "   " + l).join(`
-`));
-        const description = agentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance";
-        cfg.command["crew"] = { template, description };
-        crewCommandSnapshot = { template, description };
-      }
-    },
-    get tool() {
-      return forgeDisabled ? {} : forgeTools();
-    },
-    "tool.execute.before": async (input2, output) => {
-      if (process.env.FORGE_PERM_PROBE) {
-        try {
-          appendFileSync2(join6(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} before tool=${JSON.stringify(input2.tool)} session=${input2.sessionID}
-`);
-        } catch {}
-      }
-      if (watchdog.mode !== "off" && (input2.tool === "shell" || input2.tool === "bash") && sessionIsForgeFamily(input2.sessionID)) {
-        const a = output?.args ?? {};
-        const cmdText = typeof a.command === "string" ? a.command : typeof a.cmd === "string" ? a.cmd : undefined;
-        watchdog.track(input2.callID, input2.sessionID, input2.tool, undefined, cmdText !== undefined ? commandNeedle(cmdText) : undefined);
-        if (process.env.FORGE_WATCHDOG_PROBE) {
-          try {
-            appendFileSync2(join6(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} track ${input2.callID} needle=${JSON.stringify(cmdText !== undefined ? commandNeedle(cmdText) : undefined)} rawArgs=${JSON.stringify(output?.args ?? null).slice(0, 200)}
-`);
-          } catch {}
-        }
-      }
-      if (input2.tool === "task") {
-        const a = output?.args ?? {};
-        const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined;
-        const speaker = sessionAgents.get(input2.sessionID);
-        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
-          if (target && target.toLowerCase().startsWith("forge-")) {
-            throw new Error(`[forge:partition] Dispatch refused: "${target}" is a forge-family worker and the current agent ("${speaker}") is outside the forge family. Use the native general/explore subagents, or switch to the forge agent to dispatch forge-* workers.`);
-          }
-        }
-        if (target && target.toLowerCase().startsWith("forge-") && input2.sessionID) {
-          const poolRefusal = await poolGateRefusal(client, input2.sessionID, target);
-          if (poolRefusal)
-            throw new Error(poolRefusal);
-        }
-        const pendingRefusal = crewPendingRefusal(input2.sessionID);
-        if (pendingRefusal)
-          throw new Error(pendingRefusal);
-        if (target && target.toLowerCase().startsWith("forge-") && input2.sessionID) {
-          const complianceRefusal = await crewComplianceRefusalFor(client, input2.sessionID, target);
-          if (complianceRefusal)
-            throw new Error(complianceRefusal);
-        }
-      }
-      if ((input2.tool === "write" || input2.tool === "edit") && input2.sessionID) {
-        const speaker = sessionAgents.get(input2.sessionID);
-        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
-          const a = output?.args ?? {};
-          const raw = typeof a.filePath === "string" ? a.filePath : typeof a.path === "string" ? a.path : undefined;
-          if (raw) {
-            const state = stateForBan(input2.sessionID);
-            const base = state?.worktree ?? hostWorktree ?? "";
-            const abs = (isAbsolute2(raw) ? raw : join6(base, raw)).replaceAll("\\", "/").toLowerCase();
-            if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
-              throw new Error(`[forge:partition] Write refused: "${raw}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`);
-            }
-          }
-        }
-      }
-      if (typeof input2.tool === "string" && isWriteTool(input2.tool)) {
-        const state = stateForBan(input2.sessionID);
-        const active = state ? resolveActivePlan(state) : null;
-        if (active && active.doc.status === "draft") {
-          if (input2.tool === "task") {
-            const a = output?.args ?? {};
-            const target = typeof a.subagent_type === "string" ? a.subagent_type : typeof a.agent === "string" ? a.agent : undefined;
-            const refusal = draftDispatchRefusal(input2.sessionID, target);
-            if (refusal)
-              throw new Error(refusal);
-          } else {
-            throw new Error(`[forge] A plan is in draft; write operations are denied (${input2.tool}). Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.`);
-          }
-        }
-      }
-      if (input2.tool === "forge_shell" && input2.sessionID) {
-        const a = output?.args ?? {};
-        const cmd = typeof a.command === "string" ? a.command : undefined;
-        if (cmd) {
-          const speaker = sessionAgents.get(input2.sessionID);
-          const workerId = speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT ? speaker.slice("forge-".length) : undefined;
-          if (workerId !== undefined) {
-            const def = resolvePools()?.agents[workerId]?.def;
-            if (def !== undefined && effectiveReadonlyShape(def)) {
-              const verdict = classifyExecCommand(cmd);
-              if (verdict.klass === WRITE_CLASS) {
-                const seen = sealFindings.get(input2.sessionID) ?? new Set;
-                if (!seen.has(verdict.indicator)) {
-                  seen.add(verdict.indicator);
-                  sealFindings.set(input2.sessionID, seen);
-                  console.warn(`[forge:seal] session ${input2.sessionID} (readonly worker "${speaker}"): write-class forge_shell command denied — indicator "${verdict.indicator}" (${verdict.detail ?? cmd.slice(0, 60)}). Remedy: "shape": "write" on the agent when its job legitimately mutates.`);
-                }
-                throw new Error(`[forge:seal] Exec refused: this session runs the readonly worker "${speaker}" (explicit "shape": "readonly") and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. READ-CLASS commands (inspection, search, read-only evals) flow normally. If this worker's job legitimately mutates, set "shape": "write" on its forge.json entry. Report this refusal VERBATIM — do not work around it.`);
-              }
-            }
-          } else if (speaker === undefined) {
-            const verdict = classifyExecCommand(cmd);
-            if (verdict.klass === WRITE_CLASS && !sealUnknownNotes.has(input2.sessionID)) {
-              sealUnknownNotes.add(input2.sessionID);
-              console.warn(`[forge:seal] session ${input2.sessionID}: a WRITE-CLASS forge_shell command (${verdict.indicator}) flowed UNSEALED — the session's agent is unknown (fail-open; the exec seal binds explicit-readonly forge-* workers only).`);
-            }
-          }
-        }
-      }
-      if (input2.sessionID && typeof input2.tool === "string") {
-        const speaker = sessionAgents.get(input2.sessionID);
-        if (speaker !== undefined) {
-          if (!isForgeFamilyAgent(speaker) && FORGE_TOOL_SET.has(input2.tool)) {
-            throw new Error(`[forge:partition] Tool refused: "${input2.tool}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`);
-          }
-          if (isForgeFamilyAgent(speaker) && (input2.tool === "shell" || input2.tool === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
-            throw new Error(`[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`);
-          }
-          if (isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT && FORGE_STATE_TOOL_SET.has(input2.tool)) {
-            throw new Error(`[forge:partition] Tool refused: "${input2.tool}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${input2.tool} at the gate.`);
-          }
-        }
-      }
-    },
-    "chat.message": async (input2) => {
-      if (forgeDisabled)
-        return;
-      const raw = input2;
-      if (typeof raw.sessionID === "string" && raw.sessionID) {
-        idleJobSessions.delete(raw.sessionID);
-        if (typeof raw.agent === "string" && raw.agent) {
-          sessionAgents.set(raw.sessionID, raw.agent);
-        }
-      }
-    },
-    "chat.params": async (input2, output) => {
-      if (forgeDisabled)
-        return;
-      const raw = input2;
-      const sessionID = raw.sessionID;
-      if (!sessionID)
-        return;
-      const agentName = typeof raw.agent === "string" ? raw.agent : raw.agent?.name;
-      if (typeof agentName === "string" && agentName)
-        sessionAgents.set(sessionID, agentName);
-      {
-        const capObj = raw.model;
-        const capProvider = typeof raw.model?.providerID === "string" ? raw.model.providerID : "";
-        const capModel = typeof capObj?.modelID === "string" ? capObj.modelID : typeof capObj?.id === "string" ? capObj.id : "";
-        if (capProvider && capModel)
-          sessionModels.set(sessionID, { provider: capProvider, model: capModel });
-      }
-      if (typeof agentName !== "string" || !agentName.startsWith("forge-"))
-        return;
-      const frozen = sessionDepths.get(sessionID);
-      if (frozen) {
-        if (process.env.FORGE_DEPTH_PROBE) {
-          try {
-            appendFileSync2(join6(probeTmp(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} frozen-apply translation=${JSON.stringify(frozen.translation) ?? "null"}
-`);
-          } catch {}
-        }
-        if (frozen.translation)
-          applyDepthTranslation(output.options ?? (output.options = {}), frozen.translation);
-        return;
-      }
-      const agentId = agentName.slice("forge-".length);
-      const def = resolvePools()?.agents[agentId]?.def;
-      if (!def?.thoughtLevel)
-        return;
-      const modelObj = raw.model;
-      const providerID = typeof raw.model?.providerID === "string" ? raw.model.providerID : "";
-      const modelID = typeof modelObj?.modelID === "string" ? modelObj.modelID : typeof modelObj?.id === "string" ? modelObj.id : "";
-      const channel = resolveDepthChannel(providerID, modelID);
-      const { translation, findingMessage } = resolvePinnedDepth(def.thoughtLevel, channel);
-      sessionDepths.set(sessionID, { translation });
-      if (translation) {
-        applyDepthTranslation(output.options ?? (output.options = {}), translation);
-      } else if (findingMessage && !depthFindingNotes.has(agentId)) {
-        depthFindingNotes.set(agentId, findingMessage);
-        console.warn(`[forge:depth] agent forge-${agentId}: ${findingMessage}`);
-      }
-      if (process.env.FORGE_DEPTH_PROBE) {
-        try {
-          appendFileSync2(join6(probeTmp(), "forge-depth-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} prov=${providerID} model=${modelID} depth=${def.thoughtLevel} channel=${JSON.stringify(channel)} translation=${JSON.stringify(translation) ?? "null"} finding=${findingMessage ?? "-"}
-` + `    input=${JSON.stringify(raw).slice(0, 600)}
-` + `    optionsAfter=${JSON.stringify(output.options ?? {})}
-`);
-        } catch {}
-      }
-    },
-    __forgeSubagentsTest: {
-      crews: () => crews,
-      sealFindings: (sessionID) => [...sealFindings.get(sessionID) ?? []],
-      depthState: (sessionID) => sessionDepths.get(sessionID)?.translation ?? null,
-      depthFinding: (agentId) => depthFindingNotes.get(agentId) ?? null,
-      catalog: () => modelsDevCatalog,
-      setCatalog: (c) => {
-        modelsDevCatalog = c;
-      },
-      crewCommand: () => crewCommandSnapshot,
-      materialized: () => materializedSnapshot,
-      resetAnchors: () => {
-        hostAnchors.length = 0;
-        poolResolver = null;
-        poolResolution = null;
-      },
-      anchors: () => [...hostAnchors],
-      resolveNow: () => resolvePools(),
-      workspacePoolOf: (anchor) => sessionPoolFileOf(anchor),
-      dispatchTasks: () => [...dispatchTasks.values()],
-      setSessionModel: (sessionID, identity) => {
-        if (identity === null)
-          sessionModels.delete(sessionID);
-        else
-          sessionModels.set(sessionID, identity);
-      },
-      dispatchQueues: () => [...dispatchQueues.entries()].flatMap(([owner, wishes]) => wishes.map((w) => ({ ownerSession: owner, jobId: w.jobId, agentID: w.agentID }))),
-      setDispatchJournalFs: (factory) => {
-        dispatchJournalFsFactory = factory;
-        dispatchJournals.clear();
-        recoveredDispatchWorkspaces.clear();
-      },
-      dispatchRecoveredWorkspaces: () => [...recoveredDispatchWorkspaces],
-      dispatchJournalText: (worktree) => {
-        try {
-          return journalFor(worktree).fs.read();
-        } catch {
-          return null;
-        }
-      },
-      setSessionAnchorLedgerFs: (factory) => {
-        sessionAnchorLedgerFsFactory = factory;
-        poolGateLedgerNotes.clear();
-        sessionAnchorLedgerMemo.clear();
-        sessionAnchorLedgerAppends = 0;
-      },
-      resetSessionBindings: () => {
-        sessions.clear();
-        anchorPrefNotes.clear();
-        poolGateUnknownNotes.clear();
-        poolGateLedgerNotes.clear();
-        sessionAnchorLedgerMemo.clear();
-        sessionAnchorLedgerAppends = 0;
-      },
-      sessionAnchorLedgerText: () => {
-        try {
-          return sessionAnchorLedgerFs().read();
-        } catch {
-          return null;
-        }
-      },
-      dispatchProgress: (sessionID) => (dispatchProgressQueue.get(sessionID) ?? []).map((notice) => notice.text),
-      dispatchProgressDropped: (sessionID) => [...dispatchProgressDropped.get(sessionID) ?? []],
-      jobTail: (jobId) => jobManager.get(jobId)?.tail ?? null,
-      dispatchGateState: () => {
-        if (!dispatchGate)
-          return null;
-        const live = dispatchGate.liveCounts();
-        const providers = new Set([...Object.keys(live.provider), ...gateProvidersSeen]);
-        const breakers = {};
-        for (const p of providers)
-          breakers[p] = dispatchGate.breakerState(p);
-        return { live, breakers };
-      },
-      resetDispatchGate: () => {
-        dispatchGate = null;
-        admittedGate.clear();
-        gateProvidersSeen.clear();
-        sessionModels.clear();
-        dispatchConfigLoaders.clear();
-      },
-      jobLedger: () => jobManager.ledgerEntries(),
-      gateSnapshot: () => Object.fromEntries(gatePermissionSnapshot),
-      resetGateSnapshot: () => {
-        gatePermissionSnapshot.clear();
-      }
-    },
-    "permission.ask": async (input2, output) => {
-      const meta = input2.metadata ?? {};
-      const permissionField = input2.permission;
-      const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof permissionField === "string" ? permissionField : undefined) ?? input2.id ?? input2.type;
-      if (process.env.FORGE_PERM_PROBE) {
-        try {
-          appendFileSync2(join6(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} ask name=${JSON.stringify(name)} in_status=${output.status} id=${JSON.stringify(input2.id)} type=${JSON.stringify(input2.type)} meta=${JSON.stringify(input2.metadata)}
-`);
-        } catch {}
-      }
-      if (name === "plan_approve" || name === "goal_write" || name === "goal_complete" || name === "goal_resume" || name === "goal_discard") {
-        if (output.status !== "deny")
-          output.status = "ask";
-        return;
-      }
-      if (typeof name === "string" && isWriteTool(name)) {
-        const state = stateForBan(input2.sessionID);
-        const active = state ? resolveActivePlan(state) : null;
-        if (active && active.doc.status === "draft") {
-          output.status = "deny";
-        }
-      }
-    },
-    event: async ({ event }) => {
-      if (event.type === "session.created") {
-        const info = event.properties.info;
-        const worktree = effectiveWorktree(info.worktree, info.directory);
-        if (typeof worktree === "string" && worktree) {
-          ensureSession(info.id, worktree);
-          if (!isRootish(worktree))
-            recoverWorkspaceDispatches(jobClient, worktree);
-        }
-      }
-      if (event.type === "session.idle") {
-        const sessionID = event.properties.sessionID;
-        if (typeof sessionID === "string" && sessionID) {
-          goalProbe(`idle event session=${sessionID}`);
-          idleJobSessions.add(sessionID);
-          scheduleIdleContinuation(client, sessionID);
-          deliverDispatchProgress(sessionID).then(() => deliverJobWakes(sessionID));
-        }
-      }
-      if (event.type === "session.deleted") {
-        const info = event.properties.info;
-        if (typeof info?.id === "string" && info.id)
-          harvestSessionEnd(info.id);
-      }
-      if (event.type === "session.moved") {
-        try {
-          const props = event.properties ?? event;
-          const f = movedEventFields(props);
-          noteSessionMoved(f.sessionID, f.directory);
-        } catch {}
-      }
-      const v1Type = event.type;
-      const v1Props = event.properties ?? {};
-      const v1Session = typeof v1Props.sessionID === "string" && v1Props.sessionID ? v1Props.sessionID : undefined;
-      if (v1Session && (v1Type === "session.execution.succeeded" || v1Type === "session.execution.failed" || v1Type === "session.execution.interrupted")) {
-        const kind = v1Type === "session.execution.succeeded" ? "succeeded" : v1Type === "session.execution.failed" ? "failed" : "interrupted";
-        const detail = kind === "failed" ? executionErrorDetail(v1Props.error) : kind === "interrupted" ? v1Props.reason !== undefined ? String(v1Props.reason) : undefined : undefined;
-        noteDispatchTerminalSignal(v1Session, kind, detail);
-        if (kind === "interrupted") {
-          try {
-            discloseInterruptedParent(v1Session);
-          } catch {}
-        }
-      } else if (v1Session && (v1Type === "session.execution.started" || v1Type === "session.step.started" || v1Type === "session.step.ended")) {
-        noteDispatchChildActivity(v1Session);
-      }
-    },
-    "shell.env": async (input2, output) => {
-      if (watchdog.mode === "off")
-        return;
-      if (!input2.callID)
-        return;
-      if (!sessionIsForgeFamily(input2.sessionID))
-        return;
-      output.env[WATCHDOG_ENV_MARK] = markerValue(input2.callID);
-      watchdog.markSeen(input2.callID);
-      if (process.env.FORGE_WATCHDOG_PROBE) {
-        try {
-          appendFileSync2(join6(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} mark ${input2.callID} hostpid=${process.pid}
-`);
-        } catch {}
-      }
-    },
-    "tool.execute.after": async (input2) => {
-      if ((input2.tool === "shell" || input2.tool === "bash") && watchdog.has(input2.callID)) {
-        watchdog.untrack(input2.callID);
-        if (process.env.FORGE_WATCHDOG_PROBE) {
-          try {
-            appendFileSync2(join6(probeTmp(), "forge-watchdog-probe.log"), `${new Date().toISOString()} untrack ${input2.callID}
-`);
-          } catch {}
-        }
-      }
-      if (typeof input2.tool !== "string")
-        return;
-      const act = turnActivity.get(input2.sessionID);
-      if (act) {
-        if (isWriteTool(input2.tool) || input2.tool === "plan_tick")
-          act.writes++;
-        if (input2.tool === "goal_check" || input2.tool === "forge_shell" || input2.tool === "shell" || input2.tool === "bash")
-          act.checks++;
-      }
-      const crewAct = crewTurnActivity.get(input2.sessionID);
-      if (crewAct) {
-        if (input2.tool === "task")
-          crewAct.dispatches++;
-        if (isWriteTool(input2.tool))
-          crewAct.writes++;
-      }
-    },
-    "experimental.chat.system.transform": async (input2, output) => {
-      if (!input2.sessionID)
-        return;
-      if (!sessionIsForgeFamily(input2.sessionID))
-        return;
-      const crewActive = crews.get(input2.sessionID);
-      if (crewActive && !output.system.some((s) => s.startsWith("[forge:crew-active]"))) {
-        const modeText = crewActive.mode === "pending" ? "PENDING (present the execution-mode choice; every task dispatch is refused until armed)" : "armed (executing)";
-        output.system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict, or crew_close {abandon: true, reason} to re-shard.`);
-      }
-      if (!forgeDisabled && jobStage() < 2 && !output.system.some((s) => s.startsWith("[forge:job-guidance]"))) {
-        output.system.push(jobsKeepBuiltinShell ? "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion." : "[forge:job-guidance] Every shell command — quick ones included — goes through forge_shell: the builtin shell/bash tools are refused on this agent, so never try them first. forge_shell returns on exit/success/idle with a jobId instead of blocking indefinitely; long-running or non-exiting commands use run_in_background. Manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.");
-      }
-      const state = sessions.get(input2.sessionID);
-      if (!state)
-        return;
-      const active = resolveActivePlan(state);
-      if (active) {
-        const p = progressOf(active.doc);
-        const rel = relFrom(state.worktree, active.path);
-        const rule = active.doc.status === "draft" ? "while in draft, write operations are denied at the tool layer; present the plan then end your turn to await the user's review — on feedback revise via plan_write and re-present; call plan_approve only after the user explicitly approves in chat (their confirmation dialog is the final gate); /plan discard to abandon" : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close — the plugin re-runs the frozen verification checks itself (fail-closed, no dialog) and writes an evidence summary the user reviews asynchronously";
-        output.system.push(`[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`);
-      }
-      if (forgeDisabled)
-        return;
-      const goal = resolveLiveGoal(state);
-      if (goal) {
-        const rel = relFrom(state.worktree, goal.path);
-        const d = goal.doc;
-        const rule = d.status === "active" ? "continue working the success criteria; call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself); if genuinely blocked call goal_pause with the blocker" : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it";
-        output.system.push(`[forge:goal-notice] This session is bound to a goal: ${rel} (status: ${d.status}${d.stopReason ? `, stopped: ${d.stopReason}` : ""}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Rule: ${rule}. If the user has not mentioned the goal yet, relay its path and status to them in one short line at the start of your reply.`);
-      }
-    },
-    "experimental.session.compacting": async (input2, output) => {
-      if (forgeDisabled)
-        return;
-      if (!input2.sessionID)
-        return;
-      if (!sessionIsForgeFamily(input2.sessionID))
-        return;
-      const state = sessions.get(input2.sessionID);
-      if (!state)
-        return;
-      const goal = resolveLiveGoal(state);
-      if (!goal)
-        return;
-      const d = goal.doc;
-      output.context.push(`[forge:goal-brief] A live goal governs this session: ${relFrom(state.worktree, goal.path)} (status: ${d.status}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Goal: ${d.goal}. Success criteria:
-${d.criteria.map((c, i) => `${i + 1}. ${c}`).join(`
-`)}
-Post-compaction turns must keep following this goal and its constraints.`);
-    },
-    "experimental.compaction.autocontinue": async (input2, output) => {
-      if (forgeDisabled)
-        return;
-      if (!input2.sessionID)
-        return;
-      const state = sessions.get(input2.sessionID);
-      if (!state)
-        return;
-      const goal = resolveLiveGoal(state);
-      if (goal && sessionIsForgeFamily(input2.sessionID))
-        output.enabled = false;
-    }
-  };
-};
 var v2HostAnchors = new Map;
-function v2AnchorCandidates(ctx) {
+function v2AnchorCandidates(ctx, includeCwd = true) {
   const out = [];
   try {
     for (const reader of [ctx.location?.worktree, ctx.location?.directory]) {
@@ -23680,7 +18947,8 @@ function v2AnchorCandidates(ctx) {
         out.push(v);
     }
   } catch {}
-  out.push(process.cwd());
+  if (includeCwd)
+    out.push(process.cwd());
   return out;
 }
 function v2ToolInputSchema(args) {
@@ -23704,88 +18972,6 @@ function wrapV2ToolResult(res) {
   }
   return { content: res };
 }
-var v2SessionRuleApi = null;
-var SESSION_RESCUE_RULE = { action: "forge_shell", resource: "*", effect: "allow" };
-var sessionRescueInjected = new Set;
-var sessionRescueDisclosed = new Set;
-function isSessionRescueRule(rule) {
-  if (rule === null || typeof rule !== "object")
-    return false;
-  const o = rule;
-  return o.action === "forge_shell" && o.resource === "*" && o.effect === "allow";
-}
-function isForgeWorkerSession(sessionID) {
-  if (!sessionID)
-    return false;
-  const agent = sessionAgents.get(sessionID);
-  return typeof agent === "string" && agent.startsWith("forge-");
-}
-async function ensureSessionRescueRule(sessionID) {
-  if (!v2SessionRuleApi)
-    return false;
-  if (sessionRescueInjected.has(sessionID))
-    return true;
-  if (explicitForgeShellPosture() === "deny")
-    return false;
-  try {
-    const record2 = await v2SessionRuleApi.get(sessionID);
-    const current = record2 !== null && typeof record2 === "object" ? record2.permissions : undefined;
-    const merged = Array.isArray(current) ? current.slice() : [];
-    if (merged.some(isSessionRescueRule)) {
-      sessionRescueInjected.add(sessionID);
-      return true;
-    }
-    merged.push({ ...SESSION_RESCUE_RULE });
-    await v2SessionRuleApi.update({ sessionID, permissions: merged });
-    sessionRescueInjected.add(sessionID);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function markSessionRescueDisclosed(sessionID) {
-  if (sessionRescueDisclosed.has(sessionID))
-    return;
-  sessionRescueDisclosed.add(sessionID);
-  console.warn(`[forge:session-rescue] warn: worker session ${sessionID} — the host permission assert fell back to deny-all (cross-anchor agent resolution; README "Native mode — worker shell rescue"); the documented session-rule rescue let this call through.`);
-}
-var sessionRescueAttached = new Set;
-function takeSessionRescueDisclosure(sessionID) {
-  if (!sessionRescueDisclosed.has(sessionID) || sessionRescueAttached.has(sessionID))
-    return null;
-  sessionRescueAttached.add(sessionID);
-  return "[forge:session-rescue] cross-anchor deny-all rescued via the session rule (see diagnostics)";
-}
-var __workerShellRescueTestSurface = {
-  setPosture(value) {
-    v2PostureTestOverride = { value };
-  },
-  clearPosture() {
-    v2PostureTestOverride = null;
-  },
-  setHostSeen(value) {
-    v2HostSeen = value;
-  },
-  setSessionRuleApi(api2) {
-    v2SessionRuleApi = api2;
-  },
-  setFamily(sessionID, agent) {
-    if (agent === undefined)
-      sessionAgents.delete(sessionID);
-    else
-      sessionAgents.set(sessionID, agent);
-  },
-  ensure: ensureSessionRescueRule,
-  isWorker: isForgeWorkerSession,
-  gate: forgeShellGate,
-  markDisclosed: markSessionRescueDisclosed,
-  takeDisclosure: takeSessionRescueDisclosure,
-  resetState() {
-    sessionRescueInjected.clear();
-    sessionRescueDisclosed.clear();
-    sessionRescueAttached.clear();
-  }
-};
 var HOST_DIRECTORY_WALK_MAX = 8;
 async function hostSessionDirectory(anchorClient, sessionID) {
   const get = anchorClient?.session?.get;
@@ -23865,11 +19051,35 @@ ${V2_DEFAULT_DIRECTORY_NOTE}: ${defaultDirectory}` };
 }
 var __sessionAnchorTestSurface = {
   hostSessionDirectory,
+  resolveSessionAnchorForPools,
+  workspacePoolOf: sessionPoolFileOf,
+  resolvePools,
   resolveToolContext: (raw, anchorClient, assertFn) => v2ToolContext(raw, anchorClient ?? undefined, assertFn ?? null),
   worktreeOf: (sessionID) => sessions.get(sessionID)?.worktree ?? null,
   bindChildToDirectory,
   sessionAnchorLedgerPath,
   noteLedgerBinding: noteSessionAnchorLedgerBinding,
+  setSessionAnchorLedgerFs: (factory) => {
+    sessionAnchorLedgerFsFactory = factory;
+    poolGateLedgerNotes.clear();
+    sessionAnchorLedgerMemo.clear();
+    sessionAnchorLedgerAppends = 0;
+  },
+  resetSessionBindings: () => {
+    sessions.clear();
+    anchorPrefNotes.clear();
+    poolGateUnknownNotes.clear();
+    poolGateLedgerNotes.clear();
+    sessionAnchorLedgerMemo.clear();
+    sessionAnchorLedgerAppends = 0;
+  },
+  sessionAnchorLedgerText: () => {
+    try {
+      return sessionAnchorLedgerFs().read();
+    } catch {
+      return null;
+    }
+  },
   initializedDirectories: () => [...v2InitializedDirs],
   resetInitializedDirectories: () => {
     v2InitializedDirs.clear();
@@ -23902,7 +19112,7 @@ function v2AgentNameOf(src) {
   }
   return;
 }
-var V2_PERMISSION_DOORS = new Set(GATE_PERMISSION_KEYS.filter((key) => key !== "forge_shell"));
+var V2_PERMISSION_DOORS = new Set(GATE_PERMISSION_KEYS);
 var __permissionDoorsTestSurface = {
   gateKeys: GATE_PERMISSION_KEYS,
   v2Doors: V2_PERMISSION_DOORS
@@ -23911,16 +19121,16 @@ function v2RegisterPermissionBelt(ctx) {
   if (typeof ctx.permission?.hook !== "function")
     return;
   try {
-    ctx.permission.hook("evaluate", async (raw) => {
+    Promise.resolve(ctx.permission.hook("evaluate", async (raw) => {
       try {
         const evalInput = raw !== null && typeof raw === "object" ? raw : null;
         if (!evalInput || typeof evalInput.effect !== "string")
           return;
         const meta = evalInput.metadata !== null && typeof evalInput.metadata === "object" ? evalInput.metadata : {};
-        const name = (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof evalInput.action === "string" ? evalInput.action : undefined);
+        const name = evalInput.action === NATIVE_TOOL_VOCAB.dispatchTool ? evalInput.action : (typeof meta.tool === "string" ? meta.tool : undefined) ?? (typeof evalInput.action === "string" ? evalInput.action : undefined);
         if (process.env.FORGE_PERM_PROBE) {
           try {
-            appendFileSync2(join6(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}
+            appendFileSync(join5(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-evaluate name=${JSON.stringify(name)} effect=${evalInput.effect} raw=${JSON.stringify(raw).slice(0, 300)}
 `);
           } catch {}
         }
@@ -23934,12 +19144,22 @@ function v2RegisterPermissionBelt(ctx) {
           const state = stateForBan(sessionID);
           const active = state ? resolveActivePlan(state) : null;
           if (active && active.doc.status === "draft") {
+            if (evalInput.action === NATIVE_TOOL_VOCAB.dispatchTool && state) {
+              const resources = evalInput.resources;
+              const target = Array.isArray(resources) && resources.length === 1 && typeof resources[0] === "string" ? resources[0] : undefined;
+              const refusal = nativeDraftDispatchRefusal(state, target);
+              if (!refusal)
+                return;
+              evalInput.effect = "deny";
+              evalInput.message = refusal;
+              return;
+            }
             evalInput.effect = "deny";
             evalInput.message = "[forge] A plan is in draft; write operations are denied. Switch back to the forge agent to present it and complete plan approval (plan_approve), or run /plan discard to abandon the plan.";
           }
         }
       } catch {}
-    });
+    })).catch(() => {});
   } catch {}
 }
 function v2ToolEventArgs(raw) {
@@ -23967,17 +19187,26 @@ function v2RegisterToolHooks(ctx, anchorClient) {
   if (typeof ctx.tool?.hook !== "function")
     return;
   try {
-    ctx.tool.hook("execute.before", async (raw) => {
+    Promise.resolve(ctx.tool.hook("execute.before", async (raw) => {
       const { tool: tool3, sessionID, args } = v2ToolEventArgs(raw);
       const evAgent = v2AgentNameOf(raw);
       if (evAgent && sessionID)
         sessionAgents.set(sessionID, evAgent);
       if (process.env.FORGE_PERM_PROBE) {
         try {
-          appendFileSync2(join6(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool3)} session=${JSON.stringify(sessionID)}
+          appendFileSync(join5(probeTmp(), "forge-perm-probe.log"), `${new Date().toISOString()} v2-before tool=${JSON.stringify(tool3)} session=${JSON.stringify(sessionID)}
 `);
         } catch {}
       }
+      const nativeDispatch = tool3 === NATIVE_TOOL_VOCAB.dispatchTool;
+      const goalWork = typeof tool3 === "string" && (isWriteTool(tool3) || tool3 === "goal_check");
+      const initialState = goalWork && sessionID ? sessions.get(sessionID) : undefined;
+      const initialGoal = initialState ? resolveLiveGoal(initialState) : null;
+      const initialArm = initialGoal?.doc.session === sessionID ? initialGoal : null;
+      const nativeTarget = nativeDispatch && typeof args.agent === "string" ? args.agent : undefined;
+      const nativeAnchor = nativeDispatch && sessionID ? await resolveSessionAnchorForPools(anchorClient, sessionID) : "";
+      if (nativeAnchor && sessionID)
+        ensureSession(sessionID, nativeAnchor);
       if (tool3 === "task") {
         const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined;
         const speaker = sessionID ? sessionAgents.get(sessionID) : undefined;
@@ -24000,17 +19229,14 @@ function v2RegisterToolHooks(ctx, anchorClient) {
             throw new Error(complianceRefusal);
         }
       }
-      if ((tool3 === "write" || tool3 === "edit") && sessionID) {
-        const speaker = sessionAgents.get(sessionID);
-        if (speaker !== undefined && !isForgeFamilyAgent(speaker)) {
-          const raw2 = typeof args.filePath === "string" ? args.filePath : typeof args.path === "string" ? args.path : undefined;
-          if (raw2) {
-            const state = await stateForCheck(sessionID, anchorClient);
-            const base = banBaseDirectory(state);
-            const abs = (isAbsolute2(raw2) ? raw2 : join6(base || "/", raw2)).replaceAll("\\", "/").toLowerCase();
-            if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
-              throw new Error(`[forge:partition] Write refused: "${raw2}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`);
-            }
+      if (tool3 === "write" || tool3 === "edit") {
+        const raw2 = typeof args.filePath === "string" ? args.filePath : typeof args.path === "string" ? args.path : undefined;
+        if (raw2) {
+          const state = sessionID ? await stateForCheck(sessionID, anchorClient) : null;
+          const base = banBaseDirectory(state);
+          const abs = (isAbsolute3(raw2) ? raw2 : join5(base || "/", raw2)).replaceAll("\\", "/").toLowerCase();
+          if (abs.includes("/.opencode/plan/") || abs.includes("/.opencode/goal/")) {
+            throw new Error(`[forge:partition] Write refused: "${raw2}" is inside the forge state directories (.opencode/plan, .opencode/goal), which belong to the forge agent in this workspace.`);
           }
         }
       }
@@ -24018,7 +19244,11 @@ function v2RegisterToolHooks(ctx, anchorClient) {
         const state = await stateForCheck(sessionID, anchorClient);
         const active = state ? resolveActivePlan(state) : null;
         if (active && active.doc.status === "draft") {
-          if (tool3 === "task") {
+          if (nativeDispatch && state) {
+            const refusal = nativeDraftDispatchRefusal(state, nativeTarget);
+            if (refusal)
+              throw new Error(refusal);
+          } else if (tool3 === "task") {
             const target = typeof args.subagent_type === "string" ? args.subagent_type : typeof args.agent === "string" ? args.agent : undefined;
             const refusal = draftDispatchRefusalForState(state, target);
             if (refusal)
@@ -24028,75 +19258,113 @@ function v2RegisterToolHooks(ctx, anchorClient) {
           }
         }
       }
-      if (tool3 === "forge_shell" && sessionID) {
-        const cmd = typeof args.command === "string" ? args.command : undefined;
-        if (cmd) {
-          const speaker = sessionAgents.get(sessionID);
-          const workerId = speaker !== undefined && isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT ? speaker.slice("forge-".length) : undefined;
-          if (workerId !== undefined) {
-            const def = resolvePools()?.agents[workerId]?.def;
-            if (def !== undefined && effectiveReadonlyShape(def)) {
-              const verdict = classifyExecCommand(cmd);
-              if (verdict.klass === WRITE_CLASS) {
-                const seen = sealFindings.get(sessionID) ?? new Set;
-                if (!seen.has(verdict.indicator)) {
-                  seen.add(verdict.indicator);
-                  sealFindings.set(sessionID, seen);
-                  console.warn(`[forge:seal] session ${sessionID} (readonly worker "${speaker}"): write-class forge_shell command denied — indicator "${verdict.indicator}" (${verdict.detail ?? cmd.slice(0, 60)}). Remedy: "shape": "write" on the agent when its job legitimately mutates.`);
-                }
-                throw new Error(`[forge:seal] Exec refused: this session runs the readonly worker "${speaker}" (explicit "shape": "readonly") and the command was classified WRITE-CLASS — indicator "${verdict.indicator}"${verdict.detail ? ` (${verdict.detail})` : ""}. READ-CLASS commands (inspection, search, read-only evals) flow normally. If this worker's job legitimately mutates, set "shape": "write" on its forge.json entry. Report this refusal VERBATIM — do not work around it.`);
-              }
-            }
-          } else if (speaker === undefined) {
-            const verdict = classifyExecCommand(cmd);
-            if (verdict.klass === WRITE_CLASS && !sealUnknownNotes.has(sessionID)) {
-              sealUnknownNotes.add(sessionID);
-              console.warn(`[forge:seal] session ${sessionID}: a WRITE-CLASS forge_shell command (${verdict.indicator}) flowed UNSEALED — the session's agent is unknown (fail-open; the exec seal binds explicit-readonly forge-* workers only).`);
-            }
-          }
-        }
-      }
+      assertHarnessAgent(tool3, evAgent ?? (sessionID ? sessionAgents.get(sessionID) : undefined));
       if (sessionID && typeof tool3 === "string") {
         const speaker = sessionAgents.get(sessionID);
         if (speaker !== undefined) {
           if (!isForgeFamilyAgent(speaker) && FORGE_TOOL_SET.has(tool3)) {
             throw new Error(`[forge:partition] Tool refused: "${tool3}" belongs to the forge agent family and the current agent ("${speaker}") is outside it. Switch to forge (Tab) to use forge tooling.`);
           }
-          if (isForgeFamilyAgent(speaker) && (tool3 === "shell" || tool3 === "bash") && !jobsKeepBuiltinShell && jobStage() < 2) {
-            throw new Error(`[forge:partition] Builtin shell refused: the forge family executes through forge_shell (jobs.keepBuiltinShell or jobs.mode: "native" restores the builtin shell). Re-issue the command through forge_shell.`);
-          }
           if (isForgeFamilyAgent(speaker) && speaker.toLowerCase() !== FORGE_AGENT && FORGE_STATE_TOOL_SET.has(tool3)) {
             throw new Error(`[forge:partition] Tool refused: "${tool3}" is a harness state tool reserved for the primary forge agent; "${speaker}" is a forge worker. Report your findings back to the orchestrating session — the primary agent calls ${tool3} at the gate.`);
           }
         }
       }
-    });
-    ctx.tool.hook("execute.after", async (raw) => {
+      let missingPoolRefusal;
+      let dispatchAnchor = nativeAnchor;
+      if (nativeDispatch && nativeTarget?.toLowerCase().startsWith("forge-") && sessionID) {
+        dispatchAnchor = await resolveSessionAnchorForPools(anchorClient, sessionID);
+        const poolRefusal = poolGateRefusalAtAnchor(dispatchAnchor, sessionID, nativeTarget, true, (refusal) => {
+          missingPoolRefusal = refusal;
+        });
+        if (poolRefusal)
+          throw new Error(poolRefusal);
+      }
+      if (nativeDispatch) {
+        const pendingRefusal = crewPendingRefusal(sessionID);
+        if (pendingRefusal)
+          throw new Error(pendingRefusal);
+      }
+      if (nativeDispatch && nativeTarget?.toLowerCase().startsWith("forge-") && sessionID && dispatchAnchor) {
+        const complianceRefusal = crewComplianceRefusalAtAnchor(dispatchAnchor, sessionID, nativeTarget);
+        if (complianceRefusal)
+          throw new Error(complianceRefusal);
+        if (nativeRosterActive()) {
+          const stale = rosterStaleRefusal(dispatchAnchor);
+          if (stale)
+            throw new Error(stale);
+        }
+      }
+      if (missingPoolRefusal)
+        throw new Error(missingPoolRefusal);
+      if (goalWork && sessionID) {
+        const state = sessions.get(sessionID);
+        const fresh = state ? resolveLiveGoal(state) : null;
+        const owns = fresh?.doc.session === sessionID;
+        const forgeSpeaker = sessionIsForgeFamily(sessionID);
+        if (forgeSpeaker && owns && fresh?.doc.status === "paused" || crews.get(sessionID)?.goalGoverned && (!owns || fresh?.doc.status !== "active") || initialArm && (!owns || fresh?.doc.status !== "active" || fresh.path !== initialArm.path || fresh.doc.revision !== initialArm.doc.revision || fresh.doc.armedAt !== initialArm.doc.armedAt)) {
+          throw new Error("[forge:goal] Autonomous work refused: the goal is paused or its authorization changed. Ask the user to resume or explicitly re-arm before starting new work.");
+        }
+      }
+    })).catch(() => {});
+    Promise.resolve(ctx.tool.hook("execute.after", async (raw) => {
       try {
-        const { tool: tool3, sessionID } = v2ToolEventArgs(raw);
+        const { tool: tool3, sessionID, id, args } = v2ToolEventArgs(raw);
         if (typeof tool3 !== "string" || !sessionID)
           return;
         const act = turnActivity.get(sessionID);
-        if (act) {
-          if (isWriteTool(tool3) || tool3 === "plan_tick")
-            act.writes++;
-          if (tool3 === "goal_check" || tool3 === "forge_shell" || tool3 === "shell" || tool3 === "bash")
-            act.checks++;
+        const event = raw;
+        const activityEvent = {
+          messageID: typeof event.messageID === "string" ? event.messageID : undefined,
+          status: event.status,
+          codemode: typeof event.codemode === "boolean" ? event.codemode : undefined
+        };
+        if (tool3 === "subagent") {
+          const result = event.result;
+          const metadata = result?.metadata;
+          const accepted = event.status === "completed" && id && metadata?.status === "running" && typeof metadata.sessionID === "string" && metadata.sessionID;
+          const state = sessions.get(sessionID);
+          const goal = state && resolveLiveGoal(state);
+          const owns = goal?.doc.status === "active" && goal.doc.session === sessionID;
+          const seen = goalAcceptedCalls.get(sessionID) ?? new Map;
+          if (accepted && id && !seen.has(id)) {
+            if (owns) {
+              seen.set(id, metadata.sessionID);
+              goalAcceptedCalls.set(sessionID, seen);
+              const watched = goalNativeWatch.get(sessionID) ?? new Set;
+              watched.add(metadata.sessionID);
+              goalNativeWatch.set(sessionID, watched);
+            }
+            if (act)
+              observeGoalActivity(act, tool3, isWriteTool(tool3), id, args, result, activityEvent);
+          } else if (!accepted && act)
+            observeGoalActivity(act, tool3, isWriteTool(tool3), id, args, undefined, activityEvent);
+        } else if (act)
+          observeGoalActivity(act, tool3, isWriteTool(tool3), id, event.codemode === true ? event.input : args, event.result ?? event.output, activityEvent);
+        const crew = crews.get(sessionID);
+        if (crew?.mode === "executing" && tool3 === NATIVE_TOOL_VOCAB.dispatchTool) {
+          const round = crewAcceptedRound(id, args, raw);
+          if (round && !crew.rounds?.some((r) => r.id === round.id)) {
+            (crew.rounds ??= []).push(round);
+            appendCrewRecord(crew.recordPath, "wave dispatch", [`${round.description}: ${round.id} → ${round.childID} (${round.agent}${round.agent.startsWith("forge-") ? "" : ", native fallback"})`]);
+          }
         }
         const crewAct = crewTurnActivity.get(sessionID);
         if (crewAct) {
-          if (tool3 === "task")
+          if (id && crewAct.seen?.has(id))
+            return;
+          if (id)
+            (crewAct.seen ??= new Set).add(id);
+          if (tool3 === "subagent" || tool3 === "task")
             crewAct.dispatches++;
           if (isWriteTool(tool3))
             crewAct.writes++;
         }
       } catch {}
-    });
+    })).catch(() => {});
   } catch {}
 }
 function v2ContextInjection(raw) {
-  if (forgeDisabled)
-    return;
   const o = raw !== null && typeof raw === "object" ? raw : {};
   const sessionID = v2PickStr(o, "sessionID", "sessionId");
   if (!sessionID)
@@ -24104,15 +19372,6 @@ function v2ContextInjection(raw) {
   const agentName = v2AgentNameOf(o);
   if (agentName)
     sessionAgents.set(sessionID, agentName);
-  if (agentName === FORGE_AGENT)
-    ensureSessionRescueRule(sessionID).catch(() => {});
-  {
-    const capObj = o.model;
-    const capProvider = typeof capObj?.providerID === "string" ? capObj.providerID : "";
-    const capModel = typeof capObj?.modelID === "string" ? capObj.modelID : typeof capObj?.id === "string" ? capObj.id : "";
-    if (capProvider && capModel)
-      sessionModels.set(sessionID, { provider: capProvider, model: capModel });
-  }
   if (agentName && agentName.startsWith("forge-")) {
     const agentId = agentName.slice("forge-".length);
     const pinnedDef = resolvePools()?.agents[agentId]?.def;
@@ -24134,7 +19393,7 @@ function v2ContextInjection(raw) {
         }
         if (process.env.FORGE_MODEL_PROBE) {
           try {
-            appendFileSync2(join6(probeTmp(), "forge-model-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} rewrite ${before} -> ${JSON.stringify(o.model)}
+            appendFileSync(join5(probeTmp(), "forge-model-probe.log"), `${new Date().toISOString()} sid=${sessionID} agent=${agentName} rewrite ${before} -> ${JSON.stringify(o.model)}
 `);
           } catch {}
         }
@@ -24174,11 +19433,8 @@ function v2ContextInjection(raw) {
   const system = o.system;
   const crewActive = crews.get(sessionID);
   if (crewActive && !system.some((s) => typeof s === "string" && s.startsWith("[forge:crew-active]"))) {
-    const modeText = crewActive.mode === "pending" ? "PENDING (present the execution-mode choice; every task dispatch is refused until armed)" : "armed (executing)";
-    system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; finish with crew_close when every subtask has a verdict, or crew_close {abandon: true, reason} to re-shard.`);
-  }
-  if (!forgeDisabled && jobStage() < 2 && !system.some((s) => typeof s === "string" && s.startsWith("[forge:job-guidance]"))) {
-    system.push(jobsKeepBuiltinShell ? "[forge:job-guidance] Long-running or possibly non-exiting shell commands (dev servers, watchers, installers, anything spawning detached children) go through forge_shell, never the builtin shell: it returns on idle/success/exit with a jobId instead of blocking indefinitely; manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion." : "[forge:job-guidance] Every shell command — quick ones included — goes through forge_shell: the builtin shell/bash tools are refused on this agent, so never try them first. forge_shell returns on exit/success/idle with a jobId instead of blocking indefinitely; long-running or non-exiting commands use run_in_background. Manage jobs with forge_jobs. Delegated agents: collect your job results with forge_jobs poll before yielding your conclusion.");
+    const modeText = crewActive.mode === "pending" ? "PENDING (present the execution-mode choice; do not start subagent work until the user authorizes execution)" : "armed (executing)";
+    system.push(`[forge:crew-active] A crew is ${modeText} in this session: "${crewActive.objective}" (started ${crewActive.startedAt}). A second /crew must be refused; wait without polling or sleeping for verified settlement of all work rounds and collect evidence for every declared subtask before crew_close (terminal status alone is not PASS), or crew_close {abandon: true, reason} to re-shard, subject to existing approvals.`);
   }
   const state = sessions.get(sessionID);
   if (!state)
@@ -24190,19 +19446,15 @@ function v2ContextInjection(raw) {
     const rule = active.doc.status === "draft" ? "while in draft, write operations are denied at the tool layer; present the plan then end your turn to await the user's review — on feedback revise via plan_write and re-present; call plan_approve only after the user explicitly approves in chat (their confirmation dialog is the final gate); /plan discard to abandon" : "call plan_tick immediately after each completed task; when all are done, self-check every acceptance criterion and call plan_close — the plugin re-runs the frozen verification checks itself (fail-closed, no dialog) and writes an evidence summary the user reviews asynchronously";
     system.push(`[forge:plan-notice] This session is bound to a plan: ${rel} (status: ${active.doc.status}, ${p.done}/${p.total} tasks done). Rule: ${rule}. If the user has not mentioned this plan yet, relay its path and progress to them in one short line at the start of your reply.`);
   }
-  if (forgeDisabled)
-    return;
   const goal = resolveLiveGoal(state);
   if (goal) {
     const rel = relFrom(state.worktree, goal.path);
     const d = goal.doc;
-    const rule = d.status === "active" ? "continue working the success criteria; call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself); if genuinely blocked call goal_pause with the blocker" : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it";
+    const rule = d.status === "active" ? "work the success criteria within the approved contract and remaining budgets; wait for verified settlement of any outstanding crew rounds before advancing; during genuine host waiting end your turn without polling or sleeping, the minute budget still runs; meaningful read-only work, commits and checks with new evidence are productive, no write, shell command or git diff is required every turn, and repeated identical checks without new evidence are not progress; stop at either budget limit or loss of authorization, do not start further autonomous work (already accepted host work may finish); call goal_check for host-run feedback and goal_complete at the gate (it re-runs every check itself and asks the user); if globally blocked call goal_pause with the concrete blocker, but if independent authorized work remains after a local issue continue that work" : "the goal is paused; if the user clearly asks to continue (e.g. 'continue'/'resume'), call goal_resume — the user confirms in a dialog; ordinary chat never reactivates it; do not start new autonomous work, including goal-governed crew work; already accepted host work may finish";
     system.push(`[forge:goal-notice] This session is bound to a goal: ${rel} (status: ${d.status}${d.stopReason ? `, stopped: ${d.stopReason}` : ""}, revision ${d.revision}, ${d.turnsUsed}/${d.maxTurns} turns used). Rule: ${rule}. If the user has not mentioned the goal yet, relay its path and status to them in one short line at the start of your reply.`);
   }
 }
 function v2CompactionInjection(raw) {
-  if (forgeDisabled)
-    return;
   const o = raw !== null && typeof raw === "object" ? raw : {};
   const sessionID = v2PickStr(o, "sessionID", "sessionId");
   if (!sessionID)
@@ -24223,58 +19475,112 @@ ${d.criteria.map((c, i) => `${i + 1}. ${c}`).join(`
 `)}
 Post-compaction turns must keep following this goal and its constraints.`);
 }
-function v2RegisterSessionHooks(ctx, goalClient) {
+async function v2RegisterSessionHooks(ctx, goalClient) {
   const out = { disposables: [], idleHook: false };
   if (typeof ctx.session?.hook !== "function")
     return out;
-  const register = (name, cb) => {
+  const register = async (name, cb) => {
     try {
-      const registration = ctx.session.hook(name, cb);
+      const registration = await ctx.session.hook(name, cb);
       if (registration !== null && typeof registration === "object" && typeof registration.dispose === "function") {
-        const dispose = registration.dispose;
-        out.disposables.push(() => void dispose());
+        out.disposables.push(() => registration.dispose());
       }
       return true;
     } catch {
       return false;
     }
   };
-  register("prompt", async (raw) => {
+  await register("prompt", async (raw) => {
     try {
-      if (forgeDisabled)
-        return;
       const sessionID = v2PickStr(raw, "sessionID", "sessionId");
       if (!sessionID)
         return;
-      idleJobSessions.delete(sessionID);
       const agent = v2AgentNameOf(raw);
       if (agent)
         sessionAgents.set(sessionID, agent);
     } catch {}
   });
-  register("context", async (raw) => {
+  await register("context", async (raw) => {
     try {
       v2ContextInjection(raw);
     } catch {}
   });
-  register("compaction", async (raw) => {
+  await register("compaction", async (raw) => {
     try {
       v2CompactionInjection(raw);
     } catch {}
   });
-  out.idleHook = register("experimental.idle", async (raw) => {
+  out.idleHook = await register("experimental.idle", async (raw) => {
     const sessionID = v2PickStr(raw, "sessionID", "sessionId");
     if (!sessionID)
       return;
-    v2HandleIdle(sessionID, goalClient);
+    if (hasIdleBackgroundShell(raw, sessionID))
+      goalBackgroundHeld.add(sessionID);
+    else if (idleBackgroundKnown(raw))
+      goalBackgroundHeld.delete(sessionID);
+    v2HandleIdle(sessionID, goalClient, goalBackgroundHeld.has(sessionID));
   });
   return out;
+}
+async function v2StopNative(ctx, sessionID) {
+  const svc = discoverServiceHttp();
+  const request = async (path, method = "GET") => {
+    if (!svc)
+      throw new Error("service unavailable");
+    const url2 = new URL(svc.url);
+    if (!["localhost", "127.0.0.1", "[::1]"].includes(url2.hostname))
+      throw new Error("non-local service");
+    const res = await fetch(svc.url + path, {
+      method,
+      redirect: "error",
+      signal: AbortSignal.timeout(1500),
+      headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` }
+    });
+    if (!res.ok)
+      throw new Error("stop service request failed");
+    return res.status === 204 ? undefined : await res.json();
+  };
+  let directory = "";
+  return stopNative(sessionID, {
+    children: async (parent, cursor) => {
+      if (ctx.session?.list) {
+        try {
+          return await ctx.session.list({ parentID: parent, limit: STOP_LIST_LIMIT, ...cursor ? { cursor } : {} });
+        } catch {}
+      }
+      return request(`/api/session?parentID=${encodeURIComponent(parent)}&limit=${STOP_LIST_LIMIT}${cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}`);
+    },
+    context: async (parent) => {
+      if (!ctx.session?.context)
+        throw new Error("context unavailable");
+      return ctx.session.context({ sessionID: parent });
+    },
+    shells: async () => {
+      if (!svc)
+        throw new Error("service unavailable");
+      if (!directory) {
+        const rec = await ctx.session?.get?.({ sessionID });
+        directory = rec?.location?.directory ?? rec?.directory ?? "";
+      }
+      if (!directory)
+        throw new Error("directory unknown");
+      return request(`/api/shell?location[directory]=${encodeURIComponent(directory)}`);
+    },
+    active: () => request("/api/session/active"),
+    removeShell: (id) => request(`/api/shell/${encodeURIComponent(id)}?location[directory]=${encodeURIComponent(directory)}`, "DELETE"),
+    interrupt: async (id) => {
+      if (!ctx.session?.interrupt)
+        throw new Error("interrupt unavailable");
+      return ctx.session.interrupt({ sessionID: id });
+    },
+    wait: () => new Promise((resolve4) => setTimeout(resolve4, 200))
+  });
 }
 async function v2RegisterCommands(ctx) {
   if (typeof ctx.command?.transform !== "function")
     return;
   try {
-    await ctx.command.transform(async (editor) => {
+    await ctx.command.transform((editor) => {
       const addFn = editor?.add;
       if (typeof addFn !== "function") {
         console.warn("forge: command domain editor drifted — add() missing; commands not registered");
@@ -24290,7 +19596,19 @@ async function v2RegisterCommands(ctx) {
               return;
             const promptShape = input?.prompt;
             const typed = promptShape && typeof promptShape === "object" && typeof promptShape.text === "string" ? promptShape.text : undefined;
-            const text = composeCommandPrompt(template(), typed);
+            const stop = name === "forge" && typed?.trim() === "stop";
+            if (!stop) {
+              let record4;
+              try {
+                record4 = await ctx.session.get?.({ sessionID });
+              } catch {}
+              if (record4?.agent !== FORGE_AGENT || record4.parentID !== undefined) {
+                throw new Error(`[forge:command] /${name} belongs to the primary forge agent. Switch to forge (Tab) and rerun it there.`);
+              }
+            }
+            const text = stop ? await v2StopNative(ctx, sessionID) : composeCommandPrompt(template().split(`
+`).filter((line) => !line.startsWith("FAMILY GUARD (step 0")).join(`
+`), typed);
             const delivery = typeof input?.delivery === "string" && input.delivery ? input.delivery : undefined;
             try {
               await ctx.session.prompt(delivery ? { sessionID, text, delivery } : { sessionID, text });
@@ -24320,8 +19638,8 @@ async function v2RegisterCommands(ctx) {
 `).map((l) => "   " + l).join(`
 `));
       };
-      addTemplateCommand("crew", crewTemplate, registrationAgentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of parallel native task calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance");
-      addTemplateCommand("forge", () => FORGE_COMMAND_TEMPLATE, "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop cancels this session's in-flight and queued async dispatches");
+      addTemplateCommand("crew", crewTemplate, registrationAgentCount > 0 ? "forge crew orchestration: register a declared subtask plan, execute it in waves of native subagent calls, close with an evidence-checked report" : "forge crew orchestration — NOT INITIALIZED: no forge subagents configured; invoking it shows the one-time setup guidance");
+      addTemplateCommand("forge", () => FORGE_COMMAND_TEMPLATE, "forge roster levers: sync forces an immediate forge_sync and shows the diff; init drafts the workspace forge.json in-band (refuses when one exists — review instead); init global drafts the global forge.json with the built-in override entries commented out; stop requests cancellation of confirmed native children");
     });
   } catch (e) {
     const head = e instanceof Error ? e.message : String(e);
@@ -24364,11 +19682,11 @@ function discoverServiceHttp() {
     return serviceHttpCache;
   if (serviceHttpCache === null && Date.now() - serviceHttpLastFail < 1e4)
     return null;
-  const file2 = process.env.FORGE_SERVICE_FILE || (defaultServiceFileReachable() ? join6(process.env.XDG_STATE_HOME || join6(homedir(), ".local", "state"), "opencode", "service.json") : "");
+  const file2 = process.env.FORGE_SERVICE_FILE || (defaultServiceFileReachable() ? join5(process.env.XDG_STATE_HOME || join5(homedir(), ".local", "state"), "opencode", "service.json") : "");
   if (!file2)
     return null;
   try {
-    const raw = JSON.parse(readFileSync9(file2, "utf8"));
+    const raw = JSON.parse(readFileSync4(file2, "utf8"));
     if (raw && typeof raw.url === "string" && typeof raw.password === "string" && raw.url && raw.password) {
       serviceHttpCache = { url: raw.url.replace(/\/+$/, ""), password: raw.password };
     } else {
@@ -24415,7 +19733,8 @@ function v2NativeChildWalker() {
         if (!svc)
           throw new Error("native-child walker: service.json discovery failed");
         const parent = args !== null && typeof args === "object" && typeof args.parentID === "string" ? args.parentID : "";
-        return await serviceHttpGet(svc, parent ? `/api/session?parentID=${encodeURIComponent(parent)}&limit=${NATIVE_CHILD_LIST_LIMIT}` : "/api/session");
+        const cursor = args?.cursor;
+        return await serviceHttpGet(svc, parent ? `/api/session?parentID=${encodeURIComponent(parent)}&limit=${NATIVE_CHILD_LIST_LIMIT}${typeof cursor === "string" && cursor ? `&cursor=${encodeURIComponent(cursor)}` : ""}` : "/api/session");
       },
       status: async () => {
         const svc = discoverServiceHttp();
@@ -24433,8 +19752,6 @@ function v2SessionClient(ctx) {
   if (s === null || typeof s !== "object")
     return null;
   const out = {};
-  const childDirs = new Map;
-  let lastKnownDir;
   if (typeof s.prompt === "function") {
     const send = async (opts) => {
       const input = v2PromptInputOf(opts);
@@ -24451,105 +19768,9 @@ function v2SessionClient(ctx) {
       return sid !== undefined ? s.get({ sessionID: sid }) : s.get(opts);
     };
   }
-  if (typeof s.create === "function") {
-    const rawCreate = s.create;
-    out.create = async (args) => {
-      const body = args?.body;
-      const flat = {};
-      if (body && typeof body === "object") {
-        for (const key of ["parentID", "title", "agent", "model", "permission", "permissions", "directory"]) {
-          const v = body[key];
-          if (v !== undefined)
-            flat[key] = v;
-        }
-      }
-      const directory = args?.query?.directory;
-      if (typeof directory === "string" && directory !== "" && flat.directory === undefined)
-        flat.directory = directory;
-      const record2 = await rawCreate.call(s, flat);
-      const envelope = record2 !== null && typeof record2 === "object" && (("data" in record2) || ("error" in record2)) ? record2 : { data: record2 };
-      try {
-        const rec = envelope.data ?? null;
-        if (rec && typeof rec.id === "string" && typeof directory === "string" && directory) {
-          childDirs.set(rec.id, directory);
-          lastKnownDir = directory;
-        }
-      } catch {}
-      return envelope;
-    };
-  }
-  out.messages = async (args) => {
-    const sid = typeof args?.path?.id === "string" ? args.path.id : undefined;
-    if (!sid)
-      return { error: "messages reader: no session id in args" };
-    const svc = discoverServiceHttp();
-    if (!svc)
-      return { capabilityPending: true };
-    const dir = childDirs.get(sid) ?? lastKnownDir;
-    try {
-      const loc = dir ? `?location%5Bdirectory%5D=${encodeURIComponent(dir)}` : "";
-      const res = await fetch(`${svc.url}/api/session/${sid}/message${loc}`, {
-        headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` }
-      });
-      if (!res.ok)
-        return { error: `HTTP ${res.status}` };
-      const parsed = JSON.parse(await res.text());
-      const arr = Array.isArray(parsed) ? parsed : parsed && typeof parsed === "object" && Array.isArray(parsed.data) ? parsed.data : undefined;
-      if (!Array.isArray(arr))
-        return { error: "unexpected message payload shape" };
-      return { data: arr.map(normalizeV2MessageRow).filter((x) => x !== null) };
-    } catch (e) {
-      return { error: String(e) };
-    }
-  };
-  const rawInterrupt = typeof s.interrupt === "function" ? s.interrupt.bind(s) : undefined;
-  out.abort = async (args) => {
-    const sid = v2SessionIdOf(args) ?? (args !== null && typeof args === "object" && typeof args.path?.id === "string" ? args.path.id : undefined);
-    if (!sid)
-      throw new Error("abort seam: no session id in args");
-    if (rawInterrupt) {
-      return await rawInterrupt({ sessionID: sid, resume: false });
-    }
-    const svc = discoverServiceHttp();
-    if (!svc) {
-      throw new Error("abort unavailable on this session client (no promise-layer interrupt and service.json discovery failed)");
-    }
-    const res = await fetch(`${svc.url}/api/session/${sid}/interrupt?resume=false`, {
-      method: "POST",
-      headers: { authorization: `Basic ${Buffer.from(`opencode:${svc.password}`).toString("base64")}` }
-    });
-    if (!res.ok)
-      throw new Error(`session interrupt HTTP ${res.status}`);
-    try {
-      return JSON.parse(await res.text());
-    } catch {
-      return;
-    }
-  };
+  if (typeof s.context === "function")
+    out.context = (opts) => s.context(opts);
   return Object.keys(out).length > 0 ? { session: out, nativeChildWalker: v2NativeChildWalker() } : null;
-}
-function normalizeV2MessageRow(row) {
-  if (row === null || typeof row !== "object")
-    return null;
-  const r = row;
-  if (r.info !== undefined && typeof r.info === "object")
-    return r;
-  const type = typeof r.type === "string" ? r.type : undefined;
-  if (!type || type === "idle")
-    return null;
-  const t = r.time;
-  const created = typeof t === "number" ? t : t !== undefined && t !== null && typeof t === "object" && typeof t.created === "number" ? t.created : 0;
-  const parts = Array.isArray(r.parts) ? r.parts : Array.isArray(r.content) ? r.content : typeof r.text === "string" && r.text !== "" ? [{ type: "text", text: r.text }] : [];
-  const info = { role: type, time: { created } };
-  if (typeof r.id === "string")
-    info.id = r.id;
-  if (typeof r.finish === "string")
-    info.finish = r.finish;
-  if (r.error !== undefined)
-    info.error = r.error;
-  if (t !== undefined && t !== null && typeof t === "object" && typeof t.completed === "number")
-    info.time.completed = t.completed;
-  return { info, parts };
 }
 function v2EventFields(raw) {
   if (raw === null || typeof raw !== "object")
@@ -24561,22 +19782,21 @@ function v2EventFields(raw) {
     return o.properties;
   return o;
 }
-function v2HandleIdle(sessionID, goalClient) {
+function v2HandleIdle(sessionID, goalClient, backgroundWaiting = false) {
   try {
     goalProbe(`v2 idle session=${sessionID}`);
-    idleJobSessions.add(sessionID);
     if (goalClient)
-      scheduleIdleContinuation(goalClient, sessionID);
-    deliverDispatchProgress(sessionID).then(() => deliverJobWakes(sessionID));
+      scheduleIdleContinuation(goalClient, sessionID, IDLE_DEBOUNCE_MS, backgroundWaiting);
   } catch {}
 }
 function v2SubscribeEvents(ctx, goalClient, idleFallback) {
   const subscribeFn = ctx.event?.subscribe?.bind(ctx.event);
   if (typeof subscribeFn !== "function")
     return null;
+  const controller = new AbortController;
   const trySubscribe = () => {
     try {
-      const sub = subscribeFn();
+      const sub = subscribeFn({ signal: controller.signal });
       if (sub !== null && typeof sub === "object" && typeof sub[Symbol.asyncIterator] === "function") {
         return sub[Symbol.asyncIterator]();
       }
@@ -24587,7 +19807,6 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
     let iterator = trySubscribe();
     if (!iterator)
       return null;
-    const controller = new AbortController;
     const run = async () => {
       let backoffMs = 1000;
       while (!controller.signal.aborted) {
@@ -24597,14 +19816,14 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
         try {
           for (;; ) {
             const next = await iter.next();
+            if (controller.signal.aborted)
+              return;
             if (next.done)
               break;
             const ev = next.value;
             const type = ev !== null && typeof ev === "object" && typeof ev.type === "string" ? ev.type : undefined;
             if (!type)
               continue;
-            if (controller.signal.aborted)
-              return;
             const fields = v2EventFields(ev);
             noteCrewNativeChildEvent(type, fields, goalClient);
             if (type === "session.deleted") {
@@ -24619,24 +19838,10 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
                 const f = movedEventFields(fields);
                 noteSessionMoved(f.sessionID, f.directory);
               } catch {}
-            } else if (type === "session.execution.succeeded" || type === "session.execution.failed" || type === "session.execution.interrupted") {
-              const sessionID = v2PickStr(fields, "sessionID", "sessionId");
-              if (sessionID) {
-                const kind = type === "session.execution.succeeded" ? "succeeded" : type === "session.execution.failed" ? "failed" : "interrupted";
-                const detail = kind === "failed" ? executionErrorDetail(fields.error) : kind === "interrupted" ? fields.reason !== undefined ? String(fields.reason) : undefined : undefined;
-                noteDispatchTerminalSignal(sessionID, kind, detail);
-                if (kind === "interrupted") {
-                  try {
-                    discloseInterruptedParent(sessionID);
-                  } catch {}
-                }
-                if (idleFallback && type === "session.execution.succeeded")
-                  v2HandleIdle(sessionID, goalClient);
-              }
-            } else if (type === "session.execution.started" || type === "session.step.started" || type === "session.step.ended") {
+            } else if (idleFallback && type === "session.execution.succeeded") {
               const sessionID = v2PickStr(fields, "sessionID", "sessionId");
               if (sessionID)
-                noteDispatchChildActivity(sessionID);
+                v2HandleIdle(sessionID, goalClient);
             } else if (type === "session.created") {
               try {
                 const info = fields.info ?? fields.session;
@@ -24644,8 +19849,6 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
                 const worktree = effectiveWorktree(info !== null && typeof info === "object" && typeof info.worktree === "string" ? info.worktree : undefined, info !== null && typeof info === "object" && typeof info.directory === "string" ? info.directory : undefined);
                 if (id && typeof worktree === "string" && worktree) {
                   ensureSession(id, worktree);
-                  if (!isRootish(worktree))
-                    recoverWorkspaceDispatches(jobClient, worktree);
                 }
               } catch {}
             } else if (idleFallback && type === "session.idle") {
@@ -24657,7 +19860,7 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
         } catch {}
         if (controller.signal.aborted)
           return;
-        await new Promise((resolve2) => setTimeout(resolve2, backoffMs));
+        await new Promise((resolve4) => setTimeout(resolve4, backoffMs));
         if (controller.signal.aborted)
           return;
         const fresh = trySubscribe();
@@ -24668,42 +19871,38 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
       }
     };
     run();
-    let closed = false;
+    let closing;
     return () => {
-      if (closed)
-        return;
-      closed = true;
-      controller.abort();
-      try {
-        iterator?.return?.();
-      } catch {}
+      if (!closing) {
+        controller.abort();
+        closing = (async () => {
+          try {
+            await iterator?.return?.();
+          } catch {}
+        })();
+      }
+      return closing;
     };
   } catch {
     return null;
   }
 }
-var v2WiringSeam = { sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sealFindings, sealUnknownNotes, sessionMovedAnchors, jobLedger: () => jobManager.ledgerEntries(), dispatchTasks, jobManager, crewNativeChildren, crewNativeCeiling, crewChildDigest, crewNativeWatch, crewNativeRecheckArmed: (sessionID) => crewNativeRecheck.has(sessionID), crewNativeRecheckNow: (sessionID, client) => crewNativeRecheckTick(sessionID, client), resetHostAnchors: () => {
+var v2WiringSeam = { modelsDevCatalog: () => modelsDevCatalog, resolveDepthChannel, sessions, sessionAgents, crews, sessionDepths, turnActivity, crewTurnActivity, sessionMovedAnchors, crewNativeChildren, crewNativeCeiling, crewChildDigest, crewNativeWatch, crewNativeRecheckArmed: (sessionID) => crewNativeRecheck.has(sessionID), crewNativeRecheckNow: (sessionID, client) => crewNativeRecheckTick(sessionID, client), resetHostAnchors: () => {
   hostAnchors.length = 0;
+  v2HostAnchors.clear();
+  observedRecipeFiles.clear();
   poolResolver = null;
   poolResolution = null;
 } };
-var V2_SHELL_DENY = { action: "shell", resource: "*", effect: "deny" };
-function v2WithShellDeny(perms) {
-  const arr = Array.isArray(perms) ? perms.filter((p) => p !== null && typeof p === "object") : [];
-  if (!arr.some((p) => p.action === "shell"))
-    arr.push({ ...V2_SHELL_DENY });
-  return arr;
-}
-function v2PermissionArray(record2) {
-  const arr = Object.entries(record2).map(([action, effect]) => ({ action, resource: "*", effect }));
-  arr.push({ ...V2_SHELL_DENY });
+function v2PermissionArray(record4) {
+  const arr = Object.entries(record4).map(([action, effect]) => ({ action, resource: "*", effect }));
   return arr;
 }
 function v2ReadHideNatives(deps) {
   try {
     const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
     const globalPath = forgeConfigPaths({ homeDir }).global;
-    const text = deps?.readFile ? deps.readFile(globalPath) : readFileSync9(globalPath, "utf8");
+    const text = deps?.readFile ? deps.readFile(globalPath) : readFileSync4(globalPath, "utf8");
     const parsed = parseForgeJsonc(text);
     if (parsed.ok && parsed.config !== null && typeof parsed.config === "object") {
       const knob = parsed.config.hideNativeAgents;
@@ -24714,8 +19913,14 @@ function v2ReadHideNatives(deps) {
   return true;
 }
 async function v2Setup(ctx, deps) {
+  for (const finding of legacyDispatchEnvFindings(process.env))
+    console.warn(`[forge:v2] ${finding.level}: ${finding.message}`);
+  const noFetch = process.env.FORGE_TEST_NO_DISPATCH_FETCH;
+  const nodeTest = !!process.env.NODE_TEST_CONTEXT || process.execArgv.some((a) => a === "--test" || a.startsWith("--test-"));
+  await refreshModelsDevCatalog(noFetch === "1" || noFetch !== "0" && nodeTest, 2000);
+  const explicitCandidates = [...deps?.anchors ?? [], ...v2AnchorCandidates(ctx, false)];
+  const v2Candidates = [...explicitCandidates, process.cwd()];
   {
-    const v2Candidates = [...deps?.anchors ?? [], ...v2AnchorCandidates(ctx)];
     for (const cand of v2Candidates) {
       const t = cand.trim();
       if (t)
@@ -24728,43 +19933,89 @@ async function v2Setup(ctx, deps) {
     }
   }
   v2HostSeen = true;
-  v2PostureHomeDir = deps?.homeDir ?? homedir();
-  const globalKnobs = readGlobalKnobs(deps);
+  const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
+  const globalPoolFile = forgeConfigPaths({ homeDir }).global;
+  const readRecipe = deps?.readFile ?? ((path) => readFileSync4(path, "utf8"));
+  const recipeStat = deps?.stat ?? recipeFileStat;
+  const snapshots = new Map;
+  const unreadable2 = new Set;
+  const snapshotRead = (path) => {
+    const previous = snapshots.get(path);
+    if (previous !== undefined)
+      return previous;
+    if (unreadable2.has(path))
+      throw new Error(`Recipe unavailable in this sync snapshot: ${path}`);
+    try {
+      const text = readRecipe(path);
+      snapshots.set(path, text);
+      return text;
+    } catch (err) {
+      unreadable2.add(path);
+      throw err;
+    }
+  };
+  const globalKnobs = readGlobalKnobs(globalPoolFile, { readFile: snapshotRead });
+  const stillAuthorized = (path) => {
+    const text = snapshots.get(path);
+    if (text === undefined)
+      return false;
+    const parsed = parseForgeJsonc(text);
+    if (!parsed.ok || !parseTopLevelKnobs(parsed.config, path).syncAuto)
+      return false;
+    try {
+      return recipeStat(path) !== null && readRecipe(path) === text;
+    } catch {
+      return false;
+    }
+  };
   v2MaterializeMode = deps?.materialize ?? globalKnobs.materialize ?? "native";
   if (v2MaterializeMode === "native") {
     try {
-      const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
-      const resolver = createPoolResolver({ homeDir, stat: deps?.stat, readFile: deps?.readFile });
-      const seen = new Map;
-      for (const cand of [...deps?.anchors ?? [], ...v2AnchorCandidates(ctx)]) {
-        const key = normalizeAnchorDir(cand);
-        if (key && !seen.has(key))
-          seen.set(key, cand.trim());
-      }
-      const resolution = resolver.resolve([...seen.values()]);
-      const globalPoolFile = forgeConfigPaths({ homeDir }).global;
-      const allPlans = planRosterSync(resolution, { globalPoolFile });
-      for (const family of resolution.families) {
-        let auto = false;
-        try {
-          const text = deps?.readFile ? deps.readFile(family.file) : readFileSync9(family.file, "utf8");
-          const parsed = parseForgeJsonc(text);
-          if (parsed.ok)
-            auto = parseTopLevelKnobs(parsed.config, family.file).syncAuto;
-        } catch {}
-        if (!auto)
+      const resolver = createPoolResolver({ homeDir, stat: recipeStat, readFile: snapshotRead });
+      const explicitKeys = explicitCandidates.map(normalizeAnchorDir).filter(Boolean);
+      const currentKeys = new Set(explicitKeys.length ? explicitKeys : [normalizeAnchorDir(process.cwd())]);
+      const currentFiles = new Set([globalPoolFile]);
+      for (const anchor of hostAnchors) {
+        if (!currentKeys.has(anchorKey(anchor)))
           continue;
-        const verdict = staleCheckForPool(family.file, family.materializedIds, realRosterFs(), rosterContentOf(resolution));
+        const file2 = resolver.workspacePoolOf(anchor);
+        if (file2 !== null)
+          currentFiles.add(file2);
+      }
+      const resolution = resolver.resolve(hostAnchors);
+      for (const family of resolution.families)
+        observedRecipeFiles.add(family.file);
+      const overrideDir = globalAgentDirFor({ homeDir, configDir: process.env.OPENCODE_CONFIG_DIR });
+      const rosterDirs = { globalPoolFile, globalAgentDir: overrideDir };
+      const allPlans = planRosterSync(resolution, rosterDirs);
+      for (const family of resolution.families) {
+        if (!currentFiles.has(family.file))
+          continue;
+        const verdict = staleCheckForPool(family.file, family.materializedIds, realRosterFs(), (matId) => compileResolvedRosterEntry(resolution, matId, { globalPoolFile }).content, rosterAgentDirFor(family.file, rosterDirs));
         if (!verdict.stale)
           continue;
+        if (!stillAuthorized(family.file)) {
+          console.warn(`[forge:sync] warn: ${verdict.reason}; call forge_sync to reconcile (no current auto opt-in).`);
+          continue;
+        }
         const plans = allPlans.filter((p) => p.family.file === family.file);
         const outcome = executeRosterSync(plans, realRosterFs());
         console.warn(`[forge:sync] warn: sync:"auto" — stale roster regenerated at session start (${verdict.reason}); created ${outcome.created.length}, updated ${outcome.updated.length}, gc'd ${outcome.gced.length}${outcome.errors.length ? `, errors: ${outcome.errors.join("; ")}` : ""}`);
       }
+      const overridePlan = planOverrideSync(resolution.overrides ?? {}, { dir: overrideDir, recipeFile: globalPoolFile }) ?? { kind: "override", dir: overrideDir, files: [] };
+      const overrideFindings = overrideSyncFindings(overridePlan, realRosterFs());
+      if (overrideFindings.length) {
+        if (stillAuthorized(globalPoolFile)) {
+          const outcome = executeRosterSync([overridePlan], realRosterFs());
+          console.warn(`[forge:sync] warn: sync:"auto" — ${overrideFindings.join("; ")}; created ${outcome.created.length}, updated ${outcome.updated.length}, gc'd ${outcome.gced.length}${outcome.errors.length ? `, errors: ${outcome.errors.join("; ")}` : ""}`);
+        } else {
+          console.warn(`[forge:sync] warn: ${overrideFindings.join("; ")}; call forge_sync to reconcile (no auto opt-in).`);
+        }
+      }
     } catch {}
   }
   if (typeof ctx.agent?.transform === "function") {
-    await ctx.agent.transform(async (draft) => {
+    await ctx.agent.transform((draft) => {
       if (typeof draft.get !== "function" || typeof draft.update !== "function")
         return;
       if (draft.get(FORGE_AGENT) === undefined) {
@@ -24773,13 +20024,6 @@ async function v2Setup(ctx, deps) {
           agent.system = FORGE_PROMPT;
           agent.mode = "primary";
         });
-      }
-      try {
-        draft.update(FORGE_AGENT, (agent) => {
-          agent.permissions = v2WithShellDeny(agent.permissions);
-        });
-      } catch (err) {
-        console.warn(`[forge:v2] error: shell deny not applied to the forge record: ${String(err)}`);
       }
       if (v2ReadHideNatives(deps)) {
         for (const nativeId of ["build", "plan"]) {
@@ -24799,19 +20043,19 @@ async function v2Setup(ctx, deps) {
       }
       if (v2MaterializeMode === "native") {} else
         try {
-          const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
+          const homeDir2 = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
           const candidates = [...deps?.anchors ?? [], ...v2AnchorCandidates(ctx)];
           for (const cand of candidates) {
             const key = normalizeAnchorDir(cand);
             if (key && !v2HostAnchors.has(key))
               v2HostAnchors.set(key, cand.trim());
           }
-          const resolver = createPoolResolver({ homeDir, stat: deps?.stat, readFile: deps?.readFile });
+          const resolver = createPoolResolver({ homeDir: homeDir2, stat: deps?.stat ?? recipeFileStat, readFile: deps?.readFile });
           const resolution = resolver.resolve([...v2HostAnchors.values()]);
           for (const finding of resolution.findings) {
             console.warn(`[forge:v2] ${finding.level}: ${finding.message}`);
           }
-          const v2GlobalPath = forgeConfigPaths({ homeDir }).global;
+          const v2GlobalPath = forgeConfigPaths({ homeDir: homeDir2 }).global;
           for (const [matId, agent] of Object.entries(resolution.agents)) {
             const id = `forge-${matId}`;
             if (draft.get(id) !== undefined)
@@ -24840,7 +20084,7 @@ async function v2Setup(ctx, deps) {
     const toolAnchor = v2AnchorClient(ctx);
     const toolAssert = typeof ctx.permission?.assert === "function" ? (input) => ctx.permission.assert(input) : null;
     try {
-      await ctx.tool.transform(async (editor) => {
+      await ctx.tool.transform((editor) => {
         if (typeof editor?.add !== "function")
           return;
         for (const [name, def] of Object.entries(forgeTools())) {
@@ -24851,6 +20095,17 @@ async function v2Setup(ctx, deps) {
             input: v2ToolInputSchema(d.args),
             async execute(args, toolCtx) {
               const { context, defaultDirectory } = await v2ToolContext(toolCtx, toolAnchor, toolAssert);
+              if (name === "crew_close" && typeof context.sessionID === "string") {
+                const sid = context.sessionID;
+                context.crewCloseEvidence = async () => {
+                  const view = await walkNativeChildren(v2NativeChildWalker(), sid);
+                  let transcript = null;
+                  try {
+                    transcript = await ctx.session?.context?.({ sessionID: sid });
+                  } catch {}
+                  return { ...view, rounds: crews.get(sid)?.rounds ?? [], context: transcript };
+                };
+              }
               const res = await d.execute?.(args, context);
               return nameDefaultDirectory(wrapV2ToolResult(res), defaultDirectory);
             }
@@ -24859,93 +20114,182 @@ async function v2Setup(ctx, deps) {
       });
     } catch {}
   }
+  const searchLocation = ctx.location;
+  const searchDirectory = searchLocation?.directory;
+  const searchProject = searchLocation?.project?.directory;
+  const searchWarn = (message) => console.warn(`[forge:search] ${message}; native tools retained`);
+  if (typeof searchDirectory === "string" && isAbsolute3(searchDirectory) && typeof searchProject === "string" && isAbsolute3(searchProject) && searchLocation?.workspaceID === undefined && typeof ctx.permission?.assert === "function" && typeof ctx.tool?.transform === "function") {
+    const ask = ctx.permission.assert.bind(ctx.permission);
+    try {
+      await ctx.tool.transform((editor) => {
+        for (const kind of ["grep", "glob"]) {
+          const native = editor.get?.(kind);
+          if (!native || !editor.update || typeof native.execute !== "function" || !native.output) {
+            searchWarn(`${kind} definition unavailable`);
+            continue;
+          }
+          const output = native.output;
+          const outputFields = output.value?.fields ?? output.items?.properties;
+          const requiredOutput = kind === "grep" ? ["entry", "line", "offset", "text", "submatches"] : ["path", "type"];
+          if (!outputFields || !requiredOutput.every((key) => (key in outputFields))) {
+            searchWarn(`${kind} unknown output schema`);
+            continue;
+          }
+          const executeNative = native.execute;
+          const schema = native.input;
+          let enhancedInput;
+          if (schema?.fields && typeof schema.mapFields === "function") {
+            const bool = schema.fields[kind === "grep" ? "literal" : "hidden"];
+            if (typeof bool?.annotate !== "function") {
+              searchWarn(`${kind} optional boolean schema unavailable`);
+              continue;
+            }
+            enhancedInput = schema.mapFields((fields) => ({ ...fields, ...kind === "glob" ? { hidden: bool.annotate({ description: "Include hidden files and directories (default: true).", default: true }) } : {}, follow: bool.annotate({ description: "Follow symbolic links and junctions (default: true).", default: true }) }));
+          } else if (schema?.type === "object" && schema.properties) {
+            enhancedInput = { ...schema, properties: { ...schema.properties, ...kind === "glob" ? { hidden: { ...schema.properties.hidden, default: true, description: "Include hidden files and directories (default: true)." } } : {}, follow: { type: "boolean", default: true, description: "Follow symbolic links and junctions (default: true)." } } };
+          } else {
+            searchWarn(`${kind} unknown input schema`);
+            continue;
+          }
+          try {
+            editor.update(kind, (draft) => {
+              draft.input = enhancedInput;
+              draft.description = `${native.description ?? kind} Follows symbolic links and junctions by default.${kind === "glob" ? " Hidden directories are included by default." : ""}`;
+              draft.execute = async (raw, invocation) => {
+                if (raw.path && ambiguousSearchPath(raw.path)) {
+                  const { follow: _follow, ...nativeInput } = raw;
+                  return executeNative(nativeInput, invocation);
+                }
+                let rgConfig;
+                for (const file2 of [forgeConfigPaths({ projectDir: searchProject }).project, globalPoolPathOf()]) {
+                  try {
+                    const parsed = parseForgeJsonc(readFileSync4(file2, "utf8"));
+                    const search = parsed.ok ? parsed.config?.search : undefined;
+                    if (typeof search?.rgPath === "string") {
+                      rgConfig = search;
+                      break;
+                    }
+                  } catch {}
+                }
+                const rg = resolveRgBinary(rgConfig);
+                let engine = rg.ok ? "ripgrep" : "builtin-js";
+                const startupFailed = (result) => result.error && result.status === null && ["ENOENT", "EACCES", "EPERM", "ENOEXEC"].includes(result.error.code ?? "");
+                const grep = rg.ok ? (bytes, input) => {
+                  if (engine === "builtin-js")
+                    return jsGrep(bytes, input);
+                  const args = ["--no-config", "--no-ignore", "--json", ...input.literal ? ["--fixed-strings"] : [], ...input.caseSensitive === false ? ["--ignore-case"] : [], "--", input.pattern, "-"];
+                  const result = spawnSync3(rg.binary, args, { input: bytes, encoding: "utf8", windowsHide: true, timeout: 1e4, maxBuffer: 32 * 1024 * 1024 });
+                  if (startupFailed(result)) {
+                    engine = "builtin-js";
+                    return jsGrep(bytes, input);
+                  }
+                  if (result.error || result.status !== 0 && result.status !== 1)
+                    throw new Error(result.error?.message ?? result.stderr ?? "ripgrep failed");
+                  return result.stdout.split(/\r?\n/).filter(Boolean).flatMap((line) => {
+                    const event = JSON.parse(line);
+                    if (event.type !== "match")
+                      return [];
+                    const d = event.data;
+                    const text = d.lines.text ?? Buffer.from(d.lines.bytes, "base64").toString("utf8");
+                    return [{ line: d.line_number, offset: d.absolute_offset, text: text.length > 2000 ? text.slice(0, 2000) + "..." : text, submatches: d.submatches.slice(0, 100).map((m) => ({ text: m.match.text ?? Buffer.from(m.match.bytes ?? "", "base64").toString("utf8"), start: m.start, end: m.end })) }];
+                  });
+                } : undefined;
+                const glob = rg.ok ? (pattern, paths) => {
+                  if (!paths.length)
+                    return [];
+                  const fallback = () => paths.map((path) => matchGlob(pattern, path));
+                  if (engine === "builtin-js")
+                    return fallback();
+                  const result = spawnSync3(rg.binary, ["--no-config", "--no-ignore", "--null-data", "--line-number", "--no-filename", "--color", "never", "--", strictGlobToRegExp(pattern).source, "-"], { input: paths.join("\x00") + "\x00", encoding: "utf8", windowsHide: true, timeout: 1e4, maxBuffer: 32 * 1024 * 1024 });
+                  if (startupFailed(result)) {
+                    engine = "builtin-js";
+                    return fallback();
+                  }
+                  if (result.error || result.status !== 0 && result.status !== 1)
+                    throw new Error(result.error?.message ?? result.stderr ?? "ripgrep failed");
+                  const matched = new Set(result.stdout.split("\x00").map((line) => Number(line.slice(0, line.indexOf(":")))));
+                  return paths.map((_, i) => matched.has(i + 1));
+                } : undefined;
+                return authorizedSearch(kind, raw, invocation, searchDirectory, searchProject, {
+                  realpath: realpathSync2,
+                  stat: lstatSync,
+                  list: readdirSync,
+                  read: (path) => {
+                    const fd = openSync(path, "r");
+                    try {
+                      const before = fstatSync(fd);
+                      if (!before.isFile() || before.size > MAX_FILE_BYTES || realpathSync2(path) !== path)
+                        return Buffer.alloc(MAX_FILE_BYTES + 1);
+                      const bytes = Buffer.allocUnsafe(MAX_FILE_BYTES + 1);
+                      const n = readSync(fd, bytes, 0, bytes.length, 0);
+                      const after = fstatSync(fd);
+                      if (before.ino !== after.ino || before.dev !== after.dev || realpathSync2(path) !== path)
+                        throw new Error("Search target changed");
+                      return bytes.subarray(0, n);
+                    } finally {
+                      closeSync(fd);
+                    }
+                  },
+                  assert: ask,
+                  grep,
+                  glob,
+                  engine: () => engine,
+                  globalIgnore: { home: (process.platform === "win32" ? process.env.USERPROFILE : process.env.HOME) ?? "", xdg: process.env.XDG_CONFIG_HOME },
+                  delegateNative: () => {
+                    searchWarn("global ignore authorization or environment unavailable");
+                    const { follow: _follow, ...nativeInput } = raw;
+                    return executeNative(nativeInput, invocation);
+                  }
+                });
+              };
+            });
+          } catch (error45) {
+            searchWarn(`${kind} update rejected: ${String(error45)}`);
+          }
+        }
+      });
+    } catch (error45) {
+      searchWarn(`tool transform rejected: ${String(error45)}`);
+    }
+  } else
+    searchWarn("host availability or permission context unknown or non-local");
   v2RegisterPermissionBelt(ctx);
-  if (typeof ctx.session?.get === "function" && typeof ctx.session.update === "function") {
-    const rawGet = ctx.session.get.bind(ctx.session);
-    const rawUpdate = ctx.session.update.bind(ctx.session);
-    v2SessionRuleApi = {
-      get: (sessionID) => rawGet({ sessionID }),
-      update: (input) => rawUpdate(input)
-    };
-  }
   const v2Anchor = v2AnchorClient(ctx);
   anchorClientShared = v2Anchor;
   v2RegisterToolHooks(ctx, v2Anchor);
   const v2Client = v2SessionClient(ctx);
-  if (v2Client && (v2Client.session.promptAsync || v2Client.session.prompt))
-    jobClient = v2Client;
   const goalClient = v2Client && typeof v2Client.session.prompt === "function" && typeof v2Client.session.get === "function" ? v2Client : null;
-  v2SessionWaitSeam = typeof ctx.session?.wait === "function" ? (sessionID) => ctx.session.wait({ sessionID }) : null;
-  v2DispatchStorage = ctx.storage && typeof ctx.storage.scan === "function" && typeof ctx.storage.set === "function" ? ctx.storage : null;
-  try {
-    if (hostWorktree && !isRootish(hostWorktree)) {
-      recoverWorkspaceDispatches(v2Client, hostWorktree);
-    }
-  } catch {}
-  try {
-    if (hostWorktree && !isRootish(hostWorktree)) {
-      adoptPersistedDispatchRows(v2Client, hostWorktree);
-    }
-  } catch {}
-  const sessionHooks = v2RegisterSessionHooks(ctx, goalClient);
+  const sessionHooks = await v2RegisterSessionHooks(ctx, goalClient);
   await v2RegisterCommands(ctx);
   const v2AbortEvents = v2SubscribeEvents(ctx, goalClient, !sessionHooks.idleHook);
   const disposables = [...sessionHooks.disposables, ...v2AbortEvents ? [v2AbortEvents] : []];
-  return disposables.length > 0 ? () => {
-    for (const dispose of disposables) {
-      try {
-        dispose();
-      } catch {}
-    }
+  return disposables.length > 0 ? async () => {
+    if (goalClient)
+      disposeGoalClient(goalClient);
+    await Promise.allSettled(disposables.map(async (dispose) => dispose()));
   } : undefined;
 }
-var plugin_default = { id: "forge", server, setup: v2Setup };
+var plugin_default = { id: "forge", setup: v2Setup };
 export {
   v2WiringSeam,
   v2Setup,
   v2SessionClientForTests,
-  takeDispatchTerminalSignal,
-  stopReceipt,
-  setDispatchWaitSeamForTests,
-  setDispatchStorageForTests,
   setCrewNativeChildClockForTests,
-  server,
   resolveGateAskWatchdogMs,
-  resolveForgeShellPosture,
-  resolveDispatchQueueMax,
   resetServiceHttpDiscoveryForTests,
-  recoverOneDispatchRecord,
-  recentDispatchChildActivity,
-  observedOrphanDispatches,
-  noteDispatchTerminalSignal,
-  noteDispatchChildActivity,
   noteCrewNativeChildEvent,
-  normalizeV2MessageRow,
   isRootish,
-  isDispatchCancelled,
   gate,
-  forgetDispatchSignals,
   forgeFamilyGuard,
-  executionErrorDetail,
   effectiveWorktree,
-  effectiveSurvive,
-  disclosedInterruptFlights,
-  discloseInterruptedParent,
-  detectOrphanDispatchChildren,
   plugin_default as default,
   crewOrchestrationTemplate,
   composeCommandPrompt,
-  cancelDispatch,
-  adoptPersistedDispatchRows,
-  __workerShellRescueTestSurface,
   __sessionAnchorTestSurface,
   __runtimeNamespaceTestSurface,
   __permissionDoorsTestSurface,
-  TASK_SEAM_DEGRADED_ERROR,
   SYNC_LEVER_BODY,
-  STOP_QUEUED_REASON,
   STOP_LEVER_BODY,
-  STOP_DEQUEUED_REASON,
   PLAN_COMMAND_TEMPLATE,
   INIT_WORKSPACE_LEAD,
   INIT_GLOBAL_SCAFFOLD_NOTE,
@@ -24956,7 +20300,5 @@ export {
   FORGE_HELP_ROUTE_LINE,
   FORGE_COMMAND_TEMPLATE,
   FORGE_BOUNDARIES_TEXT,
-  DEFAULT_DISPATCH_QUEUE_MAX,
-  CREW_INIT_TEMPLATE,
-  ASYNC_DISPATCH_CAP
+  CREW_INIT_TEMPLATE
 };

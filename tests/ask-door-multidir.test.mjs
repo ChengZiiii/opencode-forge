@@ -75,9 +75,8 @@ test("B1: a door opened in directory A asks through A's interface — a later in
   bind(a, sid)
 
   await assert.rejects(a.state.tools.get("goal_write").execute(DOOR_ARGS("b1"), realCtx(sid)), /permission denied: goal_write/)
-  await assert.rejects(a.state.tools.get("forge_shell").execute({ command: "cd" }, realCtx(sid)), /permission denied: forge_shell/)
 
-  assert.deepEqual(actions(a), ["goal_write", "forge_shell"], "A's own interface carried both asks")
+  assert.deepEqual(actions(a), ["goal_write"], "A's own interface carried the goal approval")
   assert.equal(b.state.asserts.length, 0, "the interface of the later initialization B saw nothing")
   assert.deepEqual(goalFiles(dirA), [], "declined → nothing armed")
   assert.deepEqual(goalFiles(dirB), [])
@@ -89,7 +88,7 @@ test("B1: a door opened in directory A asks through A's interface — a later in
   assert.equal(b.state.asserts.length, 0)
 })
 
-test("B2: the last-initialized interface going dead (its directory evicted) leaves directory A's doors and forge_shell untouched", async () => {
+test("B2: the last-initialized interface going dead (its directory evicted) leaves directory A's doors untouched", async () => {
   const dirA = mk("forge-door-b2-a-")
   const dirB = mk("forge-door-b2-b-")
   const a = await init(dirA)
@@ -102,8 +101,7 @@ test("B2: the last-initialized interface going dead (its directory evicted) leav
   // The user's decline comes back as the user's decline — the host's own
   // ToolError, never the dead interface's failure, and never an approval.
   await assert.rejects(a.state.tools.get("goal_write").execute(DOOR_ARGS("b2"), realCtx(sid)), /^ToolError: \[mock\] permission denied: goal_write$/)
-  await assert.rejects(a.state.tools.get("forge_shell").execute({ command: "cd" }, realCtx(sid)), /^ToolError: \[mock\] permission denied: forge_shell$/)
-  assert.deepEqual(actions(a), ["goal_write", "forge_shell"])
+  assert.deepEqual(actions(a), ["goal_write"])
   assert.equal(b.state.asserts.length, 0)
 
   // B's own tools hold B's dead interface: they fail closed, by that failure.
@@ -131,17 +129,12 @@ test("B3: single directory — the ask a door sends to the host is exactly what 
       metadata: { title: "Arm goal: door b3" },
     },
   ])
-  // No agent on the context → no agent key at all (never a fabricated one).
+  // An unknown speaker must not reach the approval interface.
   await assert.rejects(
     only.state.tools.get("goal_write").execute(DOOR_ARGS("b3-noagent"), { sessionID: "ses-b3-noagent", messageID: "msg_1", id: "call_1" }),
-    /permission denied: goal_write/,
+    /primary identity is not established/,
   )
-  assert.deepEqual(only.state.asserts[1], {
-    sessionID: "ses-b3-noagent",
-    action: "goal_write",
-    resources: ["*"],
-    metadata: { title: "Arm goal: door b3-noagent" },
-  })
+  assert.equal(only.state.asserts.length, 1)
   assert.deepEqual(goalFiles(only.dir), [])
 })
 
@@ -181,7 +174,6 @@ test("B5: an initialization that captured no permission interface refuses every 
   state.sessionRecords.set(sid, { sessionID: sid, location: { directory: dir } })
 
   await assert.rejects(state.tools.get("goal_write").execute(DOOR_ARGS("b5"), realCtx(sid)), REFUSED_CLOSED)
-  await assert.rejects(state.tools.get("forge_shell").execute({ command: "cd" }, realCtx(sid)), REFUSED_CLOSED)
   assert.deepEqual(goalFiles(dir), [])
 })
 

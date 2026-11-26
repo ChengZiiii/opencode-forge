@@ -10,7 +10,7 @@ import { fileURLToPath } from "node:url"
 import { v2SessionClientForTests, resetServiceHttpDiscoveryForTests } from "../plugin.ts"
 
 // crew-continue-native-child-gate D8.7 — test hermeticity of the service.json
-// channel (messages reader, native-child walker, interrupt fallback).
+// channel (native-child walker).
 //
 // Leak scan 2026-11-23: `v2-tools` issued 11 real GETs
 // (`/api/session/ses_mockchild_1/message → 404`) against the user's running
@@ -34,7 +34,6 @@ function svcCtx() {
     session: {
       prompt: async () => {},
       get: async () => ({}),
-      create: async (flat) => ({ id: flat.id ?? "ses_adapter_child" }),
     },
   }
 }
@@ -81,14 +80,11 @@ test("service discovery is hermetic: the runner never reads the default location
   resetServiceHttpDiscoveryForTests()
   assert.equal(process.env.NODE_TEST_CONTEXT !== undefined || process.execArgv.some((a) => a === "--test" || a.startsWith("--test-")), true, "precondition: this process IS the Node test runner")
 
-  await t.test("leg 1 — inside the runner: capability absence, zero requests, on all three channel users", async () => {
+  await t.test("leg 1 — inside the runner: capability absence, zero requests, on both native-child observation reads", async () => {
     const adapter = v2SessionClientForTests(svcCtx())
-    assert.ok(adapter?.session.messages, "adapter built")
     assert.ok(adapter?.nativeChildWalker, "walker present")
-    assert.deepEqual(await adapter.session.messages({ path: { id: "ses_leak_probe" } }), { capabilityPending: true }, "messages: pending = leg-not-applicable, never a view failure")
     await assert.rejects(adapter.nativeChildWalker.session.list({ parentID: "ses_parent" }), /service\.json discovery failed/, "walker list throws → pure core fails OPEN")
     await assert.rejects(adapter.nativeChildWalker.session.status(), /service\.json discovery failed/, "walker status throws → pure core fails OPEN")
-    await assert.rejects(adapter.session.abort({ path: { id: "ses_leak_probe" } }), /abort unavailable/, "interrupt fallback refuses rather than dialing a default host")
     assert.deepEqual(fake.hits, [], "nothing reached the fake host")
   })
 
@@ -97,10 +93,9 @@ test("service discovery is hermetic: the runner never reads the default location
     writeFileSync(svcFile, JSON.stringify({ url: `http://127.0.0.1:${fake.port}`, password: "pw-fake" }))
     process.env.FORGE_SERVICE_FILE = svcFile
     const adapter = v2SessionClientForTests(svcCtx())
-    const res = await adapter.session.messages({ path: { id: "ses_fixture_child" } })
-    assert.equal(res.error, undefined, "happy path through the fixture")
-    assert.equal(res.data.length, 1)
-    assert.deepEqual(fake.hits, ["GET /api/session/ses_fixture_child/message"])
+    const res = await adapter.nativeChildWalker.session.list({ parentID: "ses_fixture_child" })
+    assert.equal(res.length, 1, "happy path through the fixture")
+    assert.deepEqual(fake.hits, ["GET /api/session?parentID=ses_fixture_child&limit=500"])
     delete process.env.FORGE_SERVICE_FILE
     resetServiceHttpDiscoveryForTests()
   })
@@ -112,8 +107,8 @@ test("service discovery is hermetic: the runner never reads the default location
       [
         `const m = await import(${JSON.stringify(pathToFileURL(PLUGIN).href)})`,
         "const adapter = m.v2SessionClientForTests({ session: { prompt: async () => {}, get: async () => ({}), create: async () => ({ id: 'x' }) } })",
-        "const res = await adapter.session.messages({ path: { id: 'ses_control_child' } })",
-        "process.stdout.write(JSON.stringify({ ok: res.error === undefined, rows: res.data?.length }) + '\\n')",
+        "const res = await adapter.nativeChildWalker.session.list({ parentID: 'ses_control_child' })",
+        "process.stdout.write(JSON.stringify({ ok: Array.isArray(res), rows: res.length }) + '\\n')",
         "",
       ].join("\n"),
     )
@@ -134,6 +129,6 @@ test("service discovery is hermetic: the runner never reads the default location
     clearTimeout(timer)
     assert.deepEqual(exit, { code: 0, signal: null }, `plain child exited cleanly\nstdout: ${stdout}\nstderr: ${stderr.slice(0, 600)}`)
     assert.deepEqual(JSON.parse(stdout.trim()), { ok: true, rows: 1 }, "the plain child read the default location and got the fake host's answer")
-    assert.deepEqual(fake.hits.slice(before), ["GET /api/session/ses_control_child/message"], "control request observed")
+    assert.deepEqual(fake.hits.slice(before), ["GET /api/session?parentID=ses_control_child&limit=500"], "control request observed")
   })
 })

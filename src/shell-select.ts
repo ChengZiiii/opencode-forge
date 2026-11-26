@@ -1,5 +1,5 @@
-// Host-aligned shell interpreter selection (spec: job-supervisor —
-// "Host-aligned shell interpreter selection"). Mirrors the upstream chain
+// Host-aligned shell interpreter selection (spec: goal-harness —
+// "Host-aligned interpreter for verification shell checks"). Mirrors the upstream chain
 // (opencode packages/core/src/shell.ts, verified 2026-09-28): a
 // host-configured shell wins when visible in the merged config; Windows
 // prefers pwsh → powershell → git-bash → %COMSPEC% (cmd.exe as a

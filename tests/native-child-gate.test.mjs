@@ -329,7 +329,90 @@ test("D8 walk view: a readable list with NO children of this session is readable
 
 // ---------------------------------------------------------------------------
 // D8 — nativeSessionBusy: the orchestrator's own state on the same map.
+test("native pagination: succeeded row plus cursor must read the empty tail", async () => {
+  const calls = []
+  const client = { session: {
+    list: async args => { calls.push(args); return args.cursor ? { data: [], cursor: {} } : { data: [{ id: CHILD, parentID: PARENT, outcome: "succeeded", location: { directory: "project" } }], cursor: { next: "opaque" } } },
+    status: async () => ({ data: {} }),
+  } }
+  assert.deepEqual(await walkNativeChildren(client, PARENT), { readable: true, inFlight: [], settled: [{ childID: CHILD, outcome: "succeeded" }] })
+  assert.deepEqual(calls, [{ parentID: PARENT }, { parentID: PARENT, cursor: "opaque" }])
+})
 // ---------------------------------------------------------------------------
+test("native pagination: multiple pages contribute to one active-map decision", async () => {
+  let statusCalls = 0
+  const client = { session: {
+    list: async ({ cursor }) => !cursor ? { data: [{ id: CHILD, parentID: PARENT, outcome: "succeeded" }], cursor: { next: "a" } } : cursor === "a" ? { data: [{ id: OTHER_CHILD, parentID: PARENT }], cursor: { next: "b" } } : { data: [], cursor: {} },
+    status: async () => { statusCalls++; return { data: { [OTHER_CHILD]: { type: "running" } } } },
+  } }
+  assert.deepEqual(await walkNativeChildren(client, PARENT), { readable: true, inFlight: [OTHER_CHILD], settled: [{ childID: CHILD, outcome: "succeeded" }] })
+  assert.equal(statusCalls, 1)
+})
+
+test("native pagination: partial, repeated, errored and capped pages discard all earlier rows", async () => {
+  const first = { data: [{ id: CHILD, parentID: PARENT, outcome: "succeeded" }], cursor: { next: "a" } }
+  const invalid = [
+    () => ({ data: [{ id: OTHER_CHILD, parentID: PARENT }], cursor: { next: "a" } }),
+    () => { throw new Error("HTTP failed") },
+    () => ({ data: [], error: "bad request" }),
+    () => ({ data: [], partial: true }),
+    () => ({ data: [], truncated: true }),
+    () => ({ data: [], cursor: { next: "b" } }),
+    () => ({ data: Array.from({ length: 499 }, (_, i) => ({ id: `c${i}`, parentID: PARENT })) }),
+    () => ({ data: [{ parentID: PARENT }] }),
+  ]
+  for (const tail of invalid) {
+    const client = { session: { list: async ({ cursor }) => cursor ? tail() : first, status: async () => assert.fail("must not read active map for incomplete enumeration") } }
+    assert.deepEqual(await walkNativeChildren(client, PARENT), { readable: false, inFlight: [], settled: [] })
+  }
+})
+
+test("native pagination: inner envelope cursor is followed, including matching outer metadata", async () => {
+  for (const outer of [{}, { cursor: { next: "tail" } }]) {
+    const calls = []
+    const client = { session: {
+      list: async ({ cursor }) => { calls.push(cursor); return cursor ? { data: { sessions: [], cursor: { next: null } } } : { ...outer, data: { sessions: [{ id: CHILD, parentID: PARENT, outcome: "succeeded" }], cursor: { next: "tail" } } } },
+      status: async () => ({ data: {} }),
+    } }
+    assert.deepEqual(await walkNativeChildren(client, PARENT), { readable: true, inFlight: [], settled: [{ childID: CHILD, outcome: "succeeded" }] })
+    assert.deepEqual(calls, [undefined, "tail"])
+  }
+})
+
+test("native pagination: all accepted envelope levels must establish completeness", async () => {
+  const sessions = [{ id: CHILD, parentID: PARENT, outcome: "succeeded" }]
+  const cases = [
+    { data: { sessions, partial: true } },
+    { data: { sessions, truncated: true } },
+    { data: { sessions, error: "failed" } },
+    { data: { sessions, cursor: "tail" } },
+    { data: sessions, cursor: "tail" },
+    { data: sessions, cursor: [] },
+    { data: sessions, cursor: false },
+    { data: sessions, cursor: { next: 1 } },
+    { data: { sessions, cursor: { next: "tail" } }, cursor: { next: "different" } },
+    { data: { sessions, cursor: { next: "tail" } }, cursor: { next: null } },
+    { data: { sessions, cursor: { next: null } }, cursor: { next: "tail" } },
+  ]
+  for (const raw of cases) {
+    let statusCalls = 0
+    const client = { session: { list: async () => raw, status: async () => { statusCalls++; return { data: {} } } } }
+    assert.deepEqual(await walkNativeChildren(client, PARENT), { readable: false, inFlight: [], settled: [] }, JSON.stringify(raw))
+    assert.equal(statusCalls, 0)
+  }
+})
+
+test("native pagination: pending list or status cannot hold the walk past its total deadline", async () => {
+  const pending = () => new Promise(() => {})
+  for (const hangStatus of [false, true]) {
+    const client = { deadlineMs: 30, session: {
+      list: async ({ cursor }) => hangStatus ? [{ id: CHILD, parentID: PARENT }] : cursor ? pending() : { data: [{ id: CHILD, parentID: PARENT }], cursor: { next: "a" } },
+      status: pending,
+    } }
+    assert.deepEqual(await walkNativeChildren(client, PARENT), { readable: false, inFlight: [], settled: [] })
+  }
+})
+
 test("D8 nativeSessionBusy: present+non-idle ⇒ true; absent or idle ⇒ false; unreadable ⇒ null", async () => {
   const mk = (map) => ({ session: { status: async () => ({ data: map }) } })
   assert.equal(await nativeSessionBusy(mk({ [PARENT]: { type: "running" } }), PARENT), true)

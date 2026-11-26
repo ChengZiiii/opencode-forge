@@ -1,3 +1,4 @@
+// Historical (2026-11-26, retire-plugin-runtime): mixed retained namespace/crew and retired task assertions; not current acceptance.
 // Deep live E2E for the pool-namespace-contract era (npm-published dist is the
 // system under test — plugin channel `npm:@sorenllm/opencode-forge`). Drives a
 // hermetic sandbox host (OPENCODE_CONFIG_DIR + XDG triple redirect +

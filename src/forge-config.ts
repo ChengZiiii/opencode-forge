@@ -15,7 +15,8 @@
 // unconfigured host is inert and silent, and the plugin only ever READS the
 // file — onboarding is human-facing documentation, never an AI invitation.
 
-import { readFileSync, statSync } from "node:fs"
+import { readFileSync, realpathSync, statSync } from "node:fs"
+import { isAbsolute, relative } from "node:path"
 
 export type AgentShape = "readonly" | "write"
 
@@ -438,96 +439,6 @@ export function validateOverrideNode(raw: unknown, label: string): { overrides: 
 
 
 // ---------------------------------------------------------------------------
-// dispatch node (harden-dispatch-resilience D3): optional per-file top-level
-// `dispatch` { providerConcurrency, modelConcurrency, circuitBreaker }.
-// Field-level fail-soft exactly like the agent set: a bad value drops with a
-// warn finding and never throws; an absent node means no limits. Layers
-// cascade-merge (global base, project override per map key / breaker field).
-// ---------------------------------------------------------------------------
-
-export type DispatchNodeConfig = {
-  providerConcurrency: Record<string, number>
-  modelConcurrency: Record<string, number>
-  circuitBreaker: { consecutiveFailures?: number; cooldownMs?: number }
-}
-
-function isPositiveInt(v: unknown): v is number {
-  return typeof v === "number" && Number.isInteger(v) && v >= 1
-}
-
-function parseLimitMap(raw: unknown, label: string, findings: ForgeConfigFinding[]): Record<string, number> | null {
-  if (raw === undefined || raw === null) return {}
-  if (!isRecord(raw)) {
-    findings.push({ level: "warn", code: "dispatch-map-invalid", message: `${label} must be an object mapping keys to positive-integer limits — field ignored` })
-    return null
-  }
-  const out: Record<string, number> = {}
-  for (const [key, value] of Object.entries(raw)) {
-    const k = key.trim()
-    if (!k) {
-      findings.push({ level: "warn", code: "dispatch-map-key-invalid", message: `${label}: an empty key cannot carry a limit — entry ignored` })
-      continue
-    }
-    if (!isPositiveInt(value)) {
-      findings.push({ level: "warn", code: "dispatch-map-value-invalid", message: `${label}.${key} must be a positive integer — entry ignored (fail-soft, never a throw)` })
-      continue
-    }
-    out[k] = value
-  }
-  return out
-}
-
-/**
- * Validate one layer's `dispatch` node. Returns `{ config: null }` for an
- * absent node (no limits — today's behavior) and a config with whatever
- * valid fields survived otherwise; every dropped field carries a warn
- * finding. Pure data-in/data-out.
- */
-export function validateDispatchNode(raw: unknown, label: string): { config: DispatchNodeConfig | null; findings: ForgeConfigFinding[] } {
-  const findings: ForgeConfigFinding[] = []
-  if (raw === undefined || raw === null) return { config: null, findings }
-  if (!isRecord(raw)) {
-    findings.push({ level: "warn", code: "dispatch-node-invalid", message: `${label} must be an object ({providerConcurrency, modelConcurrency, circuitBreaker}) — the whole node is ignored` })
-    return { config: null, findings }
-  }
-  const providerConcurrency = parseLimitMap(raw.providerConcurrency, `${label}.providerConcurrency`, findings)
-  const modelConcurrency = parseLimitMap(raw.modelConcurrency, `${label}.modelConcurrency`, findings)
-  const cbRaw = raw.circuitBreaker
-  const circuitBreaker: DispatchNodeConfig["circuitBreaker"] = {}
-  if (cbRaw !== undefined && cbRaw !== null) {
-    if (!isRecord(cbRaw)) {
-      findings.push({ level: "warn", code: "dispatch-breaker-invalid", message: `${label}.circuitBreaker must be an object ({consecutiveFailures, cooldownMs}) — field ignored` })
-    } else {
-      if (cbRaw.consecutiveFailures !== undefined) {
-        if (isPositiveInt(cbRaw.consecutiveFailures)) circuitBreaker.consecutiveFailures = cbRaw.consecutiveFailures
-        else findings.push({ level: "warn", code: "dispatch-breaker-failures-invalid", message: `${label}.circuitBreaker.consecutiveFailures must be a positive integer — field ignored` })
-      }
-      if (cbRaw.cooldownMs !== undefined) {
-        if (isPositiveInt(cbRaw.cooldownMs)) circuitBreaker.cooldownMs = cbRaw.cooldownMs
-        else findings.push({ level: "warn", code: "dispatch-breaker-cooldown-invalid", message: `${label}.circuitBreaker.cooldownMs must be a positive integer — field ignored` })
-      }
-    }
-  }
-  return { config: { providerConcurrency: providerConcurrency ?? {}, modelConcurrency: modelConcurrency ?? {}, circuitBreaker }, findings }
-}
-
-/**
- * Cascade merge (global base, project override): each map merges per key
- * with the override winning; the breaker merges per FIELD with the
- * override winning. null on both sides = no dispatch node at all.
- */
-export function mergeDispatchNodes(base: DispatchNodeConfig | null, override: DispatchNodeConfig | null): DispatchNodeConfig | null {
-  if (base === null && override === null) return null
-  const b = base ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: {} }
-  const o = override ?? { providerConcurrency: {}, modelConcurrency: {}, circuitBreaker: {} }
-  return {
-    providerConcurrency: { ...b.providerConcurrency, ...o.providerConcurrency },
-    modelConcurrency: { ...b.modelConcurrency, ...o.modelConcurrency },
-    circuitBreaker: { ...b.circuitBreaker, ...o.circuitBreaker },
-  }
-}
-
-// ---------------------------------------------------------------------------
 // Top-level host knobs (change native-first-roster, design D5): optional
 // `materialize: "native" | "runtime"` and `sync: "auto"` on a forge.json
 // top level. Field-level fail-soft exactly like everything else: a bad
@@ -553,6 +464,28 @@ export function parseSyncKnob(v: unknown, label: string): { auto: boolean; findi
     auto: false,
     findings: [{ level: "warn", code: "sync-invalid", message: `${label}.sync must be "auto" (the only opt-in) — field ignored; the default posture applies (staleness gate + in-band forge_sync)` }],
   }
+}
+
+// Retired runtime keys are diagnosed by presence only, never parsed.
+export function legacyRuntimeOptionFindings(top: unknown, label: string, recipe = true): ForgeConfigFinding[] {
+  const findings: ForgeConfigFinding[] = []
+  for (const key of recipe ? ["jobs", "watchdog", "dispatch"] : ["jobs", "watchdog"]) {
+    if (isRecord(top) && Object.prototype.hasOwnProperty.call(top, key)) {
+      findings.push({ level: "warn", code: "legacy-runtime-option-in-recipe", message: `${label}: top-level "${key}" configures a retired runtime — ignored` })
+    }
+  }
+  return findings
+}
+
+// Fixed historical names bound the findings; never inspect or print values.
+export function legacyDispatchEnvFindings(env: Record<string, string | undefined>): ForgeConfigFinding[] {
+  return [
+    "DEBUG", "JOURNAL_MAX", "MAX_ATTEMPTS", "NOTIFY_INTERVAL_MS",
+    "POLL_INTERVAL_MS", "POLL_SLICE_MS", "POLL_TIMEOUT_MS", "QUEUE_MAX",
+    "RECONCILE_FLOOR_MS", "RETRY_BACKOFF_MS", "STALE_FLOOR_MS", "STALE_MODE", "STALE_MS",
+  ].map((suffix) => `FORGE_DISPATCH_${suffix}`).filter((key) => env[key] !== undefined).map((key) => ({
+    level: "warn", code: "legacy-dispatch-env", message: `${key} configures a retired runtime — ignored`,
+  }))
 }
 
 // Combined parse over a parsed top level (data in, data out — pure).
@@ -589,10 +522,7 @@ export type LoadedForgeConfig = {
   // anchor's ancestor chain); null when no project layer exists.
   projectPath: string | null
   findings: ForgeConfigFinding[]
-  // harden-dispatch-resilience D3: this layer's validated `dispatch` node
-  // (null when absent/wholly invalid — no limits). Optional for backward
-  // compatibility with existing LoadedForgeConfig consumers.
-  dispatch?: DispatchNodeConfig | null
+
 }
 
 export function forgeConfigPaths(opts: { projectDir?: string; homeDir?: string }): { project: string; global: string } {
@@ -658,17 +588,24 @@ export function discoverProjectFileWith(
   }
 }
 
+// Default real-filesystem adapter. The test preload restricts disk discovery
+// to its owned fixture root; explicit injected stat/read pairs bypass it.
+export function recipeFileStat(path: string): { mtimeMs: number; size: number } | null {
+  try {
+    const root = process.env.FORGE_TEST_FIXTURE_ROOT
+    if (root) {
+      const within = (rel: string) => rel !== ".." && !rel.startsWith("../") && !rel.startsWith("..\\") && !isAbsolute(rel)
+      if (!within(relative(root, path)) || !within(relative(realpathSync(root), realpathSync(path)))) return null
+    }
+    const s = statSync(path)
+    return { mtimeMs: s.mtimeMs, size: s.size }
+  } catch {
+    return null
+  }
+}
+
 export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): LoadedForgeConfig } {
-  const stat =
-    deps.stat ??
-    ((path: string) => {
-      try {
-        const s = statSync(path)
-        return { mtimeMs: s.mtimeMs, size: s.size }
-      } catch {
-        return null
-      }
-    })
+  const stat = deps.stat ?? recipeFileStat
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, "utf8"))
   const globalPath = forgeConfigPaths({ homeDir: deps.homeDir }).global
 
@@ -721,11 +658,7 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
       } else {
         const validated = validateAgentSet(top === undefined ? undefined : (top as Record<string, unknown>).agents)
         result = { agents: validated.agents, source, path, projectPath: source === "project" ? path : null, findings: validated.findings }
-        // dispatch node (harden-dispatch-resilience D3): field-level
-        // fail-soft; findings ride the same channel as the agent findings.
-        const dispatchNode = validateDispatchNode(top === undefined ? undefined : (top as Record<string, unknown>).dispatch, `${path}: dispatch`)
-        result.dispatch = dispatchNode.config
-        result.findings.push(...dispatchNode.findings)
+        result.findings.push(...legacyRuntimeOptionFindings(top, path))
       }
     }
     cache.set(path, { mtimeMs: st.mtimeMs, size: st.size, result })
@@ -742,9 +675,7 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
       const project = projectPath ? readCandidate(projectPath, "project") : null
       const global = globalPath ? readCandidate(globalPath, "global") : null
       // Merge, never replace: global base, project definition wins per agent
-      // id (wholesale — one definition per id, no cross-layer blending). The
-      // dispatch node cascade-merges separately (D3: per map key / breaker
-      // field, project over global).
+      // id (wholesale — one definition per id, no cross-layer blending).
       if (project && global) {
         return {
           agents: { ...global.agents, ...project.agents },
@@ -752,11 +683,10 @@ export function createForgeConfigLoader(deps: ForgeConfigLoaderDeps): { load(): 
           path: project.path,
           projectPath: project.path,
           findings: [...global.findings, ...project.findings],
-          dispatch: mergeDispatchNodes(global.dispatch ?? null, project.dispatch ?? null),
         }
       }
-      if (project) return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings, dispatch: project.dispatch ?? null }
-      if (global) return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings, dispatch: global.dispatch ?? null }
+      if (project) return { agents: project.agents, source: "project", path: project.path, projectPath: project.path, findings: project.findings }
+      if (global) return { agents: global.agents, source: "global", path: global.path, projectPath: null, findings: global.findings }
       // Unconfigured: inert and silent (spec — "the unconfigured state SHALL
       // be inert: no subagents registered, no errors raised, no AI-facing
       // configuration recipe emitted").
@@ -898,16 +828,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
    *  has no pool (the global fallback applies). */
   workspacePoolOf(anchor: string): string | null
 } {
-  const stat =
-    deps.stat ??
-    ((path: string) => {
-      try {
-        const s = statSync(path)
-        return { mtimeMs: s.mtimeMs, size: s.size }
-      } catch {
-        return null
-      }
-    })
+  const stat = deps.stat ?? recipeFileStat
   const readFile = deps.readFile ?? ((path: string) => readFileSync(path, "utf8"))
   const globalPath = forgeConfigPaths({ homeDir: deps.homeDir }).global
 
@@ -946,6 +867,7 @@ export function createPoolResolver(deps: PoolResolverDeps): {
     } else {
       const top = doc.config === undefined ? undefined : (doc.config as Record<string, unknown>)
       const validated = validateAgentSet(top === undefined ? undefined : top.agents)
+      validated.findings.push(...legacyRuntimeOptionFindings(top, path))
       // builtin-override D1: the `override` node is GLOBAL-layer-only. On a
       // workspace pool file it is ignored with a warn finding (workspace
       // agents always compile namespaced — per-project built-in overrides
@@ -1015,6 +937,13 @@ export function createPoolResolver(deps: PoolResolverDeps): {
         if (f) uniqueFiles.add(f)
       }
       if (globalPath && globalParsed) uniqueFiles.add(globalPath)
+
+      // A deleted workspace file is absent from discovery, so readPool never
+      // sees its missing stat. Evict entries no longer in the resolved set
+      // before a recreation can reuse the same mtime and size.
+      for (const file of fileCache.keys()) {
+        if (!uniqueFiles.has(file)) fileCache.delete(file)
+      }
 
       // ---- resolution order is PURELY lexicographic by absolute pool-file
       // path (design D1): the global fallback file sorts alongside every
