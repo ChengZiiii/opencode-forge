@@ -295,6 +295,8 @@ Candidate3 unknown check 正式局部签收（candidate3-goal-check-unknown.log�
 
 发布收尾凭据追加（覆盖前段“尚未发布”的时点状态）：用户明确授权提交/push/npm/本地升级并接受已披露未覆盖项；主控报告commit `0742759b27b6c85376ab3875bcd9655f6ab96661` 已推至 `origin/retire-plugin-runtime`。本工人独立读取release-0.35.0/registry-verification-20261126T190312Z.json：0.35.0 publish_exit=0、status=verified、dist-tags.latest=0.35.0；发布仅一次按主控报告。registry独立下载hash与发布tgz一致：SHA-256=5e2d45fb26e365dbc1a23793f28e3d4a8c7882d0ec19c7322d42ad029723e7b5、shasum=06fcc1f4e6e5aa3b0c2dde3f96606448385b97ce，integrity亦与前述同包一致。仅据该凭据核发布对账，不冒称本轮重下或执行publish/git。官方安装凭据release-0.35.0/local-install-verification-0.35.0.json（脱敏命令记录local-install-commands-0.35.0.log）：本机0.35.0、新cache1795720132680，四文件equal=true与测试包相同（index SHA-256=5798a04452b0cb003efd8cc020f2518aa3d9f936659b8153f85a6687e78dc941）；config与backup字节相同且parsed=true，service运行28894、list单forge0.35.0，旧cache已改名1795516668114.stale-0.34.0-pre-0.35.0。userTuiRestartConfirmed=false，用户重启确认仍待，11.4整项不勾，不把未测矩阵全勾，不archive active change。本轮只更新tasks/audit，不执行git或改生产文件。
 
+用户验收确认（2026-11-27）：用户对上述0.35.0发布、本机安装及待验收报告明确回复「全部通过」，本次owner验收据此关闭，覆盖前述“用户确认仍待”的状态。不推断具体TUI重启步骤，不修改既有JSON的userTuiRestartConfirmed=false历史记录；此前未覆盖矩阵、D6及过程偏差不改写为实测通过，11.4包含全部历史条件的整项仍不勾，不archive。
+
 ## 12. 收尾（业主明示后）
 
 - [ ] 12.1 归档前重新核对 0.2 全部依赖及 forge-commands 文字冲突解决条件，按归档/撤销各自合法基线核对；已撤销的 D 草案及其它取消 change 不并入主规格，授权范围外 change 不自行处置。

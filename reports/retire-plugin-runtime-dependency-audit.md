@@ -625,6 +625,8 @@ Candidate3 unknown check 正式局部签收（candidate3-goal-check-unknown.log�
 
 发布收尾凭据追加（覆盖前述尚未发布的历史时点）：用户明确授权提交/push/npm/本地升级并接受已披露未覆盖项；commit `0742759b27b6c85376ab3875bcd9655f6ab96661` 已推 `origin/retire-plugin-runtime` 按主控报告记账。本工人已独立读release-0.35.0/registry-verification-20261126T190312Z.json：publish_exit=0、verified、latest=0.35.0，registry独立下载SHA-256=5e2d45fb26e365dbc1a23793f28e3d4a8c7882d0ec19c7322d42ad029723e7b5、shasum=06fcc1f4e6e5aa3b0c2dde3f96606448385b97ce及integrity均匹配同一发布tgz；publish一次归因主控报告，不称本工人执行或重下。官方安装凭据release-0.35.0/local-install-verification-0.35.0.json（脱敏命令记录local-install-commands-0.35.0.log）：本机0.35.0、新cache1795720132680，四文件equal=true与测试包相同（index SHA-256=5798a04452b0cb003efd8cc020f2518aa3d9f936659b8153f85a6687e78dc941）；config与backup字节相同且parsed=true，service运行28894、list单forge0.35.0，旧cache已改名1795516668114.stale-0.34.0-pre-0.35.0。userTuiRestartConfirmed=false，用户重启确认仍待。未测矩阵、D6及过程偏差保留，不整勾11.4或其他whole checkbox，不archive active change；本轮仅改两既有文档，不执行git、不改生产文件。
 
+用户验收确认（2026-11-27）：用户对上述0.35.0发布、本机安装及待验收报告明确回复「全部通过」，仅关闭本次owner验收，覆盖前述用户确认仍待状态；不推断具体TUI重启步骤，既有JSON中userTuiRestartConfirmed=false保留为历史快照。未覆盖矩阵、D6及过程偏差不改写为实测通过，不整勾11.4全部历史条件、不archive、不改源码。
+
 ### 历史快照 20261126-225726，非当前 e3ec
 
 | 核验项 | 独立读取/实算证据与边界 |
