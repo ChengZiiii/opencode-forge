@@ -623,6 +623,8 @@ Candidate3 unknown check 正式局部签收（candidate3-goal-check-unknown.log�
 
 最终实包局部smoke增证（2026-11-27，主控核验回报）：同一0.35.0 tgz SHA-256=5e2d45fb26e365dbc1a23793f28e3d4a8c7882d0ec19c7322d42ad029723e7b5，release-0.35.0/release-goal-smoke.log与release-stop-smoke.log两run均exit0、owned cleanup0、root removed=true。本工人已读两raw的smoke-staging-unique/package/dist/index.js artifact/5798及cleanup0；Goal ledger yes/no/no→paused/no-progress、stop双native child局部链与exit/root结果按主控核验归因，不冒称本工人重跑或完整矩阵通过。dist仍5798a04452b0cb003efd8cc020f2518aa3d9f936659b8153f85a6687e78dc941，全量767/767。owner明确接受披露限制并放行，原缺口/过程偏差/D6继续保留，不新增whole checkbox、不archive。发布/官方安装/用户重启实测尚待。本轮只改tasks/audit，不动package/README/dist，保持实包对应；此前文件由主控已stage，本增量由主控再stage，本工人不修改index。
 
+发布收尾凭据追加（覆盖前述尚未发布的历史时点）：用户明确授权提交/push/npm/本地升级并接受已披露未覆盖项；commit `0742759b27b6c85376ab3875bcd9655f6ab96661` 已推 `origin/retire-plugin-runtime` 按主控报告记账。本工人已独立读release-0.35.0/registry-verification-20261126T190312Z.json：publish_exit=0、verified、latest=0.35.0，registry独立下载SHA-256=5e2d45fb26e365dbc1a23793f28e3d4a8c7882d0ec19c7322d42ad029723e7b5、shasum=06fcc1f4e6e5aa3b0c2dde3f96606448385b97ce及integrity均匹配同一发布tgz；publish一次归因主控报告，不称本工人执行或重下。官方安装凭据release-0.35.0/local-install-verification-0.35.0.json（脱敏命令记录local-install-commands-0.35.0.log）：本机0.35.0、新cache1795720132680，四文件equal=true与测试包相同（index SHA-256=5798a04452b0cb003efd8cc020f2518aa3d9f936659b8153f85a6687e78dc941）；config与backup字节相同且parsed=true，service运行28894、list单forge0.35.0，旧cache已改名1795516668114.stale-0.34.0-pre-0.35.0。userTuiRestartConfirmed=false，用户重启确认仍待。未测矩阵、D6及过程偏差保留，不整勾11.4或其他whole checkbox，不archive active change；本轮仅改两既有文档，不执行git、不改生产文件。
+
 ### 历史快照 20261126-225726，非当前 e3ec
 
 | 核验项 | 独立读取/实算证据与边界 |
