@@ -9,5 +9,5 @@
     "allowImportingTsExtensions": true,
     "noEmit": true
   },
-  "include": ["plugin.ts", "src/**/*.ts"]
+  "include": ["plugin.ts", "tui.ts", "rpc.ts", "src/**/*.ts"]
 }

@@ -3,6 +3,7 @@ import { authorizedSearch, ambiguousSearchPath, jsGrep, type SearchInput, type S
 import { strictGlobToRegExp, matchGlob, MAX_FILE_BYTES } from "./src/search-js.ts"
 import { resolveRgBinary } from "./src/search-core.ts"
 import { spawnSync } from "node:child_process"
+import { AsyncLocalStorage } from "node:async_hooks"
 import { classifyGoalActivity, hasIdleBackgroundShell, idleBackgroundKnown, settledGoalRounds, observeGoalActivity, rememberGoalCheck, type GoalActivity } from "./src/goal-activity.ts"
 import type { ToolDefinition } from "@opencode-ai/plugin"
 import { tool } from "@opencode-ai/plugin"
@@ -65,6 +66,10 @@ import { forgeAgentDef, effectiveReadonlyShape } from "./src/dispatch-tiers.ts"
 import { applyDepthTranslation, resolvePinnedDepth, type DepthChannel, type DepthTranslation } from "./src/dispatch-depth.ts"
 import { legacyDispatchEnvFindings, createForgeConfigLoader, createPoolResolver, forgeConfigPaths, parseForgeJsonc, parseTopLevelKnobs, poolFileCompliance, recipeFileStat, sanitizeNamespace, type ForgeAgentDef, type ForgeMaterializeKnob, type LoadedForgeConfig, type PoolResolution } from "./src/forge-config.ts"
 import { agentDirFor, rosterAgentDirFor, compileResolvedRosterEntry, executeRosterSync, globalAgentDirFor, planOverrideSync, overrideSyncFindings, planRosterSync, staleCheckForPool, NATIVE_TOOL_VOCAB, VARIANT_DEPTH_WORDS, type RosterFsDeps, type SyncPlan } from "./src/roster-compile.ts"
+import { forgeConfigRpcDefinition } from "./rpc.ts"
+import { createConfigRpcStore } from "./src/config-rpc-protocol.ts"
+import { createConfigRpcHostDeps, currentConfigRpcEpoch, rotateConfigRpcEpoch, type ConfigScopeAccessors } from "./src/config-rpc-host.ts"
+import { createConfigRpcSyncHandler, captureSyncBaseline, type ConfigRpcSyncDeps, type SyncResolutionSnapshot } from "./src/config-rpc-sync.ts"
 
 
 const FORGE_AGENT = "forge"
@@ -305,6 +310,21 @@ const sessions = new Map<string, SessionState>()
 const sessionMovedAnchors = new Map<string, string>()
 const anchorMovedNotes = new Set<string>()
 
+// RPC session-anchor REQUEST CONTEXT (final precision round): the forge-config
+// RPC preload wrapper CAPTURES resolveSessionAnchorForPools' per-request
+// result — the chain ALREADY adjudicated the record-vs-pooled-map preference
+// (anchor-pool-preference) and the moved statement inside it — and carries it
+// to the SYNCHRONOUS scope chain through this per-request async context.
+// NO shared per-session preload map: concurrent requests for the same session
+// cannot cross-contaminate each other's fresh resolution, and a stale
+// in-memory `sessions` binding (an OLD workspace) can never unconditionally
+// outrank THIS request's fresh resolved result (it sits BELOW the context in
+// sessionAnchorOf). The moved map stays the FIRST synchronous read (in and
+// out of locks, no await), so a session.moved that lands after the preload
+// still wins; an empty/unresolvable preload carries "" and the chain falls
+// through to the live maps and the ledger exactly as before.
+const rpcAnchorRequestContext = new AsyncLocalStorage<{ resolvedAnchor: string }>()
+
 // Record a host `session.moved` statement. Tolerant to payload drift (v1
 // properties / v2 flat-data shapes); a degenerate directory is ignored
 // (never poisons a good binding). Fail-soft by construction.
@@ -418,6 +438,16 @@ const foldPath = (p: string) => (process.platform === "win32" ? p.replace(/\//g,
 // The global fallback layer's forge.json path (test-home aware).
 function globalPoolPathOf(): string {
   return forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global
+}
+
+// Strict UTF-8 read for the forge-config RPC's sync/baseline resolution
+// (review item 6): fatal decode — undecodable bytes THROW instead of
+// silently mangling the document the plan would be compiled from (the
+// config-rpc-edit kernel's snapshot discipline, mirrored at the resolution
+// surface). A throw surfaces as a fail-closed sync/commit refusal.
+const CONFIG_RPC_UTF8_STRICT = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+function strictUtf8Read(path: string): string {
+  return CONFIG_RPC_UTF8_STRICT.decode(readFileSync(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -3822,6 +3852,12 @@ type V2CommandEditor = {
 type V2PluginContext = {
   agent?: {
     transform?(cb: (draft: V2AgentDraft) => void): Promise<unknown>
+    // SDK-proven official seam (promise/plugin.d.ts AgentDomain =
+    // AgentApi(Client["agent"]) + transform/reload): list(input?, opts?) →
+    // AgentListOutput {location?, data: Agent.Info[]}. Guarded — a drifted
+    // host without it degrades the sync verdict to "unconfirmed" (the
+    // honest default), never a throw.
+    list?(input?: unknown, opts?: unknown): Promise<unknown>
   }
   tool?: {
     transform?(cb: (editor: V2ToolEditor) => void): Promise<unknown>
@@ -3875,7 +3911,28 @@ type V2PluginContext = {
   // the conventions §3 mapping (directory/project → ctx.location.*); the
   // exact method names are verified in the sandbox stage. Guarded readers
   // mean a drifted location simply leaves the process cwd as the anchor.
-  location?: { worktree?: () => unknown; directory?: () => unknown }
+  // Field reality (2.3.2 live probe): location.directory is a string
+  // PROPERTY carrying the load location; the function shape is the legacy
+  // guard. Both accepted, never guessed.
+  location?: { worktree?: (() => unknown) | string; directory?: (() => unknown) | string }
+  // Official Plugin RPC domain (probe-proven 2.4.2, archive REPORT §9.6/
+  // §9.10: `ctx.rpc.register(definition, handlers)` resolves a registration
+  // carrying `dispose()`; unknown methods reject with the
+  // rpc.method_not_found family; `await registration.dispose()` makes the
+  // method unavailable until re-register). Handler params are typed `never`
+  // (the bottom type) so the protocol store's concrete signatures remain
+  // assignable while the host-side call shape stays unknown — the host, not
+  // this module, invokes them. Guarded: a drifted host without the domain
+  // (or a failed registration) leaves the forge-config RPC unregistered and
+  // every other behavior untouched; the TUI then fail-closes as an
+  // unprovable transport (zero writes, zero syncs).
+  rpc?: {
+    register?(definition: unknown, handlers: Record<string, (input: never) => unknown>): Promise<unknown>
+  }
+  // Probe-proven server ctx field (archive probe plugin index.js:26:
+  // `ctx.app.version` on the SERVER side). Guarded read — drift degrades to
+  // an empty version string in the RPC echo, never a throw.
+  app?: { version?: unknown }
 }
 
 // Injection seam for the V2 harness (task 1.2): the resolver runs on real
@@ -5422,6 +5479,209 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
       // Auto-sync is best-effort: never a throw into the host.
     }
   }
+  // ---- forge-config RPC (change forge-tui-subagent-config, tasks 6.1–6.5):
+  // the server-mediated commit protocol over the OFFICIAL Plugin RPC. The
+  // server resolves every target from its OWN authoritative state (host
+  // anchor registry, sessionMovedAnchors, known families, the shared pool
+  // resolver); the TUI only drafts and confirms. Guarded: a drifted host
+  // without ctx.rpc.register (or a failed registration) keeps every other
+  // behavior — the TUI side fail-closes as an unprovable transport (zero
+  // writes, zero syncs, retries included).
+  let disposeConfigRpc: (() => Promise<void>) | null = null
+  if (typeof ctx.rpc?.register === "function") {
+    try {
+      // Registration generation: this registration is a NEW epoch
+      // generation — every handle/token issued before it must refuse
+      // (server-provable invalidation, task 6.5). Cleanup rotates again.
+      rotateConfigRpcEpoch()
+      // THIS registration's server-observed location: the binding anchor
+      // for every null-session (home) scope — exactly this location's home
+      // plus the server's own global home, never a wildcard. SOLE SOURCE:
+      // the real ctx.location.directory of THIS registration (probe-proven
+      // per-location RPC dispatch — each location activates its own setup
+      // domain, so the ctx.location of this call IS the server-observed
+      // location). deps.anchors and the v2 candidate list are other
+      // consumers' anchor domains, NOT this registration's observed
+      // location; the process cwd is NEVER a substitute. Missing/drifted →
+      // null and every null-session scope refuses (fail closed).
+      const rpcLocation = ((): string | null => {
+        try {
+          const reader = ctx.location?.directory
+          const v = typeof reader === "function" ? (reader as () => unknown)() : reader
+          if (typeof v === "string" && v.trim() !== "" && !isRootish(v)) return v
+        } catch {
+          // Drifted location access: fail closed below.
+        }
+        return null
+      })()
+      const accessors: ConfigScopeAccessors = {
+        // LIVE-MAP-FIRST session anchor (never the async session.get seam):
+        // session.moved record → live session map → ledger re-bind (its
+        // pool-ownership re-check rides along). A synchronous read of the
+        // moved map cannot lose the race the stale session.get loses.
+        sessionAnchorOf: (sessionID) => {
+          // 1) The host's session.moved statement — re-read SYNCHRONOUSLY on
+          //    every resolution (in and out of the lock, no await) so a move
+          //    that landed even after this request's preload still wins.
+          const moved = sessionMovedAnchors.get(sessionID)
+          if (moved && moved.trim() !== "" && !isRootish(moved)) return moved
+          // 2) THIS request's fresh resolved anchor (review 7a, final
+          //    round): the preload's per-request capture — the async chain
+          //    already adjudicated record-vs-pooled-map (anchor-pool-preference)
+          //    and the moved statement inside it, so the synchronous chain
+          //    consumes that result instead of re-litigating with its own
+          //    priority scheme. It outranks the live `sessions` map: a stale
+          //    in-memory binding (an OLD workspace) must never unconditionally
+          //    beat the host's fresh record.
+          const resolved = rpcAnchorRequestContext.getStore()?.resolvedAnchor
+          if (typeof resolved === "string" && resolved.trim() !== "" && !isRootish(resolved)) return resolved
+          const mapped = sessions.get(sessionID)?.worktree ?? ""
+          if (mapped && mapped.trim() !== "" && !isRootish(mapped)) return mapped
+          const ledger = resolveAnchorViaLedger(sessionID, "")
+          return ledger && ledger.trim() !== "" && !isRootish(ledger) ? ledger : null
+        },
+        workspacePoolOf: (anchor) => sessionPoolFileOf(anchor),
+        globalPoolPath: () => globalPoolPathOf(),
+        knownWorkspaceRoot: (anchor) => hostAnchors.some((a) => anchorKey(a) === anchorKey(anchor)),
+        samePath: (a, b) => a.trim() !== "" && b.trim() !== "" && foldPath(a) === foldPath(b),
+        pathExists: (p) => recipeFileStat(p) !== null,
+      }
+      // Fresh authoritative resolution for the sync/baseline paths (review
+      // item 6): a NEW createPoolResolver per call over the SAME host anchor
+      // registry — the shared resolver's mtime/size cache cannot serve a
+      // stale parse to a fresh hash. The recording readFile captures the
+      // exact bytes the plan was compiled from, so hash and plan bind ONE
+      // snapshot (never a second read that could see different bytes).
+      const syncResolvers = (): SyncResolutionSnapshot | null => {
+        if (hostAnchors.length === 0) return null
+        const readOf = new Map<string, string>()
+        const fresh = createPoolResolver({
+          homeDir,
+          readFile: (p) => {
+            const text = strictUtf8Read(p)
+            readOf.set(p, text)
+            return text
+          },
+        })
+        const resolution = fresh.resolve(hostAnchors)
+        for (const f of resolution.families) observedRecipeFiles.add(f.file)
+        return { resolution, readOf: (p: string) => readOf.get(p) ?? null }
+      }
+      const hostDeps = createConfigRpcHostDeps(accessors, {
+        observedLocation: rpcLocation,
+        // Pre-write baseline capture (review item 3): the commit protocol
+        // calls this inside the commit lock, BEFORE the publish — the disk
+        // still holds the pre-write recipe, so the fresh full resolution is
+        // the true "before" the dependent sync diffs against (save-caused
+        // winner flips stay visible). A throw fails the commit closed
+        // (store-owned zero-publish discipline).
+        beforeCommit: (req) => captureSyncBaseline({ ownerFile: req.binding.path, anchor: req.binding.anchor, observedLocation: req.binding.observedLocation }, syncResolvers, () => Date.now()),
+      })
+      const store = createConfigRpcStore(hostDeps)
+      // Independent host-registry observation (review item 8 / spec 6.4):
+      // the OFFICIAL ctx.agent.list seam (AgentDomain — SDK promise/
+      // plugin.d.ts; AgentListOutput {location?, data: Agent.Info[]} with
+      // {id, system?, model?, permissions?} rows). The rows feed the sync
+      // applied-comparator; anything the comparator cannot see keeps the
+      // verdict UNCONFIRMED — never applied from the recipe's own
+      // projection. Fail-soft: a drifted/absent/throwing seam returns null
+      // → unconfirmed (probe worker re-verifies the live call; a false
+      // "applied" is impossible by construction here).
+      const listNativeAgents = async (): Promise<Array<{ id: string; system?: unknown; model?: unknown; permissions?: unknown }> | null> => {
+        if (typeof ctx.agent?.list !== "function") return null
+        try {
+          const out = (await ctx.agent.list()) as unknown
+          const rows = Array.isArray(out)
+            ? (out as unknown[])
+            : out !== null && typeof out === "object" && Array.isArray((out as { data?: unknown }).data)
+              ? ((out as { data: unknown[] }).data as unknown[])
+              : null
+          if (rows === null) return null
+          const mapped: Array<{ id: string; system?: unknown; model?: unknown; permissions?: unknown }> = []
+          for (const row of rows) {
+            // ONE malformed row makes the WHOLE observation unusable
+            // (review round 6): a {name}-shaped drift row must never be
+            // silently skipped — a pure-delete sync could misread an
+            // unobservable host as "id gone". Null = unobservable → the
+            // sync verdict stays unconfirmed.
+            if (row === null || typeof row !== "object") return null
+            const rec = row as { id?: unknown; system?: unknown; model?: unknown; permissions?: unknown }
+            if (typeof rec.id !== "string" || rec.id.trim() === "") return null
+            mapped.push({ id: rec.id, system: rec.system, model: rec.model, permissions: rec.permissions })
+          }
+          return mapped
+        } catch {
+          return null
+        }
+      }
+      const syncDeps: ConfigRpcSyncDeps = {
+        resolveScope: hostDeps.resolver,
+        resolvePools: syncResolvers,
+        getCommitContext: (commitId) => store.getCommitContext(commitId),
+        globalPoolFile: globalPoolPathOf,
+        rosterDirs: () => ({ globalPoolFile: globalPoolPathOf(), globalAgentDir: globalAgentDirFor({ homeDir, configDir: process.env.OPENCODE_CONFIG_DIR }) }),
+        rosterFs: realRosterFs,
+        epoch: currentConfigRpcEpoch,
+        listNativeAgents,
+        attachSyncOutcome: (commitId, sync) => store.attachSyncOutcome(commitId, sync),
+      }
+      const syncHandler = createConfigRpcSyncHandler(syncDeps)
+      const appVersion = typeof ctx.app?.version === "string" ? ctx.app.version : ""
+      // Session-anchor PRE-LOAD (review item 7a, original agreement; final
+      // round): the handlers resolve scopes SYNCHRONOUSLY (moved-map-first,
+      // in and out of their locks — a stale session.get must never outweigh
+      // the host's session.moved statement). For a RESUMED session that
+      // never re-fired session.created and sits in neither map, a maps-only
+      // chain would refuse a session whose anchor the HOST knows. The
+      // pre-load runs the ASYNC authoritative chain (host session record →
+      // moved-first → anchor-pool-preference → ledger re-bind) OUTSIDE any
+      // lock, BEFORE the synchronous resolution, and CAPTURES its result —
+      // never discarded — into a PER-REQUEST async context that
+      // sessionAnchorOf consumes right after the moved map. Per-request (no
+      // shared per-session map): concurrent requests cannot cross-
+      // contaminate each other's fresh resolution, and a stale `sessions`
+      // binding can never unconditionally outrank this request's fresh
+      // result. The lock interior stays synchronous moved-first with no
+      // await gap.
+      const withPreload = (handler: (input: never) => unknown): ((input: never) => Promise<unknown>) => async (input: never) => {
+        const sid = input !== null && typeof input === "object" ? (input as { sessionID?: unknown }).sessionID : undefined
+        let resolvedAnchor = ""
+        if (typeof sid === "string" && sid.trim() !== "") {
+          try {
+            const anchor = await resolveSessionAnchorForPools(sharedAnchorClient(), sid)
+            if (typeof anchor === "string" && anchor.trim() !== "" && !isRootish(anchor)) resolvedAnchor = anchor
+          } catch {
+            // Fail-soft: the synchronous chain still refuses an unresolvable
+            // scope; a failed pre-load never widens resolution.
+          }
+        }
+        return rpcAnchorRequestContext.run({ resolvedAnchor }, () => handler(input))
+      }
+      const registration = (await ctx.rpc.register(
+        forgeConfigRpcDefinition,
+        Object.fromEntries(
+          Object.entries({ ...store.handlers({ pluginID: "forge", appVersion }), sync: syncHandler }).map(([name, handler]) => [name, withPreload(handler)]),
+        ),
+      )) as { dispose?: () => Promise<void> } | null | undefined
+      if (registration && typeof registration.dispose === "function") {
+        const regDispose = registration.dispose.bind(registration)
+        disposeConfigRpc = async () => {
+          // Registration-generation change on unload: every issued
+          // handle/token refuses afterwards (probe-proven dispose makes the
+          // method unavailable; generation rotation makes the issued
+          // binding stale server-side).
+          rotateConfigRpcEpoch()
+          try {
+            await regDispose()
+          } catch {
+            // Best-effort: a drifted dispose never breaks the cleanup chain.
+          }
+        }
+      }
+    } catch (err) {
+      console.warn(`[forge:v2] warn: forge-config RPC registration unavailable — the config commit protocol is disabled for this process (${err instanceof Error ? err.message : String(err)})`)
+    }
+  }
   // ---- agent domain: forge primary + full sole-pool-ownership
   // materialization (task 1.2 — parity with the v1 config hook, same
   // createPoolResolver + forgeAgentDef cores).
@@ -5766,7 +6026,7 @@ export async function v2Setup(ctx: V2PluginContext, deps?: V2SetupDeps): Promise
   // host runs on plugin unload (2.4.0 registers the function `setup`
   // resolves to). It tears down THIS instance only
   // (tests/v2-setup-cleanup.test.mjs pins it).
-  const disposables = [...sessionHooks.disposables, ...(v2AbortEvents ? [v2AbortEvents] : [])]
+  const disposables = [...sessionHooks.disposables, ...(v2AbortEvents ? [v2AbortEvents] : []), ...(disposeConfigRpc ? [disposeConfigRpc] : [])]
   return disposables.length > 0
     ? async () => {
         if (goalClient) disposeGoalClient(goalClient)

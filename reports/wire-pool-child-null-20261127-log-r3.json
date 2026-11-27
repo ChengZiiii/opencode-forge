@@ -1,0 +1,19 @@
+{
+  "exitCode": 0,
+  "log": [
+    "ROOT(preserved): C:\\Users\\Soren\\AppData\\Local\\Temp\\forge-wirepool-LHNaoS",
+    "FIXTURE pool=parent/.opencode/forge.json (plugindev,5); child has no forge.json",
+    "=== LEG: serve cwd=child ===",
+    "SERVE: http://127.0.0.1:56094",
+    "SERVE: password captured (len=43, memory-only)",
+    "owned PID: 2620",
+    "A GET#6 forge state=active plugins=104",
+    "A echo: 200 {\"nonceMatch\":true,\"pluginID\":\"forge\",\"appVersion\":\"2.4.2\"}",
+    "WORKSPACE-null topKeys: [\"ok\",\"snapshotId\",\"path\",\"targetIdentity\",\"scope\",\"sessionID\",\"observedLocation\",\"anchor\",\"epoch\",\"generation\",\"expiresAt\",\"exists\",\"readable\",\"creatable\",\"identity\",\"raw\",\"document\",\"parseError\",\"findings\"]",
+    "WORKSPACE-null: {\"ok\":true,\"exists\":true,\"path\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-LHNaoS\\\\parent\\\\.opencode\\\\forge.json\",\"observedLocation\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-LHNaoS\\\\parent\\\\child-repo\",\"anchor\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-LHNaoS\\\\parent\\\\child-repo\",\"creatable\":false,\"findings\":[]}",
+    "GLOBAL-null: {\"ok\":true,\"exists\":false,\"path\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-LHNaoS\\\\forge-home/.config/opencode/forge.json\",\"observedLocation\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-LHNaoS\\\\parent\\\\child-repo\",\"anchor\":null,\"creatable\":true,\"findings\":[]}",
+    "session.create: 200 sid: ses_de29cc...",
+    "WORKSPACE-session@child: {\"ok\":true,\"exists\":true,\"path\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-LHNaoS\\\\parent\\\\.opencode\\\\forge.json\",\"observedLocation\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-LHNaoS\\\\parent\\\\child-repo\",\"anchor\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-LHNaoS\\\\parent\\\\child-repo\",\"creatable\":false,\"findings\":[]}",
+    "DONE failures: 0 []"
+  ]
+}

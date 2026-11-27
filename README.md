@@ -440,6 +440,130 @@ applies except to stop (live host identity lookup coverage remains incomplete).
 The command router never writes files itself — every write goes through
 `forge_sync` or the normal write tool on your explicit go-ahead, transcript-visible.
 
+### The configuration TUI (`Forge: Configure subagents` / `/forge-config`)
+
+A human-only TUI entry, separate from the server command domain: **`Forge:
+Configure subagents`** in the command palette (Ctrl+P, searchable) and the
+**`/forge-config`** slash shortcut. It never sends a prompt, never touches
+the conversation's model, and opening/browsing/cancelling writes nothing.
+Requires the `@opencode/plugin/tui` runtime surface (opencode CLI 2.4.2+;
+the entry loads from the same installed package via its `./tui` export —
+there is no second installation source, and the `.` server entry stays
+independent: if the TUI surface is unavailable, server-side Forge is
+unaffected and the miss is disclosed).
+
+**How saves work (server-mediated commit protocol).** The TUI itself never
+writes a recipe file — it drafts, previews and asks. Every authoritative
+answer comes from the server plugin over the official Plugin RPC
+(`ctx.client.rpc` against the shared `./rpc` definition the same package
+exports): the server reads the target exactly once when the editor opens
+(the edit-start snapshot), prepares a canonical patch with a preview hash,
+issues a bounded, short-lived, SINGLE-USE preview token, and — only on your
+explicit confirmation — commits atomically under a per-target lock after
+re-verifying the snapshot, ownership and scope. If the file changed since
+the editor opened, the save is refused and a reload is offered — an
+external edit is never silently overwritten. Before every commit the TUI
+re-checks the server epoch (echo round-trip); after a server restart or a
+plugin re-registration every old token is refused. A commit whose response
+is lost is resolved by the same-epoch receipt — without one the outcome is
+UNKNOWN: nothing is replayed, your drafts are kept, and the next Save &
+Sync prepares against the current content and asks you again.
+
+**Remote disclosure.** A confirmed save writes the CONNECTED SERVER's
+filesystem — including when the TUI is attached to a remote server. Before
+confirmation is possible, the preview names the scope, the exact
+server-side path and the server-issued target identity, and states that
+the write lands on the connected server, not a local file. Acceptance
+rests on the server's authoritative ownership resolution, not on
+same-machine proof. A target the server cannot authoritatively resolve
+stays read-only/unavailable with an explanation.
+
+**Trust boundary, stated plainly.** An RPC method registration is NOT a
+tool and appears on no model-facing tool surface — but it is also NOT a
+proof of a human caller: any client holding the server's API
+authentication can call the prepare/commit methods directly. The server's
+guarantees are exactly: writes bounded to server-resolved recipe targets,
+content-bound single-use epoch tokens, and same-epoch receipts. Displaying
+the preview and obtaining your confirmation is the TUI's responsibility,
+not something the protocol can attest.
+
+**Connection loss.** Default per-boot server authentication rotates on
+restart — an old TUI session cannot recover (it meets a 401 wall), and no
+lossless reconnect is claimed. On any detected disconnect or epoch change
+the TUI drops its in-flight tokens; the recovery path is the normal one:
+re-read, re-prepare, and confirm a fresh preview.
+
+What it covers:
+
+- **Scope/source** — Workspace view (the server-resolved owning
+  `.opencode/forge.json`; when none exists the global fallback is shown as
+  the effective roster and a workspace pool file can be created explicitly:
+  exact path shown, fallback replacement warned, a valid declared `pool`
+  name required) and Global view (workers + `general`/`explore` overrides,
+  labelled not-effective when a workspace pool owns the session). Editing
+  an ancestor-owned pool happens at the owning file; IDs are never renamed.
+  A missing, disabled or unverifiable server Forge row, or an unprovable
+  RPC transport (the echo probe), closes the editor with an explanation —
+  zero reads via RPC, zero writes, zero syncs, including retries.
+- **Editing** — create/delete workers and overrides with confirmation.
+  Drafts preview LIVE in the list: pending values, pending removals and a
+  Pinned→Auto conversion (both pin fields shown as removed) are overlaid on
+  the base entry with a pending marker, and search runs over that merged
+  view. This is preview only — NOT autosave: nothing is written until you
+  confirm an explicit save, and discarding a draft restores the base entry.
+  model/level have independent entry points via the host catalog
+  (provider → model → level; Auto removes BOTH pin fields, Pinned requires
+  both; a Pinned entry can change the level alone, and changing the model
+  keeps the Auto/Pinned mode — only the level is revalidated; entries
+  absent from the catalog keep their raw value and are labelled
+  unverified — catalog `active` never proves credentials), shape
+  (write default / readonly), prompt, and explicit permission overrides
+  (mandatory worker restrictions stay compiler-enforced and are not
+  offered as editable).
+- **Save & Sync** — everything stays a draft until you confirm an explicit
+  save preview (exact file + scope + server-issued identity + per-change
+  summary + findings, computed by the server). Unrelated bytes, comments,
+  unknown fields, encoding and newline style are preserved by the server's
+  targeted JSONC edit; validator-rejected entries are NOT written and are
+  listed in the receipt while their siblings commit. Writes are atomic; a
+  failure leaves the prior bytes intact; a no-op writes nothing. A
+  completed save keeps you in the editor on a fresh view of the current
+  bytes (a new edit-start snapshot); if that refresh fails you still see
+  saved + refresh failed with the receipt kept — nothing is replayed, and
+  recovery is a fresh prepare or an explicit reload. Results stay short
+  (counts plus risk flags, no stacked long toasts) with the full
+  per-entry receipt available on demand.
+- **Application status** — after the save, the server re-runs the existing
+  roster compiler for the edited family only (global saves include the
+  override channel) and reports the projection separately from the save.
+  The first sync runs immediately after a written save: the server prepares
+  the projection against the CURRENT recipe (a pure read, bound to the save
+  receipt), shows the scope/path/changes preview (changed entries listed
+  first, plus an unchanged count), and applies only on your
+  explicit second confirmation; a cancel or failure keeps the saved recipe
+  and offers an explicit retry with the same independent prepare + fresh
+  preview + confirm. "Applied" requires the server's own host observation
+  of the actually changed fields or the exact removed ID — without a proven
+  native-registry observation the status stays honestly "unconfirmed",
+  never upgraded. A cross-family winner change is reported unconfirmed with
+  the existing host-wide sync (`/forge sync`) as the separate recovery;
+  running children are never restarted.
+
+Slash no-shadowing: `/forge-config` arms only while the host's reactive
+command gate (`ctx.storage.memory`) holds a provably-free registry check
+for the CURRENT location; if you define your own `/forge-config`, Forge
+closes the gate on detection (registry re-checks at registration, on
+command-change events when the host delivers them, and at invocation time)
+so the next invocation reaches YOUR command — an invocation our alias
+swallowed is refused with a disclosure, never fake-executed. The palette
+entry always registers.
+
+Official enable/disable: the server plugin lifecycle is the switch — the
+official CLI has no per-plugin disable flag (only `list/add/check/update/
+remove`), so removal = the registry row disappears and the TUI refuses
+saves/syncs until the server part is active again. The palette/slash entry
+itself is TUI-only and never appears in the server command list.
+
 ### forge.json — the configuration
 
 A dedicated `forge.json` (JSONC — comments allowed) with **workspace pool
@@ -878,7 +1002,7 @@ apply-timing table above).
 npm install
 bun run typecheck     # tsc --noEmit
 node --import ./tests/lib/test-runtime-namespace.mjs --test tests/*.test.mjs   # (= npm test; keeps test artifacts off the host's)
-bun run bundle        # rebuild self-contained dist/index.js (committed)
+bun run bundle        # rebuild self-contained dist (index.js + tui.js + rpc.js + schema, committed)
 ```
 
 The preload sets `FORGE_TEST_RUNTIME_DIR` to a private runtime directory.

@@ -1,0 +1,18 @@
+{
+  "exitCode": 0,
+  "log": [
+    "ROOT(preserved): C:\\Users\\Soren\\AppData\\Local\\Temp\\forge-wirepool-0eO7A3",
+    "FIXTURE pool=parent/.opencode/forge.json (plugindev,5); child has no forge.json",
+    "=== LEG: serve cwd=child ===",
+    "SERVE: http://127.0.0.1:62200",
+    "SERVE: password captured (len=43, memory-only)",
+    "owned PID: 25372",
+    "A GET#6 forge state=active plugins=104",
+    "A echo: 200 {\"nonceMatch\":true,\"pluginID\":\"forge\",\"appVersion\":\"2.4.2\"}",
+    "WORKSPACE-null: {\"ok\":true,\"exists\":true,\"path\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-0eO7A3\\\\parent\\\\.opencode\\\\forge.json\",\"observedLocation\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-0eO7A3\\\\parent\\\\child-repo\",\"anchor\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-0eO7A3\\\\parent\\\\child-repo\",\"creatable\":false,\"findings\":[]}",
+    "GLOBAL-null: {\"ok\":true,\"exists\":false,\"path\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-0eO7A3\\\\forge-home/.config/opencode/forge.json\",\"observedLocation\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-0eO7A3\\\\parent\\\\child-repo\",\"anchor\":null,\"creatable\":true,\"findings\":[]}",
+    "session.create: 200 sid: ses_de29d5...",
+    "WORKSPACE-session@child: {\"ok\":true,\"exists\":true,\"path\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-0eO7A3\\\\parent\\\\.opencode\\\\forge.json\",\"observedLocation\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-0eO7A3\\\\parent\\\\child-repo\",\"anchor\":\"C:\\\\Users\\\\Soren\\\\AppData\\\\Local\\\\Temp\\\\forge-wirepool-0eO7A3\\\\parent\\\\child-repo\",\"creatable\":false,\"findings\":[]}",
+    "DONE failures: 0 []"
+  ]
+}

@@ -824,6 +824,7 @@ function resolveRgBinary(config, seams) {
 
 // plugin.ts
 import { spawnSync as spawnSync3 } from "node:child_process";
+import { AsyncLocalStorage } from "node:async_hooks";
 
 // src/goal-activity.ts
 import { createHash } from "node:crypto";
@@ -13382,8 +13383,8 @@ function tool(input) {
 }
 tool.schema = exports_external;
 // plugin.ts
-import { closeSync, fstatSync, openSync, readSync, appendFileSync, existsSync, lstatSync, mkdirSync as mkdirSync2, readdirSync, readFileSync as readFileSync4, realpathSync as realpathSync2, renameSync as renameSync2, statSync as statSync3, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
-import { basename as basename2, dirname as dirname3, isAbsolute as isAbsolute3, join as join5, relative as relative3 } from "node:path";
+import { closeSync, fstatSync, openSync, readSync, appendFileSync, existsSync, lstatSync as lstatSync3, mkdirSync as mkdirSync3, readdirSync, readFileSync as readFileSync5, realpathSync as realpathSync4, renameSync as renameSync3, statSync as statSync4, unlinkSync as unlinkSync3, writeFileSync as writeFileSync4 } from "node:fs";
+import { basename as basename2, dirname as dirname4, isAbsolute as isAbsolute3, join as join5, relative as relative3 } from "node:path";
 import { tmpdir as tmpdir2, homedir } from "node:os";
 
 // src/plan-file.ts
@@ -16284,6 +16285,3456 @@ function staleCheckForPool(poolFile, expectedMatIds, deps = {}, expectedContentO
   return { stale: false, reason: "artifacts are at least as new as the recipe" };
 }
 
+// rpc.ts
+var CONFIG_RPC_DEFINITION_ID = "opencode-forge-config";
+var scopeSchema = { type: "string", enum: ["workspace", "global"], description: "recipe scope" };
+var sessionIDSchema = { type: ["string", "null"], description: "authoritative sessionID, or exactly null for the server-observed home scope" };
+var fileIdentitySchema = {
+  type: "object",
+  properties: {
+    mtimeMs: { type: "number" },
+    size: { type: "integer" },
+    dev: { type: "string" },
+    ino: { type: "string" }
+  },
+  required: ["mtimeMs", "size"],
+  additionalProperties: false
+};
+var nullable2 = (schema) => ({ anyOf: [schema, { type: "null" }] });
+var findingSchema = {
+  type: "object",
+  properties: {
+    level: { type: "string", enum: ["warn", "error"] },
+    code: { type: "string" },
+    message: { type: "string" }
+  },
+  required: ["level", "code", "message"],
+  additionalProperties: false
+};
+var findingsSchema = { type: "array", items: findingSchema };
+var entryDraftSchema = {
+  type: "object",
+  properties: {
+    mode: { type: "string", enum: ["auto", "pinned"], description: "Auto/Pinned is an atomic pair: auto removes model+thoughtLevel, pinned requires both" },
+    model: { type: "string" },
+    thoughtLevel: { type: "string" },
+    prompt: { type: "string" },
+    shape: { type: "string", enum: ["readonly", "write"] },
+    permission: { type: "object", additionalProperties: { type: "string" } }
+  },
+  required: ["mode"],
+  additionalProperties: false
+};
+var opSchema = {
+  type: "object",
+  properties: {
+    opId: { type: "string", description: "client correlation id, echoed per entry outcome" },
+    action: { type: "string", enum: ["create", "update", "delete"] },
+    kind: { type: "string", enum: ["worker", "override"] },
+    id: { type: "string" },
+    draft: entryDraftSchema,
+    renameTo: { type: "string", description: "presence refuses the op — existing entry ids are immutable" },
+    pool: { type: "string", description: "workspace worker creation on an absent file; one consistent pool per create-file batch" }
+  },
+  required: ["opId", "action", "kind", "id"],
+  additionalProperties: false
+};
+var obj = (properties, required2) => ({ type: "object", properties, required: required2, additionalProperties: false });
+var parseErrorSchema = {
+  type: "object",
+  properties: {
+    message: { type: "string" },
+    line: { type: "integer" },
+    column: { type: "integer" }
+  },
+  required: ["message"],
+  additionalProperties: false
+};
+var editOpenOkSchema = {
+  type: "object",
+  properties: {
+    ok: { const: true },
+    snapshotId: { type: "string" },
+    path: { type: "string" },
+    targetIdentity: { type: "string", description: "server-issued identity of the resolved binding — disclosed before confirmation and bound into the token" },
+    scope: scopeSchema,
+    sessionID: sessionIDSchema,
+    observedLocation: nullable2({ type: "string" }),
+    anchor: nullable2({ type: "string" }),
+    epoch: { type: "string" },
+    generation: { type: "integer" },
+    expiresAt: { type: "number" },
+    exists: { type: "boolean" },
+    readable: { type: "boolean" },
+    creatable: { type: "boolean" },
+    identity: nullable2(fileIdentitySchema),
+    raw: nullable2({ type: "string" }),
+    document: { description: "parsed JSONC document (unknown JSON value), or null" },
+    parseError: nullable2(parseErrorSchema),
+    findings: findingsSchema
+  },
+  required: [
+    "ok",
+    "snapshotId",
+    "path",
+    "targetIdentity",
+    "scope",
+    "sessionID",
+    "observedLocation",
+    "anchor",
+    "epoch",
+    "generation",
+    "expiresAt",
+    "exists",
+    "readable",
+    "creatable",
+    "identity",
+    "raw",
+    "document",
+    "parseError",
+    "findings"
+  ],
+  additionalProperties: false
+};
+var editOpenErrSchema = obj({
+  ok: { const: false },
+  reason: { type: "string", enum: ["scope-unresolved", "unavailable", "malformed-request"] },
+  message: { type: "string" }
+}, ["ok", "reason", "message"]);
+var previewEntrySchema = obj({
+  opId: { type: "string" },
+  id: { type: "string" },
+  kind: { type: "string", enum: ["worker", "override"] },
+  action: { type: "string", enum: ["create", "update", "delete"] },
+  entryKind: { type: "string", enum: ["create-file", "patch", "remove", "no-op"] },
+  summary: { type: "array", items: { type: "string" } },
+  findings: findingsSchema
+}, ["opId", "id", "kind", "action", "entryKind", "summary", "findings"]);
+var previewRejectedSchema = obj({
+  opId: { type: "string" },
+  id: { type: "string" },
+  reason: { type: "string" },
+  message: { type: "string" },
+  findings: findingsSchema
+}, ["opId", "id", "reason", "message", "findings"]);
+var previewSchema = obj({
+  path: { type: "string" },
+  targetIdentity: { type: "string", description: "server-issued identity of the resolved binding (see editOpen)" },
+  scope: scopeSchema,
+  sessionID: sessionIDSchema,
+  oldText: nullable2({ type: "string" }),
+  newText: { type: "string" },
+  previewHash: { type: "string", description: "sha256 hex of newText — the canonical token content binding" },
+  createFile: { type: "boolean", description: "derived from the edit-start snapshot (absent file), never from the last entry's plan kind" },
+  identity: nullable2(fileIdentitySchema),
+  entries: { type: "array", items: previewEntrySchema },
+  rejected: { type: "array", items: previewRejectedSchema }
+}, ["path", "targetIdentity", "scope", "sessionID", "oldText", "newText", "previewHash", "createFile", "identity", "entries", "rejected"]);
+var prepareTokenSchema = obj({
+  token: { type: "string" },
+  expiresAt: { type: "number" },
+  epoch: { type: "string" },
+  generation: { type: "integer" }
+}, ["token", "expiresAt", "epoch", "generation"]);
+var prepareOkTokenSchema = obj({
+  ok: { const: true },
+  outcome: { const: "token" },
+  token: prepareTokenSchema,
+  preview: previewSchema,
+  findings: findingsSchema
+}, ["ok", "outcome", "token", "preview", "findings"]);
+var prepareOkNoopSchema = obj({
+  ok: { const: true },
+  outcome: { const: "no-op" },
+  summary: { type: "array", items: { type: "string" } },
+  rejected: { type: "array", items: previewRejectedSchema },
+  findings: findingsSchema
+}, ["ok", "outcome", "summary", "rejected", "findings"]);
+var prepareRejectReasons = [
+  "snapshot-unknown",
+  "snapshot-expired",
+  "epoch-stale",
+  "scope-mismatch",
+  "scope-unresolved",
+  "conflict-reload",
+  "unreadable",
+  "unparseable",
+  "invalid-op",
+  "invalid-id",
+  "invalid-pool",
+  "invalid-scope",
+  "duplicate",
+  "not-found",
+  "ambiguous",
+  "no-valid-entries",
+  "malformed-request",
+  "unavailable"
+];
+var commitEntryOutcomeSchema = obj({
+  opId: { type: "string" },
+  id: { type: "string" },
+  kind: { type: "string", enum: ["worker", "override"] },
+  action: { type: "string", enum: ["create", "update", "delete"] },
+  entryKind: { type: "string", enum: ["create-file", "patch", "remove", "no-op"] },
+  outcome: { type: "string", enum: ["written", "no-op", "rejected"] },
+  reason: { type: "string" },
+  summary: { type: "array", items: { type: "string" } },
+  findings: findingsSchema
+}, ["opId", "id", "kind", "action", "entryKind", "outcome", "summary", "findings"]);
+var commitReceiptSchema = {
+  type: "object",
+  properties: {
+    commitId: { type: "string" },
+    token: { type: "string" },
+    outcome: {
+      type: "string",
+      enum: ["written", "no-op", "conflict", "ownership-lost", "write-failed", "missing", "unreadable", "unparseable"]
+    },
+    message: { type: "string" },
+    path: { type: "string" },
+    targetIdentity: { type: "string", description: "server-issued identity of the binding this receipt belongs to" },
+    scope: scopeSchema,
+    sessionID: sessionIDSchema,
+    savedIdentity: nullable2(fileIdentitySchema),
+    bytes: { type: "integer", description: "real UTF-8 byte length of the published document" },
+    entries: { type: "array", items: commitEntryOutcomeSchema },
+    epoch: { type: "string" },
+    generation: { type: "integer" },
+    at: { type: "number" },
+    sync: { anyOf: [{ type: "object" }, { type: "null" }], description: "server-side family-sync outcome slot (owned by the sync handlers); null until attached" }
+  },
+  required: [
+    "commitId",
+    "token",
+    "outcome",
+    "message",
+    "path",
+    "targetIdentity",
+    "scope",
+    "sessionID",
+    "savedIdentity",
+    "bytes",
+    "entries",
+    "epoch",
+    "generation",
+    "at"
+  ],
+  additionalProperties: true
+};
+var commitRejectReasons = [
+  "token-unknown",
+  "token-expired",
+  "token-spent",
+  "epoch-stale",
+  "scope-mismatch",
+  "scope-unresolved",
+  "confirm-required",
+  "malformed-request",
+  "unavailable"
+];
+var syncRosterRefSchema = obj({ nativeId: { type: "string" }, fileName: { type: "string" } }, ["nativeId", "fileName"]);
+var syncErrorItemSchema = {
+  type: "object",
+  properties: {
+    message: { type: "string" },
+    nativeId: { type: "string" },
+    fileName: { type: "string" }
+  },
+  required: ["message"],
+  additionalProperties: false
+};
+var syncConflictItemSchema = {
+  type: "object",
+  properties: {
+    message: { type: "string" },
+    nativeId: { type: "string" },
+    fileName: { type: "string" },
+    winnerFile: { type: "string" }
+  },
+  required: ["message"],
+  additionalProperties: false
+};
+var syncPreviewSchema = obj({
+  path: { type: "string" },
+  scope: scopeSchema,
+  sessionID: sessionIDSchema,
+  observedLocation: nullable2({ type: "string" }),
+  anchor: nullable2({ type: "string" }),
+  family: nullable2(obj({ file: { type: "string" }, ns: { type: "string" }, materializedIds: { type: "array", items: { type: "string" } } }, ["file", "ns", "materializedIds"])),
+  overridesIncluded: { type: "boolean" },
+  files: { type: "array", items: obj({ nativeId: { type: "string" }, fileName: { type: "string" }, dest: { type: "string" }, op: { type: "string", enum: ["create", "update", "unchanged"] } }, ["nativeId", "fileName", "dest", "op"]) },
+  gc: { type: "array", items: obj({ nativeId: { type: "string" }, dest: { type: "string" } }, ["nativeId", "dest"]) },
+  coverage: { const: "full" },
+  summary: { type: "array", items: { type: "string" } },
+  findings: findingsSchema
+}, ["path", "scope", "sessionID", "observedLocation", "anchor", "family", "overridesIncluded", "files", "gc", "coverage", "summary", "findings"]);
+var syncRejectReasons = [
+  "invalid-input",
+  "scope-unresolved",
+  "no-coverage",
+  "recipe-unusable",
+  "directory-conflict",
+  "token-unknown",
+  "token-expired",
+  "token-spent",
+  "epoch-stale",
+  "scope-mismatch",
+  "stale-preview",
+  "unavailable"
+];
+var forgeConfigRpcDefinition = {
+  id: CONFIG_RPC_DEFINITION_ID,
+  methods: {
+    echo: {
+      input: obj({ nonce: { type: "string" } }, ["nonce"]),
+      errors: {},
+      output: obj({
+        nonce: { type: "string" },
+        pluginID: { type: "string" },
+        appVersion: { type: "string" },
+        epoch: { type: "string", description: "current server epoch — observable for reconnect/epoch-change detection" },
+        generation: { type: "integer", description: "current RPC registration generation" }
+      }, ["nonce", "pluginID", "appVersion", "epoch", "generation"])
+    },
+    editOpen: {
+      input: obj({ scope: scopeSchema, sessionID: sessionIDSchema }, ["scope", "sessionID"]),
+      errors: {},
+      output: { anyOf: [editOpenOkSchema, editOpenErrSchema] }
+    },
+    prepare: {
+      input: obj({
+        snapshotId: { type: "string" },
+        scope: scopeSchema,
+        sessionID: sessionIDSchema,
+        ops: { type: "array", items: opSchema, maxItems: 32, description: "bounded previews: at most 32 ops (default cap; handler enforces its configured limit) and 262144 UTF-8 bytes per serialized draft" }
+      }, ["snapshotId", "scope", "sessionID", "ops"]),
+      errors: {},
+      output: {
+        anyOf: [
+          prepareOkTokenSchema,
+          prepareOkNoopSchema,
+          obj({ ok: { const: false }, reason: { type: "string", enum: [...prepareRejectReasons] }, message: { type: "string" }, findings: findingsSchema }, ["ok", "reason", "message"])
+        ]
+      }
+    },
+    commit: {
+      input: obj({
+        token: { type: "string" },
+        confirm: { type: "boolean", description: "must be EXACTLY true — explicit human confirmation (handler-enforced)" },
+        scope: scopeSchema,
+        sessionID: sessionIDSchema
+      }, ["token", "confirm", "scope", "sessionID"]),
+      errors: {},
+      output: {
+        anyOf: [
+          obj({ ok: { const: true }, receipt: commitReceiptSchema }, ["ok", "receipt"]),
+          obj({ ok: { const: false }, reason: { type: "string", enum: [...commitRejectReasons] }, message: { type: "string" } }, ["ok", "reason", "message"])
+        ]
+      }
+    },
+    receipt: {
+      input: obj({ token: { type: "string" } }, ["token"]),
+      errors: {},
+      output: {
+        anyOf: [
+          obj({ found: { const: true }, receipt: commitReceiptSchema, epoch: { type: "string" }, generation: { type: "integer" } }, ["found", "receipt", "epoch", "generation"]),
+          obj({ found: { const: false }, epoch: { type: "string" }, generation: { type: "integer" } }, ["found", "epoch", "generation"])
+        ]
+      }
+    },
+    sync: {
+      input: {
+        type: "object",
+        properties: {
+          scope: scopeSchema,
+          sessionID: sessionIDSchema,
+          confirm: { type: "boolean" },
+          action: { type: "string", enum: ["prepare", "apply"] },
+          token: { type: "string", description: "required for apply (the prepared sync token); prepare must not carry one" },
+          commitId: { type: "string", description: "optional apply-side correlation to the commit receipt" }
+        },
+        required: ["scope", "sessionID", "confirm", "action"],
+        additionalProperties: false
+      },
+      errors: {},
+      output: {
+        anyOf: [
+          obj({
+            ok: { const: true },
+            action: { const: "prepare" },
+            outcome: { const: "token" },
+            token: prepareTokenSchema,
+            preview: syncPreviewSchema,
+            findings: findingsSchema
+          }, ["ok", "action", "outcome", "token", "preview", "findings"]),
+          obj({
+            ok: { const: true },
+            action: { const: "prepare" },
+            outcome: { const: "noop" },
+            preview: syncPreviewSchema,
+            findings: findingsSchema
+          }, ["ok", "action", "outcome", "preview", "findings"]),
+          {
+            type: "object",
+            properties: {
+              ok: { const: true },
+              action: { const: "apply" },
+              outcome: { type: "string", enum: ["applied", "unconfirmed", "conflict", "refused", "noop"] },
+              applied: { type: "boolean" },
+              path: { type: "string" },
+              scope: scopeSchema,
+              sessionID: sessionIDSchema,
+              created: { type: "array", items: syncRosterRefSchema },
+              updated: { type: "array", items: syncRosterRefSchema },
+              unchanged: { type: "array", items: { type: "string" } },
+              gced: { type: "array", items: { type: "string" } },
+              errors: { type: "array", items: syncErrorItemSchema },
+              removedIds: { type: "array", items: { type: "string" } },
+              appliedStatus: {
+                type: "object",
+                properties: {
+                  status: { type: "string", enum: ["applied", "unconfirmed"] },
+                  observedBy: nullable2({ type: "string" }),
+                  confirmedIds: { type: "array", items: { type: "string" } },
+                  removedConfirmedIds: { type: "array", items: { type: "string" } },
+                  unconfirmedIds: { type: "array", items: { type: "string" } }
+                },
+                required: ["status", "observedBy", "confirmedIds", "removedConfirmedIds", "unconfirmedIds"],
+                additionalProperties: false
+              },
+              conflicts: { type: "array", items: syncConflictItemSchema },
+              summary: { type: "array", items: { type: "string" } },
+              findings: findingsSchema,
+              epoch: { type: "string" },
+              generation: { type: "integer" },
+              at: { type: "number" }
+            },
+            required: [
+              "ok",
+              "action",
+              "outcome",
+              "applied",
+              "path",
+              "scope",
+              "sessionID",
+              "created",
+              "updated",
+              "unchanged",
+              "gced",
+              "errors",
+              "removedIds",
+              "appliedStatus",
+              "conflicts",
+              "summary",
+              "findings",
+              "epoch",
+              "generation",
+              "at"
+            ],
+            additionalProperties: false
+          },
+          obj({
+            ok: { const: false },
+            action: { type: "string", enum: ["prepare", "apply", "unknown"] },
+            reason: { type: "string", enum: [...syncRejectReasons] },
+            message: { type: "string" }
+          }, ["ok", "action", "reason", "message"])
+        ]
+      }
+    }
+  },
+  events: {}
+};
+
+// src/config-rpc-protocol.ts
+import { createHash as createHash2, randomUUID } from "node:crypto";
+import { lstatSync as lstatSync2, realpathSync as realpathSync3 } from "node:fs";
+
+// src/forge-config-edit.ts
+import { lstatSync, linkSync, mkdirSync as mkdirSync2, readFileSync as readFileSync4, realpathSync as realpathSync2, renameSync as renameSync2, unlinkSync as unlinkSync2, writeFileSync as writeFileSync3 } from "node:fs";
+import { dirname as dirname3, resolve as resolve4 } from "node:path";
+
+// src/jsonc-edit.ts
+function skipWsAndComments(text, i) {
+  const n = text.length;
+  while (i < n) {
+    const c = text[i];
+    if (c === " " || c === "\t" || c === "\r" || c === `
+`) {
+      i++;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "/") {
+      while (i < n && text[i] !== `
+`)
+        i++;
+      continue;
+    }
+    if (c === "/" && text[i + 1] === "*") {
+      i += 2;
+      while (i < n && !(text[i] === "*" && i + 1 < n && text[i + 1] === "/"))
+        i++;
+      i = Math.min(i + 2, n);
+      continue;
+    }
+    break;
+  }
+  return i;
+}
+function scanStringEnd(text, i) {
+  i++;
+  const n = text.length;
+  while (i < n) {
+    if (text[i] === "\\") {
+      i += 2;
+      continue;
+    }
+    if (text[i] === '"')
+      return i + 1;
+    i++;
+  }
+  return null;
+}
+function scanLiteralEnd(text, i) {
+  const n = text.length;
+  while (i < n && !`,{}[]/ 	\r
+`.includes(text[i]))
+    i++;
+  return i;
+}
+function scanValue(text, i) {
+  const start = skipWsAndComments(text, i);
+  if (start >= text.length)
+    return { ok: false, detail: "unexpected end of document where a value was expected" };
+  const c = text[start];
+  if (c === '"') {
+    const end = scanStringEnd(text, start);
+    return end === null ? { ok: false, detail: "unterminated string" } : { ok: true, start, end };
+  }
+  if (c === "{")
+    return scanObject(text, start);
+  if (c === "[")
+    return scanArray(text, start);
+  return { ok: true, start, end: scanLiteralEnd(text, start) };
+}
+function scanObject(text, i) {
+  const start = i;
+  const members = [];
+  let j = skipWsAndComments(text, i + 1);
+  const n = text.length;
+  for (;; ) {
+    if (j >= n)
+      return { ok: false, detail: "unterminated object (missing '}')" };
+    if (text[j] === "}")
+      return { ok: true, start, end: j + 1, members };
+    if (text[j] !== '"')
+      return { ok: false, detail: `expected a quoted key in object, found ${JSON.stringify(text[j])}` };
+    const keyStart = j;
+    const keyEnd = scanStringEnd(text, j);
+    if (keyEnd === null)
+      return { ok: false, detail: "unterminated string (object key)" };
+    let key;
+    try {
+      key = JSON.parse(text.slice(keyStart, keyEnd));
+    } catch {
+      return { ok: false, detail: "invalid object key encoding" };
+    }
+    j = skipWsAndComments(text, keyEnd);
+    if (j >= n || text[j] !== ":")
+      return { ok: false, detail: "expected ':' after object key" };
+    const value = scanValue(text, j + 1);
+    if (!value.ok)
+      return value;
+    members.push({ key, keyStart, valueStart: value.start, valueEnd: value.end });
+    j = skipWsAndComments(text, value.end);
+    if (j >= n)
+      return { ok: false, detail: "unterminated object (missing '}')" };
+    if (text[j] === ",") {
+      j = skipWsAndComments(text, j + 1);
+      continue;
+    }
+    if (text[j] === "}")
+      return { ok: true, start, end: j + 1, members };
+    return { ok: false, detail: `expected ',' or '}' in object, found ${JSON.stringify(text[j])}` };
+  }
+}
+function scanArray(text, i) {
+  const start = i;
+  let j = skipWsAndComments(text, i + 1);
+  const n = text.length;
+  for (;; ) {
+    if (j >= n)
+      return { ok: false, detail: "unterminated array (missing ']')" };
+    if (text[j] === "]")
+      return { ok: true, start, end: j + 1 };
+    const value = scanValue(text, j);
+    if (!value.ok)
+      return value;
+    j = skipWsAndComments(text, value.end);
+    if (j >= n)
+      return { ok: false, detail: "unterminated array (missing ']')" };
+    if (text[j] === ",") {
+      j = skipWsAndComments(text, j + 1);
+      continue;
+    }
+    if (text[j] === "]")
+      return { ok: true, start, end: j + 1 };
+    return { ok: false, detail: `expected ',' or ']' in array, found ${JSON.stringify(text[j])}` };
+  }
+}
+function scanTopLevelKeys(text) {
+  const i = skipWsAndComments(text, 0);
+  if (i >= text.length)
+    return { ok: false, reason: "unparseable", detail: "empty document" };
+  if (text[i] !== "{")
+    return { ok: false, reason: "unparseable", detail: "top level must be an object" };
+  const obj2 = scanObject(text, i);
+  if (!obj2.ok)
+    return { ok: false, reason: "unparseable", detail: obj2.detail };
+  const after = skipWsAndComments(text, obj2.end);
+  if (after < text.length)
+    return { ok: false, reason: "unparseable", detail: "unexpected content after the top-level object" };
+  return { ok: true, top: obj2.members.map((m) => ({ key: m.key, value: { start: m.valueStart, end: m.valueEnd } })) };
+}
+function locateEntry(text, container, entryKey) {
+  const top = scanTopLevelKeys(text);
+  if (!top.ok)
+    return top;
+  const containers = top.top.filter((m2) => m2.key === container);
+  if (containers.length === 0)
+    return { ok: false, reason: "container-missing", detail: `no top-level "${container}" object in this document` };
+  if (containers.length > 1)
+    return { ok: false, reason: "ambiguous", detail: `top-level "${container}" is defined ${containers.length} times — the edit target is ambiguous` };
+  const range = containers[0].value;
+  if (text[skipWsAndComments(text, range.start)] !== "{")
+    return { ok: false, reason: "container-not-object", detail: `top-level "${container}" is not an object` };
+  const obj2 = scanObject(text, range.start);
+  if (!obj2.ok)
+    return { ok: false, reason: "unparseable", detail: obj2.detail };
+  const entries = obj2.members.filter((m2) => m2.key === entryKey);
+  if (entries.length === 0)
+    return { ok: false, reason: "not-found", detail: `"${container}" has no entry "${entryKey}"` };
+  if (entries.length > 1)
+    return { ok: false, reason: "ambiguous", detail: `"${container}.${entryKey}" is defined ${entries.length} times — the edit target is ambiguous` };
+  const m = entries[0];
+  return { ok: true, entry: { start: m.valueStart, end: m.valueEnd }, container: { start: range.start, end: range.end }, member: { start: m.keyStart, end: m.valueEnd } };
+}
+function objectFields(text, range) {
+  if (text[skipWsAndComments(text, range.start)] !== "{")
+    return { ok: false, reason: "container-not-object", detail: "the target is not an object" };
+  const obj2 = scanObject(text, range.start);
+  if (!obj2.ok)
+    return { ok: false, reason: "unparseable", detail: obj2.detail };
+  return {
+    ok: true,
+    fields: obj2.members.map((m) => ({ key: m.key, member: { start: m.keyStart, end: m.valueEnd }, value: { start: m.valueStart, end: m.valueEnd } }))
+  };
+}
+function detectEol(text) {
+  return text.includes(`\r
+`) ? `\r
+` : `
+`;
+}
+function indentFor(text, pos, fallback = "  ") {
+  let i = pos;
+  while (i > 0 && (text[i - 1] === " " || text[i - 1] === "\t"))
+    i--;
+  if (i === 0)
+    return fallback;
+  const prev = text[i - 1];
+  if (prev === `
+` || prev === "\r")
+    return text.slice(i, pos) || fallback;
+  return fallback;
+}
+function memberLineStart(text, member) {
+  let i = member.start;
+  while (i > 0 && (text[i - 1] === " " || text[i - 1] === "\t"))
+    i--;
+  const ownsLine = i > 0 && (text[i - 1] === `
+` || text[i - 1] === "\r");
+  return { start: ownsLine ? i : member.start, ownsLine };
+}
+function removeMemberSlice(text, member) {
+  const line = memberLineStart(text, member);
+  const start = line.start;
+  const j = skipWsAndComments(text, member.end);
+  if (j < text.length && text[j] === ",") {
+    return `${text.slice(0, start)}${text.slice(member.end, j)}${text.slice(j + 1)}`;
+  }
+  let end = member.end;
+  while (end < text.length && (text[end] === " " || text[end] === "\t"))
+    end++;
+  if (line.ownsLine && text[end] === "\r" && text[end + 1] === `
+`)
+    end += 2;
+  else if (line.ownsLine && text[end] === `
+`)
+    end += 1;
+  let k = start - 1;
+  while (k >= 0 && (text[k] === " " || text[k] === "\t" || text[k] === "\r" || text[k] === `
+`))
+    k--;
+  if (k >= 0 && text[k] === ",")
+    return `${text.slice(0, k)}${text.slice(end)}`;
+  return `${text.slice(0, start)}${text.slice(end)}`;
+}
+function insertField(text, range, key, valueJson) {
+  if (text[skipWsAndComments(text, range.start)] !== "{")
+    return { ok: false, reason: "container-not-object", detail: "the target is not an object" };
+  const obj2 = scanObject(text, range.start);
+  if (!obj2.ok)
+    return { ok: false, reason: "unparseable", detail: obj2.detail };
+  if (obj2.members.some((m) => m.key === key))
+    return { ok: false, reason: "ambiguous", detail: `"${key}" already exists — insert refused` };
+  const eol = detectEol(text);
+  const keyJson = JSON.stringify(key);
+  if (obj2.members.length > 0) {
+    const indent = indentFor(text, obj2.members[0].keyStart);
+    const at = obj2.members[obj2.members.length - 1].valueEnd;
+    return { ok: true, text: `${text.slice(0, at)},${eol}${indent}${keyJson}: ${valueJson}${text.slice(at)}` };
+  }
+  const close = range.end - 1;
+  const inner = text.slice(range.start + 1, close);
+  if (inner.includes(`
+`)) {
+    const memberIndent = `${indentFor(text, close, "")}  `;
+    return { ok: true, text: `${text.slice(0, close)}${memberIndent}${keyJson}: ${valueJson}${text.slice(close)}` };
+  }
+  return { ok: true, text: `${text.slice(0, close)}${keyJson}: ${valueJson}${text.slice(close)}` };
+}
+function replaceFieldValue(text, value, replacementJson) {
+  return { ok: true, text: `${text.slice(0, value.start)}${replacementJson}${text.slice(value.end)}` };
+}
+function removeField(text, member) {
+  return { ok: true, text: removeMemberSlice(text, member) };
+}
+function insertEntry(text, containerKey, entryKey, entryJson, opts) {
+  const top = scanTopLevelKeys(text);
+  if (!top.ok)
+    return top;
+  const containers = top.top.filter((m) => m.key === containerKey);
+  if (containers.length > 1)
+    return { ok: false, reason: "ambiguous", detail: `top-level "${containerKey}" is defined ${containers.length} times — the edit target is ambiguous` };
+  if (containers.length === 1) {
+    const range = containers[0].value;
+    if (text[skipWsAndComments(text, range.start)] !== "{")
+      return { ok: false, reason: "container-not-object", detail: `top-level "${containerKey}" is not an object` };
+    const obj3 = scanObject(text, range.start);
+    if (!obj3.ok)
+      return { ok: false, reason: "unparseable", detail: obj3.detail };
+    if (obj3.members.some((m) => m.key === entryKey))
+      return { ok: false, reason: "ambiguous", detail: `"${containerKey}.${entryKey}" already exists — create refused` };
+    return insertField(text, range, entryKey, entryJson);
+  }
+  if (opts?.createContainer === false)
+    return { ok: false, reason: "container-missing", detail: `no top-level "${containerKey}" object in this document` };
+  const eol = detectEol(text);
+  const containerJson = `{${JSON.stringify(entryKey)}: ${entryJson}}`;
+  const containerKeyJson = JSON.stringify(containerKey);
+  if (top.top.length > 0) {
+    const indent = indentFor(text, firstMemberKeyStart(text));
+    const at = top.top[top.top.length - 1].value.end;
+    return { ok: true, text: `${text.slice(0, at)},${eol}${indent}${containerKeyJson}: ${containerJson}${text.slice(at)}` };
+  }
+  const obj2 = scanObject(text, skipWsAndComments(text, 0));
+  if (!obj2.ok)
+    return { ok: false, reason: "unparseable", detail: obj2.detail };
+  const close = obj2.end - 1;
+  return { ok: true, text: `${text.slice(0, close)}${containerKeyJson}: ${containerJson}${text.slice(close)}` };
+}
+function firstMemberKeyStart(text) {
+  const obj2 = scanObject(text, skipWsAndComments(text, 0));
+  return obj2.ok && obj2.members.length > 0 ? obj2.members[0].keyStart : 0;
+}
+function removeEntry(text, container, entryKey) {
+  const loc = locateEntry(text, container, entryKey);
+  if (!loc.ok)
+    return loc;
+  return { ok: true, text: removeMemberSlice(text, loc.member) };
+}
+
+// src/file-identity.ts
+import { statSync as statSync3 } from "node:fs";
+
+class UnsafeIdentityError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "UnsafeIdentityError";
+  }
+}
+function isUnsafeIdentityError(err) {
+  return err instanceof UnsafeIdentityError;
+}
+var CANONICAL_DECIMAL = /^(0|[1-9][0-9]*)$/;
+function canonicalIdComponent(value, label) {
+  if (value === undefined)
+    return;
+  if (typeof value === "number") {
+    if (!Number.isSafeInteger(value) || value < 0) {
+      throw new UnsafeIdentityError(`${label} ${String(value)} is not a non-negative safe integer — refusing the identity`);
+    }
+    return String(value);
+  }
+  if (typeof value !== "string") {
+    throw new UnsafeIdentityError(`${label} must be a non-negative decimal string or a safe integer, got ${typeof value} — refusing the identity`);
+  }
+  if (!/^[0-9]+$/.test(value)) {
+    throw new UnsafeIdentityError(`${label} must be a non-negative decimal string, got ${JSON.stringify(value)}`);
+  }
+  if (!CANONICAL_DECIMAL.test(value))
+    return BigInt(value).toString();
+  return value;
+}
+function normalizeFileIdentity(id) {
+  if (typeof id.mtimeMs !== "number" || !Number.isFinite(id.mtimeMs)) {
+    throw new UnsafeIdentityError(`mtimeMs ${String(id.mtimeMs)} is not a finite number — refusing the identity`);
+  }
+  if (typeof id.size !== "number" || !Number.isSafeInteger(id.size) || id.size < 0) {
+    throw new UnsafeIdentityError(`size ${String(id.size)} is not a non-negative safe integer — refusing the identity`);
+  }
+  return {
+    mtimeMs: id.mtimeMs,
+    size: id.size,
+    dev: canonicalIdComponent(id.dev, "dev"),
+    ino: canonicalIdComponent(id.ino, "ino")
+  };
+}
+function safeBigintNumber(value, label) {
+  const n = Number(value);
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new UnsafeIdentityError(`${label} ${value.toString()} is not a non-negative safe integer — refusing the identity`);
+  }
+  return n;
+}
+function identityFromBigintStats(st) {
+  const mtimeNs = st.mtimeNs;
+  const seconds = mtimeNs / 1000000000n;
+  const nanos = mtimeNs % 1000000000n;
+  return normalizeFileIdentity({
+    mtimeMs: Number(seconds) * 1000 + Number(nanos) / 1e6,
+    size: safeBigintNumber(st.size, "size"),
+    dev: st.dev.toString(),
+    ino: st.ino.toString()
+  });
+}
+function defaultIdentityStat(path) {
+  let st;
+  try {
+    st = statSync3(path, { bigint: true });
+  } catch {
+    return null;
+  }
+  return identityFromBigintStats(st);
+}
+function identityMatches(a, b) {
+  if (a.mtimeMs !== b.mtimeMs || a.size !== b.size)
+    return false;
+  if (a.dev !== undefined && b.dev !== undefined && a.ino !== undefined && b.ino !== undefined && (a.dev !== b.dev || a.ino !== b.ino))
+    return false;
+  return true;
+}
+
+// src/forge-config-edit.ts
+var UTF8_STRICT = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+function defaultReadFile(path) {
+  return UTF8_STRICT.decode(readFileSync4(path));
+}
+function strictDecode(bytes) {
+  if (typeof bytes === "string") {
+    for (const ch of bytes) {
+      const cp = ch.codePointAt(0);
+      if (cp >= 55296 && cp <= 57343)
+        throw new Error("invalid UTF-8 content: lone surrogate (lossy decode) detected");
+    }
+    return bytes;
+  }
+  if (bytes instanceof Uint8Array)
+    return UTF8_STRICT.decode(bytes);
+  return UTF8_STRICT.decode(Buffer.from(bytes));
+}
+function snapshotRecipe(deps) {
+  const stat = deps.stat ?? defaultIdentityStat;
+  const readFile = deps.readFile ?? defaultReadFile;
+  const rawStat = stat(deps.path);
+  const st = rawStat === null ? null : normalizeFileIdentity(rawStat);
+  if (st === null) {
+    return { path: deps.path, exists: false, readable: false, raw: null, stat: null, parse: null };
+  }
+  let raw = null;
+  try {
+    raw = strictDecode(readFile(deps.path));
+  } catch {
+    return { path: deps.path, exists: true, readable: false, raw: null, stat: st, parse: null };
+  }
+  const parsed = parseForgeJsonc(raw);
+  const parse6 = parsed.ok ? { ok: true, value: parsed.config } : { ok: false, message: `${parsed.error.message}${parsed.error.line !== undefined ? ` (line ${parsed.error.line}, column ${parsed.error.column})` : ""}` };
+  return { path: deps.path, exists: true, readable: true, raw, stat: st, parse: parse6 };
+}
+var EDITABLE_FIELDS = ["model", "thoughtLevel", "prompt", "shape", "permission"];
+var AGENT_ID_RE2 = /^[a-z0-9-]+$/;
+function normalizeWorkerId(rawId) {
+  const findings = [];
+  let id = rawId;
+  if (rawId.startsWith("forge-")) {
+    id = rawId.replace(/^(forge-)+/, "");
+    findings.push({ level: "warn", code: "agent-id-forge-prefix", message: `id "${rawId}": the forge- prefix is added automatically at materialization — using "${id}"` });
+  }
+  return { id, findings };
+}
+function validateDraftShape(draft) {
+  const findings = [];
+  if (draft.mode === "pinned") {
+    if (typeof draft.model !== "string" || draft.model.trim().length === 0 || typeof draft.thoughtLevel !== "string" || draft.thoughtLevel.trim().length === 0) {
+      findings.push({ level: "error", code: "agent-half-configured", message: "pinned mode requires BOTH model and thoughtLevel — a pin with a missing half is refused (it would silently degrade to an Auto worker)" });
+    }
+  } else if (draft.model !== undefined || draft.thoughtLevel !== undefined) {
+    findings.push({ level: "error", code: "auto-with-pin-fields", message: "auto mode cannot carry model or thoughtLevel — switch to pinned mode to set the pair" });
+  }
+  if (draft.prompt !== undefined && !(typeof draft.prompt === "string" && draft.prompt.trim().length > 0)) {
+    findings.push({ level: "error", code: "prompt-invalid", message: "prompt must be a non-empty string" });
+  }
+  if (draft.shape !== undefined && draft.shape !== "readonly" && draft.shape !== "write") {
+    findings.push({ level: "error", code: "shape-invalid", message: 'shape must be "readonly" or "write"' });
+  }
+  if (draft.permission !== undefined && !(typeof draft.permission === "object" && draft.permission !== null && !Array.isArray(draft.permission) && Object.values(draft.permission).every((v) => typeof v === "string"))) {
+    findings.push({ level: "error", code: "permission-invalid", message: "permission must map tool names to string values" });
+  }
+  return findings;
+}
+function validatedDefOf(id, draft) {
+  const entry = {};
+  if (draft.mode === "pinned") {
+    entry.model = draft.model;
+    entry.thoughtLevel = draft.thoughtLevel;
+  }
+  if (draft.prompt !== undefined)
+    entry.prompt = draft.prompt;
+  if (draft.shape !== undefined)
+    entry.shape = draft.shape;
+  if (draft.permission !== undefined)
+    entry.permission = draft.permission;
+  const { id: normalizedId } = normalizeWorkerId(id);
+  const validated = validateAgentSet({ [normalizedId]: entry }, "agents");
+  const def = validated.agents[normalizedId] ?? {};
+  return { ok: !validated.findings.some((f) => f.level === "error"), def, findings: validated.findings };
+}
+function validateWorkerDraft(id, draft, existingIds) {
+  const { id: normalizedId, findings } = normalizeWorkerId(id);
+  if (!normalizedId || !AGENT_ID_RE2.test(normalizedId)) {
+    return { ok: false, findings: [...findings, { level: "error", code: "agent-id-invalid", message: `agent id must match [a-z0-9-] after forge- prefix stripping — "${id}" is invalid` }], normalizedId };
+  }
+  const normalizedExisting = new Set(existingIds.map((k) => normalizeWorkerId(k).id));
+  if (normalizedExisting.has(normalizedId)) {
+    return { ok: false, findings: [...findings, { level: "error", code: "agent-id-collision", message: `"${normalizedId}" already exists in this recipe (ids that normalize to the same word collide; first definition wins)` }], normalizedId };
+  }
+  const shapeFindings = validateDraftShape(draft);
+  if (shapeFindings.some((f) => f.level === "error")) {
+    return { ok: false, findings: [...findings, ...shapeFindings], normalizedId };
+  }
+  const check2 = validatedDefOf(normalizedId, draft);
+  return { ok: check2.ok, findings: [...findings, ...shapeFindings, ...check2.findings], normalizedId };
+}
+function validateOverrideDraft(id, draft) {
+  if (!BUILTIN_OVERRIDE_IDS.includes(id)) {
+    return { ok: false, findings: [{ level: "error", code: "override-id-unknown", message: `override ids are exactly ${BUILTIN_OVERRIDE_IDS.map((i) => `"${i}"`).join(", ")} (lowercase, case-sensitive) — "${id}" is not a built-in subagent id (a forge- prefix never normalizes into an override id)` }], normalizedId: id };
+  }
+  const shapeFindings = validateDraftShape(draft);
+  if (shapeFindings.some((f) => f.level === "error")) {
+    return { ok: false, findings: shapeFindings, normalizedId: id };
+  }
+  const check2 = validatedDefOf(id, draft);
+  return { ok: check2.ok, findings: check2.findings, normalizedId: id };
+}
+var planErr = (reason, message, findings = []) => ({ ok: false, reason, message, detail: message, findings });
+function foldJsoncReason(reason) {
+  if (reason === "container-missing")
+    return "not-found";
+  if (reason === "container-not-object")
+    return "unparseable";
+  return reason;
+}
+function deepEqual(a, b) {
+  if (a === b)
+    return true;
+  if (typeof a !== "object" || typeof b !== "object" || a === null || b === null)
+    return false;
+  if (Array.isArray(a) !== Array.isArray(b))
+    return false;
+  const ka = Object.keys(a);
+  const kb = Object.keys(b);
+  if (ka.length !== kb.length)
+    return false;
+  return ka.every((k) => (k in b) && deepEqual(a[k], b[k]));
+}
+function patchEntryFields(raw, container, id, setFields, removeFields) {
+  let working = raw;
+  const summary = [];
+  for (const key of EDITABLE_FIELDS) {
+    const want = setFields[key];
+    const shouldRemove = removeFields.includes(key);
+    if (want === undefined && !shouldRemove)
+      continue;
+    if (key === "permission" && want !== undefined && typeof want === "object" && want !== null && !Array.isArray(want)) {
+      const patched = patchPermissionSubKeys(working, container, id, want);
+      if (!patched.ok)
+        return patched;
+      if (patched.subPatched) {
+        working = patched.text;
+        summary.push(...patched.notes);
+        continue;
+      }
+    }
+    const loc = locateEntry(working, container, id);
+    if (!loc.ok)
+      return { ok: false, message: `entry became unlocatable mid-plan: ${loc.detail}` };
+    const fields = objectFields(working, loc.entry);
+    if (!fields.ok)
+      return { ok: false, message: `the "${container}.${id}" entry is not an object — refusing a field-level edit` };
+    const matches = fields.fields.filter((f) => f.key === key);
+    if (matches.length > 1) {
+      return { ok: false, message: `"${container}.${id}.${key}" is defined ${matches.length} times — ambiguous edit target, refusing` };
+    }
+    const have = matches[0];
+    if (want !== undefined) {
+      const wantJson = JSON.stringify(want);
+      if (have !== undefined) {
+        const currentText = working.slice(have.value.start, have.value.end);
+        const current = parseForgeJsonc(currentText);
+        if (current.ok && deepEqual(current.config, want))
+          continue;
+        if ((key === "model" || key === "thoughtLevel") && current.ok && typeof current.config === "string" && typeof want === "string") {
+          const haveNorm = key === "model" ? current.config.trim() : current.config.trim().toLowerCase();
+          const wantNorm = key === "model" ? want.trim() : want.trim().toLowerCase();
+          if (haveNorm === wantNorm)
+            continue;
+        }
+        const replaced = replaceFieldValue(working, have.value, wantJson);
+        working = replaced.text;
+        summary.push(`set ${id}.${key} = ${wantJson}`);
+      } else {
+        const inserted = insertField(working, loc.entry, key, wantJson);
+        if (!inserted.ok)
+          return { ok: false, message: `could not add ${id}.${key}: ${inserted.detail}` };
+        working = inserted.text;
+        summary.push(`add ${id}.${key} = ${wantJson}`);
+      }
+    } else if (shouldRemove && have !== undefined) {
+      const removed = removeField(working, have.member);
+      working = removed.text;
+      summary.push(`remove ${id}.${key}`);
+    }
+  }
+  return { ok: true, text: working, summary };
+}
+function patchPermissionSubKeys(raw, container, id, want) {
+  let working = raw;
+  const notes = [];
+  const currentMapOf = (text) => {
+    const loc = locateEntry(text, container, id);
+    if (!loc.ok)
+      return { ok: false, message: `entry became unlocatable mid-plan: ${loc.detail}` };
+    const fields = objectFields(text, loc.entry);
+    if (!fields.ok)
+      return { ok: false, message: `the "${container}.${id}" entry is not an object — refusing a field-level edit` };
+    const perms = fields.fields.filter((f) => f.key === "permission");
+    if (perms.length === 0)
+      return { ok: true, map: {} };
+    if (perms.length > 1)
+      return { ok: false, message: `"${container}.${id}.permission" is defined ${perms.length} times — ambiguous edit target, refusing` };
+    const parsed = parseForgeJsonc(text.slice(perms[0].value.start, perms[0].value.end));
+    if (!parsed.ok || typeof parsed.config !== "object" || parsed.config === null || Array.isArray(parsed.config)) {
+      return { ok: false, message: "not-a-map" };
+    }
+    return { ok: true, map: parsed.config };
+  };
+  const first = currentMapOf(working);
+  if (!first.ok && first.message !== "not-a-map")
+    return first;
+  if (!first.ok)
+    return { ok: true, text: raw, notes: [], subPatched: false };
+  for (const subKey of Object.keys(first.map)) {
+    if (subKey in want)
+      continue;
+    const r = permissionSubKeyOp(working, container, id, subKey, null);
+    if (!r.ok)
+      return r;
+    working = r.text;
+    if (r.changed)
+      notes.push(`remove ${id}.permission.${subKey}`);
+  }
+  for (const [subKey, value] of Object.entries(want)) {
+    const r = permissionSubKeyOp(working, container, id, subKey, value);
+    if (!r.ok)
+      return r;
+    working = r.text;
+    if (r.changed)
+      notes.push(`set ${id}.permission.${subKey} = ${JSON.stringify(value)}`);
+  }
+  return { ok: true, text: working, notes, subPatched: true };
+}
+function permissionSubKeyOp(raw, container, id, subKey, value) {
+  const loc = locateEntry(raw, container, id);
+  if (!loc.ok)
+    return { ok: false, message: `entry became unlocatable mid-plan: ${loc.detail}` };
+  const fields = objectFields(raw, loc.entry);
+  if (!fields.ok)
+    return { ok: false, message: `the "${container}.${id}" entry is not an object — refusing a field-level edit` };
+  const perms = fields.fields.filter((f) => f.key === "permission");
+  if (perms.length === 0) {
+    if (value === null)
+      return { ok: true, text: raw, changed: false };
+    const mapJson = `{${JSON.stringify(subKey)}: ${JSON.stringify(value)}}`;
+    const inserted2 = insertField(raw, loc.entry, "permission", mapJson);
+    if (!inserted2.ok)
+      return { ok: false, message: `could not add ${id}.permission: ${inserted2.detail}` };
+    return { ok: true, text: inserted2.text, changed: true };
+  }
+  if (perms.length > 1)
+    return { ok: false, message: `"${container}.${id}.permission" is defined ${perms.length} times — ambiguous edit target, refusing` };
+  const mapRange = perms[0].value;
+  const parsed = parseForgeJsonc(raw.slice(mapRange.start, mapRange.end));
+  if (!parsed.ok || typeof parsed.config !== "object" || parsed.config === null || Array.isArray(parsed.config)) {
+    return { ok: false, message: `"${container}.${id}.permission" is not a map — refusing a sub-key edit` };
+  }
+  const sub = objectFields(raw, mapRange);
+  if (!sub.ok)
+    return { ok: false, message: sub.detail };
+  const hits = sub.fields.filter((f) => f.key === subKey);
+  if (hits.length > 1)
+    return { ok: false, message: `"${container}.${id}.permission.${subKey}" is defined ${hits.length} times — ambiguous edit target, refusing` };
+  const have = hits[0];
+  if (value === null) {
+    if (have === undefined)
+      return { ok: true, text: raw, changed: false };
+    const removed = removeField(raw, have.member);
+    return { ok: true, text: removed.text, changed: true };
+  }
+  const wantJson = JSON.stringify(value);
+  if (have !== undefined) {
+    const current = parseForgeJsonc(raw.slice(have.value.start, have.value.end));
+    if (current.ok && deepEqual(current.config, value))
+      return { ok: true, text: raw, changed: false };
+    const replaced = replaceFieldValue(raw, have.value, wantJson);
+    return { ok: true, text: replaced.text, changed: true };
+  }
+  const inserted = insertField(raw, mapRange, subKey, wantJson);
+  if (!inserted.ok)
+    return { ok: false, message: `could not add ${id}.permission.${subKey}: ${inserted.detail}` };
+  return { ok: true, text: inserted.text, changed: true };
+}
+function buildInitialFile(opts) {
+  const lines = ["{"];
+  if (opts.pool !== undefined) {
+    lines.push(`  "pool": ${JSON.stringify(opts.pool)},`);
+  }
+  lines.push(`  "${opts.container}": {`);
+  lines.push(`    ${JSON.stringify(opts.id)}: ${opts.entryJson}`);
+  lines.push("  }");
+  lines.push("}");
+  return `${lines.join(`
+`)}
+`;
+}
+function entryJsonOf(def) {
+  const ordered = {};
+  for (const key of EDITABLE_FIELDS) {
+    if (def[key] !== undefined)
+      ordered[key] = def[key];
+  }
+  return JSON.stringify(ordered);
+}
+function existingEntryIds(raw, container) {
+  const top = scanTopLevelKeys(raw);
+  if (!top.ok)
+    return { ok: false, message: top.detail };
+  const found = top.top.find((m) => m.key === container);
+  if (!found)
+    return { ok: true, ids: [] };
+  const fields = objectFields(raw, found.value);
+  if (!fields.ok)
+    return { ok: false, message: fields.detail };
+  return { ok: true, ids: fields.fields.map((f) => f.key) };
+}
+function patchInputsOf(draft, def) {
+  const setFields = {};
+  const removeFields = [];
+  if (draft.mode === "pinned") {
+    setFields.model = def.model;
+    setFields.thoughtLevel = def.thoughtLevel;
+  } else {
+    removeFields.push("model", "thoughtLevel");
+  }
+  if (draft.prompt !== undefined)
+    setFields.prompt = def.prompt;
+  if (draft.shape !== undefined)
+    setFields.shape = def.shape;
+  if (draft.permission !== undefined)
+    setFields.permission = def.permission;
+  return { setFields, removeFields };
+}
+function planEntryEdit(snapshot, op, opts, container, kind) {
+  const findings = [];
+  if (op.renameTo !== undefined && op.renameTo !== op.id) {
+    return planErr("invalid-id", "renaming an existing entry id is not supported — create the new id explicitly and delete the old one", findings);
+  }
+  if (kind === "override") {
+    if (!BUILTIN_OVERRIDE_IDS.includes(op.id)) {
+      if (opts.scope === "workspace")
+        return planErr("invalid-scope", "override entries live only on the GLOBAL recipe (~/.config/opencode/forge.json) — a workspace pool file may not carry them", findings);
+      return planErr("invalid-id", `override ids are exactly ${BUILTIN_OVERRIDE_IDS.map((i) => `"${i}"`).join(", ")} (lowercase, case-sensitive) — "${op.id}" is not a built-in subagent id (a forge- prefix never normalizes into an override id)`, findings);
+    }
+    if (opts.scope === "workspace") {
+      return planErr("invalid-scope", "override entries live only on the GLOBAL recipe (~/.config/opencode/forge.json) — a workspace pool file may not carry them", findings);
+    }
+  }
+  if (!snapshot.exists) {
+    if (op.action !== "create") {
+      return planErr("not-found", `no recipe file at ${snapshot.path} — nothing to ${op.action}`, findings);
+    }
+    const wantsPool = kind === "worker" && opts.scope !== "global";
+    if (wantsPool && opts.pool === undefined) {
+      return planErr("invalid-pool", "creating a workspace pool file requires a valid declared pool name ([a-z0-9-], 1-24 chars) — pass opts.pool", findings);
+    }
+    if (wantsPool && !validatePoolField(opts.pool).ok) {
+      return planErr("invalid-pool", `"${String(opts.pool)}" is not a valid pool namespace ([a-z0-9-], 1-24 chars after trim)`, findings);
+    }
+    const validate = kind === "worker" ? validateWorkerDraft(op.id, op.draft ?? { mode: "auto" }, []) : validateOverrideDraft(op.id, op.draft ?? { mode: "auto" });
+    findings.push(...validate.findings);
+    if (!validate.ok) {
+      const isId = validate.findings.some((f) => f.level === "error" && (f.code === "agent-id-invalid" || f.code === "agent-id-collision" || f.code === "override-id-unknown"));
+      return planErr(isId ? "invalid-id" : "invalid-draft", validate.findings.filter((f) => f.level === "error").map((f) => f.message).join("; "), findings);
+    }
+    const check3 = validatedDefOf(validate.normalizedId, op.draft ?? { mode: "auto" });
+    const content = buildInitialFile({ pool: wantsPool ? opts.pool : undefined, container, id: validate.normalizedId, entryJson: entryJsonOf(check3.def) });
+    if (!parseForgeJsonc(content).ok) {
+      return planErr("unparseable", "the initial document this plan produces does not parse — refusing", findings);
+    }
+    if (kind === "worker" && wantsPool) {
+      findings.push({ level: "warn", code: "tui-fallback-replaced", message: `creating "${validate.normalizedId}" in this workspace pool replaces the global fallback for this roster` });
+    }
+    return {
+      ok: true,
+      plan: {
+        kind: "create-file",
+        action: "create",
+        path: snapshot.path,
+        container,
+        id: validate.normalizedId,
+        newText: content,
+        summary: [`create ${container}.${validate.normalizedId} in ${snapshot.path}${wantsPool ? ` (pool "${opts.pool}")` : " (global)"}`]
+      },
+      findings
+    };
+  }
+  if (snapshot.raw === null) {
+    return planErr("unreadable", `the recipe at ${snapshot.path} exists but cannot be read (unreadable bytes or invalid UTF-8) — refusing every edit, including creation`, findings);
+  }
+  const raw = snapshot.raw;
+  const parse6 = snapshot.parse;
+  if (parse6 === null || !parse6.ok) {
+    const detail = parse6 && !parse6.ok ? parse6.message : "unparseable document";
+    return planErr("unparseable", `${snapshot.path}: ${detail} — broken documents are never edited in place; fix the syntax first`, findings);
+  }
+  if (parse6.value === null || typeof parse6.value !== "object" || Array.isArray(parse6.value)) {
+    return planErr("unparseable", `${snapshot.path}: top level must be an object — refusing to edit`, findings);
+  }
+  if (kind === "worker") {
+    if (op.action === "create") {
+      const existing = existingEntryIds(raw, container);
+      if (!existing.ok)
+        return planErr("unparseable", existing.message, findings);
+      const validate2 = validateWorkerDraft(op.id, op.draft ?? { mode: "auto" }, existing.ids);
+      findings.push(...validate2.findings);
+      if (!validate2.ok) {
+        const isDup = validate2.findings.some((f) => f.code === "agent-id-collision");
+        const isId = validate2.findings.some((f) => f.code === "agent-id-invalid");
+        return planErr(isDup ? "duplicate" : isId ? "invalid-id" : "invalid-draft", validate2.findings.filter((f) => f.level === "error").map((f) => f.message).join("; "), findings);
+      }
+      const check4 = validatedDefOf(validate2.normalizedId, op.draft ?? { mode: "auto" });
+      const inserted = insertEntry(raw, container, validate2.normalizedId, entryJsonOf(check4.def), { createContainer: true });
+      if (!inserted.ok)
+        return planErr(inserted.reason === "ambiguous" ? "duplicate" : foldJsoncReason(inserted.reason), inserted.detail, findings);
+      if (!parseForgeJsonc(inserted.text).ok)
+        return planErr("unparseable", "the patched document does not parse — refusing", findings);
+      if (opts.scope !== "global") {
+        findings.push({ level: "warn", code: "tui-fallback-replaced", message: `creating "${validate2.normalizedId}" in this workspace pool replaces the global fallback for this roster` });
+      }
+      return {
+        ok: true,
+        plan: {
+          kind: "patch",
+          action: "create",
+          path: snapshot.path,
+          container,
+          id: validate2.normalizedId,
+          newText: inserted.text,
+          summary: [`create ${container}.${validate2.normalizedId} in ${snapshot.path}`]
+        },
+        findings
+      };
+    }
+    const loc2 = locateEntry(raw, container, op.id);
+    if (!loc2.ok)
+      return planErr(foldJsoncReason(loc2.reason), `${container}.${op.id}: ${loc2.detail}`, findings);
+    if (op.action === "delete") {
+      const removed = removeEntry(raw, container, op.id);
+      if (!removed.ok)
+        return planErr(foldJsoncReason(removed.reason), removed.detail, findings);
+      if (!parseForgeJsonc(removed.text).ok)
+        return planErr("unparseable", "the patched document does not parse — refusing", findings);
+      return {
+        ok: true,
+        plan: {
+          kind: "remove",
+          action: "delete",
+          path: snapshot.path,
+          container,
+          id: op.id,
+          newText: removed.text,
+          summary: [`delete ${container}.${op.id} from ${snapshot.path}`]
+        },
+        findings
+      };
+    }
+    const validate = validateWorkerDraft(op.id, op.draft ?? { mode: "auto" }, []);
+    findings.push(...validate.findings);
+    if (!validate.ok) {
+      return planErr("invalid-draft", validate.findings.filter((f) => f.level === "error").map((f) => f.message).join("; "), findings);
+    }
+    const check3 = validatedDefOf(op.id, op.draft ?? { mode: "auto" });
+    const { setFields: setFields2, removeFields: removeFields2 } = patchInputsOf(op.draft ?? { mode: "auto" }, check3.def);
+    const patched2 = patchEntryFields(raw, container, op.id, setFields2, removeFields2);
+    if (!patched2.ok)
+      return planErr("ambiguous", patched2.message, findings);
+    if (!parseForgeJsonc(patched2.text).ok)
+      return planErr("unparseable", "the patched document does not parse — refusing", findings);
+    if (patched2.text === raw) {
+      return {
+        ok: true,
+        plan: { kind: "no-op", action: "update", path: snapshot.path, container, id: op.id, newText: raw, summary: ["no field changes"] },
+        findings
+      };
+    }
+    return {
+      ok: true,
+      plan: {
+        kind: "patch",
+        action: "update",
+        path: snapshot.path,
+        container,
+        id: op.id,
+        newText: patched2.text,
+        summary: patched2.summary
+      },
+      findings
+    };
+  }
+  const validateOverride = validateOverrideDraft(op.id, op.draft ?? { mode: "auto" });
+  findings.push(...validateOverride.findings);
+  if (!validateOverride.ok) {
+    return planErr("invalid-draft", validateOverride.findings.filter((f) => f.level === "error").map((f) => f.message).join("; "), findings);
+  }
+  if (op.action === "create") {
+    const existing = existingEntryIds(raw, container);
+    if (!existing.ok)
+      return planErr("unparseable", existing.message, findings);
+    const normalizedExisting = new Set(existing.ids.map((k) => normalizeWorkerId(k).id));
+    if (normalizedExisting.has(op.id)) {
+      return planErr("duplicate", `override.${op.id} already exists — a key that normalizes onto it (forge-${op.id}) holds the slot (first definition wins); update it instead`, findings);
+    }
+    const check3 = validatedDefOf(op.id, op.draft ?? { mode: "auto" });
+    const inserted = insertEntry(raw, container, op.id, entryJsonOf(check3.def), { createContainer: true });
+    if (!inserted.ok)
+      return planErr(inserted.reason === "ambiguous" ? "duplicate" : foldJsoncReason(inserted.reason), inserted.detail, findings);
+    if (!parseForgeJsonc(inserted.text).ok)
+      return planErr("unparseable", "the patched document does not parse — refusing", findings);
+    return {
+      ok: true,
+      plan: {
+        kind: "patch",
+        action: "create",
+        path: snapshot.path,
+        container: "override",
+        id: op.id,
+        newText: inserted.text,
+        summary: [`activate override.${op.id} in ${snapshot.path} (machine-wide)`]
+      },
+      findings
+    };
+  }
+  const loc = locateEntry(raw, "override", op.id);
+  if (!loc.ok)
+    return planErr(foldJsoncReason(loc.reason), `override.${op.id}: ${loc.detail}`, findings);
+  if (op.action === "delete") {
+    const removed = removeEntry(raw, "override", op.id);
+    if (!removed.ok)
+      return planErr(foldJsoncReason(removed.reason), removed.detail, findings);
+    if (!parseForgeJsonc(removed.text).ok)
+      return planErr("unparseable", "the patched document does not parse — refusing", findings);
+    return {
+      ok: true,
+      plan: {
+        kind: "remove",
+        action: "delete",
+        path: snapshot.path,
+        container: "override",
+        id: op.id,
+        newText: removed.text,
+        summary: [`remove override.${op.id} from ${snapshot.path} (built-in behavior returns)`]
+      },
+      findings
+    };
+  }
+  const check2 = validatedDefOf(op.id, op.draft ?? { mode: "auto" });
+  const { setFields, removeFields } = patchInputsOf(op.draft ?? { mode: "auto" }, check2.def);
+  const patched = patchEntryFields(raw, "override", op.id, setFields, removeFields);
+  if (!patched.ok)
+    return planErr("ambiguous", patched.message, findings);
+  if (!parseForgeJsonc(patched.text).ok)
+    return planErr("unparseable", "the patched document does not parse — refusing", findings);
+  if (patched.text === raw) {
+    return {
+      ok: true,
+      plan: { kind: "no-op", action: "update", path: snapshot.path, container: "override", id: op.id, newText: raw, summary: ["no field changes"] },
+      findings
+    };
+  }
+  return {
+    ok: true,
+    plan: {
+      kind: "patch",
+      action: "update",
+      path: snapshot.path,
+      container: "override",
+      id: op.id,
+      newText: patched.text,
+      summary: patched.summary
+    },
+    findings
+  };
+}
+function planWorkerEdit(snapshot, op, opts) {
+  return planEntryEdit(snapshot, op, opts ?? {}, "agents", "worker");
+}
+function planOverrideEdit(snapshot, op, opts) {
+  return planEntryEdit(snapshot, op, opts ?? {}, "override", "override");
+}
+var tempCounter = 0;
+function normalizedStat(st) {
+  return st === null ? null : normalizeFileIdentity(st);
+}
+function commitRecipeEdit(snapshot, plan, deps = {}) {
+  const path = plan.path ?? snapshot.path;
+  if (deps.recheckOwnership !== undefined && deps.recheckOwnership() === false) {
+    return { ok: false, reason: "ownership-lost", message: "the owning scope re-check failed — the target's owning pool or anchor changed since the snapshot" };
+  }
+  const stat = deps.stat ?? defaultIdentityStat;
+  const readFile = deps.readFile ?? defaultReadFile;
+  const sampledIdentity = (p) => {
+    try {
+      return { identity: normalizedStat(stat(p)), refusal: null };
+    } catch (err) {
+      if (!isUnsafeIdentityError(err))
+        throw err;
+      return { identity: null, refusal: { ok: false, reason: "write-failed", message: `unsafe file identity for ${p}: ${err.message} — refusing before any write (no temp, no publish)` } };
+    }
+  };
+  if (plan.kind === "no-op") {
+    const sampledNoop = sampledIdentity(path);
+    if (sampledNoop.refusal !== null)
+      return sampledNoop.refusal;
+    const noopIdentity = sampledNoop.identity;
+    if (noopIdentity === null)
+      return { ok: false, reason: "missing", message: `${path} no longer exists` };
+    let noopRaw;
+    try {
+      noopRaw = strictDecode(readFile(path));
+    } catch (err) {
+      return { ok: false, reason: "unreadable", message: `cannot read ${path}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (snapshot.raw !== null && noopRaw !== snapshot.raw) {
+      return { ok: false, reason: "conflict", message: `${path} changed since the snapshot — the no-op verdict is stale; reload` };
+    }
+    if (snapshot.stat !== null && !identityMatches(noopIdentity, snapshot.stat)) {
+      return { ok: false, reason: "conflict", message: `${path}'s identity changed since the snapshot — the no-op verdict is stale; reload` };
+    }
+    return { ok: true, outcome: "no-op", bytes: 0 };
+  }
+  const sampledPre = sampledIdentity(path);
+  if (sampledPre.refusal !== null)
+    return sampledPre.refusal;
+  const identity = sampledPre.identity;
+  if (plan.kind === "create-file") {
+    if (identity !== null)
+      return { ok: false, reason: "conflict", message: `${path} appeared since the snapshot — reload before creating` };
+  } else {
+    if (identity === null)
+      return { ok: false, reason: "missing", message: `${path} no longer exists` };
+    let currentRaw;
+    try {
+      currentRaw = strictDecode(readFile(path));
+    } catch (err) {
+      return { ok: false, reason: "unreadable", message: `cannot read ${path} before replace: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (snapshot.raw !== null && currentRaw !== snapshot.raw) {
+      return { ok: false, reason: "conflict", message: `${path} changed since the snapshot — refusing to overwrite newer contents; reload` };
+    }
+    if (snapshot.stat !== null && !identityMatches(identity, snapshot.stat)) {
+      return { ok: false, reason: "conflict", message: `${path}'s identity changed since the snapshot — refusing; reload` };
+    }
+    if (currentRaw === plan.newText)
+      return { ok: true, outcome: "no-op", bytes: 0 };
+    const curParsed = parseForgeJsonc(currentRaw);
+    const newParsed = parseForgeJsonc(plan.newText);
+    if (curParsed.ok && newParsed.ok && deepEqual(curParsed.config, newParsed.config)) {
+      return { ok: true, outcome: "no-op", bytes: 0 };
+    }
+  }
+  if (parseForgeJsonc(plan.newText).ok === false) {
+    return { ok: false, reason: "unparseable", message: "the planned document does not parse — refusing to write" };
+  }
+  let refusal = null;
+  try {
+    if (deps.writeFile !== undefined) {
+      if (deps.rename === undefined) {
+        return { ok: false, reason: "write-failed", message: "the injected fs provides writeFile without rename — no atomic publish surface; refusing (fail closed)" };
+      }
+      const publishLink = deps.link;
+      if (plan.kind === "create-file" && publishLink === undefined) {
+        return { ok: false, reason: "write-failed", message: "creation on an injected fs requires an exclusive publish surface (link) — a rename publish could cover a competing creation; refusing before any write" };
+      }
+      const renamePublish = deps.rename;
+      const temp = `${path}.forge-tui-${process.pid}-${++tempCounter}.tmp`;
+      let tempOwned = false;
+      try {
+        if (plan.kind === "create-file" && deps.mkdir !== undefined) {
+          try {
+            deps.mkdir(dirname3(path));
+          } catch {}
+        }
+        deps.writeFile(temp, plan.newText);
+        tempOwned = true;
+        if (deps.recheckOwnership !== undefined && deps.recheckOwnership() === false) {
+          refusal = { reason: "ownership-lost", message: "ownership re-check failed after the temp write — the save was aborted before the publish" };
+        } else {
+          const stale = plan.kind === "create-file" ? verifyCreateAbsent(path, { stat }) : verifyFreshness(snapshot, path, { stat, readFile });
+          if (stale !== null) {
+            refusal = { reason: "conflict", message: stale };
+          } else if (plan.kind === "create-file") {
+            const finalStale = verifyCreateAbsent(path, { stat });
+            refusal = finalStale !== null ? { reason: "conflict", message: finalStale } : exclusiveInjectedPublish({ link: publishLink, rename: renamePublish }, temp, path, plan.newText, readFile);
+          } else {
+            renamePublish(temp, path);
+            const landed = strictDecode(readFile(path));
+            if (landed !== plan.newText) {
+              refusal = { reason: "conflict", message: `${path} changed while the save was in flight — application refused; reload` };
+            }
+          }
+        }
+      } finally {
+        if (tempOwned && deps.unlink !== undefined) {
+          try {
+            deps.unlink(temp);
+          } catch {}
+        }
+      }
+    } else {
+      refusal = atomicRealWrite(path, snapshot, plan, { stat, readFile, recheckOwnership: deps.recheckOwnership });
+    }
+  } catch (err) {
+    return { ok: false, reason: "write-failed", message: `write failed: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (refusal !== null)
+    return { ok: false, reason: refusal.reason, message: refusal.message };
+  return { ok: true, outcome: "written", bytes: plan.newText.length };
+}
+function verifyFreshness(snapshot, path, deps) {
+  const st = normalizedStat(deps.stat(path));
+  if (st === null)
+    return `${path} no longer exists`;
+  if (snapshot.raw !== null) {
+    let currentRaw;
+    try {
+      currentRaw = strictDecode(deps.readFile(path));
+    } catch (err) {
+      return `cannot read ${path} before replace: ${err instanceof Error ? err.message : String(err)}`;
+    }
+    if (currentRaw !== snapshot.raw)
+      return `${path} changed since the snapshot — refusing to overwrite newer contents; reload`;
+  }
+  if (snapshot.stat !== null && !identityMatches(st, snapshot.stat)) {
+    return `${path}'s identity changed since the snapshot — refusing; reload`;
+  }
+  return null;
+}
+function assertRealDirAncestors(dir) {
+  let cur = resolve4(dir);
+  const chain = [];
+  while (true) {
+    chain.unshift(cur);
+    const parent = dirname3(cur);
+    if (parent === cur)
+      break;
+    cur = parent;
+  }
+  for (const dirPath of chain) {
+    let st;
+    try {
+      st = lstatSync(dirPath);
+    } catch (err) {
+      if (err.code === "ENOENT")
+        continue;
+      throw new Error(`unsafe creation root: cannot inspect ${dirPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+    if (st.isSymbolicLink())
+      throw new Error(`unsafe creation root: ${dirPath} is a symlink/junction — the creation could land outside the intended tree`);
+    if (!st.isDirectory())
+      throw new Error(`unsafe creation root: ${dirPath} is not a directory`);
+  }
+}
+function atomicRealWrite(path, snapshot, plan, deps) {
+  const isCreate = plan.kind === "create-file";
+  if (!isCreate) {
+    const lst = lstatSync(path);
+    if (lst.isSymbolicLink())
+      throw new Error(`unsafe target: ${path} is a symlink — replace the link target's real file instead`);
+    if (lst.nlink > 1)
+      throw new Error(`unsafe target: ${path} is hard-linked (${lst.nlink} names) — the write would leak across identities`);
+    const real = realpathOf(path);
+    if (real !== null && foldPath(real) !== foldPath(path))
+      throw new Error(`unsafe target: ${path} resolves to ${real}`);
+  } else {
+    assertRealDirAncestors(dirname3(path));
+    try {
+      mkdirSync2(dirname3(path), { recursive: true });
+    } catch {}
+    const real = realpathOf(dirname3(path));
+    if (real !== null && foldPath(real) !== foldPath(resolve4(dirname3(path)))) {
+      throw new Error(`unsafe creation root: ${dirname3(path)} resolves to ${real} — refusing to create through a redirected parent`);
+    }
+  }
+  let ownedTemp = "";
+  try {
+    for (let attempt = 0;attempt < 5; attempt++) {
+      const candidate = `${path}.forge-tui-${process.pid}-${++tempCounter}.tmp`;
+      try {
+        writeFileSync3(candidate, plan.newText, { flag: "wx", mode: 384 });
+        ownedTemp = candidate;
+        break;
+      } catch (err) {
+        const code = err.code;
+        if (code === "EEXIST") {
+          if (attempt < 4)
+            continue;
+          break;
+        }
+        throw err;
+      }
+    }
+    if (ownedTemp === "") {
+      return { reason: "write-failed", message: `could not acquire an exclusive temp name next to ${path} (5 attempts, all occupied) — refusing rather than touching foreign files` };
+    }
+    const temp = ownedTemp;
+    if (deps.recheckOwnership !== undefined && deps.recheckOwnership() === false) {
+      return { reason: "ownership-lost", message: "ownership re-check failed after the temp write — the save was aborted before the publish" };
+    }
+    const stale = isCreate ? verifyCreateAbsent(path, deps) : verifyFreshness(snapshot, path, deps);
+    if (stale !== null)
+      return { reason: "conflict", message: stale };
+    if (isCreate) {
+      try {
+        linkSync(temp, path);
+      } catch (err) {
+        if (err.code === "EEXIST") {
+          return { reason: "conflict", message: `${path} appeared while the save was in flight — creation refused (no-clobber); reload` };
+        }
+        throw new Error(`exclusive publish unavailable on this filesystem (${err instanceof Error ? err.message : String(err)}) — creation refused (fail closed)`);
+      }
+      return null;
+    }
+    renameSync2(temp, path);
+    return null;
+  } finally {
+    if (ownedTemp !== "") {
+      try {
+        unlinkSync2(ownedTemp);
+      } catch {}
+    }
+  }
+}
+function verifyCreateAbsent(path, deps) {
+  if (normalizedStat(deps.stat(path)) !== null)
+    return `${path} appeared since the snapshot — creation refused (no-clobber); reload`;
+  return null;
+}
+function exclusiveInjectedPublish(deps, temp, path, newText, readFile) {
+  const publish = deps.link ?? deps.rename;
+  try {
+    publish(temp, path);
+  } catch (err) {
+    if (err.code === "EEXIST") {
+      return { reason: "conflict", message: `${path} appeared while the save was in flight — creation refused (no-clobber); reload` };
+    }
+    throw err;
+  }
+  const landed = strictDecode(readFile(path));
+  if (landed !== newText) {
+    return { reason: "conflict", message: `${path} changed while the save was in flight — application refused; reload` };
+  }
+  return null;
+}
+function realpathOf(path) {
+  try {
+    return realpathSync2(path);
+  } catch {
+    return null;
+  }
+}
+function foldPath(p) {
+  return process.platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p;
+}
+var commitLocks = new Map;
+function withCommitLock(path, fn) {
+  const key = foldPath(path);
+  const prev = commitLocks.get(key) ?? Promise.resolve();
+  const run = prev.then(fn, fn);
+  const tail = run.then(() => {
+    return;
+  }, () => {
+    return;
+  });
+  commitLocks.set(key, tail);
+  tail.then(() => {
+    if (commitLocks.get(key) === tail)
+      commitLocks.delete(key);
+  });
+  return run;
+}
+
+// src/config-rpc-protocol.ts
+var DEFAULT_TTL = { snapshot: 6 * 60 * 60 * 1000, token: 5 * 60 * 1000, receipt: 6 * 60 * 60 * 1000 };
+var DEFAULT_LIMITS = { snapshots: 64, tokens: 128, receipts: 256 };
+var defaultHash = (text) => createHash2("sha256").update(text, "utf8").digest("hex");
+function parseOf(text) {
+  const p = parseForgeJsonc(text);
+  return p.ok ? { ok: true, value: p.config } : { ok: false, message: `${p.error.message}${p.error.line !== undefined ? ` (line ${p.error.line}, column ${p.error.column})` : ""}` };
+}
+function foldPath2(p) {
+  return process.platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p;
+}
+function defaultLstat(p) {
+  try {
+    const st = lstatSync2(p, { bigint: true });
+    const identity = identityFromBigintStats(st);
+    return { exists: true, isSymlink: st.isSymbolicLink(), isDirectory: st.isDirectory(), isFile: st.isFile(), nlink: safeBigintNumber(st.nlink, "nlink"), mtimeMs: identity.mtimeMs, size: identity.size };
+  } catch (err) {
+    if (err.code === "ENOENT")
+      return { exists: false };
+    throw err;
+  }
+}
+function defaultRealpath(p) {
+  return realpathSync3(p);
+}
+function guardReadableTarget(path, seams) {
+  const lstat = seams.lstat ?? defaultLstat;
+  const realpath = seams.realpath ?? defaultRealpath;
+  const resolved = path.replace(/\//g, "\\");
+  const parts = resolved.split(/\\/).filter(Boolean);
+  let walk = parts[0] ?? "";
+  for (let i = 1;i < parts.length - 1; i++) {
+    walk = `${walk}\\${parts[i]}`.replace(/^\\+/, "\\");
+    let st;
+    try {
+      st = lstat(walk);
+    } catch (err) {
+      return { ok: false, message: `unsafe target: cannot inspect ${walk}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (!st.exists)
+      break;
+    if (st.isSymlink)
+      return { ok: false, message: `unsafe target: ${walk} is a symlink/junction — refusing to read or write through it` };
+    if (!st.isDirectory)
+      return { ok: false, message: `unsafe target: ${walk} is not a directory` };
+  }
+  let finalSt;
+  try {
+    finalSt = lstat(path);
+  } catch (err) {
+    return { ok: false, message: `unsafe target: cannot inspect ${path}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+  if (finalSt.exists) {
+    if (finalSt.isSymlink)
+      return { ok: false, message: `unsafe target: ${path} is a symlink — replace the link target's real file instead` };
+    if (!finalSt.isFile)
+      return { ok: false, message: `unsafe target: ${path} is not a regular file` };
+    if (finalSt.nlink > 1)
+      return { ok: false, message: `unsafe target: ${path} is hard-linked (${finalSt.nlink} names) — the write would leak across identities` };
+    let real;
+    try {
+      real = realpath(path);
+    } catch (err) {
+      return { ok: false, message: `unsafe target: cannot resolve ${path}: ${err instanceof Error ? err.message : String(err)}` };
+    }
+    if (foldPath2(real) !== foldPath2(path)) {
+      return { ok: false, message: `unsafe target: ${path} resolves to ${real}` };
+    }
+  }
+  return { ok: true };
+}
+function createConfigRpcStore(deps) {
+  const randomId = deps.randomId ?? (() => randomUUID());
+  const hash2 = deps.hash ?? defaultHash;
+  const ttl = { ...DEFAULT_TTL, ...deps.ttlMs };
+  const limits = { ...DEFAULT_LIMITS, ...deps.limits };
+  const maxOps = deps.maxOps ?? 32;
+  const maxDraftBytes = deps.maxDraftBytes ?? 262144;
+  const maxContextBytes = deps.maxContextBytes ?? 1024 * 1024;
+  const fs = deps.fs ?? {};
+  const snapshots = new Map;
+  const tokens = new Map;
+  const receipts = new Map;
+  let epochOverride = null;
+  const epochNow = () => epochOverride ?? deps.epoch();
+  const now = () => deps.clock();
+  const epochLive = (bound) => {
+    const cur = epochNow();
+    return cur.epoch === bound.epoch && cur.generation === bound.generation;
+  };
+  const insertBounded = (map2, key, value, max) => {
+    if (map2.size >= max && !map2.has(key)) {
+      const oldest = map2.keys().next();
+      if (!oldest.done)
+        map2.delete(oldest.value);
+    }
+    map2.set(key, value);
+  };
+  const sweep = () => {
+    const t = now();
+    let evictedReceipts = 0;
+    for (const [id, entry] of receipts) {
+      if (t > entry.expiresAt) {
+        receipts.delete(id);
+        evictedReceipts++;
+      }
+    }
+    return { evictedSnapshots: 0, evictedTokens: 0, evictedReceipts };
+  };
+  const targetIdentityOf = (binding) => `cfgt-${hash2(`${binding.scope}
+${binding.path}
+${binding.observedLocation ?? ""}
+${binding.anchor ?? ""}`).slice(0, 32)}`;
+  const bindingOf = (base) => ({ ...base, targetIdentity: targetIdentityOf(base) });
+  const INVALID = Symbol("config-rpc-invalid-session");
+  const asSessionID = (v) => {
+    if (v === null)
+      return null;
+    if (typeof v === "string")
+      return v;
+    return INVALID;
+  };
+  const onlyKeys = (input, keys) => {
+    if (typeof input !== "object" || input === null)
+      return false;
+    return Object.keys(input).every((k) => keys.includes(k));
+  };
+  const echo = (input, ctx) => {
+    const cur = epochNow();
+    return {
+      nonce: typeof input?.nonce === "string" ? input.nonce : "",
+      pluginID: ctx.pluginID,
+      appVersion: ctx.appVersion,
+      epoch: cur.epoch,
+      generation: cur.generation
+    };
+  };
+  const editOpen = (input) => {
+    sweep();
+    if (!onlyKeys(input, ["scope", "sessionID"])) {
+      return { ok: false, reason: "malformed-request", message: "malformed editOpen request — unexpected top-level field(s) are refused" };
+    }
+    const sessionID = asSessionID(input?.sessionID);
+    if (sessionID === INVALID || input?.scope !== "workspace" && input?.scope !== "global") {
+      return { ok: false, reason: "scope-unresolved", message: 'malformed editOpen request — scope must be "workspace"|"global" and sessionID a string or exactly null' };
+    }
+    const resolved = deps.resolver({ scope: input.scope, sessionID });
+    if (!resolved.ok) {
+      return { ok: false, reason: "scope-unresolved", message: resolved.message };
+    }
+    if (resolved.target.observedLocation === null || resolved.target.observedLocation === undefined) {
+      return { ok: false, reason: "scope-unresolved", message: "the server cannot observe a location for this target right now — no snapshot is issued (fail closed)" };
+    }
+    const guard = guardReadableTarget(resolved.target.path, fs);
+    if (!guard.ok) {
+      return { ok: false, reason: "scope-unresolved", message: `${guard.message} — no snapshot is issued` };
+    }
+    const snapshot = snapshotRecipe({ path: resolved.target.path, stat: fs.stat, readFile: fs.readFile });
+    if (input.scope === "workspace" && !resolved.target.creatable && !snapshot.exists) {
+      return { ok: false, reason: "scope-unresolved", message: `the owning workspace pool ${resolved.target.path} reads back absent while its creation is not authoritatively anchored — conflicted resolution; no snapshot handle is issued, reopen to re-resolve` };
+    }
+    if (snapshot.exists && snapshot.stat !== null) {
+      let post;
+      try {
+        post = (fs.lstat ?? defaultLstat)(resolved.target.path);
+      } catch (err) {
+        return { ok: false, reason: "scope-unresolved", message: `unsafe target: ${resolved.target.path} changed while being read (inspect failed: ${err instanceof Error ? err.message : String(err)}) — no snapshot is issued` };
+      }
+      const st0 = snapshot.stat;
+      const swapped = !post.exists || post.isSymlink || !post.isFile || post.mtimeMs === undefined || post.mtimeMs !== st0.mtimeMs || post.size !== undefined && post.size !== st0.size;
+      if (swapped) {
+        return { ok: false, reason: "scope-unresolved", message: `unsafe target: ${resolved.target.path} changed while being read — refusing (no bytes disclosed); reload` };
+      }
+    }
+    const t = now();
+    const cur = epochNow();
+    const binding = bindingOf({
+      path: resolved.target.path,
+      scope: input.scope,
+      sessionID,
+      observedLocation: resolved.target.observedLocation,
+      anchor: resolved.target.anchor
+    });
+    const snapshotId = randomId();
+    const entry = {
+      snapshotId,
+      binding,
+      snapshot,
+      epoch: { ...cur },
+      createdAt: t,
+      expiresAt: t + ttl.snapshot
+    };
+    insertBounded(snapshots, snapshotId, entry, limits.snapshots);
+    const findings = [];
+    if (!snapshot.exists && !resolved.target.creatable) {
+      findings.push({ level: "warn", code: "target-not-creatable", message: `no recipe at ${binding.path} and the server cannot authoritatively anchor a creation here — browsing only, writes unavailable` });
+    }
+    if (snapshot.exists && !snapshot.readable) {
+      findings.push({ level: "warn", code: "target-unreadable", message: `the recipe at ${binding.path} exists but cannot be decoded (strict UTF-8) — every edit is refused` });
+    }
+    return {
+      ok: true,
+      snapshotId,
+      path: binding.path,
+      targetIdentity: binding.targetIdentity,
+      scope: binding.scope,
+      sessionID: binding.sessionID,
+      observedLocation: binding.observedLocation,
+      anchor: binding.anchor,
+      epoch: cur.epoch,
+      generation: cur.generation,
+      expiresAt: entry.expiresAt,
+      exists: snapshot.exists,
+      readable: snapshot.readable,
+      creatable: resolved.target.creatable === true,
+      identity: snapshot.stat,
+      raw: snapshot.raw,
+      document: snapshot.parse && snapshot.parse.ok ? snapshot.parse.value : null,
+      parseError: snapshot.parse && !snapshot.parse.ok ? { message: snapshot.parse.message } : null,
+      findings
+    };
+  };
+  function planBatch(entry, ops) {
+    const baseline = entry.snapshot;
+    const entries = [];
+    const rejected = [];
+    const findings = [];
+    let acc = baseline.raw ?? "";
+    let createdFile = false;
+    for (const op of ops) {
+      if (op.renameTo !== undefined) {
+        rejected.push({ opId: op.opId, id: op.id, kind: op.kind, action: op.action, reason: "invalid-id", message: "renaming an existing entry id is not supported — create the new id explicitly and delete the old one", findings: [] });
+        continue;
+      }
+      if (op.kind !== "worker" && op.kind !== "override") {
+        rejected.push({ opId: op.opId, id: op.id, kind: "worker", action: op.action, reason: "invalid-op", message: `op kind must be "worker" or "override"`, findings: [] });
+        continue;
+      }
+      if (op.action !== "create" && op.action !== "update" && op.action !== "delete") {
+        rejected.push({ opId: op.opId, id: op.id, kind: op.kind, action: "create", reason: "invalid-op", message: `op action must be "create", "update" or "delete"`, findings: [] });
+        continue;
+      }
+      const draft = op.draft;
+      if (draft !== undefined && Buffer.byteLength(JSON.stringify(draft), "utf8") > maxDraftBytes) {
+        rejected.push({ opId: op.opId, id: op.id, kind: op.kind, action: op.action, reason: "invalid-op", message: `the draft exceeds the bounded preview size (${maxDraftBytes} UTF-8 bytes) — refusing this op only`, findings: [] });
+        continue;
+      }
+      const planOp = { action: op.action, id: op.id, draft };
+      const opts = { scope: entry.binding.scope, pool: op.pool };
+      const result = op.kind === "worker" ? planWorkerEdit(currentSnapshot(baseline, acc, createdFile || baseline.exists), planOp, opts) : planOverrideEdit(currentSnapshot(baseline, acc, createdFile || baseline.exists), planOp, opts);
+      findings.push(...result.findings);
+      if (!result.ok) {
+        rejected.push({ opId: op.opId, id: op.id, kind: op.kind, action: op.action, reason: result.reason, message: result.message, findings: result.findings.filter((f) => f.level === "error") });
+        continue;
+      }
+      if (result.plan.path !== entry.binding.path) {
+        rejected.push({ opId: op.opId, id: op.id, kind: op.kind, action: op.action, reason: "invalid-op", message: "internal: planned path drifted from the resolved binding — refusing the op", findings: [] });
+        continue;
+      }
+      acc = result.plan.newText;
+      if (result.plan.kind === "create-file")
+        createdFile = true;
+      entries.push({
+        opId: op.opId,
+        id: result.plan.id,
+        kind: op.kind,
+        action: op.action,
+        entryKind: result.plan.kind,
+        summary: result.plan.summary,
+        findings: result.findings
+      });
+    }
+    return { accText: acc, entries, rejected, findings };
+  }
+  function currentSnapshot(baseline, acc, exists) {
+    if (exists && baseline.exists)
+      return { ...baseline, raw: acc, parse: parseOf(acc) };
+    if (exists && !baseline.exists) {
+      return { path: baseline.path, exists: true, readable: true, raw: acc, stat: null, parse: parseOf(acc) };
+    }
+    return baseline;
+  }
+  const prepare = (input) => {
+    sweep();
+    if (!onlyKeys(input, ["snapshotId", "scope", "sessionID", "ops"])) {
+      return { ok: false, reason: "malformed-request", message: "malformed prepare request — unexpected top-level field(s) are refused" };
+    }
+    const entry = typeof input?.snapshotId === "string" ? snapshots.get(input.snapshotId) : undefined;
+    if (entry === undefined) {
+      return { ok: false, reason: "snapshot-unknown", message: "unknown snapshot handle — open the editor (editOpen) again" };
+    }
+    if (!epochLive(entry.epoch)) {
+      snapshots.delete(entry.snapshotId);
+      return { ok: false, reason: "epoch-stale", message: "the server epoch or RPC registration generation changed — every handle and token issued before it is refused; reopen the editor" };
+    }
+    const t = now();
+    if (t > entry.expiresAt) {
+      snapshots.delete(entry.snapshotId);
+      return { ok: false, reason: "snapshot-expired", message: "the edit-start snapshot handle expired — reopen the editor (no auto-renewal)" };
+    }
+    const sessionID = asSessionID(input?.sessionID);
+    if (sessionID === INVALID || input?.scope !== entry.binding.scope || input.sessionID !== entry.binding.sessionID) {
+      return { ok: false, reason: "scope-mismatch", message: "stated scope/sessionID do not exactly match the snapshot binding (null against null)" };
+    }
+    if (!Array.isArray(input.ops)) {
+      return { ok: false, reason: "invalid-op", message: "ops must be an array" };
+    }
+    if (input.ops.length > maxOps) {
+      return { ok: false, reason: "invalid-op", message: `a prepare carries at most ${maxOps} ops (bounded previews) — got ${input.ops.length}` };
+    }
+    const resolved = deps.resolver({ scope: entry.binding.scope, sessionID: entry.binding.sessionID });
+    if (!resolved.ok) {
+      return { ok: false, reason: "scope-unresolved", message: resolved.message };
+    }
+    if (resolved.target.path !== entry.binding.path || resolved.target.observedLocation !== entry.binding.observedLocation || resolved.target.anchor !== entry.binding.anchor) {
+      return { ok: false, reason: "scope-mismatch", message: "the target no longer resolves under the edit-start binding (owner, path or observed location changed) — reopen the editor" };
+    }
+    const fresh = freshnessOf(baselineOf(entry.snapshot));
+    if (fresh !== null)
+      return fresh;
+    if (!entry.snapshot.exists && resolved.target.creatable !== true) {
+      return { ok: false, reason: "scope-unresolved", message: `no recipe at ${entry.binding.path} and the server cannot authoritatively anchor a creation here — writes unavailable` };
+    }
+    if (entry.snapshot.exists && !entry.snapshot.readable) {
+      return { ok: false, reason: "unreadable", message: `the recipe at ${entry.binding.path} was unreadable when the editor opened (invalid UTF-8) — refusing every edit; reload after fixing the encoding` };
+    }
+    if (entry.snapshot.exists && entry.snapshot.readable && entry.snapshot.parse !== null && !entry.snapshot.parse.ok) {
+      return { ok: false, reason: "unparseable", message: `${entry.binding.path}: ${entry.snapshot.parse.message} — broken documents are never edited in place; fix the syntax first` };
+    }
+    const batch = planBatch(entry, input.ops);
+    const allFindings = [...batch.findings];
+    if (batch.entries.length === 0) {
+      const first = batch.rejected[0];
+      return {
+        ok: false,
+        reason: "no-valid-entries",
+        message: first !== undefined ? `${batch.rejected.length} of ${input.ops.length} entries rejected — ${first.message}` : "no entries to save",
+        findings: allFindings
+      };
+    }
+    const createFile = !entry.snapshot.exists;
+    const anyChange = batch.entries.some((e) => e.entryKind !== "no-op");
+    if (!anyChange) {
+      return {
+        ok: true,
+        outcome: "no-op",
+        summary: batch.entries.flatMap((e) => e.summary),
+        rejected: batch.rejected.map(({ opId, id, reason, message, findings }) => ({ opId, id, reason, message, findings })),
+        findings: allFindings
+      };
+    }
+    const cur = epochNow();
+    const token = randomId();
+    const expiresAt = t + ttl.token;
+    const newText = batch.accText;
+    const tokenEntry = {
+      token,
+      binding: entry.binding,
+      snapshotId: entry.snapshotId,
+      raw: entry.snapshot.raw,
+      identity: entry.snapshot.stat,
+      newText,
+      previewHash: hash2(newText),
+      createFile,
+      writeKind: createFile ? "create-file" : "patch",
+      entries: batch.entries,
+      rejected: batch.rejected,
+      epoch: { ...cur },
+      createdAt: t,
+      expiresAt,
+      spent: false
+    };
+    insertBounded(tokens, token, tokenEntry, limits.tokens);
+    const preview = {
+      path: entry.binding.path,
+      targetIdentity: entry.binding.targetIdentity,
+      scope: entry.binding.scope,
+      sessionID: entry.binding.sessionID,
+      oldText: entry.snapshot.raw,
+      newText,
+      previewHash: tokenEntry.previewHash,
+      createFile,
+      identity: entry.snapshot.stat,
+      entries: batch.entries.map((e) => ({
+        opId: e.opId,
+        id: e.id,
+        kind: e.kind,
+        action: e.action,
+        entryKind: e.entryKind,
+        summary: e.summary,
+        findings: e.findings
+      })),
+      rejected: batch.rejected.map(({ opId, id, reason, message, findings }) => ({ opId, id, reason, message, findings }))
+    };
+    return {
+      ok: true,
+      outcome: "token",
+      token: { token, expiresAt, epoch: cur.epoch, generation: cur.generation },
+      preview,
+      findings: allFindings
+    };
+  };
+  function freshnessOf(baseline) {
+    const stat = fs.stat;
+    const readFile = fs.readFile;
+    const path = baseline.path;
+    const st = snapshotRecipe({ path, stat, readFile });
+    if (baseline.exists) {
+      if (!st.exists) {
+        return { ok: false, reason: "conflict-reload", message: `${path} no longer exists — the edit-start snapshot is stale; reload` };
+      }
+      if (!st.readable) {
+        return { ok: false, reason: "unreadable", message: `${path} cannot be decoded since the editor opened — refusing (never a lossy rewrite source); reload` };
+      }
+      if (baseline.raw !== null && st.raw !== baseline.raw) {
+        return { ok: false, reason: "conflict-reload", message: `${path} changed since the editor opened — refusing to overwrite newer contents; reload` };
+      }
+      if (baseline.stat !== null && st.stat !== null) {
+        const a = baseline.stat;
+        const b = st.stat;
+        if (a.mtimeMs !== b.mtimeMs || a.size !== b.size) {
+          return { ok: false, reason: "conflict-reload", message: `${path}'s identity changed since the editor opened — refusing; reload` };
+        }
+        if (a.dev !== undefined && b.dev !== undefined && a.ino !== undefined && b.ino !== undefined && (a.dev !== b.dev || a.ino !== b.ino)) {
+          return { ok: false, reason: "conflict-reload", message: `${path} was deleted and recreated since the editor opened — refusing; reload` };
+        }
+      }
+      return null;
+    }
+    if (st.exists) {
+      return { ok: false, reason: "conflict-reload", message: `${path} appeared since the editor opened — reload before creating` };
+    }
+    return null;
+  }
+  const commit = async (input) => {
+    sweep();
+    if (!onlyKeys(input, ["token", "confirm", "scope", "sessionID"])) {
+      return { ok: false, reason: "malformed-request", message: "malformed commit request — unexpected top-level field(s) are refused" };
+    }
+    if (input?.confirm !== true) {
+      return { ok: false, reason: "confirm-required", message: "commit requires confirm === true — an unconfirmed preview is never written" };
+    }
+    const entry = typeof input?.token === "string" ? tokens.get(input.token) : undefined;
+    if (entry === undefined) {
+      return { ok: false, reason: "token-unknown", message: "unknown preview token — an earlier attempt under this id cannot be confirmed (it may or may not have written); do not replay, prepare fresh against current content" };
+    }
+    if (entry.spent) {
+      return { ok: false, reason: "token-spent", message: "the token was already used — at most one write per token; look the receipt up by token instead of replaying" };
+    }
+    if (!epochLive(entry.epoch)) {
+      tokens.delete(entry.token);
+      return { ok: false, reason: "epoch-stale", message: "the server epoch or RPC registration generation changed — this attempt wrote nothing; any earlier attempt under this token is NOT adjudicated here (query the receipt; found:false = UNKNOWN)" };
+    }
+    const t = now();
+    if (t > entry.expiresAt) {
+      tokens.delete(entry.token);
+      return { ok: false, reason: "token-expired", message: "the preview token expired — this attempt wrote nothing; any earlier attempt under this token is NOT adjudicated here (query the receipt; found:false = UNKNOWN). Run a fresh prepare (no auto-renewal)" };
+    }
+    const sessionID = asSessionID(input?.sessionID);
+    if (sessionID === INVALID || input?.scope !== entry.binding.scope || input.sessionID !== entry.binding.sessionID) {
+      return { ok: false, reason: "scope-mismatch", message: "stated scope/sessionID do not exactly match the token binding (null against null) — this attempt wrote nothing and the unspent token stays usable for the correct binding" };
+    }
+    const pre = resolveBinding(entry);
+    if (pre !== null)
+      return pre;
+    return withCommitLock(entry.binding.path, () => {
+      if (entry.spent) {
+        return { ok: false, reason: "token-spent", message: "the token was used by a competing commit while this attempt waited — at most one write per token; look the receipt up by token" };
+      }
+      if (!epochLive(entry.epoch)) {
+        tokens.delete(entry.token);
+        return { ok: false, reason: "epoch-stale", message: "the server epoch or registration generation changed while the commit was pending — this attempt wrote nothing" };
+      }
+      const t2 = now();
+      if (t2 > entry.expiresAt) {
+        tokens.delete(entry.token);
+        return { ok: false, reason: "token-expired", message: "the preview token expired while the commit was pending — this attempt wrote nothing (no auto-renewal)" };
+      }
+      if (tokens.get(entry.token) !== entry) {
+        return { ok: false, reason: "token-unknown", message: "the token is no longer registered (bounded-store eviction while the commit was pending) — its earlier outcome cannot be confirmed from here; re-prepare against current content" };
+      }
+      const inLockScope = resolveBinding(entry);
+      if (inLockScope !== null)
+        return inLockScope;
+      const fresh = freshnessOf(baselineOfToken(entry));
+      if (fresh !== null) {
+        entry.spent = true;
+        const receipt3 = buildReceipt(entry, "conflict", fresh.message, { at: t2, savedIdentity: null, bytes: 0 });
+        recordReceipt(receipt3, entry.epoch, t2, null);
+        return { ok: true, receipt: receipt3 };
+      }
+      let context = null;
+      if (deps.beforeCommit !== undefined) {
+        let captureError = null;
+        try {
+          const captured = deps.beforeCommit({
+            scope: entry.binding.scope,
+            sessionID: entry.binding.sessionID,
+            path: entry.binding.path,
+            binding: { path: entry.binding.path, observedLocation: entry.binding.observedLocation, anchor: entry.binding.anchor, targetIdentity: entry.binding.targetIdentity },
+            newText: entry.newText
+          });
+          if (captured === null || typeof captured !== "object" || Array.isArray(captured)) {
+            captureError = "beforeCommit returned a non-object baseline";
+          } else if (Buffer.byteLength(JSON.stringify(captured), "utf8") > maxContextBytes) {
+            captureError = `beforeCommit baseline exceeds the bounded context size (${maxContextBytes} UTF-8 bytes)`;
+          } else {
+            context = captured;
+          }
+        } catch (err) {
+          captureError = `beforeCommit failed: ${err instanceof Error ? err.message : String(err)}`;
+        }
+        if (captureError !== null) {
+          entry.spent = true;
+          const at0 = now();
+          const receipt3 = buildReceipt(entry, "write-failed", `${captureError} — refusing before the publish`, { at: at0, savedIdentity: null, bytes: 0 });
+          recordReceipt(receipt3, entry.epoch, at0, null);
+          return { ok: true, receipt: receipt3 };
+        }
+      }
+      entry.spent = true;
+      const recheckOwnership = () => {
+        try {
+          const r = deps.resolver({ scope: entry.binding.scope, sessionID: entry.binding.sessionID });
+          if (!r.ok)
+            return false;
+          if (r.target.path !== entry.binding.path || r.target.observedLocation !== entry.binding.observedLocation || r.target.anchor !== entry.binding.anchor)
+            return false;
+          if (entry.createFile && r.target.creatable !== true)
+            return false;
+          if (deps.reverify !== undefined && !deps.reverify({ scope: entry.binding.scope, sessionID: entry.binding.sessionID, path: entry.binding.path, observedLocation: entry.binding.observedLocation, anchor: entry.binding.anchor }))
+            return false;
+          return true;
+        } catch {
+          return false;
+        }
+      };
+      let result;
+      try {
+        result = commitRecipeEdit(baselineSnapshotFor(entry), { kind: entry.writeKind, path: entry.binding.path, newText: entry.newText }, {
+          stat: fs.stat,
+          readFile: fs.readFile,
+          writeFile: fs.writeFile,
+          rename: fs.rename,
+          link: fs.link,
+          unlink: fs.unlink,
+          mkdir: fs.mkdir,
+          recheckOwnership
+        });
+      } catch (err) {
+        result = { ok: false, reason: "write-failed", message: `write failed: ${err instanceof Error ? err.message : String(err)}` };
+      }
+      const at = now();
+      if (!result.ok) {
+        const receipt3 = buildReceipt(entry, result.reason, result.message, { at, savedIdentity: null, bytes: 0 });
+        recordReceipt(receipt3, entry.epoch, at, null);
+        return { ok: true, receipt: receipt3 };
+      }
+      if (result.outcome === "written") {
+        const post2 = postWriteIdentity(entry.binding.path);
+        const receipt3 = buildReceipt(entry, "written", post2.unsafe ? "saved — the write succeeded, but the post-write identity could not be sampled losslessly (unsafe identity; receipt carries no saved identity)" : "saved", { at, savedIdentity: post2.identity, bytes: Buffer.byteLength(entry.newText, "utf8") });
+        recordReceipt(receipt3, entry.epoch, at, context);
+        return { ok: true, receipt: receipt3 };
+      }
+      const post = postWriteIdentity(entry.binding.path);
+      const receipt2 = buildReceipt(entry, "no-op", post.unsafe ? "no changes — nothing written — the post-write identity could not be sampled losslessly (unsafe identity; receipt carries no saved identity)" : "no changes — nothing written", { at, savedIdentity: post.identity, bytes: 0 });
+      recordReceipt(receipt2, entry.epoch, at, context);
+      return { ok: true, receipt: receipt2 };
+    });
+  };
+  function resolveBinding(entry) {
+    let r;
+    try {
+      r = deps.resolver({ scope: entry.binding.scope, sessionID: entry.binding.sessionID });
+    } catch (err) {
+      return { ok: false, reason: "scope-unresolved", message: `authoritative resolution failed: ${err instanceof Error ? err.message : String(err)} — nothing was written` };
+    }
+    if (!r.ok)
+      return { ok: false, reason: "scope-unresolved", message: r.message };
+    if (r.target.path !== entry.binding.path || r.target.observedLocation !== entry.binding.observedLocation || r.target.anchor !== entry.binding.anchor) {
+      return { ok: false, reason: "scope-mismatch", message: "the target no longer resolves under the token binding (owner, path or observed location changed) — nothing was written" };
+    }
+    if (entry.createFile && r.target.creatable !== true) {
+      return { ok: false, reason: "scope-unresolved", message: "the server no longer anchors a creation at the bound target — nothing was written" };
+    }
+    return null;
+  }
+  function baselineOf(snap) {
+    return { path: snap.path, exists: snap.exists, readable: snap.readable, raw: snap.raw, stat: snap.stat };
+  }
+  function baselineOfToken(entry) {
+    return { path: entry.binding.path, exists: !entry.createFile, readable: !entry.createFile, raw: entry.raw, stat: entry.identity };
+  }
+  function baselineSnapshotFor(entry) {
+    return {
+      path: entry.binding.path,
+      exists: !entry.createFile,
+      readable: !entry.createFile,
+      raw: entry.raw,
+      stat: entry.identity,
+      parse: entry.raw !== null ? parseOf(entry.raw) : null
+    };
+  }
+  function statOf(path) {
+    try {
+      const st = fs.stat !== undefined ? fs.stat(path) : snapshotRecipe({ path }).stat;
+      return st === null ? null : normalizeFileIdentity(st);
+    } catch (err) {
+      if (isUnsafeIdentityError(err))
+        throw err;
+      return null;
+    }
+  }
+  function postWriteIdentity(path) {
+    try {
+      return { identity: statOf(path), unsafe: false };
+    } catch (err) {
+      if (!isUnsafeIdentityError(err))
+        throw err;
+      return { identity: null, unsafe: true };
+    }
+  }
+  function buildReceipt(entry, outcome, message, extra) {
+    const cur = epochNow();
+    const entries = [
+      ...entry.entries.map((e) => {
+        const reasonField = outcome === "written" || outcome === "no-op" ? undefined : outcome;
+        return {
+          opId: e.opId,
+          id: e.id,
+          kind: e.kind,
+          action: e.action,
+          entryKind: e.entryKind,
+          outcome: outcome === "written" ? e.entryKind === "no-op" ? "no-op" : "written" : outcome === "no-op" ? "no-op" : "rejected",
+          ...reasonField !== undefined ? { reason: reasonField } : {},
+          summary: e.summary,
+          findings: e.findings
+        };
+      }),
+      ...entry.rejected.map((r) => ({
+        opId: r.opId,
+        id: r.id,
+        kind: r.kind,
+        action: r.action,
+        entryKind: "no-op",
+        outcome: "rejected",
+        reason: r.reason,
+        summary: [],
+        findings: r.findings
+      }))
+    ];
+    return {
+      commitId: randomId(),
+      token: entry.token,
+      outcome,
+      message,
+      path: entry.binding.path,
+      targetIdentity: entry.binding.targetIdentity,
+      scope: entry.binding.scope,
+      sessionID: entry.binding.sessionID,
+      savedIdentity: extra.savedIdentity,
+      bytes: extra.bytes,
+      entries,
+      epoch: cur.epoch,
+      generation: cur.generation,
+      at: extra.at,
+      sync: null
+    };
+  }
+  function recordReceipt(receipt2, epoch, at, context) {
+    const store = { receipt: receipt2, epoch: { ...epoch }, createdAt: at, expiresAt: at + ttl.receipt, context };
+    insertBounded(receipts, receipt2.token, store, limits.receipts);
+  }
+  const receipt = (input) => {
+    sweep();
+    if (!onlyKeys(input, ["token"])) {
+      const cur0 = epochNow();
+      return { found: false, epoch: cur0.epoch, generation: cur0.generation };
+    }
+    const cur = epochNow();
+    const hit = typeof input?.token === "string" ? receipts.get(input.token) : undefined;
+    if (hit === undefined || hit.epoch.epoch !== cur.epoch || hit.epoch.generation !== cur.generation) {
+      return { found: false, epoch: cur.epoch, generation: cur.generation };
+    }
+    return { found: true, receipt: hit.receipt, epoch: cur.epoch, generation: cur.generation };
+  };
+  const attachSyncOutcome = (commitId, sync) => {
+    sweep();
+    for (const entry of receipts.values()) {
+      if (entry.receipt.commitId === commitId) {
+        entry.receipt.sync = sync;
+        return true;
+      }
+    }
+    return false;
+  };
+  const getCommitContext = (commitId) => {
+    sweep();
+    const cur = epochNow();
+    if (typeof commitId !== "string" || commitId.length === 0) {
+      return { found: false, epoch: cur.epoch, generation: cur.generation };
+    }
+    for (const entry of receipts.values()) {
+      if (entry.receipt.commitId !== commitId)
+        continue;
+      if (entry.epoch.epoch !== cur.epoch || entry.epoch.generation !== cur.generation)
+        break;
+      if (entry.receipt.outcome !== "written" && entry.receipt.outcome !== "no-op")
+        break;
+      if (entry.context === null)
+        break;
+      return { found: true, context: entry.context, commitId, token: entry.receipt.token, epoch: cur.epoch, generation: cur.generation };
+    }
+    return { found: false, epoch: cur.epoch, generation: cur.generation };
+  };
+  const handlers = (plugin) => ({
+    echo: (input) => echo(input, plugin),
+    editOpen: (input) => editOpen(input),
+    prepare: (input) => prepare(input),
+    commit: (input) => commit(input),
+    receipt: (input) => receipt(input)
+  });
+  return {
+    echo,
+    editOpen,
+    prepare,
+    commit,
+    receipt,
+    handlers,
+    attachSyncOutcome,
+    getCommitContext,
+    sweep,
+    size: () => ({ snapshots: snapshots.size, tokens: tokens.size, receipts: receipts.size }),
+    rotateEpoch: (next) => {
+      epochOverride = { ...next };
+    }
+  };
+}
+
+// src/config-rpc-host.ts
+import { randomUUID as randomUUID2 } from "node:crypto";
+var configRpcEpochState = { epoch: randomUUID2(), generation: 0 };
+function currentConfigRpcEpoch() {
+  return { ...configRpcEpochState };
+}
+function rotateConfigRpcEpoch() {
+  configRpcEpochState.generation += 1;
+  return { ...configRpcEpochState };
+}
+function resolveConfigTarget(acc, observedLocation, req) {
+  let anchor;
+  let location;
+  if (req.sessionID !== null) {
+    const live = acc.sessionAnchorOf(req.sessionID);
+    if (live === null || live.trim() === "") {
+      return { ok: false, reason: "scope-unresolved", message: `no authoritative anchor for session ${req.sessionID} — the server has no live workspace statement for it (session.moved / live map / ledger all empty); scope stays unresolved rather than guessed` };
+    }
+    anchor = live;
+    location = live;
+  } else {
+    if (observedLocation === null || observedLocation.trim() === "") {
+      return { ok: false, reason: "scope-unresolved", message: "this registration has no server-observed location — a null-session (home) scope is not resolvable here; refuse rather than widen to a wildcard" };
+    }
+    anchor = observedLocation;
+    location = observedLocation;
+  }
+  if (req.scope === "global") {
+    const globalPath = acc.globalPoolPath();
+    return {
+      ok: true,
+      target: {
+        path: globalPath,
+        observedLocation: location,
+        anchor: null,
+        creatable: !acc.pathExists(globalPath)
+      }
+    };
+  }
+  const pool = acc.workspacePoolOf(anchor);
+  if (pool !== null && pool.trim() !== "") {
+    return { ok: true, target: { path: pool, observedLocation: location, anchor, creatable: false } };
+  }
+  if (!acc.knownWorkspaceRoot(anchor)) {
+    return { ok: false, reason: "scope-unresolved", message: `${anchor} has no owning pool file and is not a host-initialized workspace root — creation cannot be authoritatively anchored here${req.sessionID !== null ? " (a session identity does not substitute for the host's root registration)" : ""}` };
+  }
+  return { ok: true, target: { path: forgeConfigPaths({ projectDir: anchor }).project, observedLocation: location, anchor, creatable: true } };
+}
+function reverifyConfigTarget(acc, observedLocation, req) {
+  try {
+    const r = resolveConfigTarget(acc, observedLocation, { scope: req.scope, sessionID: req.sessionID });
+    if (!r.ok)
+      return false;
+    const t = r.target;
+    if (!acc.samePath(t.path, req.path))
+      return false;
+    if (!sameOptionalPath(t.observedLocation, req.observedLocation, acc))
+      return false;
+    if (!sameOptionalPath(t.anchor, req.anchor, acc))
+      return false;
+    if (req.scope === "workspace" && t.creatable && !acc.knownWorkspaceRoot(t.anchor ?? ""))
+      return false;
+    return true;
+  } catch {
+    return false;
+  }
+}
+function sameOptionalPath(a, b, acc) {
+  if (a === null || b === null)
+    return a === b;
+  return acc.samePath(a, b);
+}
+function hostStat(path) {
+  return defaultIdentityStat(path);
+}
+function createConfigRpcHostDeps(acc, opts = {}) {
+  const observedLocation = opts.observedLocation ?? null;
+  const resolver = (req) => resolveConfigTarget(acc, observedLocation, req);
+  const reverify = (req) => reverifyConfigTarget(acc, observedLocation, req);
+  const fs = { stat: hostStat, ...opts.fs };
+  return {
+    clock: opts.clock ?? (() => Date.now()),
+    randomId: opts.randomId,
+    hash: opts.hash,
+    epoch: currentConfigRpcEpoch,
+    resolver,
+    reverify,
+    ttlMs: opts.ttlMs,
+    limits: opts.limits,
+    fs,
+    beforeCommit: opts.beforeCommit
+  };
+}
+
+// src/config-rpc-sync.ts
+import { createHash as createHash3, randomUUID as randomUUID3 } from "node:crypto";
+import { normalize as normalize2, resolve as resolvePath } from "node:path";
+
+// src/family-sync.ts
+function selectFamilyPlans(plans, familyFile) {
+  return { plans: plans.filter((p) => p.family.file === familyFile) };
+}
+function findFamily(resolution, familyFile) {
+  return resolution.families.find((f) => f.file === familyFile) ?? null;
+}
+function canonicalJson(v) {
+  if (v === undefined)
+    return "null";
+  if (v === null || typeof v !== "object")
+    return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v))
+    return `[${v.map(canonicalJson).join(",")}]`;
+  const rec = v;
+  return `{${Object.keys(rec).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson(rec[k])}`).join(",")}}`;
+}
+function familyProjectionSnapshot(resolution) {
+  const ownerByMatId = {};
+  const contentByMatId = {};
+  for (const family of resolution.families) {
+    for (const matId of family.materializedIds) {
+      ownerByMatId[matId] = family.file;
+      contentByMatId[matId] = canonicalJson(resolution.agents[matId] ?? null);
+    }
+  }
+  return { ownerByMatId, contentByMatId };
+}
+function baselineSnapshotOf(resolution) {
+  return {
+    ...familyProjectionSnapshot(resolution),
+    collisionFindings: resolution.findings.filter((f) => f.code === "materialized-id-collision").map((f) => f.message)
+  };
+}
+function collisionFindings(resolution, familyFile) {
+  return resolution.findings.filter((f) => f.code === "materialized-id-collision" && f.message.includes(familyFile)).map((f) => f.message);
+}
+function projectionDiffConflicts(beforeSnap, after, selected) {
+  const conflicts = [];
+  const afterSnap = familyProjectionSnapshot(after);
+  const ids = new Set([...Object.keys(beforeSnap.ownerByMatId), ...Object.keys(afterSnap.ownerByMatId)]);
+  for (const matId of ids) {
+    const beforeOwner = beforeSnap.ownerByMatId[matId];
+    const afterOwner = afterSnap.ownerByMatId[matId];
+    const beforeContent = beforeSnap.contentByMatId[matId];
+    const afterContent = afterSnap.contentByMatId[matId];
+    if (beforeOwner !== undefined && afterOwner === undefined) {
+      if (beforeOwner !== selected) {
+        conflicts.push(`materialized id "${matId}" (forge-${matId}) is no longer materialized — family ${beforeOwner}'s projection needs GC/reconciliation outside the selected family`);
+      }
+      continue;
+    }
+    if (beforeOwner === undefined && afterOwner !== undefined) {
+      if (afterOwner !== selected) {
+        conflicts.push(`materialized id "${matId}" (forge-${matId}) is newly materialized by family ${afterOwner} — a family-scoped sync never writes another family's projection`);
+      }
+      continue;
+    }
+    if (beforeOwner !== afterOwner) {
+      const other = beforeOwner !== selected ? beforeOwner : afterOwner;
+      conflicts.push(`materialized id "${matId}" (forge-${matId}) winner moved from ${String(beforeOwner)} to ${String(afterOwner)} — family ${String(other)}'s projection needs reconciliation outside the selected family`);
+      continue;
+    }
+    if (beforeContent !== afterContent && afterOwner !== selected) {
+      conflicts.push(`materialized id "${matId}" (forge-${matId}) projection content changed inside family ${afterOwner} — a family-scoped sync never rewrites another family's projection`);
+    }
+  }
+  return conflicts;
+}
+function crossFamilyWinnerConflictsFromBaseline(before, after, familyFile) {
+  if (before === null) {
+    return [...collisionFindings(after, familyFile), "cross-family winner drift cannot be ruled out (no pre-save baseline to diff) — application must stay unconfirmed"];
+  }
+  const seen = new Set(before.collisionFindings);
+  const conflicts = after.findings.filter((f) => f.code === "materialized-id-collision" && f.message.includes(familyFile) && !seen.has(f.message)).map((f) => f.message);
+  conflicts.push(...projectionDiffConflicts(before, after, familyFile));
+  return conflicts;
+}
+
+// src/config-rpc-sync.ts
+var DEFAULT_TTL_MS = 5 * 60 * 1000;
+var DEFAULT_MAX_TOKENS = 64;
+var foldPathOf = (p) => process.platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p;
+var sha256 = (text) => createHash3("sha256").update(text, "utf8").digest("hex");
+function canonicalJson2(v) {
+  if (v === undefined)
+    return "null";
+  if (v === null || typeof v !== "object")
+    return JSON.stringify(v) ?? "null";
+  if (Array.isArray(v))
+    return `[${v.map(canonicalJson2).join(",")}]`;
+  const rec = v;
+  return `{${Object.keys(rec).sort().map((k) => `${JSON.stringify(k)}:${canonicalJson2(rec[k])}`).join(",")}}`;
+}
+var SYNC_INPUT_KEYS = new Set(["scope", "sessionID", "confirm", "action", "token", "commitId"]);
+function validateInput(raw) {
+  if (raw === null || typeof raw !== "object" || Array.isArray(raw)) {
+    return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: "malformed sync request — expected an object" } };
+  }
+  const rec = raw;
+  for (const key of Object.keys(rec)) {
+    if (!SYNC_INPUT_KEYS.has(key)) {
+      return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: `unknown sync request field "${key}" — the sync surface accepts exactly scope/sessionID/confirm/action/token/commitId` } };
+    }
+  }
+  const scope = rec.scope;
+  if (scope !== "workspace" && scope !== "global") {
+    return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: 'sync scope must be "workspace" or "global"' } };
+  }
+  const sessionID = rec.sessionID;
+  if (sessionID !== null && typeof sessionID !== "string") {
+    return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: "sync sessionID must be a string or exactly null" } };
+  }
+  const action = rec.action;
+  if (action !== "prepare" && action !== "apply") {
+    return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: 'sync action must be "prepare" or "apply"' } };
+  }
+  if (typeof rec.confirm !== "boolean") {
+    return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: "sync confirm must be a boolean" } };
+  }
+  if (action === "prepare" && rec.confirm !== false) {
+    return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: 'sync prepare is pure read — confirm must be false; run action "apply" with confirm true to execute' } };
+  }
+  if (action === "apply") {
+    if (rec.confirm !== true) {
+      return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: "sync apply requires confirm === true — an unconfirmed plan is never executed" } };
+    }
+    if (typeof rec.token !== "string" || rec.token.length === 0) {
+      return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: 'sync apply requires the token returned by action "prepare"' } };
+    }
+  }
+  if (rec.token !== undefined && typeof rec.token !== "string") {
+    return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: "sync token must be a string when present" } };
+  }
+  if (rec.commitId !== undefined && typeof rec.commitId !== "string") {
+    return { refuse: { ok: false, action: "unknown", reason: "invalid-input", message: "sync commitId must be a string when present" } };
+  }
+  return {
+    input: {
+      scope,
+      sessionID,
+      confirm: rec.confirm,
+      action,
+      token: typeof rec.token === "string" ? rec.token : undefined,
+      commitId: typeof rec.commitId === "string" ? rec.commitId : undefined
+    }
+  };
+}
+function planFingerprintOf(plans, hash2) {
+  const surface = plans.map((p) => p.kind === "family" ? { kind: p.kind, family: { file: p.family.file, ns: p.family.ns, materializedIds: p.family.materializedIds }, dir: p.dir, files: p.files.map((f) => ({ matId: f.matId, fileName: f.fileName, content: f.content })) } : { kind: p.kind, dir: p.dir, files: p.files.map((f) => ({ fileName: f.fileName, content: f.content })) });
+  return hash2(canonicalJson2(surface));
+}
+function recipeUsableFor(resolution, file2, stat) {
+  if ((stat ?? (() => null))(file2) === null)
+    return false;
+  return !resolution.findings.some((f) => (f.code === "config-parse-error" || f.code === "config-not-object") && f.message.startsWith(`${file2}:`));
+}
+function planFamilySync(resolution, familyFile, dirs, opts) {
+  const plans = selectFamilyPlans(planRosterSync(resolution, { globalPoolFile: dirs.globalPoolFile, globalAgentDir: dirs.globalAgentDir, platform: opts?.platform }), familyFile).plans;
+  if (foldPathOf(familyFile) === foldPathOf(dirs.globalPoolFile)) {
+    const overridePlan = planOverrideSync(resolution.overrides ?? {}, { dir: dirs.globalAgentDir, recipeFile: dirs.globalPoolFile });
+    plans.push(overridePlan ?? { kind: "override", dir: dirs.globalAgentDir, files: [] });
+  }
+  return plans;
+}
+function joinPath2(dir, name) {
+  const sep3 = dir.includes("\\") && !dir.includes("/") ? "\\" : "/";
+  return dir.endsWith(sep3) ? `${dir}${name}` : `${dir}${sep3}${name}`;
+}
+function previewOpOf(plan, dest, content, fs) {
+  let existing = null;
+  try {
+    if ((fs.stat ?? (() => null))(dest) !== null)
+      existing = fs.readFile ? fs.readFile(dest) : null;
+  } catch {
+    existing = null;
+  }
+  if (existing === null)
+    return { op: "create" };
+  const same = plan.kind === "family" ? existing.replace(/\r\n/g, `
+`) === content.replace(/\r\n/g, `
+`) : existing === content;
+  return { op: same ? "unchanged" : "update" };
+}
+function gcCandidatesForPlan(plan, fs) {
+  const wanted = new Set(plan.files.map((f) => f.fileName));
+  const gcEligible = (name) => {
+    if (!name.endsWith(".md"))
+      return false;
+    if (plan.kind === "override")
+      return name === "general.md" || name === "explore.md";
+    return name.startsWith("forge-");
+  };
+  const out = [];
+  let listing = null;
+  try {
+    listing = fs.readdir ? fs.readdir(plan.dir) : null;
+  } catch {
+    listing = null;
+  }
+  if (listing === null)
+    return out;
+  for (const name of listing) {
+    if (!gcEligible(name))
+      continue;
+    if (wanted.has(name))
+      continue;
+    const dest = joinPath2(plan.dir, name);
+    let marked = false;
+    try {
+      marked = (fs.readFile ? fs.readFile(dest) : "").includes("<!-- GENERATED BY forge_sync");
+    } catch {
+      marked = false;
+    }
+    if (!marked)
+      continue;
+    out.push({ nativeId: nativeIdOfFileName(name), dest });
+  }
+  return out;
+}
+function nativeIdOfFileName(name) {
+  return name.replace(/\.md$/, "");
+}
+function nativeIdOfPlanFile(plan, file2) {
+  if (plan.kind === "family" && typeof file2.matId === "string")
+    return `forge-${file2.matId}`;
+  return file2.fileName.replace(/\.md$/, "");
+}
+function canonicalPathOf(p) {
+  return foldPathOf(normalize2(resolvePath(p)));
+}
+function directoryOverlapConflicts(resolution, selectedPlans, familyFile, dirs) {
+  const selectedDirs = new Set(selectedPlans.map((p) => canonicalPathOf(p.dir)));
+  const conflicts = [];
+  for (const p of planRosterSync(resolution, { globalPoolFile: dirs.globalPoolFile, globalAgentDir: dirs.globalAgentDir })) {
+    if (p.kind !== "family")
+      continue;
+    if (canonicalPathOf(p.family.file) === canonicalPathOf(familyFile))
+      continue;
+    if (selectedDirs.has(canonicalPathOf(p.dir))) {
+      conflicts.push(`unselected family ${p.family.file} shares the artifact directory of the selected sync (${p.dir}) — a family-scoped sync would garbage-collect another family's projection; use the host-wide sync instead`);
+    }
+  }
+  return conflicts;
+}
+function compiledBodyOf(content) {
+  const m = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(content);
+  if (m === null)
+    return null;
+  return content.slice(m[0].length).replace(/^\r?\n/, "").replace(/\r\n/g, `
+`);
+}
+function modelStringFromContent(content) {
+  const fm = /^---\r?\n[\s\S]*?\r?\n---(?:\r?\n|$)/.exec(content);
+  if (fm === null)
+    return;
+  const m = /^model: ("((?:[^"\\]|\\.)*)"|(.+))$/m.exec(fm[0]);
+  if (m === null)
+    return;
+  if (m[2] !== undefined)
+    return JSON.parse(`"${m[2]}"`);
+  return m[3]?.trim();
+}
+function compiledPermissionFaceOf(content) {
+  const fm = /^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/.exec(content);
+  if (fm === null)
+    return null;
+  const lines = fm[1].split(/\r?\n/);
+  const start = lines.findIndex((l) => l === "permissions:");
+  if (start >= 0) {
+    const out = {};
+    for (let i = start + 1;i < lines.length; i++) {
+      const action = /^ {2}- action: ("(?:[^"\\]|\\.)*")$/.exec(lines[i]);
+      if (action === null)
+        break;
+      const resource = /^ {4}resource: ("(?:[^"\\]|\\.)*")$/.exec(lines[i + 1] ?? "");
+      const effect = /^ {4}effect: ("(?:[^"\\]|\\.)*")$/.exec(lines[i + 2] ?? "");
+      if (resource === null || effect === null)
+        return null;
+      if (JSON.parse(resource[1]) !== "*")
+        return null;
+      out[JSON.parse(action[1])] = JSON.parse(effect[1]);
+      i += 2;
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+  const toolsStart = lines.findIndex((l) => l === "tools:");
+  if (toolsStart >= 0) {
+    const out = {};
+    for (let i = toolsStart + 1;i < lines.length; i++) {
+      const entry = /^ {2}([A-Za-z0-9_]+): (true|false)$/.exec(lines[i]);
+      if (entry === null)
+        break;
+      out[entry[1]] = entry[2] === "false" ? "deny" : "allow";
+    }
+    return Object.keys(out).length > 0 ? out : null;
+  }
+  return null;
+}
+function modelObserved(expected, rowModel) {
+  if (expected === undefined)
+    return rowModel === undefined || rowModel === null || rowModel === "";
+  const hash2 = expected.indexOf("#");
+  const base = hash2 < 0 ? expected : expected.slice(0, hash2);
+  const variant = hash2 < 0 ? undefined : expected.slice(hash2 + 1);
+  if (typeof rowModel === "string") {
+    const at = rowModel.indexOf("#");
+    const rowBase = at < 0 ? rowModel : rowModel.slice(0, at);
+    const rowVariant = at < 0 ? undefined : rowModel.slice(at + 1);
+    return rowBase === base && (variant === undefined ? rowVariant === undefined || rowVariant === "" : rowVariant === variant);
+  }
+  if (rowModel !== null && typeof rowModel === "object") {
+    const rec = rowModel;
+    const modelId = typeof rec.id === "string" ? rec.id : typeof rec.modelID === "string" ? rec.modelID : undefined;
+    if (typeof rec.providerID === "string" && typeof modelId === "string") {
+      if (`${rec.providerID}/${modelId}` !== base)
+        return false;
+      const rowVariant = typeof rec.variant === "string" && rec.variant !== "" ? rec.variant : undefined;
+      return variant === rowVariant;
+    }
+  }
+  return false;
+}
+function normalizeRuleset(rowPermissions) {
+  if (Array.isArray(rowPermissions)) {
+    const rules = [];
+    for (const entry of rowPermissions) {
+      if (entry === null || typeof entry !== "object")
+        return null;
+      const rec = entry;
+      if (typeof rec.action !== "string" || typeof rec.effect !== "string")
+        return null;
+      rules.push({ action: rec.action, resource: typeof rec.resource === "string" ? rec.resource : undefined, effect: rec.effect });
+    }
+    return rules;
+  }
+  if (rowPermissions !== null && typeof rowPermissions === "object") {
+    const rec = rowPermissions;
+    if (!Object.values(rec).every((v) => typeof v === "string"))
+      return null;
+    return Object.entries(rec).map(([action, effect]) => ({ action, effect }));
+  }
+  return null;
+}
+function permissionAliasesOf(action) {
+  if (action === "task")
+    return ["task", "subagent"];
+  if (action === "bash")
+    return ["bash", "shell"];
+  return [action];
+}
+function permissionsObserved(face, rowPermissions) {
+  if (face === null)
+    return true;
+  const rules = normalizeRuleset(rowPermissions);
+  if (rules === null)
+    return false;
+  for (const [action, effect] of Object.entries(face)) {
+    const names = permissionAliasesOf(action);
+    let globalEffective;
+    let globalSeen = false;
+    let proofValid = true;
+    for (const rule of rules) {
+      if (rule.action !== "*" && !names.includes(rule.action))
+        continue;
+      if (rule.resource === undefined || rule.resource === "*") {
+        globalSeen = true;
+        globalEffective = rule.effect;
+        proofValid = true;
+      } else if (globalSeen && rule.effect !== globalEffective) {
+        proofValid = false;
+      }
+    }
+    if (!globalSeen || !proofValid || globalEffective !== effect)
+      return false;
+  }
+  return true;
+}
+function createConfigRpcSyncHandler(deps) {
+  const now = deps.clock ?? (() => Date.now());
+  const randomId = deps.randomId ?? (() => randomUUID3());
+  const hash2 = deps.hash ?? sha256;
+  const ttlMs = deps.ttlMs ?? DEFAULT_TTL_MS;
+  const maxTokens = deps.maxTokens ?? DEFAULT_MAX_TOKENS;
+  const tokens = new Map;
+  const sweep = () => {
+    const t = now();
+    const cur = deps.epoch();
+    for (const [id, entry] of tokens) {
+      if (t > entry.expiresAt || entry.epoch.epoch !== cur.epoch || entry.epoch.generation !== cur.generation)
+        tokens.delete(id);
+    }
+  };
+  const sameBinding = (a, b) => a === null || b === null ? a === b : foldPathOf(a) === foldPathOf(b);
+  const baselineFor = (commitId) => {
+    if (typeof deps.getCommitContext !== "function")
+      return null;
+    let ctx;
+    try {
+      ctx = deps.getCommitContext(commitId);
+    } catch {
+      return null;
+    }
+    if (!ctx.found)
+      return null;
+    return readBaselineShape(ctx.context);
+  };
+  function readBaselineShape(raw) {
+    if (raw === null || typeof raw !== "object")
+      return null;
+    const rec = raw;
+    if (rec.v !== 1 || rec.coverage !== "full" && rec.coverage !== "unknown")
+      return null;
+    if (typeof rec.ownerFile !== "string" || rec.ownerFile === "")
+      return null;
+    const before = rec.before;
+    if (before === null || typeof before !== "object" || typeof before.ownerByMatId !== "object" || typeof before.contentByMatId !== "object" || !Array.isArray(before.collisionFindings))
+      return null;
+    return {
+      v: 1,
+      at: typeof rec.at === "number" ? rec.at : 0,
+      coverage: rec.coverage,
+      reason: typeof rec.reason === "string" ? rec.reason : undefined,
+      ownerFile: rec.ownerFile,
+      anchor: rec.anchor === null || typeof rec.anchor === "string" ? rec.anchor : null,
+      observedLocation: rec.observedLocation === null || typeof rec.observedLocation === "string" ? rec.observedLocation : null,
+      familyNs: rec.familyNs === null || typeof rec.familyNs === "string" ? rec.familyNs : null,
+      materializedIds: Array.isArray(rec.materializedIds) ? rec.materializedIds.filter((x) => typeof x === "string") : [],
+      before
+    };
+  }
+  const buildPreview = (raw) => {
+    const fs = deps.rosterFs();
+    const snapshot = deps.resolvePools();
+    if (snapshot === null) {
+      return { ok: false, output: { ok: false, action: "prepare", reason: "no-coverage", message: "the host's authoritative anchor registry cannot resolve a full pool picture — sync is refused rather than answered from a partial set; initialize the workspace (or retry once the host has seen it)" } };
+    }
+    const resolution = snapshot.resolution;
+    const resolved = deps.resolveScope({ scope: raw.scope, sessionID: raw.sessionID });
+    if (!resolved.ok) {
+      return { ok: false, output: { ok: false, action: "prepare", reason: "scope-unresolved", message: resolved.message } };
+    }
+    const familyFile = resolved.target.path;
+    const dirs = deps.rosterDirs();
+    const globalFile = dirs.globalPoolFile;
+    const isGlobalFamily = foldPathOf(familyFile) === foldPathOf(globalFile);
+    if (!recipeUsableFor(resolution, familyFile, fs.stat)) {
+      const exists = (fs.stat ?? (() => null))(familyFile) !== null;
+      return { ok: false, output: { ok: false, action: "prepare", reason: exists ? "recipe-unusable" : "stale-preview", message: exists ? `${familyFile} does not parse — broken documents are disclosed, never synced in place; fix the syntax first` : `${familyFile} is absent — nothing to project for this scope${resolved.target.creatable ? " (creating it is an edit-path save, not a sync)" : ""}` } };
+    }
+    const family = findFamily(resolution, familyFile);
+    const plans = planFamilySync(resolution, familyFile, dirs);
+    const overlaps = directoryOverlapConflicts(resolution, plans, familyFile, dirs);
+    if (overlaps.length > 0) {
+      return { ok: false, output: { ok: false, action: "prepare", reason: "directory-conflict", message: overlaps.join("; ") } };
+    }
+    const findings = resolution.findings.filter((f) => f.level === "warn" || f.level === "error").map((f) => ({ level: f.level, code: f.code, message: f.message }));
+    const familyBytes = snapshot.readOf(familyFile);
+    if (familyBytes === null) {
+      return { ok: false, output: { ok: false, action: "prepare", reason: "recipe-unusable", message: `${familyFile} was not part of the authoritative resolution's reads — refusing rather than hashing a second read of possibly different bytes` } };
+    }
+    const contentHash = hash2(familyBytes);
+    const files = [];
+    const summary = [];
+    for (const plan of plans) {
+      for (const file2 of plan.files) {
+        const dest = joinPath2(plan.dir, file2.fileName);
+        const { op } = previewOpOf(plan, dest, file2.content, fs);
+        files.push({ nativeId: nativeIdOfPlanFile(plan, file2), fileName: file2.fileName, dest, op });
+        if (op !== "unchanged")
+          summary.push(`${op}: ${dest}`);
+      }
+    }
+    const gc = plans.flatMap((p) => gcCandidatesForPlan(p, fs));
+    for (const g of gc)
+      summary.push(`gc: ${g.dest} (${g.nativeId})`);
+    const preview = {
+      path: familyFile,
+      scope: raw.scope,
+      sessionID: raw.sessionID,
+      observedLocation: resolved.target.observedLocation,
+      anchor: resolved.target.anchor,
+      family: family === null ? null : { file: family.file, ns: family.ns, materializedIds: [...family.materializedIds] },
+      overridesIncluded: isGlobalFamily,
+      files,
+      gc,
+      coverage: "full",
+      summary,
+      findings
+    };
+    return { ok: true, preview, plans, familyFile, contentHash, fingerprint: planFingerprintOf(plans, hash2), gcFingerprint: hash2(canonicalJson2(gc)), gc, snapshot };
+  };
+  const savedBaselineConflict = (commitId, familyFile, snap) => {
+    const baseline = baselineFor(commitId);
+    if (baseline === null) {
+      return { ok: false, reason: "no-coverage", message: `the commit baseline for ${commitId} is unknown, evicted or malformed — whether that save wrote is UNKNOWN and a dependent sync is refused with zero writes; re-run the save flow, or sync current state standalone (without commitId)` };
+    }
+    if (baseline.coverage !== "full") {
+      return { ok: false, reason: "no-coverage", message: `the save's pre-publish baseline is not a full resolution (${baseline.reason ?? "unknown coverage"}) — dependent sync refused with zero writes` };
+    }
+    if (foldPathOf(baseline.ownerFile) !== foldPathOf(familyFile)) {
+      return { ok: false, reason: "scope-mismatch", message: `the owning family moved after the confirmed save (baseline owner ${baseline.ownerFile} vs resolved ${familyFile}) — a sync must never follow a new owner the human did not confirm; re-open the editor` };
+    }
+    const flips = crossFamilyWinnerConflictsFromBaseline(baseline.before, snap.resolution, familyFile);
+    if (flips.length > 0) {
+      return { ok: false, reason: "directory-conflict", message: `the save changed cross-family collision winners — family-scoped sync refused before any write (zero artifact writes): ${flips.join("; ")}; the explicit host-wide sync is the recovery lever` };
+    }
+    return { ok: true };
+  };
+  const prepare = (input) => {
+    sweep();
+    if (input.commitId !== undefined && typeof deps.getCommitContext === "function") {
+      let found = false;
+      try {
+        found = deps.getCommitContext(input.commitId).found === true;
+      } catch {
+        found = false;
+      }
+      if (!found) {
+        return { ok: false, action: "prepare", reason: "no-coverage", message: `the commit ${input.commitId} this sync would correlate to has no retained pre-save context — the save's evidence is missing (never reconstructed); run the save flow again, or sync current state standalone (without commitId)` };
+      }
+    }
+    const built = buildPreview(input);
+    if (!built.ok)
+      return built.output;
+    const cur = deps.epoch();
+    const t = now();
+    if (input.commitId !== undefined) {
+      const baseline = savedBaselineConflict(input.commitId, built.familyFile, built.snapshot);
+      if (!baseline.ok)
+        return { ok: false, action: "prepare", reason: baseline.reason, message: baseline.message };
+    }
+    if (built.preview.files.every((f) => f.op === "unchanged") && built.gc.length === 0) {
+      return { ok: true, action: "prepare", outcome: "noop", preview: built.preview, findings: built.preview.findings };
+    }
+    const token = `synctok-${randomId()}`;
+    const entry = {
+      token,
+      scope: input.scope,
+      sessionID: input.sessionID,
+      observedLocation: built.preview.observedLocation,
+      anchor: built.preview.anchor,
+      familyFile: built.familyFile,
+      contentHash: built.contentHash,
+      planFingerprint: built.fingerprint,
+      gcFingerprint: built.gcFingerprint,
+      commitId: input.commitId,
+      epoch: { ...cur },
+      createdAt: t,
+      expiresAt: t + ttlMs,
+      spent: false
+    };
+    if (tokens.size >= maxTokens && !tokens.has(token)) {
+      const oldest = tokens.keys().next();
+      if (!oldest.done)
+        tokens.delete(oldest.value);
+    }
+    tokens.set(token, entry);
+    return {
+      ok: true,
+      action: "prepare",
+      outcome: "token",
+      token: { token, expiresAt: entry.expiresAt, epoch: cur.epoch, generation: cur.generation },
+      preview: built.preview,
+      findings: built.preview.findings
+    };
+  };
+  const apply = async (input) => {
+    const fail = (reason, message) => ({ ok: false, action: "apply", reason, message });
+    const entry = typeof input.token === "string" ? tokens.get(input.token) : undefined;
+    if (entry === undefined) {
+      sweep();
+      return fail("token-unknown", "unknown sync token — nothing was executed; run a fresh prepare against current content");
+    }
+    const pre = deps.epoch();
+    if (entry.epoch.epoch !== pre.epoch || entry.epoch.generation !== pre.generation) {
+      tokens.clear();
+      return fail("epoch-stale", "the server epoch or RPC registration generation changed — every sync token issued before it is refused; re-prepare");
+    }
+    const tPre = now();
+    if (tPre > entry.expiresAt) {
+      tokens.delete(entry.token);
+      return fail("token-expired", "the sync token expired — nothing was executed; run a fresh prepare (no auto-renewal)");
+    }
+    if (entry.spent)
+      return fail("token-spent", "the sync token was already used — at most one execution per token; run a fresh prepare to retry");
+    if (input.scope !== entry.scope || input.sessionID !== entry.sessionID) {
+      return fail("scope-mismatch", "the request's scope/sessionID do not exactly match the sync token binding — nothing was executed");
+    }
+    if ((input.commitId ?? null) !== (entry.commitId ?? null)) {
+      return fail("invalid-input", input.commitId === undefined ? `this sync token was prepared as a DEPENDENT sync of commit ${entry.commitId} — the apply must carry the same commitId (the correlation is part of the token binding)` : `the apply carries commitId ${input.commitId} but its prepare bound ${entry.commitId === undefined ? "no commitId" : entry.commitId} — a sync cannot correlate to a receipt its prepare never bound; re-prepare with the commitId to run the baseline-checked dependent sync`);
+    }
+    const resolved = deps.resolveScope({ scope: entry.scope, sessionID: entry.sessionID });
+    if (!resolved.ok)
+      return fail("scope-unresolved", resolved.message);
+    if (foldPathOf(resolved.target.path) !== foldPathOf(entry.familyFile) || !sameBinding(resolved.target.observedLocation, entry.observedLocation) || !sameBinding(resolved.target.anchor, entry.anchor)) {
+      return fail("scope-mismatch", "the target no longer resolves under the sync token binding (owner, path, session location or anchor changed) — re-prepare against current state");
+    }
+    const preSnap = deps.resolvePools();
+    if (preSnap === null)
+      return fail("no-coverage", "the host's authoritative anchor registry cannot resolve a full pool picture — sync is refused (no partial-set execution)");
+    const commitEvidence = (commitId) => {
+      if (typeof deps.getCommitContext !== "function") {
+        return { ok: false, message: `the sync correlates to commit ${commitId} but no commit-context seam is available — whether that save wrote is UNKNOWN; refused with zero writes` };
+      }
+      let found = false;
+      try {
+        found = deps.getCommitContext(commitId).found === true;
+      } catch {
+        found = false;
+      }
+      if (!found) {
+        return { ok: false, message: `the commit ${commitId} this sync correlates to has no retained pre-save context (evicted, cross-epoch or unknown) — whether that save wrote is UNKNOWN; the correlated sync is refused with zero writes (re-run the save flow to re-establish evidence)` };
+      }
+      return { ok: true };
+    };
+    if (typeof input.commitId === "string") {
+      const evidence = commitEvidence(input.commitId);
+      if (!evidence.ok)
+        return fail("no-coverage", evidence.message);
+    }
+    const verifyState = (snap) => {
+      const fs = deps.rosterFs();
+      const res = snap.resolution;
+      const family = findFamily(res, entry.familyFile);
+      if (family === null)
+        return { ok: false, reason: "stale-preview", message: `${entry.familyFile} no longer materializes as the owning family — re-prepare against current state` };
+      const dirs = deps.rosterDirs();
+      const plans = planFamilySync(res, entry.familyFile, dirs);
+      const overlaps = directoryOverlapConflicts(res, plans, entry.familyFile, dirs);
+      if (overlaps.length > 0)
+        return { ok: false, reason: "directory-conflict", message: overlaps.join("; ") };
+      if (planFingerprintOf(plans, hash2) !== entry.planFingerprint)
+        return { ok: false, reason: "stale-preview", message: "the planned projection changed since prepare — re-prepare against current content (a saved patch is never replayed)" };
+      const gc = plans.flatMap((p) => gcCandidatesForPlan(p, fs));
+      if (hash2(canonicalJson2(gc)) !== entry.gcFingerprint)
+        return { ok: false, reason: "stale-preview", message: "the garbage-collection candidates changed since prepare — re-prepare against current state" };
+      const familyBytes = snap.readOf(entry.familyFile);
+      if (familyBytes === null)
+        return { ok: false, reason: "recipe-unusable", message: `${entry.familyFile} was not part of the authoritative resolution's reads — refusing rather than hashing a second read of possibly different bytes` };
+      if (hash2(familyBytes) !== entry.contentHash)
+        return { ok: false, reason: "stale-preview", message: `${entry.familyFile} changed since prepare — re-prepare against current content` };
+      return { ok: true, plans, gc };
+    };
+    const preState = verifyState(preSnap);
+    if (!preState.ok)
+      return fail(preState.reason, preState.message);
+    const preBaseline = entry.commitId === undefined ? { ok: true } : savedBaselineConflict(entry.commitId, entry.familyFile, preSnap);
+    if (!preBaseline.ok)
+      return fail(preBaseline.reason, preBaseline.message);
+    const execResult = await withCommitLock(entry.familyFile, async () => {
+      const cur = deps.epoch();
+      if (entry.epoch.epoch !== cur.epoch || entry.epoch.generation !== cur.generation) {
+        tokens.clear();
+        return fail("epoch-stale", "the epoch or registration generation changed while the apply was pending — refused, nothing was executed");
+      }
+      const t2 = now();
+      if (t2 > entry.expiresAt) {
+        tokens.delete(entry.token);
+        return fail("token-expired", "the sync token expired while the apply was pending — nothing was executed; re-prepare (no auto-renewal)");
+      }
+      if (entry.spent)
+        return fail("token-spent", "the sync token was used by a competing apply — at most one execution per token");
+      if (input.scope !== entry.scope || input.sessionID !== entry.sessionID) {
+        return fail("scope-mismatch", "the request's scope/sessionID stopped matching the sync token binding — nothing was executed");
+      }
+      const inLockScope = deps.resolveScope({ scope: entry.scope, sessionID: entry.sessionID });
+      if (!inLockScope.ok || foldPathOf(inLockScope.target.path) !== foldPathOf(entry.familyFile) || !sameBinding(inLockScope.target.observedLocation, entry.observedLocation) || !sameBinding(inLockScope.target.anchor, entry.anchor)) {
+        return fail("scope-mismatch", "the binding re-resolution changed while the apply was pending — refused, nothing was executed; re-prepare");
+      }
+      const snap = deps.resolvePools();
+      if (snap === null)
+        return fail("no-coverage", "coverage became unresolvable while the apply was pending — refused, nothing was executed");
+      const inLock = verifyState(snap);
+      if (!inLock.ok)
+        return fail(inLock.reason, inLock.message);
+      const inLockBaseline = entry.commitId === undefined ? { ok: true } : savedBaselineConflict(entry.commitId, entry.familyFile, snap);
+      if (!inLockBaseline.ok)
+        return fail(inLockBaseline.reason, inLockBaseline.message);
+      if (typeof input.commitId === "string") {
+        const inLockEvidence = commitEvidence(input.commitId);
+        if (!inLockEvidence.ok)
+          return fail("no-coverage", `${inLockEvidence.message} (re-checked inside the commit lock before any write)`);
+      }
+      entry.spent = true;
+      const outcome = executeRosterSync(inLock.plans, deps.rosterFs());
+      const after = deps.resolvePools();
+      const conflicts = after === null ? ["post-sync coverage could not be re-resolved — application stays unconfirmed"] : crossFamilyWinnerConflictsFromBaseline(baselineSnapshotOf(snap.resolution), after.resolution, entry.familyFile);
+      const removedIds = outcome.gced.map((dest) => nativeIdOfFileName(dest.split(/[\\/]/).pop() ?? dest));
+      const changedNative = [];
+      for (const p of inLock.plans) {
+        if (p.kind === "family") {
+          for (const f of p.files) {
+            const dest = joinPath2(p.dir, f.fileName);
+            if (!outcome.created.includes(dest) && !outcome.updated.includes(dest))
+              continue;
+            changedNative.push({ plan: p, fileName: f.fileName, matId: f.matId, content: f.content });
+          }
+        } else {
+          for (const f of p.files) {
+            const dest = joinPath2(p.dir, f.fileName);
+            if (!outcome.created.includes(dest) && !outcome.updated.includes(dest))
+              continue;
+            changedNative.push({ plan: p, fileName: f.fileName, content: f.content });
+          }
+        }
+      }
+      const summary = [
+        ...outcome.created.map((d) => `created: ${d}`),
+        ...outcome.updated.map((d) => `updated: ${d}`),
+        ...outcome.unchanged.length ? [`unchanged: ${outcome.unchanged.length} file(s) already current`] : [],
+        ...outcome.gced.length ? [`gc'd: ${outcome.gced.join(", ")}`] : [],
+        ...outcome.errors.length ? [`errors: ${outcome.errors.join("; ")}`] : [],
+        ...conflicts.length ? [`conflicts (disclosed, not reconciled): ${conflicts.join("; ")}`] : []
+      ];
+      const findings = after === null ? [] : after.resolution.findings.filter((f) => f.level === "warn" || f.level === "error").map((f) => ({ level: f.level, code: f.code, message: f.message }));
+      const refOf = new Map;
+      for (const p of inLock.plans) {
+        for (const f of p.files)
+          refOf.set(joinPath2(p.dir, f.fileName), { nativeId: nativeIdOfPlanFile(p, f), fileName: f.fileName });
+      }
+      const refFor = (dest) => {
+        const hit = refOf.get(dest);
+        if (hit !== undefined)
+          return hit;
+        const fileName = dest.split(/[\\/]/).pop() ?? dest;
+        return { nativeId: nativeIdOfFileName(fileName), fileName };
+      };
+      const createdRefs = outcome.created.map(refFor);
+      const updatedRefs = outcome.updated.map(refFor);
+      const errorItems = outcome.errors.map((message) => {
+        const hit = [...refOf.keys()].find((d) => message.startsWith(`${d}:`));
+        return hit === undefined ? { message } : { message, ...refOf.get(hit) };
+      });
+      const conflictItems = conflicts.map((message) => ({ message }));
+      const base = {
+        ok: true,
+        action: "apply",
+        path: entry.familyFile,
+        scope: entry.scope,
+        sessionID: entry.sessionID,
+        created: createdRefs,
+        updated: updatedRefs,
+        unchanged: outcome.unchanged,
+        gced: outcome.gced,
+        errors: errorItems,
+        removedIds,
+        conflicts: conflictItems,
+        summary,
+        findings,
+        epoch: cur.epoch,
+        generation: cur.generation,
+        at: t2
+      };
+      const changedIds = changedNative.map((c) => nativeIdOfPlanFile(c.plan, { matId: c.matId, fileName: c.fileName }));
+      const erroredIds = [];
+      for (const p of inLock.plans) {
+        for (const f of p.files) {
+          const dest = joinPath2(p.dir, f.fileName);
+          if (outcome.created.includes(dest) || outcome.updated.includes(dest))
+            continue;
+          if (outcome.errors.some((e) => e.startsWith(`${dest}:`) || e.startsWith(`${dest}.new:`)))
+            erroredIds.push(nativeIdOfPlanFile(p, f));
+        }
+      }
+      if (conflicts.length > 0) {
+        return { ...base, outcome: "conflict", applied: false, appliedStatus: { status: "unconfirmed", observedBy: null, confirmedIds: [], removedConfirmedIds: [], unconfirmedIds: [...changedIds, ...erroredIds, ...removedIds] } };
+      }
+      if (outcome.errors.length > 0 && outcome.created.length === 0 && outcome.updated.length === 0 && outcome.gced.length === 0) {
+        return { ...base, outcome: "refused", applied: false, appliedStatus: { status: "unconfirmed", observedBy: null, confirmedIds: [], removedConfirmedIds: [], unconfirmedIds: [] } };
+      }
+      if (outcome.created.length === 0 && outcome.updated.length === 0 && outcome.gced.length === 0) {
+        return { ...base, outcome: "noop", applied: false, appliedStatus: { status: "unconfirmed", observedBy: null, confirmedIds: [], removedConfirmedIds: [], unconfirmedIds: [] } };
+      }
+      const observer = deps.listNativeAgents;
+      if (typeof observer !== "function") {
+        return { ...base, outcome: "unconfirmed", applied: false, appliedStatus: { status: "unconfirmed", observedBy: null, confirmedIds: [], removedConfirmedIds: [], unconfirmedIds: [...changedIds, ...erroredIds, ...removedIds] } };
+      }
+      let rows2 = null;
+      try {
+        rows2 = await observer();
+      } catch {
+        rows2 = null;
+      }
+      if (rows2 === null) {
+        return { ...base, outcome: "unconfirmed", applied: false, appliedStatus: { status: "unconfirmed", observedBy: null, confirmedIds: [], removedConfirmedIds: [], unconfirmedIds: [...changedIds, ...erroredIds, ...removedIds] } };
+      }
+      const byId = new Map;
+      for (const row of rows2) {
+        if (row === null || typeof row !== "object" || typeof row.id !== "string" || row.id.trim() === "") {
+          return { ...base, outcome: "unconfirmed", applied: false, appliedStatus: { status: "unconfirmed", observedBy: null, confirmedIds: [], removedConfirmedIds: [], unconfirmedIds: [...changedIds, ...erroredIds, ...removedIds] } };
+        }
+        byId.set(row.id, row);
+      }
+      const confirmedIds = [];
+      const unconfirmedIds = [];
+      for (const c of changedNative) {
+        const nativeId = nativeIdOfPlanFile(c.plan, { matId: c.matId, fileName: c.fileName });
+        const row = byId.get(nativeId);
+        const observed = row !== undefined && modelObserved(modelStringFromContent(c.content), row.model) && systemObserved(compiledBodyOf(c.content), row.system) && permissionsObserved(compiledPermissionFaceOf(c.content), row.permissions);
+        if (observed)
+          confirmedIds.push(nativeId);
+        else
+          unconfirmedIds.push(nativeId);
+      }
+      const removedConfirmedIds = removedIds.filter((id) => !byId.has(id));
+      const removedUnconfirmed = removedIds.filter((id) => byId.has(id));
+      const allConfirmed = unconfirmedIds.length === 0 && removedUnconfirmed.length === 0 && erroredIds.length === 0 && outcome.errors.length === 0;
+      return {
+        ...base,
+        outcome: allConfirmed ? "applied" : "unconfirmed",
+        applied: allConfirmed,
+        appliedStatus: {
+          status: allConfirmed ? "applied" : "unconfirmed",
+          observedBy: "host-agent-list",
+          confirmedIds,
+          removedConfirmedIds,
+          unconfirmedIds: [...unconfirmedIds, ...erroredIds, ...removedUnconfirmed]
+        }
+      };
+    });
+    if (execResult === null) {
+      return { ok: false, action: "apply", reason: "unavailable", message: "sync execution produced no verdict — nothing is claimed" };
+    }
+    if (execResult.ok && execResult.action === "apply" && typeof input.commitId === "string" && typeof deps.attachSyncOutcome === "function") {
+      const appliedResult = execResult;
+      let attached = false;
+      try {
+        attached = deps.attachSyncOutcome(input.commitId, {
+          action: "sync",
+          outcome: appliedResult.outcome,
+          applied: appliedResult.applied,
+          path: appliedResult.path,
+          created: appliedResult.created,
+          updated: appliedResult.updated,
+          gced: appliedResult.gced,
+          conflicts: appliedResult.conflicts,
+          appliedStatus: appliedResult.appliedStatus,
+          at: appliedResult.at
+        });
+      } catch {
+        attached = false;
+      }
+      if (!attached) {
+        appliedResult.summary.push(`note: the sync outcome could not be attached to receipt ${input.commitId} (unknown or evicted — the sync result above remains authoritative)`);
+      }
+    }
+    return execResult;
+  };
+  return async (raw) => {
+    const checked = validateInput(raw);
+    if ("refuse" in checked)
+      return checked.refuse;
+    try {
+      return checked.input.action === "prepare" ? prepare(checked.input) : await apply(checked.input);
+    } catch (err) {
+      return { ok: false, action: checked.input.action, reason: "unavailable", message: `sync ${checked.input.action} failed: ${err instanceof Error ? err.message : String(err)}` };
+    }
+  };
+}
+function systemObserved(expected, rowSystem) {
+  if (expected === null)
+    return false;
+  return typeof rowSystem === "string" && rowSystem === expected;
+}
+function captureSyncBaseline(req, resolvePools, clock) {
+  const at = clock();
+  const snap = resolvePools();
+  if (snap === null) {
+    return { v: 1, at, coverage: "unknown", reason: "no-coverage", ownerFile: req.ownerFile, anchor: req.anchor, observedLocation: req.observedLocation, familyNs: null, materializedIds: [], before: { ownerByMatId: {}, contentByMatId: {}, collisionFindings: [] } };
+  }
+  const family = findFamily(snap.resolution, req.ownerFile);
+  return {
+    v: 1,
+    at,
+    coverage: "full",
+    ownerFile: req.ownerFile,
+    anchor: req.anchor,
+    observedLocation: req.observedLocation,
+    familyNs: family?.ns ?? null,
+    materializedIds: family ? [...family.materializedIds] : [],
+    before: baselineSnapshotOf(snap.resolution)
+  };
+}
+
 // plugin.ts
 var FORGE_AGENT = "forge";
 var FORGE_STATE_TOOLS = [
@@ -16437,6 +19888,7 @@ function effectiveWorktree(worktree, fallback) {
 var sessions = new Map;
 var sessionMovedAnchors = new Map;
 var anchorMovedNotes = new Set;
+var rpcAnchorRequestContext = new AsyncLocalStorage;
 function noteSessionMoved(sessionID, directory) {
   if (typeof sessionID !== "string" || !sessionID)
     return;
@@ -16487,9 +19939,13 @@ var poolResolver = null;
 var poolResolution = null;
 var poolGateUnknownNotes = new Set;
 var anchorPrefNotes = new Set;
-var foldPath = (p) => process.platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p;
+var foldPath3 = (p) => process.platform === "win32" ? p.replace(/\//g, "\\").toLowerCase() : p;
 function globalPoolPathOf() {
   return forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global;
+}
+var CONFIG_RPC_UTF8_STRICT = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true });
+function strictUtf8Read(path) {
+  return CONFIG_RPC_UTF8_STRICT.decode(readFileSync5(path));
 }
 var v2HostSeen = false;
 var v2MaterializeMode = "native";
@@ -16508,21 +19964,21 @@ function realRosterFs() {
     const refused = () => new Error(`test fixture root refused roster path: ${path}`);
     if (!within(fixtureRoot, path))
       throw refused();
-    const root = realpathSync2(fixtureRoot);
+    const root = realpathSync4(fixtureRoot);
     let cursor = path;
     while (true) {
       try {
-        lstatSync(cursor);
+        lstatSync3(cursor);
       } catch (err) {
         if (err.code !== "ENOENT")
           throw err;
-        const parent = dirname3(cursor);
+        const parent = dirname4(cursor);
         if (parent === cursor || !within(fixtureRoot, parent))
           throw refused();
         cursor = parent;
         continue;
       }
-      if (!within(root, realpathSync2(cursor)))
+      if (!within(root, realpathSync4(cursor)))
         throw refused();
       return;
     }
@@ -16531,7 +19987,7 @@ function realRosterFs() {
     stat: (path) => {
       try {
         checkPath(path);
-        const s = statSync3(path);
+        const s = statSync4(path);
         return { mtimeMs: s.mtimeMs, size: s.size };
       } catch {
         return null;
@@ -16539,24 +19995,24 @@ function realRosterFs() {
     },
     readFile: (path) => {
       checkPath(path);
-      return readFileSync4(path, "utf8");
+      return readFileSync5(path, "utf8");
     },
     writeFile: (path, data) => {
-      checkPath(dirname3(path));
+      checkPath(dirname4(path));
       checkPath(path);
-      writeFileSync3(path, data);
+      writeFileSync4(path, data);
     },
     rename: (from, to) => {
-      checkPath(dirname3(from));
+      checkPath(dirname4(from));
       checkPath(from);
-      checkPath(dirname3(to));
+      checkPath(dirname4(to));
       checkPath(to);
-      renameSync2(from, to);
+      renameSync3(from, to);
     },
     unlink: (path) => {
-      checkPath(dirname3(path));
+      checkPath(dirname4(path));
       checkPath(path);
-      unlinkSync2(path);
+      unlinkSync3(path);
     },
     readdir: (path) => {
       try {
@@ -16568,13 +20024,13 @@ function realRosterFs() {
     },
     mkdir: (path) => {
       checkPath(path);
-      mkdirSync2(path, { recursive: true });
+      mkdirSync3(path, { recursive: true });
     }
   };
 }
 function readGlobalKnobs(path, deps) {
   try {
-    const text = deps?.readFile ? deps.readFile(path) : readFileSync4(path, "utf8");
+    const text = deps?.readFile ? deps.readFile(path) : readFileSync5(path, "utf8");
     const parsed = parseForgeJsonc(text);
     if (!parsed.ok)
       return { materialize: undefined, syncAuto: false };
@@ -16621,7 +20077,7 @@ function runRosterSync() {
     plans.push(overridePlan ?? { kind: "override", dir: overrideDir, files: [] });
   const outcome = executeRosterSync(plans, realRosterFs());
   const lines = [`[forge:sync] Compiled ${plans.reduce((n, p) => n + p.files.length, 0)} roster file(s) across ${plans.filter((p) => p.files.length > 0).length} pool(s):`, ...missingRecipeNotes];
-  if (foldPath(agentDirFor(rosterDirs.globalPoolFile)) !== foldPath(overrideDir))
+  if (foldPath3(agentDirFor(rosterDirs.globalPoolFile)) !== foldPath3(overrideDir))
     lines.push(`  global artifacts use ${overrideDir}; former recipe-sibling path ${agentDirFor(rosterDirs.globalPoolFile)} is not scanned or cleaned by this global sync.`);
   if (outcome.created.length)
     lines.push(`  created: ${outcome.created.join(", ")}`);
@@ -16650,7 +20106,7 @@ function rosterContentOf(resolution) {
 function rosterStaleRefusal(anchor) {
   const resolution = resolvePools();
   const poolFile = anchor ? sessionPoolFileOf(anchor) : null;
-  const fam = resolution?.families.find((f) => foldPath(f.file) === foldPath(poolFile ?? globalPoolPathOf()));
+  const fam = resolution?.families.find((f) => foldPath3(f.file) === foldPath3(poolFile ?? globalPoolPathOf()));
   const file2 = fam ? fam.file : poolFile;
   const verdict = staleCheckForPool(file2, fam ? fam.materializedIds : [], realRosterFs(), resolution ? rosterContentOf(resolution) : undefined, file2 === null ? undefined : rosterAgentDirFor(file2, { globalPoolFile: globalPoolPathOf(), globalAgentDir: globalAgentDirFor({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir(), configDir: process.env.OPENCODE_CONFIG_DIR }) }));
   if (!verdict.stale)
@@ -16662,7 +20118,7 @@ function anchorPath(dir) {
   if (!p)
     return "";
   try {
-    return realpathSync2(p);
+    return realpathSync4(p);
   } catch {
     return p;
   }
@@ -16731,7 +20187,7 @@ function crewPoolComplianceRefusal(anchor) {
     return null;
   let text;
   try {
-    text = readFileSync4(poolFile, "utf8");
+    text = readFileSync5(poolFile, "utf8");
   } catch (err) {
     const reason = err instanceof Error ? err.message : String(err);
     return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) could not be read (${reason}). ` + `Repair the file so it is readable JSONC declaring a valid top-level "pool" namespace ([a-z0-9-], 1-24 chars) — REQUIRED for crew-governed dispatch. ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
@@ -16743,8 +20199,8 @@ function crewPoolComplianceRefusal(anchor) {
   const verdict = poolFileCompliance(parsed.config);
   if (verdict.compliant)
     return null;
-  const fam = resolvePools()?.families.find((f) => foldPath(f.file) === foldPath(poolFile));
-  const suggested = fam?.ns ?? sanitizeNamespace(basename2(dirname3(dirname3(poolFile))));
+  const fam = resolvePools()?.families.find((f) => foldPath3(f.file) === foldPath3(poolFile));
+  const suggested = fam?.ns ?? sanitizeNamespace(basename2(dirname4(dirname4(poolFile))));
   return `[forge:crew] Pool compliance refused: this session's workspace pool file (${poolFile}) is non-compliant — ${verdict.violation}. ` + `Minimal fix: add or repair the top-level "pool": "${suggested}" field (a [a-z0-9-] string, 1-24 chars — REQUIRED for crew-governed dispatch). ` + `The gate lifts hot-apply: the next resolve after the repair admits registration/dispatch; no host restart.`;
 }
 var CREW_WAVE_RULE = "A wave is the set of native `subagent` calls made together by the orchestrating session (agent = the selected worker). Reuse of a sessionID starts another work round; duplicate observations of one round count once. Children work in the background; use host completion messages and available session evidence to verify settlement. Launch the next wave ONLY after every work round of the previous wave is verified settled. Partial, truncated or unknown views, idle or missing sessions, and unresolved outcomes do not establish settlement; end your turn and wait for the rest, without polling or sleeping. A diagnostic is not permission to launch another wave.";
@@ -16762,8 +20218,8 @@ function crewRecordPathFor(worktree, objective) {
   return join5(dir, name);
 }
 function writeCrewRecord(path, objective, anchor, subtasks, lineage) {
-  mkdirSync2(join5(path, ".."), { recursive: true });
-  writeFileSync3(path, [
+  mkdirSync3(join5(path, ".."), { recursive: true });
+  writeFileSync4(path, [
     `# Crew Record: ${objective}`,
     "",
     `- registered: ${nowIso()}`,
@@ -16899,17 +20355,17 @@ function sessionAnchorLedgerFs() {
   return {
     read: () => {
       try {
-        return readFileSync4(filePath, "utf8");
+        return readFileSync5(filePath, "utf8");
       } catch {
         return "";
       }
     },
     write: (text) => {
-      mkdirSync2(dirname3(filePath), { recursive: true });
-      writeFileSync3(filePath, text, "utf8");
+      mkdirSync3(dirname4(filePath), { recursive: true });
+      writeFileSync4(filePath, text, "utf8");
     },
     append: (text) => {
-      mkdirSync2(dirname3(filePath), { recursive: true });
+      mkdirSync3(dirname4(filePath), { recursive: true });
       appendFileSync(filePath, text, "utf8");
     }
   };
@@ -16950,7 +20406,7 @@ function noteSessionAnchorLedgerBinding(sessionID, worktree) {
       return;
     if (sessionPoolFileOf(worktree) === null)
       return;
-    const folded = foldPath(worktree);
+    const folded = foldPath3(worktree);
     if (sessionAnchorLedgerMemo.get(sessionID) === folded)
       return;
     const fsx = sessionAnchorLedgerFs();
@@ -16998,7 +20454,7 @@ async function resolveSessionAnchorForPools(anchorClient, sessionID) {
   if (process.env.FORGE_ANCHOR_PROBE)
     anchorProbeLog("map", sessionID, { mapped });
   const moved = sessionMovedAnchors.get(sessionID) ?? "";
-  if (moved && (authoritative === "" || foldPath(moved) !== foldPath(authoritative))) {
+  if (moved && (authoritative === "" || foldPath3(moved) !== foldPath3(authoritative))) {
     if (!anchorMovedNotes.has(sessionID)) {
       anchorMovedNotes.add(sessionID);
       console.warn(`[forge:pool] session ${sessionID}: dispatch anchor re-resolved from the host's session.moved event (${moved}) — the session.get seam still reports the pre-move location${authoritative ? ` (${authoritative})` : ""}; the moved workspace wins this resolution.`);
@@ -17007,7 +20463,7 @@ async function resolveSessionAnchorForPools(anchorClient, sessionID) {
   }
   if (authoritative === "")
     return resolveAnchorViaLedger(sessionID, mapped);
-  if (mapped && !isRootish(mapped) && foldPath(mapped) !== foldPath(authoritative) && sessionPoolFileOf(authoritative) === null && sessionPoolFileOf(mapped) !== null) {
+  if (mapped && !isRootish(mapped) && foldPath3(mapped) !== foldPath3(authoritative) && sessionPoolFileOf(authoritative) === null && sessionPoolFileOf(mapped) !== null) {
     if (!anchorPrefNotes.has(sessionID)) {
       anchorPrefNotes.add(sessionID);
       console.warn(`[forge:pool] session ${sessionID}: the authoritative session record anchors to a POOL-LESS directory (${authoritative}) while the session's live binding owns a pool (${mapped}) — the pooled binding wins this resolution (restart-resume rebind shape).`);
@@ -17063,7 +20519,7 @@ function poolGateRefusalAtAnchor(anchor, sessionID, target, requireEntry = false
     }
     return refusal;
   }
-  if (allowed === null || foldPath(entry.file) !== foldPath(allowed)) {
+  if (allowed === null || foldPath3(entry.file) !== foldPath3(allowed)) {
     return `[forge:pool] Dispatch refused: "${target}" belongs to the pool ${entry.file} — not dispatchable from this session. ` + `This session's dispatchable roster is ${sessionPool ? `its workspace pool (${sessionPool})` : `the global fallback (${globalPoolPathOf()})`}. ` + `Exits: open a session in that pool's workspace, or configure the role into this workspace's pool (its .opencode/forge.json), or into the global layer (${globalPoolPathOf()}).`;
   }
   return null;
@@ -17115,7 +20571,7 @@ function draftDispatchRefusalForState(state, target) {
 function nativeDraftDispatchRefusal(state, target) {
   const pool = sessionPoolFileOf(state.worktree) ?? globalPoolPathOf();
   const resolution = resolvePools();
-  const scouts = Object.entries(resolution?.agents ?? {}).filter(([, entry]) => pool !== null && foldPath(entry.file) === foldPath(pool) && effectiveReadonlyShape(entry.def) && (entry.def.permission?.shell === "deny" || entry.def.permission?.bash === "deny"));
+  const scouts = Object.entries(resolution?.agents ?? {}).filter(([, entry]) => pool !== null && foldPath3(entry.file) === foldPath3(pool) && effectiveReadonlyShape(entry.def) && (entry.def.permission?.shell === "deny" || entry.def.permission?.bash === "deny"));
   const roster = rosterStaleRefusal(state.worktree) ? [] : scouts.map(([id]) => "forge-" + id).sort();
   if (target && roster.includes(target))
     return null;
@@ -17141,7 +20597,7 @@ function readPlanDir(worktree) {
   const dir = planDirOf(worktree);
   if (!existsSync(dir))
     return [];
-  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync4(join5(dir, name), "utf8") }));
+  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync5(join5(dir, name), "utf8") }));
 }
 function ensureSession(sessionID, worktree) {
   const existing = sessions.get(sessionID);
@@ -17170,7 +20626,7 @@ function worktreeFor(context) {
 }
 function resolveActivePlan(state) {
   if (state.planPath && existsSync(state.planPath)) {
-    const doc2 = parsePlanLoose(readFileSync4(state.planPath, "utf8"));
+    const doc2 = parsePlanLoose(readFileSync5(state.planPath, "utf8"));
     if (doc2 && !isTerminal(doc2.status))
       return { path: state.planPath, doc: doc2 };
     state.planPath = undefined;
@@ -17226,7 +20682,7 @@ var planWriteTool = tool({
       throw new PlanError(`A plan in ${active.doc.status} state is already active (${relFrom(state.worktree, active.path)}). Finish it with plan_close, or /plan discard it before planning something new.`);
     } else {
       const dir = planDirOf(state.worktree);
-      mkdirSync2(dir, { recursive: true });
+      mkdirSync3(dir, { recursive: true });
       path = join5(dir, planFileName(localDate(), slugify(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md"))));
       mode = "created";
     }
@@ -17261,7 +20717,7 @@ var planTickTool = tool({
     if (active.doc.status !== "approved") {
       throw new PlanError(`Plan status is ${active.doc.status}; only an approved plan can be ticked. Get user approval via plan_approve first.`);
     }
-    const next = tickTask(readFileSync4(active.path, "utf8"), args.n, nowIso());
+    const next = tickTask(readFileSync5(active.path, "utf8"), args.n, nowIso());
     atomicWrite(active.path, next);
     const doc2 = parsePlan(next);
     const p = progressOf(doc2);
@@ -17332,7 +20788,7 @@ var planApproveTool = tool({
       throw new PlanError(`Plan status is ${active.doc.status}; only a draft plan can be approved.`);
     }
     await gate(context.ask, "plan_approve", `Approve plan: ${active.doc.goal}`);
-    atomicWrite(active.path, transitionStatus(readFileSync4(active.path, "utf8"), "approved", nowIso()));
+    atomicWrite(active.path, transitionStatus(readFileSync5(active.path, "utf8"), "approved", nowIso()));
     context.metadata({ title: `Plan approved: ${active.doc.goal}` });
     return {
       title: "plan approved",
@@ -17368,13 +20824,13 @@ Tick every task before closing.`);
       const outcomes = await runChecks(active.doc.checks, state.worktree);
       if (!outcomesAllOk(outcomes)) {
         const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-        atomicWrite(active.path, appendPlanCheckLog(readFileSync4(active.path, "utf8"), runId, outcomes, nowIso()));
+        atomicWrite(active.path, appendPlanCheckLog(readFileSync5(active.path, "utf8"), runId, outcomes, nowIso()));
         throw new PlanError(`Completion gate: verification re-run failed (fail-closed). The plan stays approved; the failing run is recorded in the plan's Check Log.
 ${formatOutcomes(outcomes.filter((o) => !o.ok))}
 Fix the work and retry — the frozen check set is re-run at every close and cannot be changed here.`);
       }
       const selfChecks = args.checks ?? [];
-      const closed2 = appendTerminalSection(transitionStatus(readFileSync4(active.path, "utf8"), "done", closedAt), "closed", {
+      const closed2 = appendTerminalSection(transitionStatus(readFileSync5(active.path, "utf8"), "done", closedAt), "closed", {
         reason: "completion gate passed (plugin-verified)",
         ...selfChecks.length > 0 ? { checks: selfChecks } : {},
         outcomes: outcomes.map((o) => ({ index: o.index, ok: o.ok, label: o.label, detail: o.detail, durationMs: o.durationMs })),
@@ -17398,7 +20854,7 @@ Fix the work and retry — the frozen check set is re-run at every close and can
 - `)}
 Fix the implementation and retry, or revise the plan first.`);
     }
-    const closed = appendTerminalSection(transitionStatus(readFileSync4(active.path, "utf8"), "done", closedAt), "closed", { reason: "completion gate passed (plugin-verified)", checks: args.checks }, closedAt);
+    const closed = appendTerminalSection(transitionStatus(readFileSync5(active.path, "utf8"), "done", closedAt), "closed", { reason: "completion gate passed (plugin-verified)", checks: args.checks }, closedAt);
     atomicWrite(active.path, closed);
     context.metadata({ title: `Plan done: ${active.doc.goal}` });
     return {
@@ -17416,7 +20872,7 @@ var planReopenTool = tool({
     const state = ensureSession(context.sessionID, worktreeFor(context));
     let target = null;
     if (state.planPath && existsSync(state.planPath)) {
-      const doc2 = parsePlanLoose(readFileSync4(state.planPath, "utf8"));
+      const doc2 = parsePlanLoose(readFileSync5(state.planPath, "utf8"));
       if (doc2)
         target = { path: state.planPath, doc: doc2 };
     }
@@ -17429,7 +20885,7 @@ var planReopenTool = tool({
       throw new PlanError("No done plan to reopen in this workspace (only a closed plan can be reopened).");
     }
     const now = nowIso();
-    const next = appendReopenSection(transitionStatus(readFileSync4(target.path, "utf8"), "approved", now), now, args.reason);
+    const next = appendReopenSection(transitionStatus(readFileSync5(target.path, "utf8"), "approved", now), now, args.reason);
     atomicWrite(target.path, next);
     state.planPath = target.path;
     const p = progressOf(target.doc);
@@ -17455,7 +20911,7 @@ var planDiscardTool = tool({
     const superseding = successor.length > 0;
     const target = superseding ? "superseded" : "abandoned";
     const exitedAt = nowIso();
-    const next = appendTerminalSection(transitionStatus(readFileSync4(active.path, "utf8"), target, exitedAt), superseding ? "superseded" : "abandoned", { reason: args.reason, ...superseding ? { successor } : {} }, exitedAt);
+    const next = appendTerminalSection(transitionStatus(readFileSync5(active.path, "utf8"), target, exitedAt), superseding ? "superseded" : "abandoned", { reason: args.reason, ...superseding ? { successor } : {} }, exitedAt);
     atomicWrite(active.path, next);
     state.planPath = undefined;
     const section = `## ${exitedAt} — ${target}`;
@@ -17473,11 +20929,11 @@ function readGoalDir(worktree) {
   const dir = goalDirOf(worktree);
   if (!existsSync(dir))
     return [];
-  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync4(join5(dir, name), "utf8") }));
+  return readdirSync(dir).filter((f) => f.endsWith(".md")).map((name) => ({ name, text: readFileSync5(join5(dir, name), "utf8") }));
 }
 function resolveSessionGoal(state) {
   if (state.goalPath && existsSync(state.goalPath)) {
-    const doc2 = parseGoalLoose(readFileSync4(state.goalPath, "utf8"));
+    const doc2 = parseGoalLoose(readFileSync5(state.goalPath, "utf8"));
     if (doc2 && !isGoalTerminal(doc2.status))
       return { path: state.goalPath, doc: doc2 };
     state.goalPath = undefined;
@@ -17588,7 +21044,7 @@ var goalWriteTool = tool({
       await gate(context.ask, "goal_write", `Arm goal: ${args.goal}`);
     }
     const dir = goalDirOf(state.worktree);
-    mkdirSync2(dir, { recursive: true });
+    mkdirSync3(dir, { recursive: true });
     const name = goalFileName(localDateNow(), slugifyGoal(args.goal), readdirSync(dir).filter((f) => f.endsWith(".md")));
     const path = join5(dir, name);
     const text = renderGoal(input, {
@@ -17631,7 +21087,7 @@ var goalCheckTool = tool({
       o.index = selected[i].n;
     });
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    const next = appendCheckLog(readFileSync4(goal.path, "utf8"), runId, outcomes, nowIso());
+    const next = appendCheckLog(readFileSync5(goal.path, "utf8"), runId, outcomes, nowIso());
     atomicWrite(goal.path, next);
     const ok = outcomesAllOk(outcomes);
     context.metadata({ title: `goal_check: ${outcomes.filter((o) => o.ok).length}/${outcomes.length} pass` });
@@ -17665,7 +21121,7 @@ var goalCompleteTool = tool({
     const failures = outcomes.filter((o) => !o.ok);
     if (failures.length > 0) {
       const runId2 = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-      atomicWrite(goal.path, appendCheckLog(readFileSync4(goal.path, "utf8"), runId2, outcomes, nowIso()));
+      atomicWrite(goal.path, appendCheckLog(readFileSync5(goal.path, "utf8"), runId2, outcomes, nowIso()));
       throw new GoalError(`Completion gate: verification re-run failed (fail-closed). The goal stays active.
 ${formatOutcomes(failures)}
 Fix the work and retry; recorded results never substitute for the gate's own re-run.`);
@@ -17678,7 +21134,7 @@ Fix the work and retry; recorded results never substitute for the gate's own re-
     }
     await gate(context.ask, "goal_complete", `Complete goal: ${goal.doc.goal}`);
     const runId = `${nowIso()}-${Math.random().toString(36).slice(2, 8)}`;
-    let text = appendCheckLog(readFileSync4(goal.path, "utf8"), runId, outcomes, nowIso());
+    let text = appendCheckLog(readFileSync5(goal.path, "utf8"), runId, outcomes, nowIso());
     text = transitionGoal(text, "completed", nowIso());
     atomicWrite(goal.path, text);
     context.metadata({ title: `Goal completed: ${goal.doc.goal}` });
@@ -17700,7 +21156,7 @@ var goalPauseTool = tool({
       throw new GoalError(`No active goal to pause (status: ${goal?.doc.status ?? "none"}).`);
     }
     const stopReason = args.blocker?.trim() ? "blocker" : "user";
-    atomicWrite(goal.path, transitionGoal(readFileSync4(goal.path, "utf8"), "paused", nowIso(), { stopReason, blocker: args.blocker?.trim() }));
+    atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "paused", nowIso(), { stopReason, blocker: args.blocker?.trim() }));
     engineForgetSession(context.sessionID);
     if (goal.doc.session && goal.doc.session !== context.sessionID)
       engineForgetSession(goal.doc.session);
@@ -17732,7 +21188,7 @@ var goalResumeTool = tool({
     }
     const promoting = goal.doc.status === "queued";
     await gate(context.ask, "goal_resume", `${promoting ? "Promote" : "Resume"} goal: ${goal.doc.goal}`);
-    let text = readFileSync4(goal.path, "utf8");
+    let text = readFileSync5(goal.path, "utf8");
     const confirmed = parseGoalLoose(text);
     if (!confirmed || confirmed.status !== goal.doc.status || confirmed.revision !== goal.doc.revision || confirmed.armedAt !== goal.doc.armedAt || confirmed.session !== goal.doc.session || confirmed.created !== goal.doc.created) {
       throw new GoalError("Goal authorization changed while awaiting confirmation; retry goal_resume.");
@@ -17762,7 +21218,7 @@ var goalDiscardTool = tool({
     if (!goal)
       throw new GoalError("No goal to discard in this workspace.");
     await gate(context.ask, "goal_discard", `Discard goal: ${goal.doc.goal}`);
-    atomicWrite(goal.path, transitionGoal(readFileSync4(goal.path, "utf8"), "abandoned", nowIso()));
+    atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "abandoned", nowIso()));
     state.goalPath = undefined;
     engineForgetSession(context.sessionID);
     context.metadata({ title: `Goal abandoned: ${goal.doc.goal}` });
@@ -17854,7 +21310,7 @@ var crewBeginTool = tool({
     const sessionProject = sessionLoaded?.projectPath ?? null;
     const globalPoolPath = forgeConfigPaths({ homeDir: process.env.FORGE_TEST_FORGE_HOME ?? homedir() }).global;
     const sessionPool = sessionProject;
-    const sessionFamily = resolution?.families.find((f) => foldPath(f.file) === foldPath(sessionPool ?? globalPoolPath)) ?? null;
+    const sessionFamily = resolution?.families.find((f) => foldPath3(f.file) === foldPath3(sessionPool ?? globalPoolPath)) ?? null;
     const sessionCovered = sessionPool === null || sessionFamily !== null;
     const sessionRosterIds = sessionFamily ? sessionFamily.materializedIds : [];
     if (sessionRosterIds.length === 0) {
@@ -18301,7 +21757,7 @@ function ledgerGoalTurn(pending) {
   const classification = classifyGoalActivity(act, pending.previous);
   if (pending.turn !== undefined) {
     try {
-      const text = readFileSync4(pending.goal.path, "utf8");
+      const text = readFileSync5(pending.goal.path, "utf8");
       if (matchingGoalTurn(text, pending)) {
         atomicWrite(pending.goal.path, appendLedger(text, {
           turn: pending.turn,
@@ -18663,7 +22119,7 @@ function wrapupBriefText(goal, reason, repeatedEvidence = false) {
 }
 async function autoPauseGoal(client, state, goal, reason, wrapup, repeatedEvidence = false) {
   goalProbe(`auto-pause session=${state.sessionID} reason=${reason} wrapup=${wrapup}`);
-  atomicWrite(goal.path, transitionGoal(readFileSync4(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
+  atomicWrite(goal.path, transitionGoal(readFileSync5(goal.path, "utf8"), "paused", nowIso(), { stopReason: reason }));
   engineForgetSession(state.sessionID);
   if (wrapup && goal.doc.session) {
     try {
@@ -18834,7 +22290,7 @@ async function continueIfEligible(client, sessionID, backgroundWaiting = false) 
     const stillAuthorized = () => {
       if (!stillCurrent())
         return false;
-      const fresh2 = parseGoalLoose(readFileSync4(goal.path, "utf8"));
+      const fresh2 = parseGoalLoose(readFileSync5(goal.path, "utf8"));
       return fresh2?.status === "active" && fresh2.session === sessionID && fresh2.revision === goal.doc.revision && fresh2.armedAt === goal.doc.armedAt;
     };
     if (!stillAuthorized())
@@ -18871,7 +22327,7 @@ async function continueIfEligible(client, sessionID, backgroundWaiting = false) 
       }
       return;
     }
-    const text = readFileSync4(goal.path, "utf8");
+    const text = readFileSync5(goal.path, "utf8");
     const fresh = matchingGoalTurn(text, pendingTurn);
     if (disposedGoalClients.has(client) || !fresh || !stillCurrent() && fresh.status === "active") {
       if (pendingContinuationTurn.get(sessionID) === pendingTurn) {
@@ -19573,7 +23029,7 @@ async function v2StopNative(ctx, sessionID) {
         throw new Error("interrupt unavailable");
       return ctx.session.interrupt({ sessionID: id });
     },
-    wait: () => new Promise((resolve4) => setTimeout(resolve4, 200))
+    wait: () => new Promise((resolve5) => setTimeout(resolve5, 200))
   });
 }
 async function v2RegisterCommands(ctx) {
@@ -19686,7 +23142,7 @@ function discoverServiceHttp() {
   if (!file2)
     return null;
   try {
-    const raw = JSON.parse(readFileSync4(file2, "utf8"));
+    const raw = JSON.parse(readFileSync5(file2, "utf8"));
     if (raw && typeof raw.url === "string" && typeof raw.password === "string" && raw.url && raw.password) {
       serviceHttpCache = { url: raw.url.replace(/\/+$/, ""), password: raw.password };
     } else {
@@ -19860,7 +23316,7 @@ function v2SubscribeEvents(ctx, goalClient, idleFallback) {
         } catch {}
         if (controller.signal.aborted)
           return;
-        await new Promise((resolve4) => setTimeout(resolve4, backoffMs));
+        await new Promise((resolve5) => setTimeout(resolve5, backoffMs));
         if (controller.signal.aborted)
           return;
         const fresh = trySubscribe();
@@ -19902,7 +23358,7 @@ function v2ReadHideNatives(deps) {
   try {
     const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
     const globalPath = forgeConfigPaths({ homeDir }).global;
-    const text = deps?.readFile ? deps.readFile(globalPath) : readFileSync4(globalPath, "utf8");
+    const text = deps?.readFile ? deps.readFile(globalPath) : readFileSync5(globalPath, "utf8");
     const parsed = parseForgeJsonc(text);
     if (parsed.ok && parsed.config !== null && typeof parsed.config === "object") {
       const knob = parsed.config.hideNativeAgents;
@@ -19935,7 +23391,7 @@ async function v2Setup(ctx, deps) {
   v2HostSeen = true;
   const homeDir = deps?.homeDir ?? process.env.FORGE_TEST_FORGE_HOME ?? homedir();
   const globalPoolFile = forgeConfigPaths({ homeDir }).global;
-  const readRecipe = deps?.readFile ?? ((path) => readFileSync4(path, "utf8"));
+  const readRecipe = deps?.readFile ?? ((path) => readFileSync5(path, "utf8"));
   const recipeStat = deps?.stat ?? recipeFileStat;
   const snapshots = new Map;
   const unreadable2 = new Set;
@@ -20014,6 +23470,122 @@ async function v2Setup(ctx, deps) {
       }
     } catch {}
   }
+  let disposeConfigRpc = null;
+  if (typeof ctx.rpc?.register === "function") {
+    try {
+      rotateConfigRpcEpoch();
+      const rpcLocation = (() => {
+        try {
+          const reader = ctx.location?.directory;
+          const v = typeof reader === "function" ? reader() : reader;
+          if (typeof v === "string" && v.trim() !== "" && !isRootish(v))
+            return v;
+        } catch {}
+        return null;
+      })();
+      const accessors = {
+        sessionAnchorOf: (sessionID) => {
+          const moved = sessionMovedAnchors.get(sessionID);
+          if (moved && moved.trim() !== "" && !isRootish(moved))
+            return moved;
+          const resolved = rpcAnchorRequestContext.getStore()?.resolvedAnchor;
+          if (typeof resolved === "string" && resolved.trim() !== "" && !isRootish(resolved))
+            return resolved;
+          const mapped = sessions.get(sessionID)?.worktree ?? "";
+          if (mapped && mapped.trim() !== "" && !isRootish(mapped))
+            return mapped;
+          const ledger = resolveAnchorViaLedger(sessionID, "");
+          return ledger && ledger.trim() !== "" && !isRootish(ledger) ? ledger : null;
+        },
+        workspacePoolOf: (anchor) => sessionPoolFileOf(anchor),
+        globalPoolPath: () => globalPoolPathOf(),
+        knownWorkspaceRoot: (anchor) => hostAnchors.some((a) => anchorKey(a) === anchorKey(anchor)),
+        samePath: (a, b) => a.trim() !== "" && b.trim() !== "" && foldPath3(a) === foldPath3(b),
+        pathExists: (p) => recipeFileStat(p) !== null
+      };
+      const syncResolvers = () => {
+        if (hostAnchors.length === 0)
+          return null;
+        const readOf = new Map;
+        const fresh = createPoolResolver({
+          homeDir,
+          readFile: (p) => {
+            const text = strictUtf8Read(p);
+            readOf.set(p, text);
+            return text;
+          }
+        });
+        const resolution = fresh.resolve(hostAnchors);
+        for (const f of resolution.families)
+          observedRecipeFiles.add(f.file);
+        return { resolution, readOf: (p) => readOf.get(p) ?? null };
+      };
+      const hostDeps = createConfigRpcHostDeps(accessors, {
+        observedLocation: rpcLocation,
+        beforeCommit: (req) => captureSyncBaseline({ ownerFile: req.binding.path, anchor: req.binding.anchor, observedLocation: req.binding.observedLocation }, syncResolvers, () => Date.now())
+      });
+      const store = createConfigRpcStore(hostDeps);
+      const listNativeAgents = async () => {
+        if (typeof ctx.agent?.list !== "function")
+          return null;
+        try {
+          const out = await ctx.agent.list();
+          const rows2 = Array.isArray(out) ? out : out !== null && typeof out === "object" && Array.isArray(out.data) ? out.data : null;
+          if (rows2 === null)
+            return null;
+          const mapped = [];
+          for (const row of rows2) {
+            if (row === null || typeof row !== "object")
+              return null;
+            const rec = row;
+            if (typeof rec.id !== "string" || rec.id.trim() === "")
+              return null;
+            mapped.push({ id: rec.id, system: rec.system, model: rec.model, permissions: rec.permissions });
+          }
+          return mapped;
+        } catch {
+          return null;
+        }
+      };
+      const syncDeps = {
+        resolveScope: hostDeps.resolver,
+        resolvePools: syncResolvers,
+        getCommitContext: (commitId) => store.getCommitContext(commitId),
+        globalPoolFile: globalPoolPathOf,
+        rosterDirs: () => ({ globalPoolFile: globalPoolPathOf(), globalAgentDir: globalAgentDirFor({ homeDir, configDir: process.env.OPENCODE_CONFIG_DIR }) }),
+        rosterFs: realRosterFs,
+        epoch: currentConfigRpcEpoch,
+        listNativeAgents,
+        attachSyncOutcome: (commitId, sync) => store.attachSyncOutcome(commitId, sync)
+      };
+      const syncHandler = createConfigRpcSyncHandler(syncDeps);
+      const appVersion = typeof ctx.app?.version === "string" ? ctx.app.version : "";
+      const withPreload = (handler) => async (input) => {
+        const sid = input !== null && typeof input === "object" ? input.sessionID : undefined;
+        let resolvedAnchor = "";
+        if (typeof sid === "string" && sid.trim() !== "") {
+          try {
+            const anchor = await resolveSessionAnchorForPools(sharedAnchorClient(), sid);
+            if (typeof anchor === "string" && anchor.trim() !== "" && !isRootish(anchor))
+              resolvedAnchor = anchor;
+          } catch {}
+        }
+        return rpcAnchorRequestContext.run({ resolvedAnchor }, () => handler(input));
+      };
+      const registration = await ctx.rpc.register(forgeConfigRpcDefinition, Object.fromEntries(Object.entries({ ...store.handlers({ pluginID: "forge", appVersion }), sync: syncHandler }).map(([name, handler]) => [name, withPreload(handler)])));
+      if (registration && typeof registration.dispose === "function") {
+        const regDispose = registration.dispose.bind(registration);
+        disposeConfigRpc = async () => {
+          rotateConfigRpcEpoch();
+          try {
+            await regDispose();
+          } catch {}
+        };
+      }
+    } catch (err) {
+      console.warn(`[forge:v2] warn: forge-config RPC registration unavailable — the config commit protocol is disabled for this process (${err instanceof Error ? err.message : String(err)})`);
+    }
+  }
   if (typeof ctx.agent?.transform === "function") {
     await ctx.agent.transform((draft) => {
       if (typeof draft.get !== "function" || typeof draft.update !== "function")
@@ -20060,7 +23632,7 @@ async function v2Setup(ctx, deps) {
             const id = `forge-${matId}`;
             if (draft.get(id) !== undefined)
               continue;
-            const provenance = foldPath(agent.file) === foldPath(v2GlobalPath) ? { global: true } : { ns: agent.ns, file: agent.file };
+            const provenance = foldPath3(agent.file) === foldPath3(v2GlobalPath) ? { global: true } : { ns: agent.ns, file: agent.file };
             const v1def = forgeAgentDef(matId, agent.def, provenance, agent.shared ?? undefined);
             try {
               draft.update(id, (agentDraft) => {
@@ -20163,7 +23735,7 @@ async function v2Setup(ctx, deps) {
                 let rgConfig;
                 for (const file2 of [forgeConfigPaths({ projectDir: searchProject }).project, globalPoolPathOf()]) {
                   try {
-                    const parsed = parseForgeJsonc(readFileSync4(file2, "utf8"));
+                    const parsed = parseForgeJsonc(readFileSync5(file2, "utf8"));
                     const search = parsed.ok ? parsed.config?.search : undefined;
                     if (typeof search?.rgPath === "string") {
                       rgConfig = search;
@@ -20211,19 +23783,19 @@ async function v2Setup(ctx, deps) {
                   return paths.map((_, i) => matched.has(i + 1));
                 } : undefined;
                 return authorizedSearch(kind, raw, invocation, searchDirectory, searchProject, {
-                  realpath: realpathSync2,
-                  stat: lstatSync,
+                  realpath: realpathSync4,
+                  stat: lstatSync3,
                   list: readdirSync,
                   read: (path) => {
                     const fd = openSync(path, "r");
                     try {
                       const before = fstatSync(fd);
-                      if (!before.isFile() || before.size > MAX_FILE_BYTES || realpathSync2(path) !== path)
+                      if (!before.isFile() || before.size > MAX_FILE_BYTES || realpathSync4(path) !== path)
                         return Buffer.alloc(MAX_FILE_BYTES + 1);
                       const bytes = Buffer.allocUnsafe(MAX_FILE_BYTES + 1);
                       const n = readSync(fd, bytes, 0, bytes.length, 0);
                       const after = fstatSync(fd);
-                      if (before.ino !== after.ino || before.dev !== after.dev || realpathSync2(path) !== path)
+                      if (before.ino !== after.ino || before.dev !== after.dev || realpathSync4(path) !== path)
                         throw new Error("Search target changed");
                       return bytes.subarray(0, n);
                     } finally {
@@ -20262,7 +23834,7 @@ async function v2Setup(ctx, deps) {
   const sessionHooks = await v2RegisterSessionHooks(ctx, goalClient);
   await v2RegisterCommands(ctx);
   const v2AbortEvents = v2SubscribeEvents(ctx, goalClient, !sessionHooks.idleHook);
-  const disposables = [...sessionHooks.disposables, ...v2AbortEvents ? [v2AbortEvents] : []];
+  const disposables = [...sessionHooks.disposables, ...v2AbortEvents ? [v2AbortEvents] : [], ...disposeConfigRpc ? [disposeConfigRpc] : []];
   return disposables.length > 0 ? async () => {
     if (goalClient)
       disposeGoalClient(goalClient);

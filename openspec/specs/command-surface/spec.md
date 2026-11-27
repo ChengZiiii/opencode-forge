@@ -49,7 +49,9 @@ best-effort: it `SHALL NOT` throw into the host.
 
 ### Requirement: Single forge command surface
 
-The plugin `SHALL` register exactly one forge command (`/forge`), routing on typed arguments: `sync`, `init`, `init global`, `stop` (session-scoped stop of the invoking session's native subagents — see 'Session-scoped stop for native subagents'), and a help fallback listing every route. The plugin `SHALL NOT` register any hyphenated forge command (`forge-sync`, `forge-init`, `forge-init-global`, `forge-cancel`). User-owned entries carrying those names `SHALL` never be clobbered, rewritten, or deleted by the plugin (the create-only no-clobber contract is unchanged — the plugin merely stops creating its own).
+The plugin `SHALL` register exactly one server forge command (`/forge`), routing on typed arguments: `sync`, `init`, `init global`, `stop` (session-scoped stop of the invoking session's native subagents — see 'Session-scoped stop for native subagents'), and a help fallback listing every route. The plugin `SHALL NOT` register any retired hyphenated server forge command (`forge-sync`, `forge-init`, `forge-init-global`, `forge-cancel`). User-owned entries carrying those names `SHALL` never be clobbered, rewritten, or deleted by the plugin (the create-only no-clobber contract is unchanged — the plugin merely stops creating its own).
+
+The separate TUI-only `/forge-config` command and palette entry SHALL NOT be registered in the server command domain, SHALL NOT send a model prompt, and SHALL NOT clobber user-owned commands.
 
 The `sync`, `init`, and `init global` routes SHALL enforce a forge-primary identity guard independent of tool visibility before any route work (see forge-subagents 'User-facing /forge command family'); `/forge stop` SHALL be exempt. Init SHALL refuse-and-review existing recipes and require explicit consent before a normal write. Unknown identity SHALL NOT start a guarded route.
 
@@ -71,7 +73,7 @@ The `sync`, `init`, and `init global` routes SHALL enforce a forge-primary ident
 #### Scenario: User-owned entries with retired names survive untouched
 
 - **WHEN** the user's own config carries a command named `forge-sync`
-- **THEN** the plugin neither overwrites nor deletes it, and registers only `/forge` as its own
+- **THEN** the plugin neither overwrites nor deletes it, and registers only `/forge` as its own server forge command
 
 ### Requirement: Session-scoped stop for native subagents
 

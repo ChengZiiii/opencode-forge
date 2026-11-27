@@ -1,12 +1,18 @@
 {
   "name": "@sorenllm/opencode-forge",
-  "version": "0.35.0",
+  "version": "0.36.4",
   "description": "General-purpose Forge agent for OpenCode with file-backed Plan and Goal harnesses, a Crew workflow with evidence-checked reports, and configurable native worker agents with model and reasoning-depth pins or inherited models.",
   "type": "module",
   "main": "./dist/index.js",
   "exports": {
     ".": {
       "import": "./dist/index.js"
+    },
+    "./tui": {
+      "import": "./dist/tui.js"
+    },
+    "./rpc": {
+      "import": "./dist/rpc.js"
     },
     "./schema.json": "./dist/forge.schema.json"
   },
@@ -15,7 +21,7 @@
     "README.md"
   ],
   "scripts": {
-    "bundle": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && bun build ./plugin.ts --outfile ./dist/index.js --target node --format esm && node -e \"require('node:fs').copyFileSync('schema/forge.schema.json','dist/forge.schema.json')\"",
+    "bundle": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\" && bun build ./plugin.ts --outfile ./dist/index.js --target node --format esm && bun build ./tui.ts --outfile ./dist/tui.js --target node --format esm && bun build ./rpc.ts --outfile ./dist/rpc.js --target node --format esm && node -e \"require('node:fs').copyFileSync('schema/forge.schema.json','dist/forge.schema.json')\"",
     "test": "node --import ./tests/lib/test-runtime-namespace.mjs --test tests/*.test.mjs",
     "typecheck": "tsc --noEmit"
   },
@@ -43,7 +49,13 @@
     "url": "https://github.com/ChengZiiii/opencode-forge/issues"
   },
   "peerDependencies": {
-    "@opencode-ai/plugin": "^1.18.0"
+    "@opencode-ai/plugin": "^1.18.0",
+    "@opencode/plugin": ">=2.4.2"
+  },
+  "peerDependenciesMeta": {
+    "@opencode/plugin": {
+      "optional": true
+    }
   },
   "devDependencies": {
     "@opencode-ai/plugin": "^1.18.0",
